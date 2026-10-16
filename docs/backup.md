@@ -66,7 +66,9 @@ tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchange_baselines`), the automod delivery claims, the gateway
 boot directives, the member-erasure audit, the internal clock high-water
 mark, the voice configuration tables, the accepted voice-room create history
-(`voice_create_reservations`), the retention queues
+(`voice_create_reservations`), the owner-grant journal (`voice_owner_grants`,
+pending and completed recipient provenance, restored after `voice_rooms`),
+the retention queues
 (`retention_guild_purge_queue`, `retention_deletion_requests`), the seasonal
 XP projection (`member_season_xp`), the event store (voice capture plus
 presence capture plus member-capture deltas plus message/reaction capture

@@ -566,6 +566,8 @@ impl GatewaySessionStore {
                         .map(|id| id.parse())
                         .transpose()
                         .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+                    max_uses: 0,
+                    temporary: false,
                 })
             })
             .collect()

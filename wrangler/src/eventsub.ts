@@ -31,9 +31,18 @@ export const EVENTSUB_PATH = "/hooks/twitch";
 /**
  * Fixed receiver port, distinct from BOT_PORT (8080) and the internal-actions
  * RECEIVER_PORT (8091). The DO `requiredPorts` entry and the container bind
- * land with the receiver slice; until then forwarding here fails closed.
+ * are wired in `index.ts` once the Operator provisions the secret; until then
+ * forwarding here fails closed.
  */
 export const EVENTSUB_RECEIVER_PORT = 8092;
+/**
+ * The Worker, not the Operator, picks the bind (same rule as
+ * `RECEIVER_BIND` in internal-actions.ts: the Containers port check and
+ * `containerFetch` cannot reach a loopback-only socket, so the receiver
+ * listens on all interfaces inside the private container network, gated by
+ * the Worker-set `TWO_INTERNAL_CONTAINER` marker).
+ */
+export const EVENTSUB_RECEIVER_BIND = `0.0.0.0:${EVENTSUB_RECEIVER_PORT}`;
 /** Mirrors the core (`twitch_eventsub::MAX_BODY_BYTES`): cap before hashing. */
 export const MAX_BODY_BYTES = 64 * 1024;
 /** A subscription challenge is one short token; anything larger is not one. */

@@ -2499,6 +2499,32 @@ pub struct GuildRoomWorker<S, H> {
     /// only whole-handle replacement needs `Arc::get_mut`.
     http: Arc<H>,
     creators: HashMap<Snowflake, CreatorChannel>,
+    /// A channel event (create/update/delete) asked for a creator-view
+    /// re-read; the maintenance tick merges it, debounced. Set by
+    /// `ActorCommand::RefreshCreators`, cleared by `reload_creators`.
+    creators_refresh_due: bool,
+    /// Actor clock of the last creator-view merge (periodic refresh).
+    creators_read_ms: Option<u64>,
+    /// Live generation the creator view was last merged at. A gateway
+    /// reconnect (GuildCreate/Resumed) bumps the generation but sends no
+    /// channel event, so with no RefreshCreators flag the merge would wait
+    /// up to the five-minute interval. The next maintenance tick merges on
+    /// a generation change (debounced), so rows written while down converge
+    /// within about 10 s instead of up to 5 minutes. Updated only by a
+    /// successful merge, so a failed read retries on the next debounced
+    /// tick.
+    creators_generation: u64,
+    /// Channel ids the join read-through already asked the store about with
+    /// no row found, cleared by each successful creator merge. Joins into
+    /// ordinary (non-creator, non-room) channels must not cost a store read
+    /// every time; a later creator row still converges via the next merge.
+    creator_misses: HashSet<Snowflake>,
+    /// Join read-through backoff: set when a single-row creator read fails
+    /// or times out (or the bulk merge fails), cleared by the next
+    /// successful store read. While set, joins skip the store read instead
+    /// of each holding the inbox for up to the timeout ahead of the
+    /// create-to-move dispatch.
+    creator_revalidate_cooldown_until: Option<tokio::time::Instant>,
     access: AccessControls,
     /// Caps and cooldown for the durable create admission; the rolling burst
     /// limits are fixed legacy constants.
@@ -2736,6 +2762,25 @@ const KICK_AUDIT_RETRY_MS: u64 = 5_000;
 
 const OWNER_REPAIR_COOLDOWN_MS: u64 = 60_000;
 
+/// Creator-view refresh bounds: channel events flag a re-read, debounced so a
+/// bulk reorder's CHANNEL_UPDATE echo storm costs one query; the interval
+/// backs up the five-minute naming-settings reload, which already replaces
+/// the whole creator map from the same rows (deletions included) and now
+/// warns when its own read fails. The direct read still earns its place: it
+/// converges full-row fields the snapshot codec does not copy, and rows the
+/// naming reload never saw because its read failed. The merge only adds or
+/// updates rows: a row missing from one direct read is treated as transient,
+/// not a deletion, and a failed read keeps the old map instead of dropping it.
+/// Bound for the join-path single-row read-through: a saturated pool waits up
+/// to 10 s for a connection, but a lobby join must not wait that long.
+const CREATORS_REFRESH_DEBOUNCE_MS: u64 = 10_000;
+const CREATORS_REFRESH_INTERVAL_MS: u64 = 300_000;
+const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
+/// How long join-path creator re-reads back off after a failed, timed-out or
+/// refused bulk store read: one slow pool must not serialize every later
+/// join behind another long wait. A successful store read clears it early.
+const REVALIDATE_COOLDOWN_MS: u64 = 30_000;
+
 /// Repeat bookkeeping for one tracked failure. `last_attempt_ms` is the
 /// actor's monotonic clock, so a restart begins a fresh budget.
 #[derive(Debug, Clone)]
@@ -2844,11 +2889,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             Err(_) => (NameSettings::default(), false),
         };
         let guild_id = live.guild_id;
+        let creators_generation = live.read_state().generation;
         let worker = Self {
             live,
             store,
             http: Arc::new(http),
             creators,
+            creators_refresh_due: false,
+            creators_read_ms: None,
+            creators_generation,
+            creator_misses: HashSet::new(),
+            creator_revalidate_cooldown_until: None,
             access,
             admission: temp_voice_admission(),
             rooms,
@@ -2983,20 +3034,54 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         if let Some(reason) = refusal {
             metrics::global().voice_join_refused(reason);
+            // Name the refusal reason, the refusing channel, and the
+            // creator-map state at join time: the next restart-cured stall
+            // must not need guessing. No member, name or token content is
+            // logged: counts, booleans, clocks and ids only.
+            let live_state = self.live.read_state();
+            let creators_len = self.creators.len() as u64;
+            let known = self.creators.contains_key(&ticket.creator_id);
             if reason == "halted" {
                 warn!(
+                    voice_event = "voice_join_received",
                     guild = self.live.guild_id.to_string(),
-                    reason, "voice creator join refused before queueing"
+                    channel = ticket.creator_id.to_string(),
+                    reason,
+                    creators_len,
+                    known,
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
+                    "voice creator join refused before queueing"
                 );
             } else if reason == "duplicate" {
                 debug!(
+                    voice_event = "voice_join_received",
                     guild = self.live.guild_id.to_string(),
-                    reason, "voice creator join refused before queueing"
+                    channel = ticket.creator_id.to_string(),
+                    reason,
+                    creators_len,
+                    known,
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
+                    "voice creator join refused before queueing"
                 );
             } else {
                 info!(
+                    voice_event = "voice_join_received",
                     guild = self.live.guild_id.to_string(),
-                    reason, "voice creator join refused before queueing"
+                    channel = ticket.creator_id.to_string(),
+                    reason,
+                    creators_len,
+                    known,
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
+                    "voice creator join refused before queueing"
                 );
             }
             return false;
@@ -3024,9 +3109,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     error: blocked.error,
                 });
                 metrics::global().voice_join_refused("name_blocked");
+                let live_state = self.live.read_state();
                 info!(
+                    voice_event = "voice_join_received",
                     guild = self.live.guild_id.to_string(),
+                    channel = ticket.creator_id.to_string(),
                     reason = "name_blocked",
+                    creators_len = self.creators.len() as u64,
+                    known = self.creators.contains_key(&ticket.creator_id),
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
                     "voice creator join refused before queueing"
                 );
                 timing.finish("name_blocked");
@@ -3068,6 +3162,157 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             },
         );
         true
+    }
+
+    /// Re-read one creator row when the in-memory view lacks it, so a join is
+    /// never refused for a channel id that is a `voice_creators` row. Returns
+    /// whether the channel is a creator afterwards (the map now holds it).
+    /// Known creators and known rooms never cost a store read, and neither do
+    /// halted workers (the join is refused as `halted` anyway), channels a
+    /// previous read-through already missed (cleared by each successful
+    /// merge), nor joins while a recent read failed or timed out (backing
+    /// off for [`REVALIDATE_COOLDOWN_MS`], cleared early by the next
+    /// successful store read). The read is bounded so a saturated pool cannot
+    /// hold the inbox ahead of the create-to-move dispatch. A failed or slow
+    /// read keeps the old view and reports false, so the caller refuses
+    /// exactly as before.
+    pub(super) async fn revalidate_creator(&mut self, channel_id: Snowflake) -> bool {
+        if self.creators.contains_key(&channel_id) || self.rooms.contains_key(&channel_id) {
+            return self.creators.contains_key(&channel_id);
+        }
+        if self.halted {
+            return false;
+        }
+        if let Some(until) = self.creator_revalidate_cooldown_until {
+            if tokio::time::Instant::now() < until {
+                return false;
+            }
+            self.creator_revalidate_cooldown_until = None;
+        }
+        if self.creator_misses.contains(&channel_id) {
+            return false;
+        }
+        let read = tokio::time::timeout(
+            Duration::from_millis(REVALIDATE_TIMEOUT_MS),
+            self.store.creator_for(self.live.guild_id, channel_id),
+        )
+        .await;
+        match read {
+            Ok(Ok(Some(creator))) => {
+                self.creator_revalidate_cooldown_until = None;
+                self.live.protect_creators([creator.channel_id]);
+                self.creators.insert(creator.channel_id, creator);
+                self.name_signatures.clear();
+                self.name_inputs = None;
+                info!(
+                    guild = self.live.guild_id.to_string(),
+                    "voice creator view revalidated from the store"
+                );
+                true
+            }
+            Ok(Ok(None)) => {
+                self.creator_revalidate_cooldown_until = None;
+                self.creator_misses.insert(channel_id);
+                false
+            }
+            Ok(Err(error)) => {
+                self.creator_revalidate_cooldown_until = Some(
+                    tokio::time::Instant::now() + Duration::from_millis(REVALIDATE_COOLDOWN_MS),
+                );
+                debug!(
+                    guild = self.live.guild_id.to_string(),
+                    ?error,
+                    "voice creator revalidation failed; keeping the cached view"
+                );
+                false
+            }
+            Err(_) => {
+                self.creator_revalidate_cooldown_until = Some(
+                    tokio::time::Instant::now() + Duration::from_millis(REVALIDATE_COOLDOWN_MS),
+                );
+                debug!(
+                    guild = self.live.guild_id.to_string(),
+                    timed_out = true,
+                    "voice creator revalidation failed; keeping the cached view"
+                );
+                false
+            }
+        }
+    }
+
+    /// Merge the stored creator rows into the in-memory view: insert rows the
+    /// view lacks and swap in changed ones, exactly like `CreatorAdded` (which
+    /// also clears the name caches on any change), but never delete.
+    /// `reload_name_settings` already replaces the whole map from the same
+    /// rows every five minutes, deletions included, so this merge is the
+    /// backstop for what that path cannot see: a failing config-snapshot read
+    /// and full-row fields the snapshot codec does not copy. A row missing
+    /// from one direct read is still treated as transient, not a deletion:
+    /// dropping it would refuse joins until restart. A failed read keeps the
+    /// old view and backs the join read-through off. A successful merge
+    /// clears the read-through miss cache and that backoff.
+    /// Runs when `creators_refresh_due` is set (channel events, debounced),
+    /// every [`CREATORS_REFRESH_INTERVAL_MS`], or when the live generation
+    /// changed since the last successful merge (a gateway reconnect
+    /// republished the snapshot but sent no channel event), from the
+    /// maintenance tick. The generation path is debounced like a channel
+    /// event, so a failed read retries on the next debounced tick instead of
+    /// every tick.
+    pub(super) async fn reload_creators(&mut self, now_ms: u64) {
+        let interval_elapsed = self
+            .creators_read_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= CREATORS_REFRESH_INTERVAL_MS);
+        let debounced = self
+            .creators_read_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= CREATORS_REFRESH_DEBOUNCE_MS);
+        let generation_changed = self.live.read_state().generation != self.creators_generation;
+        if !(interval_elapsed
+            || (self.creators_refresh_due && debounced)
+            || (generation_changed && debounced))
+        {
+            return;
+        }
+        self.creators_refresh_due = false;
+        self.creators_read_ms = Some(now_ms);
+        let generation = self.live.read_state().generation;
+        match self.store.creators(self.live.guild_id).await {
+            Ok(rows) => {
+                self.creators_generation = generation;
+                self.creator_misses.clear();
+                self.creator_revalidate_cooldown_until = None;
+                let mut added = 0u64;
+                let mut changed = false;
+                for creator in rows {
+                    if self.creators.get(&creator.channel_id) != Some(&creator) {
+                        let known = self.creators.contains_key(&creator.channel_id);
+                        self.live.protect_creators([creator.channel_id]);
+                        self.creators.insert(creator.channel_id, creator);
+                        if !known {
+                            added += 1;
+                        }
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.name_signatures.clear();
+                    self.name_inputs = None;
+                    info!(
+                        guild = self.live.guild_id.to_string(),
+                        added, "voice creator view merged stored rows"
+                    );
+                }
+            }
+            Err(error) => {
+                self.creator_revalidate_cooldown_until = Some(
+                    tokio::time::Instant::now() + Duration::from_millis(REVALIDATE_COOLDOWN_MS),
+                );
+                debug!(
+                    guild = self.live.guild_id.to_string(),
+                    ?error,
+                    "voice creator refresh failed; keeping the cached view"
+                );
+            }
+        }
     }
 
     /// The member's tracked rooms that hold no human and expect no move: the
@@ -6449,6 +6694,11 @@ enum ActorCommand {
     /// Test probe: the worker's naming settings and known display names.
     #[cfg(test)]
     NamingProbe(oneshot::Sender<(NameSettings, NameDirectory)>),
+    /// Test probe: the worker's current creator-channel ids, so sink tests
+    /// can pin the channel-event merge without driving a join (which would
+    /// also merge via the read-through and hide a dead event hook).
+    #[cfg(test)]
+    CreatorsProbe(oneshot::Sender<Vec<Snowflake>>),
     /// An occupant's game or stream changed: the room's name inputs moved.
     RoomFactsChanged(Snowflake),
     Join {
@@ -6463,6 +6713,10 @@ enum ActorCommand {
     /// A new or edited creator row (`/create`, `/textchannels`): the worker
     /// swaps it in for rooms created from here on.
     CreatorAdded(CreatorChannel),
+    /// A channel was created, renamed/moved or deleted: flag the creator view
+    /// for a debounced store merge on the maintenance tick, so an externally
+    /// changed creator row converges without a restart.
+    RefreshCreators,
     /// The guild's saved access controls changed (`/access`).
     AccessChanged(AccessControls),
     /// One-shot worker snapshot for `/setup` (room count, failures, halt).
@@ -6562,6 +6816,42 @@ const MAX_PENDING_IMPORTS: usize = 128;
 struct PendingImport {
     candidate: VoiceConfiguration,
     expires_at: Instant,
+}
+
+/// Reply for a command whose required guild-role facts have not loaded
+/// yet: retryable, never a permanent permission denial.
+const WARMING_UP_REPLY: &str =
+    "Voice commands are warming up while I load this server's permissions. Please try again shortly.";
+
+/// Whether guild-role authority could be established for an interaction.
+/// `WarmingUp` covers absent, unready, disconnected or incomplete
+/// guild-role facts; `MissingMember` covers an interaction without the
+/// member/user facts needed to evaluate authority at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuildAuthority {
+    Ready(Permissions),
+    WarmingUp,
+    MissingMember,
+}
+
+/// Commands gated on guild-role authority (`may_create`, the admin flag,
+/// or `may_manage_server`). Only these get the warming-up reply when cold;
+/// commands that do not depend on that authority keep their behaviour.
+fn requires_guild_authority(command: &VoiceCommand) -> bool {
+    matches!(
+        command,
+        VoiceCommand::Create { .. }
+            | VoiceCommand::TextChannels { .. }
+            | VoiceCommand::Position { .. }
+            | VoiceCommand::Group { .. }
+            | VoiceCommand::InheritPermissions { .. }
+            | VoiceCommand::DefaultLimit { .. }
+            | VoiceCommand::AlwaysPrivate { .. }
+            | VoiceCommand::Access(_)
+            | VoiceCommand::Logging(_)
+            | VoiceCommand::Export
+            | VoiceCommand::Import { .. }
+    )
 }
 
 pub struct VoiceRuntime<S, H> {
@@ -6701,23 +6991,53 @@ where
         interaction: &Interaction,
         now_micros: i128,
     ) -> Option<Permissions> {
-        let guild = interaction_guild(interaction)?;
-        let member = interaction.member.as_ref()?;
-        let member_id = member.user.as_ref()?.id.get();
-        let actor = self.live_actor(guild)?;
+        match self.guild_authority_at(interaction, now_micros) {
+            GuildAuthority::Ready(permissions) => Some(permissions),
+            GuildAuthority::WarmingUp | GuildAuthority::MissingMember => None,
+        }
+    }
+
+    fn guild_authority(&self, interaction: &Interaction) -> GuildAuthority {
+        self.guild_authority_at(
+            interaction,
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000,
+        )
+    }
+
+    /// Tri-state behind [`Self::guild_permissions_at`]: a generic `None`
+    /// cannot tell a cold snapshot (retryable) from a missing member
+    /// (malformed, never relabelled as warm-up). Missing/disconnected or
+    /// incomplete guild-role facts are `WarmingUp` and stay fail-closed.
+    fn guild_authority_at(&self, interaction: &Interaction, now_micros: i128) -> GuildAuthority {
+        let Some(guild) = interaction_guild(interaction) else {
+            return GuildAuthority::MissingMember;
+        };
+        let Some(member) = interaction.member.as_ref() else {
+            return GuildAuthority::MissingMember;
+        };
+        let Some(member_id) = member.user.as_ref().map(|user| user.id.get()) else {
+            return GuildAuthority::MissingMember;
+        };
+        let Some(actor) = self.live_actor(guild) else {
+            return GuildAuthority::WarmingUp;
+        };
         let live = actor.live.read_state();
         if !live.ready {
-            return None;
+            return GuildAuthority::WarmingUp;
         }
-        let bot = live.bot.as_ref()?;
-        let mut permissions = effective_permissions(
+        let Some(bot) = live.bot.as_ref() else {
+            return GuildAuthority::WarmingUp;
+        };
+        let Some(mut permissions) = effective_permissions(
             guild,
             bot.guild_owner_id,
             member_id,
             &member.roles,
             &bot.roles,
             &[],
-        )?;
+        ) else {
+            return GuildAuthority::WarmingUp;
+        };
         // Discord exempts the guild owner and Administrator, both of which
         // effective_permissions resolves to all bits. Other timed-out members
         // retain only their existing View Channel and Read Message History bits.
@@ -6729,7 +7049,7 @@ where
         {
             permissions &= Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY;
         }
-        Some(permissions)
+        GuildAuthority::Ready(permissions)
     }
 
     fn ensure_actor(&self, guild: Snowflake) -> Option<GuildActor> {
@@ -7048,6 +7368,15 @@ where
         }
     }
 
+    /// Flag the guild worker's creator view for a debounced store merge after
+    /// a channel create, rename/move or delete. Never spawns an actor: frames
+    /// before the first GuildCreate have no worker to flag.
+    fn refresh_creators(&self, guild: Snowflake) {
+        if let Some(actor) = self.live_actor(guild) {
+            let _ = actor.tx.send(ActorCommand::RefreshCreators);
+        }
+    }
+
     /// Push freshly saved access controls to the live actor, so a creation
     /// switch takes effect without a restart.
     fn access_changed(&self, guild: Snowflake, controls: AccessControls) {
@@ -7159,6 +7488,15 @@ where
         let actor = self.live_actor(guild_id)?;
         let (reply, inbox) = oneshot::channel();
         actor.tx.send(ActorCommand::NamingProbe(reply)).ok()?;
+        inbox.await.ok()
+    }
+
+    /// Test probe: the worker's current creator-channel ids.
+    #[cfg(test)]
+    async fn creators_probe(&self, guild_id: Snowflake) -> Option<Vec<Snowflake>> {
+        let actor = self.live_actor(guild_id)?;
+        let (reply, inbox) = oneshot::channel();
+        actor.tx.send(ActorCommand::CreatorsProbe(reply)).ok()?;
         inbox.await.ok()
     }
 
@@ -7341,16 +7679,19 @@ where
             Event::ChannelCreate(created) => {
                 if let Some(guild_id) = created.guild_id.map(|id| id.get()) {
                     self.update_live(guild_id, |live| live.upsert_channel(created.0.clone()));
+                    self.refresh_creators(guild_id);
                 }
             }
             Event::ChannelUpdate(updated) => {
                 if let Some(guild_id) = updated.guild_id.map(|id| id.get()) {
                     self.update_live(guild_id, |live| live.upsert_channel(updated.0.clone()));
+                    self.refresh_creators(guild_id);
                 }
             }
             Event::ChannelDelete(deleted) => {
                 if let Some(guild_id) = deleted.guild_id.map(|id| id.get()) {
                     self.update_live(guild_id, |live| live.remove_channel(deleted.id.get()));
+                    self.refresh_creators(guild_id);
                 }
             }
             Event::GuildUpdate(updated) => {
@@ -7666,6 +8007,12 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                     .elapsed()
                     .as_millis()
                     .min(u128::from(u64::MAX)) as u64;
+                // Read-through on a stale creator view: a join for a channel
+                // id that is a voice_creators row is never refused for being
+                // unknown. Known creators and known rooms skip the store read.
+                if let ActorCommand::Join { ticket, .. } = &command {
+                    worker.revalidate_creator(ticket.creator_id).await;
+                }
                 let accepted = apply_command(worker, command, now_ms);
                 if accepted {
                     last_progress = tokio::time::Instant::now();
@@ -7775,6 +8122,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
             _ = std::future::ready(()), if maintenance_ready => {
                 maintenance_ready = false;
                 let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                worker.reload_creators(now_ms).await;
                 worker.reload_name_settings(now_ms).await;
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
@@ -7822,6 +8170,12 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         ActorCommand::NamingProbe(reply) => {
             let _ = reply.send((worker.name_settings.clone(), worker.name_directory.clone()));
         }
+        #[cfg(test)]
+        ActorCommand::CreatorsProbe(reply) => {
+            let mut ids: Vec<Snowflake> = worker.creators.keys().copied().collect();
+            ids.sort_unstable();
+            let _ = reply.send(ids);
+        }
         ActorCommand::RoomFactsChanged(room) => worker.room_facts_changed(room, now_ms),
         ActorCommand::Join {
             ticket,
@@ -7841,12 +8195,16 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         }
         ActorCommand::CreatorAdded(creator) => {
             worker.live.protect_creators([creator.channel_id]);
+            let _ = worker.creator_misses.remove(&creator.channel_id);
             if worker.creators.get(&creator.channel_id) != Some(&creator) {
                 worker.creators.insert(creator.channel_id, creator);
                 worker.name_signatures.clear();
                 worker.name_inputs = None;
             }
             worker.reconcile();
+        }
+        ActorCommand::RefreshCreators => {
+            worker.creators_refresh_due = true;
         }
         ActorCommand::AccessChanged(controls) => worker.access = controls,
         ActorCommand::Status(reply) => {
@@ -10447,6 +10805,15 @@ where
     let Some(command) = runtime.parse_voice_command(interaction) else {
         return false;
     };
+    // Cold guild-role facts are not a permanent denial: a command that
+    // needs that authority gets the retryable warming-up reply and fails
+    // closed before any gate read or protected effect. Missing-member
+    // interactions keep their existing handling.
+    let authority = runtime.guild_authority(interaction);
+    if matches!(authority, GuildAuthority::WarmingUp) && requires_guild_authority(&command) {
+        reply(ephemeral_response(WARMING_UP_REPLY)).await;
+        return true;
+    }
     // Guild-level role gate first. Settings that cannot be read fail closed for
     // members: only an admin proceeds without them.
     let member = access_member(interaction, runtime.guild_permissions(interaction));
@@ -11174,6 +11541,13 @@ where
     }
     let permissions = runtime.guild_permissions(interaction);
     if !may_manage_server(permissions) {
+        if matches!(
+            runtime.guild_authority(interaction),
+            GuildAuthority::WarmingUp
+        ) {
+            reply(ephemeral_response(WARMING_UP_REPLY)).await;
+            return true;
+        }
         reply(ephemeral_response(
             "You need Manage Server to confirm an import.",
         ))

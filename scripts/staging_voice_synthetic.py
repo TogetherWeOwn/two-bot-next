@@ -14,8 +14,30 @@ What it proves on the deployed staging bot (stdlib only, no third-party code):
              Connect and Manage Channels (owner grants)
   status     a voice-channel status line is set on the room
   delete     after the test bot leaves, the room is deleted within the grace
+  rename     the creator is renamed before the join and restored after: the
+             post-rename join must still move the test bot into a new room
+             (SKIP while the test bot may not rename: its staging role needs
+             Manage Channels once; SKIP on HTTP 429, Discord's 2-renames-per-
+             10-minutes per-channel limit, so workflow retries do not fail)
   metrics    optional: /ops/metrics `two_bot_voice_names_total` counts the room
              as created_with_template (SKIP when no metrics token is configured)
+  limit      the room's `user_limit` PATCHes to a probed value and back with a
+             read-back after each write (FAIL on HTTP 403: the owner grant was
+             lost after creation; SKIP on HTTP 429; the same Discord
+             field `/limit` and `/unlimit` manage)
+  privacy    the room's @everyone Connect overwrite toggles and restores with a
+             read-back after each write (SKIP while the test bot may not edit
+             overwrites: its staging role needs Manage Roles once; SKIP on
+             HTTP 429; the same Discord entry `/private` and `/public` rewrite)
+  name_panel the room's name after the rename cycle renders from its template
+             (not the "<display>'s room" fallback): what the `/name` panel's
+             Current-name line would show
+
+The limit/privacy/name_panel checks exercise the Discord channel fields the
+owner commands manage through the same REST paths the bot writes; they do not
+invoke the slash commands themselves (Discord only creates interactions for
+real users, so a bot token cannot). A PASS means the room the staging bot made
+is fully owner-manageable; a FAIL names the field that did not round-trip.
 
 Identity and fences (fail-closed, before any request):
   - TWO_VOICE_SYNTHETIC_BOT_TOKEN: a dedicated test bot (never the bot under
@@ -60,6 +82,10 @@ VIEW, CONNECT, MANAGE = 1 << 10, 1 << 20, 1 << 4
 OWNER_BITS = VIEW | CONNECT | MANAGE
 VOICE_TYPES = (2, 13)
 FALLBACK = re.compile(r"^.+['’]s room$")
+# Marker appended to the staging creator's name for the rename case. The run
+# restores the original name in a finally block; a name already carrying the
+# marker means a previous run did not restore, and the rename is skipped.
+RENAME_MARKER = " (synthetic)"
 
 # Body-cap refusal contract (same shape as staging_probe.py MAX_BODY_BYTES and
 # the contract probe BODY_CAP): every response read takes at most
@@ -124,13 +150,24 @@ def evaluate(obs):
     after the move), statuses (room status
     strings seen), deleted (bool), delete_seconds, grace_seconds, metrics_delta
     (int or None when unavailable), channels_before (guild channels before the
-    join; the creator's existing rooms move the expected slot to their end).
+    join; the creator's existing rooms move the expected slot to their end),
+    received_delta (joins-received delta or None when metrics are unavailable),
+    refused_delta (per-reason refused deltas, {} when unavailable),
+    limit_initial/limit_probed (user_limit before/probed), limit_set_ok and
+    limit_restored (each write verified by read-back), limit_forbidden (FAIL
+    reason: the owner Manage Channels grant was lost after creation) and
+    limit_rate_limited (SKIP reason), limit_note, privacy_initial_denies
+    (@everyone Connect deny before the toggle), privacy_toggled and
+    privacy_restored (each write verified by read-back), privacy_forbidden
+    and privacy_rate_limited (SKIP reasons), privacy_note, panel_name (the
+    room's name read after the rename cycle) and panel_note.
     """
     out = []
     creator, room_id = obs["creator"], obs.get("room_id")
     created = obs.get("room_created") or {}
     out.append(check("create", bool(room_id) and created.get("parent_id") == creator.get("parent_id"),
-                     f"room={room_id} parent={created.get('parent_id')} creator_parent={creator.get('parent_id')}"))
+                     f"room={room_id} parent={created.get('parent_id')} creator_parent={creator.get('parent_id')}"
+                     f"{refusal_suffix(obs)}"))
     out.append(check("moved", bool(room_id) and obs.get("moved_to") == room_id,
                      f"joiner landed in {obs.get('moved_to')} (room {room_id})"))
     rejoin = obs.get("rejoin_room_id")
@@ -158,7 +195,114 @@ def evaluate(obs):
     out.append(check("metrics", delta is not None and delta >= 1,
                      "no metrics token configured" if delta is None else f"created_with_template +{delta}",
                      skip=delta is None))
+    note = obs.get("rename_note")
+    if obs.get("rename_forbidden"):
+        out.append(check("rename", False,
+                         "test bot may not rename the staging creator (HTTP 403): grant its "
+                         "staging role Manage Channels once, then the rename case gates",
+                         skip=True))
+    elif obs.get("rename_rate_limited"):
+        out.append(check("rename", False,
+                         "creator rename hit Discord's per-channel rename limit (HTTP 429): "
+                         "a retry or dispatch collided within 10 minutes; rename skipped",
+                         skip=True))
+    elif obs.get("rename_applied") and obs.get("rename_restored"):
+        out.append(check("rename", True,
+                         f"creator renamed to {obs.get('rename_name')!r} and restored; "
+                         f"the post-rename join landed in {obs.get('moved_to')}"))
+    elif note and not obs.get("rename_applied"):
+        out.append(check("rename", False, note))
+    elif obs.get("rename_applied") and not obs.get("rename_restored"):
+        out.append(check("rename", False,
+                         "creator was renamed but the original name was NOT restored; "
+                         "restore it manually"))
+    else:
+        out.append(check("rename", False, note or "creator rename was not applied"))
+    limit_note = obs.get("limit_note")
+    if obs.get("limit_forbidden"):
+        out.append(check("limit", False,
+                         "room user_limit PATCH answered HTTP 403: the test bot owns "
+                         "its room, so its owner Manage Channels grant was lost or "
+                         "ineffective after creation; restore the member overwrite "
+                         "(the owner check reads creation-time grants and cannot "
+                         "see this loss)"))
+    elif obs.get("limit_rate_limited"):
+        out.append(check("limit", False,
+                         "room user_limit PATCH hit Discord's rate limit (HTTP 429): "
+                         "a retry or dispatch collided; limit skipped",
+                         skip=True))
+    elif obs.get("limit_set_ok") and obs.get("limit_restored"):
+        out.append(check("limit", True,
+                         f"user_limit {obs.get('limit_initial')} -> {obs.get('limit_probed')} "
+                         f"-> {obs.get('limit_initial')} (each write verified by read-back)"))
+    elif limit_note and not obs.get("limit_set_ok"):
+        out.append(check("limit", False, limit_note))
+    elif obs.get("limit_set_ok") and not obs.get("limit_restored"):
+        out.append(check("limit", False,
+                         "room user_limit was set but NOT restored to "
+                         f"{obs.get('limit_initial')}; restore it manually"))
+    else:
+        out.append(check("limit", False, limit_note or "room user_limit was not round-tripped"))
+    privacy_note = obs.get("privacy_note")
+    if obs.get("privacy_forbidden"):
+        out.append(check("privacy", False,
+                         "test bot may not rewrite the room's @everyone overwrite "
+                         "(HTTP 403): grant its staging role Manage Roles once, "
+                         "then the private/public toggle gates",
+                         skip=True))
+    elif obs.get("privacy_rate_limited"):
+        out.append(check("privacy", False,
+                         "room overwrite PUT hit Discord's rate limit (HTTP 429): "
+                         "a retry or dispatch collided; privacy skipped",
+                         skip=True))
+    elif obs.get("privacy_toggled") and obs.get("privacy_restored"):
+        out.append(check("privacy", True,
+                         "@everyone Connect deny "
+                         f"{'on' if obs.get('privacy_initial_denies') else 'off'} -> "
+                         f"{'off' if obs.get('privacy_initial_denies') else 'on'} -> "
+                         f"{'on' if obs.get('privacy_initial_denies') else 'off'} "
+                         "(each write verified by read-back)"))
+    elif privacy_note and not obs.get("privacy_toggled"):
+        out.append(check("privacy", False, privacy_note))
+    elif obs.get("privacy_toggled") and not obs.get("privacy_restored"):
+        out.append(check("privacy", False,
+                         "room @everyone Connect deny was toggled but NOT restored; "
+                         "restore it manually"))
+    else:
+        out.append(check("privacy", False,
+                         privacy_note or "room @everyone Connect deny was not round-tripped"))
+    panel = obs.get("panel_name") or ""
+    if panel and not FALLBACK.match(panel):
+        out.append(check("name_panel", True,
+                         f"post-rename room name {panel!r} renders from its template "
+                         "(what the /name panel's Current-name line shows)"))
+    else:
+        out.append(check("name_panel", False,
+                         obs.get("panel_note") or
+                         f"post-rename room name {panel!r} is missing or the fallback"))
     return out
+
+
+def refusal_suffix(obs):
+    """Name the refusal reason on a failed create: joins-received plus per-reason
+    refused deltas when metrics are available, or a metrics-unavailable note.
+    The next restart-cured stall must name its reason, not just room=None."""
+    refused = obs.get("refused_delta") or {}
+    total = sum(refused.values())
+    received = obs.get("received_delta")
+    if received is None and not refused:
+        return ""
+    parts = []
+    if received is not None:
+        parts.append(f"received={received:g}")
+    for reason in sorted(refused):
+        if refused[reason]:
+            parts.append(f"{reason}={refused[reason]:g}")
+    if not parts:
+        if received is not None:
+            return f"; joins received={received:g}, no refusals"
+        return ""
+    return "; joins " + ", ".join(parts)
 
 
 def fence(guild_id, creator_id, staging_url):
@@ -182,6 +326,63 @@ def counter(text, outcome):
             except ValueError:
                 pass
     return total
+
+
+def parse_received(text):
+    """Value of two_bot_voice_joins_received_total in a Prometheus body (0.0 when absent)."""
+    for line in text.splitlines():
+        if line.startswith("two_bot_voice_joins_received_total "):
+            try:
+                return float(line.rsplit(" ", 1)[1])
+            except ValueError:
+                pass
+    return 0.0
+
+
+def parse_refusals(text):
+    """Per-reason two_bot_voice_join_refused_total{reason=...} counts in a Prometheus body."""
+    out = {}
+    for line in text.splitlines():
+        if not line.startswith("two_bot_voice_join_refused_total{"):
+            continue
+        try:
+            value = float(line.rsplit(" ", 1)[1])
+        except ValueError:
+            continue
+        for part in line.split("{", 1)[1].split("}", 1)[0].split(","):
+            key, _, val = part.partition("=")
+            if key.strip() == "reason":
+                out[val.strip().strip('"')] = out.get(val.strip().strip('"'), 0.0) + value
+    return out
+
+
+def metrics_snapshot(staging_url, token):
+    """One /ops/metrics fetch returning (received, refusals) or (None, None).
+
+    `received` is the joins-received counter, `refusals` maps each refusal
+    reason to its count. Unavailable metrics (no URL/token, HTTP error,
+    network failure) report (None, None) so the caller SKIPs the refusal
+    naming instead of guessing; an over-cap body raises BodyTooLarge like the
+    other readers.
+    """
+    if not (staging_url and token):
+        return None, None
+    req = urllib.request.Request(f"{staging_url.rstrip('/')}/ops/metrics", headers={
+        "Authorization": f"Bearer {token}", "User-Agent": "two-bot-voice-synthetic (staging)"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read(MAX_BODY_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(MAX_BODY_BYTES + 1)
+        if len(raw) > MAX_BODY_BYTES:
+            raise BodyTooLarge("metrics read answered over the body cap") from None
+        return None, None
+    except (urllib.error.URLError, OSError):
+        return None, None
+    if len(raw) > MAX_BODY_BYTES:
+        raise BodyTooLarge("metrics read answered over the body cap")
+    text = raw.decode()
+    return parse_received(text), parse_refusals(text)
 
 
 # --------------------------------------------------------------------------
@@ -286,6 +487,59 @@ def rest(token, path, timeout=20):
     return json.loads(raw)
 
 
+def rest_patch(token, path, payload, timeout=20):
+    """PATCH a Discord resource with a JSON body under the same body cap.
+
+    Returns (status, parsed body or None). HTTP errors report their status
+    instead of raising (a 403 means the test bot may not rename); only an
+    over-cap body raises BodyTooLarge, like the GET path.
+    """
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(f"{API}{path}", data=data, headers={
+        "Authorization": f"Bot {token}", "User-Agent": "two-bot-voice-synthetic (staging)",
+        "Content-Type": "application/json"}, method="PATCH")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(MAX_BODY_BYTES + 1)
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(MAX_BODY_BYTES + 1)
+        if len(raw) > MAX_BODY_BYTES:
+            raise BodyTooLarge("Discord REST read answered over the body cap") from None
+        return exc.code, None
+    if len(raw) > MAX_BODY_BYTES:
+        raise BodyTooLarge("Discord REST read answered over the body cap")
+    return status, json.loads(raw)
+
+
+def rest_put_overwrite(token, channel_id, overwrite_id, allow, deny, ow_type, timeout=20):
+    """PUT one channel permission overwrite under the same body cap.
+
+    `allow`/`deny` are ints sent as Discord's string bitfields; `ow_type` is 0
+    for a role (@everyone) or 1 for a member. Returns the HTTP status (a 403
+    means the test bot may not edit overwrites; 429 is Discord's rate limit);
+    only an over-cap body raises BodyTooLarge, like the GET/PATCH paths.
+    """
+    data = json.dumps({"allow": str(allow), "deny": str(deny), "type": ow_type}).encode()
+    req = urllib.request.Request(f"{API}/channels/{channel_id}/permissions/{overwrite_id}",
+                                 data=data, headers={
+                                     "Authorization": f"Bot {token}",
+                                     "User-Agent": "two-bot-voice-synthetic (staging)",
+                                     "Content-Type": "application/json"}, method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(MAX_BODY_BYTES + 1)
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(MAX_BODY_BYTES + 1)
+        if len(raw) > MAX_BODY_BYTES:
+            raise BodyTooLarge("Discord REST read answered over the body cap") from None
+        return exc.code
+    if len(raw) > MAX_BODY_BYTES:
+        raise BodyTooLarge("Discord REST read answered over the body cap")
+    return status
+
+
 def metrics_value(staging_url, token):
     if not (staging_url and token):
         return None
@@ -360,8 +614,10 @@ class Session:
 
 
 def run_live(args, token):
-    obs = {"grace_seconds": args.grace, "statuses": [], "deleted": False}
+    obs = {"grace_seconds": args.grace, "statuses": [], "deleted": False,
+           "received_delta": None, "refused_delta": {}}
     before = metrics_value(args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
+    snap_before = metrics_snapshot(args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
     s = Session(token)
     joined = False
     try:
@@ -370,6 +626,44 @@ def run_live(args, token):
         obs["me"] = s.me
         creator = rest(token, f"/channels/{args.creator}")
         obs["creator"] = creator
+        # Rename case: a renamed creator must still move joins into new rooms
+        # (a stale creator view refused them until restart). The original name
+        # is restored in the finally block; residue from a previous run skips
+        # the rename but still runs the lifecycle checks.
+        original_name = creator.get("name", "")
+        obs["rename_original"] = original_name
+        obs["rename_applied"] = obs["rename_restored"] = False
+        obs["rename_forbidden"] = obs["rename_rate_limited"] = False
+        # Set before the PATCH: a request Discord applies but whose response
+        # is lost (timeout, failed read-back) must still be restored.
+        obs["rename_attempted"] = False
+        temp_name = (original_name + RENAME_MARKER)[:100] or "Create a Lobby" + RENAME_MARKER
+        if RENAME_MARKER in original_name:
+            obs["rename_note"] = ("creator already carries synthetic residue "
+                                  f"({original_name!r}); rename skipped, restore it manually")
+        else:
+            obs["rename_attempted"] = True
+            status, _ = rest_patch(token, f"/channels/{args.creator}", {"name": temp_name})
+            if status == 403:
+                obs["rename_forbidden"] = True
+            elif status == 429:
+                obs["rename_rate_limited"] = True
+                obs["rename_note"] = ("rename PATCH answered 429 (per-channel rename limit); "
+                                      "rename skipped")
+            elif status is not None and 200 <= status < 300:
+                obs["rename_applied"] = True
+                obs["rename_name"] = temp_name
+                try:
+                    seen = rest(token, f"/channels/{args.creator}")
+                except Exception:
+                    seen = {}
+                if seen.get("name") == temp_name:
+                    obs["creator"] = creator = seen
+                else:
+                    obs["rename_note"] = (f"rename PATCH answered {status} but the name "
+                                          f"reads back {seen.get('name')!r}")
+            else:
+                obs["rename_note"] = f"rename PATCH answered {status}; rename skipped"
         obs["channels_before"] = rest(token, f"/guilds/{args.guild}/channels")
         s.voice(args.guild, args.creator)
         joined = True
@@ -400,6 +694,99 @@ def run_live(args, token):
             obs["channels"] = rest(token, f"/guilds/{args.guild}/channels")
             obs["statuses"] = [e["d"].get("status") for e in s.events
                                if e["t"] == "VOICE_CHANNEL_STATUS_UPDATE" and e["d"].get("id") == room_id]
+            # Owner-command round-trips on the room we own: the same Discord
+            # fields /limit, /private//public and /name manage, driven through
+            # the same REST paths the bot writes (Discord creates interactions
+            # only for real users, so a bot token cannot invoke the slash
+            # commands themselves). Each write is verified by a read-back and
+            # restored, so a green run leaves the room as the bot made it. A
+            # failed step records a note (its check FAILs). A limit 403 FAILs
+            # (the owner Manage Channels grant was lost after creation); a
+            # limit/privacy 429 and a privacy 403 (its one-time Manage Roles
+            # grant is still pending) record SKIP reasons instead.
+            obs["limit_forbidden"] = obs["limit_rate_limited"] = False
+            obs["limit_set_ok"] = obs["limit_restored"] = False
+            try:
+                seen = rest(token, f"/channels/{room_id}")
+                initial = int(seen.get("user_limit") or 0)
+                probed = 3 if initial == 2 else 2
+                obs["limit_initial"], obs["limit_probed"] = initial, probed
+                status, _ = rest_patch(token, f"/channels/{room_id}", {"user_limit": probed})
+                if status == 403:
+                    obs["limit_forbidden"] = True
+                elif status == 429:
+                    obs["limit_rate_limited"] = True
+                    obs["limit_note"] = ("room user_limit PATCH answered 429 "
+                                         "(rate limit); limit skipped")
+                elif status is not None and 200 <= status < 300:
+                    if int(rest(token, f"/channels/{room_id}").get("user_limit") or 0) == probed:
+                        obs["limit_set_ok"] = True
+                        back, _ = rest_patch(token, f"/channels/{room_id}",
+                                             {"user_limit": initial})
+                        if (back is not None and 200 <= back < 300
+                                and int(rest(token, f"/channels/{room_id}")
+                                        .get("user_limit") or 0) == initial):
+                            obs["limit_restored"] = True
+                else:
+                    obs["limit_note"] = f"room user_limit PATCH answered {status}; limit skipped"
+            except Exception as exc:
+                obs["limit_note"] = f"{type(exc).__name__} during the limit round-trip"
+            obs["privacy_forbidden"] = obs["privacy_rate_limited"] = False
+            obs["privacy_toggled"] = obs["privacy_restored"] = False
+            try:
+                seen = rest(token, f"/channels/{room_id}")
+                current = [o for o in seen.get("permission_overwrites", []) or []
+                           if o.get("type") == 0 and str(o.get("id")) == str(args.guild)]
+                allow = int(current[0].get("allow") or 0) if current else 0
+                deny = int(current[0].get("deny") or 0) if current else 0
+                initial_denies = bool(deny & CONNECT)
+                obs["privacy_initial_denies"] = initial_denies
+                if initial_denies:
+                    planned_allow, planned_deny = allow, deny & ~CONNECT
+                else:
+                    planned_allow, planned_deny = allow & ~CONNECT, deny | CONNECT
+                status = rest_put_overwrite(token, room_id, args.guild,
+                                            planned_allow, planned_deny, 0)
+                if status == 403:
+                    obs["privacy_forbidden"] = True
+                elif status == 429:
+                    obs["privacy_rate_limited"] = True
+                    obs["privacy_note"] = ("room overwrite PUT answered 429 "
+                                           "(rate limit); privacy skipped")
+                elif status is not None and 200 <= status < 300:
+                    now = rest(token, f"/channels/{room_id}")
+                    entries = [o for o in now.get("permission_overwrites", []) or []
+                               if o.get("type") == 0 and str(o.get("id")) == str(args.guild)]
+                    denies = (bool(int(entries[0].get("deny") or 0) & CONNECT)
+                              if entries else False)
+                    if denies == (not initial_denies):
+                        obs["privacy_toggled"] = True
+                        back = rest_put_overwrite(token, room_id, args.guild, allow, deny, 0)
+                        if back is not None and 200 <= back < 300:
+                            fin = rest(token, f"/channels/{room_id}")
+                            fentries = [o for o in fin.get("permission_overwrites", []) or []
+                                        if o.get("type") == 0
+                                        and str(o.get("id")) == str(args.guild)]
+                            fdenies = (bool(int(fentries[0].get("deny") or 0) & CONNECT)
+                                       if fentries else False)
+                            if fdenies == initial_denies:
+                                obs["privacy_restored"] = True
+                    else:
+                        obs["privacy_note"] = ("room overwrite PUT answered "
+                                               f"{status} but @everyone Connect reads back "
+                                               f"{'denied' if denies else 'allowed'}")
+                else:
+                    obs["privacy_note"] = f"room overwrite PUT answered {status}; privacy skipped"
+            except Exception as exc:
+                obs["privacy_note"] = f"{type(exc).__name__} during the privacy round-trip"
+            # Name-panel render: read the room's name after the rename cycle
+            # (the limit/privacy writes may have triggered a bot re-render, so
+            # read last). No write: the /name panel's Current-name line shows
+            # whatever this GET returns.
+            try:
+                obs["panel_name"] = rest(token, f"/channels/{room_id}").get("name")
+            except Exception as exc:
+                obs["panel_note"] = f"{type(exc).__name__} reading the room name for the panel"
             # Hop from our own room straight back into the creator: a member
             # doing this must get a new room, not stay in the lobby.
             s.voice(args.guild, args.creator)
@@ -423,9 +810,35 @@ def run_live(args, token):
                 s.voice(args.guild, None)
             except OSError:
                 pass
+        # Restore whenever a rename was attempted and the live name differs
+        # from the original: the PATCH may have applied while its response
+        # was lost, which the old applied-only gate left as residue.
+        if obs.get("rename_attempted") and not obs.get("rename_forbidden"):
+            try:
+                seen_now = rest(token, f"/channels/{args.creator}")
+                if seen_now.get("name") != obs.get("rename_original", ""):
+                    status, _ = rest_patch(token, f"/channels/{args.creator}",
+                                           {"name": obs.get("rename_original", "")})
+                    seen = rest(token, f"/channels/{args.creator}")
+                    obs["rename_restored"] = (isinstance(status, int) and 200 <= status < 300
+                                              and seen.get("name") == obs.get("rename_original"))
+            except Exception:
+                obs["rename_restored"] = False
         s.close()
     after = metrics_value(args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
     obs["metrics_delta"] = None if before is None or after is None else int(after - before)
+    received_before, refused_before = snap_before
+    received_after, refused_after = metrics_snapshot(
+        args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
+    if received_before is not None and received_after is not None:
+        obs["received_delta"] = received_after - received_before
+    if refused_before is not None and refused_after is not None:
+        delta = {}
+        for reason in set(refused_before) | set(refused_after):
+            moved = refused_after.get(reason, 0.0) - refused_before.get(reason, 0.0)
+            if moved:
+                delta[reason] = moved
+        obs["refused_delta"] = delta
     obs.setdefault("creator", {"id": args.creator})
     obs.setdefault("channels", [])
     return obs

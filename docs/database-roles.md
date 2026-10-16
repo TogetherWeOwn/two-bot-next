@@ -16,6 +16,11 @@ holds no membership path into the migrator group.
 | `two_web_reader` | CONNECT; no CREATE/TEMP | No access | No access | No access | USAGE; SELECT on nine reviewed views |
 | `two_bot_migrator_ro` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | SELECT on bot tables, admission lanes and SQLx ledger; no DML | No access | USAGE; no view or function access |
 
+The owner-grant journal (`voice_owner_grants`) is an ordinary `table`-kind
+entry under this policy: the runtime group holds SELECT, INSERT, UPDATE and
+DELETE on it, the migrator owns it, the read-only migrator group holds SELECT
+only, and the web reader has no access.
+
 No runtime, reader or read-only migrator grants carry grant options. Runtime cannot create schemas,
 tables, temporary tables or functions, alter tables, truncate them, or read the
 SQLx migration ledger. The `two_bot_migrator_ro` group exists for the
@@ -217,9 +222,9 @@ their login status or silently removing memberships. It contains no passwords.
    reads 0 findings. For later migrations, the order is fixed: (a) dispatch the
    matching migration workflow plan (`staging-migrate.yml` with
    `--target staging` for staging, `production-migrate.yml` with
-   `--target production` for PlanetScale main `two_bot`; production takes no
-   branch pin yet, so a production dispatch aimed at a PlanetScale host
-   refuses closed until the production branch-pin follow-up lands) and review
+   `--target production` for PlanetScale main `two_bot`, passing
+   `production_branch_id` (required for `*.psdb.cloud` hosts; it must match
+   the binding username's `{role}.{branch_id}` suffix)) and review
    the pending set; (b) dispatch apply through the reviewed environment so the dedicated
    migrator login creates objects with `SET ROLE two_bot_migrator` from the
    start: creator-specific default ACLs belong to the group, not automatically

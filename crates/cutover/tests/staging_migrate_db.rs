@@ -718,6 +718,30 @@ async fn real_sqlx_runner_cases() -> TestResult {
     assert!(audit["verify_findings"].is_array());
     assert_eq!(audit["matrix_sha256"].as_str().map(str::len), Some(64));
     assert_eq!(audit["verify_sha256"].as_str().map(str::len), Some(64));
+    // The plan manifest carries connection usage for the 80% warning: the
+    // login ceiling is max minus reserved, and the ratio is against it.
+    let usage = &audit["connection_usage"];
+    let used = usage["used"].as_i64().expect("connection used");
+    let max = usage["max_connections"].as_i64().expect("max connections");
+    let reserved = usage["reserved_connections"]
+        .as_i64()
+        .expect("reserved connections");
+    let effective = usage["effective_max_connections"]
+        .as_i64()
+        .expect("effective ceiling");
+    assert!(used >= 0, "connection usage must be present");
+    assert!(max > 0, "max_connections must be positive");
+    assert_eq!(
+        effective,
+        max - reserved,
+        "login ceiling is max minus reserved"
+    );
+    let pct = usage["pct_full"].as_f64().expect("pct_full");
+    let expected_pct = used as f64 / effective.max(1) as f64 * 100.0;
+    assert!(
+        (pct - expected_pct).abs() < 1e-9,
+        "pct_full is against the login ceiling"
+    );
     // Pending spans both sides of the ledger max: versions below 390 were
     // never applied, yet SQLx must still pick them up.
     assert!(expected.contains(&201), "below-max gap must be pending");
@@ -1120,4 +1144,46 @@ async fn post_apply_unreadable_ledger_is_unknown_not_empty() -> TestResult {
     let total = two_bot_cutover::staging_migrate::MIGRATOR.iter().count();
     assert_eq!(run.present.len(), total, "every pending migration applied");
     Ok(())
+}
+
+/// The connection count must be visible to the unprivileged plan login:
+/// `backend_type` is NULL for other roles' sessions without
+/// `pg_read_all_stats`, so a filtered `pg_stat_activity` count sees only the
+/// reader's own session. Open sessions as another role and read through the
+/// plan-style RO login; the count must include them.
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI service"]
+async fn connection_count_sees_other_roles_from_plan_login() -> TestResult {
+    use two_bot_cutover::staging_migrate::CONNECTION_COUNT_SQL;
+
+    let fx = Fixture::new().await?;
+    let result = async {
+        let outsider_options = PgConnectOptions::new_without_pgpass()
+            .host(&fx.host)
+            .port(5432)
+            .username(&fx.outsider)
+            .password("")
+            .database(&fx.database)
+            .ssl_mode(PgSslMode::Disable);
+        let mut others = Vec::new();
+        for _ in 0..3 {
+            others.push(PgConnection::connect_with(&outsider_options).await?);
+        }
+        let mut reader = fx.ro_session().await?;
+        let used: i64 = sqlx::query_scalar(CONNECTION_COUNT_SQL)
+            .fetch_one(&mut reader)
+            .await?;
+        assert!(
+            used >= 3,
+            "plan login must see the 3 other-role sessions, counted {used}"
+        );
+        for conn in others {
+            conn.close().await?;
+        }
+        reader.close().await?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    fx.finish().await?;
+    result
 }

@@ -29,6 +29,10 @@ on:
       production_database:
         description: Pinned production database name, non-secret (binding must match)
         required: true
+      production_branch_id:
+        description: Pinned PlanetScale branch id, non-secret (required for *.psdb.cloud hosts; must match the binding username role.branch_id suffix; empty for other hosts)
+        required: false
+        default: ''
       recovery_evidence_ref:
         description: Reference to approved recovery evidence (card/document, no URL secrets)
         required: true
@@ -96,6 +100,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           PRODUCTION_HOST: ${{ inputs.production_host }}
           PRODUCTION_DATABASE: ${{ inputs.production_database }}
+          PRODUCTION_BRANCH_ID: ${{ inputs.production_branch_id }}
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
           EXPECTED_PENDING: ${{ inputs.expected_pending }}
@@ -109,6 +114,7 @@ jobs:
           set -o pipefail
           ./target/debug/staging-migrate --target production --plan --source-sha "$SOURCE_SHA" \
             --production-host "$PRODUCTION_HOST" --production-database "$PRODUCTION_DATABASE" \
+            --production-branch-id "$PRODUCTION_BRANCH_ID" \
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
             --expected-pending "$EXPECTED_PENDING" \
             | tee production-migrate-manifest.json
@@ -156,6 +162,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           PRODUCTION_HOST: ${{ inputs.production_host }}
           PRODUCTION_DATABASE: ${{ inputs.production_database }}
+          PRODUCTION_BRANCH_ID: ${{ inputs.production_branch_id }}
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
           EXPECTED_PENDING: ${{ inputs.expected_pending }}
@@ -235,6 +242,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           PRODUCTION_HOST: ${{ inputs.production_host }}
           PRODUCTION_DATABASE: ${{ inputs.production_database }}
+          PRODUCTION_BRANCH_ID: ${{ inputs.production_branch_id }}
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
           EXPECTED_PENDING: ${{ inputs.expected_pending }}
@@ -250,6 +258,7 @@ jobs:
           set -o pipefail
           ./target/debug/staging-migrate --target production --apply --source-sha "$SOURCE_SHA" \
             --production-host "$PRODUCTION_HOST" --production-database "$PRODUCTION_DATABASE" \
+            --production-branch-id "$PRODUCTION_BRANCH_ID" \
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
             --expected-pending "$EXPECTED_PENDING" \
             --plan-manifest-sha256 "$PLAN_MANIFEST_SHA256" --plan-run-id "$PLAN_RUN_ID" \

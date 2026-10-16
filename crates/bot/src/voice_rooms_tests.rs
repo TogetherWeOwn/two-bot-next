@@ -3,6 +3,8 @@ use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
+#[path = "voice_cold_authority_tests.rs"]
+mod cold_authority;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_join_requests_tests.rs"]
@@ -179,6 +181,16 @@ struct Store {
     /// that pin ordering against the Discord and persist calls.
     trace_claims: bool,
     creators_error: Option<StoreError>,
+    /// Single-row creator reads: the join-path read-through must skip known
+    /// creators, rooms, halted workers and already-missed channels.
+    creator_for_reads: Arc<AtomicU64>,
+    /// Scripted single-row creator read failure: while set, every
+    /// `creator_for` read fails, so tests can prove the join path backs off
+    /// instead of paying a read per join.
+    creator_for_error: Option<StoreError>,
+    /// Hanging single-row reads sleep this long before the row lookup, so a
+    /// test can prove the join path bounds a slow pool at the timeout.
+    creator_for_delay: Option<Duration>,
     custom_names: Mutex<HashMap<u64, String>>,
     save_custom_name_errors: Mutex<VecDeque<StoreError>>,
     /// V4 audit rows appended so far, in append order.
@@ -230,6 +242,9 @@ impl Store {
             bind_errors: Mutex::new(VecDeque::new()),
             trace_claims: false,
             creators_error: None,
+            creator_for_reads: Arc::new(AtomicU64::new(0)),
+            creator_for_error: None,
+            creator_for_delay: None,
             custom_names: Mutex::new(HashMap::new()),
             save_custom_name_errors: Mutex::new(VecDeque::new()),
             kick_audit: Mutex::new(Vec::new()),
@@ -307,6 +322,13 @@ impl RoomPersistence for Store {
         _: u64,
         channel: u64,
     ) -> Result<Option<CreatorChannel>, StoreError> {
+        self.creator_for_reads.fetch_add(1, Ordering::Relaxed);
+        if let Some(error) = self.creator_for_error {
+            return Err(error);
+        }
+        if let Some(delay) = self.creator_for_delay {
+            tokio::time::sleep(delay).await;
+        }
         Ok(self
             .creators
             .lock()
@@ -1315,11 +1337,16 @@ impl std::io::Write for JoinLogWriter {
 fn capture_join_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
     // Share the reconcile tests' global subscriber to keep callsite interest
     // stable; the local JSON writer captures only this runtime's events.
+    // Admit DEBUG: benign duplicate refusals log at debug, and the default
+    // fmt max is INFO, so without this the duplicate refusal line is dropped.
+    // No other capture user filters on a field a debug line sets, so their
+    // exact counts are unaffected.
     let _global = tracing_capture::global();
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let output = Arc::clone(&bytes);
     let subscriber = tracing_subscriber::fmt()
         .json()
+        .with_max_level(tracing::Level::DEBUG)
         .with_writer(move || JoinLogWriter(Arc::clone(&output)))
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
@@ -1453,6 +1480,115 @@ async fn duplicate_voice_frames_and_duplicate_tickets_do_not_create_twice() {
         worker.http.created_attributes.lock().unwrap()[0].user_limit,
         8
     );
+}
+
+#[tokio::test]
+async fn refused_creator_joins_log_channel_and_creator_map_state() {
+    // Stall triage needs the refusing channel and the creator-map state on
+    // every refusal line: the channel id, the ticket's map generation versus
+    // the live one, whether the channel is a known creator, and the map size.
+    let (bytes, _subscriber) = capture_join_logs();
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = join(&mut worker, MEMBER);
+    // Same ticket twice: the repeat is refused as a benign duplicate while
+    // the channel stays a known creator.
+    assert!(!worker.accept_join(ticket, "duplicate", 8, NOW.to_owned()));
+    // A join into a channel the creator map never held.
+    let unknown = JoinTicket {
+        creator_id: 999,
+        ..ticket
+    };
+    assert!(!worker.accept_join(unknown, "new room", 9, NOW.to_owned()));
+    // A stale ticket on a gateway that has not re-readied: flip ready on the
+    // same worker and re-offer the queued ticket. The stale_ticket check runs
+    // before the duplicate check, so the reason is stale_ticket with
+    // ready=false, proving the field varies instead of being a constant.
+    worker.live.write_state().ready = false;
+    assert!(!worker.accept_join(ticket, "new room", 10, NOW.to_owned()));
+    // A halted worker refuses joins until restart: seed a credential refusal
+    // so the first dispatch halts it, then join again and check the halted
+    // line carries the same channel and map-state fields.
+    let (live, store, http, _) = fixture();
+    store
+        .claim_script
+        .lock()
+        .unwrap()
+        .push_back(Err(StoreError::CredentialRefused));
+    let mut halted_worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut halted_worker, MEMBER);
+    dispatch(&mut halted_worker, 0).await;
+    assert!(halted_worker.halted());
+    let halted_ticket = halted_worker
+        .live
+        .voice_update(MEMBER + 1, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(!halted_worker.accept_join(halted_ticket, "new room", 10, NOW.to_owned()));
+    // A name the automod filter blocks: refused as name_blocked with the
+    // same channel and map-state fields.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http)
+        .await
+        .unwrap()
+        .with_name_policy(Arc::new(fixture_policy(&["room"])));
+    assert!(!join_as(&mut worker, MEMBER, "Ava"));
+    let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    let refusals: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["message"] == "voice creator join refused before queueing")
+        .collect();
+    assert_eq!(refusals.len(), 5, "{text}");
+    let fields = &refusals[0]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "duplicate");
+    assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["ticket_generation"], ticket.generation);
+    assert_eq!(fields["live_generation"], ticket.generation);
+    assert_eq!(fields["known"], true);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], false);
+    assert_eq!(fields["ready"], true);
+    let fields = &refusals[1]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "unknown_creator");
+    assert_eq!(fields["channel"], "999");
+    assert_eq!(fields["ticket_generation"], ticket.generation);
+    assert_eq!(fields["live_generation"], ticket.generation);
+    assert_eq!(fields["known"], false);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], false);
+    assert_eq!(fields["ready"], true);
+    let fields = &refusals[2]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "stale_ticket");
+    assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["ticket_generation"], ticket.generation);
+    assert_eq!(fields["live_generation"], ticket.generation);
+    assert_eq!(fields["known"], true);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], false);
+    assert_eq!(fields["ready"], false);
+    let fields = &refusals[3]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "halted");
+    assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["ticket_generation"], halted_ticket.generation);
+    assert_eq!(fields["live_generation"], halted_ticket.generation);
+    assert_eq!(fields["known"], true);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], true);
+    assert_eq!(fields["ready"], true);
+    let fields = &refusals[4]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "name_blocked");
+    assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["ticket_generation"], ticket.generation);
+    assert_eq!(fields["live_generation"], ticket.generation);
+    assert_eq!(fields["known"], true);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], false);
+    assert_eq!(fields["ready"], true);
 }
 
 #[tokio::test]
@@ -6074,7 +6210,15 @@ fn parse_logging_subcommands() {
 #[tokio::test]
 async fn logging_command_needs_an_admin() {
     let runtime = logging_runtime(Arc::default(), None, None);
-    let member = logging_interaction(sub_option("show", vec![]), false);
+    // Ready guild-role facts, not cold ones: command_snapshot's @everyone
+    // carries no permissions and the member holds no roles, so authority
+    // resolves to a known non-admin and the denial is permanent.
+    // (logging_snapshot's @everyone carries MANAGE_CHANNELS, and a held
+    // role missing from the snapshot is the cold warming-up case covered
+    // by the cold-authority tests.)
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    let mut member = logging_interaction(sub_option("show", vec![]), false);
+    member.member.as_mut().unwrap().roles.clear();
     let (owned, response) = handle_capture(&runtime, &member).await;
     assert!(owned);
     assert_eq!(
@@ -6200,10 +6344,19 @@ async fn logging_mention_refuses_unsafe_roles_without_saving() {
         let response = response.expect("refusal");
         let text = response_text(&response);
         if case == "missing-held" {
-            // The actor's own role is missing from cache, so the guild admin
-            // gate denies before target validation runs. Either layer refuses
-            // without saving.
-            assert_eq!(text, "You need Manage Channels to use /logging.", "{case}");
+            // The actor's own role is missing from cache, so guild-role
+            // facts are incomplete: a cold authority state. The reply is
+            // the retryable warming-up text, not a permanent denial, and
+            // nothing is saved.
+            let lower = text.to_ascii_lowercase();
+            assert!(
+                lower.contains("warm") && (lower.contains("try again") || lower.contains("retry")),
+                "{case}: expected warming-up + retry reply, got: {text}"
+            );
+            assert!(
+                !text.contains("You need Manage Channels to use /logging."),
+                "{case}: cold reply must not be a permanent denial, got: {text}"
+            );
         } else {
             assert!(text.contains("Nothing was changed"), "{case}: {text}");
         }
@@ -6307,10 +6460,19 @@ async fn logging_channel_refuses_non_text_unknown_and_hidden_targets() {
         .await;
         let text = response_text(&response.unwrap());
         if case == "missing-held" {
-            // The actor's own role is missing from cache, so the guild admin
-            // gate denies before target validation runs. Either layer refuses
-            // without saving.
-            assert_eq!(text, "You need Manage Channels to use /logging.", "{case}");
+            // The actor's own role is missing from cache, so guild-role
+            // facts are incomplete: a cold authority state. The reply is
+            // the retryable warming-up text, not a permanent denial, and
+            // nothing is saved.
+            let lower = text.to_ascii_lowercase();
+            assert!(
+                lower.contains("warm") && (lower.contains("try again") || lower.contains("retry")),
+                "{case}: expected warming-up + retry reply, got: {text}"
+            );
+            assert!(
+                !text.contains("You need Manage Channels to use /logging."),
+                "{case}: cold reply must not be a permanent denial, got: {text}"
+            );
         } else {
             assert!(text.contains("Nothing was changed"), "{case}: {text}");
         }
@@ -7843,7 +8005,16 @@ async fn responder_without_guild_roles_refuses_channel_permission_claims_without
     assert_eq!(*trace.lock().unwrap(), ["defer", "complete"]);
     let completed = replies.completed.lock().unwrap();
     assert_eq!(completed.len(), 1);
-    assert!(response_text(&completed[0]).contains("You need Manage Channels"));
+    let text = response_text(&completed[0]);
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        lower.contains("warm") && (lower.contains("try again") || lower.contains("retry")),
+        "cold denial must say warming up and ask to retry, got: {text:?}"
+    );
+    assert!(
+        !text.contains("You need Manage Channels"),
+        "cold denial must not report a permanent denial, got: {text:?}"
+    );
 }
 
 #[tokio::test]
@@ -12992,6 +13163,455 @@ async fn silent_join_refusals_carry_stable_reason_labels() {
     assert!(
         refused_with_reason("name_blocked") > blocked_before,
         "blocked names refuse with the name_blocked label"
+    );
+}
+
+#[tokio::test]
+async fn stale_creator_view_revalidates_from_the_store_before_refusing() {
+    // The runtime creator view went stale while the voice_creators row
+    // existed, so joins refused as unknown_creator until restart. A stale
+    // view must re-read the store row for the joined channel instead of
+    // refusing it.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Stale view only: the store row stays, the worker map loses it.
+    worker.creators.clear();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .expect("ticket for a joined channel");
+    assert!(
+        !worker.creators.contains_key(&CREATOR),
+        "stale view under test"
+    );
+    assert!(
+        worker.revalidate_creator(CREATOR).await,
+        "a voice_creators row must revalidate the stale view"
+    );
+    assert!(worker.creators.contains_key(&CREATOR));
+    assert!(
+        worker.accept_join_received(
+            ticket,
+            "new room",
+            7,
+            NOW.to_owned(),
+            tokio::time::Instant::now()
+        ),
+        "the revalidated join is accepted, not refused as unknown_creator"
+    );
+}
+
+#[tokio::test]
+async fn revalidate_ignores_channels_with_no_creator_row() {
+    // A join to a channel the store never heard of still refuses: the
+    // revalidation only admits channels that are voice_creators rows.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    const STRANGER: u64 = 999;
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert!(!worker.creators.contains_key(&STRANGER));
+}
+
+#[tokio::test]
+async fn creator_template_edit_reaches_existing_rooms_through_the_refresh() {
+    // reload_creators runs just before reload_name_settings on the same
+    // maintenance tick. When it swaps a changed row it must clear the name
+    // caches like CreatorAdded does: NameSignature carries no template, so
+    // once the edited row is stored, reload_name_settings sees an unchanged
+    // map and skips its own clear, and the edit never re-renders.
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "old".to_owned();
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.reload_name_settings(0).await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(worker.desired_names[&700], "old");
+    worker.store.creators.lock().unwrap()[0].name_template = "new".to_owned();
+    worker.reload_creators(300_000).await;
+    worker.reload_name_settings(300_000).await;
+    worker.refresh_template_names(300_000);
+    assert_eq!(
+        worker.desired_names[&700], "new",
+        "a template-only row edit merged by reload_creators must re-render existing rooms"
+    );
+}
+
+#[tokio::test]
+async fn revalidate_skips_the_store_read_while_halted() {
+    // A halted worker refuses every join as `halted` anyway; the read-through
+    // must not spend store reads (or bypass the halt re-probe pacing) first.
+    let (live, store, http, _) = fixture();
+    let reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.halted = true;
+    const STRANGER: u64 = 555;
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "halted joins must not cost a store read"
+    );
+}
+
+#[tokio::test]
+async fn revalidate_remembers_channels_with_no_creator_row() {
+    // Joins into ordinary voice channels (permanent, AFK, lobby) arrive as
+    // Join commands too. Without a miss cache each one costs a store read;
+    // the merge clears misses, so a later creator row still converges.
+    let (live, store, http, _) = fixture();
+    let reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    const STRANGER: u64 = 999;
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        1,
+        "repeat joins to a non-creator channel must reuse the miss cache"
+    );
+}
+
+#[tokio::test]
+async fn revalidate_backs_off_while_the_store_is_degraded() {
+    // One failed read must not cost a read per later join: while the store
+    // is degraded every join skips the read, and the next successful merge
+    // clears the backoff so joins read again.
+    let (live, store, http, _) = fixture();
+    let reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.store.creator_for_error = Some(StoreError::Unavailable);
+    const FIRST: u64 = 901;
+    const SECOND: u64 = 902;
+    assert!(!worker.revalidate_creator(FIRST).await);
+    assert!(!worker.revalidate_creator(SECOND).await);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        1,
+        "joins into other channels must skip the read while the store is degraded"
+    );
+    // Recovery: the store is healthy again and a merge ran, so the next
+    // join into an unseen channel reads once more.
+    worker.store.creator_for_error = None;
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, FIRST));
+    worker.creators_refresh_due = true;
+    worker.reload_creators(0).await;
+    assert!(worker.creators.contains_key(&FIRST));
+    assert!(!worker.revalidate_creator(SECOND).await);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        2,
+        "a successful merge must clear the backoff"
+    );
+}
+
+#[tokio::test]
+async fn revalidate_bounds_a_hanging_store_read() {
+    // A saturated pool must not hold the join inbox: the read resolves at
+    // the timeout, and the repeat join pays no second read.
+    let (live, store, http, _) = fixture();
+    let reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.store.creator_for_delay = Some(Duration::from_secs(30));
+    const STRANGER: u64 = 903;
+    const OTHER: u64 = 904;
+    let started = tokio::time::Instant::now();
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a hanging read must resolve at the 1 s bound, took {:?}",
+        started.elapsed()
+    );
+    assert!(!worker.revalidate_creator(OTHER).await);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        1,
+        "a timed-out read must back further joins off"
+    );
+}
+
+#[tokio::test]
+async fn actor_join_revalidates_a_stale_creator_view() {
+    // The inbox read-through is the production path: a Join sent through the
+    // actor loop must merge a store row the in-memory view lost.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.creators.clear();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .expect("ticket for a joined channel");
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            ActorLimits::default(),
+        )
+        .await;
+        worker
+    });
+    tx.send(ActorCommand::Join {
+        ticket,
+        display: "new room".to_owned(),
+        seed: 7,
+        created_at: NOW.to_owned(),
+        received: tokio::time::Instant::now(),
+    })
+    .unwrap();
+    // The Status round-trip proves the Join was handled: the inbox is FIFO.
+    let (reply, reply_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(reply)).unwrap();
+    reply_rx.await.unwrap();
+    drop(tx);
+    let worker = handle.await.unwrap();
+    assert!(
+        worker.creators.contains_key(&CREATOR),
+        "a Join through the actor must revalidate a stale creator view"
+    );
+}
+
+#[tokio::test]
+async fn refresh_creators_command_flags_a_debounced_merge() {
+    // Channel create/update/delete frames must reach the worker as a merge
+    // flag: without this arm the gateway wiring is dead.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert!(!worker.creators_refresh_due);
+    apply_command(&mut worker, ActorCommand::RefreshCreators, 0);
+    assert!(worker.creators_refresh_due);
+}
+
+#[tokio::test(start_paused = true)]
+async fn maintenance_tick_runs_the_creator_refresh() {
+    // The maintenance branch must call reload_creators: it stamps the read
+    // clock and clears the miss cache, which reload_name_settings never does.
+    let (live, store, http, _) = fixture();
+    let reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    const STRANGER: u64 = 999;
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    assert!(worker.creators_read_ms.is_none());
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            ActorLimits::default(),
+        )
+        .await;
+        worker
+    });
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+    }
+    let (reply, reply_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(reply)).unwrap();
+    reply_rx.await.unwrap();
+    drop(tx);
+    let mut worker = handle.await.unwrap();
+    assert!(
+        worker.creators_read_ms.is_some(),
+        "the maintenance tick must run reload_creators"
+    );
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        2,
+        "the merge must clear the miss cache"
+    );
+}
+
+#[tokio::test]
+async fn reload_creators_debounces_channel_event_refreshes() {
+    // A bulk reorder's CHANNEL_UPDATE echo storm flags one re-read, not one
+    // per frame: refreshes inside the debounce window are skipped.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 201));
+    worker.creators_refresh_due = true;
+    worker.reload_creators(5_000).await;
+    assert!(
+        !worker.creators.contains_key(&201),
+        "a flagged refresh inside the debounce window must wait"
+    );
+    worker.creators_refresh_due = true;
+    worker.reload_creators(10_000).await;
+    assert!(worker.creators.contains_key(&201));
+}
+
+#[tokio::test]
+async fn reload_creators_converges_rows_on_the_five_minute_interval() {
+    // With no channel events flagging a merge, the interval still converges
+    // rows written outside the worker.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.store.creators.lock().unwrap()[0].name_template = "old".to_owned();
+    worker.reload_creators(0).await;
+    assert_eq!(worker.creators[&CREATOR].name_template, "old");
+    worker.store.creators.lock().unwrap()[0].name_template = "new".to_owned();
+    worker.reload_creators(299_999).await;
+    assert_eq!(
+        worker.creators[&CREATOR].name_template, "old",
+        "the interval must gate the periodic merge"
+    );
+    worker.reload_creators(300_000).await;
+    assert_eq!(worker.creators[&CREATOR].name_template, "new");
+}
+
+#[tokio::test]
+async fn reload_creators_keeps_the_view_on_a_failed_read() {
+    // A transient store error is not a deletion: the old map stays so joins
+    // keep flowing until the next refresh.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.creators.clear();
+    worker.store.creators_error = Some(StoreError::Unavailable);
+    worker.reload_creators(300_000).await;
+    assert!(
+        !worker.creators.contains_key(&CREATOR),
+        "a failed read must not invent rows"
+    );
+    worker.store.creators_error = None;
+    worker.reload_creators(600_000).await;
+    assert!(worker.creators.contains_key(&CREATOR));
+}
+
+#[tokio::test]
+async fn reload_creators_converges_after_a_gateway_reconnect() {
+    // A gateway reconnect (GuildCreate/Resumed) bumps the live generation but
+    // sends no channel event, so no RefreshCreators flag is set and the
+    // five-minute interval has not elapsed. A generation change must trigger
+    // a debounced merge so rows written while down converge within about
+    // 10 s instead of waiting up to 5 minutes.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    assert!(worker.creators.contains_key(&CREATOR));
+    // A creator row written outside the worker while the gateway was down.
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 201));
+    // The reconnect republishes the snapshot (new generation, new channel).
+    assert!(worker.live.publish(snapshot(&[201], vec![])));
+    // Debounced (10 s since the last read) but no flag and no interval: the
+    // reconnect alone must converge the new row.
+    worker.reload_creators(10_000).await;
+    assert!(
+        worker.creators.contains_key(&201),
+        "a gateway reconnect must merge rows written while down"
+    );
+}
+
+#[tokio::test]
+async fn reload_creators_debounces_a_generation_merge_after_a_reconnect() {
+    // A generation change inside the debounce window must not read the
+    // store: without the debounce a reconnect during a store outage would
+    // re-read about 4 times a second per guild on the 250 ms tick.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 201));
+    // The reconnect republishes the snapshot (new generation, new channel).
+    assert!(worker.live.publish(snapshot(&[201], vec![])));
+    worker.reload_creators(5_000).await;
+    assert!(
+        !worker.creators.contains_key(&201),
+        "a generation change inside the debounce window must wait"
+    );
+    worker.reload_creators(10_000).await;
+    assert!(
+        worker.creators.contains_key(&201),
+        "the debounced tick must merge the row after a reconnect"
+    );
+}
+
+#[tokio::test]
+async fn reload_creators_retries_a_failed_generation_merge_on_the_next_tick() {
+    // A reconnect whose first merge read fails must leave the stored
+    // generation alone: stamping it before the read would park the retry on
+    // the five-minute interval, exactly the outage case the trigger targets.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 201));
+    // The reconnect republishes the snapshot (new generation, new channel).
+    assert!(worker.live.publish(snapshot(&[201], vec![])));
+    let generation_before = worker.creators_generation;
+    worker.store.creators_error = Some(StoreError::Unavailable);
+    worker.reload_creators(10_000).await;
+    assert!(
+        !worker.creators.contains_key(&201),
+        "a failed generation merge must not invent rows"
+    );
+    assert_eq!(
+        worker.creators_generation, generation_before,
+        "a failed read must leave the generation alone so the next tick retries"
+    );
+    worker.store.creators_error = None;
+    worker.reload_creators(20_000).await;
+    assert!(
+        worker.creators.contains_key(&201),
+        "the next debounced tick must retry the generation merge"
+    );
+}
+
+#[tokio::test]
+async fn reload_creators_settles_generation_after_a_successful_merge() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 201));
+    assert!(worker.live.publish(snapshot(&[201], vec![])));
+    worker.reload_creators(10_000).await;
+    assert!(worker.creators.contains_key(&201));
+
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 202));
+    worker.reload_creators(20_000).await;
+    assert!(
+        !worker.creators.contains_key(&202),
+        "a successful generation merge must settle the generation until the next interval"
     );
 }
 

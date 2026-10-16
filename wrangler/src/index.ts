@@ -72,9 +72,11 @@ import {
 } from "./internal-actions.ts";
 import {
   EVENTSUB_PATH,
+  EVENTSUB_RECEIVER_BIND,
   EVENTSUB_RECEIVER_PORT,
   allowlistedHeaders as eventsubAllowlistedHeaders,
   eventsubIngressEnabled,
+  eventsubReceiverEnabled,
   handleEventsubIngress,
   isEventsubRequest,
   readBody as readEventsubBody,
@@ -179,6 +181,8 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   EVENTSUB_INGRESS?: string;
   /** Operator-set Worker secret enabling the EventSub forward. Never flag-forwarded. */
   TWO_EVENTSUB?: string;
+  /** Operator-set Worker secret carrying the Twitch signing secret. Never flag-forwarded. */
+  TWO_TWITCH_WEBHOOK_SECRET?: string;
   /** Operator-set Worker secrets for the private receiver. Never flag-forwarded. */
   TWO_INTERNAL_ACTIONS?: string;
   TWO_INTERNAL_CALLERS?: string;
@@ -522,6 +526,16 @@ function containerPort(raw: string | undefined): number {
 // the non-secret DISCORD_* IDs ride FORWARDED_DISCORD_IDS there (TOG-19025).
 const APPLICATION_ID_KEY = "DISCORD_APPLICATION_ID" as const;
 
+/**
+ * The private EventSub receiver boots all-or-nothing: the Worker forwards the
+ * enable flag only with the signing secret present. Without the secret nothing
+ * is forwarded, so a half-provisioned enable stays dark instead of
+ * crash-looping the shared container on a fatal missing-secret startup.
+ */
+function eventsubReceiverForwarded(env: Env): boolean {
+  return eventsubReceiverEnabled(env) && !!env.TWO_TWITCH_WEBHOOK_SECRET;
+}
+
 /** Readonly view of the secrets/vars the DO forwards into the container. */
 function containerEnvVars(env: Env, port: number): Record<string, string> {
   const vars: Record<string, string> = {
@@ -565,6 +579,20 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     if (env.TWO_INTERNAL_CHANNEL_KEYS) vars["TWO_INTERNAL_CHANNEL_KEYS"] = env.TWO_INTERNAL_CHANNEL_KEYS;
     if (env.TWO_INTERNAL_KEYS) vars["TWO_INTERNAL_KEYS"] = env.TWO_INTERNAL_KEYS;
   }
+  // Private EventSub receiver. Dark unless the Operator sets TWO_EVENTSUB to
+  // exactly "1" with the signing secret present; any other state forwards
+  // nothing, so a typo or a missing secret cannot crash-loop the gateway
+  // (the receiver boots all-or-nothing). The bind and the container marker
+  // are the Worker's constants, never Operator-set values. The signing secret
+  // travels on its own explicit line and is never logged.
+  if (eventsubReceiverForwarded(env)) {
+    if (port === EVENTSUB_RECEIVER_PORT) throw new Error("BOT_PORT must differ from the EventSub receiver port");
+    if (port === RECEIVER_PORT) throw new Error("BOT_PORT must differ from the internal-actions receiver port");
+    vars["TWO_EVENTSUB"] = "1";
+    vars["TWO_EVENTSUB_BIND"] = EVENTSUB_RECEIVER_BIND;
+    vars[CONTAINER_MARKER] = CONTAINER_MARKER_VALUE;
+    vars["TWO_TWITCH_WEBHOOK_SECRET"] = env.TWO_TWITCH_WEBHOOK_SECRET as string;
+  }
   return vars;
 }
 
@@ -586,10 +614,13 @@ export class TwoBotContainer extends Container<Env> {
 
   constructor(ctx: DurableObjectState<{}>, env: Env) {
     super(ctx, env);
-    // The receiver port joins startup port checks only while the receiver is
+    // Each receiver port joins startup port checks only while its receiver is
     // enabled. Dark never touches the property, so the SDK resolves exactly
     // the ports it does on base main (`requiredPorts` stays undefined).
-    if (receiverEnabled(env)) this.requiredPorts = [this.defaultPort, RECEIVER_PORT];
+    const wanted = [this.defaultPort];
+    if (receiverEnabled(env)) wanted.push(RECEIVER_PORT);
+    if (eventsubReceiverForwarded(env)) wanted.push(EVENTSUB_RECEIVER_PORT);
+    if (wanted.length > 1) this.requiredPorts = [...new Set(wanted)];
     // A deployment can reattach to a running old process. Reconcile before
     // ingress or alarms are delivered, not just before the next cold start.
     this.initialization = ctx.blockConcurrencyWhile(async () => {
@@ -851,9 +882,10 @@ export class TwoBotContainer extends Container<Env> {
    * Staging-only EventSub ingress behind the ownership fence. Re-checks the
    * Worker's gate, then forwards the exact bytes to the EventSub receiver
    * port. Public ingress never starts the Container: probes and keepalive own
-   * that, so an unauthenticated flood cannot cause a cold start. Until the
-   * receiver slice lands nothing listens on that port and every forward fails
-   * closed to the 503 envelope below.
+   * that, so an unauthenticated flood cannot cause a cold start. The private
+   * receiver binds 8092 while TWO_EVENTSUB is "1" with the signing secret
+   * present; when dark or cold the forward fails closed to the 503 envelope
+   * below.
    */
   private async internalEventsub(request: Request): Promise<Response> {
     if (!eventsubIngressEnabled(this.env) || !isEventsubRequest(request)) return notFound();
@@ -1022,12 +1054,16 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   override async startAndWaitForPorts(...args: Parameters<Container<Env>["startAndWaitForPorts"]>): Promise<void> {
-    // containerFetch always names one port. While the receiver is enabled its
+    // containerFetch always names one port. While a receiver is enabled its
     // port is checked with it; the explicit port stays first for the SDK.
     const [ports, ...rest] = args;
-    const checked = typeof ports === "number" && receiverEnabled(this.env)
-      ? [...new Set([ports, this.defaultPort ?? ports, RECEIVER_PORT])]
-      : ports;
+    let checked = ports;
+    if (typeof ports === "number" && (receiverEnabled(this.env) || eventsubReceiverForwarded(this.env))) {
+      const extra = [ports, this.defaultPort ?? ports];
+      if (receiverEnabled(this.env)) extra.push(RECEIVER_PORT);
+      if (eventsubReceiverForwarded(this.env)) extra.push(EVENTSUB_RECEIVER_PORT);
+      checked = [...new Set(extra)];
+    }
     return this.owned(() => super.startAndWaitForPorts(checked, ...rest));
   }
 

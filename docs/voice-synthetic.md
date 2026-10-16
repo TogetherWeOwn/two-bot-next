@@ -19,7 +19,18 @@ creator) and asserts:
 | status | a voice-channel status line is set on the room |
 | rejoin | the test bot hops from that room straight back into the creator, and a second new room appears and it is moved into that room (a member must never stay in the lobby) |
 | delete | after the test bot leaves, every room it was moved into (the first room and the rejoin room) is deleted within the empty grace |
+| rename | the creator is renamed before the join and restored after; the post-rename join must still move the test bot into a new room (SKIP while the test bot may not rename — see below) |
+| limit | the room's `user_limit` PATCHes to a probed value and back, each write verified by read-back (FAIL on 403, SKIP on 429) |
+| privacy | the room's @everyone Connect overwrite toggles and restores, each write verified by read-back (SKIP while the test bot may not edit overwrites — see below; SKIP on 429) |
+| name_panel | the room's name after the rename cycle still renders from its template, not the fallback (what the `/name` panel's Current-name line shows) |
 | metrics | optional: `two_bot_voice_names_total{outcome="created_with_template"}` grows (SKIP without a metrics token) |
+
+A failed `create` names the refusal reason: the run snapshots
+`two_bot_voice_joins_received_total` and per-reason
+`two_bot_voice_join_refused_total` before and after the join, and the create
+detail reports the deltas (for example `joins received=2,
+unknown_creator=2`), so the next restart-cured stall names its reason instead
+of just `room=None`. Without a metrics token there is no suffix.
 
 The script refuses (exit 2, no request sent) unless the guild is TWO Staging
 and the creator is the staging Create a Lobby channel.
@@ -92,6 +103,52 @@ A missing token fails the run: the voice gate is required by default, so an
 unconfigured gate never reads as green. Set `VOICE_SYNTHETIC_REQUIRED=false`
 to restore the old "not configured" notice-and-pass while the test bot is
 being provisioned.
+
+## Rename case (one-time staging role grant)
+
+The `rename` check renames the staging creator to `<name> (synthetic)`,
+joins it, and restores the original name in a `finally` block, so a renamed
+creator that stops moving joins fails the gate. Renaming needs Manage
+Channels: grant the test bot's staging role Manage Channels once (staging
+guild only; the test bot lives nowhere else). Until then the check reports
+SKIP with that detail and every other check still runs. A rename PATCH
+answered with HTTP 429 (Discord allows 2 channel renames per 10 minutes)
+also reports SKIP: the workflow retries after 30 seconds and dispatches can
+collide within 10 minutes, and neither must fail the run. A name already
+carrying ` (synthetic)` means a previous run did not restore: the rename is
+skipped and the check FAILs naming the residue, so it is restored manually
+instead of being renamed over. Restore runs whenever a rename was attempted
+and the live name differs from the original, so a rename Discord applied but
+whose response was lost is still restored.
+
+## Owner-command round-trips (limit, privacy, name panel)
+
+While the test bot owns its room it drives the same Discord fields `/limit`,
+`/unlimit`, `/private`, `/public` and `/name` manage, through the same REST
+paths the bot writes: `user_limit` PATCHes, the @everyone Connect overwrite
+PUTs, and a final read of the template-rendered room name. Each write is
+verified by a read-back and restored, so a green run leaves the room as the
+bot made it.
+
+What this proves — and what it does not: a PASS means the room the staging
+bot created is fully owner-manageable (grants, overwrites and template render
+all healthy). It does not invoke the slash commands themselves: Discord
+creates interactions only for real users, so a bot token cannot. The slash
+path (registration, gating, replies) stays covered by the Rust test suite and
+the registry smoke.
+
+Grants and SKIP conditions, mirroring the rename case:
+
+- `limit` needs the owner Manage Channels grant the room already carries. A
+  403 FAILs: the test bot owns its room, so the grant was lost or ineffective
+  after creation (the `owner` check reads creation-time grants and cannot see
+  this loss). A 429 SKIPs.
+- `privacy` needs Manage Roles to rewrite overwrites: grant the test bot's
+  staging role Manage Roles once (staging guild only). Until then the check
+  reports SKIP with that detail and every other check still runs. A 429
+  also reports SKIP.
+- `name_panel` is read-only and needs no grant: it FAILs when the
+  post-rename room name is missing or the `<display>'s room` fallback.
 
 ## Run it by hand
 

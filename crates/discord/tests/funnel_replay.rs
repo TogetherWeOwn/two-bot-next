@@ -501,6 +501,8 @@ fn invite_snapshot(uses: u64) -> Vec<InviteState> {
         uses,
         inviter_id: Some(INVITER),
         channel_id: Some(CH_TEXT),
+        max_uses: 0,
+        temporary: false,
     }]
 }
 
@@ -1628,6 +1630,8 @@ fn pipeline_invite_create_seeds_baseline() {
             uses: 1,
             inviter_id: Some(INVITER),
             channel_id: Some(CH_TEXT),
+            max_uses: 0,
+            temporary: false,
         }],
     );
     pipeline.handle(&join_event(A, false, "12:00:00"));

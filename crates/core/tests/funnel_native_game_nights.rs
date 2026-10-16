@@ -92,6 +92,8 @@ fn rotation_replaces_the_code_without_dropping_the_funnel_row() {
             uses: 5,
             inviter_id: Some(INVITER),
             channel_id: Some(CHANNEL),
+            max_uses: 0,
+            temporary: false,
         },
     );
     let rotated = tracker.rotate_code(GUILD, "old-code", "new-code");
@@ -102,6 +104,8 @@ fn rotation_replaces_the_code_without_dropping_the_funnel_row() {
             uses: 0,
             inviter_id: Some(INVITER),
             channel_id: Some(CHANNEL),
+            max_uses: 0,
+            temporary: false,
         })
     );
     assert_eq!(tracker.inviter_for(GUILD, "old-code"), None);

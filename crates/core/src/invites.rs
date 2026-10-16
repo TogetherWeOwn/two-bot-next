@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::Snowflake;
+use crate::{EventType, FunnelEvent, Snowflake};
 
 /// One invite counter reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +21,12 @@ pub struct InviteState {
     pub uses: u64,
     pub inviter_id: Option<Snowflake>,
     pub channel_id: Option<Snowflake>,
+    /// Creation-time cap (`max_uses`; 0 = unlimited). Retained from the
+    /// `InviteCreate` witness so the seed baseline pins the code's terms;
+    /// attribution itself diffs only `uses`.
+    pub max_uses: u64,
+    /// Creation-time temporariness. Retained with `max_uses`, same reason.
+    pub temporary: bool,
 }
 
 /// How much each invite code was used between two counter readings.
@@ -154,6 +160,56 @@ pub fn summarize_attribution_split(rows: &[(&str, u64)]) -> AttributionSplit {
             AttributionCategory::Unknown => out.unknown += n,
             AttributionCategory::Other => {}
         }
+    }
+    out
+}
+
+/// Per-inviter referral counts over recorded join facts (referral-rewards
+/// seam): count `MemberJoin` rows by their `metadata["inviterId"]`.
+///
+/// Only singly-credited joins carry that key (`on_join` writes it exactly
+/// when `inviter_id` is `Some`), so `vanity`/`unknown`/`ambiguous` rows and
+/// non-join rows contribute nothing. An unparseable inviter id is ignored,
+/// never attributed.
+///
+/// Raw evidence, not credit decisions: each member counts at most once
+/// (first credited join wins, mirroring `referral_rewards` `DuplicateJoin`),
+/// and self-referrals (`member_id == inviter`) are skipped (mirroring
+/// `SelfReferral`). Consumers that award credit must evaluate through
+/// `referral_rewards::evaluate_referrals`; this seam never applies tenure or
+/// engagement rules.
+#[must_use]
+pub fn referral_counts(events: &[FunnelEvent]) -> HashMap<Snowflake, u64> {
+    let mut out: HashMap<Snowflake, u64> = HashMap::new();
+    let mut seen_members: HashSet<Snowflake> = HashSet::new();
+    for event in events {
+        if event.event_type != EventType::MemberJoin {
+            continue;
+        }
+        let Some(inviter) = event
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("inviterId"))
+            .and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    s.parse::<Snowflake>().ok()
+                } else {
+                    v.as_u64()
+                }
+            })
+        else {
+            continue;
+        };
+        let Some(member) = event.member_id else {
+            continue;
+        };
+        if member == inviter {
+            continue;
+        }
+        if !seen_members.insert(member) {
+            continue;
+        }
+        *out.entry(inviter).or_default() += 1;
     }
     out
 }
@@ -387,6 +443,8 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
             uses: 0,
             inviter_id: old.inviter_id,
             channel_id: old.channel_id,
+            max_uses: old.max_uses,
+            temporary: old.temporary,
         };
         self.store
             .store_all(guild_id, std::slice::from_ref(&rotated));
@@ -401,6 +459,9 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
     }
 
     /// Attribution string for a join, given the codes that grew.
+    ///
+    /// Multi-code growth files `ambiguous:a+b` with the codes SORTED, so the
+    /// filed string never depends on the snapshot read order.
     #[must_use]
     pub fn attribute(&self, grew: &[String], guild_has_vanity: bool) -> String {
         match grew {
@@ -408,6 +469,7 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
             [first, rest @ ..] => {
                 let mut codes = vec![first.as_str()];
                 codes.extend(rest.iter().map(String::as_str));
+                codes.sort_unstable();
                 format!("ambiguous:{}", codes.join("+"))
             }
             [] => {
@@ -483,6 +545,8 @@ mod tests {
             uses,
             inviter_id: Some(7),
             channel_id: None,
+            max_uses: 0,
+            temporary: false,
         }
     }
 
@@ -668,5 +732,35 @@ mod tests {
         ];
         let c = count_downtime_unknown_joins(&w, &joins);
         assert_eq!(c[0].downtime_unknown, 1);
+    }
+
+    #[test]
+    fn referral_counts_dedupes_rejoins_and_skips_self_referrals() {
+        fn credited_join(member_id: u64, inviter_id: u64) -> FunnelEvent {
+            FunnelEvent {
+                guild_id: 1,
+                member_id: Some(member_id),
+                event_type: EventType::MemberJoin,
+                occurred_at: "2026-09-20T12:00:00.000Z".to_owned(),
+                source: "invite:a".to_owned(),
+                metadata: Some(serde_json::json!({ "inviterId": inviter_id.to_string() })),
+                dedupe_token: None,
+            }
+        }
+        // Review probe: three joins by member 5 plus a self-join by inviter 7
+        // must not read back as `{7: 4}`.
+        let events = vec![
+            credited_join(5, 7),
+            credited_join(5, 7),
+            credited_join(5, 7),
+            credited_join(7, 7),
+        ];
+        let counts = referral_counts(&events);
+        assert_eq!(
+            counts.get(&7),
+            Some(&1),
+            "first credited join wins; rejoins and self-referrals add nothing"
+        );
+        assert_eq!(counts.len(), 1);
     }
 }

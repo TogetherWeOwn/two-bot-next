@@ -1,0 +1,238 @@
+name: reusable rust nextest
+
+# Shared Rust nextest lane (SDLC 2.3 CI speed pilot). Org-level home is
+# TogetherWeOwn/.github (.github/workflows/rust-nextest.yml), called via
+# `uses:` with a pinned SHA like the test-guard precedent; this file is the
+# same content with a local path so the pilot runs before the central move.
+# Advisory only: no required check calls it, and it never reports ci-ok.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Full head SHA the caller checked out for selection
+        required: true
+        type: string
+    secrets:
+      SCCACHE_BUCKET:
+        description: R2 bucket for the sccache backend (absent keeps the GitHub-cache backend)
+        required: false
+      SCCACHE_ENDPOINT:
+        description: R2 S3-compatible endpoint (absent keeps the GitHub-cache backend)
+        required: false
+      SCCACHE_REGION:
+        description: R2 region, usually auto (absent keeps the GitHub-cache backend)
+        required: false
+      AWS_ACCESS_KEY_ID:
+        description: R2 access key id (absent keeps the GitHub-cache backend)
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        description: R2 secret access key (absent keeps the GitHub-cache backend)
+        required: false
+
+# Repo policy (scripts/ci/test_workflows.py): top-level permissions stay
+# empty; the least-privilege grant lives on the job instead.
+permissions: {}
+
+jobs:
+  nextest:
+    name: rust nextest (advisory)
+    permissions:
+      contents: read
+    # Runner routing (TOG-12339): public repo -> GitHub-hosted, private ->
+    # CI_OVERFLOW_* switch for this named job, then the self-hosted pool.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'nextest') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 45
+    # Same job-container and disposable Postgres service as the `rust-tests`
+    # lane in check.yml: the lib/bins run below needs the CI test database.
+    # A job container gets its own network namespace, so no published host
+    # port collides on the shared self-hosted Docker host.
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    # NOTE: job-container steps default to sh (no pipefail), so every run
+    # step below declares bash explicitly.
+    env:
+      CARGO_TERM_COLOR: always
+      # Disk hygiene (same pins as the check lanes): smaller binaries, no
+      # incremental artifacts.
+      CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_TEST_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_DEV_INCREMENTAL: 'false'
+      CARGO_PROFILE_TEST_INCREMENTAL: 'false'
+      TWO_CUSTOM_COMMAND_TEST_CI: "1"
+      TWO_AUTOMATION_TRANSFER_TEST_CI: "1"
+      TWO_LFG_TESTDB_CI: '1'
+      TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
+      # CI service hosts only; deployed processes default to `required`.
+      TWO_DATABASE_TLS: local-only
+      # sccache wraps every rustc call; the backend step below selects R2 or
+      # the GitHub cache before the server starts.
+      RUSTC_WRAPPER: sccache
+    services:
+      agent-testdb:
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          # Ephemeral CI service only; tests explicitly use an empty password.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --tmpfs /var/lib/postgresql:rw,size=1073741824
+          --memory 2147483648
+          --memory-swap 2147483648
+          --health-cmd "test $(stat -f -c %T $PGDATA) = tmpfs && pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Job-container prerequisites (loopback forward to agent-testdb)
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
+          rm -rf /var/lib/apt/lists/*
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          exit 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        with:
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+
+      # PR isolation first: on pull_request events sccache stays on local disk
+      # only and no shared-backend credential is written anywhere. R2 write
+      # credentials must never reach PR-built code (this lane compiles and
+      # executes build scripts and tests at the PR head, and a shared R2
+      # bucket has no per-PR scope, so a PR could poison objects a later
+      # main build links). The GitHub-cache backend stays off PRs too: its
+      # entries share the repo Actions cache quota with the warm `check`
+      # entry the required lanes restore, so an advisory lane must not grow
+      # it. Off-PR runs (push to main, workflow_dispatch) use R2 when the
+      # caller passed all the pins, else the GitHub-cache backend. Values
+      # travel via the environment file, never the log: secrets stay masked.
+      - name: Select sccache backend (R2 when pinned, GitHub cache otherwise)
+        env:
+          R2_BUCKET: ${{ secrets.SCCACHE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.SCCACHE_ENDPOINT }}
+          R2_REGION: ${{ secrets.SCCACHE_REGION }}
+          R2_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          R2_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          NEXTEST_EVENT: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$NEXTEST_EVENT" = "pull_request" ]; then
+            echo "sccache backend: local disk only (no shared writes on PRs)"
+          elif [ -n "$R2_BUCKET" ] && [ -n "$R2_ENDPOINT" ] && [ -n "$R2_KEY" ] && [ -n "$R2_SECRET" ]; then
+            {
+              echo "SCCACHE_BUCKET=$R2_BUCKET"
+              echo "SCCACHE_ENDPOINT=$R2_ENDPOINT"
+              echo "SCCACHE_REGION=${R2_REGION:-auto}"
+              echo "AWS_ACCESS_KEY_ID=$R2_KEY"
+              echo "AWS_SECRET_ACCESS_KEY=$R2_SECRET"
+            } >> "$GITHUB_ENV"
+            echo "sccache backend: R2"
+          else
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+            echo "sccache backend: GitHub cache"
+          fi
+
+      - name: Start sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      # Restore-only: the warm `check` entry in check.yml owns the registry
+      # write, so this step never saves. sccache is the only shared-cache
+      # writer left, and only off-PR (R2 or GitHub cache on push to main;
+      # local disk on pull_request per the backend step above).
+      - name: Restore cargo registry cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          shared-key: check
+          save-if: false
+
+      - name: Install pinned cargo-nextest
+        shell: bash
+        run: cargo install cargo-nextest --version 0.9.99 --locked
+
+      - name: Prepare isolated test databases
+        shell: bash
+        run: |
+          createdb -h agent-testdb -U agent_test two_bot_test_ci
+          createdb -h agent-testdb -U agent_test two_next_backup_ci
+          createdb -h agent-testdb -U agent_test two_next_backup_publication_ci
+          printf 'PAPERCLIP_RUN_SCRATCH_DIR=%s/two-bot-check-scratch\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      # Advisory pilot scope: workspace lib/bins via nextest (retries=1 and
+      # JUnit come from .config/nextest.toml profile `ci`). A fail-then-pass
+      # retry is reported flaky, not red; the ledger step still runs.
+      # JUnit `path = "junit.xml"` in .config/nextest.toml is profile-store
+      # relative (target/nextest/ci/junit.xml), not workspace-root. Resolve it
+      # and copy to the workspace root so the parse/upload steps below see one
+      # stable path. The nextest exit status is preserved: a failing test run
+      # still fails this step, but its JUnit evidence is retained for upload.
+      - name: cargo nextest (unit and binary, retries=1, JUnit)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        shell: bash
+        run: |
+          status=0
+          cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci || status=$?
+          for candidate in target/nextest/ci/junit.xml junit.xml; do
+            if [ -f "$candidate" ]; then
+              cp "$candidate" junit.xml
+              break
+            fi
+          done
+          if [ ! -f junit.xml ]; then
+            found=$(find target/nextest -name junit.xml -print -quit 2>/dev/null || true)
+            if [ -n "$found" ]; then
+              cp "$found" junit.xml
+            fi
+          fi
+          test -f junit.xml
+          exit $status
+
+      - name: sccache stats (advisory speed evidence)
+        shell: bash
+        run: sccache --show-stats
+
+      - name: Parse JUnit into the flake ledger
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Consequence, not root: when nextest never ran there is no JUnit
+          # to parse. Fail with a pointer upstream instead of a raw
+          # traceback so triage lands on the originating step.
+          if [ ! -f junit.xml ]; then
+            echo "junit.xml not found: nextest produced no output; see the upstream step for the root failure." >&2
+            exit 1
+          fi
+          python3 scripts/ci/flake_ledger.py --junit junit.xml --output flake-ledger.jsonl
+
+      - name: Upload JUnit evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-junit-${{ github.run_id }}
+          path: junit.xml
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload flake ledger
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flake-ledger-${{ github.run_id }}
+          path: flake-ledger.jsonl
+          if-no-files-found: error
+          retention-days: 14

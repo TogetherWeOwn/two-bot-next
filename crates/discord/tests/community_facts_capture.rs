@@ -105,6 +105,8 @@ fn invite_snapshot(uses: u64) -> Vec<InviteState> {
         uses,
         inviter_id: Some(INVITER),
         channel_id: None,
+        max_uses: 0,
+        temporary: false,
     }]
 }
 

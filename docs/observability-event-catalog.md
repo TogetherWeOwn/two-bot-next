@@ -42,6 +42,8 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `interaction acknowledgement blocked; advancing past lost callback` | `crates/bot/src/gateway.rs` (`complete_acknowledgement`) | Ordered RSVP acknowledgement hit send-admission Blocked; checkpoint advances past the lost callback without replaying uncertain effects |
 | `interaction response failed; not replaying command` | `crates/bot/src/gateway.rs` (`complete_acknowledgement`, three sites) | Ordered RSVP preparation or completion failed without admission blockage; command advances without replaying uncertain effects |
 | `READY identity differs from boot token; ordered identity not armed` | `crates/bot/src/gateway.rs` (`run_shard`) | READY application id differs from the boot/REST pin; ordered identity stays disarmed and its fence keeps refusing |
+| `retention lifecycle skipped; schema gap, nothing to cancel` | `crates/bot/src/gateway.rs` (`retention_lifecycle`) | Rejoin-cancel hit a schema gap (missing table/permission, SQLSTATE only); skipped, nothing to cancel, gateway survives a database behind the binary |
+| `retention purge skipped; schema gap, operator replay required` | `crates/bot/src/gateway.rs` (`retention_lifecycle`) | Real guild removal hit a schema gap; gateway acked past the only purge-queue write, Operator must replay it per privacy.md once the migration lands |
 | `gateway prerequisites missing; gateway parked, /readyz reports down` | `crates/bot/src/main.rs` (`run`) | Token, database URL or guild ID missing; shard never starts |
 | `feature gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs` (`build_interaction_runtime`) | Feature-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
 | `moderation gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs` (`build_interaction_runtime`) | Moderation-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
@@ -63,6 +65,13 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `voice database unavailable; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice store connect failed; gateway continues voice-off |
 | `voice rooms enabled; gateway sink attached` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice runtime built; sink attached to the gateway writer |
 | `voice HTTP setup failed; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice HTTP setup failed; gateway continues voice-off |
+| `eventsub startup refused` | `crates/bot/src/main.rs` (`run`, two sites) | EventSub receiver config invalid or bind failed; process exits for supervisor restart |
+| `eventsub delivery refused` | `crates/bot/src/eventsub_http.rs` (`refuse`) | Delivery failed verification, admission or shape checks; `status` and `error_class` name the refusal |
+| `challenge answered` | `crates/bot/src/eventsub_http.rs` (`receive`) | Webhook verification challenge answered with the plaintext challenge; Twitch enables the subscription |
+| `notification acknowledged` | `crates/bot/src/eventsub_http.rs` (`receive`) | Notification verified and acknowledged; durable claim wiring lands in a follow-up slice |
+| `revocation acknowledged` | `crates/bot/src/eventsub_http.rs` (`receive`) | Revocation verified and acknowledged; boot/periodic reconcile owns re-subscription |
+| `delivery ignored` | `crates/bot/src/eventsub_http.rs` (`receive`, three sites) | Deterministic planning error or unknown classify variant acknowledged with 2xx so Twitch does not retry |
+| `event = "eventsub_receiver"` | `crates/bot/src/eventsub_http.rs` (`refuse`, `receive`) | Bounded `event` field value every receiver emission carries; no header, token or body leaves the process |
 
 ## Gateway metric event labels
 
@@ -178,7 +187,7 @@ sink attaches to the gateway writer on the cutover path.
 | `voice_event="voice_reconcile"` | `crates/bot/src/voice_rooms.rs` (`reconcile`: `voice_reconcile planned`) | One reconcile pass plan size with per-action counts |
 | `voice_event="voice_dead_letter"` | `crates/bot/src/voice_rooms.rs` (`mark_failed_observed`: `voice action dead-lettered`) | Queue write exhausted retries with bounded `action` and attempts |
 | `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs` (`execute_create`: `voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
-| `voice_event="voice_join_received"` | `crates/bot/src/voice_rooms.rs` (`accept_join_received`: `voice creator join accepted` / `voice creator join refused before queueing`) | One creator-channel join delivered to the guild actor, accepted or refused. The refused line carries a bounded `reason` (`halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked`, `other`); every delivery bumps `two_bot_voice_joins_received_total`, so received-vs-handled drift is the stall signal |
+| `voice_event="voice_join_received"` | `crates/bot/src/voice_rooms.rs` (`accept_join_received`: `voice creator join accepted` / `voice creator join refused before queueing`) | One creator-channel join delivered to the guild actor, accepted or refused. The refused line carries a bounded `reason` (`halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked`, `other`) plus the refusing `channel` id and creator-map state at join time (`creators_len`, `known`, `halted`, `ready`, `live_generation`, `ticket_generation`; no member/name/token content); every delivery bumps `two_bot_voice_joins_received_total`, so received-vs-handled drift is the stall signal |
 
 Adjacent actor message without a `voice_event` field:
 `voice actor load failed; actor respawns on the next guild snapshot`
@@ -209,6 +218,26 @@ worker halted on a Discord 401 (or the writer latched one); the probe stays
 out because only a token fix and a restart clear that halt.
 `voice halt re-probe: store still refusing` / `voice halt re-probe timed out`
 (debug): the latch stays set; the next probe runs after the re-probe interval.
+
+Creator-view refresh actor messages (all in `GuildRoomWorker::revalidate_creator`
+/ `reload_creators` in `crates/bot/src/voice_rooms.rs`, guild-only fields,
+no IDs):
+`voice creator view revalidated from the store` (info): a join arrived for an
+unknown channel id that turned out to be a `voice_creators` row; the row merged
+into the in-memory view instead of refusing the join.
+`voice creator view merged stored rows` (info, only when at least one new row
+merged): a channel create/update/delete (debounced) or the five-minute
+maintenance tick merged stored creator rows into the view; the merge only adds
+or updates, never deletes.
+`voice creator revalidation failed; keeping the cached view` /
+`voice creator refresh failed; keeping the cached view` (debug): the store read
+failed (or the single-row read-through timed out after 1 s, `timed_out=true`),
+so the old view is kept and the join is refused exactly as before.
+`voice naming settings refresh failed; keeping the cached view` (warn, in
+`GuildRoomWorker::reload_name_settings` in `crates/bot/src/voice_name_panel.rs`):
+the `config_snapshot` read failed, so the naming reload kept the cached
+settings and creators; the direct creator merge still converges the view while
+this fails.
 
 ## Unknowns (TBD)
 

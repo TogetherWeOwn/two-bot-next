@@ -2289,6 +2289,59 @@
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized reply text or screenshots and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
     {
+      "id": "s12-30",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Private Twitch EventSub receiver inside the container network (#973)",
+          "`crates/bot/src/eventsub_http.rs:64-79` (bind plus serve; verification runs before parsing, challenge echoed, scalar-only logs) and `crates/core/src/eventsub_receiver_config.rs:46-88` (served only when `TWO_EVENTSUB` is exactly `1`, `TWO_EVENTSUB_BIND` literal-IP:port rule with the Worker-set container marker admitting a wildcard, `TWO_TWITCH_WEBHOOK_SECRET` 10-100 printable ASCII). Env-only catalog `crates/core/src/settings.rs:130-134` with generated rows `docs/configuration.md:194-195,257`, Worker ingress `wrangler/src/eventsub.ts:37,64` and forward/secret guard `wrangler/src/container-env.ts:256,268-270,299`; receiver contract `docs/stream-funnel.md:131-164`"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "On staging with the Operator-provisioned webhook secret, enable the receiver dark-flag exactly as configured, deliver a signed Twitch challenge and one signed notification through the Worker ingress, then repeat with a bad signature and with the flag unset.",
+      "expected": "The challenge is echoed only after verification, signed notifications are accepted with scalar-only logs, bad signatures are refused before parsing, the receiver is not served while the flag is unset, and enabled-but-invalid configuration stops startup instead of downgrading.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
+      "id": "s12-31",
+      "parity": {
+        "section": 12,
+        "row": [
+          "Voice creator-view merge on gateway reconnect plus join-time creator-map refusal naming (#976)",
+          "`crates/bot/src/voice_rooms.rs:3245-3264` (`reload_creators` merges the stored rows on a generation change, debounced 10 s by `CREATORS_REFRESH_DEBOUNCE_MS` at `:2776` against the five-minute `CREATORS_REFRESH_INTERVAL_MS` at `:2777`; a failed read keeps the old generation and retries on the next debounced tick), driven by the maintenance tick at `:8043`; join refusals name the reason (`unknown_creator` at `:3023` and siblings) with the map state at join time (length, known, halted, ready, live and ticket generations) at `:3035-3075`"
+        ]
+      },
+      "owner": [
+        "TOG-10119",
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "On the disposable staging guild, register a creator channel, force a gateway reconnect, then join the creator channel; also join once against a deliberately stale creator map.",
+      "expected": "The creator view merges stored rows after the reconnect generation change (debounced, failed reads keep the old generation), the join succeeds without a restart, and any refusal names its reason with the join-time map state in the log.",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+    },
+    {
+      "id": "s12-32",
+      "parity": {
+        "section": 12,
+        "row": [
+          "EventSub subscription reconcile at startup plus a bounded hourly interval (#989, open)",
+          "Open-PR tip `06e7f00d` (read-only): `crates/bot/src/eventsub_reconcile.rs:28-34` (`TWO_TWITCH_CALLBACK_URL` callback gate, `TWO_TWITCH_BROADCASTERS` allowlist with empty-parks, `RECONCILE_INTERVAL_SECS = 3_600`), `:53-61` (`gate_open`/`enabled`, exactly-`1` gate) plus `:343-346` (`spawn_if_enabled`, gated by `enabled()`), spawned in `crates/bot/src/main.rs:384`; catalog plus generated-reference plus container-env additions ride the same PR, as does the `docs/stream-funnel.md` interval rewrite"
+        ]
+      },
+      "owner": [
+        "TOG-13123"
+      ],
+      "status": "manual",
+      "action": "After the open reconcile slice merges, first re-verify the flag names and cited file:line at its merge head and refresh the parity row; then on staging with the receiver enabled, restart the container and observe one bounded reconcile interval tick with an empty and a populated broadcaster allowlist.",
+      "expected": "Reconcile runs at startup and on the hourly interval only while the receiver flag is exactly on, an empty allowlist parks without subscriptions, and no reconcile runs while the flag is off; until the slice lands, HEAD runs no reconcile (library-only planner; the receiver only acks revocations).",
+      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+    },
+    {
       "id": "s13-f114c44",
       "parity": {
         "section": 13,

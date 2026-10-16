@@ -36,7 +36,12 @@ are outside this implementation's scope.
   erased with its owner takes its whole list with it (the rows cascade). Its approved-grant
   witness (`voice_join_grants`) does the same: erasure removes the erased member's rows from
   every room's grant list, and a room erased with its owner takes its grants with it
-  (the rows cascade). Guild room-command controls
+  (the rows cascade). Its owner-grant journal (`voice_owner_grants`) records
+  prospective recipients, pending or completed: erasure removes the erased
+  member's rows by (`guild_id`, `member_id`), and deleting a parent room
+  removes its journal rows through the migration's `ON DELETE CASCADE`.
+  Erasure removes database tracking only, never the Discord channel.
+  Guild room-command controls
   (`voice_access_controls`: creation switch, required role ID, per-command role
   IDs) and room logging settings (`voice_logging_settings`: detail level, notice
   channel ID, mention role ID) hold channel and role IDs only and no member IDs.
@@ -188,7 +193,20 @@ job runs on a bounded schedule: a dry run that deletes nothing unless
 purger is installed: do not claim a live 30/90-day TTL beyond the windows
 this job enforces. Every run reports per-class metrics, with partial runs
 (deferred/overdue deletions, failed guild purges) surfaced as warnings that
-stay retryable.
+stay retryable. When the database is behind the binary (an unapplied
+migration or grant), the gateway acks dispatches whose queue write hits the
+schema gap instead of crash-looping: a skipped rejoin-cancel is a no-op, but
+a skipped true guild removal is logged at error level with the guild id
+(`retention purge skipped; schema gap, operator replay required`) and must be
+replayed by the Operator once the migration lands, running the same insert
+the live path runs: `INSERT INTO retention_guild_purge_queue (guild_id)
+VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;`
+Conditional: replay only if no `GUILD_CREATE` for that guild was acked after
+the `operator replay required` line — a later `retention lifecycle skipped;
+schema gap, nothing to cancel` warn for the same guild means it rejoined, so
+skip the insert while the guild is live (replaying it would queue a live
+guild for the next `execute` run). Run the default dry run first and confirm
+the guild is still gone before executing.
 
 The append-only event-store capture (`event_store`, when its slices land)
 follows the same rule: its rows persist until erasure, and its TTL policy is

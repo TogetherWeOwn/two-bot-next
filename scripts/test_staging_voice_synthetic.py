@@ -40,6 +40,16 @@ def obs(**over):
         "delete_seconds": 1.2,
         "grace_seconds": 0,
         "metrics_delta": 1,
+        "rename_applied": True,
+        "rename_restored": True,
+        "limit_initial": 0,
+        "limit_probed": 2,
+        "limit_set_ok": True,
+        "limit_restored": True,
+        "privacy_initial_denies": False,
+        "privacy_toggled": True,
+        "privacy_restored": True,
+        "panel_name": "🍄 Synthetic’s workshop",
     }
     base.update(over)
     return base
@@ -118,6 +128,152 @@ class EvaluateTest(unittest.TestCase):
     def test_metrics_skip_only_when_unavailable(self):
         self.assertEqual(verdicts(obs(metrics_delta=None))["metrics"], "SKIP")
         self.assertEqual(verdicts(obs(metrics_delta=0))["metrics"], "FAIL")
+
+    def test_rename_passes_when_applied_and_restored(self):
+        self.assertEqual(verdicts(obs())["rename"], "PASS")
+
+    def test_rename_skips_when_the_test_bot_may_not_rename(self):
+        result = verdicts(obs(rename_applied=False, rename_restored=False, rename_forbidden=True))
+        self.assertEqual(result["rename"], "SKIP")
+
+    def test_rename_fails_when_the_original_name_is_not_restored(self):
+        result = verdicts(obs(rename_restored=False))
+        self.assertEqual(result["rename"], "FAIL")
+
+    def test_rename_fails_when_not_applied(self):
+        result = verdicts(obs(rename_applied=False, rename_restored=False))
+        self.assertEqual(result["rename"], "FAIL")
+
+    def test_rename_skips_on_the_per_channel_rename_limit(self):
+        result = verdicts(obs(rename_applied=False, rename_restored=False,
+                              rename_rate_limited=True,
+                              rename_note="rename PATCH answered 429 (per-channel rename limit); "
+                                          "rename skipped"))
+        self.assertEqual(result["rename"], "SKIP")
+        detail = next(c["detail"] for c in synth.evaluate(
+            obs(rename_applied=False, rename_restored=False, rename_rate_limited=True))
+            if c["check"] == "rename")
+        self.assertIn("429", detail)
+
+    def test_rename_residue_fails_with_the_note(self):
+        result = verdicts(obs(rename_applied=False, rename_restored=False,
+                              rename_note="creator already carries synthetic residue"))
+        self.assertEqual(result["rename"], "FAIL")
+        detail = next(c["detail"] for c in synth.evaluate(
+            obs(rename_applied=False, rename_restored=False, rename_note="x"))
+            if c["check"] == "rename")
+        self.assertIn("x", detail)
+
+    def test_limit_passes_on_verified_set_and_restore(self):
+        self.assertEqual(verdicts(obs())["limit"], "PASS")
+
+    def test_limit_fails_when_owner_passes_but_patch_is_forbidden(self):
+        result = verdicts(obs(limit_set_ok=False, limit_restored=False, limit_forbidden=True))
+        self.assertEqual(result["owner"], "PASS")
+        self.assertEqual(result["limit"], "FAIL")
+        detail = next(c["detail"] for c in synth.evaluate(
+            obs(limit_set_ok=False, limit_restored=False, limit_forbidden=True))
+            if c["check"] == "limit")
+        self.assertIn("403", detail)
+        self.assertIn("Manage Channels", detail)
+
+    def test_limit_skips_on_rate_limit(self):
+        result = verdicts(obs(limit_set_ok=False, limit_restored=False,
+                              limit_rate_limited=True,
+                              limit_note="user_limit PATCH answered 429; limit skipped"))
+        self.assertEqual(result["limit"], "SKIP")
+
+    def test_limit_fails_when_not_applied(self):
+        result = verdicts(obs(limit_set_ok=False, limit_restored=False))
+        self.assertEqual(result["limit"], "FAIL")
+
+    def test_limit_fails_when_set_but_not_restored(self):
+        result = verdicts(obs(limit_restored=False))
+        self.assertEqual(result["limit"], "FAIL")
+
+    def test_privacy_passes_on_verified_toggle_and_restore(self):
+        self.assertEqual(verdicts(obs())["privacy"], "PASS")
+
+    def test_privacy_skips_when_the_test_bot_may_not_edit_overwrites(self):
+        result = verdicts(obs(privacy_toggled=False, privacy_restored=False,
+                              privacy_forbidden=True))
+        self.assertEqual(result["privacy"], "SKIP")
+
+    def test_privacy_skips_on_rate_limit(self):
+        result = verdicts(obs(privacy_toggled=False, privacy_restored=False,
+                              privacy_rate_limited=True,
+                              privacy_note="overwrite PUT answered 429; privacy skipped"))
+        self.assertEqual(result["privacy"], "SKIP")
+
+    def test_privacy_fails_when_not_toggled(self):
+        result = verdicts(obs(privacy_toggled=False, privacy_restored=False))
+        self.assertEqual(result["privacy"], "FAIL")
+
+    def test_privacy_fails_when_toggled_but_not_restored(self):
+        result = verdicts(obs(privacy_restored=False))
+        self.assertEqual(result["privacy"], "FAIL")
+
+    def test_name_panel_passes_on_template_render(self):
+        self.assertEqual(verdicts(obs())["name_panel"], "PASS")
+
+    def test_name_panel_fails_on_fallback(self):
+        self.assertEqual(verdicts(obs(panel_name="Synthetic's room"))["name_panel"], "FAIL")
+
+    def test_name_panel_fails_when_missing(self):
+        self.assertEqual(verdicts(obs(panel_name=None))["name_panel"], "FAIL")
+
+    def test_failed_create_names_the_refusal_reason(self):
+        # RED first: a create stall must name its refusal reason and the
+        # creator-map state, not just room=None. The next restart-cured stall
+        # diagnoses itself from the create line.
+        failing = obs(room_id=None, room_created=None, moved_to=None,
+                      received_delta=2.0, refused_delta={"unknown_creator": 2.0})
+        detail = next(c["detail"] for c in synth.evaluate(failing)
+                      if c["check"] == "create")
+        self.assertIn("unknown_creator=2", detail)
+        self.assertIn("received=2", detail)
+
+    def test_failed_create_without_metrics_carries_no_suffix(self):
+        failing = obs(room_id=None, room_created=None, moved_to=None)
+        detail = next(c["detail"] for c in synth.evaluate(failing)
+                      if c["check"] == "create")
+        self.assertNotIn("received=", detail)
+        self.assertNotIn("unknown_creator", detail)
+
+
+class MetricsSnapshotTest(unittest.TestCase):
+    def test_parses_received_and_per_reason_refusals(self):
+        body = ("two_bot_voice_joins_received_total 7\n"
+                'two_bot_voice_join_refused_total{reason="unknown_creator"} 2\n'
+                'two_bot_voice_join_refused_total{reason="halted"} 1\n'
+                'two_bot_voice_names_total{outcome="created_with_template"} 3\n')
+        seen = []
+
+        def fake_open(req, timeout=None):
+            class _Resp:
+                def read(self, n):
+                    seen.append(n)
+                    return body.encode()
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+            return _Resp()
+
+        with mock.patch.object(synth.urllib.request, "urlopen", side_effect=fake_open):
+            received, refused = synth.metrics_snapshot("https://two-bot-next-staging.x", "tok")
+        self.assertEqual(received, 7)
+        self.assertEqual(refused, {"unknown_creator": 2.0, "halted": 1.0})
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_unavailable_metrics_report_none(self):
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               side_effect=OSError("down")):
+            self.assertEqual(synth.metrics_snapshot("https://two-bot-next-staging.x", "tok"),
+                             (None, None))
+        self.assertEqual(synth.metrics_snapshot(None, None), (None, None))
 
 
 class FenceTest(unittest.TestCase):
@@ -209,7 +365,7 @@ class BodyCapTest(unittest.TestCase):
         self.assertLessEqual(len(raw), size, "fixture must fit the target size")
         return raw + b" " * (size - len(raw))
 
-    def response(self, payload, seen):
+    def response(self, payload, seen, status=200):
         class _Resp:
             def read(self, n):
                 seen.append(n)
@@ -221,7 +377,9 @@ class BodyCapTest(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-        return _Resp()
+        resp = _Resp()
+        resp.status = status
+        return resp
 
     def http_error(self, payload, seen, code=500):
         err = urllib.error.HTTPError("https://discord.com/api/v10/x", code,
@@ -329,6 +487,53 @@ class BodyCapTest(unittest.TestCase):
             self.assertIsNone(synth.metrics_value("https://two-bot-next-staging.x", "tok"))
         self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
 
+    def test_patch_reports_status_without_raising(self):
+        seen = []
+        body = json.dumps({"id": CREATOR, "name": "Create a Lobby"}).encode()
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               return_value=self.response(body, seen)):
+            self.assertEqual(synth.rest_patch("t", f"/channels/{CREATOR}", {"name": "x"}),
+                             (200, {"id": CREATOR, "name": "Create a Lobby"}))
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_patch_forbidden_reports_403(self):
+        seen = []
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               side_effect=self.http_error(b"{}", seen, code=403)):
+            self.assertEqual(synth.rest_patch("t", f"/channels/{CREATOR}", {"name": "x"}),
+                             (403, None))
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_patch_over_cap_refuses(self):
+        big = b"y" * (synth.MAX_BODY_BYTES + 1)
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               return_value=self.response(big, [])):
+            with self.assertRaises(synth.BodyTooLarge) as ctx:
+                synth.rest_patch("t", f"/channels/{CREATOR}", {"name": "x"})
+        self.assertEqual(str(ctx.exception), "Discord REST read answered over the body cap")
+
+    def test_put_overwrite_reports_status_without_raising(self):
+        seen = []
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               return_value=self.response(b"{}", seen)):
+            self.assertEqual(synth.rest_put_overwrite("t", ROOM, CREATOR, 0, 1048576, 0), 200)
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_put_overwrite_forbidden_reports_403(self):
+        seen = []
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               side_effect=self.http_error(b"{}", seen, code=403)):
+            self.assertEqual(synth.rest_put_overwrite("t", ROOM, CREATOR, 0, 1048576, 0), 403)
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_put_overwrite_over_cap_refuses(self):
+        big = b"y" * (synth.MAX_BODY_BYTES + 1)
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               return_value=self.response(big, [])):
+            with self.assertRaises(synth.BodyTooLarge) as ctx:
+                synth.rest_put_overwrite("t", ROOM, CREATOR, 0, 1048576, 0)
+        self.assertEqual(str(ctx.exception), "Discord REST read answered over the body cap")
+
     def test_user_agent_pins_are_unchanged(self):
         requests = []
 
@@ -338,8 +543,10 @@ class BodyCapTest(unittest.TestCase):
 
         with mock.patch.object(synth.urllib.request, "urlopen", side_effect=fake_open):
             synth.rest("t", f"/channels/{ROOM}")
+            synth.rest_patch("t", f"/channels/{ROOM}", {"name": "x"})
+            synth.rest_put_overwrite("t", ROOM, CREATOR, 0, 1048576, 0)
             synth.metrics_value("https://two-bot-next-staging.x", "tok")
-        self.assertEqual(len(requests), 2)
+        self.assertEqual(len(requests), 4)
         for req in requests:
             self.assertEqual(req.get_header("User-agent"), self.EXPECTED_UA)
 

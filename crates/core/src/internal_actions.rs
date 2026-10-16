@@ -2797,10 +2797,13 @@ mod tests {
         // of each class. TOG-19027 moves TWO_FEED_POLL_SECONDS from cold
         // to hot, shifting one entry between those classes. The staging
         // voice synthetic adds one env-only key (TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS).
+        // TOG-23387 adds five env-only EventSub keys (TWO_EVENTSUB,
+        // TWO_EVENTSUB_BIND, TWO_TWITCH_CLIENT_ID, TWO_TWITCH_CLIENT_SECRET,
+        // TWO_TWITCH_WEBHOOK_SECRET).
         for (class, expected) in [
             (SettingClass::Hot, 42),
             (SettingClass::Cold, 27),
-            (SettingClass::EnvOnly, 54),
+            (SettingClass::EnvOnly, 59),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),

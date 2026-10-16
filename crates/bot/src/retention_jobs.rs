@@ -69,10 +69,13 @@ pub(crate) fn pool_from_url(url: &str) -> Result<PgPool, ErrorClass> {
 /// per-attempt [`TIMEOUT`], panic-isolated by the supervisor like every job.
 /// The real action calls the existing cutover retention operation; every
 /// successful report emits one structured `retention_run` event with the
-/// mode and all counters. A partial `Ok` (deferred/overdue deletions or
-/// failed guild purges) logs at WARN so it is never silently reduced to
-/// scheduler success. SQL/schema failures return [`ErrorClass::Database`]
-/// to the supervisor and stay retryable.
+/// mode and all counters. A partial `Ok` (deferred/overdue deletions,
+/// failed guild purges, or guard-deferred guild purges) logs at WARN so it
+/// is never silently reduced to scheduler success. Schema-coverage gaps
+/// defer as `Ok` (counted in `schema_gap_deferrals` for deletions and
+/// `guild_purges_failed` for queued guilds, with the gap list in the warn
+/// log) and retry after the plan is repaired; only SQL/connection failures
+/// return [`ErrorClass::Database`] to the supervisor and stay retryable.
 #[must_use]
 pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
     let cadence = CADENCE;
@@ -88,6 +91,7 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                     .await
                     .map_err(|_| ErrorClass::Database)?;
                 let partial = report.guild_purges_failed > 0
+                    || report.guild_purges_deferred > 0
                     || report.deletions_deferred > 0
                     || report.deletions_overdue > 0;
                 if partial {
@@ -99,8 +103,12 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                         audit_cache_deleted = report.audit_cache_deleted,
                         guild_rows_purged = report.guild_rows_purged,
                         guild_purges_failed = report.guild_purges_failed,
+                        guild_purges_deferred = report.guild_purges_deferred,
+                        guild_purges_deferred_oldest_secs =
+                            report.guild_purges_deferred_oldest_secs,
                         deletions_completed = report.deletions_completed,
                         deletions_deferred = report.deletions_deferred,
+                        schema_gap_deferrals = report.schema_gap_deferrals,
                         deletions_overdue = report.deletions_overdue,
                         duration_ms = report.duration_ms,
                         "retention run completed with pending work",
@@ -114,8 +122,12 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                         audit_cache_deleted = report.audit_cache_deleted,
                         guild_rows_purged = report.guild_rows_purged,
                         guild_purges_failed = report.guild_purges_failed,
+                        guild_purges_deferred = report.guild_purges_deferred,
+                        guild_purges_deferred_oldest_secs =
+                            report.guild_purges_deferred_oldest_secs,
                         deletions_completed = report.deletions_completed,
                         deletions_deferred = report.deletions_deferred,
+                        schema_gap_deferrals = report.schema_gap_deferrals,
                         deletions_overdue = report.deletions_overdue,
                         duration_ms = report.duration_ms,
                         "retention run completed",
