@@ -20,6 +20,15 @@ DERIVE = re.compile(
 )
 DERIVE_ONE = re.compile(r"#\[derive\((?P<traits>[^)]*)\)\]")
 FIELD = re.compile(r"\b(\w+)\s*:\s*([^,\n}]+)")
+# Tuple variants carry no field name, so key off an exactly
+# credential-bearing variant name (a claim token is an ownership
+# credential in this codebase). Anchored: `SecretTooShort(String)`
+# carries a key id, not a secret, and must not trip this.
+TUPLE_VARIANT = re.compile(r"\b([A-Z]\w*)\s*\(([^;{}]*)\)")
+SENSITIVE_VARIANT = re.compile(
+    r"(?:claimed?|claimtoken|token|accesstoken|refreshtoken|secret|password|credentials?)",
+    re.IGNORECASE,
+)
 SENSITIVE = re.compile(
     r"(?:^|_)(?:token|secret|password|credential|credentials)(?:_|$)"
     r"|^(?:database_url|webhook_url|access_key_id|secret_access_key)$"
@@ -67,6 +76,16 @@ def violations(source, path="fixture.rs"):
                 continue
             line = source.count("\n", 0, start + field.start()) + 1
             results.append(f"{path}:{line}: {match['name']}.{name} is raw under derived Debug; use Secret<T>")
+        for variant in TUPLE_VARIANT.finditer(body):
+            name, payload = variant.groups()
+            if not SENSITIVE_VARIANT.fullmatch(name) or not RAW.search(payload):
+                continue
+            if re.search(r"\bSecret\s*<", payload):
+                continue
+            if (path, match["name"], name) in EXCEPTIONS:
+                continue
+            line = source.count("\n", 0, start + variant.start()) + 1
+            results.append(f"{path}:{line}: {match['name']}::{name} is raw under derived Debug; use Secret<T>")
     return results
 
 
@@ -105,6 +124,15 @@ class GuardTests(unittest.TestCase):
     def test_comments_literals_and_nonsecret_fields_pass(self):
         self.assertFalse(violations('// #[derive(Debug)] struct Bad { token: String }\n#[derive(Debug)] struct Fine { token_count: usize, id: String }'))
         self.assertFalse(violations('const TEXT: &str = "#[derive(Debug)] struct Bad { token: String }";'))
+
+    def test_tuple_variants_fail(self):
+        for variant in ["Claimed(String)", "Token(String)", "ClaimToken(Vec<u8>)", "Secret(&'a str)"]:
+            code = f"#[derive(Clone, Debug)]\npub enum Fixture {{ {variant}, Other, }}"
+            self.assertEqual(len(violations(code)), 1, code)
+
+    def test_tuple_secret_wrapper_and_plain_payloads_pass(self):
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed(Secret<String>), Token(crate::Secret<String>), }'))
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Message(String), Count(u64), }'))
 
     def test_exception_is_exact(self):
         code = '#[derive(Debug)] struct ModerationMarker { token: String }'

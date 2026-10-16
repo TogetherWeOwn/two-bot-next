@@ -142,7 +142,7 @@ async fn cleanup(pool: Pool<Postgres>, schema: &str) {
 /// any other outcome.
 fn claimed(outcome: ClaimOutcome) -> String {
     match outcome {
-        ClaimOutcome::Claimed(token) => token,
+        ClaimOutcome::Claimed(token) => token.expose().clone(),
         other => panic!("expected Claimed, got {other:?}"),
     }
 }

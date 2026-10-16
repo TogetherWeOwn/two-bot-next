@@ -39,6 +39,8 @@
 
 use sqlx::{Pool, Postgres};
 
+use crate::Secret;
+
 /// Bounded lease for a never-started claim, in seconds. The window between
 /// claiming and [`mark_live_send_started`] is a few in-process database
 /// statements, so 30 s is ample headroom for a live owner while keeping a
@@ -75,8 +77,9 @@ pub enum ClaimOutcome {
     /// payload is the row's claim token: an ownership capability the owner
     /// must present to [`mark_live_send_started`], [`mark_live_delivered`]
     /// and [`release_live`]. A takeover rotates it, fencing out the
-    /// previous owner. Never log it.
-    Claimed(String),
+    /// previous owner. Never log it: the [`Secret`] wrapper redacts it
+    /// under `Debug`, and callers reach it only through `expose()`.
+    Claimed(Secret<String>),
     /// A never-started claim exists but its lease is still fresh: its owner
     /// may still be sending, or may have crashed before starting. Answer
     /// 5xx, which asks Twitch to retry; a retry after the lease expires can
@@ -121,7 +124,7 @@ pub async fn claim_live(
         .fetch_optional(pool)
         .await?;
         if let Some((Some(token),)) = inserted {
-            return Ok(ClaimOutcome::Claimed(token));
+            return Ok(ClaimOutcome::Claimed(token.into()));
         }
         if inserted.is_some() {
             // A tokenless row can only come from a pre-token writer; treat
@@ -273,7 +276,7 @@ async fn classify_conflict(
     .fetch_optional(pool)
     .await?;
     if let Some((Some(token),)) = updated {
-        return Ok(Some(ClaimOutcome::Claimed(token)));
+        return Ok(Some(ClaimOutcome::Claimed(token.into())));
     }
     if updated.is_some() {
         // Tokenless row (pre-token writer): owned elsewhere, never ours.
@@ -297,4 +300,23 @@ async fn classify_conflict(
         Some((true,)) => Some(ClaimOutcome::InFlight),
         Some((false,)) => Some(ClaimOutcome::Duplicate),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claimed_token_is_redacted_in_both_debug_forms() {
+        let fixture_token = "fixture-claim-token-sentinel";
+        let outcome = ClaimOutcome::Claimed(Secret::new(fixture_token.to_owned()));
+        for output in [format!("{outcome:?}"), format!("{outcome:#?}")] {
+            assert!(output.contains("[REDACTED]"), "{output}");
+            assert!(!output.contains(fixture_token), "{output}");
+        }
+        let ClaimOutcome::Claimed(token) = outcome else {
+            unreachable!()
+        };
+        assert_eq!(token.expose(), fixture_token);
+    }
 }
