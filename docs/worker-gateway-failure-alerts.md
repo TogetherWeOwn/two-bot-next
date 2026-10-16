@@ -18,6 +18,9 @@ Logs only, never `/metrics`.
 - `event="container_gateway_failure"`, emitted by the Container DO keepalive
   in `wrangler/src/index.ts` once per tick while the gateway task is failing.
 - `phase` is `durable_gateway` (the only phase today).
+- `failed_step` names the fallible step, `error_code` carries the SQLSTATE
+  (`none` when no database code applies), `build_revision` carries the
+  container Git SHA, and `log_url` links the log-query docs.
 - `class` is one of the twelve `FailureClass` tokens:
 
 | `class` | Failing step |

@@ -20,7 +20,8 @@ No Gatus or third-party monitor is used.
 - **Readiness:** `/health` indicates the HTTP process responds;
   `/readyz` reports process, gateway, database, token-invalid state and build
   identity. A 503 includes the bounded readiness breakdown. `gateway_failure`
-  is a fixed-vocabulary phase/class, not an SQL error message or SQLSTATE.
+  carries the fixed-vocabulary phase/class plus the failing step and the
+  SQLSTATE code (`failed_step`/`error_code`), never an SQL error message.
 - **Metrics and alerts:** the Container exposes `/metrics` internally. The DO
   scrapes it on keepalive ticks, evaluates the rules in
   [`wrangler/src/alert-rules.ts`](../wrangler/src/alert-rules.ts), persists
@@ -65,23 +66,29 @@ No Gatus or third-party monitor is used.
 
 `gateway_checkpoint_failures` fires on an increase in the checkpoint-failure
 counter between metric samples. `gateway_unpaired_disconnect` detects a
-sustained disconnect without RESUMED or fresh READY. Read the class and failed
-step from the Container's structured `gateway_failed` log line, which carries
-`failed_step` and the sanitized `error_code`. The Worker separately writes a
-`container_gateway_failure` event with only the phase and class. The `/readyz`
-`gateway_failure` field also exposes phase and class only. SQL errors are never
-emitted verbatim. A PostgreSQL SQLSTATE code appears only when the producer
-explicitly extracts it; do not infer one from a generic `database` class. A
-missing grant (`42501`) or missing table (`42P01`) is a deployment/schema/ACL
-issue for the authorized Operator,
+sustained disconnect without RESUMED or fresh READY. `rest_5xx_rate` fires when
+Discord 5xx responses exceed 10% of REST requests in a window. Read the class
+and failed step from the Container's structured `gateway_failed` log line,
+which carries `failed_step` and the sanitized `error_code`. The Worker
+re-emits the same phase, class, failed step and SQLSTATE code in its
+`container_gateway_failure` event, and `/readyz` serves the step plus the code
+in `gateway_failure.failed_step`/`error_code` alongside the phase/class. SQL
+errors are never emitted verbatim. A PostgreSQL SQLSTATE code appears only when
+the producer explicitly extracts it; do not infer one from a generic
+`database` class. A missing grant (`42501`) or missing table (`42P01`) is a
+deployment/schema/ACL issue for the authorized Operator,
 not something to repair with a production query or restart.
 
+Every alert message and alert log line carries the container build revision and
+a log-query link; a crash-loop or unhandled exception surfaces as a sustained
+`/readyz` red, which alerts after the readiness threshold below.
+
 If `/readyz` remains red, the Worker/DO readiness transition alerts after its
-configured consecutive-failure threshold (default approximately ten minutes
-at the 60-second keepalive cadence). This is not a two-minute guarantee. A
-missing/invalid metrics scrape preserves existing firing state and does not
-count as recovery. See the detailed rule definitions and their alert-response
-sections in [the operations runbook](runbook.md#metrics-alerts) and
+configured consecutive-failure threshold (default approximately two minutes
+at the 60-second keepalive cadence). A missing/invalid metrics scrape preserves
+existing firing state and does not count as recovery. See the detailed rule
+definitions and their alert-response sections in
+[the operations runbook](runbook.md#metrics-alerts) and
 [metrics reference](metrics.md#off-container-scrape-and-alert-rules).
 
 ## Known coverage limits
@@ -89,9 +96,6 @@ sections in [the operations runbook](runbook.md#metrics-alerts) and
 These are deliberate, visible limits of the current implementation; do not
 claim them as shipped acceptance:
 
-- Worker/DO alert log lines and Discord messages do not yet consistently carry
-  the Container Git SHA and a direct log-query URL. Use the build/deploy
-  correlation procedure above.
 - Container tracing is structured JSON, but a single `request_id` is not yet
   propagated end-to-end from Worker through Container, Durable Object, and
   queued work. Do not assume logs can be joined by request ID.

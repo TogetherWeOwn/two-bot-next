@@ -93,6 +93,10 @@ const JOB_ERROR_CLASS_SET: ReadonlySet<string> = new Set(JOB_ERROR_CLASSES);
 export const REST_429_RATIO = 0.1;
 /** ...and the window must hold at least this many requests. */
 export const REST_429_MIN_REQUESTS = 10;
+/** 5xxs must exceed this share of REST requests between two samples... */
+export const REST_5XX_RATIO = 0.1;
+/** ...and the window must hold at least this many requests. */
+export const REST_5XX_MIN_REQUESTS = 10;
 /** Pool at max with zero idle for this many consecutive samples. */
 export const POOL_SATURATED_SAMPLES = 3;
 /** DB errors must reach this many between two samples... */
@@ -116,6 +120,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "job_stale", summary: `scheduled job has no success for more than ${STALE_INTERVALS} intervals`, runbook: "runbook.md#alert-job-stale" },
   { id: "job_consecutive_failures", summary: `scheduled job failed ${FAILURE_THRESHOLD}+ times in a row`, runbook: "runbook.md#alert-job-failures" },
   { id: "rest_429_rate", summary: `Discord REST 429s exceed ${REST_429_RATIO * 100}% of requests`, runbook: "runbook.md#alert-rest-429" },
+  { id: "rest_5xx_rate", summary: `Discord REST 5xxs exceed ${REST_5XX_RATIO * 100}% of requests`, runbook: "runbook.md#alert-rest-5xx" },
   { id: "db_pool_saturated", summary: `database pool exhausted for ${POOL_SATURATED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-db-pool" },
   { id: "db_errors", summary: `database errors reached ${DB_ERROR_MIN_ERRORS}+ between samples`, runbook: "runbook.md#alert-db-errors" },
   { id: "send_admission_blocked", summary: `Discord sends refused admission for ${SEND_BLOCKED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-send-admission-blocked" },
@@ -141,12 +146,43 @@ export function runbookUrl(rule: RuleDef): string {
   return `${RUNBOOK_BASE_URL}${rule.runbook}`;
 }
 
+/**
+ * Public docs link for the Worker/Container log query backing every alert.
+ * A stable docs URL (not an account-scoped dashboard link) so webhook
+ * messages stay public-safe: the operator opens the environment's Workers
+ * Observability logs from there.
+ */
+export const LOG_QUERY_URL = "https://developers.cloudflare.com/workers/observability/logs/workers-logs/";
+
+/** Build/SHA context appended to every alert message and alert log line. */
+export interface AlertContext {
+  /** Container Git SHA from `/readyz` (`unknown` when the probe failed). */
+  buildRevision?: string | undefined;
+  /** Failing gateway step from `/readyz` (`gateway_failure.failed_step`). */
+  failedStep?: string | undefined;
+  /** SQLSTATE class from `/readyz` (`gateway_failure.error_code`). */
+  errorCode?: string | undefined;
+}
+
+/** Shared suffix carrying build, failure detail and the log-query link. */
+export function alertContextSuffix(context?: AlertContext): string {
+  const build = context?.buildRevision?.trim() ? context.buildRevision.trim() : "unknown";
+  let suffix = ` Build: ${build}. Logs: ${LOG_QUERY_URL}`;
+  const step = context?.failedStep?.trim();
+  const code = context?.errorCode?.trim();
+  if (step || code) {
+    suffix += ` Failure: ${step || "unknown"}/${code || "none"}.`;
+  }
+  return suffix;
+}
+
 export interface MetricsAlertState {
   /** Rule ids (with subject) currently firing, e.g. `job_stale:rank`. */
   firing: string[];
   /** Latest fixed failure class by job; absent on state stored by older Worker versions. */
   jobErrorClasses?: Record<string, JobErrorClass>;
   rest429: number;
+  rest5xx: number;
   restTotal: number;
   poolStreak: number;
   dbErrors: number;
@@ -184,7 +220,7 @@ export interface MetricsAlertState {
   dispatchDropStreaks?: Record<string, number>;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
 
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
@@ -362,16 +398,22 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   }
 
   let rest429 = 0;
+  let rest5xx = 0;
   let restTotal = 0;
   for (const s of gauge("two_bot_rest_requests_total")) {
     restTotal += s.value;
     if (s.labels["result"] === "429") rest429 += s.value;
+    if (s.labels["result"] === "5xx") rest5xx += s.value;
   }
   // A counter that went backwards means the process restarted: no window.
-  const reset = rest429 < prev.rest429 || restTotal < prev.restTotal;
+  // `?? 0` covers DO storage written before the 5xx field existed.
+  const prevRest5xx = prev.rest5xx ?? 0;
+  const reset = rest429 < prev.rest429 || rest5xx < prevRest5xx || restTotal < prev.restTotal;
   const dTotal = restTotal - prev.restTotal;
   const d429 = rest429 - prev.rest429;
   if (!reset && dTotal >= REST_429_MIN_REQUESTS && d429 / dTotal > REST_429_RATIO) firing.push("rest_429_rate");
+  const d5xx = rest5xx - prevRest5xx;
+  if (!reset && dTotal >= REST_5XX_MIN_REQUESTS && d5xx / dTotal > REST_5XX_RATIO) firing.push("rest_5xx_rate");
 
   const configured = gauge("two_bot_db_pool_configured")[0]?.value === 1;
   const size = gauge("two_bot_db_pool_connections")[0]?.value;
@@ -555,7 +597,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks } };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
@@ -594,20 +636,22 @@ export function transitionMessages(
   after: string[],
   beforeJobErrorClasses?: Record<string, JobErrorClass>,
   afterJobErrorClasses?: Record<string, JobErrorClass>,
+  context?: AlertContext,
 ): string[] {
   const out: string[] = [];
+  const suffix = alertContextSuffix(context);
   for (const key of after.filter((k) => !before.includes(k))) {
     const rule = ruleFor(key);
     const runbook = rule ? runbookUrl(rule) : `${RUNBOOK_BASE_URL}runbook.md`;
     const errorClass = jobErrorClassForAlert(key, afterJobErrorClasses);
     const classSuffix = errorClass ? ` (last error class: ${errorClass})` : "";
     const severity = rule?.severity ? ` (${rule.severity})` : "";
-    out.push(`two-bot-next ALERT ${key}${classSuffix}${severity}: ${rule?.summary ?? key}. Runbook: ${runbook}`);
+    out.push(`two-bot-next ALERT ${key}${classSuffix}${severity}: ${rule?.summary ?? key}. Runbook: ${runbook}.${suffix}`);
   }
   for (const key of before.filter((k) => !after.includes(k))) {
     const errorClass = jobErrorClassForAlert(key, beforeJobErrorClasses);
     const classSuffix = errorClass ? ` (last error class: ${errorClass})` : "";
-    out.push(`two-bot-next RESOLVED ${key}${classSuffix}.`);
+    out.push(`two-bot-next RESOLVED ${key}${classSuffix}.${suffix}`);
   }
   return out;
 }

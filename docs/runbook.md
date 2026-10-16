@@ -146,10 +146,10 @@ Look for these literal messages:
 - `gateway shard loop started` / `gateway reconnect failed; Twilight will retry`.
 - `durable gateway failed; checkpoint unchanged, readiness unavailable` — fatal
   initialization failure; underlying SQL error deliberately not logged. Its
-  `error_class` is also on `/readyz` as `gateway_failure` for 15 s before exit
-  (startup failures linger 15 s; only a running-gateway failure lingers 75 s)
-  and in Workers Logs as `container_gateway_failure` (see
-  [startup-diagnostics.md](startup-diagnostics.md)).
+  `error_class` plus the failing step and SQLSTATE code are also on `/readyz`
+  as `gateway_failure` for 15 s before exit (startup failures linger 15 s;
+  only a running-gateway failure lingers 75 s) and in Workers Logs as
+  `container_gateway_failure` (see [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
 - Worker: `two-bot container started|stopped`, `two-bot /readyz unhealthy`,
   `two-bot keepalive probe failed`, `two-bot container error`.
@@ -264,6 +264,23 @@ Escalate when the 429 share stays above threshold across several windows after
 containment, when the hot route belongs to a writer this team does not own, or
 when 429s coincide with 5xx/transport failures suggesting a wider Discord or
 network incident.
+
+#### Alert: REST 5xx
+
+More than 10% of Discord REST requests between two keepalive samples (minimum
+10 requests in the window) returned 5xx. This is Discord-side error rate, not
+proof of a bot regression: correlate with Discord status before touching the
+bot. A counter reset (process restart) skips the window rather than firing.
+
+First response: read the hot route from the `route` label on
+`two_bot_rest_requests_total{route,result="5xx"}` via the authorized
+`/ops/metrics` scrape; confirm no deploy is in progress. Do not hammer Discord
+or replay uncertain writes. A 5xx burst next to a 429 burst points at Discord
+or network trouble, not at the send-admission lane.
+
+Escalate when the 5xx share stays above threshold across several windows after
+containment, or when 5xx coincides with transport failures or gateway
+disconnects suggesting a wider incident.
 
 Executor route templates (fixed vocabulary): `GET /guilds/:guild/members/:member`
 counts member fetches, `GET /users/@me` counts current-user reads (literal
@@ -530,14 +547,14 @@ First response: if the failing process is still up (within the linger), read
 the `stage` label on `two_bot_gateway_checkpoint_failures_total` via the
 authorized `/ops/metrics` scrape — `pre_commit` means the commit was skipped
 after a funnel, leveling or acknowledgement failure, while `commit` means the
-durable store write itself failed. Once the process has restarted, the stage
-is not recoverable: the counter resets to zero and the Worker log line
-(`{"event":"container_gateway_failure","phase":…,"class":…}`) carries only
-`phase` and `class` — both stages map to `gateway_runtime_failed` — never
-the `stage`. Do not wait for the stage then; check the `gateway` component on
-`/readyz` and the Neon status for the staging branch instead: a `commit`
-failure next to DB-error or pool alerts points at the database, not the
-gateway. Do not restart manually: the process exits on its own after
+durable store write itself failed. The Worker log line
+(`container_gateway_failure`) and `/readyz` `gateway_failure` carry the phase,
+class, failing step and SQLSTATE code — both checkpoint stages map to
+`gateway_runtime_failed` — but never the checkpoint `stage`. Do not wait for
+the stage then; check the `gateway` component on `/readyz` and the Neon status
+for the staging branch instead: a `commit` failure next to DB-error or pool
+alerts points at the database, not the gateway. Do not restart manually: the
+process exits on its own after
 the linger and the supervisor restarts from the committed checkpoint — verify
 the replacement is healthy per the
 [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
