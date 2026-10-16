@@ -676,8 +676,8 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" cargo-llvm-cov
           rm -f "$RUNNER_TEMP/lcov.info"
           if ! "$RUNNER_TEMP/cargo-llvm-cov" llvm-cov --workspace --lib --bins \
-            --features two-bot-core/db --include-ignored --locked --ignore-run-fail \
-            --lcov --output-path "$RUNNER_TEMP/lcov.info"; then
+            --features two-bot-core/db --locked --ignore-run-fail \
+            --lcov --output-path "$RUNNER_TEMP/lcov.info" -- --include-ignored; then
             echo "::error::patch coverage measurement failed to build or report"
             exit 1
           fi

@@ -6,7 +6,7 @@ existing routed runner. Patch coverage runs in `rust-tests`, alongside the
 existing disposable Postgres service, rather than the lint-only `check` lane.
 
 - Patch coverage (HARD): `cargo llvm-cov --workspace --lib --bins
-  --features two-bot-core/db --include-ignored` plus
+  --features two-bot-core/db -- --include-ignored` plus
   `scripts/ci/check-patch-coverage.py` requires 80% line coverage over the
   lines the PR adds. Measurement uses the `rust-tests` lane's disposable
   Postgres service and test database so ignored database-backed tests can run.

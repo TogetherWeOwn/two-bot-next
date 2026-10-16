@@ -42,7 +42,7 @@ SUPPORT_PATH = "crates/core/tests/support/tracing_capture.rs"
 
 PATCH_ROW = "| Patch coverage | Changed lines >= 80% covered | llvm-cov | every Rust PR |\n"
 REAL_PATCH_ROW = "| Patch coverage | Changed lines >= 80% covered | `cargo llvm-cov` + `scripts/ci/check-patch-coverage.py`, `check` lane | every Rust PR |\n"
-MOVED_PATCH_ROW = "| Patch coverage | Changed lines >= 80% covered | `cargo llvm-cov --workspace --lib --bins --features two-bot-core/db --include-ignored` + `scripts/ci/check-patch-coverage.py`, `rust-tests` lane with disposable Postgres | every Rust PR |\n"
+MOVED_PATCH_ROW = "| Patch coverage | Changed lines >= 80% covered | `cargo llvm-cov --workspace --lib --bins --features two-bot-core/db -- --include-ignored` + `scripts/ci/check-patch-coverage.py`, `rust-tests` lane with disposable Postgres | every Rust PR |\n"
 LINT_ROW = "| Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets -- -D warnings` | every Rust PR |\n"
 REAL_LINT_ROW = "| Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `check` lane | every Rust PR |\n"
 REAL_DEPENDENCIES_ROW = "| Dependencies | Nothing at high or above; advisories fail | `cargo-deny check all`, `check` lane | every PR |\n"

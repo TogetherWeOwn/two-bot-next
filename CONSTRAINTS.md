@@ -48,7 +48,7 @@ not adding one.
 | Format | `cargo fmt --all -- --check` clean | `check` lane | every PR |
 | Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `check` lane | every Rust PR |
 | Floor | No waivers, skips, deleted tests, stripped assertions, lowered thresholds; `#[expect(...)]` and `cfg_attr(..., allow/expect/ignore)` count as waivers | `python3 scripts/ci/check-floor-guard.py`, `check` lane | every PR |
-| Patch coverage | Changed lines >= 80% covered | `cargo llvm-cov --workspace --lib --bins --features two-bot-core/db --include-ignored` + `scripts/ci/check-patch-coverage.py`, `rust-tests` lane with disposable Postgres | every Rust PR |
+| Patch coverage | Changed lines >= 80% covered | `cargo llvm-cov --workspace --lib --bins --features two-bot-core/db -- --include-ignored` + `scripts/ci/check-patch-coverage.py`, `rust-tests` lane with disposable Postgres | every Rust PR |
 | Dependencies | Nothing at high or above; advisories fail | `cargo-deny check all`, `check` lane | every PR |
 | Request-path unwrap | No new `.unwrap()` in route/handler/interaction/command/webhook files (WARN first) | ast-grep rule + `scripts/ci/check-unwrap-request-paths.py`, `check` lane | every Rust PR |
 | Rust pitfalls | No new `todo!`/`unimplemented!`, empty `.expect("")`, `panic!` in non-test code, `process::exit` in library code (WARN first) | vendored `.semgrep/rust-warn.yml` + `scripts/ci/check-semgrep-warn.py`, `check` lane | every Rust PR |

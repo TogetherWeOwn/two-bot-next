@@ -1232,7 +1232,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(step["env"]["QUALITY_BASE"], expected_base)
         self.assertEqual(step["env"]["QUALITY_HEAD"], "${{ github.sha }}")
         self.assertIn("--ignore-run-fail", step["run"])
-        self.assertIn("--include-ignored", step["run"])
+        # --include-ignored is a libtest flag: it must follow the `--`
+        # separator, otherwise cargo-llvm-cov rejects it as an invalid option.
+        self.assertIn("-- --include-ignored", step["run"])
         self.assertIn("--features two-bot-core/db", step["run"])
         self.assertIn("--lib --bins", step["run"])
         self.assertIn('[ ! -s "$RUNNER_TEMP/lcov.info" ]', step["run"])
