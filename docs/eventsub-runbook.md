@@ -138,7 +138,7 @@ Classification after verification:
   on a `stream.online` v1 subscription is echoed as the `200 text/plain`
   body with `Cache-Control: no-store`.
   Source: `crates/core/src/twitch_eventsub.rs:245-272`,
-  `crates/bot/src/eventsub_http.rs:270-286`.
+  `crates/bot/src/eventsub_http.rs:281-297`.
 - Only `stream.online` version `1` is accepted; any other subscription type
   or version is a deterministic `WrongSubscription` error.
   Source: `crates/core/src/twitch_eventsub.rs:225-231`.
@@ -153,7 +153,7 @@ the subscription creation (the challenge was not echoed — delete and
 recreate the subscription, see below), and only then the callback URL shape
 (plain `https`, no port, query, fragment, or userinfo; canonical form).
 Source: `crates/core/src/twitch_eventsub.rs:400-431`,
-`crates/bot/src/eventsub_http.rs:318-325`.
+`crates/bot/src/eventsub_http.rs:332-340`.
 
 ## Refusal matrix
 
@@ -190,7 +190,7 @@ direct `containerFetch`, because the Worker answers those shapes first):
 |---|---|---|---|
 | 400 | `malformed` | false | Query string present, empty body, or invalid challenge on a direct fetch. The query gate runs before verification. Check the forwarded request shape, not the secret. Source: `crates/bot/src/eventsub_http.rs:188-189,259-260,341-343`. |
 | 401 | `unauthorized` | false | Signature, freshness, or timestamp failure, or (on a direct fetch) missing/malformed delivery headers. Via the Worker, a malformed header shape is 400 at ingress (row above); first action is still secret agreement and clock skew (10-minute window). Source: `crates/bot/src/eventsub_http.rs:224-235,263-278`. |
-| 404 | `not_found` | false | Wrong path (exact path is `/hooks/twitch`) or any non-callback route via the fallback on a direct fetch. Via the public URL the Worker already answered non-POSTs and bad shapes with its own 404. Source: `crates/bot/src/eventsub_http.rs:35,184-189`. |
+| 404 | `not_found` | false | Wrong path (exact path is `/hooks/twitch`) or any non-callback route via the fallback on a direct fetch. Via the public URL the Worker already answered non-POSTs and bad shapes with its own 404. Source: `crates/bot/src/eventsub_http.rs:35,88,138-146,184-189`. |
 | 405 | `method_not_allowed` | false | Anything but POST on the callback path on a direct fetch. Via the public URL the Worker drops non-POSTs with its own 404 before the container. Source: `crates/bot/src/eventsub_http.rs:191-203`. |
 | 408 | `request_timeout` | true | Body slower than the 5 s read budget while holding one of the 32 permits. Retriable: the sender (Twitch) backs off and redelivers. Source: `crates/bot/src/eventsub_http.rs:38,238-257`. |
 | 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:36,238-247`, `crates/core/src/twitch_eventsub.rs:49-51`. |
