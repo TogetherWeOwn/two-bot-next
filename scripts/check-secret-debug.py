@@ -24,7 +24,7 @@ FIELD = re.compile(r"\b(\w+)\s*:\s*([^,\n}]+)")
 # credential-bearing variant name (a claim token is an ownership
 # credential in this codebase). Anchored: `SecretTooShort(String)`
 # carries a key id, not a secret, and must not trip this.
-TUPLE_VARIANT = re.compile(r"\b([A-Z]\w*)\s*\(([^;{}]*)\)")
+TUPLE_VARIANT = re.compile(r"\b([A-Z]\w*)\s*\(([^{}]*?)\)")
 SENSITIVE_VARIANT = re.compile(
     r"(?:claimed?|claimtoken|token|accesstoken|refreshtoken|secret|password|credentials?)",
     re.IGNORECASE,
@@ -43,7 +43,23 @@ EXCEPTIONS = {
         "funnel idempotency identifier, not an authentication credential",
     ("crates/core/src/handlers.rs", "StoredRow", "dedupe_token"):
         "funnel idempotency identifier, not an authentication credential",
+    ("crates/core/src/voice_naming.rs", "Segment", "Token"):
+        "voice name-template token name (lowercased @@name@@), not a credential",
 }
+
+
+def split_top_level(payload):
+    fields, depth, start = [], 0, 0
+    for i, ch in enumerate(payload):
+        if ch in "(<[{":
+            depth += 1
+        elif ch in ")>]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            fields.append(payload[start:i])
+            start = i + 1
+    fields.append(payload[start:])
+    return fields
 
 
 def blank_literals(source):
@@ -78,9 +94,12 @@ def violations(source, path="fixture.rs"):
             results.append(f"{path}:{line}: {match['name']}.{name} is raw under derived Debug; use Secret<T>")
         for variant in TUPLE_VARIANT.finditer(body):
             name, payload = variant.groups()
-            if not SENSITIVE_VARIANT.fullmatch(name) or not RAW.search(payload):
+            if not SENSITIVE_VARIANT.fullmatch(name):
                 continue
-            if re.search(r"\bSecret\s*<", payload):
+            if not any(
+                RAW.search(field) and not re.search(r"\bSecret\s*<", field)
+                for field in split_top_level(payload)
+            ):
                 continue
             if (path, match["name"], name) in EXCEPTIONS:
                 continue
@@ -133,10 +152,26 @@ class GuardTests(unittest.TestCase):
     def test_tuple_secret_wrapper_and_plain_payloads_pass(self):
         self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed(Secret<String>), Token(crate::Secret<String>), }'))
         self.assertFalse(violations('#[derive(Debug)] enum Fixture { Message(String), Count(u64), }'))
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed(Secret<[u8; 32]>, u64), }'))
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed(Option<Secret<String>>, u64), }'))
+
+    def test_tuple_mixed_and_array_payloads_fail(self):
+        for variant in [
+            "Token(String, Secret<String>)",
+            "Token(Secret<String>, String)",
+            "ClaimToken([u8; 32])",
+            "Claimed([u8; 32])",
+            "Token(Secret<String>, [u8; 32])",
+        ]:
+            code = f"#[derive(Debug)] enum Fixture {{ {variant}, Other, }}"
+            self.assertEqual(len(violations(code)), 1, code)
 
     def test_exception_is_exact(self):
         code = '#[derive(Debug)] struct ModerationMarker { token: String }'
         self.assertFalse(violations(code, "crates/core/src/mac.rs"))
+        self.assertTrue(violations(code, "other.rs"))
+        code = '#[derive(Debug)] enum Segment { Token(String) }'
+        self.assertFalse(violations(code, "crates/core/src/voice_naming.rs"))
         self.assertTrue(violations(code, "other.rs"))
 
 
