@@ -39,14 +39,17 @@ locked without changing their contents; this is a source-control baseline, **not
 an attestation that a database has applied them**. CI never queries migration
 history in staging or production.
 
-## Risky-statement lint (required)
+## Risky-statement lint (required, with one advisory rule)
 
 `python3 scripts/ci/check-squawk-migrations.py --base-ref <sha>` lints the
 migration files changed since the baseline (CI passes the PR base SHA, the
 push-before SHA, or `origin/main`; without `--base-ref` it lints every
 file). It is a deterministic squawk subset: standard library only, no
-database, no network. CI runs it with `--strict`, so findings fail
-the PR; omit the flag for an advisory local preview.
+database, no network. CI runs with `--strict`: `adding-required-field`,
+`creating-index`, `adding-check-constraint`, and `changing-column-type` findings
+fail the PR. `dropping-object` remains a warning because safe, coordinated
+removal still ends with a `DROP TABLE` or `DROP COLUMN`. Omit `--strict` for a
+local advisory preview of all five rules.
 
 Write migrations that stay silent:
 
@@ -65,9 +68,9 @@ Write migrations that stay silent:
 
 The checker discovers `crates/*/migrations/*.sql` dynamically with
 `--migration-glob` and `--exclude` overrides and no hardcoded crate list,
-so the same script ports 1:1 into a central reusable workflow called from
-every repo (org rollout follow-up: central repo plus org ruleset required
-workflow, then `--strict` here).
+so the same script can be adopted 1:1 by a central reusable workflow called
+from every repo. The remaining org rollout follow-up is a central repo plus
+an org-ruleset required workflow; `--strict` is already enabled here.
 
 ## Existing migration changes
 
