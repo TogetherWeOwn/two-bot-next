@@ -147,12 +147,20 @@ mod tests {
         // Enumerate the migrations directory so a new CREATE without a matrix
         // row fails CI. No database connection is needed. Our 0130 custom
         // commands migration is covered automatically: the file lives in-tree.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
-        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .expect("migrations directory")
-            .map(|entry| entry.expect("migration entry").path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
-            .collect();
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let migration_dirs = [
+            manifest.join("../cutover/migrations"),
+            manifest.join("../store/migrations"),
+        ];
+        let mut paths = Vec::new();
+        for dir in migration_dirs {
+            paths.extend(
+                std::fs::read_dir(&dir)
+                    .expect("migrations directory")
+                    .map(|entry| entry.expect("migration entry").path())
+                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql")),
+            );
+        }
         paths.sort();
         assert!(!paths.is_empty(), "no migrations found");
         for path in paths {
