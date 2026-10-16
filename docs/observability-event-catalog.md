@@ -66,11 +66,11 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `voice rooms enabled; gateway sink attached` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice runtime built; sink attached to the gateway writer |
 | `voice HTTP setup failed; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice HTTP setup failed; gateway continues voice-off |
 | `eventsub startup refused` | `crates/bot/src/main.rs` (`run`, two sites) | EventSub receiver config invalid or bind failed; process exits for supervisor restart |
-| `eventsub delivery refused` | `crates/bot/src/eventsub_http.rs` (`refuse`) | Delivery failed verification, admission or shape checks; `status` and `error_class` name the refusal, bounded `message_type` (`webhook_callback_verification` / `notification` / `revocation` / `unknown`) names the delivery type (`unknown` before headers are established) |
+| `eventsub delivery refused` | `crates/bot/src/eventsub_http.rs` (`refuse`) | Delivery failed verification, admission, shape or classification; `status` and `error_class` name the refusal, bounded `message_type` (`webhook_callback_verification` / `notification` / `revocation` / `unknown`) names the delivery type (`unknown` before headers are established) |
 | `challenge answered` | `crates/bot/src/eventsub_http.rs` (`receive`) | Webhook verification challenge answered with the plaintext challenge; Twitch enables the subscription |
 | `notification acknowledged` | `crates/bot/src/eventsub_http.rs` (`receive`) | Notification verified and acknowledged; durable claim wiring lands in a follow-up slice |
 | `revocation acknowledged` | `crates/bot/src/eventsub_http.rs` (`receive`) | Revocation verified and acknowledged; boot/periodic reconcile owns re-subscription; bounded `reason` (`user_removed` / `authorization_revoked` / `notification_failures_exceeded` / `version_removed` / `other`) answers counts by reason |
-| `delivery ignored` | `crates/bot/src/eventsub_http.rs` (`receive`, three sites) | Deterministic planning error or unknown classify variant acknowledged with 2xx so Twitch does not retry |
+| `delivery ignored` | `crates/bot/src/eventsub_http.rs` (`receive`, two info sites) | Known ignored delivery or deterministic planning error acknowledged with 2xx; unknown/future classification errors are counted as `other` and refused with retryable 503 |
 | `event = "eventsub_receiver"` | `crates/bot/src/eventsub_http.rs` (`refuse`, `receive`) | Bounded `event` field value every receiver emission carries; no header, token or body leaves the process |
 | `eventsub reconcile parked: TWO_EVENTSUB is not exactly 1` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`, `spawn_if_enabled`) | Info; gate dark, no subscription is listed or mutated (`status = "parked"`, `reason = "flag_dark"`) |
 | `eventsub reconcile refused: callback configuration is invalid` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; `TWO_TWITCH_CALLBACK_URL` missing or not an https callback, no Helix call (`error_class = "reconcile_config_invalid"`) |
@@ -126,6 +126,18 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_latency_seconds` | Last heartbeat ACK round-trip; `NaN` until measured |
 | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert) |
+
+## EventSub delivery series
+
+Counters emitted by the Twitch EventSub receiver render. Unknown `kind`
+and `outcome` values collapse to `other`, and no member ID, token, header,
+body, broadcaster, subscription or secret data reaches any label.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures; requests rejected before body intake are not deliveries |
+| `two_bot_eventsub_classified_total{kind}` | Deliveries by bounded receiver classification; `kind` is `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`; `other` marks unknown/future classification errors returned as retryable 503 |
+| `two_bot_eventsub_posts_total{outcome}` | Go-live post attempts by bounded outcome; `outcome` is `attempted`, `succeeded`, `failed` or `other`; zero until the go-live sender slice is wired |
 
 ## Scheduled job labels
 
