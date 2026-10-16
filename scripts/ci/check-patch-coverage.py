@@ -140,6 +140,84 @@ def is_measurable_source(path):
     return False
 
 
+def _contains_fn_body(source):
+    """Whether any ``fn`` item has a ``{`` body before its closing ``;``.
+
+    Linear scan (no regular expressions): ``;`` inside ``()``/``[]`` pairs
+    (for example ``[u8; 32]``) never terminates the signature, so only a
+    ``{`` or ``;`` at nesting depth zero decides. Double-quoted strings and
+    ``//``/``/* */`` comments are skipped so a brace inside them cannot fake
+    a body. A fail-closed conservative choice: an ``fn`` token hidden in a
+    comment still scans forward, which can only report a body (uncovered),
+    never silence a measurable file.
+    """
+    total = len(source)
+    pos = 0
+    while True:
+        idx = source.find("fn", pos)
+        if idx == -1:
+            return False
+        before = source[idx - 1] if idx > 0 else " "
+        after_pos = idx + 2
+        after = source[after_pos] if after_pos < total else " "
+        if (before.isalnum() or before == "_") or (after.isalnum() or after == "_"):
+            pos = idx + 2
+            continue
+        line_start = source.rfind("\n", 0, idx) + 1
+        if "//" in source[line_start:idx]:
+            pos = idx + 2
+            continue
+        if source.count("/*", 0, idx) > source.count("*/", 0, idx):
+            pos = idx + 2
+            continue
+        depth_paren = 0
+        depth_bracket = 0
+        cursor = after_pos
+        in_string = False
+        terminated = False
+        while cursor < total:
+            ch = source[cursor]
+            if in_string:
+                if ch == "\\":
+                    cursor += 2
+                    continue
+                if ch == '"':
+                    in_string = False
+                cursor += 1
+                continue
+            if ch == '"':
+                in_string = True
+                cursor += 1
+                continue
+            if ch == "/" and cursor + 1 < total and source[cursor + 1] == "/":
+                line_end = source.find("\n", cursor + 2)
+                cursor = total if line_end == -1 else line_end + 1
+                continue
+            if ch == "/" and cursor + 1 < total and source[cursor + 1] == "*":
+                close = source.find("*/", cursor + 2)
+                cursor = total if close == -1 else close + 2
+                continue
+            if ch == "(":
+                depth_paren += 1
+            elif ch == ")":
+                if depth_paren > 0:
+                    depth_paren -= 1
+            elif ch == "[":
+                depth_bracket += 1
+            elif ch == "]":
+                if depth_bracket > 0:
+                    depth_bracket -= 1
+            elif ch == "{" and depth_paren == 0 and depth_bracket == 0:
+                return True
+            elif ch == ";" and depth_paren == 0 and depth_bracket == 0:
+                terminated = True
+                break
+            cursor += 1
+        pos = idx + 2
+        if not terminated and cursor >= total:
+            continue
+
+
 def has_instrumentable_function(path):
     """Whether a source file contains a function body the coverage report can map."""
     try:
@@ -147,12 +225,7 @@ def has_instrumentable_function(path):
     except OSError:
         # An unreadable changed source is not evidence that the gate may skip it.
         return True
-    return re.search(
-        r'(?m)^\s*(?:(?:pub(?:\([^)]*\))?|async|const|unsafe|default)\s+)*'
-        r'(?:extern(?:\s+"[^"]+")?\s+)?fn\s+(?:r#)?\w+'
-        r'(?:[^;{}]|\[[^]]*\]|\([^)]*\))*\{',
-        source,
-    ) is not None
+    return _contains_fn_body(source)
 
 
 def evaluate(hits, added):
