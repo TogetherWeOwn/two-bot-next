@@ -146,9 +146,11 @@ pub fn reconnect_delay(policy: &ReconnectPolicy, attempt: u32) -> Option<Duratio
 /// wait exactly [`reconnect_delay`] before the next attempt, except after the
 /// final budgeted attempt, where there is no next attempt to wait for.
 /// Exhausting the budget publishes [`GatewayState::Draining`] so readyz fails
-/// closed. A shutdown that is already pending wins before any attempt
-/// (checked at the top of each iteration, so one arriving during a backoff
-/// sleep ends the episode before the next attempt). Draining is sticky, as at
+/// closed. Shutdown wins immediately: it is checked at the top of each
+/// iteration and raced (biased, shutdown first) against every `connect` and
+/// backoff sleep, so a SIGTERM during a sleep or a hanging connect ends the
+/// episode without waiting out the delay — the same "SIGTERM never waits"
+/// shape as `publish_gateway_failure` in `main.rs`. Draining is sticky, as at
 /// every other publish site: if an outside owner publishes
 /// [`GatewayState::Draining`] during the unlocked `connect` or backoff sleep,
 /// neither publish overwrites it (readyz is never resurrected to ready or
@@ -166,11 +168,10 @@ where
 {
     tokio::pin!(shutdown);
     for attempt in 0..policy.max_attempts {
-        // A shutdown that is already pending wins before any attempt. Poll
-        // `connect` and the backoff sleep directly (not inside `select!`):
-        // racing them against `shutdown` changes how the paused clock in
-        // tests observes the timers, and the recorded attempt timestamps
-        // must advance by exactly the scheduled delay.
+        // A shutdown that is already pending wins before any attempt. The
+        // `connect` and backoff sleep below are also raced against shutdown
+        // (biased, shutdown first): the recorded attempt timestamps still
+        // advance by exactly the scheduled delay when shutdown never fires.
         tokio::select! {
             biased;
             () = &mut shutdown => return SupervisedExit::ShutdownRequested,
@@ -181,7 +182,11 @@ where
         if *state.read().await == GatewayState::Draining {
             return SupervisedExit::ShutdownRequested;
         }
-        let outcome = Box::into_pin(connect(attempt)).await;
+        let outcome = tokio::select! {
+            biased;
+            () = &mut shutdown => return SupervisedExit::ShutdownRequested,
+            outcome = Box::into_pin(connect(attempt)) => outcome,
+        };
         match outcome {
             AttemptOutcome::Connected => {
                 // Guard Draining set during the unlocked connect await, the
@@ -209,9 +214,15 @@ where
                 drop(guard);
                 // `attempt` is within budget (checked above), so the delay
                 // exists; fall back to no wait rather than panic if a future
-                // policy rule ever disagrees.
+                // policy rule ever disagrees. Race the sleep against
+                // shutdown so a SIGTERM during backoff ends the episode
+                // without waiting out the delay.
                 let delay = reconnect_delay(&policy, attempt).unwrap_or(Duration::ZERO);
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    biased;
+                    () = &mut shutdown => return SupervisedExit::ShutdownRequested,
+                    () = tokio::time::sleep(delay) => {}
+                }
             }
         }
     }

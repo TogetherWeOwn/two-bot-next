@@ -16,8 +16,9 @@
 //! - loop pins: a flapping gateway reconnects on the bounded schedule with
 //!   timer-resolution-bounded gaps, and an always-failing gateway stops after
 //!   exactly the budgeted attempts.
-//! - shutdown pin (green now and later): a pending shutdown ends the episode
-//!   before any attempt.
+//! - shutdown pins: a pending shutdown ends the episode before any attempt,
+//!   and a SIGTERM during a backoff sleep preempts the sleep instead of
+//!   waiting it out.
 //! - draining pins: Draining published mid-episode (during the connect await
 //!   or the backoff sleep) is never overwritten by the Connected/Armed
 //!   publishes and ends the episode with no further attempts.
@@ -460,6 +461,81 @@ async fn shutdown_wins_before_any_attempt() {
         SupervisedExit::ShutdownRequested
     );
     assert_eq!(script.attempts(), 0, "no attempt after shutdown");
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_backoff_sleep_ends_episode_without_waiting_out_the_delay() {
+    // SIGTERM during a backoff must end the episode immediately, not after
+    // the full sleep: the sleep is raced against shutdown (biased), the same
+    // "SIGTERM never waits" shape as publish_gateway_failure in main.rs.
+    let policy = ReconnectPolicy {
+        base_delay: Duration::from_secs(30),
+        max_delay: Duration::from_secs(30),
+        max_attempts: 5,
+        seed: FLAP_SEED,
+    };
+    let delay = reconnect_delay(&policy, 0).expect("attempt is within budget");
+    assert!(
+        delay >= Duration::from_secs(15),
+        "the skipped wait must be meaningful, got {delay:?}"
+    );
+    let state = Arc::new(RwLock::new(GatewayState::Connected));
+    let script = Script::new(Arc::clone(&state), u32::MAX);
+    let shutdown_signal = Arc::new(tokio::sync::Notify::new());
+    let shutdown_waiter = Arc::clone(&shutdown_signal);
+    let supervised = tokio::spawn(run_supervised(
+        Arc::clone(&state),
+        policy,
+        script.connector(),
+        async move {
+            shutdown_waiter.notified().await;
+        },
+    ));
+    let next_attempt = script.attempted.notified();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), next_attempt)
+            .await
+            .is_ok(),
+        "supervisor must reach the first attempt within a bounded wait"
+    );
+    for _ in 0..10 {
+        if supervised.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        *state.read().await,
+        GatewayState::Armed,
+        "supervisor must be inside the backoff before shutdown fires"
+    );
+    let before = tokio::time::Instant::now();
+    shutdown_signal.notify_one();
+    for _ in 0..100 {
+        if supervised.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        supervised.is_finished(),
+        "shutdown during backoff must end the episode without waiting out the full sleep"
+    );
+    assert_eq!(
+        supervised.await.expect("supervisor task"),
+        SupervisedExit::ShutdownRequested
+    );
+    assert_eq!(script.attempts(), 1, "no attempt may run after shutdown");
+    let elapsed = tokio::time::Instant::now() - before;
+    assert!(
+        elapsed < delay,
+        "episode waited {elapsed:?}; shutdown must preempt the {delay:?} backoff sleep"
+    );
+    assert_eq!(
+        *state.read().await,
+        GatewayState::Armed,
+        "shutdown leaves the backoff state for its owner to drain"
+    );
 }
 
 /// Connector that stands in for the outside drain owner: it publishes
