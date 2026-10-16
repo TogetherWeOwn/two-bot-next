@@ -19,7 +19,16 @@ DERIVE = re.compile(
     r"(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum)\s+(?P<name>\w+)[^{;]*\{"
 )
 DERIVE_ONE = re.compile(r"#\[derive\((?P<traits>[^)]*)\)\]")
-FIELD = re.compile(r"\b(\w+)\s*:\s*([^,\n}]+)")
+FIELD = re.compile(r"\b(\w+)\s*:(?!:)\s*")
+# Tuple variants carry no field name, so key off an exactly
+# credential-bearing variant name (a claim token is an ownership
+# credential in this codebase). Anchored: `SecretTooShort(String)`
+# carries a key id, not a secret, and must not trip this.
+TUPLE_VARIANT = re.compile(r"\b([A-Z]\w*)\s*\(")
+SENSITIVE_VARIANT = re.compile(
+    r"(?:claimed?|claimtoken|token|accesstoken|refreshtoken|secret|password|credentials?)",
+    re.IGNORECASE,
+)
 SENSITIVE = re.compile(
     r"(?:^|_)(?:token|secret|password|credential|credentials)(?:_|$)"
     r"|^(?:database_url|webhook_url|access_key_id|secret_access_key)$"
@@ -34,7 +43,111 @@ EXCEPTIONS = {
         "funnel idempotency identifier, not an authentication credential",
     ("crates/core/src/handlers.rs", "StoredRow", "dedupe_token"):
         "funnel idempotency identifier, not an authentication credential",
+    ("crates/core/src/voice_naming.rs", "Segment", "Token"):
+        "voice name-template token name (lowercased @@name@@), not a credential",
 }
+
+
+def tuple_variants(body):
+    """Yield (name, payload, offset) for tuple variants in `body`.
+
+    The payload is captured with balanced-paren scanning: a non-greedy
+    regex stops at the first inner `)`, so fields after a parenthesized
+    field (e.g. `Claimed((u64, u64), String)`) would never be checked.
+    """
+    for match in TUPLE_VARIANT.finditer(body):
+        depth, end = 1, match.end()
+        while end < len(body) and depth:
+            depth += (body[end] == "(") - (body[end] == ")")
+            end += 1
+        if depth:
+            continue
+        yield match.group(1), body[match.end():end - 1], match.start()
+
+
+def strip_secret_spans(text):
+    """Remove balanced `Secret<...>` spans, leaving any raw types behind.
+
+    A per-field `Secret<` anywhere check is fail-open when a raw type is
+    nested in the same top-level field as a `Secret`: e.g.
+    `(Secret<String>, String)`, `Option<(Secret<String>, String)>` and
+    `fn() -> (Secret<String>, String)` all print the raw element under
+    derived Debug. Stripping the balanced spans (the `>` of a `->`
+    inside the span does not close it) exposes such raw remnants.
+    """
+    out, i = [], 0
+    while True:
+        match = re.search(r"\bSecret\s*<", text[i:])
+        if not match:
+            out.append(text[i:])
+            return "".join(out)
+        start = i + match.start()
+        out.append(text[i:start])
+        depth, j = 1, i + match.end()
+        while j < len(text) and depth:
+            if text[j] == "<":
+                depth += 1
+            elif text[j] == ">" and not (j > 0 and text[j - 1] == "-"):
+                depth -= 1
+            j += 1
+        i = j
+
+
+def has_raw_outside_secret(text):
+    return bool(RAW.search(strip_secret_spans(text)))
+
+
+def split_top_level(payload):
+    fields, depth, start = [], 0, 0
+    for i, ch in enumerate(payload):
+        if ch in "(<[{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ">":
+            # The `>` of a `->` return arrow is not a closing angle
+            # bracket: counting it drives depth to -1, the following
+            # top-level comma is missed, and a raw field can hide
+            # behind an earlier `Secret<...>`. Clamp stray `>` at 0
+            # for the same reason.
+            if i > 0 and payload[i - 1] == "-":
+                continue
+            if depth > 0:
+                depth -= 1
+        elif ch == "," and depth == 0:
+            fields.append(payload[start:i])
+            start = i + 1
+    fields.append(payload[start:])
+    return fields
+
+
+def named_fields(body):
+    """Yield (name, type, offset) for named fields in `body`.
+
+    The type is captured with balanced-bracket scanning: truncating at
+    the first comma (the old `[^,\\n}]+`) hides every raw element after
+    it, e.g. `token: (u64, String)` or `token: (Secret<String>, String)`.
+    Scanning stops at a top-level comma, semicolon, or closing bracket.
+    """
+    for match in FIELD.finditer(body):
+        depth, end = 0, match.end()
+        while end < len(body):
+            ch = body[end]
+            if ch in "(<[{":
+                depth += 1
+            elif ch in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif ch == ">":
+                if end > 0 and body[end - 1] == "-":
+                    pass  # return arrow, not a closing angle bracket
+                elif depth > 0:
+                    depth -= 1
+            elif ch in ",;" and depth == 0:
+                break
+            end += 1
+        yield match.group(1), body[match.end():end], match.start()
 
 
 def blank_literals(source):
@@ -57,16 +170,25 @@ def violations(source, path="fixture.rs"):
             depth += (clean[end] == "{") - (clean[end] == "}")
             end += 1
         body = clean[start:end - 1]
-        for field in FIELD.finditer(body):
-            name, field_type = field.groups()
-            if not SENSITIVE.search(name) or not RAW.search(field_type):
-                continue
-            if re.search(r"\bSecret\s*<", field_type):
+        for name, field_type, field_start in named_fields(body):
+            if not SENSITIVE.search(name) or not has_raw_outside_secret(field_type):
                 continue
             if (path, match["name"], name) in EXCEPTIONS:
                 continue
-            line = source.count("\n", 0, start + field.start()) + 1
+            line = source.count("\n", 0, start + field_start) + 1
             results.append(f"{path}:{line}: {match['name']}.{name} is raw under derived Debug; use Secret<T>")
+        for name, payload, variant_start in tuple_variants(body):
+            if not SENSITIVE_VARIANT.fullmatch(name):
+                continue
+            if not any(
+                has_raw_outside_secret(field)
+                for field in split_top_level(payload)
+            ):
+                continue
+            if (path, match["name"], name) in EXCEPTIONS:
+                continue
+            line = source.count("\n", 0, start + variant_start) + 1
+            results.append(f"{path}:{line}: {match['name']}::{name} is raw under derived Debug; use Secret<T>")
     return results
 
 
@@ -106,9 +228,67 @@ class GuardTests(unittest.TestCase):
         self.assertFalse(violations('// #[derive(Debug)] struct Bad { token: String }\n#[derive(Debug)] struct Fine { token_count: usize, id: String }'))
         self.assertFalse(violations('const TEXT: &str = "#[derive(Debug)] struct Bad { token: String }";'))
 
+    def test_tuple_variants_fail(self):
+        for variant in ["Claimed(String)", "Token(String)", "ClaimToken(Vec<u8>)", "Secret(&'a str)"]:
+            code = f"#[derive(Clone, Debug)]\npub enum Fixture {{ {variant}, Other, }}"
+            self.assertEqual(len(violations(code)), 1, code)
+
+    def test_tuple_secret_wrapper_and_plain_payloads_pass(self):
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed(Secret<String>), Token(crate::Secret<String>), }'))
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Message(String), Count(u64), }'))
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed(Secret<[u8; 32]>, u64), }'))
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed(Option<Secret<String>>, u64), }'))
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed((u64, u64), Secret<String>), }'))
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Token(fn() -> Secret<String>), }'))
+
+    def test_tuple_mixed_and_array_payloads_fail(self):
+        for variant in [
+            "Token(String, Secret<String>)",
+            "Token(Secret<String>, String)",
+            "ClaimToken([u8; 32])",
+            "Claimed([u8; 32])",
+            "Token(Secret<String>, [u8; 32])",
+            "Claimed((u64, u64), String)",
+            "Token((u64,u64), Vec<u8>)",
+            "Token(fn() -> Secret<String>, String)",
+            "Token(Box<dyn Fn() -> Secret<String>>, String)",
+            "Claimed((Secret<String>, String))",
+            "Token(Option<(Secret<String>, String)>)",
+            "Token(fn() -> (Secret<String>, String))",
+        ]:
+            code = f"#[derive(Debug)] enum Fixture {{ {variant}, Other, }}"
+            self.assertEqual(len(violations(code)), 1, code)
+
+    def test_arrow_inside_secret_at_depth_passes(self):
+        # The `>` of `->` at depth > 0 must not close a bracket: without
+        # that guard the payload splits/strips at the arrow and the raw
+        # `String` inside the `Secret<...>` span looks unwrapped.
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Token(Secret<fn() -> u64, String>), }'))
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Token(Secret<fn() -> String>), }'))
+
+    def test_named_fields_after_first_comma_fail(self):
+        for field in [
+            "token: (u64, String)",
+            "token: (Secret<String>, String)",
+            "token: Option<(Secret<String>, String)>",
+            "password: HashMap<u64, String>",
+            "token: fn() -> (Secret<String>, String)",
+        ]:
+            code = f"#[derive(Debug)] struct Fixture {{ {field}, }}"
+            self.assertEqual(len(violations(code)), 1, code)
+        code = "#[derive(Debug)] enum Fixture { V { token: (u64, String) }, }"
+        self.assertEqual(len(violations(code)), 1, code)
+
+    def test_named_wrapped_fields_after_first_comma_pass(self):
+        self.assertFalse(violations('#[derive(Debug)] struct Safe { token: (Secret<String>, u64), }'))
+        self.assertFalse(violations('#[derive(Debug)] struct Safe { token: (u64, Secret<String>), }'))
+
     def test_exception_is_exact(self):
         code = '#[derive(Debug)] struct ModerationMarker { token: String }'
         self.assertFalse(violations(code, "crates/core/src/mac.rs"))
+        self.assertTrue(violations(code, "other.rs"))
+        code = '#[derive(Debug)] enum Segment { Token(String) }'
+        self.assertFalse(violations(code, "crates/core/src/voice_naming.rs"))
         self.assertTrue(violations(code, "other.rs"))
 
 
