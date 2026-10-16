@@ -62,13 +62,6 @@ _EMITTED_REASON = "emitted series documented in docs/metrics.md; no catalog row 
 # Every emitted family absent from the catalog, with why it stays out.
 # A name here that gains a catalog row fails until its exemption is removed.
 EXEMPT_SERIES = {
-    # REST route family: templates are pinned by the sibling
-    # test_doc_route_list_equals_rest_routes; the catalog tracks event
-    # names, not REST routes.
-    "two_bot_rest_requests_total": (
-        "route templates pinned by test_doc_route_list_equals_rest_routes "
-        "and docs/metrics.md; the catalog tracks event names, not REST routes"
-    ),
     "two_bot_rest_guard_invalid_requests_total": _GUARD_REASON,
     "two_bot_rest_guard_rejected_requests_total": _GUARD_REASON,
     "two_bot_rest_guard_breaker_opens_total": _GUARD_REASON,
