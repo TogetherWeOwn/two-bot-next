@@ -191,6 +191,20 @@ class EvaluateTests(unittest.TestCase):
                 gate.ROOT = real_root
         self.assertEqual(result, (0, 1, [("crates/core/src/ffi.rs", 1)]))
 
+    def test_array_semicolon_in_function_signature_is_instrumentable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "crates/core/src/digest.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("pub fn digest(input: [u8; 32]) { let _ = input; }\\n")
+            real_root = gate.ROOT
+            gate.ROOT = root
+            try:
+                result = gate.evaluate({}, {("crates/core/src/digest.rs", 1)})
+            finally:
+                gate.ROOT = real_root
+        self.assertEqual(result, (0, 1, [("crates/core/src/digest.rs", 1)]))
+
     def test_measurable_source_exclusions_and_root_source_are_pinned(self):
         cases = {
             "crates/bot/src/gateway.rs": True,

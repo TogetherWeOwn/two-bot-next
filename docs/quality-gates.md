@@ -5,7 +5,7 @@ HARD fails the PR. Gates run in their designated lanes in `check.yml` on the
 existing routed runner. Patch coverage runs in `rust-tests`, alongside the
 existing disposable Postgres service, rather than the lint-only `check` lane.
 
-- Patch coverage (HARD): `cargo llvm-cov --workspace --lib --bins
+- Patch coverage (HARD): `cargo llvm-cov --workspace --lib --bins --tests
   --features two-bot-core/db -- --include-ignored` plus
   `scripts/ci/check-patch-coverage.py` requires 80% line coverage over the
   lines the PR adds. Measurement uses the `rust-tests` lane's disposable

@@ -1236,7 +1236,7 @@ class WorkflowTests(unittest.TestCase):
         # separator, otherwise cargo-llvm-cov rejects it as an invalid option.
         self.assertIn("-- --include-ignored", step["run"])
         self.assertIn("--features two-bot-core/db", step["run"])
-        self.assertIn("--lib --bins", step["run"])
+        self.assertIn("--lib --bins --tests", step["run"])
         self.assertIn('[ ! -s "$RUNNER_TEMP/lcov.info" ]', step["run"])
         self.assertEqual(
             step["env"]["TWO_TEST_DATABASE_URL"],

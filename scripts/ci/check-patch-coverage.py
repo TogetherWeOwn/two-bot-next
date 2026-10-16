@@ -116,7 +116,7 @@ def normalize(path):
 
 
 def is_measurable_source(path):
-    """Workspace-relative Rust sources the lib+bins report must instrument.
+    """Workspace-relative Rust sources the lib+bins+tests report must instrument.
 
     Test-only files (``*_test.rs``, ``*_tests.rs``, ``test_*.rs``,
     ``tests.rs``, or anything under a ``tests`` directory) are excluded:
@@ -149,7 +149,8 @@ def has_instrumentable_function(path):
         return True
     return re.search(
         r'(?m)^\s*(?:(?:pub(?:\([^)]*\))?|async|const|unsafe|default)\s+)*'
-        r'(?:extern(?:\s+"[^"]+")?\s+)?fn\s+(?:r#)?\w+[^;{]*\{',
+        r'(?:extern(?:\s+"[^"]+")?\s+)?fn\s+(?:r#)?\w+'
+        r'(?:[^;{}]|\[[^]]*\]|\([^)]*\))*\{',
         source,
     ) is not None
 
