@@ -10,7 +10,8 @@ name: synthetic-user-flow
 # When it runs: every 5 minutes on main, plus manual dispatch. The dispatch
 # `force_fail` input proves the failure-to-alert path without touching prod:
 # it points the staging probe at an unallowlisted origin so the fence refuses
-# (exit 2), the evidence upload keeps the refusal, and the alert step posts.
+# (exit 2), the upload tolerates the missing receipt, and the alert posts with
+# unknown build identity plus the run link.
 #
 # Operator bindings (never in this file): repo vars STAGING_WORKER_URL and
 # PROD_WORKER_URL carry the two Worker origins, and the `synthetic-alerts`
