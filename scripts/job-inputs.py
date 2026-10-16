@@ -216,7 +216,6 @@ RUST_WORKER_EXACT = frozenset({
 # ``supply`` (CI standard rule 6, TOG-14881). They select no test job.
 IMAGE_ONLY_EXACT = frozenset({
     "Dockerfile",
-    "Dockerfile.distroless",
     ".dockerignore",
 })
 

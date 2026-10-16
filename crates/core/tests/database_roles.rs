@@ -248,6 +248,9 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
         .execute(pool)
         .await?;
+    sqlx::raw_sql("CREATE TABLE public._two_bot_migrations (version bigint PRIMARY KEY);")
+        .execute(pool)
+        .await?;
     sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
         .execute(pool)
         .await?;
@@ -1450,6 +1453,9 @@ async fn scratch_membership_run(creation_self_grant: Option<&str>) {
         sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
             .execute(&provisioner_pool)
             .await?;
+        sqlx::raw_sql("CREATE TABLE public._two_bot_migrations (version bigint PRIMARY KEY);")
+            .execute(&provisioner_pool)
+            .await?;
         sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
             .execute(&provisioner_pool)
             .await?;
@@ -1538,6 +1544,10 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         .await
         .unwrap();
     sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
+        .execute(&provision_pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TABLE public._two_bot_migrations (version bigint PRIMARY KEY);")
         .execute(&provision_pool)
         .await
         .unwrap();

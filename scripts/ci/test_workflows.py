@@ -11,15 +11,18 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
-    # Branch keeps the moderation-db job; main #84 added the supply-chain job.
-    # The pin must be the union of both sides.
+    # The nextest branch adds its required lane; main adds the production schema gate.
+    # The inventory pin must retain both changes.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
                   "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
                   # `check` is now the lint lane; the test steps it used to
                   # carry run in these three parallel lanes, all gated by ci-ok.
                   "rust-tests", "ignored-db-stores", "ignored-db-runtime",
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
-                  "fuzz-compile"},
+                  "fuzz-compile",
+                  # Promoted nextest lane (shared reusable), gated by ci-ok
+                  # like the Rust lanes.
+                  "nextest"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "production", "release"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "voice-synthetic"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
@@ -50,11 +53,11 @@ JOB_INVENTORY = {
     # runner. Read-only, no secrets, no deploy route: the generic
     # deployment/probe scan already passes, so only the inventory pin is needed.
     "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke"},
-    # SDLC 2.3 CI speed pilot (advisory only, never required, never in
-    # ci-ok): dorny/paths-filter affected-only selection, the shared
-    # nextest lane, and the minutes-per-merged-PR report.
-    "ci-speed.yml": {"changes", "nextest", "report"},
-    # Shared nextest lane, called by ci-speed.yml; org-level home is
+    # SDLC 2.3 CI speed evidence (the shared nextest lane graduated to a
+    # required check.yml job): dorny/paths-filter affected-only selection
+    # and the minutes-per-merged-PR report.
+    "ci-speed.yml": {"changes", "report"},
+    # Shared nextest lane, called by check.yml; org-level home is
     # TogetherWeOwn/.github with a pinned SHA like test-guard.
     "reusable-rust-nextest.yml": {"nextest"},
     # Advisory PR-size labels (org reusable, advisory only, never required):
@@ -70,9 +73,10 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
                    ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
-                   # SDLC 2.3 CI speed pilot: advisory caller to the shared
-                   # nextest lane (local path until the central move).
-                   ("ci-speed.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
+                   # SDLC 2.3 CI speed pilot, promoted: required check.yml
+                   # caller to the shared nextest lane (local path until
+                   # the central move).
+                   ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
                    # Advisory PR-size labels: thin caller to the central
                    # reusable, pinned SHA (repin both refs together).
                    ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2",
@@ -122,7 +126,7 @@ RUNTIME_PATHS = (
     "crates/bot/src/main.rs", "crates/core/Cargo.toml", "crates/core/README.md",
     "crates/core/tests/fixtures/reference_settings.json", "src/main.rs",
     "sql/web_v1.sql", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml",
-    "migrations.lock", "Dockerfile", "Dockerfile.distroless", ".dockerignore",
+    "migrations.lock", "Dockerfile", ".dockerignore",
     "wrangler/wrangler.toml", "wrangler/src/index.ts", "wrangler/package.json",
     "wrangler/package-lock.json", "wrangler/scripts/ownership-control.mjs",
     "wrangler/README.md", "scripts/staging_rollout.py", "scripts/container-smoke.py",
@@ -251,7 +255,9 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
         pairs.append((branch_env, branch_input))
     pairs.extend([("RECOVERY_REF", "recovery_evidence_ref"),
                   ("ACL_REF", "acl_plan_ref"), ("EXPECTED_PENDING", "expected_pending"),
+                  ("EXPECTED_STORE_PENDING", "expected_store_pending"),
                   ("PLAN_MANIFEST_SHA256", "plan_manifest_sha256"),
+                  ("STORE_PLAN_MANIFEST_SHA256", "store_plan_manifest_sha256"),
                   ("PLAN_RUN_ID", "plan_run_id")])
     expected_env = {key: "${{ inputs." + value + " }}" for key, value in pairs}
     if publish.get("env") != expected_env or publish.get("shell") != "bash":
@@ -320,10 +326,12 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
     if set(on) != {"workflow_dispatch"}:
         errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
     inputs = ((on.get("workflow_dispatch") or {}).get("inputs") or {})
-    optional = {"mode", "expected_pending", "plan_manifest_sha256", "plan_run_id"}
+    optional = {"mode", "expected_pending", "expected_store_pending",
+                "plan_manifest_sha256", "store_plan_manifest_sha256", "plan_run_id"}
     expected = {"mode", "source_sha", host_input, db_input,
                 "recovery_evidence_ref", "acl_plan_ref", "expected_pending",
-                "plan_manifest_sha256", "plan_run_id"}
+                "expected_store_pending", "plan_manifest_sha256",
+                "store_plan_manifest_sha256", "plan_run_id"}
     if branch_input is not None:
         expected.add(branch_input)
         optional.add(branch_input)
@@ -352,7 +360,13 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                 or "ascending" not in str(pending.get("description")).lower()):
             errors.append(f"{name}: expected_pending must stay optional, default empty, "
                           "and documented as the ascending reviewed plan list")
-        for key in ("plan_manifest_sha256", "plan_run_id"):
+        store_pending = inputs.get("expected_store_pending") or {}
+        if (str(store_pending.get("required")).lower() != "false"
+                or store_pending.get("default") != ""
+                or "ascending" not in str(store_pending.get("description")).lower()):
+            errors.append(f"{name}: expected_store_pending must stay optional, default empty, "
+                          "and documented as the ascending reviewed store plan list")
+        for key in ("plan_manifest_sha256", "store_plan_manifest_sha256", "plan_run_id"):
             field = inputs.get(key) or {}
             if str(field.get("required")).lower() != "false" or field.get("default") != "":
                 errors.append(f"{name}: {key} must stay optional and default empty "
@@ -361,6 +375,10 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         if "sha" not in str(digest.get("description")).lower():
             errors.append(f"{name}: plan_manifest_sha256 must document the manifest-hash contract "
                           "(apply refuses unless it matches on the same source_sha)")
+        store_digest = inputs.get("store_plan_manifest_sha256") or {}
+        if "sha" not in str(store_digest.get("description")).lower():
+            errors.append(f"{name}: store_plan_manifest_sha256 must document the store "
+                          "manifest-hash contract (apply refuses unless it matches)")
         acl = inputs.get("acl_plan_ref") or {}
         if "bare" not in str(acl.get("description")).lower():
             errors.append(f"{name}: acl_plan_ref must document the bare reference contract "
@@ -448,8 +466,12 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         errors.append(f"{name}:apply: must run the migrator with --apply only")
     if "--plan-manifest-sha256" not in apply_runs or "--plan-run-id" not in apply_runs:
         errors.append(f"{name}:apply: must pass the plan-bound manifest hash and run id to the runner")
+    if "--store-plan-manifest-sha256" not in apply_runs or "--expected-store-pending" not in apply_runs:
+        errors.append(f"{name}:apply: must pass the store plan-bound manifest hash and pending list to the runner")
     if "--plan-manifest-sha256" in plan_runs or "--plan-run-id" in plan_runs:
         errors.append(f"{name}:plan: must not take plan-bound inputs (it produces the manifest)")
+    if "--store-plan-manifest-sha256" in plan_runs:
+        errors.append(f"{name}:plan: must not take the store plan-bound hash (it produces the manifest)")
     if "--plan-manifest-path" not in apply_runs:
         errors.append(f"{name}:apply: must pass the producing run's downloaded manifest to the runner")
     if "--plan-manifest-path" in plan_runs:
@@ -2320,7 +2342,26 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(installers["check"][0]["with"]["components"].replace(" ", "").split(",")),
                          {"rustfmt", "clippy"})
 
-    def test_rust_tests_toolchain_install_is_retry_guarded(self):
+    def pinned_toolchain_lanes(self, channel):
+        # Every PR-gating job that installs the repository pin: all of
+        # check.yml (the ci-ok aggregate) and the shared nextest lane it
+        # calls. The nightly-pinned fuzz lane installs a different toolchain
+        # and is excluded by the channel match.
+        lanes = []
+        for workflow_name in ("check.yml", "reusable-rust-nextest.yml"):
+            for job_id, job in self.workflows[workflow_name]["jobs"].items():
+                if any(str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")
+                       and step.get("with", {}).get("toolchain") == channel
+                       for step in job.get("steps", [])):
+                    lanes.append((workflow_name, job_id))
+        # Sentinels: an enumeration that silently found nothing would pass
+        # every subtest vacuously.
+        for lane in (("check.yml", "ignored-db-runtime"), ("reusable-rust-nextest.yml", "nextest")):
+            self.assertIn(lane, lanes)
+        self.assertNotIn(("check.yml", "fuzz-compile"), lanes)
+        return lanes
+
+    def test_rust_toolchain_installs_are_retry_guarded(self):
         # `rustup toolchain install` inside the installer failed once on main
         # with `Network is unreachable` syncing the channel manifest, failing
         # the job before any test ran (green on re-run). The upstream
@@ -2328,36 +2369,125 @@ class WorkflowTests(unittest.TestCase):
         # continues on error and the next step retries the same pin and fails
         # closed. The retry must request the repository pin and every
         # component the installer requests, or a green retry can mask a drift.
+        # Every PR-gating lane that installs the pin must carry the guard: a
+        # 4-second install failure on ignored-db-runtime reddened PR #984
+        # while the identical step passed on the other lanes of the same
+        # head. The lanes are enumerated from the workflows, not listed, so a
+        # new lane cannot install the pin unguarded. Scheduled and manual
+        # workflows (nightly, benchmark, fuzz smoke) do not gate a PR and
+        # stay out of scope.
         channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
-        steps = self.workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
-        installers = [index for index, step in enumerate(steps)
-                      if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
-        self.assertEqual(len(installers), 1)
-        index = installers[0]
-        installer = steps[index]
-        self.assertTrue(installer.get("continue-on-error"),
-                        "toolchain installer must continue so the retry step can run")
-        self.assertIn("id", installer)
-        retry = steps[index + 1]
-        self.assertNotIn("uses", retry)
-        self.assertIn("run", retry)
-        self.assertEqual(retry.get("if"), f"steps.{installer['id']}.outcome == 'failure'")
-        self.assertNotEqual(retry.get("continue-on-error"), True,
-                            "the retry must fail the job when the toolchain stays missing")
-        self.assertIn(channel, retry["run"])
-        for component in installer["with"]["components"].replace(" ", "").split(","):
-            with self.subTest(component=component):
-                self.assertIn(component, retry["run"])
-        with self.subTest(change="retry step removed"):
-            workflows = deepcopy(self.workflows)
-            del workflows["check.yml"]["jobs"]["rust-tests"]["steps"][index + 1]
-            retry_steps = workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
-            still_guarded = (
-                len(retry_steps) > index + 1
-                and "run" in retry_steps[index + 1]
-                and retry_steps[index + 1].get("if") == f"steps.{installer['id']}.outcome == 'failure'"
-            )
-            self.assertFalse(still_guarded, "removing the retry step must fail this guard")
+        targets = self.pinned_toolchain_lanes(channel)
+        for workflow_name, job_id in targets:
+            with self.subTest(workflow=workflow_name, job=job_id):
+                steps = self.workflows[workflow_name]["jobs"][job_id]["steps"]
+                installers = [index for index, step in enumerate(steps)
+                              if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
+                self.assertEqual(len(installers), 1)
+                index = installers[0]
+                installer = steps[index]
+                self.assertTrue(installer.get("continue-on-error"),
+                                "toolchain installer must continue so the retry step can run")
+                self.assertIn("id", installer)
+                retry = steps[index + 1]
+                self.assertNotIn("uses", retry)
+                self.assertIn("run", retry)
+                # Container steps default to sh, where `set -euo pipefail`
+                # aborts before any retry runs (b7753a4). The retry needs bash.
+                self.assertEqual(retry.get("shell"), "bash",
+                                 "toolchain retry must run under bash, not container sh")
+                self.assertEqual(retry.get("if"), f"steps.{installer['id']}.outcome == 'failure'")
+                self.assertNotEqual(retry.get("continue-on-error"), True,
+                                    "the retry must fail the job when the toolchain stays missing")
+                self.assertIn(channel, retry["run"])
+                components = installer.get("with", {}).get("components", "")
+                for component in filter(None, components.replace(" ", "").split(",")):
+                    with self.subTest(component=component):
+                        self.assertIn(component, retry["run"])
+                with self.subTest(change="retry step removed"):
+                    workflows = deepcopy(self.workflows)
+                    del workflows[workflow_name]["jobs"][job_id]["steps"][index + 1]
+                    retry_steps = workflows[workflow_name]["jobs"][job_id]["steps"]
+                    still_guarded = (
+                        len(retry_steps) > index + 1
+                        and "run" in retry_steps[index + 1]
+                        and retry_steps[index + 1].get("if") == f"steps.{installer['id']}.outcome == 'failure'"
+                    )
+                    self.assertFalse(still_guarded, "removing the retry step must fail this guard")
+
+    def test_rust_toolchain_retry_fails_closed_behaviorally(self):
+        # Behavioral pin for the retry guard above: substrings alone cannot
+        # pin branch selection (deleting `[ "$attempt" -lt 5 ] || exit 1`
+        # keeps every substring while the step exits 0 with no toolchain
+        # installed) or the exact pin (a `rustup default stable` keeps the
+        # install-line substring). Run each retry step under bash with
+        # function-shimmed fake `rustup`/`sleep` (a function shim, not a
+        # PATH shim, so the pin also runs in harnesses that sanitize PATH
+        # on exec): always-failing rustup exits 1 after exactly 5 installs
+        # with no default, and rustup succeeding on attempt 2 exits 0 having
+        # defaulted the exact repository pin.
+        import os
+        import subprocess
+        import tempfile
+
+        channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+        targets = self.pinned_toolchain_lanes(channel)
+        fake_prelude = (
+            "rustup() {\n"
+            "  printf '%s\\n' \"$*\" >> \"$FAKE_RUSTUP_CALLS\"\n"
+            "  FAKE_N=$((${FAKE_N:-0} + 1))\n"
+            "  if [ \"$FAKE_N\" -lt \"$FAKE_SUCCEED_ON\" ]; then return 1; fi\n"
+            "  return 0\n"
+            "}\n"
+            "sleep() { :; }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            calls_path = tmp_path / "rustup-calls.txt"
+            for workflow_name, job_id in targets:
+                steps = self.workflows[workflow_name]["jobs"][job_id]["steps"]
+                installers = [index for index, step in enumerate(steps)
+                              if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
+                self.assertEqual(len(installers), 1)
+                run_text = str(steps[installers[0] + 1]["run"])
+                for case_name, succeed_on, expected_status, expected_installs in (
+                    ("always-fails", "99", 1, 5),
+                    ("succeeds-on-2", "2", 0, 2),
+                ):
+                    with self.subTest(workflow=workflow_name, job=job_id, case=case_name):
+                        calls_path.write_text("", encoding="utf-8")
+                        run_env = dict(os.environ)
+                        run_env.update(
+                            {
+                                "FAKE_RUSTUP_CALLS": str(calls_path),
+                                "FAKE_SUCCEED_ON": succeed_on,
+                            }
+                        )
+                        proc = subprocess.run(
+                            ["bash", "-c", fake_prelude + run_text],
+                            env=run_env,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        self.assertEqual(
+                            proc.returncode, expected_status,
+                            f"unexpected retry status: {proc.stderr}",
+                        )
+                        calls = calls_path.read_text(encoding="utf-8").splitlines()
+                        installs = [line for line in calls if line.startswith("toolchain install ")]
+                        self.assertEqual(len(installs), expected_installs,
+                                         f"expected {expected_installs} installs, got: {calls}")
+                        for line in installs:
+                            self.assertIn(channel, line,
+                                          f"retry must install the exact pin, got: {line!r}")
+                        defaults = [line for line in calls if line.startswith("default ")]
+                        if expected_status == 0:
+                            self.assertIn(f"default {channel} --force-non-host", defaults,
+                                          f"retry must default the exact pin, got: {calls}")
+                        else:
+                            self.assertEqual(defaults, [],
+                                             f"failed retry must not default anything, got: {calls}")
 
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
@@ -2434,61 +2564,70 @@ class WorkflowTests(unittest.TestCase):
         self.assertIs(profile.get("fail-fast"), False)
 
     def test_nextest_shared_backends_stay_off_pull_requests(self):
-        # R2 write credentials must never reach PR-built code (build scripts
-        # and tests execute at the PR head, and a shared R2 bucket has no
-        # per-PR scope: a PR could poison objects main later links). The
-        # GitHub-cache backend has the same quota shape: the lane's entries
-        # share the repo Actions cache with the warm `check` entry. PR runs
-        # therefore use sccache on local disk only; shared backends are
-        # main/push-only.
+        # R2 write credentials must never reach PR- or merge-queue-built code
+        # (build scripts and tests execute at a head that is not on `main`
+        # yet, and a shared R2 bucket has no per-PR scope: a PR could poison
+        # objects main later links). check.yml runs on merge_group, so a
+        # pull_request-only denylist is not enough. Only push-to-main and
+        # workflow_dispatch runs may use shared backends; every other event
+        # uses sccache on local disk only. The GitHub-cache backend has the
+        # same quota shape: the lane's entries share the repo Actions cache
+        # with the warm `check` entry, so non-main runs must not grow it.
         lane = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
         select = next(step for step in lane.get("steps", [])
                       if str(step.get("name", "")).startswith("Select sccache backend"))
         run_text = str(select.get("run", ""))
-        self.assertIn("pull_request", run_text)
+        self.assertIn("workflow_dispatch", run_text)
         self.assertIn("github.event_name", str(select.get("env", "")))
         self.assertIn("local disk", run_text)
-        # The pull_request branch must come FIRST: reordering the R2 branch
-        # ahead of it (even with the guard kept as a later elif) would let
-        # shared-backend credentials reach PR runs as soon as any secret is
-        # set, while every substring above stays present. Nothing
+        # The allowlist branch must come FIRST: a denylist (`!=`) or a
+        # reordered R2 branch ahead of it would let shared-backend
+        # credentials reach merge_group runs as soon as any secret is set,
+        # while every substring above stays present. Nothing
         # credential-shaped may precede the guard.
         lines = run_text.splitlines()
         gate = next(i for i, line in enumerate(lines)
-                    if "NEXTEST_EVENT" in line and "pull_request" in line)
-        # Exact pin: an inverted (!=), dead (&& false), or reordered guard
-        # all keep the `if ` prefix, so pin the full first line.
+                    if "NEXTEST_EVENT" in line)
+        # Exact pin: a denylist, dead (&& false), or reordered guard all keep
+        # the `if ` prefix, so pin the full first line.
         self.assertEqual(
             lines[gate].strip(),
-            'if [ "$NEXTEST_EVENT" = "pull_request" ]; then',
-            f"pull_request guard must be the exact first branch, got: {lines[gate]!r}",
+            'if [ "$NEXTEST_EVENT" = "push" ] || [ "$NEXTEST_EVENT" = "workflow_dispatch" ]; then',
+            f"push/workflow_dispatch allowlist must be the exact first branch, got: {lines[gate]!r}",
         )
         before = "\n".join(lines[:gate])
         self.assertNotIn("GITHUB_ENV", before)
         self.assertNotIn("R2_", before)
         self.assertNotIn("SCCACHE_", before)
-        # The pull_request body must write nothing shared: an extra
-        # SCCACHE_/R2_/GITHUB_ENV write inside the PR branch keeps every
-        # substring above while leaking credentials on PR runs.
-        end = next(
-            i
-            for i in range(gate + 1, len(lines))
-            if lines[i].strip().startswith("elif ")
-            or lines[i].strip() == "else"
-            or lines[i].strip().startswith("fi")
-        )
-        pr_body = "\n".join(lines[gate + 1 : end])
-        self.assertNotIn("GITHUB_ENV", pr_body)
-        self.assertNotIn("R2_", pr_body)
-        self.assertNotIn("SCCACHE_", pr_body)
-        self.assertNotIn("AWS_", pr_body)
-        # The shared backends are still configured off-PR: this guards
+        indent = lines[gate][: len(lines[gate]) - len(lines[gate].lstrip())]
+
+        def outer_boundary(start, word):
+            return next(
+                i
+                for i in range(start, len(lines))
+                if lines[i].strip() == word
+                and lines[i][: len(lines[i]) - len(lines[i].lstrip())] == indent
+            )
+
+        outer_else = outer_boundary(gate + 1, "else")
+        outer_fi = outer_boundary(outer_else + 1, "fi")
+        # The local-disk body must write nothing shared: an extra
+        # SCCACHE_/R2_/GITHUB_ENV write inside it keeps every substring above
+        # while leaking credentials on PR and merge-queue runs.
+        disk_body = "\n".join(lines[outer_else + 1 : outer_fi])
+        self.assertIn("local disk", disk_body)
+        self.assertNotIn("GITHUB_ENV", disk_body)
+        self.assertNotIn("R2_", disk_body)
+        self.assertNotIn("SCCACHE_", disk_body)
+        self.assertNotIn("AWS_", disk_body)
+        # The shared backends are still configured on main: this guards
         # against gutting the step instead of guarding it.
-        self.assertIn("GITHUB_ENV", "\n".join(lines[end:]))
-        # Behavioral pin: run the extracted step under bash. On PRs the
-        # env file stays empty even with all R2 vars set; off-PR the R2
-        # lines appear. Catches inverted/dead guards and PR-branch writes
-        # that structural pins miss.
+        self.assertIn("GITHUB_ENV", "\n".join(lines[gate + 1 : outer_else]))
+        # Behavioral pin: run the extracted step under bash. On
+        # pull_request, merge_group, and other events the env file stays
+        # empty even with all R2 vars set; on push and workflow_dispatch
+        # the R2 lines appear. Catches inverted/dead guards and disk-branch
+        # writes that structural pins miss.
         import os
         import subprocess
         import tempfile
@@ -2504,48 +2643,52 @@ class WorkflowTests(unittest.TestCase):
             backend_env_path = tmp.name
         try:
             base = dict(os.environ)
-            pr_env = dict(base)
-            pr_env.update(
-                {
-                    "NEXTEST_EVENT": "pull_request",
-                    **r2_env,
-                    "GITHUB_ENV": backend_env_path,
-                }
-            )
-            Path(backend_env_path).write_text("", encoding="utf-8")
-            proc = subprocess.run(
-                ["bash", "-c", run_text],
-                env=pr_env,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(proc.returncode, 0, f"PR backend step failed: {proc.stderr}")
-            self.assertEqual(
-                Path(backend_env_path).read_text(encoding="utf-8"),
-                "",
-                "PR run must not write shared-backend credentials",
-            )
-            push_env = dict(base)
-            push_env.update(
-                {
-                    "NEXTEST_EVENT": "push",
-                    **r2_env,
-                    "GITHUB_ENV": backend_env_path,
-                }
-            )
-            Path(backend_env_path).write_text("", encoding="utf-8")
-            proc = subprocess.run(
-                ["bash", "-c", run_text],
-                env=push_env,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(proc.returncode, 0, f"push backend step failed: {proc.stderr}")
-            written = Path(backend_env_path).read_text(encoding="utf-8")
-            self.assertIn("SCCACHE_BUCKET=test-bucket", written)
-            self.assertIn("AWS_ACCESS_KEY_ID=test-key", written)
+            for event in ("pull_request", "merge_group", "schedule"):
+                with self.subTest(event=event):
+                    run_env = dict(base)
+                    run_env.update(
+                        {
+                            "NEXTEST_EVENT": event,
+                            **r2_env,
+                            "GITHUB_ENV": backend_env_path,
+                        }
+                    )
+                    Path(backend_env_path).write_text("", encoding="utf-8")
+                    proc = subprocess.run(
+                        ["bash", "-c", run_text],
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(proc.returncode, 0, f"{event} backend step failed: {proc.stderr}")
+                    self.assertEqual(
+                        Path(backend_env_path).read_text(encoding="utf-8"),
+                        "",
+                        f"{event} run must not write shared-backend credentials",
+                    )
+            for event in ("push", "workflow_dispatch"):
+                with self.subTest(event=event):
+                    run_env = dict(base)
+                    run_env.update(
+                        {
+                            "NEXTEST_EVENT": event,
+                            **r2_env,
+                            "GITHUB_ENV": backend_env_path,
+                        }
+                    )
+                    Path(backend_env_path).write_text("", encoding="utf-8")
+                    proc = subprocess.run(
+                        ["bash", "-c", run_text],
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(proc.returncode, 0, f"{event} backend step failed: {proc.stderr}")
+                    written = Path(backend_env_path).read_text(encoding="utf-8")
+                    self.assertIn("SCCACHE_BUCKET=test-bucket", written)
+                    self.assertIn("AWS_ACCESS_KEY_ID=test-key", written)
         finally:
             try:
                 os.unlink(backend_env_path)
@@ -2554,26 +2697,142 @@ class WorkflowTests(unittest.TestCase):
         raw = (ROOT / ".github/workflows/reusable-rust-nextest.yml").read_text(encoding="utf-8")
         self.assertNotIn("adds no cache footprint", raw)
 
-    def test_ci_speed_withholds_r2_secrets_on_pull_request(self):
-        # Even with the callee-side guard, the caller must not forward R2
-        # write secrets on pull_request events. The gate must read
-        # `!= 'pull_request' && secrets.X || ''`: the seemingly equivalent
-        # `== 'pull_request' && '' || secrets.X` forwards the secret anyway,
-        # because '' is falsy in GitHub expressions.
-        job = self.workflows["ci-speed.yml"]["jobs"]["nextest"]
+    def test_required_nextest_withholds_r2_secrets_on_pull_request(self):
+        # Even with the callee-side guard, the caller must forward R2 write
+        # secrets only on push to main and workflow_dispatch. check.yml runs
+        # on merge_group too, so a `!= 'pull_request'` gate would forward the
+        # secrets to queued code that is not on `main` yet. The gate must
+        # read `(== 'push' || == 'workflow_dispatch') && secrets.X || ''`:
+        # the seemingly equivalent `== 'pull_request' && '' || secrets.X`
+        # forwards the secret anyway, because '' is falsy in GitHub
+        # expressions.
+        job = self.workflows["check.yml"]["jobs"]["nextest"]
         r2_keys = ("SCCACHE_BUCKET", "SCCACHE_ENDPOINT", "SCCACHE_REGION",
                    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
         for key in r2_keys:
             with self.subTest(secret=key):
-                # Exact pin: only `!= 'pull_request' && secrets.X || ''`
-                # withholds the secret on pull_request. Flipping && to ||
-                # (or leading with `== 'pull_request' && ''`) forwards it
+                # Exact pin: the allowlist form withholds the secret on
+                # pull_request AND merge_group. A `!= 'pull_request'` form or
+                # a leading `== ... && ''` form forwards it on some event
                 # while keeping every substring present, so substrings
                 # cannot pin this gate.
                 self.assertEqual(
                     str(job["secrets"][key]),
-                    "${{ github.event_name != 'pull_request' && secrets." + key + " || '' }}",
+                    "${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets." + key + " || '' }}",
                 )
+
+    def test_required_nextest_caller_shape_is_pinned(self):
+        # The promoted lane is a required check.yml job: least-privilege
+        # grant, rust-selector gate like the other Rust test lanes, exact
+        # head SHA into the reusable lane, and R2 secrets only off-PR
+        # (pinned by the withholding test above).
+        job = self.workflows["check.yml"]["jobs"]["nextest"]
+        self.assertEqual(job.get("name"), "rust nextest")
+        self.assertEqual(job.get("permissions"), {"contents": "read"})
+        self.assertIn("job-inputs", job.get("needs", []))
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
+        self.assertEqual(job.get("uses"), "./.github/workflows/reusable-rust-nextest.yml")
+        self.assertEqual(job["with"]["ref"], "${{ github.event.pull_request.head.sha || github.sha }}")
+        self.assertNotIn("runs-on", job)
+        agg = self.workflows["check.yml"]["jobs"]["ci-ok"]
+        self.assertIn("nextest", agg["needs"])
+        self.assertIn("NEXTEST_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))
+
+    def test_required_nextest_timeout_ceiling_is_pinned(self):
+        # Gate ceiling: the required lane must keep its 45-minute ceiling.
+        # Raising it hides a wedged runner; the pin forces a reviewed change.
+        job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        # BaseLoader keeps scalars as strings; "45" is the 45-minute ceiling.
+        self.assertEqual(job.get("timeout-minutes"), "45")
+
+    def test_required_nextest_quarantine_ejects_without_revert(self):
+        # Red-group ejection path: the `quarantine` input must exist with an
+        # empty default, and the nextest step must turn each filter into a
+        # `--skip` so the rest of the suite still gates. Pinned
+        # cargo-nextest 0.9.99 only accepts `--skip` AFTER the `--`
+        # separator, so the pin asserts the exact argv order: a `--skip`
+        # before `--` fails the whole lane with a usage error.
+        workflow = self.workflows["reusable-rust-nextest.yml"]
+        quarantine = workflow["on"]["workflow_call"]["inputs"]["quarantine"]
+        self.assertEqual(quarantine.get("default"), "")
+        job = workflow["jobs"]["nextest"]
+        run_nextest = next(step for step in job.get("steps", [])
+                           if str(step.get("name", "")).startswith("cargo nextest"))
+        self.assertEqual(run_nextest["env"]["QUARANTINE"], "${{ inputs.quarantine }}")
+        run_text = str(run_nextest.get("run", ""))
+        self.assertIn("--skip", run_text)
+        self.assertIn("$QUARANTINE", run_text)
+        self.assertIn('-- "${skip_args[@]}"', run_text)
+        self.assertNotIn("--profile ci $skip_args", run_text)
+        # Behavioral pin: substrings alone cannot pin branch selection (an
+        # inverted empty/non-empty guard, or a flag dropped from one branch,
+        # keeps every substring above while silently disabling ejection).
+        # Run the extracted step under bash with a function-shimmed fake
+        # `cargo` that records its argv and emits the JUnit file the rest of
+        # the step copies, then pin the exact argv for both quarantine
+        # states. (A function shim, not a PATH shim, so the pin also runs
+        # in harnesses that sanitize PATH on exec.)
+        import os
+        import subprocess
+        import tempfile
+
+        base_argv = [
+            "nextest", "run", "--workspace", "--lib", "--bins",
+            "--features", "two-bot-core/db", "--locked", "--profile", "ci",
+        ]
+        cases = (
+            ("empty-quarantine", "", base_argv, 0, 0),
+            (
+                "two-quarantine-filters",
+                "red_group other_red",
+                base_argv + ["--", "--skip", "red_group", "--skip", "other_red"],
+                0,
+                0,
+            ),
+            # A real nextest failure must remain the step result after the
+            # JUnit report is copied for the always-run ledger/upload steps.
+            ("nextest-failure", "", base_argv, 37, 37),
+        )
+        fake_cargo = (
+            "cargo() {\n"
+            "  printf '%s\\n' \"$@\" > \"$FAKE_CARGO_ARGV\"\n"
+            "  mkdir -p target/nextest/ci\n"
+            "  printf '<testsuites/>\\n' > target/nextest/ci/junit.xml\n"
+            "  return \"${FAKE_CARGO_STATUS:-0}\"\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            argv_path = tmp_path / "cargo-argv.txt"
+            for case_name, quarantine_value, expected_argv, cargo_status, expected_status in cases:
+                with self.subTest(case=case_name):
+                    work_dir = tmp_path / ("work-" + case_name)
+                    work_dir.mkdir()
+                    run_env = dict(os.environ)
+                    run_env.update(
+                        {
+                            "QUARANTINE": quarantine_value,
+                            "FAKE_CARGO_ARGV": str(argv_path),
+                            "FAKE_CARGO_STATUS": str(cargo_status),
+                        }
+                    )
+                    proc = subprocess.run(
+                        ["bash", "-eo", "pipefail", "-c", fake_cargo + run_text],
+                        cwd=work_dir,
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        proc.returncode, expected_status,
+                        f"unexpected step status for {case_name}: {proc.stderr}",
+                    )
+                    recorded = argv_path.read_text(encoding="utf-8").splitlines()
+                    self.assertEqual(recorded, expected_argv)
+                    report = work_dir / "junit.xml"
+                    self.assertTrue(report.is_file(), f"nextest report was not copied for {case_name}")
+                    self.assertEqual(report.read_text(encoding="utf-8"), "<testsuites/>\n")
 
     def test_ci_speed_rollout_documents_pr_local_cache(self):
         rollout = (ROOT / "docs/ci-speed-rollout.md").read_text(encoding="utf-8")

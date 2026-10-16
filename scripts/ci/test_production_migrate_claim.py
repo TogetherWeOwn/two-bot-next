@@ -43,7 +43,9 @@ def production_plan():
 class ProductionClaimTests(unittest.TestCase):
     def setUp(self):
         self.plan = production_plan()
-        self.env = {**ENV, "PLAN_MANIFEST_SHA256": self.plan["plan_manifest_sha256"]}
+        self.env = {**ENV, "PLAN_MANIFEST_SHA256": self.plan["plan_manifest_sha256"],
+                    "STORE_PLAN_MANIFEST_SHA256": self.plan["store_plan_manifest_sha256"],
+                    "EXPECTED_STORE_PENDING": "400,9007199254740992"}
 
     def test_builds_production_claim(self):
         claim = build_claim(self.plan, self.env)
@@ -53,6 +55,14 @@ class ProductionClaimTests(unittest.TestCase):
         self.assertEqual(claim["target"], self.plan["target"])
         self.assertEqual(claim["expected_pending"], ["1", "9007199254740993"])
         self.assertEqual(claim["plan_manifest_sha256"], self.plan["plan_manifest_sha256"])
+        self.assertEqual(claim["expected_store_pending"], ["400", "9007199254740992"])
+        self.assertEqual(claim["store_plan_manifest_sha256"],
+                         self.plan["store_plan_manifest_sha256"])
+        # A wrong store list or hash refuses like the cutover binding.
+        with self.assertRaises(Refused):
+            build_claim(self.plan, {**self.env, "EXPECTED_STORE_PENDING": "400"})
+        with self.assertRaises(Refused):
+            build_claim(self.plan, {**self.env, "STORE_PLAN_MANIFEST_SHA256": "c" * 64})
 
     def test_refuses_staging_manifest(self):
         staging = json.loads(PLAN.read_text())
