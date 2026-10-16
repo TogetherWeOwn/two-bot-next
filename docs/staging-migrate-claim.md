@@ -6,8 +6,10 @@ Existing required reviewers, independent exact-source review, recovery/ACL
 checks and written CEO GO remain required. Production has its own mirror:
 `production-migrate.yml` with `scripts/ci/production_migrate_claim.py`, which
 binds the same projection hash but requires the production workflow path,
-environment, `migration_target` and `PRODUCTION_HOST`/`PRODUCTION_DATABASE`
-pins; a staging claim never satisfies it and vice versa.
+environment, `migration_target` and
+`PRODUCTION_HOST`/`PRODUCTION_DATABASE`/`PRODUCTION_BRANCH_ID` pins (a
+PlanetScale plan without the pinned branch id, or a request pin that does not
+match the plan, refuses); a staging claim never satisfies it and vice versa.
 
 ## Available before environment approval
 

@@ -1,0 +1,343 @@
+"""Offline gate-contract tests; no database, no Actions dispatch, no secrets."""
+
+import json
+import os
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import production_schema_gate
+from production_schema_gate import (
+    Refused,
+    connection_warning,
+    drift_message,
+    is_staging_host,
+    main,
+    pending_versions,
+    pins_from_url,
+    run_gate,
+    verify_binding,
+    waive_reason,
+)
+
+PROD_HOST = "two-production-abc123.us-east-1.aws.example.com"
+PROD_DB = "two_bot"
+PROD_URL = f"postgresql://two_bot_migrator_ro:pw@{PROD_HOST}:5432/{PROD_DB}"
+SHA = "a" * 40
+
+
+def env(url=PROD_URL, host=PROD_HOST, database=PROD_DB, branch=""):
+    return {
+        "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL": url,
+        "TWO_BOT_PRODUCTION_HOST": host,
+        "TWO_BOT_PRODUCTION_DATABASE": database,
+        "TWO_BOT_PRODUCTION_BRANCH_ID": branch,
+    }
+
+
+class PinsFromUrlTests(unittest.TestCase):
+    def test_direct_url_yields_lowercase_host_and_database(self):
+        host, database, branch = pins_from_url(
+            "postgresql://two_bot_migrator_ro:pw@Two-Production-1.Example.COM:5432/two_bot"
+        )
+        self.assertEqual(host, "two-production-1.example.com")
+        self.assertEqual(database, "two_bot")
+        self.assertEqual(branch, "")
+
+    def test_planetscale_url_yields_branch_from_username_suffix(self):
+        host, database, branch = pins_from_url(
+            "postgresql://two-bot-migrator.cnlmx96ec5kw:pw@myapp.pg.psdb.cloud:5432/postgres"
+        )
+        self.assertEqual(host, "myapp.pg.psdb.cloud")
+        self.assertEqual(database, "postgres")
+        self.assertEqual(branch, "cnlmx96ec5kw")
+
+    def test_pooler_port_is_refused_before_any_plan(self):
+        with self.assertRaises(Refused):
+            pins_from_url(f"postgresql://two_bot_migrator_ro:pw@{PROD_HOST}:6432/{PROD_DB}")
+
+    def test_pooler_username_is_refused_before_any_plan(self):
+        with self.assertRaises(Refused):
+            pins_from_url(
+                f"postgresql://two_bot_migrator_ro|bouncer:pw@{PROD_HOST}:5432/{PROD_DB}"
+            )
+
+    def test_garbage_url_is_refused(self):
+        for bad in ("", "not-a-url", "postgresql://", "https://example.invalid/db"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(Refused):
+                    pins_from_url(bad)
+
+
+class VerifyBindingTests(unittest.TestCase):
+    """The binding is compared with independently pinned vars, never itself."""
+
+    def test_matching_binding_passes_and_returns_pins(self):
+        self.assertEqual(verify_binding(PROD_URL, PROD_HOST, PROD_DB, ""), (PROD_HOST, PROD_DB, ""))
+
+    def test_wrong_target_binding_is_refused(self):
+        other = f"postgresql://two_bot_migrator_ro:pw@{PROD_HOST}:5432/other_db"
+        with self.assertRaises(Refused):
+            verify_binding(other, PROD_HOST, PROD_DB, "")
+        wrong_host = f"postgresql://two_bot_migrator_ro:pw@other-host.example.com:5432/{PROD_DB}"
+        with self.assertRaises(Refused):
+            verify_binding(wrong_host, PROD_HOST, PROD_DB, "")
+
+    def test_prod_like_pins_stay_allowed(self):
+        # The production host and database are production-like by
+        # construction; only the staging fence applies.
+        self.assertEqual(
+            verify_binding(
+                "postgresql://two_bot_migrator_ro:pw@ep-prod-1.example.com:5432/two_bot_prod",
+                "ep-prod-1.example.com",
+                "two_bot_prod",
+                "",
+            ),
+            ("ep-prod-1.example.com", "two_bot_prod", ""),
+        )
+
+    def test_staging_pins_and_bindings_are_refused(self):
+        staging_url = "postgresql://two_bot_migrator_ro:pw@ep-staging-1.aws.neon.tech/two_bot"
+        with self.assertRaises(Refused):
+            verify_binding(staging_url, "ep-staging-1.aws.neon.tech", "two_bot", "")
+        with self.assertRaises(Refused):
+            verify_binding(PROD_URL, "ep-staging-1.aws.neon.tech", PROD_DB, "")
+        with self.assertRaises(Refused):
+            verify_binding(staging_url, PROD_HOST, PROD_DB, "")
+
+    def test_planetscale_binding_refuses_without_a_branch_pin(self):
+        psdb = "postgresql://two-bot-migrator.cnlmx96ec5kw:pw@myapp.pg.psdb.cloud:5432/postgres"
+        with self.assertRaises(Refused):
+            verify_binding(psdb, "myapp.pg.psdb.cloud", "postgres", "")
+
+    def test_planetscale_binding_passes_with_matching_branch_pin(self):
+        psdb = "postgresql://two-bot-migrator.cnlmx96ec5kw:pw@myapp.pg.psdb.cloud:5432/postgres"
+        self.assertEqual(
+            verify_binding(psdb, "myapp.pg.psdb.cloud", "postgres", "cnlmx96ec5kw"),
+            ("myapp.pg.psdb.cloud", "postgres", "cnlmx96ec5kw"),
+        )
+
+    def test_planetscale_binding_refuses_mismatched_or_malformed_branch_pin(self):
+        psdb = "postgresql://two-bot-migrator.cnlmx96ec5kw:pw@myapp.pg.psdb.cloud:5432/postgres"
+        for branch in ("otherbranch1", "bad branch", "bad/branch"):
+            with self.subTest(branch=branch):
+                with self.assertRaises(Refused):
+                    verify_binding(psdb, "myapp.pg.psdb.cloud", "postgres", branch)
+
+    def test_empty_or_pooler_expected_pins_are_refused(self):
+        for host, database in (
+            ("", PROD_DB),
+            (PROD_HOST, ""),
+            ("direct-pooler.example.com", PROD_DB),
+        ):
+            with self.subTest(host=host, database=database):
+                with self.assertRaises(Refused):
+                    verify_binding(PROD_URL, host, database, "")
+
+    def test_staging_host_fence(self):
+        for host in ("agent-testdb", "127.0.0.1", "localhost",
+                     "ep-staging-1.aws.neon.tech", "ep-x.us-east-2.aws.neon.tech"):
+            self.assertTrue(is_staging_host(host), host)
+        for host in ("two-production-1.example.com", "ep-prod-1.example.com"):
+            self.assertFalse(is_staging_host(host), host)
+
+
+class RunGateArgvTests(unittest.TestCase):
+    """run_gate must forward the identity pins to the binary, not just to main."""
+
+    def capture_argv(self, *args):
+        captured = []
+
+        def fake_run(argv, **kwargs):
+            captured.append(list(argv))
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"pending_before": []}) + "\n",
+                stderr="",
+            )
+
+        with mock.patch.object(production_schema_gate.subprocess, "run", fake_run):
+            manifest = run_gate("bin", SHA, *args)
+        self.assertEqual(manifest["pending_before"], [])
+        self.assertEqual(len(captured), 1)
+        return captured[0]
+
+    def flag_value(self, argv, flag):
+        self.assertIn(flag, argv)
+        return argv[argv.index(flag) + 1]
+
+    def test_forwards_branch_pin_for_planetscale_host(self):
+        argv = self.capture_argv(
+            "postgresql://two-bot-migrator.cnlmx96ec5kw:pw@myapp.pg.psdb.cloud:5432/postgres",
+            "myapp.pg.psdb.cloud",
+            "postgres",
+            "cnlmx96ec5kw",
+        )
+        self.assertEqual(self.flag_value(argv, "--production-branch-id"), "cnlmx96ec5kw")
+        self.assertEqual(self.flag_value(argv, "--production-host"), "myapp.pg.psdb.cloud")
+        self.assertEqual(self.flag_value(argv, "--production-database"), "postgres")
+
+    def test_forwards_empty_branch_for_non_planetscale_host(self):
+        # The binary treats an empty --production-branch-id as no-pin.
+        argv = self.capture_argv(PROD_URL, PROD_HOST, PROD_DB, "")
+        self.assertEqual(self.flag_value(argv, "--production-branch-id"), "")
+
+
+class WaiveReasonTests(unittest.TestCase):
+    def test_rollback_waives(self):
+        self.assertIsNotNone(waive_reason("rollback", "false"))
+
+    def test_live_sha_takeover_redeploy_waives(self):
+        self.assertIsNotNone(waive_reason("deploy", "true"))
+
+    def test_new_build_must_run_the_gate(self):
+        self.assertIsNone(waive_reason("deploy", "false"))
+
+
+class MainTests(unittest.TestCase):
+    def run_main(self, argv, run, manifest_out):
+        return main(argv + ["--manifest-out", str(manifest_out)], env=env(), run=run)
+
+    def test_rollback_waives_without_reading_the_database(self):
+        def refuse_run(*args):
+            raise AssertionError("waived runs must not reach the database")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "manifest.json"
+            self.assertEqual(
+                self.run_main(["--binary", "bin", "--source-sha", SHA,
+                               "--mode", "rollback"], refuse_run, out), 0)
+            manifest = json.loads(out.read_text())
+            self.assertIn("waived", manifest)
+            self.assertEqual(manifest["mode"], "rollback")
+
+    def test_live_sha_redeploy_waives_without_reading_the_database(self):
+        def refuse_run(*args):
+            raise AssertionError("waived runs must not reach the database")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "manifest.json"
+            self.assertEqual(
+                self.run_main(["--binary", "bin", "--source-sha", SHA,
+                               "--mode", "deploy", "--allow-unstaged", "true"],
+                              refuse_run, out), 0)
+            self.assertIn("waived", json.loads(out.read_text()))
+
+    def test_main_forwards_branch_pin_from_env(self):
+        seen = []
+
+        def capture(*args):
+            seen.append(args)
+            return {"pending_before": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "manifest.json"
+            self.assertEqual(
+                main(["--binary", "bin", "--source-sha", SHA, "--mode", "deploy",
+                      "--manifest-out", str(out)],
+                     env=env(branch="cnlmx96ec5kw"), run=capture), 0)
+            self.assertEqual(seen[0][-1], "cnlmx96ec5kw")
+
+    def test_clean_plan_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "manifest.json"
+            self.assertEqual(
+                self.run_main(["--binary", "bin", "--source-sha", SHA,
+                               "--mode", "deploy"],
+                              lambda *args: {"pending_before": []}, out), 0)
+            self.assertEqual(json.loads(out.read_text())["pending_before"], [])
+
+    def test_drift_fails_with_the_pending_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "manifest.json"
+            self.assertEqual(
+                self.run_main(["--binary", "bin", "--source-sha", SHA,
+                               "--mode", "deploy"],
+                              lambda *args: {"pending_before": [424, 425]}, out), 1)
+
+    def test_refused_binding_exits_unusable(self):
+        def refuse(*args):
+            raise Refused("plan database binding is not provided")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "manifest.json"
+            with self.assertRaises(Refused):
+                self.run_main(["--binary", "bin", "--source-sha", SHA,
+                               "--mode", "deploy"], refuse, out)
+
+    def test_short_sha_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "manifest.json"
+            with self.assertRaises(Refused):
+                self.run_main(["--binary", "bin", "--source-sha", "abc",
+                               "--mode", "deploy"],
+                              lambda *args: {"pending_before": []}, out)
+
+
+class PendingVersionsTests(unittest.TestCase):
+    def test_empty_pending_means_no_drift(self):
+        self.assertEqual(pending_versions({"pending_before": []}), [])
+
+    def test_nonempty_pending_is_returned_in_order(self):
+        self.assertEqual(pending_versions({"pending_before": [424, 425]}), [424, 425])
+
+    def test_malformed_manifest_fails_closed(self):
+        for bad in ({}, {"pending_before": None}, {"pending_before": ["424"]},
+                    {"pending_before": [425, 424]}, {"pending_before": True}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(Refused):
+                    pending_versions(bad)
+
+
+class DriftMessageTests(unittest.TestCase):
+    def test_names_pending_versions_and_manual_apply_dispatch(self):
+        message = drift_message([424, 425], SHA)
+        self.assertIn("schema drift", message)
+        self.assertIn("424", message)
+        self.assertIn("425", message)
+        self.assertIn(SHA, message)
+        self.assertIn("production-migrate", message)
+        self.assertIn("apply", message)
+        self.assertIn("deploy-production", message)
+
+
+class ConnectionWarningTests(unittest.TestCase):
+    def test_no_usage_means_no_warning(self):
+        self.assertIsNone(connection_warning({}))
+
+    def test_hot_pool_warns_without_failing(self):
+        manifest = {
+            "pending_before": [],
+            "audit": {"connection_usage": {"used": 25, "max_connections": 25}},
+        }
+        warning = connection_warning(manifest)
+        self.assertIsNotNone(warning)
+        self.assertIn("25/25", warning)
+
+    def test_warning_boundary_is_strictly_above_eighty_percent(self):
+        def manifest(used, maximum):
+            return {"audit": {"connection_usage": {"used": used, "max_connections": maximum}}}
+
+        self.assertIsNone(connection_warning(manifest(80, 100)))
+        self.assertIsNotNone(connection_warning(manifest(81, 100)))
+
+    def test_degenerate_or_misplaced_usage_never_warns(self):
+        for bad in (
+            {"audit": None},
+            {"audit": {}},
+            {"audit": {"connection_usage": None}},
+            {"audit": {"connection_usage": {"used": 25}}},
+            {"audit": {"connection_usage": {"max_connections": 25}}},
+            {"audit": {"connection_usage": {"used": -1, "max_connections": 25}}},
+            {"audit": {"connection_usage": {"used": 25, "max_connections": 0}}},
+            {"audit": {"connection_usage": {"used": True, "max_connections": 25}}},
+            {"connection_usage": {"used": 25, "max_connections": 25}},
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(connection_warning(bad))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -109,6 +109,21 @@ def reject(reason):
     return 1
 
 
+def _gateway_ready(report):
+    """True when the component breakdown reports the gateway ready.
+
+    The breakdown is untrusted service output: only an exact
+    ["gateway", "ready"] pair counts, and nothing remote reaches the
+    verdict text, so a hostile answer cannot forge a passing state.
+    """
+    components = report.get("components")
+    if not isinstance(components, list):
+        return False
+    return any(
+        isinstance(row, list) and row == ["gateway", "ready"] for row in components
+    )
+
+
 def readyz(args):
     if args.status not in ("200", "503"):
         return reject(f"/readyz answered {args.status}")
@@ -148,10 +163,20 @@ def readyz(args):
                 f"build_id {build_id} is not this run's build ({args.build_id}): "
                 "a previous container still serves this SHA"
             )
-        state = "gateway ready" if args.status == "200" else "gateway parked; deploy is healthy"
-        print(f"{state}, revision matches the SHA, build {build_id}")
+        # A parked gateway is never a pass: the release gate requires
+        # /readyz 200 with gateway=ready, or it fails and the run rolls
+        # back. A truthful 503 while the gateway reconnects keeps polling
+        # in the workflow; it must never certify the deploy.
+        if args.status != "200" or not _gateway_ready(report):
+            return reject("gateway not ready: /readyz is not 200 with gateway ready; roll back")
+        print(f"gateway ready, revision matches the SHA, build {build_id}")
         return 0
     if args.mode == "rollback" and revision == build_id == UNSTAMPED:
+        # Pre-stamp identity is recorded, not verified: it still needs a live
+        # 200 with gateway ready, so parked 503s never count as a stable pass
+        # on a rollback to a build from before stamping.
+        if args.status != "200" or not _gateway_ready(report):
+            return reject("gateway not ready: /readyz is not 200 with gateway ready; roll back")
         print("pre-stamp version: build identity unknown, revision not verifiable (recorded; rollback not failed)")
         return 0
     if revision == UNSTAMPED:
