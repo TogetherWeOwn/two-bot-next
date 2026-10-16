@@ -603,6 +603,30 @@ fn assert_checkpoint_timeout_expiry(source: &str) {
     );
 }
 
+const EVENTS_TICK_TIMEOUT_ASSERT: &str = r#"assert!(
+                ticked.is_ok(),
+                "events job never hit REST during first boot"
+            );"#;
+
+fn assert_events_tick_timeout_expiry(source: &str) {
+    assert_timeout_async_result_suffix(
+        source,
+        r#")
+            .await;
+            assert!(
+                ticked.is_ok(),
+                "events job never hit REST during first boot"
+            );"#,
+        "events tick must fail when its first-boot STEP timeout expires",
+    );
+    assert_direct_statement_at_depth(
+        source,
+        EVENTS_TICK_TIMEOUT_ASSERT,
+        0,
+        "events-tick timeout assertion must be a direct statement beside its timeout binding",
+    );
+}
+
 fn assert_budget_lane_hold_pin(source: &str) {
     let code = code_only(source);
     let loop_header = "for (name, gateway_response) in [";
@@ -713,12 +737,47 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
     );
 
     let lifecycle = function_body(ALIVE, "lifecycle");
-    let events_tick = source_between(&lifecycle, "let ticked = timeout(STEP", "ticked.is_ok()");
+    let events_tick = source_between(
+        &lifecycle,
+        "let ticked = timeout(STEP",
+        "// Post-ready settle window",
+    );
+    assert_events_tick_timeout_expiry(&events_tick);
     assert_loop_inside_step_timeout(
         &events_tick,
         "events tick must poll inside its STEP deadline",
         10,
     );
+    let ignored_events_tick =
+        events_tick.replace(EVENTS_TICK_TIMEOUT_ASSERT, "let _ = ticked.is_ok();");
+    assert_ne!(ignored_events_tick, events_tick);
+    assert!(std::panic::catch_unwind(|| {
+        assert_events_tick_timeout_expiry(&ignored_events_tick);
+    })
+    .is_err());
+    let weakened_events_tick =
+        events_tick.replace("ticked.is_ok(),", "ticked.is_ok() || boot == 0,");
+    assert_ne!(weakened_events_tick, events_tick);
+    assert!(std::panic::catch_unwind(|| {
+        assert_events_tick_timeout_expiry(&weakened_events_tick);
+    })
+    .is_err());
+    let commented_events_tick = events_tick.replace(
+        EVENTS_TICK_TIMEOUT_ASSERT,
+        &format!("/* {EVENTS_TICK_TIMEOUT_ASSERT} */"),
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_events_tick_timeout_expiry(&commented_events_tick);
+    })
+    .is_err());
+    let gated_events_tick = events_tick.replace(
+        EVENTS_TICK_TIMEOUT_ASSERT,
+        &format!("if false {{ {EVENTS_TICK_TIMEOUT_ASSERT} }}"),
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_events_tick_timeout_expiry(&gated_events_tick);
+    })
+    .is_err());
     let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
     assert_settle_window(&settle);
     assert_settle_ungated(&lifecycle);
@@ -1142,7 +1201,12 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
         10,
     );
     let lifecycle = function_body(ALIVE, "lifecycle");
-    let events_tick = source_between(&lifecycle, "let ticked = timeout(STEP", "ticked.is_ok()");
+    let events_tick = source_between(
+        &lifecycle,
+        "let ticked = timeout(STEP",
+        "// Post-ready settle window",
+    );
+    assert_events_tick_timeout_expiry(&events_tick);
     assert_loop_inside_step_timeout(
         &events_tick,
         "events tick must poll inside its STEP deadline",
