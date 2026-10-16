@@ -215,7 +215,10 @@ fn assert_code_contains(source: &str, snippet: &str, context: &str) {
 }
 
 fn assert_no_code_contains(source: &str, snippet: &str, context: &str) {
-    assert!(!code_only(source).contains(snippet), "{context}");
+    assert!(
+        !code_only(source).contains(&code_only(snippet)),
+        "{context}"
+    );
 }
 
 fn contains_continue_keyword(code: &str) -> bool {
@@ -312,11 +315,69 @@ const OPS_DEADLINE_ASSERT: &str = r#"assert!(
             "bot did not serve health on the configured port"
         );"#;
 
+fn brace_depth_before(code: &str, pos: usize) -> i32 {
+    let mut depth = 0i32;
+    for byte in code[..pos].bytes() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+fn timeout_step_async_body(source: &str, context: &str) -> String {
+    // The first `{` after `timeout(STEP` opens the async block; the poll
+    // loop must live inside those braces, not merely between the timeout
+    // call and a later terminator. Matched over code only so a
+    // commented-out wrapper does not satisfy the pin.
+    let code = code_only(source);
+    let start = code
+        .find("timeout(STEP")
+        .unwrap_or_else(|| panic!("{context}"));
+    let open = code[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("{context}"));
+    braced_block(&code, open)
+}
+
+fn assert_loop_inside_step_timeout(source: &str, context: &str) {
+    let body = timeout_step_async_body(source, context);
+    assert_poll_site(&body, "loop");
+}
+
+fn assert_settle_ungated(lifecycle: &str) {
+    // The settle window must run every boot at the same nesting as SIGTERM.
+    // Wrapping it in `if boot == 0` drops the post-RESUMED window on boot 1
+    // (the exact gap the window was added to close); wrapping it in
+    // `if false` drops it entirely. Both keep the settle text present, so
+    // the depth of `let settle_until` must equal the depth of `terminate`.
+    let code = code_only(lifecycle);
+    let settle_pos = code
+        .find("let settle_until =")
+        .expect("settle window must declare its deadline");
+    let term_pos = code
+        .find("bot.terminate().await;")
+        .expect("lifecycle must terminate the bot");
+    assert_eq!(
+        brace_depth_before(&code, settle_pos),
+        brace_depth_before(&code, term_pos),
+        "settle window must sit at the same depth as SIGTERM so it runs every boot"
+    );
+}
+
 fn assert_ops_backfill_deadline(source: &str) {
     assert_code_contains(
         source,
         OPS_DEADLINE_ASSERT,
         "spawn_bot health poll must retain its exact deadline assertion",
+    );
+    assert_code_contains(
+        source,
+        "let deadline = Instant::now() + Duration::from_secs(15);",
+        "spawn_bot must retain its 15 s deadline",
     );
     // Placement: the deadline assertion must be a direct statement of the
     // health-poll loop body. A copy moved above the loop or wrapped in
@@ -330,14 +391,14 @@ fn assert_ops_backfill_deadline(source: &str) {
     );
 }
 
-/// Require the `wait_http` poll loop to sit inside its `timeout(STEP, ...)`
-/// wrapper: the loop must be found between the timeout open and the
-/// `.unwrap_or_else` terminator, matched over code only so a commented-out
-/// wrapper does not satisfy the pin.
+/// Require the poll loop to sit inside its `timeout(STEP, ...)` async
+/// block: the loop must be found inside the braced block opened by the
+/// timeout, matched over code only so a commented-out wrapper does not
+/// satisfy the pin. A loop hoisted after the timeout block but before the
+/// terminator still sits between the two markers textually, so the
+/// between-markers check alone is placement-blind.
 fn assert_wait_http_poll_under_step_deadline(wait_http: &str) {
-    let code = code_only(wait_http);
-    let window = source_between(&code, "timeout(STEP", ".unwrap_or_else");
-    assert_poll_site(&window, "loop");
+    assert_loop_inside_step_timeout(wait_http, "wait_http must poll inside its STEP deadline");
 }
 
 fn assert_budget_lane_hold_pin(source: &str) {
@@ -396,18 +457,17 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
     assert_wait_http_poll_under_step_deadline(&wait_http);
 
     let checkpoint = function_body(ALIVE, "checkpoint");
-    assert_poll_site(&checkpoint, "loop");
-    assert_code_contains(
-        &checkpoint,
-        "timeout(STEP",
-        "checkpoint must retain its STEP deadline",
-    );
+    assert_loop_inside_step_timeout(&checkpoint, "checkpoint must poll inside its STEP deadline");
 
     let lifecycle = function_body(ALIVE, "lifecycle");
     let events_tick = source_between(&lifecycle, "let ticked = timeout(STEP", "ticked.is_ok()");
-    assert_poll_site(&events_tick, "loop");
+    assert_loop_inside_step_timeout(
+        &events_tick,
+        "events tick must poll inside its STEP deadline",
+    );
     let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
     assert_settle_window(&settle);
+    assert_settle_ungated(&lifecycle);
 
     assert_sleep_inventory(ALIVE, 4, "alive.rs sleep inventory");
     assert_no_code_contains(
@@ -651,6 +711,26 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
         assert_wait_http_poll_under_step_deadline(&commented_deadline_call);
     })
     .is_err());
+
+    // The 15 s deadline literal must be pinned: stretching it to a day
+    // keeps every other assertion present while the health poll hangs.
+    let long_deadline = spawn_bot.replace("Duration::from_secs(15)", "Duration::from_secs(86400)");
+    assert!(long_deadline.contains("86400"));
+    assert!(std::panic::catch_unwind(|| {
+        assert_ops_backfill_deadline(&long_deadline);
+    })
+    .is_err());
+
+    // Positive controls: checkpoint and events-tick loops sit inside
+    // their STEP wrappers in the real source.
+    let checkpoint = function_body(ALIVE, "checkpoint");
+    assert_loop_inside_step_timeout(&checkpoint, "checkpoint must poll inside its STEP deadline");
+    let lifecycle = function_body(ALIVE, "lifecycle");
+    let events_tick = source_between(&lifecycle, "let ticked = timeout(STEP", "ticked.is_ok()");
+    assert_loop_inside_step_timeout(
+        &events_tick,
+        "events tick must poll inside its STEP deadline",
+    );
 }
 
 #[test]
@@ -711,6 +791,59 @@ fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
     );
     assert!(std::panic::catch_unwind(|| {
         assert_settle_window(&if_false_liveness);
+    })
+    .is_err());
+
+    // The checkpoint loop text stays present but is hoisted outside its
+    // STEP wrapper: it then runs unbounded until the CI step timeout.
+    let checkpoint = function_body(ALIVE, "checkpoint");
+    let loop_outside_checkpoint = format!(
+        "loop {{ {sleep} }}\n{}",
+        checkpoint.replacen("loop {", "if true {", 1)
+    );
+    assert!(loop_outside_checkpoint.contains("timeout(STEP"));
+    assert!(std::panic::catch_unwind(|| {
+        assert_loop_inside_step_timeout(
+            &loop_outside_checkpoint,
+            "checkpoint must poll inside its STEP deadline",
+        );
+    })
+    .is_err());
+
+    // The events-tick loop stays between the ticked markers but moves out
+    // of the timeout async block: the window text still contains a loop,
+    // so only the inside-the-braces check goes red.
+    let events_tick = source_between(&lifecycle, "let ticked = timeout(STEP", "ticked.is_ok()");
+    let loop_outside_tick = format!(
+        "loop {{ {sleep} }}\n{}",
+        events_tick.replacen("loop {", "if true {", 1)
+    );
+    assert!(loop_outside_tick.contains("timeout(STEP"));
+    assert!(std::panic::catch_unwind(|| {
+        assert_loop_inside_step_timeout(
+            &loop_outside_tick,
+            "events tick must poll inside its STEP deadline",
+        );
+    })
+    .is_err());
+
+    // The settle window text stays present but is gated to boot 0 or to a
+    // never-taken branch: boot 1 then skips the post-RESUMED window, the
+    // exact gap the window was added to close.
+    assert_settle_ungated(&lifecycle);
+    let gated_boot_zero = lifecycle
+        .replacen("let settle_until =", "if boot == 0 { let settle_until =", 1)
+        .replacen("bot.terminate().await;", "} bot.terminate().await;", 1);
+    assert!(gated_boot_zero.contains("let settle_until ="));
+    assert!(std::panic::catch_unwind(|| {
+        assert_settle_ungated(&gated_boot_zero);
+    })
+    .is_err());
+    let gated_dead = lifecycle
+        .replacen("let settle_until =", "if false { let settle_until =", 1)
+        .replacen("bot.terminate().await;", "} bot.terminate().await;", 1);
+    assert!(std::panic::catch_unwind(|| {
+        assert_settle_ungated(&gated_dead);
     })
     .is_err());
 }
