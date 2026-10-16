@@ -75,6 +75,7 @@ pending creation times only. It does not print broadcaster ids/names or the
 callback URL:
 
 ```bash
+(
 set -euo pipefail
 after=""
 pages=0
@@ -134,6 +135,7 @@ printf '%s\n' "$subscriptions" |
       status_counts: ([$subscriptions[].status] | sort | group_by(.) |
         map({status: .[0], count: length}))
     }'
+)
 ```
 
 The headers reach curl on stdin, so neither the token nor the client id is in
@@ -205,10 +207,11 @@ not an immediate revocation-triggered pass. Confirm that the staging image
 contains the current implementation before using Q2; an older image will not
 emit these receipts. Reconcile lists subscriptions, diffs deletes-before-creates
 on the bot's own callback, executes the plan, then confirms with a follow-up
-listing. Search on the message text `eventsub reconcile` (not the structured
-`event` field, which this script cannot filter); this includes action failures
-and terminal outcomes. The message plus retained `error_class` (and `missing`
-on some lines) classify these lines. The reader drops `status`, counts and
+listing. The `--contains` option filters message text, not the structured
+`event` field. The `eventsub reconcile` filter finds diagnostic/action-failure
+messages; healthy and pending terminal messages require their own filters, as
+shown below. The message plus retained `error_class` (and `missing` on some
+lines) classify these lines. The reader drops `status`, counts and
 reconcile detail fields (`failed`, `prior_failed`, `action`, `error`); use the
 dashboard for them.
 
@@ -233,53 +236,78 @@ incomplete), `reconcile_no_broadcasters` (parked), `reconcile_config_invalid`
 (refused), or `reconcile_failed` (errored, sometimes preceded by
 `reconcile_unhealthy`). A `flag_dark` parked line means no pass ran. The
 dashboard exposes fields this script drops.
-The reader filters message text, not the structured `event` field. Run all
-three filters below: the broad first filter returns all `eventsub reconcile`
-messages, including diagnostic, error, refused, and parked lines. The second
-matches healthy; the third matches pending. In Workers Observability,
-select dataset `containers`, this service id, and filter
-`event = "eventsub_reconcile"` to see the event-level view. Confirm the staging
-image contains the reconcile implementation before using readback to assess
-cadence; query results describe only the deployed image.
+The broad filter catches diagnostic, error, refused, and parked messages whose
+text contains `eventsub reconcile`; it does not match the healthy or pending
+messages, which use different wording. Run all three filters below for each
+page: the broad diagnostic filter, the healthy terminal message, and the pending
+terminal message. Read a rolling 90-minute look-back as three adjacent 30-minute
+pages (the reader caps each request at 30 minutes). This spans one hourly
+interval plus 30 minutes for pass duration. If there is no terminal outcome,
+continue paging backward within the dataset's retention period; a pass can take
+longer than an hour. For each page, note timestamps and interpret all matching
+lines together using the table above. In Workers Observability, select dataset
+`containers`, this service id, and filter `event = "eventsub_reconcile"` to see
+the event-level view. Confirm the staging image contains the reconcile
+implementation before using readback to assess cadence; query results describe
+only the deployed image.
 
-Run each message filter; `--contains` searches the message text, not the
-structured `event` field:
+Run this in Bash on a host with GNU `date`; it issues all three message filters
+for each of three adjacent pages, newest first. The `jq` keeps only safe
+summary fields and matching message text in the sample output:
+
+```bash
+for end in "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+           "$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
+           "$(date -u -d '60 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"; do
+  for message in "eventsub reconcile" \
+                 "eventsub subscriptions reconciled" \
+                 "subscriptions re-created but none verified yet"; do
+    python3 scripts/container_stdout_read.py \
+      --service a038b0ad-a1f9-4966-bfb7-f992c602d938 \
+      --minutes 30 --end "$end" --contains "$message" \
+      | jq '{window,event_count,possibly_truncated,events:[.events[].message]}'
+  done
+done
+```
+
+Staging sample (2026-10-16; each of the nine filter/page queries was executed;
+for each page the broad diagnostic filter is followed by healthy then pending):
+
+```json
+{"window":{"start":"2026-10-16T23:07:28.000Z","end":"2026-10-16T23:37:28.000Z"},"event_count":0,"possibly_truncated":false,"events":[]}
+{"window":{"start":"2026-10-16T23:07:28.000Z","end":"2026-10-16T23:37:28.000Z"},"event_count":0,"possibly_truncated":false,"events":[]}
+{"window":{"start":"2026-10-16T23:07:28.000Z","end":"2026-10-16T23:37:28.000Z"},"event_count":0,"possibly_truncated":false,"events":[]}
+{"window":{"start":"2026-10-16T22:37:28.000Z","end":"2026-10-16T23:07:28.000Z"},"event_count":0,"possibly_truncated":false,"events":[]}
+{"window":{"start":"2026-10-16T22:37:28.000Z","end":"2026-10-16T23:07:28.000Z"},"event_count":0,"possibly_truncated":false,"events":[]}
+{"window":{"start":"2026-10-16T22:37:28.000Z","end":"2026-10-16T23:07:28.000Z"},"event_count":0,"possibly_truncated":false,"events":[]}
+{"window":{"start":"2026-10-16T22:07:28.000Z","end":"2026-10-16T22:37:28.000Z"},"event_count":0,"possibly_truncated":false,"events":[]}
+{"window":{"start":"2026-10-16T22:07:28.000Z","end":"2026-10-16T22:37:28.000Z"},"event_count":0,"possibly_truncated":false,"events":[]}
+{"window":{"start":"2026-10-16T22:07:28.000Z","end":"2026-10-16T22:37:28.000Z"},"event_count":0,"possibly_truncated":false,"events":[]}
+```
+
+No matching reconcile outcome appeared in the 90-minute look-back. Before
+attributing silence to a stopped task, check that the container is emitting any
+logs; the reader's unfiltered command is:
 
 ```bash
 python3 scripts/container_stdout_read.py \
-  --service a038b0ad-a1f9-4966-bfb7-f992c602d938 \
-  --minutes 5 --contains "eventsub reconcile"
-python3 scripts/container_stdout_read.py \
-  --service a038b0ad-a1f9-4966-bfb7-f992c602d938 \
-  --minutes 5 --contains "eventsub subscriptions reconciled"
-python3 scripts/container_stdout_read.py \
-  --service a038b0ad-a1f9-4966-bfb7-f992c602d938 \
-  --minutes 5 --contains "subscriptions re-created but none verified yet"
+  --service a038b0ad-a1f9-4966-bfb7-f992c602d938 --minutes 5 \
+  | jq '{window,event_count,possibly_truncated,events:[.events[].message]}'
 ```
 
-Staging samples (2026-10-16; each query was executed):
-
-Excerpted output (fields such as `ts` and `level` omitted for readability):
+Staging liveness sample (2026-10-16; six routine logs, no EventSub message):
 
 ```json
-{"event_count":1,"possibly_truncated":false,"window":{"start":"2026-10-16T16:53:58.000Z","end":"2026-10-16T16:58:58.000Z"},"events":[{"message":"eventsub reconcile parked: TWO_EVENTSUB is not exactly 1","reason":"flag_dark"}]}
-{"event_count":0,"possibly_truncated":false,"window":{"start":"2026-10-16T16:56:06.000Z","end":"2026-10-16T17:01:06.000Z"},"events":[]}
-{"event_count":0,"possibly_truncated":false,"window":{"start":"2026-10-16T16:56:08.000Z","end":"2026-10-16T17:01:08.000Z"},"events":[]}
+{"window":{"start":"2026-10-16T23:30:27.000Z","end":"2026-10-16T23:35:27.000Z"},"event_count":6,"possibly_truncated":false,"events":["raid history ungrounded; publication skipped","raid history ungrounded; publication skipped","raid history ungrounded; publication skipped","raid history ungrounded; publication skipped","raid history ungrounded; publication skipped","raid history ungrounded; publication skipped"]}
 ```
 
-The first result proves the message filter matches and shows the reconcile
-gate parked (`TWO_EVENTSUB` is not exactly `1`); it is not evidence of a
-reconcile pass. The other two zero results mean healthy and pending messages
-were not observed in their respective windows. When enabled, startup runs once;
-after each pass, the loop waits its bounded hourly interval before starting the
-next one. Start-to-start spacing is therefore pass duration plus that interval,
-and a pass can take longer than an hour. If no Q2 line appears, no pass
-completed in that window; determine whether the task is stopped or still in a
-long-running pass.
-Missing `healthy` alone is not a stopped-task signal: the pass may instead be
-pending, unhealthy, refused, parked, or failed. Use one terminal outcome
-across successive passes to assess cadence, not the spacing between lines
-within a pass.
+This confirms the container emitted logs at the time; it does not establish that
+the reconcile task is enabled. A zero Q2 result means no matching message was
+observed, not that the task stopped. Determine whether it is stopped, gated off,
+or still in a long-running pass. Do not restart on silence alone. Missing
+`healthy` lines alone are not a stopped-task signal: a pass may instead be
+pending, unhealthy, refused, parked, or failed. Use terminal outcomes across
+successive passes to assess cadence, not the spacing between lines within a pass.
 
 ## Q3 — revocation count (total; by reason from the `reason` scalar)
 
@@ -323,7 +351,7 @@ result as an exact count; otherwise narrow or page the window.
 The Q1 Helix listing (`status` per entry) remains the cross-check for
 current-state reasons; it is a snapshot, not a count.
 
-## Q4 — challenge-failure count (exact, from the `message_type` scalar)
+## Q4 — container-attributed challenge failures (lower bound)
 
 A good challenge logs `challenge answered` (echoed as `200 text/plain`;
 Twitch then enables the subscription). A bad one is refused before any
@@ -364,27 +392,34 @@ do not include every rejected request.
 
 Sample (staging Worker, 30 min, 2026-10-15): `eventsub_ingress` count 0.
 
-Exact challenge-failure query (needs this slice deployed):
+Container-attributed challenge-failure query (needs this slice deployed):
 
 ```bash
 python3 scripts/container_stdout_read.py \
   --service a038b0ad-a1f9-4966-bfb7-f992c602d938 \
   --minutes 5 --contains "delivery refused" \
-  | jq '{challenge_failures: ([.events[] | select(.message_type == "webhook_callback_verification")] | length), possibly_truncated}'
+  | jq '{container_attributed_challenge_failures: ([.events[] | select(.message_type == "webhook_callback_verification")] | length), possibly_truncated}'
 ```
 
 Sample interpretation (staging container, 5 min, 2026-10-16; query result):
 
 ```json
-{"challenge_failures":0,"possibly_truncated":false}
+{"container_attributed_challenge_failures":0,"possibly_truncated":false}
 ```
 
-No matching challenge failure was observed in this window. The count is exact
-only when `possibly_truncated` is false; otherwise narrow or page the window
-before reporting it. A stuck `webhook_callback_verification_pending` (or
-`webhook_callback_verification_failed` after a reconcile) in the Q1 Helix
-listing remains the cross-check for a subscription whose challenges never
-succeed.
+This is a lower bound, even when `possibly_truncated` is false: it counts
+only challenge refusals attributed after valid delivery headers reached the
+container. The Worker can refuse challenges with `rate_limited` (429),
+`unavailable` (503), or `upstream_timeout` (504) without a `message_type`; the
+container can also log `busy` or `upstream_timeout` refusals as
+`message_type="unknown"`. Those failures are not included in this query. A zero
+therefore means no container-attributed challenge failure was observed, not
+that no challenge failed. During subscription setup, cross-check Worker
+`eventsub_ingress` refusals in Workers Observability and inspect `unknown`-type
+container refusals alongside the Q1 Helix listing. A stuck
+`webhook_callback_verification_pending` (or
+`webhook_callback_verification_failed` after a reconcile) remains evidence of a
+subscription whose challenge has not succeeded.
 
 Remaining receiver lines for completeness: `notification acknowledged`
 (verified go-live acked; a `--contains "acknowledged"` read also matches
