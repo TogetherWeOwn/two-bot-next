@@ -26,15 +26,17 @@ What it proves on the deployed staging bot (stdlib only, no third-party code):
              lost after creation; SKIP on HTTP 429; the same Discord
              field `/limit` and `/unlimit` manage)
   privacy    the room's @everyone overwrite matches the public Connect
-             baseline, the staging product bot has effective Manage Roles on
-             the room, and no member overwrite grants Manage Roles (read-only)
+             baseline, the staging product bot has effective View Channel and
+             Manage Roles on the room (the `/private` overwrite precondition),
+             and no member overwrite grants Manage Roles (read-only)
   name_panel the room's name after the rename cycle renders from its template
              (not the "<display>'s room" fallback): what the `/name` panel's
              Current-name line would show
 
 The limit check exercises the channel field `/limit` and `/unlimit` write;
 privacy reads the public @everyone baseline and the staging product bot's
-computed Manage Roles permission (the `/private` precondition), and name_panel
+computed View Channel and Manage Roles permission (the `/private`
+precondition, mirroring `can_edit_overwrites`), and name_panel
 reads the template-rendered name. These checks do not invoke slash commands
 (Discord only creates interactions for real users, so a bot token cannot). A
 PASS means the room the staging bot made has the expected owner permissions and
@@ -178,13 +180,17 @@ def privacy_facts(channel, roles, member, guild_id, product_bot_id, guild_owner_
     product_permissions = effective_permissions(
         guild_id, product_bot_id, product_member_roles, roles, overwrites,
         guild_owner_id=guild_owner_id)
+    # Mirrors can_edit_overwrites in
+    # crates/bot/src/voice_rooms/private_runtime.rs: rewriting the @everyone
+    # overwrite needs VIEW_CHANNEL|MANAGE_ROLES, not Manage Roles alone.
+    product_can_edit = (product_permissions & (VIEW | MANAGE_ROLES)) == (VIEW | MANAGE_ROLES)
     role_by_id = {str(role.get("id")): role for role in roles}
     product_role_names = [role_by_id[role_id].get("name", role_id)
                           for role_id in product_member_roles if role_id in role_by_id]
     product_role = ", ".join(product_role_names) or "no assigned staging role"
     return {
         "privacy_public_baseline": public_baseline,
-        "privacy_product_bot_manage_roles": bool(product_permissions & MANAGE_ROLES),
+        "privacy_product_bot_manage_roles": bool(product_can_edit),
         "privacy_no_member_manage_roles": no_member_grant,
         "privacy_product_bot_role": product_role,
     }
@@ -319,7 +325,7 @@ def evaluate(obs):
     product_role = obs.get("privacy_product_bot_role") or "no assigned staging role"
     privacy_detail = (
         f"@everyone public Connect baseline={'PASS' if public_baseline else 'FAIL'}; "
-        f"product bot staging role {product_role!r} effective Manage Roles="
+        f"product bot staging role {product_role!r} effective View Channel|Manage Roles="
         f"{'PASS' if product_manage_roles else 'FAIL'}; "
         f"member overwrites grant Manage Roles={'no' if no_member_grant else 'yes'}"
     )

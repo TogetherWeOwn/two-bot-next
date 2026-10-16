@@ -293,15 +293,18 @@ class EffectivePermissionsTest(unittest.TestCase):
 class PrivacyFactsTest(unittest.TestCase):
     GUILD = "700"
     PRODUCT_BOT = "800"
+    VIEW = 1 << 10
     MANAGE_ROLES = 1 << 28
     CONNECT = 1 << 20
 
-    def facts(self, *, overwrites=None):
+    def facts(self, *, overwrites=None, role_perms=None):
         channel = {"permission_overwrites": overwrites or [
             {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"}]}
+        if role_perms is None:
+            role_perms = self.VIEW | self.MANAGE_ROLES
         roles = [
             {"id": self.GUILD, "name": "@everyone", "permissions": "0"},
-            {"id": "role", "name": "Staging Product", "permissions": str(self.MANAGE_ROLES)},
+            {"id": "role", "name": "Staging Product", "permissions": str(role_perms)},
         ]
         member = {"roles": ["role"]}
         return synth.privacy_facts(channel, roles, member, self.GUILD, self.PRODUCT_BOT)
@@ -317,6 +320,28 @@ class PrivacyFactsTest(unittest.TestCase):
         facts = self.facts(overwrites=[
             {"id": self.GUILD, "type": 0, "allow": "0", "deny": str(self.CONNECT)}])
         self.assertFalse(facts["privacy_public_baseline"])
+
+    def test_everyone_allow_connect_breaks_public_baseline(self):
+        facts = self.facts(overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": str(self.CONNECT), "deny": "0"}])
+        self.assertFalse(facts["privacy_public_baseline"])
+
+    def test_duplicate_everyone_overwrites_break_public_baseline(self):
+        facts = self.facts(overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+        ])
+        self.assertFalse(facts["privacy_public_baseline"])
+
+    def test_product_role_without_manage_roles_fails(self):
+        facts = self.facts(role_perms=self.VIEW)
+        self.assertFalse(facts["privacy_product_bot_manage_roles"])
+
+    def test_product_role_without_view_channel_fails(self):
+        # can_edit_overwrites needs VIEW_CHANNEL|MANAGE_ROLES: Manage Roles
+        # alone must not read as the /private precondition.
+        facts = self.facts(role_perms=self.MANAGE_ROLES)
+        self.assertFalse(facts["privacy_product_bot_manage_roles"])
 
     def test_any_member_manage_roles_grant_is_reported(self):
         facts = self.facts(overwrites=[
