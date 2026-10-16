@@ -29,8 +29,10 @@ with a valid broadcaster id/login/`started_at`, matching condition, and an
 `channel.update`) and versions are not announced. After signature verification,
 a notification that cannot be classified or planned is deterministic and MUST
 be acknowledged with 2XX and ignored; do not return an error status that makes
-Twitch retry it. Only a transient send or durable-ledger failure is retriable:
-release the claim and return 5XX. See `crates/core/src/stream_funnel.rs`.
+Twitch retry it. Only a transient send or durable-ledger failure is retriable
+(5XX); only a send that provably never reached Discord releases the claim —
+claim and stamp failures never release it. See
+`crates/core/src/stream_funnel.rs`.
 
 ## YouTube VOD linking convention (confirmed 2026-10-12)
 
@@ -84,9 +86,12 @@ What the core does, in order, for every delivery:
    `broadcaster + started_at` whose row is started or delivered is skipped
    with 2XX; a fresh never-started row is answered 5XX (`InFlight`), which
    asks Twitch to retry. If the send or
-   durable-ledger operation fails transiently, the caller releases the claim
-   and answers 5XX so Twitch retries. Classification or planning errors alone
-   must not trigger a retry.
+   durable-ledger operation fails transiently, the caller answers 5XX so
+   Twitch retries; it releases the claim ONLY when the send provably never
+   reached Discord (`SendFailed` in `stream_live::disposition`) — a claim
+   failure or a stamp failure after a possibly-successful send never
+   releases, or the retry could double-post. Classification or planning
+   errors alone must not trigger a retry.
 
 Subscription management is pure request building plus a diff
 (`create_subscription_body`, `parse_subscriptions`, `reconcile`). It runs at
@@ -128,10 +133,19 @@ below is present but is not called by a runtime receiver yet.
   expires. Twitch documents no retry schedule and this slice has no
   sweeper, so a go-live that is never retried is not recovered here; the
   route stays dark until a receiver wires this flow.
+- Ownership is fenced by a claim token (migration 0443): claiming
+  generates one, takeover rotates it, and `mark_live_send_started`,
+  `mark_live_delivered` and `release_live` act only for the token they
+  are given. A timed-out-but-running original owner therefore cannot
+  start, stamp or release a row a takeover gave to a new owner; exactly
+  one owner can post. If the conflicting row disappears before the
+  takeover lands, `claim_live` loops back to the insert instead of
+  answering 2xx for a go-live nobody posted.
 - A Discord send may succeed while `mark_live_delivered` fails. The claim can
   then remain `delivered_at IS NULL` with `send_started_at NOT NULL`;
-  `release_live` deletes the targeted row only when it is unstamped, so it
-  must never be used as stale recovery. Started and delivered rows are never
+  `release_live` deletes a row only for its token-holding owner while it
+  is still never-started, so it must never be used as stale recovery or
+  after a stamp failure. Started and delivered rows are never
   reclaimed, even when stale, or a retry can double-post a delivery that may
   already have reached Discord.
 - Delivered rows are retained indefinitely as dedup fences. This slice adds no

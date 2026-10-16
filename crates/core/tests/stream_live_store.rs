@@ -138,6 +138,15 @@ async fn cleanup(pool: Pool<Postgres>, schema: &str) {
     pool.close().await;
 }
 
+/// Extract the ownership token from a winning claim, failing the test on
+/// any other outcome.
+fn claimed(outcome: ClaimOutcome) -> String {
+    match outcome {
+        ClaimOutcome::Claimed(token) => token,
+        other => panic!("expected Claimed, got {other:?}"),
+    }
+}
+
 fn claim(key: &str) -> LiveClaim {
     LiveClaim {
         dedup_key: key.to_owned(),
@@ -153,10 +162,7 @@ fn claim(key: &str) -> LiveClaim {
 async fn claim_is_owned_once_then_in_flight() {
     let (pool, schema) = setup().await;
     let key = format!("{:064x}", 0x9e17bfa9a053696fu64);
-    assert_eq!(
-        claim_live(&pool, &claim(&key)).await.expect("claim"),
-        ClaimOutcome::Claimed
-    );
+    claimed(claim_live(&pool, &claim(&key)).await.expect("claim"));
     // The composed receiver entry point: a second delivery of the same
     // fresh never-started claim is InFlight (5xx), not Duplicate (200).
     assert_eq!(
@@ -167,10 +173,7 @@ async fn claim_is_owned_once_then_in_flight() {
     let mut later = claim(&key);
     later.dedup_key = format!("{:064x}", 0xdeadbeefu64);
     later.started_at = "2026-10-19T20:00:00Z".to_owned();
-    assert_eq!(
-        claim_live(&pool, &later).await.expect("new instant"),
-        ClaimOutcome::Claimed
-    );
+    claimed(claim_live(&pool, &later).await.expect("new instant"));
     cleanup(pool, &schema).await;
 }
 
@@ -179,17 +182,19 @@ async fn claim_is_owned_once_then_in_flight() {
 async fn failed_send_releases_the_claim_for_the_retry() {
     let (pool, schema) = setup().await;
     let key = format!("{:064x}", 0x9e17bfa9a053696fu64);
-    assert_eq!(
-        claim_live(&pool, &claim(&key)).await.expect("claim"),
-        ClaimOutcome::Claimed
-    );
-    assert!(release_live(&pool, &key).await.expect("release"));
-    assert_eq!(
-        claim_live(&pool, &claim(&key)).await.expect("retry"),
-        ClaimOutcome::Claimed
-    );
+    let token = claimed(claim_live(&pool, &claim(&key)).await.expect("claim"));
+    // Only the token-holding owner can release its never-started row.
     assert!(
-        !release_live(&pool, &format!("{:064x}", 0u64))
+        !release_live(&pool, &key, "stale-owner-token")
+            .await
+            .expect("release wrong token"),
+        "releasing with a foreign token must report false"
+    );
+    assert!(release_live(&pool, &key, &token).await.expect("release"));
+    let retry_token = claimed(claim_live(&pool, &claim(&key)).await.expect("retry"));
+    assert_ne!(retry_token, token, "a fresh claim must mint a new token");
+    assert!(
+        !release_live(&pool, &format!("{:064x}", 0u64), &retry_token)
             .await
             .expect("release missing"),
         "releasing an unknown key must report false"
@@ -213,10 +218,7 @@ async fn age_claim(pool: &Pool<Postgres>, key: &str, seconds_ago: i64) {
 async fn fresh_claim_cannot_be_reclaimed() {
     let (pool, schema) = setup().await;
     let key = format!("{:064x}", 0x51e551u64);
-    assert_eq!(
-        claim_live(&pool, &claim(&key)).await.expect("claim"),
-        ClaimOutcome::Claimed
-    );
+    let token = claimed(claim_live(&pool, &claim(&key)).await.expect("claim"));
     // Fresh (unexpired) unposted claim: the retry is InFlight, so the
     // receiver answers 5xx, asking Twitch to retry instead of treating
     // the go-live as delivered. Both the direct reclaim and the composed
@@ -233,7 +235,16 @@ async fn fresh_claim_cannot_be_reclaimed() {
     );
     // Once the owner starts sending, the same row is permanently fenced:
     // retries are Duplicate (200), never InFlight, through both calls.
-    assert!(mark_live_send_started(&pool, &key).await.expect("start"));
+    // A foreign token cannot start the row first.
+    assert!(
+        !mark_live_send_started(&pool, &key, "stale-owner-token")
+            .await
+            .expect("start wrong token"),
+        "starting with a foreign token must report false"
+    );
+    assert!(mark_live_send_started(&pool, &key, &token)
+        .await
+        .expect("start"));
     assert_eq!(
         reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
             .await
@@ -254,16 +265,31 @@ async fn fresh_claim_cannot_be_reclaimed() {
 async fn stale_unposted_claim_is_taken_over_atomically() {
     let (pool, schema) = setup().await;
     let key = format!("{:064x}", 0x57a1eu64);
-    assert_eq!(
-        claim_live(&pool, &claim(&key)).await.expect("claim"),
-        ClaimOutcome::Claimed
-    );
+    let old_token = claimed(claim_live(&pool, &claim(&key)).await.expect("claim"));
     age_claim(&pool, &key, STALE_CLAIM_LEASE_SECS + 60).await;
     // Crash-before-send: never started, lease expired, so the retry owns
     // it — through the composed `claim_live` entry point alone.
-    assert_eq!(
-        claim_live(&pool, &claim(&key)).await.expect("takeover"),
-        ClaimOutcome::Claimed
+    let new_token = claimed(claim_live(&pool, &claim(&key)).await.expect("takeover"));
+    assert_ne!(new_token, old_token, "takeover must rotate the claim token");
+    // The fenced-out original owner can no longer start, release or stamp
+    // the row the new owner holds.
+    assert!(
+        !mark_live_send_started(&pool, &key, &old_token)
+            .await
+            .expect("start old owner"),
+        "a stale owner must not start a taken-over claim"
+    );
+    assert!(
+        !release_live(&pool, &key, &old_token)
+            .await
+            .expect("release old owner"),
+        "a stale owner must not release a taken-over claim"
+    );
+    assert!(
+        !mark_live_delivered(&pool, &key, &old_token, "100000000000000006")
+            .await
+            .expect("stamp old owner"),
+        "a stale owner must not stamp a taken-over claim"
     );
     // Takeover refreshes the lease: an immediate second retry loses and is
     // InFlight (fresh, never started), so it is answered 5xx, not 200.
@@ -278,10 +304,14 @@ async fn stale_unposted_claim_is_taken_over_atomically() {
         ClaimOutcome::InFlight
     );
     // The new owner completes the normal path: start, then stamp.
-    assert!(mark_live_send_started(&pool, &key).await.expect("start"));
-    assert!(mark_live_delivered(&pool, &key, "100000000000000006")
+    assert!(mark_live_send_started(&pool, &key, &new_token)
         .await
-        .expect("stamp"));
+        .expect("start"));
+    assert!(
+        mark_live_delivered(&pool, &key, &new_token, "100000000000000006")
+            .await
+            .expect("stamp")
+    );
     cleanup(pool, &schema).await;
 }
 
@@ -290,14 +320,24 @@ async fn stale_unposted_claim_is_taken_over_atomically() {
 async fn started_claim_is_never_reclaimed_even_when_stale() {
     let (pool, schema) = setup().await;
     let key = format!("{:064x}", 0x9ead1e55u64);
-    assert_eq!(
-        claim_live(&pool, &claim(&key)).await.expect("claim"),
-        ClaimOutcome::Claimed
-    );
-    assert!(mark_live_send_started(&pool, &key).await.expect("start"));
+    let token = claimed(claim_live(&pool, &claim(&key)).await.expect("claim"));
+    assert!(mark_live_send_started(&pool, &key, &token)
+        .await
+        .expect("start"));
     assert!(
-        !mark_live_send_started(&pool, &key).await.expect("restart"),
+        !mark_live_send_started(&pool, &key, &token)
+            .await
+            .expect("restart"),
         "send start must be idempotent"
+    );
+    // A started row can never be released, even by its owner: after a
+    // stamp failure the send may already have reached Discord, so the
+    // row stays fenced instead of freeing a retry to double-post.
+    assert!(
+        !release_live(&pool, &key, &token)
+            .await
+            .expect("release started"),
+        "a started row must survive release"
     );
     // Send-succeeded/stamp-failed: Discord may already have the post, so
     // ageing the row must NOT make it reclaimable.
@@ -313,9 +353,11 @@ async fn started_claim_is_never_reclaimed_even_when_stale() {
         ClaimOutcome::Duplicate
     );
     // The ambiguous row stays stampable by its owner; it never auto-frees.
-    assert!(mark_live_delivered(&pool, &key, "100000000000000006")
-        .await
-        .expect("late stamp"));
+    assert!(
+        mark_live_delivered(&pool, &key, &token, "100000000000000006")
+            .await
+            .expect("late stamp")
+    );
     cleanup(pool, &schema).await;
 }
 
@@ -324,15 +366,20 @@ async fn started_claim_is_never_reclaimed_even_when_stale() {
 async fn delivered_rows_are_never_reclaimed() {
     let (pool, schema) = setup().await;
     let key = format!("{:064x}", 0x9e17bfa9a053696fu64);
-    assert_eq!(
-        claim_live(&pool, &claim(&key)).await.expect("claim"),
-        ClaimOutcome::Claimed
-    );
-    assert!(mark_live_delivered(&pool, &key, "100000000000000006")
-        .await
-        .expect("stamp"));
+    let token = claimed(claim_live(&pool, &claim(&key)).await.expect("claim"));
     assert!(
-        !release_live(&pool, &key).await.expect("release"),
+        !mark_live_delivered(&pool, &key, "stale-owner-token", "100000000000000006")
+            .await
+            .expect("stamp wrong token"),
+        "stamping with a foreign token must report false"
+    );
+    assert!(
+        mark_live_delivered(&pool, &key, &token, "100000000000000006")
+            .await
+            .expect("stamp")
+    );
+    assert!(
+        !release_live(&pool, &key, &token).await.expect("release"),
         "a delivered row must survive release"
     );
     assert_eq!(
@@ -340,7 +387,7 @@ async fn delivered_rows_are_never_reclaimed() {
         ClaimOutcome::Duplicate
     );
     assert!(
-        !mark_live_delivered(&pool, &key, "100000000000000007")
+        !mark_live_delivered(&pool, &key, &token, "100000000000000007")
             .await
             .expect("restamp"),
         "a delivered row must not restamp"
@@ -354,7 +401,7 @@ async fn delivered_rows_are_never_reclaimed() {
         ClaimOutcome::Duplicate
     );
     assert!(
-        !mark_live_send_started(&pool, &key)
+        !mark_live_send_started(&pool, &key, &token)
             .await
             .expect("start delivered"),
         "a delivered row must not start sending"

@@ -21,16 +21,29 @@
 -- cannot both win and delivered/ambiguous rows are never reclaimed.
 -- `release_live` keeps its shape for the same-process provably-unsent path
 -- (`SendFailed` disposition) and must never be used as stale recovery.
+--
+-- This migration also adds `claim_token`, the ownership fence: a fresh
+-- insert generates a token and a takeover rotates it, and
+-- `mark_live_send_started` / `mark_live_delivered` / `release_live` only
+-- act on the row whose token they present (mirroring
+-- `automod_delivery_claims.claim_token`). Without it a timed-out-but-
+-- running original owner could still start, stamp or release the row a
+-- takeover gave to a new owner. `release_live` also refuses started rows,
+-- so a stamp failure can never free a possibly-posted claim. Existing
+-- rows stay tokenless (NULL) until a takeover rotates a token in; no
+-- receiver holds a token for them yet, so no owner is locked out.
 -- One-row-per-go-live retention is unchanged: delivered rows are kept
 -- indefinitely as dedup fences; this slice adds no purge.
 -- No member identity (same shape as 0440), so the member erasure plan needs
--- no entry. Additive only: one nullable column, no backfill (existing rows
--- stay NULL = never-started, hence reclaimable once stale, matching their
--- pre-recovery meaning). `IF NOT EXISTS` throughout, matching the S6
--- convention. Rollback is `ALTER TABLE stream_live_claims DROP COLUMN IF
--- EXISTS send_started_at` (in-flight sending markers are lost; delivered
--- fences survive).
+-- no entry. Additive only: two nullable columns, no backfill (existing rows
+-- stay NULL = never-started and tokenless, hence reclaimable once stale,
+-- matching their pre-recovery meaning). `IF NOT EXISTS` throughout,
+-- matching the S6 convention. Rollback is `ALTER TABLE stream_live_claims
+-- DROP COLUMN IF EXISTS send_started_at, DROP COLUMN IF EXISTS
+-- claim_token` (in-flight sending markers and ownership tokens are lost;
+-- delivered fences survive).
 -- Bot schema range: 0001-0999. Database tests use test containers only.
 
 ALTER TABLE IF EXISTS stream_live_claims
-    ADD COLUMN IF NOT EXISTS send_started_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS send_started_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS claim_token TEXT;

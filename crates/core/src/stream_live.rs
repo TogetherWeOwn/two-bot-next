@@ -7,8 +7,11 @@
 //! the announcements channel. The receiver MUST send with
 //! `allowed_mentions: { parse: [] }`; this repository does not yet contain
 //! that sender, so the no-ping guarantee is a receiver contract, not verified
-//! behavior. On a provable send failure release the claim and answer 5xx so
-//! Twitch retries; a retry of a started or delivered claim is acknowledged
+//! behavior. Only a provably-unsent send failure releases the claim (the
+//! store deletes it only for the token-holding owner of a never-started
+//! row) and answers 5xx so Twitch retries; claim and stamp failures answer
+//! 5xx WITHOUT releasing, because a stamped-failed send may already have
+//! reached Discord. A retry of a started or delivered claim is acknowledged
 //! with 2xx and skipped, while a retry of a fresh never-started claim is
 //! answered 5xx (`InFlight`), which asks Twitch to retry instead of
 //! treating the go-live as delivered. `claim_live` classifies a
@@ -42,7 +45,9 @@ pub enum Stage {
     /// 5xx, asking Twitch to retry after the lease can expire or the owner
     /// settles the row.
     InFlight,
-    /// This delivery owns the post but the Discord send failed.
+    /// This delivery owns the post but the Discord send provably never
+    /// reached Discord (never a timeout, an ambiguous result, or a stamp
+    /// failure after a possibly-successful send).
     SendFailed,
     /// Sent and stamped with the Discord message receipt.
     Sent,
@@ -58,7 +63,9 @@ pub struct Disposition {
     /// to retry.
     pub status: u16,
     /// Release the unposted claim so the retry can claim again. Only set
-    /// when the send provably never reached Discord.
+    /// when the send provably never reached Discord (`SendFailed`); the
+    /// store honours it only for the claim-token owner of a never-started
+    /// row, so a started row stays fenced even if a receiver asks.
     pub release: bool,
 }
 
