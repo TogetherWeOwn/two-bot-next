@@ -128,6 +128,41 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert) |
 
+## Voice stall gauge series
+
+Aggregated across all current guild actors. Before the aggregation change a
+single guild actor's publish overwrote the process values, so a healthy
+guild could hide another guild's halt between scrapes; now each actor keeps
+its latest contribution in a process-local map keyed by an opaque actor key
+under an incarnation generation, and exposition renders aggregates under
+the existing series names.
+
+Sources, by stable anchor rather than line number: per-actor contributions
+are recorded by `set_voice_actor_halted`, `set_voice_actor_queue` and
+`remove_voice_actor` in `crates/core/src/metrics.rs` and rendered by
+`render` in the same file; the guild actor publishes its incarnation's
+contribution every tick from `publish_voice_gauges` in
+`crates/bot/src/voice_rooms.rs` and retires it on loop exit through the
+actor metric guard's `Drop` in the same file, so a late publish from a
+replaced incarnation cannot resurrect it. Full semantics live in
+`docs/metrics.md`.
+
+The received-vs-handled drift signal stays with the `voice_join_received`
+row in the voice structured-fields section below and is not duplicated
+here: that row counts every delivery into the guild actor, while these
+gauges show the actor-side stall posture (halted, queued depth, oldest
+wait). Bounded cardinality holds: the only label is the fixed
+`lane="urgent" | "deferred"` pair on the queue-depth family (two series,
+never per-actor/per-guild/per-channel/per-member); the halt and oldest-age
+gauges are label-free. Queue sums saturate instead of wrapping, and no
+actor, guild, channel, member, token or body content ever reaches a label.
+
+| Series | Labels | Scrape inputs | Alert usage | Meaning |
+| --- | --- | --- | --- | --- |
+| `two_bot_voice_worker_halted` | None (label-free gauge) | Additional series: accepted but not required by the scrape validator, which pins only the alert-input label sets; read manually from the container exposition or the authenticated pull | Consumed by no alert rule; manual check named in the runbook fast-burn, slow-burn and creator-map-stale first responses | 1 while any current guild actor is halted by a store CredentialRefused or Discord 401, otherwise 0; a healthy guild cannot hide another guild's halt |
+| `two_bot_voice_queue_pending` | Fixed `lane`: `urgent` or `deferred` (exactly two series) | Same additional-series handling as above | Consumed by no alert rule; manual queue-side complement to the join-budget burn rules | Queued (not in-flight) voice actions per lane, saturating-summed across all current guild actors |
+| `two_bot_voice_queue_oldest_age_seconds` | None (label-free gauge) | Same additional-series handling as above | Consumed by no alert rule; manual queue-side complement to the join-budget burn rules | Age in seconds of the oldest queued voice action, the maximum across all current guild actors; 0 when every queue is empty |
+
 ## EventSub delivery series
 
 Counters emitted by the Twitch EventSub receiver render. Unknown `kind`
