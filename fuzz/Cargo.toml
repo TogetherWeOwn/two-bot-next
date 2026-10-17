@@ -135,3 +135,10 @@ path = "fuzz_targets/helix_token.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "self_role_custom_id"
+path = "fuzz_targets/self_role_custom_id.rs"
+test = false
+doc = false
+bench = false
