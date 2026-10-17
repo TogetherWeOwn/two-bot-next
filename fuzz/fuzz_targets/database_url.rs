@@ -91,6 +91,7 @@ fuzz_target!(|data: &[u8]| {
     // validates before the driver parses, so an unsupported key can never
     // reach the driver's WARN log; the propagated message proves the order.
     let connected = connect_options(raw);
+    let connected_ok = connected.is_ok();
     match validated {
         Err(expected) => {
             let error = connected.expect_err("validate refusal must refuse connect_options");
@@ -115,7 +116,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(validate(raw).map_err(|message| message), validated);
     assert_eq!(
         connect_options(raw).is_ok(),
-        connected.is_ok(),
+        connected_ok,
         "connect_options must parse deterministically"
     );
 });
