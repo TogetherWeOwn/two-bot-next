@@ -700,6 +700,43 @@ as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
 
+#### Alert: community facts drain failures
+
+`two_bot_community_facts_drain_failures_total{reason}` grew in three consecutive
+completed keepalive sample windows after a baseline. `community_facts_drain_failures`
+is a **ticket, not a page**: gateway dispatch deliberately warns and continues
+when the community-facts writer errors or misses its deadline, so scorecard data
+loss can otherwise remain log-only while checkpoints look healthy. Growth is
+summed over the fixed `error`, `timeout` and `other` reasons. A large single
+burst stays silent.
+
+First response: triage within the watch shift. Read the per-reason counter
+through the existing authorized `/ops/metrics` path, correlate the window with
+`gateway community facts dispatch failed` / `gateway community facts dispatch
+timed out` warn logs, and check scorecard coverage separately: the scorecard
+fails closed on missing coverage, so a drain-loss window means the scorecard
+undercounts rather than overcounts. Record only fixed reason names and
+sanitized counts, never member/channel IDs, payloads or scrape tokens.
+
+Flat samples clear the streak and resolve the ticket. A backwards counter in any
+fixed reason signals a process reset: all reasons re-baseline with a zero streak
+and resolve, even if another reason's new count overtook its old value.
+Missing/invalid series or a failed scrape break the streak and discard the
+baseline, **not** the active ticket; the first valid sample after a gap is only
+a baseline, ongoing growth retains the ticket, and a subsequent valid flat/reset
+window proves recovery. A new DO field or legacy state starts unbaselined.
+Counter-only monitoring cannot detect a restart whose replacement counter
+already exceeds the old value; correlate deployment evidence rather than
+claiming that case is proven quiet.
+
+Do not change facts capture, gateway commit semantics, privacy/retention or
+scorecard calculations to clear this alert, and do not restart the bot to clear
+a counter. This alert adds neither automatic ticket-system integration nor paging
+escalation: it labels the existing transition delivery as `(ticket)` and supplies
+this runbook. Persist sanitized incident evidence and route a continuing drain
+problem to the on-call engineer through the normal triage path. No new webhook,
+production activation or live load test is authorized.
+
 #### Auto-remediation: guarded stall and crash-loop response
 
 Execution-path decision: the Worker cannot restart containers, so remediation

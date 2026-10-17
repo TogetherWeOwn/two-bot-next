@@ -122,6 +122,10 @@ export const VOICE_FAILURE_RATIO = 0.05;
 export const VOICE_FAILURE_MIN_OPS = 10;
 /** Dispatch drops must grow in this many consecutive completed sample windows. */
 export const DISPATCH_DROP_SAMPLES = 3;
+/** Fixed reasons for the community-facts drain-failure counter (mirrors `COMMUNITY_FACTS_DRAIN_REASONS` in `crates/core/src/metrics.rs`). */
+export const COMMUNITY_FACTS_DRAIN_REASONS: readonly string[] = ["error", "timeout", "other"];
+/** Summed drain-failure growth must persist this many consecutive completed windows before ticketing. */
+export const COMMUNITY_FACTS_DRAIN_SAMPLES = 3;
 /** Mirrors the fixed DISPATCH_LANES allowlist in crates/core/src/metrics.rs. */
 export const DISPATCH_LANES: readonly string[] = ["messages", "interactions", "registry", "privileged", "busy", "reactions"];
 /** Creator-join SLO: this share of genuine joins must move within 5 s (99.5%). */
@@ -173,6 +177,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_join_fast_burn", summary: `creator-join error budget burning faster than ${JOIN_FAST_BURN}x over 1 h and 5 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-fast-burn" },
   { id: "voice_join_slow_burn", summary: `creator-join error budget burning faster than ${JOIN_SLOW_BURN}x over 6 h and 30 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-slow-burn", severity: "ticket" },
   { id: "voice_creator_map_stale", summary: `voice creator map has not merged for more than ${CREATOR_MAP_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-voice-creator-map-stale" },
+  { id: "community_facts_drain_failures", summary: `community-facts drain failures grew for ${COMMUNITY_FACTS_DRAIN_SAMPLES} consecutive sample windows (warn-and-continue drain loss; scorecard fails closed)`, runbook: "runbook.md#alert-community-facts-drain-failures", severity: "ticket" },
 ];
 
 /**
@@ -260,6 +265,10 @@ export interface MetricsAlertState {
   dispatchDrops?: Record<string, number>;
   /** Consecutive positive deltas, capped at DISPATCH_DROP_SAMPLES. */
   dispatchDropStreaks?: Record<string, number>;
+  /** Per-reason community-facts drain-failure baseline; absent after a missing/invalid sample or in legacy storage. */
+  communityFactsDrainFailures?: Record<string, number>;
+  /** Consecutive completed windows with positive summed drain-failure growth, capped at COMMUNITY_FACTS_DRAIN_SAMPLES. */
+  communityFactsDrainStreak?: number;
   /**
    * Creator-join burn snapshots for the SLO windows, oldest first. Each entry
    * carries the scrape time plus cumulative counters (received joins,
@@ -277,11 +286,16 @@ export interface JoinBurnSnapshot {
   fastMoves: number;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0 };
 
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
   return { ...state, dispatchDrops: {}, dispatchDropStreaks: {} };
+}
+
+/** A failed scrape breaks drain-growth evidence, never an active drain ticket. */
+export function interruptCommunityFactsDrain(state: MetricsAlertState): MetricsAlertState {
+  return { ...state, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0 };
 }
 
 export function parseExposition(text: string): Sample[] {
@@ -786,7 +800,66 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring } };
+  // Sustained community-facts drain loss is a ticket. Only the fixed reasons
+  // count: unknown/hostile reason rows never become subjects or stored state.
+  // Growth is summed over every fixed reason, so a large single burst stays
+  // silent until three consecutive completed windows each add failures. A flat
+  // or reset window is the valid recovery; missing/invalid evidence breaks
+  // growth but preserves an active ticket.
+  const COMMUNITY_FACTS_DRAIN_KEY = "community_facts_drain_failures";
+  const drainSamples = gauge("two_bot_community_facts_drain_failures_total");
+  const drainCounts: Record<string, number> = {};
+  let drainValid = true;
+  for (const reason of COMMUNITY_FACTS_DRAIN_REASONS) {
+    const rows = drainSamples.filter((s) => s.labels["reason"] === reason);
+    const sample = rows[0];
+    if (rows.length !== 1 || !sample || Object.keys(sample.labels).length !== 1
+      || !Number.isSafeInteger(sample.value) || sample.value < 0) {
+      drainValid = false;
+      break;
+    }
+    drainCounts[reason] = sample.value;
+  }
+  const wasDrainFiring = prev.firing.includes(COMMUNITY_FACTS_DRAIN_KEY);
+  let communityFactsDrainFailures: Record<string, number> = {};
+  let communityFactsDrainStreak = 0;
+  if (!drainValid) {
+    // Missing/invalid evidence drops the baseline, never the active ticket.
+    if (wasDrainFiring) firing.push(COMMUNITY_FACTS_DRAIN_KEY);
+  } else {
+    const prevDrain = prev.communityFactsDrainFailures;
+    const hasBaseline = prevDrain !== undefined
+      && COMMUNITY_FACTS_DRAIN_REASONS.every((reason) => {
+        const count = prevDrain[reason];
+        return typeof count === "number" && Number.isSafeInteger(count) && count >= 0;
+      });
+    if (!hasBaseline) {
+      // The first valid sample (including after a gap or from legacy state)
+      // is only a baseline; it never resolves an active ticket on its own.
+      communityFactsDrainFailures = { ...drainCounts };
+      if (wasDrainFiring) firing.push(COMMUNITY_FACTS_DRAIN_KEY);
+    } else {
+      // Any backwards reason means the process restarted: re-baseline with a
+      // clear streak, even when another reason's new count overtook its old
+      // one. A reset window is valid recovery evidence, so it resolves.
+      const reset = COMMUNITY_FACTS_DRAIN_REASONS.some((reason) => drainCounts[reason]! < (prevDrain[reason] ?? 0));
+      communityFactsDrainFailures = { ...drainCounts };
+      if (reset) {
+        communityFactsDrainStreak = 0;
+      } else {
+        let delta = 0;
+        for (const reason of COMMUNITY_FACTS_DRAIN_REASONS) delta += drainCounts[reason]! - (prevDrain[reason] ?? 0);
+        if (delta <= 0) {
+          communityFactsDrainStreak = 0;
+        } else {
+          communityFactsDrainStreak = Math.min((prev.communityFactsDrainStreak ?? 0) + 1, COMMUNITY_FACTS_DRAIN_SAMPLES);
+          if (wasDrainFiring || communityFactsDrainStreak >= COMMUNITY_FACTS_DRAIN_SAMPLES) firing.push(COMMUNITY_FACTS_DRAIN_KEY);
+        }
+      }
+    }
+  }
+
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, joinBurn: joinBurn.ring } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
