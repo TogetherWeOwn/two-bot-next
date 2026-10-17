@@ -13,6 +13,8 @@ name: slow-burn-tracker
 # zero edits to the rule file) whether the slow ticket fires. The five-minute
 # cadence is load-bearing: the slow long-window baseline sits one long window
 # behind the previous scrape, so a coarser cadence prunes its own baseline.
+# GitHub runs `*/5` on a best-effort cadence, so a ring gap of 600 s or more
+# emits a ::warning:: instead of reading as a clean bill of burn health.
 #
 # Bindings: the `slow-burn-tracker` environment holds the secret
 # METRICS_SCRAPE_TOKEN (the same bearer the Worker serves /ops/metrics with;
