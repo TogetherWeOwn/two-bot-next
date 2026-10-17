@@ -95,8 +95,12 @@ Rotation procedure (needs its own authorization; this runbook does not grant
 it): Twitch fixes the transport secret at subscription creation and offers
 no update, and `reconcile()` keeps any healthy subscription on our callback
 without comparing secrets, so a new secret alone orphans the old
-subscription. Generate a fresh value meeting the constraint above, set the
-Worker secret `TWO_TWITCH_WEBHOOK_SECRET`, redeploy that Worker version and
+subscription. Generate a fresh value meeting the constraint above, stage it with
+`wrangler versions secret put --env staging TWO_TWITCH_WEBHOOK_SECRET --message <sha>`
+(stamped with the live `/readyz` `build_revision` of staging, after the
+newest-equals-serving precheck in `docs/production-deploy.md`; a plain `wrangler
+secret put` publishes an unstamped version that can never form a rollback receipt),
+redeploy that Worker version and
 transfer ownership per the enable order above, then restart the container.
 Then delete each `stream.online` v1 subscription on our callback (Helix
 DELETE, `delete_subscription_url`) and recreate it with the new secret

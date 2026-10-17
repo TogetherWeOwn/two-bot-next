@@ -49,10 +49,13 @@ wrangler versions secret put --env staging MCP_TOKEN --message <sha>
 wrangler versions deploy --env staging
 ```
 
-Stamp with the SHA of the last successful deploy (the run summary's `SHA:`
-line, or the live `/readyz` `build_revision`): a plain `wrangler secret put`
+Stamp with the live `/readyz` `build_revision` of staging: a plain `wrangler secret put`
 publishes an unstamped version that can never form a rollback receipt
-(see `docs/production-deploy.md`).
+(see `docs/production-deploy.md`). Precheck first: `versions secret put` builds on the
+newest-created version, not necessarily the serving one — confirm the newest entry of
+`wrangler versions list --env staging` is the serving version (same id as
+`wrangler deployments status --env staging`), and if they differ redeploy the intended
+SHA through the workflow first (full rule in `docs/production-deploy.md`).
 
 Staging target (follow-up): `workers-oauth-provider` in resource-server
 mode with dynamic client registration, PKCE, and scopes. Phase-1 scope is

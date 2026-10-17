@@ -91,10 +91,14 @@ environment. Names only — values never go in cards, logs, or PRs:
   staging Worker URL, used by the `/readyz` gate. If it is missing the gate
   fails closed with instructions instead of deploying blind.
 
-`<sha>` above is the SHA of the last successful deploy (the run summary's
-`SHA:` line, or the live `/readyz` `build_revision`): a plain
+`<sha>` above is the live `/readyz` `build_revision` of staging: a plain
 `wrangler secret put` publishes an unstamped version that can never form a
-rollback receipt (see `docs/production-deploy.md`).
+rollback receipt (see `docs/production-deploy.md`). Precheck first:
+`versions secret put` builds on the newest-created version, not necessarily the
+serving one — confirm the newest entry of `wrangler versions list --env staging`
+is the serving version (same id as `wrangler deployments status --env staging`),
+and if they differ redeploy the intended SHA through the workflow first (full rule
+in `docs/production-deploy.md`).
 
 ## Starting the soak
 

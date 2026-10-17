@@ -140,7 +140,15 @@ not the pre-deploy snapshot's `serving_sha` (that snapshot describes the
 version being replaced, so stamping with it would label the new version with
 the previous build's SHA and trip the post-restore gate) — then deploy that
 staged version with `wrangler versions deploy`, on staging
-and production alike. A secret-change version created by `wrangler secret
+and production alike. Precheck first: `versions secret put` builds on the
+newest-created version (`PATCH .../versions/latest`), not necessarily the
+serving one. Confirm the newest entry of `wrangler versions list --env <env>`
+is the serving version (same id as `wrangler deployments status --env <env>`);
+the stamp is the SHA that serving version was built from (its
+`workers/message`, or the live `/readyz` `build_revision`). If they differ
+(after an auto-rollback, a manual rollback, or a `versions upload`), do not
+stage secrets — redeploy the intended SHA through the workflow first, then
+stage. A secret-change version created by `wrangler secret
 put` or by a `versions secret put` without `--message` carries no stamped
 SHA and can never form a receipt. If the pre-deploy snapshot records
 `serving_sha: None`, the serving version is unstamped: stamp it (secret

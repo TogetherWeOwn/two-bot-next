@@ -82,15 +82,19 @@ fence keeps a new version from serving until the Operator transfers ownership
 (see [persisted ownership control](runbook.md#persisted-ownership-control)).
 Stage the secrets with `wrangler versions secret put --env staging <KEY> --message <sha>` (a version
 that is not yet deployed), deploy that one version, then run the takeover once.
-Stamp with the SHA of the last successful deploy (the run summary's `SHA:` line,
-or the live `/readyz` `build_revision`); an unstamped secret-change version can
-never form a rollback receipt (see `docs/production-deploy.md`).
+Stamp with the live `/readyz` `build_revision` of staging; an unstamped secret-change version can
+never form a rollback receipt (see `docs/production-deploy.md`). Precheck first:
+`versions secret put` builds on the newest-created version, not necessarily the
+serving one — confirm the newest entry of `wrangler versions list --env staging`
+is the serving version (same id as `wrangler deployments status --env staging`),
+and if they differ redeploy the intended SHA through the workflow first (full rule
+in `docs/production-deploy.md`).
 
 1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS`, `TWO_INTERNAL_CHANNEL_KEYS` and `TWO_INTERNAL_ROLE_KEYS` (plain values).
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
 4. Operator applies migrations `0423` (settings CAS) and `0424` (event outcome) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
-5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete`), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
+5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete --env staging TWO_INTERNAL_ACTIONS --message <sha>`, same precheck and stamp as above), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
 
 Migration `0424` adds the nullable `internal_idempotency.outcome` column that
 event receipts read back. Roll back in this order: disable the receiver (step 5)
