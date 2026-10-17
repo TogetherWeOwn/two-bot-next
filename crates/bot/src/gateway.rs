@@ -645,9 +645,11 @@ async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Opti
     match write {
         Ok(()) => None,
         Err(error) => {
-            if crate::gateway_failure::is_schema_gap(&error) {
-                let code = crate::db_log::error_code(&error);
-                let code = code.as_deref().unwrap_or("unknown");
+            let code = crate::db_log::error_code(&error);
+            let code = code.as_deref().unwrap_or("unknown");
+            let permission_gap_on_rejoin =
+                code == "42501" && matches!(event, Event::GuildCreate(_));
+            if crate::gateway_failure::is_schema_gap(&error) && !permission_gap_on_rejoin {
                 if is_real_guild_removal(event) {
                     tracing::error!(
                         guild = event_guild_id(event),

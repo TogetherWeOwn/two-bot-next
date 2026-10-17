@@ -948,13 +948,31 @@ def production_errors(workflow):
     production, guard = jobs.get("production", {}), jobs.get("guard", {})
     needs = production.get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
+    expected_production_if = (
+        "always() && needs.guard.result == 'success' && "
+        "(needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || "
+        "(needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))"
+    )
     if production.get("environment") != "production" or set(needs) != {"guard", "schema-gate", "roles-gate"}:
         errors.append(f"{name}:production: must wait for the guard, the schema gate, the roles gate and the protected Environment")
-    if "if" in production:
-        errors.append(f"{name}:production: a job condition could bypass the guard outputs")
-    if ("environment" in guard or "uses" in guard
-            or any(marker in str(guard).lower() for marker in DEPLOY_MARKERS)):
+    if production.get("if") != expected_production_if:
+        errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates")
+    expected_gate_if = "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
+    for gate_name in ("schema-gate", "roles-gate"):
+        if jobs.get(gate_name, {}).get("if") != expected_gate_if:
+            errors.append(f"{name}:{gate_name}: must run only for ordinary deploys")
+    guard_text = str(guard).lower()
+    guard_markers = tuple(marker for marker in DEPLOY_MARKERS if marker not in ("production_worker_url", "/readyz"))
+    if ("environment" in guard or "uses" in guard or "curl " in guard_text
+            or any(marker in guard_text for marker in guard_markers)):
         errors.append(f"{name}:guard: deployment/probe alternative outside the production job")
+    guard_script = "\n".join(step.get("run", "") for step in guard.get("steps", []))
+    for required in ('urllib.request.urlopen(worker_url + "/readyz", timeout=10)',
+                     'live_report.get("build_revision") != sha'):
+        if required not in guard_script:
+            errors.append(f"{name}:guard: missing live-SHA check {required}")
+    if guard_script.count("urllib.request.urlopen(") != 1:
+        errors.append(f"{name}:guard: unexpected live production probe")
     # Lexical regression pins on the guard script. deploy-staging runs
     # execute (TOG-12856), so every production SHA needs a staging deploy
     # run on that SHA that concluded `success` (a `skipped` run does not
@@ -1020,7 +1038,7 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:schema-gate: must keep contents:read only")
     if "if" in gate:
-        errors.append(f"{name}:schema-gate: a job condition would let drift deploy silently")
+        errors.append(f"{name}:schema-gate: a job condition would bypass the stage gate")
     if "needs" in gate:
         errors.append(f"{name}:schema-gate: must wait for nothing (it is the wait)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
@@ -1073,17 +1091,15 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
 def production_schema_gate_errors(workflow, name="deploy-production.yml"):
     """Pre-deploy production schema-drift gate: read-only plan, fail closed.
 
-    One job runs on every deploy-production dispatch after the guard (it
-    needs the guarded SHA: a dispatch SHA is an input, not github.sha),
-    through the no-reviewer `production-migrate-plan` environment, builds the
-    reviewed `staging-migrate` binary and fails the run with a `schema drift`
-    error when the guarded source is ahead of the production ledger. The
-    production job must `needs` both the guard and the gate, so drift can
-    never deploy silently. Plan-only: no migrator binding, no `--apply`, no
-    role/grant route, no wrangler, no secret indexing. Rollback and live-SHA
-    takeover redeploys serve no new schema and waive the ledger check inside
-    the reviewed script (recorded, never a job-level skip: the job carries
-    no `if:`).
+    Ordinary deploys run one post-guard job (it needs the guarded SHA: a
+    dispatch SHA is an input, not github.sha) through the no-reviewer
+    `production-migrate-plan` environment. The job builds the reviewed
+    `staging-migrate` binary and fails with `schema drift` when the guarded
+    source is ahead of the production ledger. Rollback and live-SHA takeover
+    modes explicitly skip it; the production job accepts those guard-validated
+    waivers but otherwise requires this gate to succeed. Plan-only: no
+    migrator binding, no `--apply`, no role/grant route, no wrangler, no
+    secret indexing.
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -1092,8 +1108,8 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:schema-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:schema-gate: must keep contents:read only")
-    if "if" in gate:
-        errors.append(f"{name}:schema-gate: a job condition would let drift deploy silently")
+    if gate.get("if") != "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'":
+        errors.append(f"{name}:gate: must run only for ordinary deploys")
     if gate.get("needs") != "guard":
         errors.append(f"{name}:schema-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
@@ -1242,16 +1258,14 @@ python3 scripts/ci/roles_gate.py \\
 def production_roles_gate_errors(workflow, name="deploy-production.yml"):
     """Pre-deploy production role-drift gate: read-only verify, fail closed.
 
-    One job runs on every deploy-production dispatch after the guard (it
-    needs the guarded SHA: a dispatch SHA is an input, not github.sha),
-    through the no-reviewer `production-migrate-plan` environment, builds the
-    reviewed `two-bot` binary and fails the run when `db roles verify` reports
-    any finding on a new build. The production job must `needs` the guard and
-    both gates, so drift can never deploy silently. Verify-only: no migrator
-    write binding, no `--apply`, no `roles plan` subcommand, no wrangler, no
-    secret indexing. Rollback and live-SHA takeover redeploys serve no
-    new-table grants and waive the findings check inside the reviewed script
-    (recorded, never a job-level skip: the job carries no `if:`).
+    Ordinary deploys run one post-guard job (it needs the guarded SHA: a
+    dispatch SHA is an input, not github.sha) through the no-reviewer
+    `production-migrate-plan` environment. It builds the reviewed `two-bot`
+    binary and fails when `db roles verify` reports any finding. Rollback and
+    live-SHA takeover modes explicitly skip it; the production job accepts
+    those guard-validated waivers but otherwise requires this gate to succeed.
+    Verify-only: no migrator write binding, no `--apply`, no `roles plan`
+    subcommand, no wrangler, no secret indexing.
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -1260,8 +1274,8 @@ def production_roles_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:roles-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:roles-gate: must keep contents:read only")
-    if "if" in gate:
-        errors.append(f"{name}:roles-gate: a job condition would let drift deploy silently")
+    if gate.get("if") != "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'":
+        errors.append(f"{name}:roles-gate: must run only for ordinary deploys")
     if gate.get("needs") != "guard":
         errors.append(f"{name}:roles-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("roles-gate", gate.get("runs-on")):
@@ -1860,7 +1874,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(production["jobs"]["schema-gate"].get("needs"), "guard")
         self.assertEqual(production["jobs"]["schema-gate"].get("environment"),
                          "production-migrate-plan")
-        self.assertNotIn("if", production["jobs"]["schema-gate"])
+        self.assertEqual(production["jobs"]["schema-gate"].get("if"),
+                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'")
 
     def test_production_roles_gate_shape_is_pinned_and_mutations_fail(self):
         import copy
@@ -1903,7 +1918,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(production["jobs"]["roles-gate"].get("needs"), "guard")
         self.assertEqual(production["jobs"]["roles-gate"].get("environment"),
                          "production-migrate-plan")
-        self.assertNotIn("if", production["jobs"]["roles-gate"])
+        self.assertEqual(production["jobs"]["roles-gate"].get("if"),
+                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'")
 
     def test_staging_migrate_runner_shape_is_pinned(self):
         # TOG-11572: the slice's own workflow must satisfy its carve-out, and
