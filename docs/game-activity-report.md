@@ -36,8 +36,10 @@ cargo run -p two-bot-cutover --bin game-activity-report -- --help
   solely for an owner-approved rollout, never for routine checks.
 - `--help`: prints usage and exits 0 without touching a database.
 - `--guild=<ID>` works like `--guild <ID>`. `--allow-live-guild` takes no
-  value: `--allow-live-guild=x` (or repeating it) is refused with
-  `input error: --allow-live-guild is a bare opt-in and does not accept a value`.
+  value: `--allow-live-guild=x` (or a space-separated value) is refused with
+  `input error: --allow-live-guild is a bare opt-in and does not accept a value`;
+  repeating the bare flag is refused with
+  `input error: --allow-live-guild must not be repeated`.
 - Unknown flags and positional arguments are refused with
   `unknown or malformed argument`.
 
@@ -53,7 +55,8 @@ opened (details redacted).
 - `TWO_DB_POOL_MAX`: optional pool cap (default 5); `1` is enough for a
   one-shot report.
 - `TWO_DATABASE_TLS`: unset means `Required`. Only remote hosts with an
-  explicit `sslmode` in the URL connect; loopback, single-label and
+  `sslmode` of `require`, `verify-ca` or `verify-full` in the URL connect
+  (`disable`, `allow` and `prefer` are refused); loopback, single-label and
   unix-socket URLs are refused. A refused URL exits 1 with only
   `cannot open database; connection details redacted`. See
   [database TLS](database-tls.md). `local-only` is test-only.
@@ -88,8 +91,12 @@ invent one.
   non-playing delta closes it. Other members' observations never disturb
   it. `session_count` is how many such intervals folded into the row. The
   collector flushes hourly and closes each still-playing interval at the
-  flush, reopening it for the next window: one long continuous play counts
-  as about one session per hour, not one session total.
+  flush, reopening it for the next window, so one long play can span more
+  than one session: it closes once at the first flush after it starts, and
+  again in each flush window in which that member's presence updates.
+  Windows with no presence update from them persist nothing, and the next
+  update bridges the silent stretch into one session. Treat `session_count`
+  as a count of persisted intervals, not distinct play sessions.
 - **Play time.** `total_play_ms` sums session wall-clock spans
   (`last - first`). A session built from a single observation still counts
   one minute (one polling tick, conservative against inflation) instead of
