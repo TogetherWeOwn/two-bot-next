@@ -23,11 +23,10 @@
 //!
 //! Shutdown policy: the latched watch flag is checked before the startup
 //! pass, before every interval pass, and between the Helix calls of a pass
-//! (before the listing, before each plan action, before the follow-up
-//! listing, and before every page request inside either listing, including
-//! requests following a pagination cursor), so shutdown never starts another
-//! pass and an in-flight pass stops cooperatively after its current Helix
-//! call instead of being cut mid-request. A pass stopped that way logs
+//! (before the listing, before each plan action, and before the follow-up
+//! listing), so shutdown never starts another pass and an in-flight pass
+//! stops cooperatively after its current Helix call instead of being cut
+//! mid-request. A pass stopped that way logs
 //! `reconcile_shutdown_interrupted` with the completed/remaining action
 //! counts and skips verification; the next startup pass re-lists the real
 //! subscription state and re-plans, so nothing is left silently assumed.
@@ -252,18 +251,10 @@ async fn run_plan<T: HelixTransport>(
             break;
         }
         match client
-            .execute_actions(std::slice::from_ref(action), callback, secret, shutdown)
+            .execute_actions(std::slice::from_ref(action), callback, secret)
             .await
         {
             Ok(mut done) => run.outcomes.append(&mut done),
-            Err(HelixError::Shutdown) => {
-                // Shutdown landed inside the 409 confirmation listing: the
-                // action stays unresolved, the run is incomplete by request,
-                // and the caller reports the interruption (a shutdown stop is
-                // never recorded as an action failure).
-                run.interrupted = true;
-                break;
-            }
             Err(error) => {
                 tracing::error!(
                     event = "eventsub_reconcile",
@@ -296,34 +287,14 @@ fn log_interrupted(completed: usize, remaining: usize) {
     );
 }
 
-/// Report a pass cut short by shutdown: log how far the plan got, claim no
-/// verification status, and preserve a failure recorded before shutdown, so
-/// shutdown never masks it. Every shutdown exit in [`reconcile_all`] funnels
-/// through here, so the interrupted report has exactly one shape.
-fn interrupted_summary(
-    run: PlanRun,
-    plan_len: usize,
-    prior_failed: usize,
-) -> Result<ReconcileSummary, HelixError> {
-    let completed = run.outcomes.len() + run.failed;
-    log_interrupted(completed, plan_len - completed);
-    if let Some(error) = run.first_failure {
-        return Err(error);
-    }
-    let mut summary = summarize(&run.outcomes);
-    summary.prior_failed = prior_failed;
-    Ok(summary)
-}
-
 /// List, diff with `plan_boot_actions` (deletes before creates, our callback
 /// only), run the plan action by action, then confirm with a follow-up
 /// `list_subscriptions`: the pass fails loudly, with the failed and missing
 /// counts, when any action failed or a desired broadcaster lacks a healthy
 /// subscription afterwards. A latched `shutdown` stops the pass between
-/// Helix calls instead (see the module shutdown policy), including between
-/// the page requests of either listing: the actions done so far are
-/// summarized with no verification status, and the interruption is logged,
-/// never silently counted as converged.
+/// Helix calls instead (see the module shutdown policy): the actions done
+/// so far are summarized with no verification status, and the interruption
+/// is logged, never silently counted as converged.
 pub async fn reconcile_all<T: HelixTransport>(
     client: &mut HelixClient<T>,
     callback: &CallbackUrl,
@@ -335,16 +306,7 @@ pub async fn reconcile_all<T: HelixTransport>(
         log_interrupted(0, 0);
         return Ok(ReconcileSummary::default());
     }
-    let existing = match client.list_subscriptions(shutdown).await {
-        Ok(existing) => existing,
-        Err(HelixError::Shutdown) => {
-            // Shutdown landed mid-listing: the pass never started planning,
-            // so the report matches the pre-pass check above.
-            log_interrupted(0, 0);
-            return Ok(ReconcileSummary::default());
-        }
-        Err(error) => return Err(error),
-    };
+    let existing = client.list_subscriptions().await?;
     let prior_failed = count_prior_failed(&existing, callback);
     if prior_failed > 0 {
         tracing::error!(
@@ -360,17 +322,18 @@ pub async fn reconcile_all<T: HelixTransport>(
     if run.interrupted || stopped(shutdown) {
         // The plan is finished or cut short, but shutdown takes priority
         // over the verification listing: report what ran, claim no status.
-        return interrupted_summary(run, plan.len(), prior_failed);
-    }
-    let confirmed = match client.list_subscriptions(shutdown).await {
-        Ok(confirmed) => confirmed,
-        Err(HelixError::Shutdown) => {
-            // Shutdown landed inside the verification listing: report the
-            // actions that ran, exactly as when shutdown lands before it.
-            return interrupted_summary(run, plan.len(), prior_failed);
+        // An action that already failed still fails the pass, exactly as in
+        // the uninterrupted path below, so shutdown never masks a failure.
+        let completed = run.outcomes.len() + run.failed;
+        log_interrupted(completed, plan.len() - completed);
+        if let Some(error) = run.first_failure {
+            return Err(error);
         }
-        Err(error) => return Err(error),
-    };
+        let mut summary = summarize(&run.outcomes);
+        summary.prior_failed = prior_failed;
+        return Ok(summary);
+    }
+    let confirmed = client.list_subscriptions().await?;
     let missing = unconfirmed_broadcasters(desired, callback, &confirmed);
     if run.failed > 0 || !missing.is_empty() {
         tracing::error!(
@@ -637,12 +600,6 @@ mod tests {
         /// answered, so a test can land shutdown deterministically between
         /// two plan actions: the create completes, the next one must not run.
         flip_shutdown_on_create: Option<tokio::sync::watch::Sender<bool>>,
-        /// Latches shutdown while the Nth subscription-listing page request
-        /// (1-based, across every listing in the pass) is being answered, so
-        /// a test can land shutdown deterministically inside a paginated
-        /// listing: the answered page is parsed, the next page must not run.
-        flip_shutdown_on_listing_send: Option<(usize, tokio::sync::watch::Sender<bool>)>,
-        listing_sends: Mutex<usize>,
     }
 
     impl ScriptTransport {
@@ -651,8 +608,6 @@ mod tests {
                 answers: Mutex::new(answers.into()),
                 log,
                 flip_shutdown_on_create: None,
-                flip_shutdown_on_listing_send: None,
-                listing_sends: Mutex::new(0),
             }
         }
 
@@ -692,18 +647,6 @@ mod tests {
             if let Some(shutdown) = &self.flip_shutdown_on_create {
                 if request.method == Method::POST && request.url.contains("subscriptions") {
                     shutdown.send_replace(true);
-                }
-            }
-            if request.method == Method::GET && request.url.contains("subscriptions") {
-                let mut sends = self
-                    .listing_sends
-                    .lock()
-                    .expect("listing send count must unlock");
-                *sends += 1;
-                if let Some((target, shutdown)) = &self.flip_shutdown_on_listing_send {
-                    if *sends == *target {
-                        shutdown.send_replace(true);
-                    }
                 }
             }
             self.log
@@ -1296,118 +1239,6 @@ mod tests {
             log.requests().len(),
             3,
             "token, listing, rejected create: no later action runs after shutdown"
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_during_first_listing_claims_no_status() {
-        // Shutdown lands while the opening listing's first page is answered:
-        // the page after its cursor never runs, no plan is built, and the
-        // pass reports the pre-pass shape (no status), never a partial plan.
-        let first_page = json!({"data": [], "pagination": {"cursor": "page-two"}});
-        let log = CallLog::default();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let mut transport = ScriptTransport::new(
-            vec![
-                ScriptTransport::token_answer(),
-                ScriptTransport::listing_answer(&first_page),
-            ],
-            log.clone(),
-        );
-        transport.flip_shutdown_on_listing_send = Some((1, shutdown_tx));
-        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
-        let summary = reconcile_all(
-            &mut client,
-            &callback(),
-            &["111".to_owned()],
-            &test_secret(),
-            &shutdown_rx,
-        )
-        .await
-        .expect("a shutdown-interrupted listing is not a failure");
-        assert_eq!(summary, ReconcileSummary::default());
-        assert_eq!(
-            log.requests().len(),
-            2,
-            "token and first listing page run; the page after the cursor never runs"
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_during_follow_up_listing_reports_completed_work() {
-        // The plan runs to completion, then shutdown lands inside the
-        // verification listing: the pass reports the finished create with no
-        // status, exactly as when shutdown lands before the listing.
-        let empty = json!({"data": [], "pagination": {}});
-        let follow_up_page = json!({"data": [], "pagination": {"cursor": "page-two"}});
-        let log = CallLog::default();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let mut transport = ScriptTransport::new(
-            vec![
-                ScriptTransport::token_answer(),
-                ScriptTransport::listing_answer(&empty),
-                ScriptTransport::no_content(),
-                ScriptTransport::listing_answer(&follow_up_page),
-            ],
-            log.clone(),
-        );
-        transport.flip_shutdown_on_listing_send = Some((2, shutdown_tx));
-        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
-        let summary = reconcile_all(
-            &mut client,
-            &callback(),
-            &["111".to_owned()],
-            &test_secret(),
-            &shutdown_rx,
-        )
-        .await
-        .expect("a shutdown-interrupted verification is not a failure");
-        assert_eq!(summary.created, 1, "the finished create is reported");
-        assert_eq!(
-            summary.status, None,
-            "an interrupted pass claims no verification status"
-        );
-        assert_eq!(
-            log.requests().len(),
-            4,
-            "token, listing, create, verification first page: the page after the cursor never runs"
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_during_conflict_verification_interrupts_the_run() {
-        // Shutdown lands inside the 409 confirmation listing: the conflict
-        // stays unresolved, the run is incomplete by request, and the pass
-        // reports the interruption instead of recording an action failure.
-        let empty = json!({"data": [], "pagination": {}});
-        let confirm_page = json!({"data": [], "pagination": {"cursor": "page-two"}});
-        let log = CallLog::default();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let mut transport = ScriptTransport::new(
-            vec![
-                ScriptTransport::token_answer(),
-                ScriptTransport::listing_answer(&empty),
-                ScriptTransport::rejected(StatusCode::CONFLICT),
-                ScriptTransport::listing_answer(&confirm_page),
-            ],
-            log.clone(),
-        );
-        transport.flip_shutdown_on_listing_send = Some((2, shutdown_tx));
-        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
-        let summary = reconcile_all(
-            &mut client,
-            &callback(),
-            &["111".to_owned()],
-            &test_secret(),
-            &shutdown_rx,
-        )
-        .await
-        .expect("a shutdown-interrupted conflict check is not a failure");
-        assert_eq!(summary, ReconcileSummary::default());
-        assert_eq!(
-            log.requests().len(),
-            4,
-            "token, listing, conflicted create, confirmation first page: the page after the cursor never runs"
         );
     }
 
