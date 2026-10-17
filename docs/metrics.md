@@ -362,7 +362,8 @@ as dynamic labels.
   `InternalChannelExecutor`), with the same boundary: website resolver
   `ActionNotAllowed` records `refused` at the effect, snapshot failures stay
   unsampled. Retries and rate-limit backoffs are not outcomes. Channel
-  enforcement records uncertain outcomes as `other`. A purge timeout that
+  slash enforcement records uncertain outcomes as `other`; website enforcement
+  records uncertain Discord failures as `discord_error`. A purge timeout that
   proves no deletion was sent is recorded as `refused`. No user id, reason
   text or free-form detail ever becomes a label.
 - `two_bot_community_facts_drain_failures_total{reason}` — `reason` is `error`,
