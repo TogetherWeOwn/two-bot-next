@@ -133,7 +133,11 @@ struct State {
     next_global_id: u64,
     buckets: BucketTable,
     routes: RouteTable,
-    last_pace_slot: Option<Instant>,
+    /// Last shared-pacing release, tagged with the runtime whose clock
+    /// minted it. Instants from another runtime's clock identify nothing on
+    /// this one (the process guard outlives individual test runtimes), so a
+    /// foreign tag simply starts a fresh pacing chain here.
+    last_pace_release: Option<(tokio::runtime::Id, Instant)>,
     counters: GuardSnapshot,
 }
 
@@ -142,6 +146,11 @@ pub struct RateLimitGuard {
     config: GuardConfig,
     state: Mutex<State>,
     changed: tokio::sync::Notify,
+    /// Serializes pacing turns: each holder waits out only its own spacing
+    /// from the previous release (never a pre-reserved slot chain), so a
+    /// stale or foreign-clock timestamp can delay one admission by at most
+    /// one [`GLOBAL_MIN_INTERVAL`] instead of parking it.
+    pace_gate: tokio::sync::Mutex<()>,
 }
 
 impl RateLimitGuard {
@@ -153,6 +162,7 @@ impl RateLimitGuard {
             config,
             state: Mutex::new(State::default()),
             changed: tokio::sync::Notify::new(),
+            pace_gate: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -221,10 +231,11 @@ impl RateLimitGuard {
         self.admit_inner(Some(route), essential, true).await
     }
 
-    /// Second look inside one lane admission (after the caller's own pacing
-    /// sleep): re-checks the breaker, global pause and bucket deadline
-    /// exactly like [`Self::admit_route`], but reserves no second pacing
-    /// slot — the admission already holds the one it reserved up front.
+    /// Gate wait for one route with no pacing turn: the breaker, pending
+    /// and global pauses and the learned bucket deadline, exactly like
+    /// [`Self::admit_route`]. Lane callers wait here before taking their
+    /// lane lock (and again after a restriction arrives mid-lane), so a
+    /// route-local bucket wait never parks unrelated routes behind a lane.
     pub(crate) async fn admit_route_recheck(
         &self,
         route: &str,
@@ -239,14 +250,14 @@ impl RateLimitGuard {
         essential: bool,
         pace: bool,
     ) -> Result<(), GuardError> {
-        // Reserve the shared pacing slot once for this admission, and only
-        // on the first pass where every other gate is clear (below):
-        // reserving up front would let refused admissions consume slots and
-        // would stale-date every waiter's slot during a long pause, so the
-        // pause would end in a simultaneous burst. Once reserved, the slot
-        // is kept across later passes — re-reserving on every wake would
-        // push it out each time and never converge.
-        let mut pace_slot: Option<Instant> = None;
+        // Take the pacing turn once for this admission, and only on a pass
+        // where every other gate is clear: pacing before a long pause would
+        // stale-date the spacing and release every waiter together when the
+        // pause ends, and refusals must not consume spacing at all. After
+        // the turn, loop back through the gates — a restriction may have
+        // arrived during the (at most one-interval) pacing sleep — but
+        // never pace twice for one admission.
+        let mut paced = false;
         enum Step {
             WaitPending,
             Sleep { until: Option<Instant> },
@@ -277,17 +288,6 @@ impl RateLimitGuard {
                             .chain(self.bucket_deadline(&state, route, now))
                             .max();
                     }
-                    // Every other gate is clear on this pass, so reserve
-                    // the pacing slot now (once). The reserved slot is just
-                    // another deadline on the same runtime clock as every
-                    // other guard wait.
-                    if pace && pace_slot.is_none() && until.is_none() {
-                        pace_slot = Some(Self::reserve_pace_slot(&mut state));
-                    }
-                    until = until
-                        .into_iter()
-                        .chain(pace_slot.filter(|slot| *slot > now))
-                        .max();
                     Step::Sleep { until }
                 }
             };
@@ -305,27 +305,51 @@ impl RateLimitGuard {
                         _ = tokio::time::sleep_until(until) => {},
                         _ = &mut changed => {},
                     },
-                    None => return Ok(()),
+                    None => {
+                        if pace && !paced {
+                            self.pace_once().await;
+                            paced = true;
+                            continue;
+                        }
+                        return Ok(());
+                    }
                 },
             }
         }
     }
 
-    /// Reserve the next shared slot on this guard. Concurrent admitters
-    /// serialize here: each one reserves behind the previous, so independent
-    /// executors on one guard spread to at most
-    /// [`GLOBAL_REQUESTS_PER_SECOND`]. Runtime clock, like every other guard
-    /// deadline: a wall-clock slot slept out on a paused runtime clock can
-    /// never fire, so mixed clocks deadlock frozen-clock callers whose only
-    /// time source is explicit advancement of the runtime clock.
-    fn reserve_pace_slot(state: &mut State) -> Instant {
-        let now = Instant::now();
-        let slot = state.last_pace_slot.map_or(now, |last| {
-            last.checked_add(GLOBAL_MIN_INTERVAL)
-                .map_or(now, |earliest| earliest.max(now))
-        });
-        state.last_pace_slot = Some(slot);
-        slot
+    /// One shared pacing turn: wait until at least
+    /// [`GLOBAL_MIN_INTERVAL`] after the previous turn's release on this
+    /// guard, then stamp this release. The gate serializes turns, so a
+    /// burst of admitters spaces itself one interval at a time instead of
+    /// reserving a chain of future slots. A previous release minted on
+    /// another runtime's clock (the process guard is shared across test
+    /// runtimes, whose paused clocks advance independently) or sitting in
+    /// this clock's future names no real spacing here and is ignored: the
+    /// wait it could otherwise impose is unbounded, while a same-runtime
+    /// release is always in the past and bounds the wait to one interval.
+    async fn pace_once(&self) {
+        let runtime = tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|handle| handle.id());
+        let _gate = self.pace_gate.lock().await;
+        let wait = {
+            let state = self.state.lock().expect("Discord guard state");
+            let now = Instant::now();
+            match state.last_pace_release {
+                Some((id, last)) if Some(id) == runtime && last <= now => last
+                    .checked_add(GLOBAL_MIN_INTERVAL)
+                    .map_or(Duration::ZERO, |earliest| {
+                        earliest.saturating_duration_since(now)
+                    }),
+                _ => Duration::ZERO,
+            }
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        let mut state = self.state.lock().expect("Discord guard state");
+        state.last_pace_release = runtime.map(|id| (id, Instant::now()));
     }
 
     /// Deadline for one request route from learned bucket state, if any.
@@ -434,6 +458,36 @@ impl RateLimitGuard {
         if let Some(error) = error {
             state.counters.rejected_requests_total += 1;
             return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Non-blocking route re-check for lane holders: [`Self::check_now`]
+    /// plus the learned bucket deadline for `route`. A pending global or
+    /// bucket pause reports [`GuardError::GlobalPaused`] without spending
+    /// a rejection — the caller releases its lane and waits the pause out
+    /// through [`Self::admit_route_recheck`], so the pause is a retry, not
+    /// a refusal. Terminal refusals count exactly like admission's.
+    pub(crate) fn check_route_now(&self, route: &str, essential: bool) -> Result<(), GuardError> {
+        let mut state = self.state.lock().expect("Discord guard state");
+        let now = Instant::now();
+        self.refresh(&mut state, now);
+        let terminal = if state.counters.token_invalid {
+            Some(GuardError::TokenInvalid)
+        } else if state.counters.breaker_open && !essential {
+            Some(GuardError::CircuitOpen)
+        } else {
+            None
+        };
+        if let Some(error) = terminal {
+            state.counters.rejected_requests_total += 1;
+            return Err(error);
+        }
+        if !state.pending_global.is_empty()
+            || Self::global_deadline(&state, now).is_some()
+            || self.bucket_deadline(&state, route, now).is_some()
+        {
+            return Err(GuardError::GlobalPaused);
         }
         Ok(())
     }

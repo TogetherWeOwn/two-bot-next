@@ -1110,21 +1110,50 @@ impl ActionExecutor {
         } else {
             (&self.inner.pace_last_at, self.inner.pace_interval)
         };
-        // Keep the lane reservation through cooldown and pacing. Timestamp only
-        // the actual dispatch, not each queued caller's pre-cooldown admission.
-        let mut last = lock.lock().await;
         let route_key = bucket_route_key(request);
-        guard.admit_route(&route_key, essential).await?;
-        let earliest = *last + interval;
-        if earliest > tokio::time::Instant::now() {
-            tokio::time::sleep_until(earliest).await;
+        // Wait out guard gates (global pause, this route's bucket deadline,
+        // shared pacing) before taking the lane lock: a route-local bucket
+        // reset can be seconds away, and sleeping it out under the lane
+        // lock would stall every unrelated route sharing the lane until
+        // their own admission budgets expire. The first pass also takes
+        // this admission's one pacing turn; later passes only re-wait
+        // gates that arrived while this caller queued for or slept in the
+        // lane, detected by the non-blocking re-check under the lock.
+        let mut paced = false;
+        loop {
+            if paced {
+                guard.admit_route_recheck(&route_key, essential).await?;
+            } else {
+                guard.admit_route(&route_key, essential).await?;
+                paced = true;
+            }
+            // Keep the lane reservation through the lane sleep. Timestamp
+            // only the actual dispatch, not each queued caller's
+            // pre-cooldown admission.
+            let mut last = lock.lock().await;
+            if let Err(error) = guard.check_route_now(&route_key, essential) {
+                drop(last);
+                match error {
+                    GuardError::GlobalPaused => continue,
+                    other => return Err(other),
+                }
+            }
+            let earliest = *last + interval;
+            if earliest > tokio::time::Instant::now() {
+                tokio::time::sleep_until(earliest).await;
+            }
+            // A global response/breaker/bucket reset may arrive during the
+            // lane sleep; re-wait it outside the lock, never under it.
+            if let Err(error) = guard.check_route_now(&route_key, essential) {
+                drop(last);
+                match error {
+                    GuardError::GlobalPaused => continue,
+                    other => return Err(other),
+                }
+            }
+            self.stamp_paced_lane(&mut last, kick_lane);
+            return Ok(());
         }
-        // A global response/breaker may arrive during the lane sleep. The
-        // re-check reserves no second pacing slot: this admission already
-        // holds the one from the first call.
-        guard.admit_route_recheck(&route_key, essential).await?;
-        self.stamp_paced_lane(&mut last, kick_lane);
-        Ok(())
     }
 
     /// Keep pacing/global waits before the audit service's late DB fence, and
@@ -1885,16 +1914,14 @@ impl ActionExecutor {
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return Ok(None);
                     }
-                    let wait = Duration::from_millis(res.retry_after_wait_ms());
-                    if global {
-                        // Ride out the shared pause the 429 installed at
-                        // headers receipt (it derives from the same numbers,
-                        // but concurrent traffic may have extended it).
-                        let pause = self.inner.transport.guard.snapshot().global_pause_remaining;
-                        tokio::time::sleep(wait.max(pause)).await;
-                    } else {
-                        tokio::time::sleep(wait).await;
+                    if !global {
+                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
                     }
+                    // A global 429 already installed the shared pause at
+                    // headers receipt, anchored to that instant: sleeping
+                    // the full wait again after the body would restart the
+                    // deadline. The essential re-admission waits out
+                    // whatever of the pause remains instead.
                     admitted_retry = true;
                     attempt += 1;
                 }
@@ -1999,7 +2026,7 @@ impl ActionExecutor {
                     // the fixed transient-exhaustion error for checked reads
                     // (absence for unchecked ones), never an open-ended park.
                     // The retry re-admits as essential after sleeping out
-                    // the wait (plus any shared pause).
+                    // a route-local wait; a shared pause rides admission.
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return if checked {
                             Err("Discord evidence unavailable".to_owned())
@@ -2007,13 +2034,12 @@ impl ActionExecutor {
                             Ok(None)
                         };
                     }
-                    let wait = Duration::from_millis(res.retry_after_wait_ms());
-                    if global {
-                        let pause = self.inner.transport.guard.snapshot().global_pause_remaining;
-                        tokio::time::sleep(wait.max(pause)).await;
-                    } else {
-                        tokio::time::sleep(wait).await;
+                    if !global {
+                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
                     }
+                    // Global: no local sleep — the shared pause is anchored
+                    // at headers receipt and the essential re-admission
+                    // waits out its remainder (see the observed read).
                     admitted_retry = true;
                     attempt += 1;
                 }
