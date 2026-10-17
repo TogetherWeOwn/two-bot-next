@@ -583,6 +583,29 @@ class TokenRedirectGateTests(unittest.TestCase):
             fixed_path.write_text(fixed)
             self.assertEqual(find_violations(fixed_path), [])
 
+    def test_unaliased_single_status_handler_trips_the_gate(self):
+        """The real reader shape minus its alias line still trips the gate."""
+        mutant = (
+            "import urllib.request\n"
+            "class _Refuse(urllib.request.HTTPRedirectHandler):\n"
+            "    def http_error_301(self, req, fp, code, msg, headers):\n"
+            "        fp.close()\n"
+            "        raise ValueError('refusing')\n"
+            "def _get(path, token):\n"
+            "    opener = urllib.request.build_opener(_Refuse)\n"
+            "    request = urllib.request.Request(\n"
+            "        'https://api.example' + path,\n"
+            "        headers={'Authorization': 'Bearer ' + token})\n"
+            "    with opener.open(request, timeout=10) as response:\n"
+            "        return response.read()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            mutant_path = Path(tmp) / "unaliased_handler.py"
+            mutant_path.write_text(mutant)
+            violations = find_violations(mutant_path)
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0][1], "_get")
+
     def test_lowercase_authorization_header_trips_the_gate(self):
         """Header names are case-insensitive, so lowercase still counts."""
         mutant = (
