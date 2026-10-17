@@ -2565,8 +2565,13 @@ pub struct GuildRoomWorker<S, H> {
     /// re-read; the maintenance tick merges it, debounced. Set by
     /// `ActorCommand::RefreshCreators`, cleared by `reload_creators`.
     creators_refresh_due: bool,
-    /// Actor clock of the last creator-view merge (periodic refresh).
+    /// Actor clock of the last creator refresh *attempt* (success or
+    /// failure); paces the interval/debounce retries.
     creators_read_ms: Option<u64>,
+    /// Actor clock of the last *successful* creator-view merge. The age
+    /// gauge counts from this field only, so it keeps climbing through a
+    /// store outage instead of resetting on every failed attempt.
+    creators_merged_ms: Option<u64>,
     /// Live generation the creator view was last merged at. A gateway
     /// reconnect (GuildCreate/Resumed) bumps the generation but sends no
     /// channel event, so with no RefreshCreators flag the merge would wait
@@ -2959,6 +2964,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             creators,
             creators_refresh_due: false,
             creators_read_ms: None,
+            creators_merged_ms: None,
             creators_generation,
             creator_misses: HashSet::new(),
             creator_revalidate_cooldown_until: None,
@@ -3340,6 +3346,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         match self.store.creators(self.live.guild_id).await {
             Ok(rows) => {
                 self.creators_generation = generation;
+                self.creators_merged_ms = Some(now_ms);
                 self.creator_misses.clear();
                 self.creator_revalidate_cooldown_until = None;
                 let mut added = 0u64;
@@ -8042,10 +8049,20 @@ fn watchdog_due(
     queue_nonempty && now.saturating_duration_since(last_progress) >= stuck_after
 }
 
+/// Creator-map staleness on the actor-uptime clock: seconds since the last
+/// successful merge; 0 when never merged. Pure, unit-tested: the gauge must
+/// keep climbing between merges instead of freezing at the merge-time zero.
+fn creator_map_age_secs(creators_merged_ms: Option<u64>, now_ms: u64) -> u64 {
+    creators_merged_ms.map_or(0, |last| now_ms.saturating_sub(last) / 1000)
+}
+
 /// Publish the per-tick stall gauges: halt latch plus per-lane queue depth
 /// and oldest-pending age. Cheap atomics; called every actor tick so
 /// `/ops/metrics` always shows the worker's stall posture.
-fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWorker<S, H>) {
+fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(
+    worker: &GuildRoomWorker<S, H>,
+    now_ms: u64,
+) {
     let guild = worker.live.guild_id;
     let (urgent, deferred) = worker.queue.pending_counts(guild);
     let oldest_age_secs = worker
@@ -8054,6 +8071,10 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWor
         .map_or(0, |age| age.as_secs());
     let gauges = metrics::global();
     gauges.set_voice_halted(worker.halted());
+    gauges.set_voice_creator_map(
+        worker.creators_generation,
+        creator_map_age_secs(worker.creators_merged_ms, now_ms),
+    );
     // Recompute the in-flight REST age from attempts still live, so the
     // gauge shows a currently-stalled request instead of the begin/drop
     // snapshots (0 at begin, already removed at drop).
@@ -8075,6 +8096,10 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWor
 struct StallShared<H> {
     guild: Snowflake,
     http: Arc<H>,
+    /// Actor start instant: the sibling computes the creator-map age from
+    /// the stored merge stamp on this clock, so the age keeps climbing
+    /// while the main task (and its snapshots) are hung in a dispatch.
+    start: tokio::time::Instant,
     state: Mutex<StallState>,
 }
 
@@ -8085,6 +8110,8 @@ struct StallState {
     deferred: usize,
     oldest_age_secs: u64,
     halted: bool,
+    creators_generation: u64,
+    creators_merged_ms: Option<u64>,
 }
 
 impl<H: RoomWrites> StallShared<H> {
@@ -8105,7 +8132,16 @@ impl<H: RoomWrites> StallShared<H> {
             deferred,
             oldest_age_secs,
             halted: worker.halted(),
+            creators_generation: worker.creators_generation,
+            creators_merged_ms: worker.creators_merged_ms,
         };
+    }
+
+    /// Creator-map age for a snapshot, computed on the sibling's own clock:
+    /// a frozen snapshot (hung dispatch) still yields a climbing age.
+    fn snapshot_creator_map_age_secs(&self, snap: &StallState) -> u64 {
+        let now_ms = self.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        creator_map_age_secs(snap.creators_merged_ms, now_ms)
     }
 
     /// Watchdog + gauge publish from the shared snapshot. Reads only: safe
@@ -8122,6 +8158,10 @@ impl<H: RoomWrites> StallShared<H> {
             u64::try_from(snap.urgent).unwrap_or(u64::MAX),
             u64::try_from(snap.deferred).unwrap_or(u64::MAX),
             snap.oldest_age_secs,
+        );
+        gauges.set_voice_creator_map(
+            snap.creators_generation,
+            self.snapshot_creator_map_age_secs(&snap),
         );
         // Stuck-worker watchdog: queued work with no completed turn for the
         // full window. Log + metric only; the queue keeps its retries so a
@@ -8172,12 +8212,15 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     let stall = Arc::new(StallShared {
         guild: worker.live.guild_id,
         http: Arc::clone(&worker.http),
+        start,
         state: Mutex::new(StallState {
             last_progress,
             urgent: 0,
             deferred: 0,
             oldest_age_secs: 0,
             halted: false,
+            creators_generation: 0,
+            creators_merged_ms: None,
         }),
     });
     stall.snapshot(worker, last_progress);
@@ -8256,7 +8299,8 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 dispatch_budget = dispatch_budget.saturating_sub(1);
             }
             _ = timer.tick() => {
-                publish_voice_gauges(worker);
+                let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                publish_voice_gauges(worker, now_ms);
                 // The stuck-worker watchdog lives on the sibling task now, so
                 // it fires while a dispatch is hung: see `StallShared`. The
                 // tick arm keeps the fresh gauge publish plus recovery below.
@@ -8329,6 +8373,9 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 maintenance_ready = false;
                 let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 worker.reload_creators(now_ms).await;
+                // Republish the merge stamp now, not next tick: until then
+                // the watchdog sibling would keep ageing the pre-merge stamp.
+                stall.snapshot(worker, last_progress);
                 worker.reload_name_settings(now_ms).await;
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;

@@ -40,11 +40,12 @@ const GATEWAY_RS_EVENTS: [&str; 20] = [
     "retention purge skipped; schema gap, operator replay required",
 ];
 
-/// `crates/bot/src/main.rs`: the cataloged `tracing` messages.
-const MAIN_RS_TRACED_EVENTS: [&str; 8] = [
+/// `crates/bot/src/main.rs`: the nine cataloged `tracing` messages.
+const MAIN_RS_TRACED_EVENTS: [&str; 9] = [
     "gateway intents resolved",
     "durable gateway initialized; shard connecting",
     "gateway prerequisites missing; gateway parked, /readyz reports down",
+    "gateway readiness failure injection active; /readyz reports gateway down for the staging rollback drill",
     "container service failed",
     "durable gateway failed; checkpoint unchanged, readiness unavailable",
     "shutdown_deadline_exceeded: abandoning in-flight work",

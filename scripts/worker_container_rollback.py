@@ -444,7 +444,7 @@ class Rollback:
             self.log("worker already serves the restore version; image leg only")
         self.restore_image(restore_image)
         self.take_over(restore_version)
-        self.wait_stable(restore_version, started)
+        self.wait_stable(restore_version, self.now())
         self.evidence.update({
             "restored_version": restore_version,
             "restored_image_digest": restore_image.rsplit("@", 1)[-1],

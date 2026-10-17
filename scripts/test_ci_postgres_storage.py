@@ -30,6 +30,8 @@ EXPECTED = {
     "fsync": "on",
     "full_page_writes": "on",
     "synchronous_commit": "on",
+    "max_wal_size": "512MB",
+    "min_wal_size": "64MB",
 }
 
 

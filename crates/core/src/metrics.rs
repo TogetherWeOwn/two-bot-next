@@ -254,6 +254,13 @@ pub const VOICE_JOIN_REFUSAL_REASONS: &[&str] = &[
     "name_blocked",
     "other",
 ];
+/// Rendered `le` labels for `two_bot_voice_join_to_move_seconds_bucket`: the
+/// eight finite `BUCKETS_MICROS` bounds as seconds plus `+Inf`. The rendered
+/// exposition is tested against this list, and the Worker scrape validator
+/// (`wrangler/src/metrics-scrape.ts`) and its fixture are checked against it.
+pub const VOICE_JOIN_TO_MOVE_BUCKET_LE: &[&str] = &[
+    "0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf",
+];
 /// Action-queue lanes for the `two_bot_voice_queue_pending{lane}` gauge.
 pub const VOICE_QUEUE_LANES: &[&str] = &["urgent", "deferred"];
 /// Vote-kick outcomes for `two_bot_voice_vote_kick_total{outcome}` (M4.30):
@@ -482,6 +489,13 @@ struct Values {
     voice_queue_oldest_age_secs: u64,
     /// Age of the oldest in-flight voice REST attempt in seconds; 0 when idle.
     voice_rest_in_flight_age_secs: u64,
+    /// Last merged creator-map generation (live snapshot generation stamped
+    /// by `reload_creators`); 0 before the first merge. Last writer wins.
+    creator_map_generation: u64,
+    /// Seconds since the last successful creator-map merge on the actor clock;
+    /// 0 when never merged. Last writer wins; the per-tick publish refreshes
+    /// it so the gauge shows staleness, not the merge-time zero.
+    creator_map_age_secs: u64,
     /// Global-backoff waits refused (capped) instead of parking the actor.
     voice_global_backoff_capped: u64,
     /// Actor dispatches that exceeded the per-dispatch timeout.
@@ -832,6 +846,18 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .voice_rest_in_flight_age_secs = age_secs;
+    }
+
+    /// Creator-map freshness: last merged generation plus seconds since that
+    /// merge. Last writer wins; the actor tick republishes every tick so age
+    /// keeps climbing between merges instead of freezing at the merge-time 0.
+    pub fn set_voice_creator_map(&self, generation: u64, age_secs: u64) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.creator_map_generation = generation;
+        values.creator_map_age_secs = age_secs;
     }
 
     /// One global-backoff wait capped instead of parking the actor: the call
@@ -1370,6 +1396,30 @@ impl Metrics {
             out,
             "two_bot_voice_rest_in_flight_age_seconds {}",
             values.voice_rest_in_flight_age_secs
+        )
+        .unwrap();
+        header(
+            &mut out,
+            "two_bot_voice_creator_map_generation",
+            "gauge",
+            "Last merged creator-map generation; 0 before the first merge.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_creator_map_generation {}",
+            values.creator_map_generation
+        )
+        .unwrap();
+        header(
+            &mut out,
+            "two_bot_voice_creator_map_age_seconds",
+            "gauge",
+            "Seconds since the last successful creator-map merge; 0 when never merged.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_creator_map_age_seconds {}",
+            values.creator_map_age_secs
         )
         .unwrap();
         scalar(
@@ -1987,6 +2037,22 @@ mod tests {
     }
 
     #[test]
+    fn voice_join_bucket_labels_match_the_pinned_contract() {
+        let metrics = Metrics::default();
+        metrics.voice_join_to_move(Duration::from_millis(1));
+        let text = metrics.render(None);
+        let rendered: Vec<&str> = text
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("two_bot_voice_join_to_move_seconds_bucket{le=\"")?
+                    .split('"')
+                    .next()
+            })
+            .collect();
+        assert_eq!(rendered, VOICE_JOIN_TO_MOVE_BUCKET_LE);
+    }
+
+    #[test]
     fn voice_join_occupancy_buckets_cap_without_new_series() {
         // Seeding TEST (occupancy-to-join curve): one counter per occupancy
         // bucket, capped at 7+ so cardinality stays fixed. No channel, member
@@ -2457,6 +2523,45 @@ mod tests {
             "bad sample: {}",
             series[0]
         );
+    }
+
+    #[test]
+    fn creator_map_gauges_are_label_free_generation_and_age() {
+        // Observability v1: the creator-map freshness renders as two label-free
+        // gauge series — the last merged generation and the seconds since that
+        // merge, both 0 before the first merge — so no channel, creator,
+        // guild or timestamp label can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_creator_map_generation gauge\n"));
+        assert!(text.contains("two_bot_voice_creator_map_generation 0\n"));
+        assert!(text.contains("# TYPE two_bot_voice_creator_map_age_seconds gauge\n"));
+        assert!(text.contains("two_bot_voice_creator_map_age_seconds 0\n"));
+        metrics.set_voice_creator_map(7, 42);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_creator_map_generation 7\n"));
+        assert!(text.contains("two_bot_voice_creator_map_age_seconds 42\n"));
+        assert!(!text.contains("two_bot_voice_creator_map_generation{"));
+        assert!(!text.contains("two_bot_voice_creator_map_age_seconds{"));
+        // Last writer wins on both series together.
+        metrics.set_voice_creator_map(9, 300);
+        metrics.set_voice_creator_map(8, 301);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_creator_map_generation 8\n"));
+        assert!(text.contains("two_bot_voice_creator_map_age_seconds 301\n"));
+        // Fixed cardinality: exactly one series each, parseable numbers.
+        for name in [
+            "two_bot_voice_creator_map_generation",
+            "two_bot_voice_creator_map_age_seconds",
+        ] {
+            let series: Vec<_> = text
+                .lines()
+                .filter(|line| line.starts_with(&format!("{name} ")))
+                .collect();
+            assert_eq!(series.len(), 1, "missing series: {name}");
+            let (_, value) = series[0].rsplit_once(' ').unwrap();
+            value.parse::<u64>().expect("bad sample");
+        }
     }
 
     #[test]

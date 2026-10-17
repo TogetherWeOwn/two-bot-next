@@ -48,7 +48,7 @@ for (const lane of DISPATCH_LANES) {
     const flat = ev([line(lane, 1004)], rising.state);
     assert.deepEqual(flat.firing, []);
     assert.equal(flat.state.dispatchDropStreaks?.[lane], 0);
-    assert.deepEqual(transitionMessages(rising.firing, flat.firing), [`two-bot-next RESOLVED ${key}.`]);
+    assert.match(transitionMessages(rising.firing, flat.firing)[0]!, new RegExp(`RESOLVED ${key}\\. Build: unknown\\. Logs: `));
     assert.deepEqual(transitionMessages(flat.firing, ev([line(lane, 1004)], flat.state).firing), []);
   });
 }
@@ -83,7 +83,7 @@ test("dispatch flat windows, bursts and counter resets interrupt growth", () => 
     assert.deepEqual(state.firing, n === 3 ? ["dispatch_drops:busy"] : []);
   }
   const restarted = ev([line("busy", 0)], state);
-  assert.deepEqual(transitionMessages(state.firing, restarted.firing), ["two-bot-next RESOLVED dispatch_drops:busy."]);
+  assert.match(transitionMessages(state.firing, restarted.firing)[0]!, /RESOLVED dispatch_drops:busy\. Build: unknown\. Logs: /);
 });
 
 test("dispatch detects a process reset from any lane, even when another lane overtook its old count", () => {
@@ -135,7 +135,7 @@ for (const [name, lines] of Object.entries(invalidSamples)) {
     const stillGrowing = ev([line("messages", 31)], returnBaseline.state);
     assert.deepEqual(stillGrowing.firing, before.firing, "ongoing growth must not falsely resolve after a gap");
     const quiet = ev([line("messages", 31)], stillGrowing.state);
-    assert.deepEqual(transitionMessages(stillGrowing.firing, quiet.firing), ["two-bot-next RESOLVED dispatch_drops:messages."]);
+    assert.match(transitionMessages(stillGrowing.firing, quiet.firing)[0]!, /RESOLVED dispatch_drops:messages\. Build: unknown\. Logs: /);
   });
 }
 

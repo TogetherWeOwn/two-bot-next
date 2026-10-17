@@ -309,6 +309,17 @@ class StableGateTests(unittest.TestCase):
 
 
 class RollbackRunTests(unittest.TestCase):
+    def test_stable_gate_budget_starts_after_restore_steps(self):
+        clock = Clock()
+        rb, _, _ = make_rollback({}, clock=clock)
+        gate_started = []
+        rb.restore_image = lambda image: clock.sleep(400)
+        rb.take_over = lambda version: clock.sleep(500)
+        rb.wait_stable = lambda version, started: gate_started.append(started)
+        with mock.patch.object(rollback, "serving_version", return_value=GOOD_VERSION):
+            rb.run(GOOD_VERSION, good_image())
+        self.assertEqual(gate_started, [900.0])
+
     def routes(self, serving=BAD_VERSION):
         prev = rollout_row("r-prev", good_image(), created="2026-10-14T00:00:00Z")
         created = {"n": 0}

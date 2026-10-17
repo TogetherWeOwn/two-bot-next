@@ -105,6 +105,12 @@ export const FORWARDED_FLAGS = [
   // `dry-run`/`execute`/`off`, missing defaults to dry run. Non-secret
   // runtime flag read from the process environment.
   "TWO_RETENTION_MODE",
+  // Deployment-environment marker (server.rs drill fence): committed only
+  // in [env.staging.vars] as exactly "staging" (check-env-bindings.py
+  // denies it top-level and in production), so the container can refuse
+  // the gateway-readiness failure injection anywhere else. The injection
+  // switch itself is NOT forwarded here (see NOT_FORWARDED).
+  "TWO_DEPLOY_ENV",
 ] as const;
 
 export type ForwardedFlag = (typeof FORWARDED_FLAGS)[number];
@@ -253,6 +259,7 @@ const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not t
 
 /** Every other `TWO_*` name in crates/, with why it stays out of the Container. */
 export const NOT_FORWARDED: Readonly<Record<string, string>> = {
+  TWO_GATEWAY_READINESS_FAIL_INJECTION: "staging rollback-drill switch; reaches the Container only through an explicit containerEnvVars line while TWO_DEPLOY_ENV is exactly \"staging\" (index.ts), never this flag allowlist, and never a committed wrangler.toml var (check-env-bindings.py)",
   TWO_EVENTSUB: "EventSub gate; the Worker reads it for the public ingress and forwards exactly \"1\" alongside the secret on explicit containerEnvVars lines for the private receiver only while both are set, never this flag allowlist",
   TWO_DATABASE_URL: "cutover/operator CLI secret; the Container reads DATABASE_URL",
   TWO_STAGING_DATABASE_URL: SECRET,

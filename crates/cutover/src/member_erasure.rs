@@ -17,6 +17,9 @@
 use serde::Deserialize;
 use sqlx::{PgConnection, PgPool};
 
+pub(crate) const SCHEMA_GAP_REFUSAL: &str = "erasure schema coverage incomplete";
+pub(crate) const REPLAY_GUARD_REFUSAL: &str = "unresolved erasure replay guard";
+
 #[derive(Debug, Deserialize)]
 pub struct ErasurePlan {
     pub tables: Vec<TablePlan>,
@@ -281,9 +284,7 @@ pub async fn erase_member(
             .await?;
     }
     if !schema_gaps(&mut tx).await?.is_empty() {
-        return Err(sqlx::Error::InvalidArgument(
-            "erasure schema coverage incomplete".into(),
-        ));
+        return Err(sqlx::Error::InvalidArgument(SCHEMA_GAP_REFUSAL.into()));
     }
     let mut counts = Vec::new();
     for entry in &plan.tables {
@@ -306,9 +307,7 @@ pub async fn erase_member(
         // member data. Preserve it and fail the whole operation until resolved.
         // Shared with the retention user-deletion path via has_unresolved_guards.
         if has_unresolved_guards(&mut tx, guild, member).await? {
-            return Err(sqlx::Error::InvalidArgument(
-                "unresolved erasure replay guard".into(),
-            ));
+            return Err(sqlx::Error::InvalidArgument(REPLAY_GUARD_REFUSAL.into()));
         }
         for (entry, count) in plan.tables.iter().zip(&counts) {
             let sql = format!("DELETE FROM {} WHERE {}", entry.table, entry.predicate);

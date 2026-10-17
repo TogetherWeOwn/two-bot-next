@@ -682,7 +682,7 @@ async fn failure_class_is_served_on_readyz_for_the_whole_linger_then_the_task_en
     let body = readyz_body(&state).await;
     assert_eq!(
         body["gateway_failure"],
-        serde_json::json!({"phase": "durable_gateway", "class": "checkpoint_load_failed"})
+        serde_json::json!({"phase": "durable_gateway", "class": "checkpoint_load_failed", "failed_step": "checkpoint_load", "error_code": "none"})
     );
     assert_eq!(
         body["components"][1],
@@ -691,7 +691,9 @@ async fn failure_class_is_served_on_readyz_for_the_whole_linger_then_the_task_en
     assert_eq!(
         state.failure.get(),
         Some(GatewayFailure::durable_gateway(
-            FailureClass::CheckpointLoadFailed
+            FailureClass::CheckpointLoadFailed,
+            "checkpoint_load",
+            "none",
         ))
     );
     tokio::time::sleep(Duration::from_secs(2)).await;

@@ -2,7 +2,8 @@
 'use strict';
 
 // Offline tests for release-on-promote.cjs: bump rules, note rendering, and a
-// dry run against a throwaway git repository (no network, no gh calls).
+// dry run against a throwaway git repository, plus one non-dry-run fresh cut
+// against a mocked gh (no network, no live gh calls).
 
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
@@ -124,6 +125,46 @@ r = run(later);
 assert.equal(r.status, 0, r.stderr);
 assert.match(r.stdout, /## \[1\.0\.1\]/, 'release-as is ignored once that version is tagged');
 fs.writeFileSync(config, JSON.stringify(base));
+// Fresh cut (the main promote path), non-dry-run against a mocked gh: an
+// untagged commit above the highest tag must create exactly one release,
+// targeted at the promoted SHA and explicitly marked --latest. This pins
+// the computed latest flag on the path the dry runs above never reach, so
+// a regression that marks fresh cuts --latest=false fails here.
+const binDir = path.join(dir, 'bin');
+fs.mkdirSync(binDir);
+fs.writeFileSync(path.join(binDir, 'gh'), `#!/usr/bin/env node
+'use strict';
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.GH_LOG, JSON.stringify(args) + '\\n');
+if (args[0] === 'release' && args[1] === 'view') process.exit(1);
+process.exit(0);
+`, { mode: 0o755 });
+const ghLog = path.join(dir, 'gh-fresh-cut.log');
+fs.writeFileSync(ghLog, '');
+const liveOut = path.join(dir, 'out-fresh-cut');
+fs.writeFileSync(liveOut, '');
+const live = require('node:child_process').spawnSync('node', [SCRIPT], {
+  cwd: dir, encoding: 'utf8',
+  env: {
+    ...process.env,
+    PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+    RELEASE_SHA: later, GH_REPO: 'o/r', DRY_RUN: 'false',
+    GITHUB_OUTPUT: liveOut, RUNNER_TEMP: dir, GH_LOG: ghLog,
+  },
+});
+assert.equal(live.status, 0, live.stderr);
+const ghCalls = fs.readFileSync(ghLog, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+const freshCreates = ghCalls.filter((a) => a[0] === 'release' && a[1] === 'create');
+assert.equal(freshCreates.length, 1, `fresh cut must create exactly one release; gh calls: ${JSON.stringify(ghCalls)}`);
+const freshCreate = freshCreates[0];
+assert.ok(freshCreate.includes('v1.0.1'), `fresh cut creates the bumped version; got: ${freshCreate.join(' ')}`);
+assert.equal(freshCreate[freshCreate.indexOf('--target') + 1], later, 'fresh cut targets the promoted SHA');
+assert.ok(freshCreate.includes('--latest'), `fresh cut must be marked latest; got: ${freshCreate.join(' ')}`);
+assert.ok(!freshCreate.includes('--latest=false'), `fresh cut must not opt out of latest; got: ${freshCreate.join(' ')}`);
+const liveOutText = fs.readFileSync(liveOut, 'utf8');
+assert.match(liveOutText, /tag_name=v1\.0\.1/);
+assert.match(liveOutText, /released=true/);
 r = run(offMain);
 assert.notEqual(r.status, 0);
 assert.match(r.stderr, /not on origin\/main/);

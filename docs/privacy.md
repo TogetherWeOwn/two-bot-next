@@ -195,7 +195,11 @@ this job enforces. Every run reports per-class metrics, with partial runs
 (deferred/overdue deletions, failed guild purges) surfaced as warnings that
 stay retryable. When the database is behind the binary (an unapplied
 migration or grant), the gateway acks dispatches whose queue write hits the
-schema gap instead of crash-looping: a skipped rejoin-cancel is a no-op, but
+schema gap instead of crash-looping, with one exception: a missing grant
+(`42501`) on an available rejoin holds the cursor (the gateway fails the
+dispatch and replays it) until the ACL plan is applied, because the queue
+may hold a pending purge for that guild. A missing queue table (`42P01`) on
+a rejoin is still skipped — an absent table holds nothing to cancel — and
 a skipped true guild removal is logged at error level with the guild id
 (`retention purge skipped; schema gap, operator replay required`) and must be
 replayed by the Operator once the migration lands, running the same insert

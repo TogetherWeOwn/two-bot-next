@@ -48,7 +48,7 @@ not adding one.
 | Format | `cargo fmt --all -- --check` clean | `check` lane | every PR |
 | Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `check` lane | every Rust PR |
 | Floor | No waivers, skips, deleted tests, stripped assertions, lowered thresholds; `#[expect(...)]` and `cfg_attr(..., allow/expect/ignore)` count as waivers | `python3 scripts/ci/check-floor-guard.py`, `check` lane | every PR |
-| Patch coverage | Changed lines >= 80% covered (WARN first) | `cargo llvm-cov` + `scripts/ci/check-patch-coverage.py`, `check` lane | every Rust PR |
+| Patch coverage | Changed lines >= 80% covered | `cargo llvm-cov` sweeps + per-suite guarded re-runs, merged with `llvm-cov report --workspace`, + `scripts/ci/check-patch-coverage.py`, `rust-tests` lane with disposable Postgres (see docs/quality-gates.md) | every Rust PR |
 | Dependencies | Nothing at high or above; advisories fail | `cargo-deny check all`, `check` lane | every PR |
 | Request-path unwrap | No new `.unwrap()` in route/handler/interaction/command/webhook files | ast-grep rule + `scripts/ci/check-unwrap-request-paths.py`, `check` lane | every Rust PR |
 | Rust pitfalls | No new `todo!`/`unimplemented!`, empty `.expect("")`, `panic!` in non-test code, `process::exit` in library code | vendored `.semgrep/rust-warn.yml` + `scripts/ci/check-semgrep-warn.py`, `check` lane | every Rust PR |
@@ -56,12 +56,13 @@ not adding one.
 | Docs build | Zero rustdoc warnings | `cargo doc --workspace --all-features --no-deps --locked` with `RUSTDOCFLAGS: -D warnings`, `check` lane | every Rust PR |
 
 Why 80% patch coverage: high enough to force a test for new logic, low
-enough to let a config line or a rename through. Patch coverage stays
-WARN-first because the codebase predates the gate. Semgrep's pre-existing hits
-are grandfathered through 2027-01-15 (docs/quality-gates.md); unwrap has no
-grandfathered production-only set, and its existing request-path findings are
-catalogued in docs/unwrap-backlog.md. Below high-or-above for dependencies is
-mostly noise, so the advisory scan stays HARD from day one.
+enough to let a config line or a rename through. Patch coverage is HARD;
+unwrap and Semgrep are HARD from the WARN-first soak; unwrap has no
+ grandfathered production-only set, and pre-existing Semgrep findings are
+ grandfathered through 2027-01-15 (docs/quality-gates.md). Existing request-path
+ unwrap findings are catalogued in
+docs/unwrap-backlog.md. Below high-or-above for dependencies is mostly noise,
+so the advisory scan stays HARD from day one.
 
 ## Measured, not yet enforced
 

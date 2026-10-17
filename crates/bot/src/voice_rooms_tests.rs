@@ -3206,7 +3206,10 @@ async fn owner_grant_rewrite_rate_limit_retries_before_saving_the_handoff() {
         .iter()
         .any(|c| c.starts_with("update_ownership")));
     assert!(!worker.dispatch_one(99).await);
-    dispatch(&mut worker, 100).await;
+    // Past the 429 deadline with slack: the wait starts at the real
+    // response time (`elapsed_ms`), so the exact boundary races loaded
+    // runners. Core queue tests pin the exact deadline arithmetic.
+    dispatch(&mut worker, 1_100).await;
     assert!(trace
         .lock()
         .unwrap()
@@ -3573,8 +3576,11 @@ async fn create_429_waits_exactly_and_does_not_consume_the_failure_budget() {
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 100).await;
     assert!(!worker.dispatch_one(1599).await);
-    dispatch(&mut worker, 1600).await;
-    dispatch(&mut worker, 1601).await;
+    // Past the 429 deadline with slack: the wait starts at the real
+    // response time (`elapsed_ms`), so the exact boundary races loaded
+    // runners. Core queue tests pin the exact deadline arithmetic.
+    dispatch(&mut worker, 2600).await;
+    dispatch(&mut worker, 2601).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["create", "create", "persist:500", "move:300:500"]
@@ -3729,7 +3735,9 @@ async fn a_429_requeue_keeps_one_claim_and_settles_it_once() {
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 100).await;
     assert!(worker.store.settled.lock().unwrap().is_empty());
-    dispatch(&mut worker, 1600).await;
+    // Past the 429 deadline with slack (`elapsed_ms` starts the wait at
+    // the real response time, so the exact boundary races loaded runners).
+    dispatch(&mut worker, 2600).await;
     assert_eq!(*trace.lock().unwrap(), ["create", "create", "persist:500"]);
     assert_eq!(worker.store.claims.lock().unwrap().len(), 1);
     assert_eq!(
@@ -4052,9 +4060,11 @@ async fn long_repeated_429s_reuse_one_durable_capacity_hold() {
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    dispatch(&mut worker, 350_000).await;
+    // Past each 429 deadline with slack (`elapsed_ms` starts the wait at
+    // the real response time, so the exact boundary races loaded runners).
+    dispatch(&mut worker, 351_000).await;
     assert!(worker.store.settled.lock().unwrap().is_empty());
-    dispatch(&mut worker, 700_000).await;
+    dispatch(&mut worker, 702_000).await;
     assert_eq!(worker.store.claims.lock().unwrap().len(), 1);
     assert_eq!(
         *worker.store.settled.lock().unwrap(),
@@ -4076,7 +4086,9 @@ async fn a_429_requeue_with_a_stale_join_releases_its_confirmed_absent_claim() {
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 100).await;
     worker.live.voice_update(MEMBER, None, Some(false));
-    dispatch(&mut worker, 1600).await;
+    // Past the 429 deadline with slack (`elapsed_ms` starts the wait at
+    // the real response time, so the exact boundary races loaded runners).
+    dispatch(&mut worker, 2600).await;
     assert_eq!(*trace.lock().unwrap(), ["create"]);
     assert_eq!(
         *worker.store.settled.lock().unwrap(),
@@ -4101,7 +4113,9 @@ async fn cancelled_create_settlement_refusal_is_reported_and_halts_on_credential
         dispatch(&mut worker, 0).await;
         worker.live.voice_update(MEMBER, None, Some(false));
         worker.store.settle_errors.lock().unwrap().push_back(error);
-        dispatch(&mut worker, 1500).await;
+        // Past the 429 deadline with slack (`elapsed_ms` starts the wait
+        // at the real response time, so the exact boundary races runners).
+        dispatch(&mut worker, 2500).await;
         assert_eq!(
             worker.failures().back(),
             Some(&LifecycleFailure::Persistence {
@@ -13508,6 +13522,35 @@ async fn reload_creators_keeps_the_view_on_a_failed_read() {
 }
 
 #[tokio::test]
+async fn creator_map_age_keeps_climbing_through_a_store_outage() {
+    // The age gauge counts from the last *successful* merge, never from a
+    // failed attempt: during a store outage every refresh fails, yet the
+    // age must sail past the 5 min refresh interval instead of sawing back
+    // toward 0 on each attempt (creators_read_ms stamps attempts only to
+    // pace retries, and must not feed the gauge).
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    assert_eq!(worker.creators_merged_ms, Some(0));
+    worker.store.creators_error = Some(StoreError::Unavailable);
+    worker.reload_creators(300_000).await;
+    worker.reload_creators(600_000).await;
+    assert_eq!(
+        worker.creators_merged_ms,
+        Some(0),
+        "failed reads must not move the merge stamp"
+    );
+    assert_eq!(
+        creator_map_age_secs(worker.creators_merged_ms, 600_000),
+        600,
+        "the age must climb past the refresh interval while merges fail"
+    );
+    worker.store.creators_error = None;
+    worker.reload_creators(900_000).await;
+    assert_eq!(creator_map_age_secs(worker.creators_merged_ms, 900_000), 0);
+}
+
+#[tokio::test]
 async fn reload_creators_converges_after_a_gateway_reconnect() {
     // A gateway reconnect (GuildCreate/Resumed) bumps the live generation but
     // sends no channel event, so no RefreshCreators flag is set and the
@@ -13625,6 +13668,50 @@ async fn reload_creators_settles_generation_after_a_successful_merge() {
         !worker.creators.contains_key(&202),
         "a successful generation merge must settle the generation until the next interval"
     );
+}
+
+#[test]
+fn creator_map_age_climbs_between_merges_and_starts_at_zero() {
+    // Observability v1: the creator-map age gauge climbs on the actor-uptime
+    // clock between merges (seconds, truncated) and reads 0 before the first
+    // merge; a backwards clock saturates instead of wrapping.
+    assert_eq!(creator_map_age_secs(None, 0), 0);
+    assert_eq!(creator_map_age_secs(None, 600_000), 0);
+    assert_eq!(creator_map_age_secs(Some(20_000), 20_000), 0);
+    assert_eq!(creator_map_age_secs(Some(20_000), 20_999), 0);
+    assert_eq!(creator_map_age_secs(Some(20_000), 81_000), 61);
+    assert_eq!(creator_map_age_secs(Some(90_000), 20_000), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_creator_map_age_climbs_from_a_frozen_snapshot() {
+    // While a dispatch is hung the main task takes no new snapshots, so the
+    // watchdog sibling must derive the age from the stored merge stamp on
+    // its own clock: the same frozen snapshot yields a climbing age.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    let stall = StallShared {
+        guild: worker.live.guild_id,
+        http: Arc::clone(&worker.http),
+        start: tokio::time::Instant::now(),
+        state: Mutex::new(StallState {
+            last_progress: tokio::time::Instant::now(),
+            urgent: 0,
+            deferred: 0,
+            oldest_age_secs: 0,
+            halted: false,
+            creators_generation: 0,
+            creators_merged_ms: None,
+        }),
+    };
+    stall.snapshot(&worker, tokio::time::Instant::now());
+    let snap = *stall.state.lock().unwrap();
+    assert_eq!(snap.creators_merged_ms, Some(0));
+    assert_eq!(stall.snapshot_creator_map_age_secs(&snap), 0);
+    // No new snapshot (the hung-dispatch case): the age still climbs.
+    tokio::time::advance(Duration::from_secs(400)).await;
+    assert_eq!(stall.snapshot_creator_map_age_secs(&snap), 400);
 }
 
 #[test]
