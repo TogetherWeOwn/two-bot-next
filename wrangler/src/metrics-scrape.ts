@@ -36,15 +36,17 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
  * Optional inputs validated when present but never required. The job error-class
  * gauge postdates older containers: requiring it would turn a valid older
  * exposition into a failed scrape (no page at all) instead of the documented
- * classless page. The creator-map generation/age gauges are optional for the
- * same reason: a rollback container without them must still scrape, with the
- * staleness rule held rather than every rule silenced. The evaluator already
- * tolerates their absence.
+ * classless page. The creator-map generation/age gauges and the REST admission
+ * breaker-open gauge are optional for the same reason: a rollback container
+ * without them must still scrape, with the staleness/breaker rules held
+ * rather than every rule silenced. The evaluator already tolerates their
+ * absence.
  */
 export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
   two_bot_job_last_error_class: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"], class: ["database", "rest", "configuration", "timeout", "panic", "feed", "recovery_required"] },
   two_bot_voice_creator_map_generation: {},
   two_bot_voice_creator_map_age_seconds: {},
+  two_bot_rest_guard_breaker_open: {},
 };
 
 /** Every series the validator checks: required plus optional-when-present. */
@@ -103,7 +105,8 @@ export function parseAlertScrape(text: string): Sample[] | null {
       if (Object.keys(labels).length !== Object.keys(axes).length
         || Object.keys(axes).some((axis) => !labels[axis])
         || !Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > 18446744073709551615
-        || (name === "two_bot_db_pool_configured" && value !== 0 && value !== 1)) return null;
+        || (name === "two_bot_db_pool_configured" && value !== 0 && value !== 1)
+        || (name === "two_bot_rest_guard_breaker_open" && value !== 0 && value !== 1)) return null;
       // Per-family state uses plain objects in the evaluator. Future families
       // are welcome, but never allow inherited object properties as subjects.
       if (name === "two_bot_internal_actions_total" && labels["family"]! in Object.prototype) return null;

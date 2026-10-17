@@ -934,6 +934,9 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   burn = evaluateMetrics(parseExposition(body(joinLines(1000, 10, 800))), burn.state, burnBase + 3600);
   firing.push(...burn.firing);
   firing.push(...ev(["two_bot_voice_creator_map_generation 3", "two_bot_voice_creator_map_age_seconds 601"]).firing);
+  let breaker = EMPTY_STATE;
+  for (let i = 0; i < 3; i++) breaker = ev(["two_bot_rest_guard_breaker_open 1"], breaker).state;
+  firing.push(...breaker.firing);
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);

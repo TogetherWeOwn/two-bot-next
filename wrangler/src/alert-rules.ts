@@ -112,6 +112,8 @@ export const POOL_SATURATED_SAMPLES = 3;
 export const DB_ERROR_MIN_ERRORS = 3;
 /** ...and send-admission refusals must appear in this many consecutive samples. */
 export const SEND_BLOCKED_SAMPLES = 3;
+/** REST admission breaker openings must appear in this many consecutive samples. */
+export const REST_BREAKER_OPEN_SAMPLES = 3;
 /** Website-action receiver refusals must appear in this many consecutive samples. */
 export const RECEIVER_REFUSAL_SAMPLES = 3;
 /** Consecutive unpaired gateway samples before the page; bound justified in the runbook. */
@@ -173,6 +175,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_join_fast_burn", summary: `creator-join error budget burning faster than ${JOIN_FAST_BURN}x over 1 h and 5 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-fast-burn" },
   { id: "voice_join_slow_burn", summary: `creator-join error budget burning faster than ${JOIN_SLOW_BURN}x over 6 h and 30 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-slow-burn", severity: "ticket" },
   { id: "voice_creator_map_stale", summary: `voice creator map has not merged for more than ${CREATOR_MAP_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-voice-creator-map-stale" },
+  { id: "rest_admission_breaker_open", summary: `REST admission breaker open for ${REST_BREAKER_OPEN_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-rest-admission-breaker-open", severity: "ticket" },
 ];
 
 /**
@@ -230,6 +233,12 @@ export interface MetricsAlertState {
   dbErrors: number;
   sendBlocked: number;
   sendBlockedStreak: number;
+  /**
+   * Consecutive valid samples with the REST admission breaker open, capped
+   * at REST_BREAKER_OPEN_SAMPLES. Absent on state stored by older Worker
+   * versions; legacy storage reads as no streak, never as sustained evidence.
+   */
+  breakerOpenStreak?: number;
   voiceOps: number;
   voiceFailures: number;
   voiceDeadLetters: number;
@@ -277,7 +286,7 @@ export interface JoinBurnSnapshot {
   fastMoves: number;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, breakerOpenStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
 
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
@@ -300,6 +309,7 @@ export function parseExposition(text: string): Sample[] {
 }
 
 const GATEWAY_UNPAIRED_RULE = "gateway_unpaired_disconnect";
+const REST_BREAKER_OPEN_RULE = "rest_admission_breaker_open";
 
 type GatewayPairingFields = Pick<
   MetricsAlertState,
@@ -594,6 +604,31 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const sendBlockedStreak = sendReset || sendBlocked === prevSendBlocked ? 0 : (prev.sendBlockedStreak ?? 0) + 1;
   if (sendBlockedStreak >= SEND_BLOCKED_SAMPLES) firing.push("send_admission_blocked");
 
+  // REST admission breaker (local refusals before any REST wire attempt, so
+  // the request counter and its 429/5xx rules never see them): three
+  // consecutive valid open samples of the label-free 0/1 gauge file one
+  // ticket, and one valid closed sample recovers it. Missing or malformed
+  // samples break the streak but hold a firing ticket: they manufacture
+  // neither sustained evidence nor recovery. `?? 0` covers DO storage
+  // written before this field existed, and the cap keeps persisted state
+  // bounded no matter how long the breaker stays open.
+  const breakerRows = gauge("two_bot_rest_guard_breaker_open");
+  const breakerOpen = breakerRows.length === 1 && Object.keys(breakerRows[0]!.labels).length === 0
+    && (breakerRows[0]!.value === 0 || breakerRows[0]!.value === 1)
+    ? breakerRows[0]!.value
+    : undefined;
+  const wasBreakerFiring = prev.firing.includes(REST_BREAKER_OPEN_RULE);
+  let breakerOpenStreak: number;
+  if (breakerOpen === 1) {
+    breakerOpenStreak = Math.min((prev.breakerOpenStreak ?? 0) + 1, REST_BREAKER_OPEN_SAMPLES);
+    if (breakerOpenStreak >= REST_BREAKER_OPEN_SAMPLES || wasBreakerFiring) firing.push(REST_BREAKER_OPEN_RULE);
+  } else if (breakerOpen === 0) {
+    breakerOpenStreak = 0;
+  } else {
+    breakerOpenStreak = 0;
+    if (wasBreakerFiring) firing.push(REST_BREAKER_OPEN_RULE);
+  }
+
   // Voice lifecycle failures (T3 room create/move/delete budget in
   // docs/voice-cutover-rollback-triggers.md): any outcome other than
   // `success` (`category_full`, `discord`, `persistence`, `cancelled`)
@@ -786,7 +821,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring } };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, breakerOpenStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
