@@ -12,8 +12,6 @@
 //! `game-activity-report --guild <ID> [--allow-live-guild]`
 //! Env: `TWO_DATABASE_URL` (required when `--guild` is given).
 
-use std::io::Write as _;
-
 use two_bot_core::game_activity::{render_game_activity_report, render_game_activity_unscoped};
 use two_bot_core::game_activity_store::read_guild_aggregates;
 use two_bot_cutover::cli::{open_db, require_guild, Args};
@@ -22,25 +20,27 @@ const USAGE: &str = "Usage: game-activity-report --guild <ID> [--allow-live-guil
 
 // On-demand operator report: the JSON goes to stdout by contract (written
 // through an explicit handle, not the print macros the workspace denies);
-// diagnostics and usage errors use stderr.
-fn emit(text: &str) {
-    emit_to(&mut std::io::stdout().lock(), text);
+// diagnostics and usage errors use stderr. A stdout write failure is an
+// error like any other: a truncated or missing report must not exit 0.
+fn emit_to(out: &mut impl std::io::Write, text: &str) -> std::io::Result<()> {
+    out.write_all(text.as_bytes())?;
+    out.flush()
 }
 
-fn emit_to(out: &mut impl std::io::Write, text: &str) {
-    let _ = out.write_all(text.as_bytes());
-    let _ = out.flush();
+/// Write a resolved report to `out`; resolution errors pass through and
+/// write failures become errors, so the caller exits non-zero either way.
+fn deliver(output: Result<String, String>, out: &mut impl std::io::Write) -> Result<(), String> {
+    emit_to(out, &output?).map_err(|e| format!("cannot write report to stdout: {e}"))
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse(&std::env::args().skip(1).collect::<Vec<_>>());
-    match execute(&args).await {
-        Ok(output) => emit(&output),
-        Err(e) => {
-            eprintln!("game-activity-report: {e}");
-            std::process::exit(2);
-        }
+    let output = execute(&args).await;
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = deliver(output, &mut out) {
+        eprintln!("game-activity-report: {e}");
+        std::process::exit(2);
     }
 }
 
@@ -121,7 +121,43 @@ mod tests {
     #[test]
     fn emit_to_writes_exact_bytes() {
         let mut buf: Vec<u8> = Vec::new();
-        emit_to(&mut buf, "x\n");
+        let written = emit_to(&mut buf, "x\n");
+        assert!(written.is_ok());
         assert_eq!(buf, b"x\n".to_vec());
+    }
+
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn deliver_writes_resolved_report_bytes() {
+        let mut buf: Vec<u8> = Vec::new();
+        assert_eq!(deliver(Ok("x\n".to_owned()), &mut buf), Ok(()));
+        assert_eq!(buf, b"x\n".to_vec());
+    }
+
+    #[test]
+    fn deliver_propagates_stdout_failure_as_an_error() {
+        assert!(deliver(Ok("x".to_owned()), &mut FailingWriter)
+            .is_err_and(|e| e.starts_with("cannot write report to stdout: ")));
+    }
+
+    #[test]
+    fn deliver_passes_resolution_errors_through() {
+        let mut buf: Vec<u8> = Vec::new();
+        assert_eq!(
+            deliver(Err("nope".to_owned()), &mut buf),
+            Err("nope".to_owned())
+        );
+        assert!(buf.is_empty());
     }
 }
