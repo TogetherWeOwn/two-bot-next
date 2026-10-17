@@ -4,8 +4,6 @@
 // Operator commands intentionally emit human-readable/JSON output to stdout.
 #![allow(clippy::print_stdout)]
 
-use std::str::FromStr;
-
 use sqlx::{postgres::PgConnectOptions, ConnectOptions, Connection, PgConnection};
 use two_bot_cutover::legacy_mapping::MappingSpec;
 use two_bot_cutover::legacy_verify::{verify, DEFAULT_SAMPLE_LIMIT, MAX_SAMPLE_LIMIT};
@@ -106,7 +104,11 @@ fn connection_options(text: &str) -> Result<PgConnectOptions, &'static str> {
     {
         return Err("URL must specify a PostgreSQL host, username and database (only sslmode query is supported)");
     }
-    let mut options = PgConnectOptions::from_str(text).map_err(|_| "invalid database URL")?;
+    // The sslmode-only check above is a strict subset of the shared allowlist,
+    // so the shared parser preserves it while suppressing the passfile
+    // diagnostic target during the synchronous parse.
+    let mut options =
+        two_bot_core::database_url::connect_options(text).map_err(|_| "invalid database URL")?;
     if url.password().is_none() {
         options = options.password("");
     }
@@ -182,6 +184,124 @@ async fn main() {
 mod tests {
     use super::*;
 
+    /// Thread-local log capture for the sslmode-only fence.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl Capture {
+        fn text(&self) -> String {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct CaptureFields<'a>(&'a mut String);
+
+    impl tracing::field::Visit for CaptureFields<'_> {
+        fn record_debug(&self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            write!(self.0, " {}={value:?}", field.name()).unwrap();
+        }
+    }
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::DEBUG
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            use std::fmt::Write as _;
+            let mut text = self.0.lock().unwrap();
+            write!(
+                text,
+                "{} {}",
+                event.metadata().level(),
+                event.metadata().target()
+            )
+            .unwrap();
+            event.record(&mut CaptureFields(&mut text));
+            text.push('\n');
+        }
+    }
+
+    /// Inherited libpq settings under test. Serializes the env-mutating
+    /// connection tests in this binary (the only tests here that touch PG*).
+    static PG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const PG_KEYS: [&str; 14] = [
+        "PGHOST",
+        "PGHOSTADDR",
+        "PGPORT",
+        "PGUSER",
+        "PGPASSWORD",
+        "PGDATABASE",
+        "PGPASSFILE",
+        "PGSERVICE",
+        "PGSERVICEFILE",
+        "PGOPTIONS",
+        "PGSSLCERT",
+        "PGSSLKEY",
+        "PGSSLROOTCERT",
+        "PGSSLMODE",
+    ];
+
+    struct SavedEnv(Vec<(String, Option<std::ffi::OsString>)>);
+
+    impl SavedEnv {
+        fn clear_pg_and_isolate_home() -> (std::sync::MutexGuard<'static, ()>, Self, TempHome) {
+            let guard = PG_ENV_LOCK.lock().unwrap();
+            let mut saved = Vec::new();
+            for key in PG_KEYS {
+                saved.push((key.to_owned(), std::env::var_os(key)));
+                unsafe { std::env::remove_var(key) };
+            }
+            saved.push(("HOME".to_owned(), std::env::var_os("HOME")));
+            let dir = std::env::temp_dir().join(format!(
+                "two-bot-legacy-verify-home-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("synthetic HOME");
+            unsafe { std::env::set_var("HOME", &dir) };
+            let home_guard = TempHome { dir };
+            (guard, Self(saved), home_guard)
+        }
+    }
+
+    impl Drop for SavedEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                unsafe {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    struct TempHome {
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
     #[test]
     fn unknown_flags_and_invalid_sample_limits_are_refused() {
         for argv in [
@@ -214,5 +334,76 @@ mod tests {
         let args = Args::parse(&argv).unwrap();
         assert_eq!(args.groups, ["first", "second"]);
         assert_eq!(args.sample_limit, 0);
+    }
+
+    #[test]
+    fn hostile_query_keys_rejected_before_driver_parse() {
+        let (_lock, _env, _home) = SavedEnv::clear_pg_and_isolate_home();
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            for query in [
+                "API_KEY=fixture-query-secret",
+                "Api_Key=fixture-query-secret",
+                "SSLMODE=require",
+                "api%5Fkey=fixture-query-secret",
+                "API%5FKEY=fixture-query-secret",
+                "sslmode=require&API_KEY=fixture-query-secret",
+                "options=-csearch_path=other",
+            ] {
+                let url = format!("postgres://operator:explicit@live.invalid:5432/bot?{query}");
+                let error = connection_options(&url).unwrap_err();
+                assert!(
+                    !error.contains("fixture"),
+                    "rejection echoed the query value for {query}"
+                );
+            }
+            tracing::warn!("capture remains active");
+        });
+        let text = capture.text();
+        assert!(text.contains("capture remains active"));
+        assert!(
+            !text.contains("fixture-query-secret"),
+            "hostile query value reached logs"
+        );
+        assert!(!text.contains("API_KEY"));
+        assert!(!text.contains("ignoring unrecognized connect parameter"));
+    }
+
+    #[test]
+    fn valid_sslmode_query_behavior_preserved() {
+        let (_lock, _env, _home) = SavedEnv::clear_pg_and_isolate_home();
+        let base = "postgres://operator:explicit@live.invalid:5432/bot";
+        assert!(connection_options(base).is_ok());
+        assert!(connection_options(&format!("{base}?sslmode=require")).is_ok());
+        assert!(connection_options(&format!("{base}?sslmode=disable")).is_ok());
+    }
+
+    #[test]
+    fn inherited_pgpassfile_is_forbidden() {
+        let (_lock, _env, _home) = SavedEnv::clear_pg_and_isolate_home();
+        unsafe { std::env::set_var("PGPASSFILE", "/tmp/synthetic-passfile") };
+        let error =
+            connection_options("postgres://operator:explicit@live.invalid:5432/bot").unwrap_err();
+        assert_eq!(
+            error,
+            "inherited PG connection settings are forbidden; provide explicit URLs"
+        );
+    }
+
+    #[test]
+    fn missing_url_password_clears_fallback_without_reading_host_passfile() {
+        let (_lock, _env, _home) = SavedEnv::clear_pg_and_isolate_home();
+        // Synthetic HOME is empty (no `~/.pgpass`) and all PG* are absent,
+        // so no host credential can supply a fallback. The explicit
+        // passwordless URL must still parse to a cleared password.
+        let options = connection_options("postgres://operator@live.invalid:5432/bot").unwrap();
+        // Cleared to trust-authentication, never a fallback credential.
+        // `PgConnectOptions` derives `Debug` with the password field visible
+        // in-memory; the assertion message itself carries no credential.
+        let debug = format!("{options:?}");
+        assert!(
+            debug.contains("password: Some(\"\")"),
+            "passwordless URL did not clear to trust-auth"
+        );
     }
 }
