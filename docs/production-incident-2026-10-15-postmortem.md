@@ -11,13 +11,18 @@ production crash-loop on record (2026-10-16 role drift, SQLSTATE `42501`,
 see the role gate in [production-deploy.md](production-deploy.md)) quotes
 no `failed_step` line either — and its mechanism (missing grant, cursor
 held on rejoin) is distinct from this hypothesis (missing table `42P01`).
-A reproduction on a #978 build would log `failed_step="gateway_run"` with
-`error_code="42P01"` (the retention write holds the cursor in
-`crates/bot/src/gateway.rs:877-887`, surfacing as a `gateway_run` step
-failure in `crates/bot/src/main.rs:700` and logged in
-`publish_gateway_failure` at `crates/bot/src/main.rs:861`). Update this
-section when that line is captured; do not treat the hypothesis as proven
-before then.
+A #978+ build cannot confirm this hypothesis via `gateway_failed`:
+`retention_lifecycle` classifies `42P01` as a schema gap
+(`crates/bot/src/gateway.rs:655`, `is_schema_gap` at
+`crates/bot/src/gateway_failure.rs:198`), logs `retention lifecycle
+skipped; schema gap, nothing to cancel` with `error_code=42P01`, and returns
+`None` — so no `gateway_run` step failure (`crates/bot/src/gateway.rs:877-887`,
+`crates/bot/src/main.rs:700`) and no `gateway_failed` line
+(`publish_gateway_failure` at `crates/bot/src/main.rs:861`) occur. The
+observable #978-era signal would be that schema-gap skip line with
+`error_code=42P01`; a `gateway_failed` confirmation would need a pre-#978
+build or a staging restore. Update this section when such a line is captured;
+do not treat the hypothesis as proven before then.
 
 ## Timeline (all UTC, 2026-10-15)
 
@@ -246,8 +251,9 @@ prompts.
 - Prod schema gate: DONE. `deploy-production` refuses a build whose
   migrations are ahead of the production ledger (schema gate, #979) and
   whose grants lag the migrations (role gate: `roles verify` must read 0,
-  #1019). Rollback and live-SHA redeploy waive both checks inside the
-  reviewed script (recorded, never a skip) so recovery never waits on them.
+  #1019). Rollback and live-SHA redeploy skip both gate jobs
+  (guard-validated modes only; the production job accepts exactly those),
+  so recovery never waits on them.
 - Strict ready gate: DONE (#979). A 503-`starting` answer never passes a
   deploy on a single early poll: green requires 200 with gateway `ready`
   held for 18 consecutive polls (~3 min), and any parked answer keeps
