@@ -99,6 +99,11 @@ pub enum HelixError {
     /// The subscription listing exceeded its bounded page count.
     #[error("helix subscription listing exceeded the page limit")]
     SubscriptionPageLimit,
+    /// Shutdown latched before a paginated listing call. The listing stopped
+    /// early by request, so the caller must treat it as interrupted (re-list
+    /// on the next pass), never as a failure or a complete result.
+    #[error("helix subscription listing stopped for shutdown")]
+    Shutdown,
     /// TLS, TCP or HTTP-layer failure, or a body over the byte cap.
     #[error("helix request failed: {0}")]
     Transport(String),
@@ -516,29 +521,47 @@ impl<T: HelixTransport> HelixClient<T> {
         Ok(response)
     }
 
+    /// The process shutdown latch, mirrored from the reconcile owner: an
+    /// explicitly latched value or a dropped sender both count as stopped, so
+    /// a listing never issues another page request after shutdown.
+    fn listing_stopped(shutdown: &tokio::sync::watch::Receiver<bool>) -> bool {
+        *shutdown.borrow() || shutdown.has_changed().is_err()
+    }
+
     /// List every `stream.online` subscription page, parsed to v1 webhooks via
-    /// [`parse_subscriptions`].
-    pub async fn list_subscriptions(&mut self) -> Result<Vec<ExistingSubscription>, HelixError> {
-        self.list_subscriptions_with_user_id(None).await
+    /// [`parse_subscriptions`]. A latched `shutdown` stops the listing before
+    /// every page request, including requests following a pagination cursor,
+    /// with [`HelixError::Shutdown`]; the caller reports the interruption
+    /// instead of planning on a partial list.
+    pub async fn list_subscriptions(
+        &mut self,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Vec<ExistingSubscription>, HelixError> {
+        self.list_subscriptions_with_user_id(None, shutdown).await
     }
 
     async fn list_subscriptions_for_broadcaster(
         &mut self,
         broadcaster_user_id: &str,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<Vec<ExistingSubscription>, HelixError> {
-        self.list_subscriptions_with_user_id(Some(broadcaster_user_id))
+        self.list_subscriptions_with_user_id(Some(broadcaster_user_id), shutdown)
             .await
     }
 
     async fn list_subscriptions_with_user_id(
         &mut self,
         broadcaster_user_id: Option<&str>,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<Vec<ExistingSubscription>, HelixError> {
         let mut subscriptions = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
 
         for page in 0..HELIX_MAX_SUBSCRIPTION_PAGES {
+            if Self::listing_stopped(shutdown) {
+                return Err(HelixError::Shutdown);
+            }
             let response = self
                 .send_authed(
                     "list subscriptions",
@@ -591,11 +614,16 @@ impl<T: HelixTransport> HelixClient<T> {
     /// Execute a [`reconcile`] plan in order (deletes first). A create that
     /// answers 409 reports [`ActionOutcome::AlreadyExists`] only after a
     /// follow-up listing confirms a healthy subscription on our callback.
+    /// Per-action shutdown gating stays with the caller; a latched
+    /// `shutdown` stops the confirmation listing between its page requests
+    /// with [`HelixError::Shutdown`] so the caller can report the
+    /// interruption instead of resolving the conflict on a partial list.
     pub async fn execute_actions(
         &mut self,
         actions: &[SubscriptionAction],
         callback: &CallbackUrl,
         secret: &WebhookSecret,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<Vec<ActionOutcome>, HelixError> {
         let mut outcomes = Vec::with_capacity(actions.len());
         for action in actions {
@@ -645,7 +673,7 @@ impl<T: HelixTransport> HelixClient<T> {
                             if status == StatusCode::CONFLICT =>
                         {
                             let existing = self
-                                .list_subscriptions_for_broadcaster(broadcaster_user_id)
+                                .list_subscriptions_for_broadcaster(broadcaster_user_id, shutdown)
                                 .await?;
                             if existing.iter().any(|subscription| {
                                 subscription.broadcaster_user_id.as_str()
@@ -955,6 +983,60 @@ mod tests {
         })
     }
 
+    /// A shutdown receiver that never latches: its sender lives in a static
+    /// for the whole test process, because a dropped sender also counts as
+    /// stopped.
+    fn never_shutdown() -> tokio::sync::watch::Receiver<bool> {
+        static SENDER: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> =
+            std::sync::OnceLock::new();
+        SENDER
+            .get_or_init(|| tokio::sync::watch::channel(false).0)
+            .subscribe()
+    }
+
+    /// Latches shutdown while the first listing page is being answered, so a
+    /// test can land shutdown deterministically between two page requests:
+    /// the answered page is parsed, the page after its cursor must never run.
+    struct LatchAfterFirstPage {
+        shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl HelixTransport for LatchAfterFirstPage {
+        async fn send(&self, request: HelixRequest) -> Result<HelixResponse, HelixError> {
+            assert_single_listing_filter(&request.url);
+            let mut seen = self.seen.lock().expect("seen must unlock");
+            seen.push(request.url.clone());
+            let sends = seen.len();
+            drop(seen);
+            if request.url == TOKEN_URL {
+                return ScriptTransport::token_answer("paged-token", 3_600);
+            }
+            if sends == 2 {
+                if let Some(shutdown) = self
+                    .shutdown
+                    .lock()
+                    .expect("shutdown must unlock")
+                    .take()
+                {
+                    shutdown.send_replace(true);
+                }
+                return Ok(HelixResponse {
+                    status: StatusCode::OK,
+                    body: serde_json::json!({
+                        "data": [],
+                        "pagination": {"cursor": "next-page"}
+                    })
+                    .to_string()
+                    .into_bytes(),
+                });
+            }
+            Err(HelixError::BadResponse(
+                "only the token and first listing page may run",
+            ))
+        }
+    }
+
     #[test]
     fn request_debug_redacts_header_values_and_body() {
         let req = HelixRequest {
@@ -1002,7 +1084,7 @@ mod tests {
         ]);
         let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
         let subs = client
-            .list_subscriptions()
+            .list_subscriptions(&never_shutdown())
             .await
             .expect("listing must work");
         assert!(subs.is_empty());
@@ -1055,7 +1137,7 @@ mod tests {
         ]);
         let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
         let subscriptions = client
-            .list_subscriptions()
+            .list_subscriptions(&never_shutdown())
             .await
             .expect("all pages must be listed");
         assert_eq!(
@@ -1076,6 +1158,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listing_with_latched_shutdown_makes_no_helix_call() {
+        // The script holds no answers, so any Helix call would fail inside
+        // the transport; zero seen requests is the positive proof.
+        let transport = ScriptTransport::new(Vec::new());
+        let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(true);
+        assert!(matches!(
+            client.list_subscriptions(&shutdown).await,
+            Err(HelixError::Shutdown)
+        ));
+        assert!(
+            client.transport.seen_urls().is_empty(),
+            "no Helix call may run after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_first_listing_page_stops_before_second() {
+        let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let transport = LatchAfterFirstPage {
+            shutdown: Mutex::new(Some(shutdown_tx)),
+            seen: Mutex::new(Vec::new()),
+        };
+        let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
+        assert!(matches!(
+            client.list_subscriptions(&shutdown).await,
+            Err(HelixError::Shutdown)
+        ));
+        assert_eq!(
+            client
+                .transport
+                .seen
+                .lock()
+                .expect("seen must unlock")
+                .len(),
+            2,
+            "token and first page run; the page after the cursor never runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_actions_propagates_shutdown_from_conflict_listing() {
+        // Shutdown is already latched: the create still runs (per-action
+        // gating stays with the caller), but the 409 confirmation listing
+        // must not, so the conflict surfaces as Shutdown instead of being
+        // resolved on a partial list or recorded as an action failure.
+        let transport = ScriptTransport::new(vec![
+            ScriptTransport::token_answer("exec-token", 3_600),
+            Ok(HelixResponse {
+                status: StatusCode::CONFLICT,
+                body: Vec::new(),
+            }),
+        ]);
+        let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(true);
+        assert!(matches!(
+            client
+                .execute_actions(
+                    &[SubscriptionAction::Create {
+                        broadcaster_user_id: "222".to_owned(),
+                    }],
+                    &callback(),
+                    &webhook_secret(),
+                    &shutdown,
+                )
+                .await,
+            Err(HelixError::Shutdown)
+        ));
+        assert_eq!(
+            client.transport.seen_urls(),
+            [TOKEN_URL.to_owned(), HELIX_SUBSCRIPTIONS_URL.to_owned()],
+            "create runs; the confirmation listing never runs"
+        );
+    }
+
+    #[tokio::test]
     async fn listing_fails_closed_when_page_limit_is_exceeded() {
         let mut answers = vec![ScriptTransport::token_answer("listed-token", 3_600)];
         for page in 0..HELIX_MAX_SUBSCRIPTION_PAGES {
@@ -1092,7 +1250,7 @@ mod tests {
         let transport = ScriptTransport::new(answers);
         let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
         assert!(matches!(
-            client.list_subscriptions().await,
+            client.list_subscriptions(&never_shutdown()).await,
             Err(HelixError::SubscriptionPageLimit)
         ));
         assert_eq!(
@@ -1117,7 +1275,7 @@ mod tests {
         ]);
         let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
         client
-            .list_subscriptions()
+            .list_subscriptions(&never_shutdown())
             .await
             .expect("retry must succeed");
         let transport = &client.transport;
@@ -1167,6 +1325,7 @@ mod tests {
                 ],
                 &callback(),
                 &webhook_secret(),
+                &never_shutdown(),
             )
             .await
             .expect("verified 409 must be treated as already existing");
@@ -1238,6 +1397,7 @@ mod tests {
                     }],
                     &callback(),
                     &webhook_secret(),
+                    &never_shutdown(),
                 )
                 .await
                 .expect_err("unverified create conflict must fail");

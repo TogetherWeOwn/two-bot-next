@@ -79,6 +79,16 @@ fn callback() -> CallbackUrl {
     CallbackUrl::new(OUR_CALLBACK).expect("fixture callback must parse")
 }
 
+/// A shutdown receiver that never latches: its sender lives in a static
+/// for the whole test process, because a dropped sender also counts as
+/// stopped.
+fn never_shutdown() -> tokio::sync::watch::Receiver<bool> {
+    static SENDER: OnceLock<tokio::sync::watch::Sender<bool>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| tokio::sync::watch::channel(false).0)
+        .subscribe()
+}
+
 fn fixture_creds() -> HelixCredentials {
     HelixCredentials {
         client_id: Secret::new("fixture-client-id".to_owned()),
@@ -288,7 +298,7 @@ async fn startup_reconciles_own_callback_deletes_before_creates() {
 
     // The startup sequence: list everything, diff against desired, execute.
     let existing = client
-        .list_subscriptions()
+        .list_subscriptions(&never_shutdown())
         .await
         .expect("startup listing must work");
     assert_eq!(existing.len(), 3, "all three fixture subs must parse");
@@ -307,7 +317,7 @@ async fn startup_reconciles_own_callback_deletes_before_creates() {
         "healthy keep-id stays, foreign-id is never touched, stale-id is deleted, 444 is created"
     );
     let outcomes = client
-        .execute_actions(&plan, &callback, &secret)
+        .execute_actions(&plan, &callback, &secret, &never_shutdown())
         .await
         .expect("startup execution must work");
     assert_eq!(
@@ -406,7 +416,7 @@ async fn subscription_conflict_counts_as_done_only_after_followup_listing_confir
     );
     let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
     let outcomes = client
-        .execute_actions(&actions, &callback, &secret)
+        .execute_actions(&actions, &callback, &secret, &never_shutdown())
         .await
         .expect("verified 409 must count as done");
     assert_eq!(
@@ -444,7 +454,7 @@ async fn subscription_conflict_counts_as_done_only_after_followup_listing_confir
         );
         let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
         let error = client
-            .execute_actions(&actions, &callback, &secret)
+            .execute_actions(&actions, &callback, &secret, &never_shutdown())
             .await
             .expect_err("unconfirmed 409 must fail");
         assert!(
