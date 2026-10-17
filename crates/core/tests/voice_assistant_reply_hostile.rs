@@ -75,6 +75,30 @@ fn hostile_bodies_refuse_as_bounded_errors() {
             json!({"choices": "not-an-array"}).to_string().into_bytes(),
             ReplyError::WrongShape { at: "choices" },
         ),
+        (
+            json!({"result": leak}).to_string().into_bytes(),
+            ReplyError::WrongShape { at: "choices" },
+        ),
+        (
+            json!({"choices": []}).to_string().into_bytes(),
+            ReplyError::WrongShape { at: "choices" },
+        ),
+        (
+            json!({"choices": [{"text": leak}]})
+                .to_string()
+                .into_bytes(),
+            ReplyError::WrongShape {
+                at: "choices[0].message",
+            },
+        ),
+        (
+            json!({"choices": [{"message": {"content": null}}]})
+                .to_string()
+                .into_bytes(),
+            ReplyError::WrongShape {
+                at: "choices[0].message.content",
+            },
+        ),
         (envelope(&leak), ReplyError::ContentNotJson),
         (
             envelope("```json\n{\"suggestions\": [broken\n```"),
@@ -83,6 +107,22 @@ fn hostile_bodies_refuse_as_bounded_errors() {
         (
             envelope(&json!({"suggestions": "not-an-array"}).to_string()),
             ReplyError::WrongShape { at: "suggestions" },
+        ),
+        (
+            envelope(&json!({"names": []}).to_string()),
+            ReplyError::WrongShape { at: "suggestions" },
+        ),
+        (
+            suggestions(json!([leak])),
+            ReplyError::WrongShape {
+                at: "suggestions[].template",
+            },
+        ),
+        (
+            suggestions(json!([{"template": "##", "explanation": 7}])),
+            ReplyError::WrongShape {
+                at: "suggestions[].explanation",
+            },
         ),
         (suggestions(json!([])), ReplyError::NoSuggestions),
         (
@@ -196,6 +236,30 @@ fn accepted_hostile_looking_replies_still_respect_every_bound() {
     assert_eq!(
         parse_reply(&over),
         Err(ReplyError::ExplanationTooLong { index: 0 })
+    );
+
+    // The fixed-matrix over-long second explanation refuses with its index.
+    let long_second = "e".repeat(MAX_EXPLANATION_CHARS + 1);
+    let over_second = suggestions(json!([
+        {"template": "##", "explanation": "fine"},
+        {"template": "$#", "explanation": long_second},
+    ]));
+    assert_eq!(
+        parse_reply(&over_second),
+        Err(ReplyError::ExplanationTooLong { index: 1 })
+    );
+    assert_eq!(
+        parse_reply_each(&over_second),
+        Err(ReplyError::ExplanationTooLong { index: 1 })
+    );
+    assert_bounded(&parse_reply(&over_second).expect_err("second explanation over limit refuses"));
+
+    // A numeric explanation is a shape refusal at its documented position.
+    assert_eq!(
+        parse_reply(&suggestions(json!([{"template": "##", "explanation": 7}]))),
+        Err(ReplyError::WrongShape {
+            at: "suggestions[].explanation"
+        })
     );
 
     // NUL bytes are control characters in templates, not silent truncation.
