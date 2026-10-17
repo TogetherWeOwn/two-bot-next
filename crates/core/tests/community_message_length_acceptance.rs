@@ -4,7 +4,9 @@
 //! metadata value (Unicode scalar count of the raw content) so the weekly
 //! scorecard's copy/paste detector can run on production facts instead of
 //! reporting `copy_paste:insufficient_data` every week. Content itself is
-//! never stored: only its length survives into fact metadata.
+//! never stored or threaded: the length is computed once where the gateway
+//! message is already in hand, the content is dropped at that same
+//! statement, and only the integer crosses into fact metadata.
 //!
 //! Test files only; no runtime code is touched here. Every test below pins
 //! behavior the current runtime does not implement yet, so each one FAILS
@@ -32,43 +34,51 @@
 //!     channel_class: &str,
 //!     actor: &ClassifyInput,
 //!     occurred_at: &str,
-//!     content: Option<&str>, // NEW, before `classification`
+//!     content_length: Option<usize>, // NEW, before `classification`
 //!     classification: Classification,
 //! ) -> FactWrite;
 //! pub async fn record_message_fact(
-//!     pool: &Pool<Postgres>, /* same order, plus */ content: Option<&str>,
+//!     pool: &Pool<Postgres>, /* same order, plus */ content_length: Option<usize>,
 //!     classification: Classification,
 //! ) -> Result<bool, CommunityStoreError>;
+//! // The new parameter is each function's eighth, so both need
+//! // `#[allow(clippy::too_many_arguments)]`, matching the allowances
+//! // already used on neighbouring functions in the same file.
 //!
 //! // crates/core/src/handlers.rs
-//! pub struct MessageInput { /* existing fields, plus */ pub content: Option<String> }
-//! pub struct MessageFact<'a> { /* existing fields, plus */ pub content: Option<&'a str> }
-//! // `FunnelHandlers::on_message` forwards `i.content.as_deref()` into the
-//! // `MessageFact` it records.
+//! pub struct MessageInput { /* existing fields, plus */ pub content_length: Option<usize> }
+//! pub struct MessageFact<'a> { /* existing fields, plus */ pub content_length: Option<usize> }
+//! // `FunnelHandlers::on_message` forwards `i.content_length` into the
+//! // `MessageFact` it records. Neither struct ever carries content text.
 //! ```
 //!
-//! Metadata rule: `content: Some(c)` with `!c.is_empty()` records
-//! `"contentLength": <c.chars().count()>` (Unicode scalar values, never the
-//! UTF-8 byte length and never a grapheme-cluster count). `content: None`
-//! (content absent, e.g. the privileged message-content intent is off) or
-//! an empty `Some("")` records no `contentLength` key at all — the length
-//! is never recorded as `0`, so an unknown length can never masquerade as a
-//! measured zero-length message in the copy/paste detector.
+//! Metadata rule: `content_length: Some(n)` with `n > 0` records
+//! `"contentLength": n`. `content_length: None` (no length was measured,
+//! e.g. the privileged message-content intent is off and no content was
+//! delivered) or `Some(0)` records no `contentLength` key at all — the
+//! length is never recorded as `0`, so an unknown length can never
+//! masquerade as a measured zero-length message in the copy/paste detector.
+//! The scalar-vs-byte distinction lives at the capture site and is pinned
+//! end to end by the gateway pipeline test in the discord crate's companion
+//! suite (`community_message_length_acceptance` there): the integer
+//! threaded through must be `content.chars().count()` (Unicode scalar
+//! values), never the UTF-8 byte length and never a grapheme-cluster count.
 //!
 //! Call-site updates the Builder owns (mechanical, not part of this file):
 //! every existing `message_fact` / `record_message_fact` caller and every
 //! `MessageInput` / `MessageFact` construction gains the new field. That
-//! includes the gateway pipeline that builds `MessageInput` from a gateway
-//! message-create event (it supplies `Some(content)` only when message
-//! content was actually delivered, otherwise `None`) and the discord
-//! crate's deferred community-facts sink, which forwards
-//! `MessageFact.content` into `message_fact`. Note one existing assertion
-//! the Builder must revise rather than delete: the community-store unit
-//! test that proves message facts store no content currently rejects the
-//! substring `"content"` in metadata, which the new `contentLength` key
-//! necessarily contains; the check must keep proving no message *text* is
-//! stored (as pinned by `message_fact_metadata_never_contains_content`
-//! below) without rejecting the length key itself.
+//! includes the single `Event::MessageCreate` site in the gateway pipeline
+//! (`crates/discord/src/pipeline.rs`), which computes the count from the
+//! message content already in hand and drops the content at the same
+//! statement, and the discord crate's deferred community-facts sink, which
+//! forwards `MessageFact.content_length` into `message_fact`. Note one
+//! existing assertion the Builder must revise rather than delete: the
+//! community-store unit test that proves message facts store no content
+//! currently rejects the substring `"content"` in metadata, which the new
+//! `contentLength` key necessarily contains; the check must keep proving
+//! no message *text* is stored (as pinned by
+//! `message_fact_metadata_has_no_content_bearing_field` below) without
+//! rejecting the length key itself.
 //!
 //! Run: `python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test community_message_length_acceptance`
 #![cfg(feature = "db")]
@@ -92,9 +102,6 @@ const VERSION: &str = "community-test-v1";
 const WEEK_START: &str = "2026-08-31T00:00:00.000Z";
 const WEEK_END: &str = "2026-09-07T00:00:00.000Z";
 const GENERATED_AT: &str = "2026-09-07T06:15:00.000Z";
-/// "café ☕ test" with precomposed é (U+00E9) and hot beverage (U+2615):
-/// 11 Unicode scalar values, 14 UTF-8 bytes.
-const MULTIBYTE_CONTENT: &str = "caf\u{00E9} \u{2615} test";
 
 fn actor(id: &str) -> ClassifyInput {
     ClassifyInput {
@@ -117,7 +124,7 @@ fn verdict() -> Classification {
     }
 }
 
-fn write_for(message_id: &str, occurred_at: &str, content: Option<&str>) -> FactWrite {
+fn write_for(message_id: &str, occurred_at: &str, content_length: Option<usize>) -> FactWrite {
     message_fact(
         GUILD,
         message_id,
@@ -125,7 +132,7 @@ fn write_for(message_id: &str, occurred_at: &str, content: Option<&str>) -> Fact
         "human",
         &actor(MEMBER),
         occurred_at,
-        content,
+        content_length,
         verdict(),
     )
 }
@@ -136,89 +143,72 @@ fn metadata_of(write: &FactWrite) -> serde_json::Value {
 }
 
 #[test]
-fn message_fact_records_unicode_scalar_count_not_bytes() {
-    assert_eq!(
-        MULTIBYTE_CONTENT.chars().count(),
-        11,
-        "fixture scalar count"
-    );
-    assert_eq!(MULTIBYTE_CONTENT.len(), 14, "fixture byte count differs");
-
-    let write = write_for("msg-1", "2026-09-01T10:00:00.000Z", Some(MULTIBYTE_CONTENT));
+fn message_fact_records_supplied_content_length() {
+    let write = write_for("msg-1", "2026-09-01T10:00:00.000Z", Some(11));
     let meta = metadata_of(&write);
     assert_eq!(
         meta["contentLength"], 11,
-        "contentLength is the Unicode scalar count of the raw content: {meta}"
+        "a measured length lands in metadata as contentLength: {meta}"
     );
-    assert_ne!(
-        meta["contentLength"], 14,
-        "contentLength must not be the UTF-8 byte length: {meta}"
-    );
-
-    // Scalar values, not grapheme clusters: "e" + combining acute (U+0301)
-    // twice is 4 scalars (6 bytes, 2 grapheme clusters).
-    let combining = "e\u{0301}e\u{0301}";
-    assert_eq!(combining.chars().count(), 4, "fixture scalar count");
-    let write = write_for("msg-2", "2026-09-01T10:01:00.000Z", Some(combining));
-    let meta = metadata_of(&write);
-    assert_eq!(
-        meta["contentLength"], 4,
-        "combining sequences count per scalar value: {meta}"
+    assert!(
+        meta["contentLength"].is_number(),
+        "contentLength is a JSON number, never a string: {meta}"
     );
 }
 
 #[test]
-fn message_fact_without_content_has_no_length_key() {
-    // Content absent (e.g. the privileged message-content intent is off):
-    // the fact carries no `contentLength` key, never a fabricated `0`.
+fn message_fact_without_length_has_no_length_key() {
+    // No length measured (e.g. the privileged message-content intent is
+    // off): the fact carries no `contentLength` key, never a fabricated `0`.
     let write = write_for("msg-none", "2026-09-01T10:00:00.000Z", None);
     let meta = metadata_of(&write);
     assert!(
         meta.get("contentLength").is_none(),
-        "absent content records no contentLength key: {meta}"
+        "unmeasured length records no contentLength key: {meta}"
     );
 
-    // An empty string is also "no measured length": never recorded as `0`.
-    let write = write_for("msg-empty", "2026-09-01T10:01:00.000Z", Some(""));
+    // A zero length is also "no measured length": never recorded as `0`.
+    let write = write_for("msg-empty", "2026-09-01T10:01:00.000Z", Some(0));
     let meta = metadata_of(&write);
     assert!(
         meta.get("contentLength").is_none(),
-        "empty content records no contentLength key, never 0: {meta}"
+        "zero length records no contentLength key, never 0: {meta}"
     );
 }
 
 #[test]
-fn message_fact_metadata_never_contains_content() {
-    let content = "zebra-quantifier-9173 zebra-quantifier-9173 caf\u{00E9}";
-    let write = write_for("msg-secret", "2026-09-01T10:00:00.000Z", Some(content));
-    let metadata = write.metadata.clone().expect("message metadata");
-    assert!(
-        !metadata.contains("zebra-quantifier-9173"),
-        "no message content substring in serialized metadata: {metadata}"
-    );
-    assert!(
-        !metadata.contains(content),
-        "the raw content itself is never stored: {metadata}"
-    );
-    // Only the length survives: every string value in the metadata object is
-    // free of the content token, and the scalar count is present.
+fn message_fact_metadata_has_no_content_bearing_field() {
+    // The writer only ever receives the integer, so no message text can
+    // reach the stored fact. Pin the exact metadata key set: the four
+    // pre-existing fields plus the numeric length, nothing else.
+    let write = write_for("msg-secret", "2026-09-01T10:00:00.000Z", Some(41));
     let meta = metadata_of(&write);
-    assert_eq!(meta["contentLength"], content.chars().count() as u64);
-    for (key, value) in meta.as_object().expect("metadata object") {
-        if let Some(text) = value.as_str() {
-            assert!(
-                !text.contains("zebra"),
-                "metadata value {key} carries no content substring: {text}"
-            );
-        }
-    }
-    // The rest of the write shape stays content-free too.
-    assert!(!write.source.contains("zebra"), "source: {}", write.source);
-    assert!(
-        !write.idempotency_key.contains("zebra"),
-        "idempotency key: {}",
-        write.idempotency_key
+    let mut keys: Vec<&str> = meta
+        .as_object()
+        .expect("metadata object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "channelClass",
+            "channelId",
+            "contentLength",
+            "discordBot",
+            "webhookId"
+        ],
+        "metadata carries exactly the known fields plus the length: {meta}"
     );
+    assert_eq!(meta["contentLength"], 41);
+    // Every string value is an id/class the writer already recorded; none
+    // is free text that could carry a content substring.
+    assert_eq!(meta["channelId"], CHANNEL);
+    assert_eq!(meta["channelClass"], "human");
+    // The rest of the write shape is unchanged by the new field.
+    assert_eq!(write.source, format!("channel:{CHANNEL}"));
+    assert_eq!(write.idempotency_key, "discord-message:msg-secret");
 }
 
 /// Map one built fact onto the builder's row shape exactly as the store's
@@ -269,35 +259,16 @@ fn build_json(facts: Vec<FactRow>) -> serde_json::Value {
 
 #[test]
 fn writer_to_builder_round_trip_flags_copy_paste() {
-    // Five messages from one member in one channel inside an hour, each 12
-    // scalar values long but with UTF-8 byte lengths of 12, 12, 24, 24, 21.
-    // Only a scalar-count length makes them identical-length for the
-    // detector: under byte lengths no five fall inside the detector's
-    // length window (the largest same-window byte group is three), so a
-    // byte-length implementation cannot pass this test. (The detector's
-    // threshold is five same-channel messages within ±2 chars in an hour.)
-    let contents = [
-        "hello world!", // 12 scalars, 12 bytes
-        "plain text!!", // 12 scalars, 12 bytes
-        "\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}", // 12 scalars, 24 bytes
-        "\u{2615}\u{2615}\u{2615}\u{2615}\u{2615}\u{2615}abcdef", // 12 scalars, 24 bytes
-        "\u{1F600}\u{1F600}\u{1F600}abcdefghi", // 12 scalars, 21 bytes
-    ];
-    assert_eq!(
-        contents.iter().map(|c| c.len()).collect::<Vec<_>>(),
-        vec![12, 12, 24, 24, 21],
-        "fixture byte lengths stay split under byte counting"
-    );
-    for content in contents {
-        assert_eq!(content.chars().count(), 12, "fixture: {content}");
-    }
-    let facts: Vec<FactRow> = contents
-        .iter()
-        .enumerate()
-        .map(|(i, content)| {
+    // Five messages from one member in one channel inside an hour, each
+    // with a measured length of 12. (The detector's threshold is five
+    // same-channel messages within ±2 chars in an hour.) The facts go
+    // through the real writer (`message_fact`) and the real builder
+    // (`build_scorecard` → `detect_copy_paste`).
+    let facts: Vec<FactRow> = (0..5)
+        .map(|i| {
             let at = format!("2026-09-01T10:{:02}:00.000Z", i * 6);
-            let write = write_for(&format!("msg-{i}"), &at, Some(content));
-            row_from_write((i + 1) as i64, &write)
+            let write = write_for(&format!("msg-{i}"), &at, Some(12));
+            row_from_write(i64::from(i) + 1, &write)
         })
         .collect();
     let json = build_json(facts);
@@ -320,14 +291,14 @@ fn writer_to_builder_round_trip_flags_copy_paste() {
 }
 
 #[test]
-fn writer_without_content_stays_fail_closed() {
+fn writer_without_lengths_stays_fail_closed() {
     // Control: the same burst shape with no measured lengths keeps the
     // fail-closed verdict — `copy_paste:insufficient_data`, never a flag.
     let facts: Vec<FactRow> = (0..5)
         .map(|i| {
             let at = format!("2026-09-01T10:{:02}:00.000Z", i * 6);
             let write = write_for(&format!("msg-{i}"), &at, None);
-            row_from_write((i + 1) as i64, &write)
+            row_from_write(i64::from(i) + 1, &write)
         })
         .collect();
     let json = build_json(facts);
@@ -347,11 +318,11 @@ fn writer_without_content_stays_fail_closed() {
     );
 }
 
-/// Facts sink that captures what the handler records, so the gateway path
-/// (handler → sink) is observable without a database.
+/// Facts sink that captures what the handler records, so the handler path
+/// (input → sink) is observable without a database.
 #[derive(Clone, Default)]
 struct CaptureFacts {
-    messages: std::sync::Arc<Mutex<Vec<(String, Option<String>)>>>,
+    messages: std::sync::Arc<Mutex<Vec<(String, Option<usize>)>>>,
 }
 
 impl FactsSink for CaptureFacts {
@@ -363,7 +334,7 @@ impl FactsSink for CaptureFacts {
         self.messages
             .lock()
             .expect("capture lock")
-            .push((fact.message_id.to_owned(), fact.content.map(str::to_owned)));
+            .push((fact.message_id.to_owned(), fact.content_length));
     }
 
     fn record_voice_started(&self, _fact: VoiceStartedFact<'_>) -> Option<String> {
@@ -374,7 +345,7 @@ impl FactsSink for CaptureFacts {
 }
 
 #[test]
-fn on_message_handler_forwards_content_to_the_fact_sink() {
+fn on_message_handler_forwards_content_length_to_the_fact_sink() {
     let sink = CaptureFacts::default();
     let handlers = FunnelHandlers::new(MemStore::new(), Some(NoopLeveling), Some(sink.clone()));
     let base = MessageInput {
@@ -388,25 +359,22 @@ fn on_message_handler_forwards_content_to_the_fact_sink() {
         channel_class: ChannelClass::Human,
         capture_only: false,
         occurred_at: Some("2026-09-01T10:00:00.000Z".to_owned()),
-        content: Some(MULTIBYTE_CONTENT.to_owned()),
+        content_length: Some(11),
     };
     handlers.on_message(base.clone());
     handlers.on_message(MessageInput {
         message_id: Some("msg-gateway-2".to_owned()),
         occurred_at: Some("2026-09-01T10:01:00.000Z".to_owned()),
-        content: None,
+        content_length: None,
         ..base
     });
     let captured = sink.messages.lock().expect("capture lock");
     assert_eq!(
         *captured,
         vec![
-            (
-                "msg-gateway-1".to_owned(),
-                Some(MULTIBYTE_CONTENT.to_owned())
-            ),
+            ("msg-gateway-1".to_owned(), Some(11)),
             ("msg-gateway-2".to_owned(), None),
         ],
-        "the handler forwards delivered content verbatim and absence as None"
+        "the handler forwards the measured length and absence as None"
     );
 }
