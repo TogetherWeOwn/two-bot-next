@@ -78,6 +78,9 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures. Requests rejected before body intake are not deliveries; label-free counter |
 | `two_bot_eventsub_classified_total{kind}` | EventSub deliveries classified by fixed `kind`: `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`. `ignored` covers known unrecognized or invalid outcomes, including deterministic 2xx acknowledgments, invalid challenges, and non-signature verification failures; `other` marks unknown/future classification errors, which return retryable 503. Only `BadSignature` is `tampered`. No IDs, tokens, headers, body text or secrets become labels |
 | `two_bot_eventsub_posts_total{outcome}` | Go-live post outcomes: `attempted`, `succeeded`, `failed` or `other`. The current receiver slice does not send go-live posts, so these remain zero until the sender is wired; no IDs, content or errors become labels |
+| `two_bot_eventsub_reconcile_passes_total{outcome}` | EventSub reconcile passes by fixed `outcome`: `healthy` (every desired broadcaster holds a healthy subscription afterwards), `pending` (re-created but not all verified yet) or `failed` (an action failed or a healthy subscription is missing, including listing failures). Exactly one sample per pass that reaches Helix; parked or refused startup passes (flag dark, invalid config, empty allowlist) never reach Helix and record no sample — they are log-only. Alert when `failed` rises across scrapes (alert rules land separately) |
+| `two_bot_eventsub_reconcile_actions_total{action}` | Successful EventSub reconcile mutations by fixed `action`: `create` (2xx creates) or `delete` (2xx deletes, including already-gone deletes). 409 already-exists confirmations fold into the pass outcome, not into actions; per-subscription labels never reach exposition |
+| `two_bot_eventsub_reconcile_errors_total{error_class}` | EventSub reconcile failure sites by the same fixed `error_class` strings as the `error_class` log field: `reconcile_action_failed` (once per failed plan action), `reconcile_prior_failed` (once per pass that found failed subscriptions), `reconcile_unhealthy` (once per non-converged pass) or `reconcile_failed` (listing or plan failures), plus `other` for unknown classes. No status code, body, broadcaster, subscription id or secret ever becomes a label |
 
 ## REST admission guard
 
@@ -185,6 +188,13 @@ as dynamic labels.
   `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`.
 - `two_bot_eventsub_posts_total{outcome}` — `outcome` is one of `attempted`,
   `succeeded`, `failed` or `other`.
+- `two_bot_eventsub_reconcile_passes_total{outcome}` — `outcome` is one of
+  `healthy`, `pending` or `failed`; unrecognised outcomes collapse to `failed`.
+- `two_bot_eventsub_reconcile_actions_total{action}` — `action` is `create` or
+  `delete`.
+- `two_bot_eventsub_reconcile_errors_total{error_class}` — `error_class` is one
+  of `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`,
+  `reconcile_failed` or `other`.
 - `two_bot_gateway_events_total{event}` — `event` is one of `READY`,
   `RESUMED`, `GUILD_CREATE`, `GUILD_DELETE`, `GUILD_UPDATE`,
   `GUILD_MEMBER_ADD`, `GUILD_MEMBER_REMOVE`, `GUILD_MEMBER_UPDATE`,
