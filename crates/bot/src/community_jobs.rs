@@ -210,6 +210,7 @@ pub(crate) fn register(context: Arc<Context>) -> Registration {
         out.push(Job {
             name,
             cadence,
+            cadence_source: None,
             startup_jitter: jobs::startup_jitter(cadence, rand::random()),
             timeout: Duration::from_secs(120),
             action: Arc::new(move || {

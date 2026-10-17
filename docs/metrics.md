@@ -79,6 +79,9 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures. Requests rejected before body intake are not deliveries; label-free counter |
 | `two_bot_eventsub_classified_total{kind}` | EventSub deliveries classified by fixed `kind`: `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`. `ignored` covers known unrecognized or invalid outcomes, including deterministic 2xx acknowledgments, invalid challenges, and non-signature verification failures; `other` marks unknown/future classification errors, which return retryable 503. Only `BadSignature` is `tampered`. No IDs, tokens, headers, body text or secrets become labels |
 | `two_bot_eventsub_posts_total{outcome}` | Go-live post outcomes: `attempted`, `succeeded`, `failed` or `other`. The current receiver slice does not send go-live posts, so these remain zero until the sender is wired; no IDs, content or errors become labels |
+| `two_bot_eventsub_reconcile_passes_total{outcome}` | EventSub reconcile passes by fixed `outcome`: `healthy` (every desired broadcaster holds a healthy subscription afterwards), `pending` (re-created but not all verified yet) or `failed` (an action failed or a healthy subscription is missing, including listing failures). Exactly one sample per pass that reaches Helix; parked or refused startup passes (flag dark, invalid config, empty allowlist) never reach Helix and record no sample — they are log-only. Alert when `failed` rises across scrapes (alert rules land separately) |
+| `two_bot_eventsub_reconcile_actions_total{action}` | Successful EventSub reconcile mutations by fixed `action`: `create` (2xx creates) or `delete` (2xx deletes, including already-gone deletes). 409 already-exists confirmations fold into the pass outcome, not into actions; per-subscription labels never reach exposition |
+| `two_bot_eventsub_reconcile_errors_total{error_class}` | EventSub reconcile failure sites by the same fixed `error_class` strings as the `error_class` log field: `reconcile_action_failed` (once per failed plan action), `reconcile_prior_failed` (once per pass that found failed subscriptions), `reconcile_unhealthy` (once per non-converged pass) or `reconcile_failed` (listing or plan failures), plus `other` for unknown classes. No status code, body, broadcaster, subscription id or secret ever becomes a label |
 
 ## REST admission guard
 
@@ -144,13 +147,13 @@ scheduled-message, feed, self-role recovery, unban-sweep and automod-expiry
 names against that allowlist.
 
 No scheduler or registration gate changes are implied by these labels. Feed
-supervisor cadence is the boot-configured interval (default 300 s, range
-60–86,400 s); live interval changes gate polling inside those fixed opportunities.
-A skipped inner poll returns success and resets the `feeds` consecutive-failure
-streak, so `job_consecutive_failures:feeds` is reliable only while the live
-interval is at most the boot cadence; with a live interval at least twice the boot
-cadence each failed real poll is followed by a skipped tick that zeroes the streak
-before it can reach 3. Self-role recovery runs every 30 s with 0–5 s startup jitter
+supervisor cadence follows the live interval (boot default 300 s, range
+60–86,400 s): a stored change reschedules the next tick to last-run + new
+interval and the per-tick schedule gate mirrors that slot, so ticks normally
+land only when a poll is due. A skipped inner poll (a gate refusal on an
+overlapping or not-yet-due tick) still returns success and resets the `feeds`
+consecutive-failure streak, so a streak can under-report while such refusals
+interleave with failures. Self-role recovery runs every 30 s with 0–5 s startup jitter
 and a 25 s timeout; a successful sweep need not settle every pending repair.
 The member unban sweep runs every 30 s (`UNBAN_SWEEP_INTERVAL_SECONDS`) with
 startup jitter and a 180 s attempt timeout; one attempt may outlive its cadence,
@@ -186,6 +189,13 @@ as dynamic labels.
   `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`.
 - `two_bot_eventsub_posts_total{outcome}` — `outcome` is one of `attempted`,
   `succeeded`, `failed` or `other`.
+- `two_bot_eventsub_reconcile_passes_total{outcome}` — `outcome` is one of
+  `healthy`, `pending` or `failed`; unrecognised outcomes collapse to `failed`.
+- `two_bot_eventsub_reconcile_actions_total{action}` — `action` is `create` or
+  `delete`.
+- `two_bot_eventsub_reconcile_errors_total{error_class}` — `error_class` is one
+  of `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`,
+  `reconcile_failed` or `other`.
 - `two_bot_gateway_events_total{event}` — `event` is one of `READY`,
   `RESUMED`, `GUILD_CREATE`, `GUILD_DELETE`, `GUILD_UPDATE`,
   `GUILD_MEMBER_ADD`, `GUILD_MEMBER_REMOVE`, `GUILD_MEMBER_UPDATE`,
@@ -637,10 +647,9 @@ records success, so only a truly wedged sweep tickets — check
 sweep is intentional before treating flat audit deliveries as a wedged job.
 `feeds` is covered by
 the coarse fallback, not a precise cadence, because its cadence is
-boot-configured (60–86400 s) with a live-configurable inner polling gate and
-successful gated ticks are not polling freshness; its failure alerting is
-reliable only while the live interval is at most the boot cadence, since
-skipped gated ticks return success and reset the streak. `self_role_recovery`
+live-configurable (60–86400 s) with an inner polling gate and
+successful gated ticks are not polling freshness; skipped gated ticks return
+success and reset the streak. `self_role_recovery`
 keeps failure-only alerting: twice its 30 s cadence is too close to the ~60 s
 scrape interval for safe `job_stale` paging, and this label-isolation change
 adds no ticker-staleness policy. `member_unban_sweep` keeps failure-only
@@ -650,7 +659,7 @@ failure-only alerting with the coarse 2-hour fallback: its 60 s tick is a
 no-op success until the gateway builds the activation, and it only does real
 expiry work when `TWO_AUTOMOD=1`. `self_role_recovery`, `member_unban_sweep`
 and `automod_expiry` each trigger `job_consecutive_failures` independently at
-three completed failures; `feeds` does the same within its live-interval limit
+three completed failures; `feeds` does the same subject to the skipped-tick caveat
 above. A sweep with no completions is covered only by the coarse 2-hour
 fallback, not a precise cadence.
 `wrangler/test/alert-job-catalog.test.ts` checks website/community cadence
