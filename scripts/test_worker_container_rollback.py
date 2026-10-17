@@ -11,6 +11,7 @@ import sys
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # E402-safe by convention: every scripts/ test adds its own directory first,
@@ -470,6 +471,98 @@ class MainValidationTests(unittest.TestCase):
              "--actor", "a:b", "--evidence", "e.json"], self.base_env())
         self.assertEqual(code, 1)
         self.assertIn("invalid_expected_sha", out)
+
+
+class PostStatusTests(unittest.TestCase):
+    """A created rollout (201) is success; the 10-16 staging auto-rollback
+    posted its rollout, read 201 and failed the run as api_http_failure."""
+
+    class Response:
+        def __init__(self, status, body):
+            self.status, self.body = status, body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, limit):
+            return self.body[:limit]
+
+    def client(self, status):
+        body = json.dumps({"success": True, "result": {"id": "r-1"}}).encode()
+        client = rollback.RollbackClient(ACCOUNT, "token")
+        client.opener = type("Opener", (), {"open": lambda _self, request, timeout: self.Response(status, body)})()
+        return client
+
+    def test_created_201_is_success(self):
+        self.assertEqual(self.client(201).post("/x", {}), {"id": "r-1"})
+
+    def test_ok_200_is_success(self):
+        self.assertEqual(self.client(200).post("/x", {}), {"id": "r-1"})
+
+    def test_other_2xx_fails_closed(self):
+        with self.assertRaises(base.GateError) as raised:
+            self.client(202).post("/x", {})
+        self.assertEqual(str(raised.exception), "api_http_failure")
+
+
+class ControlFenceHintTests(unittest.TestCase):
+    FENCED = ("Singleton is intentionally fenced or uninitialized; "
+              "explicit staging release required\n")
+
+    def refusal(self, stderr, variant="staging", action="takeover", epoch=None):
+        failed = rollback.subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=stderr)
+        control = rollback.control_client(variant, "secret-token", "https://w.example",
+                                          "https://s.example", "actor")
+        with mock.patch.object(rollback.subprocess, "run", return_value=failed):
+            with self.assertRaises(base.GateError) as raised:
+                control(action, epoch)
+        return raised.exception
+
+    def test_fenced_refusal_carries_no_release_hint(self):
+        # The client must stay hint-free: its takeover calls run with
+        # OWNERSHIP_RELEASE_FENCE=true (pinned below), so the fenced refusal
+        # is unreachable through them, and production throws the same prefix
+        # with a different release route. The scoped fence guidance lives in
+        # the deploy-staging takeover step instead.
+        error = self.refusal(self.FENCED)
+        self.assertEqual(str(error), "ownership_control_failed")
+        # Only the allowlisted prefix reaches the detail, with no hint.
+        self.assertEqual(error.detail, "Singleton is intentionally fenced or uninitialized")
+        self.assertNotIn("secret-token", error.detail)
+
+    def test_production_fenced_refusal_names_no_staging_route(self):
+        error = self.refusal(self.FENCED, variant="production", action="fence", epoch=9)
+        self.assertEqual(str(error), "ownership_control_failed")
+        self.assertNotIn("deploy-staging", error.detail)
+        self.assertNotIn("release_fence", error.detail)
+
+    def test_other_refusals_carry_no_release_hint(self):
+        error = self.refusal("Ownership transition not confirmed\n")
+        self.assertEqual(error.detail, "Ownership transition not confirmed")
+
+    def test_fence_env_contract_that_makes_the_hint_dead(self):
+        # Pins the env contract behind the hint removal: takeover-style
+        # actions release the fence, fence/status do not. A fenced refusal
+        # can therefore never answer this client's takeover calls.
+        seen = {}
+
+        def fake_run(command, **kwargs):
+            seen[command[2]] = kwargs["env"]["OWNERSHIP_RELEASE_FENCE"]
+            return rollback.subprocess.CompletedProcess(args=command, returncode=0,
+                                                       stdout='{"ok": true}', stderr="")
+
+        control = rollback.control_client("staging", "t" * 32, "https://w.example",
+                                          "https://s.example", "actor")
+        with mock.patch.object(rollback.subprocess, "run", side_effect=fake_run):
+            control("deployment-takeover")
+            control("takeover", 9)
+            control("fence", 9)
+            control("status")
+        self.assertEqual(seen, {"deployment-takeover": "true", "takeover": "true",
+                                "fence": "false", "status": "false"})
 
 
 if __name__ == "__main__":

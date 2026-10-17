@@ -198,10 +198,11 @@ class StaticGuardTests(unittest.TestCase):
     def test_wrangler_and_secrets_only_run_in_the_production_environment(self):
         production = children(JOBS["production"][1:], 4)
         self.assertEqual(value(production["environment"]), "production")
-        # Drift must block the deploy: the production job waits for the guard
-        # and the prod schema gate. A rollback serves no new schema and waives
-        # the ledger check inside the reviewed gate script, never here.
-        self.assertEqual(value(production["needs"]), "[guard, schema-gate]")
+        # Drift must block the deploy: the production job waits for the guard,
+        # the prod schema gate and the prod roles gate. A rollback serves no
+        # new schema and waives the ledger check inside the reviewed gate
+        # script, never here.
+        self.assertEqual(value(production["needs"]), "[guard, schema-gate, roles-gate]")
         guard = children(JOBS["guard"][1:], 4)
         self.assertNotIn("environment", guard)
         self.assertNotIn("secrets.", "\n".join(JOBS["guard"]))
@@ -220,7 +221,7 @@ class StaticGuardTests(unittest.TestCase):
 
     def test_every_job_uses_the_shared_runner_routing(self):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
-        self.assertEqual(list(JOBS), ["guard", "schema-gate", "production", "release"])
+        self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "production", "release"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
@@ -930,6 +931,10 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("../tooling/wrangler/scripts/production-ownership-control.mjs", production)
         self.assertIn("tooling/scripts/ci/production_schema_gate.py",
                       "\n".join(JOBS["schema-gate"]))
+        roles_gate = "\n".join(JOBS["roles-gate"])
+        self.assertIn("path: tooling", roles_gate)
+        self.assertIn("ref: ${{ github.sha }}", roles_gate)
+        self.assertIn("tooling/scripts/ci/roles_gate.py", roles_gate)
 
     def test_api_failures_fail_closed(self):
         for key in ("compare", "ci-runs", "ci-run", "ci-jobs", "ci-ok", "worker check", "staging", "branches"):

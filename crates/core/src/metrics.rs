@@ -255,9 +255,9 @@ pub const VOICE_JOIN_REFUSAL_REASONS: &[&str] = &[
     "other",
 ];
 /// Rendered `le` labels for `two_bot_voice_join_to_move_seconds_bucket`: the
-/// eight finite `BUCKETS_MICROS` bounds as seconds plus `+Inf`. Pinned here so
-/// the Worker scrape validator (`wrangler/src/metrics-scrape.ts`) and its
-/// fixture derive the same spelling from this contract instead of restating it.
+/// eight finite `BUCKETS_MICROS` bounds as seconds plus `+Inf`. The rendered
+/// exposition is tested against this list, and the Worker scrape validator
+/// (`wrangler/src/metrics-scrape.ts`) and its fixture are checked against it.
 pub const VOICE_JOIN_TO_MOVE_BUCKET_LE: &[&str] = &[
     "0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf",
 ];
@@ -390,6 +390,20 @@ pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
 /// `error` when the facts writer failed, `timeout` when the drain missed the
 /// dispatch deadline. Both warn and continue; `other` absorbs unknown reasons.
 pub const COMMUNITY_FACTS_DRAIN_REASONS: &[&str] = &["error", "timeout", "other"];
+/// Verified EventSub deliveries by bounded receiver classification. `other`
+/// captures unknown/future classification errors; no header, body, broadcaster,
+/// subscription, or secret data reaches the label.
+pub const EVENTSUB_DELIVERY_KINDS: [&str; 6] = [
+    "challenge",
+    "notification",
+    "revocation",
+    "tampered",
+    "ignored",
+    "other",
+];
+/// Go-live post attempts by bounded outcome. The outcome vocabulary is fixed;
+/// post identifiers and error details are never retained.
+pub const EVENTSUB_POST_OUTCOMES: [&str; 4] = ["attempted", "succeeded", "failed", "other"];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -507,6 +521,9 @@ struct Values {
     /// channel, user, dedup-key, content or body label ever reaches
     /// exposition.
     event_store_consumer_lag_secs: f64,
+    eventsub_received: u64,
+    eventsub_classified: [u64; EVENTSUB_DELIVERY_KINDS.len()],
+    eventsub_posts: [u64; EVENTSUB_POST_OUTCOMES.len()],
 }
 
 /// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
@@ -969,6 +986,41 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.community_facts_drain_failures
             [bounded_index(reason, COMMUNITY_FACTS_DRAIN_REASONS)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One EventSub delivery accepted for verification, including a delivery
+    /// whose signature will fail. Rejected requests before body intake do not
+    /// count as deliveries.
+    pub fn eventsub_received(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.eventsub_received = values.eventsub_received.saturating_add(1);
+    }
+
+    /// One EventSub receiver classification. Unknown values collapse to
+    /// `other`; caller-controlled input can never become a label.
+    pub fn eventsub_classified(&self, kind: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.eventsub_classified[bounded_index(kind, &EVENTSUB_DELIVERY_KINDS)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One go-live post outcome. Call `attempted` immediately before the send,
+    /// then `succeeded` or `failed` once its result is known. Unknown outcomes
+    /// collapse to `other`.
+    pub fn eventsub_post(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.eventsub_posts[bounded_index(outcome, &EVENTSUB_POST_OUTCOMES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -1499,6 +1551,41 @@ impl Metrics {
             values.event_store_consumer_lag_secs
         )
         .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_eventsub_received_total",
+            "counter",
+            values.eventsub_received,
+        );
+        header(
+            &mut out,
+            "two_bot_eventsub_classified_total",
+            "counter",
+            "EventSub deliveries by bounded receiver classification.",
+        );
+        for (kind, count) in EVENTSUB_DELIVERY_KINDS
+            .iter()
+            .zip(values.eventsub_classified)
+        {
+            writeln!(
+                out,
+                "two_bot_eventsub_classified_total{{kind=\"{kind}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_eventsub_posts_total",
+            "counter",
+            "Go-live announcement post attempts by bounded outcome.",
+        );
+        for (outcome, count) in EVENTSUB_POST_OUTCOMES.iter().zip(values.eventsub_posts) {
+            writeln!(
+                out,
+                "two_bot_eventsub_posts_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
         for (name, count) in [
             (
                 "two_bot_rest_guard_invalid_requests_total",
@@ -1904,6 +1991,22 @@ mod tests {
         assert!(text.contains("two_bot_voice_join_to_move_seconds_sum 0.5\n"));
         assert!(text.contains("two_bot_voice_join_to_move_seconds_bucket{le=\"0.1\"} 0\n"));
         assert!(text.contains("two_bot_voice_join_to_move_seconds_bucket{le=\"0.5\"} 2\n"));
+    }
+
+    #[test]
+    fn voice_join_bucket_labels_match_the_pinned_contract() {
+        let metrics = Metrics::default();
+        metrics.voice_join_to_move(Duration::from_millis(1));
+        let text = metrics.render(None);
+        let rendered: Vec<&str> = text
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("two_bot_voice_join_to_move_seconds_bucket{le=\"")?
+                    .split('"')
+                    .next()
+            })
+            .collect();
+        assert_eq!(rendered, VOICE_JOIN_TO_MOVE_BUCKET_LE);
     }
 
     #[test]

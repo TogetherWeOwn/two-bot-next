@@ -9,6 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker, { type Env } from "../src/index.ts";
+import { isRequestId } from "../src/request-id.ts";
 
 interface Forwarded {
   method: string;
@@ -98,10 +99,12 @@ for (const path of ["/health", "/readyz"]) {
     }
     assert.deepEqual(
       Object.keys(fwd!.headers),
-      ["x-two-bot-deployment-id"],
-      "only the Worker-stamped deployment id reaches the fenced DO",
+      ["x-request-id", "x-two-bot-deployment-id"],
+      "only the Worker-stamped deployment id and the correlation id reach the fenced DO",
     );
     assert.equal(fwd!.headers["x-two-bot-deployment-id"], "synthetic-probe-deployment");
+    // No inbound id here, so the edge minted one: a valid join key, not a leak.
+    assert.ok(isRequestId(fwd!.headers["x-request-id"] ?? ""));
     assert.equal(fwd!.body, "", "no caller body may be forwarded");
   });
 

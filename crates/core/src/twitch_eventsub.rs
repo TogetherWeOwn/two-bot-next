@@ -21,8 +21,8 @@
 //!   announcements-channel post.
 //! - [`CallbackUrl`], [`create_subscription_body`], [`parse_subscriptions`] and
 //!   [`reconcile`]: subscription management as pure request bodies and a
-//!   create/delete plan. No Helix polling: reconcile runs at boot and after a
-//!   `revocation`, never on a timer.
+//!   create/delete plan. No Helix polling and no timers here: the bot runtime
+//!   runs reconcile at startup and on a bounded interval.
 //!
 //! The HTTP receiver, Helix client, credential loading and durable dedup
 //! ledger are separate reviewed slices; every caller of `WebhookSecret::expose()`
@@ -206,6 +206,22 @@ pub enum RevocationReason {
     Other,
 }
 
+impl RevocationReason {
+    /// Bounded log scalar for the revocation ack line: Twitch's revocation
+    /// `status` vocabulary, so revocation counts by reason are answerable
+    /// from logs alone. No id, header, body or secret travels with it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserRemoved => "user_removed",
+            Self::AuthorizationRevoked => "authorization_revoked",
+            Self::NotificationFailuresExceeded => "notification_failures_exceeded",
+            Self::VersionRemoved => "version_removed",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// A verified delivery, classified by message type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Delivery {
@@ -238,10 +254,10 @@ fn valid_subscription_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Classify a **verified** delivery. Call [`verify_delivery`] first. For a
-/// verified notification, classification errors are deterministic; the receiver
-/// must acknowledge them with 2xx rather than invite Twitch retries. Reserve
-/// non-2xx responses for transient send or durable-ledger failures.
+/// Classify a **verified** delivery. Call [`verify_delivery`] first. The
+/// receiver acknowledges known deterministic notification errors with 2xx rather
+/// than inviting Twitch retries. Unknown/future classification errors remain
+/// retryable; transient send or durable-ledger failures are also non-2xx.
 pub fn classify(message_type: &str, body: &[u8]) -> Result<Delivery, EventSubError> {
     if !matches!(
         message_type,
@@ -819,6 +835,54 @@ mod tests {
             classify("notification", b"not json"),
             Err(EventSubError::InvalidBody)
         );
+    }
+
+    #[test]
+    fn revocation_statuses_map_to_bounded_log_scalars() {
+        // Twitch's revocation `status` vocabulary plus the unmapped collapse:
+        // the receiver logs only `RevocationReason::as_str`, so log counts by
+        // reason stay exact without header or body bytes leaving the process.
+        for (status, reason, scalar) in [
+            (
+                "user_removed",
+                RevocationReason::UserRemoved,
+                "user_removed",
+            ),
+            (
+                "authorization_revoked",
+                RevocationReason::AuthorizationRevoked,
+                "authorization_revoked",
+            ),
+            (
+                "notification_failures_exceeded",
+                RevocationReason::NotificationFailuresExceeded,
+                "notification_failures_exceeded",
+            ),
+            (
+                "version_removed",
+                RevocationReason::VersionRemoved,
+                "version_removed",
+            ),
+            ("gone_without_notice", RevocationReason::Other, "other"),
+        ] {
+            let body = json!({
+                "subscription": {
+                    "id": "sub-9", "type": "stream.online", "version": "1",
+                    "status": status,
+                    "condition": {"broadcaster_user_id": "1337"},
+                },
+            })
+            .to_string();
+            assert_eq!(
+                classify("revocation", body.as_bytes()),
+                Ok(Delivery::Revocation {
+                    subscription_id: "sub-9".to_owned(),
+                    reason,
+                }),
+                "status {status}"
+            );
+            assert_eq!(reason.as_str(), scalar, "status {status}");
+        }
     }
 
     #[test]

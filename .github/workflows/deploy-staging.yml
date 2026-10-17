@@ -106,9 +106,68 @@ jobs:
           set -o pipefail
           python3 scripts/ci/staging_schema_gate.py \
             --binary ./target/debug/staging-migrate --source-sha "$SOURCE_SHA"
+  # Pre-deploy role-drift gate: a database whose grants lag the migrations
+  # fails this job (and, through `needs`, the deploy below) instead of
+  # crash-looping the new build at gateway startup with SQLSTATE 42501.
+  # Read-only `two-bot db roles verify` through the no-reviewer
+  # `staging-migrate-plan` environment binding (a login holding only the
+  # read-only plan group); the expected host/database/branch pins are
+  # non-secret `vars.*` compared against that binding (never derived from
+  # it), so a wrong-target binding refuses instead of reading the wrong
+  # database. Drift is fixed by the operator reapplying the full role plan
+  # (`two-bot db roles plan`) until `verify` reads 0, never by this workflow
+  # (verify-only; the reviewed-apply fence is untouched).
+  roles-gate:
+    name: role drift gate (two-bot db roles verify)
+    permissions:
+      contents: read
+    # No `if:`: every deploy must prove drift-free grants first. A skipped
+    # gate with a green deploy would re-create the 2026-10-16 crash-loop.
+    environment: staging-migrate-plan
+    # Runner routing: same expression as every job in every workflow; see the
+    # note on `check` in check.yml. A bare self-hosted label would queue
+    # forever on the public repo.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'roles-gate') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 30
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Deploy SHA must be exact
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Build runner
+        run: cargo build -p two-bot --bin two-bot --locked
+      - name: Fail closed on role drift
+        env:
+          # Must already exist as a staging-migrate-plan environment secret; absent means refusal.
+          # Read-only login: the gate never applies and never reads the migrator binding.
+          TWO_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}
+          # Non-secret expected staging identity (repo/org vars, Operator-owned):
+          # the gate refuses unless the secret binding matches these pins.
+          TWO_BOT_STAGING_HOST: ${{ vars.TWO_BOT_STAGING_HOST }}
+          TWO_BOT_STAGING_DATABASE: ${{ vars.TWO_BOT_STAGING_DATABASE }}
+          TWO_BOT_STAGING_BRANCH_ID: ${{ vars.TWO_BOT_STAGING_BRANCH_ID }}
+        # `shell: bash` runs with `-eo pipefail`. The container's default `sh`
+        # has no pipefail, so a gate refusal piped anywhere would read green.
+        # `set -o pipefail` is belt-and-braces for the same guarantee if the
+        # shell key is ever re-targeted; the workflow-policy test pins both.
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 scripts/ci/roles_gate.py \
+            --binary ./target/debug/two-bot --target staging \
+            --expected-host "$TWO_BOT_STAGING_HOST" --expected-database "$TWO_BOT_STAGING_DATABASE" \
+            --expected-branch-id "$TWO_BOT_STAGING_BRANCH_ID"
   deploy:
     name: wrangler deploy + intended rollout gate
-    needs: schema-gate
+    needs: [schema-gate, roles-gate]
     permissions:
       contents: read # checkout only; the deploy authenticates with `staging` environment secrets
     # Runner routing: see the note on `check` in check.yml.
@@ -213,8 +272,36 @@ jobs:
           # Pin the takeover client to the receipt-validated Worker version, so a
           # retry answered by a stale version refuses while the old-to-new
           # handover still re-posts. The receipt holds only the version UUID.
-          OWNERSHIP_EXPECTED_DEPLOYMENT="$(python3 -c 'import json,os;print(json.load(open(os.environ["ROLLOUT_DIR"]+"/receipt.json"))["worker_version"])')" \
-            node scripts/ownership-control.mjs deployment-takeover
+          # The fence release route is shown only for the intentionally-fenced
+          # refusal; any other failure (auth, transition-not-confirmed) takes
+          # the generic branch, never the fence guidance.
+          # The outer bound must exceed the client's own retry window
+          # (takeoverWindowMs 330s, covering old code answering 5xx for up to
+          # 300s) plus one in-flight attempt (GET+POST, 15s abort each), so a
+          # takeover that would succeed late in its window is never killed
+          # mid-retry; test_workflows.py pins this relation. 390s = 330s
+          # window + 30s attempt + startup/shutdown margin.
+          if output="$(
+            timeout --signal=TERM --kill-after=10s 390s \
+              env OWNERSHIP_EXPECTED_DEPLOYMENT="$(python3 -c 'import json,os;print(json.load(open(os.environ["ROLLOUT_DIR"]+"/receipt.json"))["worker_version"])')" \
+              node scripts/ownership-control.mjs deployment-takeover 2>&1
+          )"; then
+            printf '%s\n' "$output"
+          else
+            result=$?
+            echo "$output" >&2
+            if [[ $result -eq 124 || $result -eq 137 ]]; then
+              echo "::error::Staging ownership takeover timed out after 390 seconds; verify rollback evidence and current ownership, and do not release the fence manually."
+              exit 1
+            fi
+            case "$output" in
+              *"Singleton is intentionally fenced or uninitialized"*)
+                echo "::error::Staging singleton fenced: re-run Actions > deploy-staging > Run workflow with release_fence checked after handoff authorization (or: gh workflow run deploy-staging.yml --ref main -f release_fence=true). A push/default never releases; do not change credentials." ;;
+              *)
+                echo "::error::Staging ownership takeover failed (not a fence refusal); see the control-client output above. Do not change credentials." ;;
+            esac
+            exit 1
+          fi
       - name: Verify exact new rollout and serving Worker/container readiness
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

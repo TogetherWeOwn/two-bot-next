@@ -3,7 +3,7 @@
 `rust-toolchain.toml` is the single source of truth (currently 1.98.1).
 Every `dtolnay/rust-toolchain` step in `check.yml`, `nightly.yml` and
 `pipeline-benchmark.yml` must request that exact channel (the fuzz-compile
-job alone uses pinned nightly), and both Dockerfiles must build
+job alone uses pinned nightly), and `Dockerfile` must build
 `FROM rust:<major>.<minor>-trixie` on the same channel, since the toolchain
 header demands bump-both-together. Runs offline via the existing
 `Source-level CI gate regressions` discover step in check.yml.
@@ -21,7 +21,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ("check.yml", "nightly.yml", "pipeline-benchmark.yml")
-DOCKERFILES = ("Dockerfile", "Dockerfile.distroless")
+DOCKERFILES = ("Dockerfile",)
 # libFuzzer needs nightly; pinned date, not floating stable.
 FUZZ_TOOLCHAIN = "nightly-2026-10-01"
 MATCH_COMMENT = "Match rust-toolchain.toml"
@@ -141,10 +141,9 @@ class ToolchainParityTests(unittest.TestCase):
     def test_pinned_tree_passes(self):
         self.assertEqual(toolchain_parity_errors(ROOT), [])
 
-    def test_both_dockerfiles_are_covered(self):
-        self.assertEqual(set(DOCKERFILES), {"Dockerfile", "Dockerfile.distroless"})
-        for name in DOCKERFILES:
-            self.assertTrue((ROOT / name).is_file(), name)
+    def test_only_default_dockerfile_is_covered(self):
+        self.assertEqual(DOCKERFILES, ("Dockerfile",))
+        self.assertTrue((ROOT / "Dockerfile").is_file())
 
     def test_pinned_fixture_passes(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:

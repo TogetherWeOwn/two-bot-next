@@ -155,15 +155,15 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
           python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
 
-      # Squawk-subset migration lint (advisory, docs/quality-gates.md): flags
-      # risky statements in changed migration files without failing the PR.
-      # Broken tooling still fails so blindness cannot hide. Promotion to a
-      # required check flips this step to --strict after the advisory soak.
-      - name: Squawk migration lint (advisory)
+      # Squawk-subset migration lint (required, docs/quality-gates.md): in
+      # --strict mode four rules fail the PR; dropping-object stays advisory
+      # because coordinated removals still require a final DROP. Broken tooling
+      # still fails so blindness cannot hide.
+      - name: Squawk migration lint (required)
         env:
           SQUAWK_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
         run: |
-          python3 scripts/ci/check-squawk-migrations.py --base-ref "$SQUAWK_BASE"
+          python3 scripts/ci/check-squawk-migrations.py --base-ref "$SQUAWK_BASE" --strict
 
       # Finish the pinned toolchain before the first pip run. The image ships
       # the pinned Rust version without rustfmt or clippy, and rust-toolchain.toml
@@ -202,8 +202,8 @@ jobs:
         run: |
           set -euo pipefail
           curl -fsSL -o "$RUNNER_TEMP/actionlint.tgz" \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
-          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes=
 
@@ -274,11 +274,32 @@ jobs:
           command: check all
 
       - name: Install Rust toolchain
+        id: toolchain
         if: needs.job-inputs.outputs.rust != 'false'
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
 
       # Fail-fast (TOG-12055): cheap lint/format/guard checks run before the
       # ~4 GiB cargo cache restore, so a failure skips the big download. The
@@ -353,9 +374,11 @@ jobs:
       # Deterministic quality gates (docs/quality-gates.md). Steps, not jobs:
       # they reuse this lane's runner, container and toolchain, so no new
       # runner minutes beyond the step itself, and ci-ok already covers them.
-      # WARN gates annotate but never fail on findings; a broken gate step
-      # still fails so blindness cannot hide. The inventory gate is HARD and
-      # always on (pure Python, milliseconds); the rest are gated on the rust
+      # Patch coverage and the squawk lint stay WARN (they annotate but never
+      # fail on findings); unwrap request-paths and semgrep are HARD and fail
+      # on new findings. A broken gate step still fails so blindness cannot
+      # hide. The inventory gate is HARD and always on (pure Python,
+      # milliseconds); the rest are gated on the rust
       # selector like the other heavy steps.
       - name: CI test-target inventory
         run: python3 scripts/ci/check-test-inventory.py
@@ -400,7 +423,7 @@ jobs:
             echo "::warning::patch coverage measurement did not complete; see the rust-tests lane for the authoritative unit-test result"
           fi
 
-      - name: Unwrap in request paths (WARN)
+      - name: Unwrap in request paths (HARD)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
@@ -425,7 +448,7 @@ jobs:
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
           PATH="$RUNNER_TEMP/ast-grep:$PATH" ast-grep test -c sgconfig.yml
 
-      - name: Semgrep Rust rules (WARN)
+      - name: Semgrep Rust rules (HARD)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
@@ -539,6 +562,8 @@ jobs:
       # toolchain stays missing, so a broken pin still fails closed.
       - name: Retry Rust toolchain install on transient network failure
         if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
         env:
           RUSTUP_PERMIT_COPY_RENAME: 1
         run: |
@@ -677,6 +702,38 @@ jobs:
       - name: Measure metrics RSS (local fixtures only)
         run: cargo run -p two-bot-core --example metrics_rss --locked
 
+  # Required nextest lane (SDLC 2.3 CI speed pilot, promoted): the workspace
+  # lib/bins scope under cargo-nextest (one retry, JUnit, flake ledger) via
+  # the shared reusable lane. Same rust-selector gate as the other Rust test
+  # lanes; `ci-ok` only accepts the skip when the selector deselected it.
+  nextest:
+    name: rust nextest
+    permissions:
+      contents: read
+    needs: [job-inputs]
+    # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
+    # `ci-ok` only accepts the skip when the selector deselected the job.
+    if: needs.job-inputs.outputs.rust != 'false'
+    uses: ./.github/workflows/reusable-rust-nextest.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    # R2 write credentials flow only on push to main and workflow_dispatch:
+    # the lane compiles and executes code, and any other event (pull_request,
+    # merge_group, ...) runs a head that is not on `main` yet. The reusable
+    # lane independently refuses shared backends off those two events
+    # (defense in depth; see its backend step). Empty elsewhere, so the lane
+    # falls back to local-disk sccache.
+    # NOTE: the gate must read `(== 'push' || == 'workflow_dispatch') &&
+    # secrets.X || ''`. A `!= 'pull_request' && secrets.X` form forwards the
+    # secret on merge_group, and `== 'pull_request' && '' || secrets.X`
+    # forwards it everywhere, because '' is falsy in GitHub expressions.
+    secrets:
+      SCCACHE_BUCKET: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_BUCKET || '' }}
+      SCCACHE_ENDPOINT: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_ENDPOINT || '' }}
+      SCCACHE_REGION: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_REGION || '' }}
+      AWS_ACCESS_KEY_ID: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_SECRET_ACCESS_KEY || '' }}
+
   ignored-db-stores:
     name: ignored db (stores)
     permissions:
@@ -748,10 +805,31 @@ jobs:
           exit 1
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
 
       - name: Pin native tests to one CPU (loaded-runner validation)
         if: github.event_name == 'workflow_dispatch' && inputs.single_core_tests
@@ -1066,10 +1144,31 @@ jobs:
           exit 1
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
 
       - name: Pin native tests to one CPU (loaded-runner validation)
         if: github.event_name == 'workflow_dispatch' && inputs.single_core_tests
@@ -1286,11 +1385,34 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         if: needs.job-inputs.outputs.rust != 'false'
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component clippy; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
+
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
@@ -1363,9 +1485,32 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
+
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
@@ -1600,10 +1745,33 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component clippy; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
+
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
@@ -1651,10 +1819,33 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component clippy; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
+
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
@@ -1698,9 +1889,32 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
+
       # TOG-11810: dependency build cache, as in the `check` job. The key
       # includes the job id, so this job keeps its own entry (it builds a
       # different dependency set); saved only on pushes to main.
@@ -1757,9 +1971,9 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Compile-only: builds all fourteen libFuzzer targets without executing them.
-      # No execution, no corpus output, no schedule; the bounded
-      # vote_kick smoke stays a manual non-controller step (see fuzz/README.md).
+      # Builds all sixteen libFuzzer targets. No campaign or generated corpus
+      # output; the existing weekly run replays only the bounded eventsub_delivery
+      # seeds below. Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -1767,6 +1981,15 @@ jobs:
       - name: Compile-only fuzz build (no execution)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz build
+      # Bounded seed replay, eventsub_delivery only: `-runs=0` executes each
+      # committed corpus seed exactly once (plus the target's fixed matrix)
+      # and exits without fuzzing. A signing-key drift between the harness
+      # and production, or seed misrouting, panics an assertion here instead
+      # of passing a compile-only gate. Compile stays the only gate for the
+      # other fifteen targets.
+      - name: Seed replay for eventsub_delivery (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
 
   worker:
     name: worker check
@@ -1902,7 +2125,7 @@ jobs:
     name: ci-ok
     permissions:
       contents: read
-    needs: [job-inputs, container-inputs, supply-chain, check, rust-tests, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile]
+    needs: [job-inputs, container-inputs, supply-chain, check, rust-tests, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile, nextest]
     # A skipped or cancelled dependency must not read as green.
     if: ${{ always() }}
     # Runner routing: see the note on the first job above.
@@ -1930,6 +2153,7 @@ jobs:
           TICKETS_RESULT: ${{ needs.tickets-postgres.result }}
           MODERATION_DB_RESULT: ${{ needs.moderation-db.result }}
           FUZZ_COMPILE_RESULT: ${{ needs.fuzz-compile.result }}
+          NEXTEST_RESULT: ${{ needs.nextest.result }}
         run: |
           python3 - <<'PY'
           import os
@@ -1962,6 +2186,7 @@ jobs:
                   ("ignored-db-stores", "IGNORED_DB_STORES_RESULT", "RUST_SELECTED"),
                   ("ignored-db-runtime", "IGNORED_DB_RUNTIME_RESULT", "RUST_SELECTED"),
                   ("fuzz-compile", "FUZZ_COMPILE_RESULT", "RUST_SELECTED"),
+                  ("nextest", "NEXTEST_RESULT", "RUST_SELECTED"),
               ]
               for job, result_var, sel_var in gated:
                   result = os.environ.get(result_var, "")

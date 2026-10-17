@@ -11,6 +11,9 @@ mod admission_test_support;
 mod audit_gateway;
 mod audit_runtime;
 mod automod_gateway;
+#[cfg(test)]
+mod backfill_error_chain_acceptance_tests;
+mod backfill_retention_chains;
 mod backup_cli;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.
 #[allow(dead_code)]
@@ -35,8 +38,14 @@ mod dispatch;
 mod erasure_cli;
 mod event_cli;
 mod eventsub_http;
+mod eventsub_reconcile;
 mod feed_jobs;
 mod gateway;
+// Bounded reconnect schedule and runner: no runtime caller yet. Test-only
+// until the gateway loop adopts it, so it lives in test builds instead of
+// shipping dead code to the container.
+#[cfg(test)]
+mod gateway_backoff;
 mod gateway_commands;
 mod gateway_failure;
 mod gateway_metrics;
@@ -74,6 +83,8 @@ mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
 mod restore_drill;
+#[cfg(test)]
+mod retention_error_chain_acceptance_tests;
 mod retention_jobs;
 #[cfg(test)]
 mod retention_runtime_tests;
@@ -375,6 +386,13 @@ async fn run(cli_args: &[String]) {
     let voice = build_voice_runtime(&config, VoiceGates::from_env().enabled).await;
 
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
+
+    // M3.3 reconcile: once at startup plus a bounded interval while
+    // `TWO_EVENTSUB` is exactly `1`. Dark parks with an info log;
+    // enabled-but-invalid configuration logs with an error class and never
+    // mutates.
+    eventsub_reconcile::spawn_if_enabled(shutdown.subscribe());
+
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
     let gateway_task = if let Ok((token, url, guild_id)) = gateway_prerequisites(&config) {
