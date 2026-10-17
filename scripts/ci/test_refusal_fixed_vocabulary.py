@@ -33,13 +33,20 @@ alternatives do (verified with the pinned binary). The
 YAML rule cannot scope that far in ast-grep 0.50 (`has` sees direct
 children only and never unifies an outer $MSG; verified with probe
 rules), so it still matches the whole call and a computed-condition
-shape must never join its valid fixtures. This pin decides CI.
+shape must never join its valid fixtures. `Refused`/`ReadFailed` take
+exactly one message argument: a second argument stringifies into a tuple
+that `scripts/staging_events_read.py:371/374` prints, so the pin asserts
+the single-argument shape (mirroring the `require` arity assert) and
+treats any extra argument as flagged. The ast-grep `Refused($MSG)` /
+`ReadFailed($MSG)` patterns only bind single-argument calls, so the YAML
+still misses that family and this pin decides it. This pin decides CI.
 Known gaps, documented rather than
 gated: `raise Refused(message)` funnels a pre-built variable (the
 `require` helper relay itself is an explicit allowlist entry; the
-`require` call sites are covered); a computed require message neither
-gate sees (`require(cond, url.strip())` trips neither the rule nor
-this pin); control flow the rule cannot see
+`require` call sites are covered); a computed or bare-attribute require
+message neither gate sees (`require(cond, url.strip())`,
+`require(ok, done.stderr)`, `require(ok, parsed.hostname)` trip neither
+the rule nor this pin); control flow the rule cannot see
 (for example a `parsed.port` read moved back outside its `try`); and a
 mixed line carrying both an allowlisted marker and a new interpolation
 stays exempt until the exact allowlist below changes, which fails this
@@ -129,11 +136,14 @@ def first_call(snippet):
 def message_segment(text, node, where=""):
     """Source of the refusal message argument, or "" when it has none.
 
-    `Refused`/`ReadFailed` carry the message in their first argument (or
+    `Refused`/`ReadFailed` carry the message in their single argument (or
     a `msg=` keyword; the ast-grep `Refused($MSG)` pattern binds that
     too, verified with the pinned binary) and `require` in its second;
     anything else (for example a computed require condition) is
-    deliberately invisible to the trigger.
+    deliberately invisible to the trigger. A second `Refused`/`ReadFailed`
+    argument stringifies into a tuple the readers print, and the
+    single-argument ast-grep patterns miss it, so out-of-contract arity
+    raises here and the callers map it to flagged.
     """
     if func_id(node.func) == "require":
         assert len(node.args) == 2, (
@@ -141,6 +151,18 @@ def message_segment(text, node, where=""):
             "the ast-grep pattern require($COND, $MSG) would miss this shape"
         )
         target = node.args[1]
+    elif func_id(node.func) in ("Refused", "ReadFailed"):
+        assert len(node.args) + len(node.keywords) == 1, (
+            f"{where}: Refused/ReadFailed take exactly one argument; "
+            "the ast-grep patterns Refused($MSG)/ReadFailed($MSG) would "
+            "miss this shape"
+        )
+        if node.args:
+            target = node.args[0]
+        elif node.keywords:
+            target = node.keywords[0].value
+        else:
+            target = None
     elif node.args:
         target = node.args[0]
     elif node.keywords:
@@ -188,15 +210,26 @@ def refusal_statements(path):
             "ReadFailed",
             "require",
         ):
-            message = message_segment(
-                text, node, where=f"{path}:{node.lineno}"
-            )
+            segment = ast.get_source_segment(text, node)
+            try:
+                message = message_segment(
+                    text, node, where=f"{path}:{node.lineno}"
+                )
+                probes = scope_probes(node, message)
+            except AssertionError:
+                # Out-of-contract arity (for example a two-argument
+                # Refused): the single-argument ast-grep patterns miss it
+                # and str(error) prints the tuple, so force a trip. The
+                # "+" guarantees the broad trigger matches; no allowlist
+                # entry contains it.
+                message = f"{segment} + extra-arg"
+                probes = [message]
             found.append(
                 (
                     node.lineno,
-                    ast.get_source_segment(text, node),
+                    segment,
                     message,
-                    scope_probes(node, message),
+                    probes,
                 )
             )
     return sorted(found, key=lambda entry: entry[:3])
@@ -220,10 +253,18 @@ def classify(segment, message, broad, exempts, probes=()):
 
 
 def snippet_verdict(snippet):
-    """classify() for one fixture or mutant snippet."""
+    """classify() for one fixture or mutant snippet.
+
+    Out-of-contract arity raises in message_segment(); map it to flagged
+    so a two-argument Refused/ReadFailed trips the pin even though the
+    single-argument ast-grep patterns miss it.
+    """
     broad, exempts = broad_and_exempts()
-    node = first_call(snippet)
-    message = message_segment(snippet.strip(), node)
+    try:
+        node = first_call(snippet)
+        message = message_segment(snippet.strip(), node)
+    except AssertionError:
+        return "flagged"
     return classify(
         snippet, message, broad, exempts, scope_probes(node, message)
     )
@@ -437,6 +478,11 @@ class MutantTests(unittest.TestCase):
         'raise Refused(output[:80])',
         'raise Refused(host.upper())',
         'raise Refused(msg=host)',
+        # A second argument stringifies into a tuple the readers print;
+        # the single-argument ast-grep patterns miss it, so the pin trips
+        # on arity (pin-only: no YAML fixture change).
+        'raise Refused("refusing: the database host must be a bare name", host)',
+        'raise ReadFailed("psql failed", done.stderr)',
     ]
     FIXED = [
         'raise Refused("refusing: the database login may not set that query parameter")',
