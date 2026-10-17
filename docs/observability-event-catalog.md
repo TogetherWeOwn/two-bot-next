@@ -140,6 +140,17 @@ body, broadcaster, subscription or secret data reaches any label.
 | `two_bot_eventsub_classified_total{kind}` | Deliveries by bounded receiver classification; `kind` is `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`; `other` marks unknown/future classification errors returned as retryable 503 |
 | `two_bot_eventsub_posts_total{outcome}` | Go-live post attempts by bounded outcome; `outcome` is `attempted`, `succeeded`, `failed` or `other`; zero until the go-live sender slice is wired |
 
+## Feed fetch series
+
+Counters emitted by the feed poller render. Unknown `outcome` values collapse
+to `failure` and unknown `error_class` values collapse to `other`, and no
+source URL, host, header, body or feed id reaches any label.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_feed_fetches_total{outcome}` | Feed fetch attempts by bounded outcome; `outcome` is `success` (2xx fetch), `invalid_source` (source refused before dialling), `refused_redirect` (redirect refused by policy) or `failure` (every other failure, including non-2xx HTTP) |
+| `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class; `error_class` is `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`; successes record nothing here |
+
 ## Scheduled job labels
 
 Each label owns independent `two_bot_job_runs_total{job,outcome}`,
