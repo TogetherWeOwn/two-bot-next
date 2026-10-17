@@ -105,7 +105,11 @@ final listing still run, and the pass then fails with the failed and missing
 counts, so one bad id never starves the broadcasters after it. A
 `revocation` delivery is acknowledged by the receiver and healed by the next
 pass; the desired set comes from `TWO_TWITCH_BROADCASTERS` (empty parks the
-pass without mutations).
+pass without mutations). A successful Helix listing answer counts as
+evidence only when it is an object carrying a `data` array: a missing or
+non-array `data` envelope on any page fails the whole listing closed, so no
+reconcile mutations are planned from invalid evidence and a malformed
+confirmation listing can never report the pass healthy.
 
 Secret handling: the signing secret is a `WebhookSecret` (10-100 ASCII, as
 Twitch requires) wrapping `Secret<String>`; its `Debug` is `[REDACTED]`. It is
