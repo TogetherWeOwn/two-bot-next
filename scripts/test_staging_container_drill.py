@@ -95,6 +95,7 @@ class World:
         self.t = 1_800_000_000.0
         self.calls = []
         self.deploys = []
+        self.messages = []
         self.fail_control = {}
         self.raise_on_api = {}  # path prefix -> error to raise
 
@@ -249,6 +250,7 @@ def run_drill(world, raw_pin=None, attestation=COVERING_ATTESTATION, logs=None):
         image = config["env"]["staging"]["containers"][0]["image"]
         world.tick(2)
         world.deploys.append(image)
+        world.messages.append(message_sha)
         if world.refuse_deploy:
             return 1
         world.serving_image = image
@@ -329,6 +331,9 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(failures, [])
         # Both legs deployed through the full-container path with different images.
         self.assertEqual(world.deploys, [BACKOUT_IMAGE, PRE_IMAGE])
+        # Each leg stamps the deployed version with the SHA its image reports:
+        # drill leg with the backout pin's SHA, restore leg with the baseline's.
+        self.assertEqual(world.messages, [BACKOUT_SHA, PRE_SHA])
         drill, restore = instance.evidence["drill"], instance.evidence["restore"]
         self.assertEqual(drill["intended_image"], BACKOUT_IMAGE)
         self.assertEqual(drill["running_image"], BACKOUT_IMAGE)
@@ -835,6 +840,7 @@ class MainTests(unittest.TestCase):
                     config = json.loads(Path(config_path).read_text())
                     world.deploys.append(
                         config["env"]["staging"]["containers"][0]["image"])
+                    world.messages.append(message_sha)
                     world.tick(2)
                     world.serving_image = config["env"]["staging"]["containers"][0]["image"]
                     world.rollouts.append(rollout_row(

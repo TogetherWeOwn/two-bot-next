@@ -133,7 +133,7 @@ cannot form a receipt and a manual rollback to it refuses; the
 in-run auto-rollback to such a snapshot keeps its legacy version-header
 identity and records `provenance: legacy-no-sha` in its evidence. Keep
 every serving version stamped: a secret change publishes a new Worker
-version too, so stage secrets with `wrangler versions secret put <KEY>
+version too, so stage secrets with `wrangler versions secret put --env <env> <KEY>
 --message <sha>` — where `<sha>` is the SHA of the last successful deploy
 (the run summary's `SHA:` line, or the live `/readyz` `build_revision`),
 not the pre-deploy snapshot's `serving_sha` (that snapshot describes the
