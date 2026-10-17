@@ -387,6 +387,48 @@ fn subscriptions_url(broadcaster_user_id: Option<&str>, cursor: Option<&str>) ->
     format!("{HELIX_SUBSCRIPTIONS_URL}?{}", query.finish())
 }
 
+/// Validate one subscription-listing page envelope and return its next-page
+/// cursor, if any.
+///
+/// A successful answer is only listing evidence when it is an object carrying
+/// a `data` array. [`parse_subscriptions`](crate::twitch_eventsub::parse_subscriptions)
+/// is deliberately lenient per entry (other types, versions, transports and
+/// malformed entries are skipped), but a missing or non-array `data` envelope
+/// must not read as "no subscriptions": reconciliation would plan creates from
+/// invalid evidence, and a malformed later page would truncate the accumulated
+/// pages into partial success. Fail the whole listing instead; the messages
+/// are static and carry no bytes from the response.
+///
+/// Returns `Ok(None)` for a terminal page (no `pagination`, a missing/null
+/// `cursor`, or a non-object `pagination`, which carries no cursor), `Ok(Some)`
+/// for a non-empty string cursor, and `Err(BadResponse)` for a missing or
+/// non-array `data` envelope or a present-but-unusable cursor (empty string,
+/// number, boolean, array or object). Pure and sync so the fuzz target drives
+/// this exact check without network or credentials.
+pub fn validate_subscription_listing_page(
+    document: &serde_json::Value,
+) -> Result<Option<String>, HelixError> {
+    if document
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .is_none()
+    {
+        return Err(HelixError::BadResponse(
+            "subscription listing has no data array",
+        ));
+    }
+    match document.get("pagination") {
+        Some(pagination) => match pagination.get("cursor") {
+            Some(serde_json::Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+            Some(serde_json::Value::Null) | None => Ok(None),
+            Some(_) => Err(HelixError::BadResponse(
+                "subscription pagination cursor is not usable",
+            )),
+        },
+        None => Ok(None),
+    }
+}
+
 /// The Helix client: cached app token plus plan execution. `T` is the
 /// transport (`HyperHelixTransport` in production, a script in tests);
 /// `clock` supplies Unix millis (default [`system_millis`]) so refresh
@@ -555,45 +597,16 @@ impl<T: HelixTransport> HelixClient<T> {
                 .await?;
             let document: serde_json::Value = serde_json::from_slice(&response.body)
                 .map_err(|_| HelixError::BadResponse("subscription listing is not JSON"))?;
-            // A successful answer is only listing evidence when it is an
-            // object carrying a `data` array. `parse_subscriptions` is
-            // deliberately lenient per entry (other types, versions,
-            // transports and malformed entries are skipped), but a missing
-            // or non-array `data` envelope must not read as "no
-            // subscriptions": reconciliation would plan creates from
-            // invalid evidence, and a malformed later page would truncate
-            // the accumulated pages into partial success. Fail the whole
-            // listing instead; the message is static and carries no bytes
-            // from the response.
-            if document
-                .get("data")
-                .and_then(serde_json::Value::as_array)
-                .is_none()
-            {
-                return Err(HelixError::BadResponse(
-                    "subscription listing has no data array",
-                ));
-            }
+            // Fail closed on malformed envelopes via the shared pure
+            // validator (also driven by the fuzz target); see
+            // [`validate_subscription_listing_page`].
+            let next_cursor = validate_subscription_listing_page(&document)?;
             subscriptions.extend(parse_subscriptions(&document));
 
-            let next_cursor = match document.get("pagination") {
-                Some(pagination) => match pagination.get("cursor") {
-                    Some(serde_json::Value::String(value)) if !value.is_empty() => {
-                        Some(value.as_str())
-                    }
-                    Some(serde_json::Value::Null) | None => None,
-                    Some(_) => {
-                        return Err(HelixError::BadResponse(
-                            "subscription pagination cursor is not usable",
-                        ));
-                    }
-                },
-                None => None,
-            };
             let Some(next_cursor) = next_cursor else {
                 return Ok(subscriptions);
             };
-            if !seen_cursors.insert(next_cursor.to_owned()) {
+            if !seen_cursors.insert(next_cursor.clone()) {
                 return Err(HelixError::BadResponse(
                     "subscription pagination cursor repeated",
                 ));
@@ -601,7 +614,7 @@ impl<T: HelixTransport> HelixClient<T> {
             if page + 1 == HELIX_MAX_SUBSCRIPTION_PAGES {
                 return Err(HelixError::SubscriptionPageLimit);
             }
-            cursor = Some(next_cursor.to_owned());
+            cursor = Some(next_cursor);
         }
 
         Err(HelixError::SubscriptionPageLimit)
