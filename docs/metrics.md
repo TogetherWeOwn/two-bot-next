@@ -513,10 +513,19 @@ Both readiness and metrics share the [Discord-only destination validator and
 non-destructive disable switch](container-readiness.md#threshold-and-notifications).
 No Prometheus server, no new infrastructure.
 
-Background alert scrapes share the streaming 64 KiB body cap and a single
-six-second request/body deadline. Non-OK bodies are cancelled without buffering;
-oversize or stalled bodies are cancelled too, without waiting on a cancellation
-hook. Failed scrapes log only `two-bot metrics scrape failed`: no response body,
+Every DO ops read — the background alert scrape, the summary proxy, the
+read-only ops proxies (metrics, gateway, backfill and the signed
+backfill-progress read) and the keepalive `/readyz` probe — shares the
+streaming 64 KiB body cap and a single end-to-end six-second deadline across
+the container fetch and the body read. The deadline does not rely on the SDK
+or the response stream honoring abort: a fetch or body that ignores
+cancellation still settles the caller at six seconds, a response that only
+arrives after the deadline is released and discarded (never proxied, never
+recorded as readiness), and body cancellation is best-effort — a cancel hook
+that stalls or never resolves cannot extend the caller's critical section.
+Non-OK bodies are cancelled without buffering; oversize or stalled bodies are
+cancelled too, without waiting on a cancellation hook. Failed scrapes log
+only `two-bot metrics scrape failed`: no response body,
 exception detail, token or URL. Empty/non-exposition, malformed or interrupted
 bodies, timeouts, and missing/duplicate/invalid alert inputs keep the previous
 firing set, counter baselines and streaks, and emit no `RESOLVED` — except the
@@ -550,10 +559,11 @@ exposition proxy, and ownership and bearer controls are unchanged.
   `404`. Unauthenticated requests never reach the container. `/metrics`
   itself stays `404`. The ownership control path (`/internal/ownership`)
   keeps its own gate and shares neither this bucket nor its budget.
-  The DO container fetch aborts after 6 s (`504`, generic body — the SDK
-  resolves aborts as a 500 Response, which is mapped to 504 without
-  proxying its text) and the upstream body is capped at 64 KiB
-  (larger → `502`, generic body).
+  The DO container fetch and its body read share one end-to-end 6 s
+  deadline (`504` at the deadline, generic body — the SDK resolves aborts
+  as a 500 Response, which is mapped to 504 without proxying its text, and
+  a fetch or stream that ignores abort still settles at the deadline) and
+  the upstream body is capped at 64 KiB (larger → `502`, generic body).
 - Rules live in `wrangler/src/alert-rules.ts`; each links to a
   [runbook](runbook.md#metrics-alerts) section (a test enforces the anchors):
 

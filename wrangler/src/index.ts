@@ -490,6 +490,24 @@ async function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   }
 }
 
+/** Release a body best-effort: a stalling cancel hook must not hold the caller. */
+function releaseBody(response: Response): void {
+  void response.body?.cancel().catch(() => {});
+}
+
+/**
+ * Settle a container fetch at `signal`'s deadline even when the SDK ignores
+ * abort. A response that arrives after the deadline is released best-effort
+ * and never delivered to the caller.
+ */
+async function deadlineFetch(work: Promise<Response>, signal: AbortSignal): Promise<Response> {
+  const request = work.then((res) => {
+    if (signal.aborted) releaseBody(res);
+    return res;
+  });
+  return abortable(request, signal);
+}
+
 /** Read at most `limit` bytes; cancel oversize/failed bodies without buffering. */
 async function readBoundedText(response: Response, limit: number, signal?: AbortSignal): Promise<string | null> {
   const reader = response.body?.getReader();
@@ -774,20 +792,23 @@ export class TwoBotContainer extends Container<Env> {
             });
           let upstream: Response;
           try {
-            upstream = await this.containerFetch(`http://c${OPS_SUMMARY_PATH}`, {
+            upstream = await deadlineFetch(this.containerFetch(`http://c${OPS_SUMMARY_PATH}`, {
               signal: fetchSignal,
-            });
+            }), fetchSignal);
           } catch {
             return summaryUnavailable(504);
           }
           if (fetchSignal.aborted || !isBotProbeResponse(upstream)) {
-            await upstream.body?.cancel().catch(() => {});
+            releaseBody(upstream);
             return summaryUnavailable(504);
           }
           let body: string | null;
           try {
-            body = await readBoundedText(upstream, MAX_SUMMARY_BODY_BYTES);
+            body = await readBoundedText(upstream, MAX_SUMMARY_BODY_BYTES, fetchSignal);
           } catch {
+            return summaryUnavailable(504);
+          }
+          if (fetchSignal.aborted) {
             return summaryUnavailable(504);
           }
           if (body === null) {
@@ -873,21 +894,21 @@ export class TwoBotContainer extends Container<Env> {
     let upstream: Response;
     try {
       upstream = headers
-        ? await this.containerFetch(new Request(containerUrl, { headers, signal: fetchSignal }))
-        : await this.containerFetch(containerUrl, {
+        ? await deadlineFetch(this.containerFetch(new Request(containerUrl, { headers, signal: fetchSignal })), fetchSignal)
+        : await deadlineFetch(this.containerFetch(containerUrl, {
           signal: fetchSignal,
-        });
+        }), fetchSignal);
     } catch {
       return unavailable(504);
     }
     if (fetchSignal.aborted) {
-      await upstream.body?.cancel().catch(() => {});
+      releaseBody(upstream);
       return unavailable(504);
     }
     if (headers && upstream.status === 401) {
       // Signed-read auth failure, not an outage: fixed 401 with the same body
       // the Worker pre-check uses, so container error text cannot leak.
-      await upstream.body?.cancel().catch(() => {});
+      releaseBody(upstream);
       return new Response("unauthorized", {
         status: 401,
         headers: withSecurityHeaders({ "content-type": "text/plain", "cache-control": "no-store" }),
@@ -896,13 +917,16 @@ export class TwoBotContainer extends Container<Env> {
     if (!upstream.ok) {
       // Cancel without reading: a huge non-2xx body must not bypass
       // the 64 KiB cap by being drained here.
-      await upstream.body?.cancel().catch(() => {});
+      releaseBody(upstream);
       return unavailable(504);
     }
     let body: string | null;
     try {
-      body = await readBoundedText(upstream, MAX_METRICS_BODY_BYTES);
+      body = await readBoundedText(upstream, MAX_METRICS_BODY_BYTES, fetchSignal);
     } catch {
+      return unavailable(504);
+    }
+    if (fetchSignal.aborted) {
       return unavailable(504);
     }
     if (body === null) {
@@ -1197,18 +1221,25 @@ export class TwoBotContainer extends Container<Env> {
           let status: number | null = null;
           let probe: ProbeDetail = { failure: null };
           try {
-            const res = await this.containerFetch("http://c/readyz", { signal: AbortSignal.timeout(6000) });
+            const probeSignal = AbortSignal.timeout(6000);
+            const res = await deadlineFetch(
+              this.containerFetch("http://c/readyz", { signal: probeSignal }), probeSignal);
             status = res.status;
             if (!res.ok) console.warn(`two-bot /readyz unhealthy: ${status}`);
             // Cap the keepalive /readyz read like the metrics scrape: a
             // compromised container controls this body, so an oversized answer
             // is a failed probe, never a buffered parse. Small bodies still
             // drain fully, so the SDK 0.3.7 proxy pipe settles cleanly.
-            const body = await readBoundedText(res, MAX_PROBE_BODY_BYTES);
+            const body = await readBoundedText(res, MAX_PROBE_BODY_BYTES, probeSignal);
             // Refresh the release tag before any error event below: a failed
             // probe must not reuse a previous image's SHA.
             this.lastRelease = null;
-            if (body === null) {
+            if (probeSignal.aborted) {
+              // A probe that only completed past its deadline is no evidence
+              // of readiness: record it as failed, never as recovery.
+              status = null;
+              console.warn("two-bot keepalive probe failed");
+            } else if (body === null) {
               status = null;
               console.warn("two-bot keepalive probe failed");
             } else {
