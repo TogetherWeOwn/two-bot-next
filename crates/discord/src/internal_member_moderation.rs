@@ -175,8 +175,48 @@ where
     /// the bot's own standing in the guild; unknown positions must refuse
     /// before calling this method. `now_ms` is the caller's clock
     /// reading in unix millis; it is injected so tests assert exact expiries.
+    ///
+    /// Records one `two_bot_moderation_enforcements_total` sample per terminal
+    /// call (TOG-28482): `success` for completed enforcements including
+    /// idempotent replays, otherwise the bounded
+    /// `ActionError::enforcement_outcome` class — including the pre-service
+    /// validation and actor/target checks, mirroring
+    /// `InternalChannelExecutor`. The verb is the request's
+    /// `ModerationAction::command_name`; no user id, reason text or free-form
+    /// detail ever becomes a label.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute(
+        &self,
+        request: &InternalMemberRequest,
+        actor: &ModerationActor,
+        target: &ModerationTarget,
+        bot_highest_role_position: i64,
+        request_id: &str,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<InternalMemberResult, ActionError> {
+        let result = self
+            .execute_inner(
+                request,
+                actor,
+                target,
+                bot_highest_role_position,
+                request_id,
+                idempotency_key,
+                now_ms,
+            )
+            .await;
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(err) => err.enforcement_outcome(),
+        };
+        two_bot_core::metrics::global()
+            .moderation_enforcement(request.action.command_name(), outcome);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_inner(
         &self,
         request: &InternalMemberRequest,
         actor: &ModerationActor,
@@ -222,18 +262,7 @@ where
             request_id: request_id.to_owned(),
             idempotency_key: idempotency_key.to_owned(),
         };
-        let result = match service.execute(&execution).await {
-            Ok(result) => result,
-            Err(err) => {
-                two_bot_core::metrics::global().moderation_enforcement(
-                    request.action.command_name(),
-                    err.enforcement_outcome(),
-                );
-                return Err(member_error(err));
-            }
-        };
-        two_bot_core::metrics::global()
-            .moderation_enforcement(request.action.command_name(), "success");
+        let result = service.execute(&execution).await.map_err(member_error)?;
         Ok(InternalMemberResult {
             outcome: result.outcome.as_str().to_owned(),
             replayed: result.replayed,

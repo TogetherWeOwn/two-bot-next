@@ -341,10 +341,14 @@ as dynamic labels.
   rejections that prove no mutation happened), `discord_error` (uncertain
   Discord failures: timeout, unreachable, rate-limited), `storage_error`
   (persistence failures) or `other`. Recorded once per terminal member
-  enforcement (slash `MemberRuntime` and website `InternalMemberExecutor`)
-  and once per terminal channel enforcement (slash
+  enforcement (slash `MemberRuntime` and website `InternalMemberExecutor`),
+  including definitive preflight refusals (unknown roles, non-member target);
+  actor cooldowns and indeterminate preflight failures are not outcomes.
+  Recorded once per terminal channel enforcement (slash
   `ChannelModerationRuntime` and website `InternalChannelExecutor`); retries
-  and rate-limit backoffs are not outcomes. No user id, reason text or
+  and rate-limit backoffs are not outcomes. Channel enforcement records
+  uncertain outcomes as `other`. A purge timeout that proves no deletion
+  was sent is recorded as `refused`. No user id, reason text or
   free-form detail ever becomes a label.
 - `two_bot_community_facts_drain_failures_total{reason}` — `reason` is `error`,
   `timeout` or `other`. Recorded once per failed community-facts drain in

@@ -142,9 +142,10 @@ body, broadcaster, subscription or secret data reaches any label.
 
 ## Moderation enforcement series
 
-Counters emitted by the moderation enforcement render. Unknown verbs and
-outcomes collapse to `other`, and no member ID, reason text or message
-content reaches any label. Verbs are the bounded `ModerationAction`
+Counters emitted by the moderation enforcement render. Unknown outcomes
+collapse to `other` (unknown verbs collapse to the trailing verb slot,
+`unlock`, until the verb allowlist grows), and no member ID, reason text
+or message content reaches any label. Verbs are the bounded `ModerationAction`
 command vocabulary (`ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`,
 `slowmode`, `lockdown`, `unlock`); outcomes are `success`, `refused`,
 `discord_error`, `storage_error` and `other`. Each terminal member or
