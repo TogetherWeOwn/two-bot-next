@@ -106,6 +106,8 @@ export const REST_5XX_MIN_REQUESTS = 10;
  * classes. See docs/runbook.md#alert-rest-5xx.
  */
 export const PROMOTION_ERROR_GATE_RULES: readonly string[] = ["rest_5xx_rate"];
+/** Engaged audit halt for three valid keepalive samples (~2 min from first to third). */
+export const AUDIT_HALT_SAMPLES = 3;
 /** Pool at max with zero idle for this many consecutive samples. */
 export const POOL_SATURATED_SAMPLES = 3;
 /** DB errors must reach this many between two samples... */
@@ -173,6 +175,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_join_fast_burn", summary: `creator-join error budget burning faster than ${JOIN_FAST_BURN}x over 1 h and 5 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-fast-burn" },
   { id: "voice_join_slow_burn", summary: `creator-join error budget burning faster than ${JOIN_SLOW_BURN}x over 6 h and 30 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-slow-burn", severity: "ticket" },
   { id: "voice_creator_map_stale", summary: `voice creator map has not merged for more than ${CREATOR_MAP_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-voice-creator-map-stale" },
+  { id: "audit_delivery_halt", summary: `audit delivery halt engaged for ${AUDIT_HALT_SAMPLES} consecutive valid samples`, runbook: "runbook.md#alert-audit-delivery-halt", severity: "ticket" },
 ];
 
 /**
@@ -227,6 +230,8 @@ export interface MetricsAlertState {
   rest5xx?: number;
   restTotal: number;
   poolStreak: number;
+  /** Consecutive valid engaged halt samples; absent in older DO storage. */
+  auditHaltStreak?: number;
   dbErrors: number;
   sendBlocked: number;
   sendBlockedStreak: number;
@@ -282,6 +287,11 @@ export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {},
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
   return { ...state, dispatchDrops: {}, dispatchDropStreaks: {} };
+}
+
+/** A failed scrape breaks the engaged run, but cannot prove a halt cleared. */
+export function interruptAuditHalt(state: MetricsAlertState): MetricsAlertState {
+  return { ...state, auditHaltStreak: 0 };
 }
 
 export function parseExposition(text: string): Sample[] {
@@ -542,6 +552,30 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     }
   }
 
+  // An unreadable sweep retains the old gauge, not an absent sample. Its
+  // supervisor failure count is therefore a veto on both firing and recovery.
+  // Conservatively hold on other failed audit sweeps too, until one succeeds.
+  // Standalone evaluator callers may supply just the halt; real scrapes require
+  // the complete job-failure family in parseAlertScrape.
+  const haltRows = gauge("two_bot_audit_delivery_halt");
+  const halt = haltRows.length === 1 ? exactSeries(haltRows, {}) : undefined;
+  const jobFailures = gauge("two_bot_job_consecutive_failures");
+  const auditHealthy = jobFailures.length === 0
+    || exactSeries(jobFailures, { job: "audit_retry" }) === 0;
+  // The gauge defaults to 0 at process boot. Unlike an observed 1, a zero
+  // cannot prove a read happened: require a successful sweep before recovery.
+  const auditSuccessRows = gauge("two_bot_job_last_success_timestamp_seconds").filter((s) => s.labels["job"] === "audit_retry");
+  const auditSuccess = exactSeries(auditSuccessRows, { job: "audit_retry" });
+  const recoveryConfirmed = auditSuccessRows.length === 0 || (auditSuccess !== undefined && auditSuccess > 0);
+  const validHalt = auditHealthy && (halt === 1 || (halt === 0 && recoveryConfirmed));
+  const auditHaltStreak = validHalt && halt === 1
+    ? Math.min((prev.auditHaltStreak ?? 0) + 1, AUDIT_HALT_SAMPLES) : 0;
+  const haltWasFiring = prev.firing.includes("audit_delivery_halt");
+  if ((!validHalt && haltWasFiring) || (validHalt && halt === 1
+    && (haltWasFiring || auditHaltStreak >= AUDIT_HALT_SAMPLES))) {
+    firing.push("audit_delivery_halt");
+  }
+
   let rest429 = 0;
   let rest5xx = 0;
   let restTotal = 0;
@@ -786,7 +820,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring } };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, auditHaltStreak, joinBurn: joinBurn.ring } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

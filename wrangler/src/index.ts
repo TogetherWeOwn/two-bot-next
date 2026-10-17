@@ -103,6 +103,7 @@ import {
   alertContextSuffix,
   evaluateMetrics,
   interruptDispatchDrops,
+  interruptAuditHalt,
   transitionMessages,
   type AlertContext,
   type MetricsAlertState,
@@ -1385,7 +1386,7 @@ export class TwoBotContainer extends Container<Env> {
         // A failed scrape is not recovery, nor part of a consecutive growth
         // window. Preserve all firing keys and other rules' existing state.
         console.warn("two-bot metrics scrape failed");
-        await this.ctx.storage.put(METRICS_ALERT_KEY, interruptDispatchDrops(previous));
+        await this.ctx.storage.put(METRICS_ALERT_KEY, interruptAuditHalt(interruptDispatchDrops(previous)));
         return;
       }
       const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000);
