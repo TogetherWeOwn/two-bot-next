@@ -438,7 +438,7 @@ class StaticGuardTests(unittest.TestCase):
 
 class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
-              ref="refs/heads/main", auto="", **responses):
+              ref="refs/heads/main", auto="", resolved_sha=None, **responses):
         if image is None:
             image = IMAGE if rollback else ""
         api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
@@ -460,6 +460,11 @@ class GuardBehaviourTests(unittest.TestCase):
             calls.append((path, query))
             if is_short and path == f"repos/{REPO}/commits/{resolved}":
                 # Short-SHA resolution via the commits API (builder contract).
+                if resolved_sha is not None:
+                    # A branch or tag named with a hex string resolves to a
+                    # commit the operator did not type: return the injected
+                    # SHA so the prefix-match check is exercised.
+                    return json.dumps({"sha": resolved_sha})
                 if is_unambiguous:
                     return json.dumps({"sha": SHA})
                 raise failed_call()
@@ -670,6 +675,27 @@ class GuardBehaviourTests(unittest.TestCase):
         # Only the resolution attempt; no compare/CI/staging gates on ambiguity.
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], f"repos/{REPO}/commits/{AMBIGUOUS_PREFIX}")
+
+    def test_short_sha_resolving_to_a_different_commit_is_refused(self):
+        # The commits endpoint resolves any ref, including a branch or tag
+        # named with a hex string: given a typed prefix whose resolution
+        # returns a full SHA that does not start with it, when the guard
+        # parses it, then it refuses with the exact accepted format and runs
+        # no downstream gate on the foreign commit. Mutant: deleting
+        # `not full.startswith(short)` from the guard fails this test.
+        foreign = "f" * 40
+        self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", foreign))
+        self.assertFalse(foreign.startswith(SHORT_UNAMBIGUOUS))
+        result = self.guard(sha=SHORT_UNAMBIGUOUS, resolved_sha=foreign)
+        self.assertRefused(result, "40-character hex")
+        self.assertRefused(result, ACCEPTED_FORMAT)
+        code, outputs, _, calls, _ = result
+        self.assertEqual(code, 1)
+        self.assertEqual(outputs, {})
+        # Only the resolution attempt; no compare/CI/staging gates on the
+        # foreign commit.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], f"repos/{REPO}/commits/{SHORT_UNAMBIGUOUS}")
 
     def test_rollback_needs_a_version_uuid(self):
         for bad in ("1234", "latest", "../v", f"{VERSION} --force", VERSION[:-1]):
