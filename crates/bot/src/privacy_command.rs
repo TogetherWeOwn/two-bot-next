@@ -13,6 +13,11 @@
 //! caller-supplied ID ever reaches the service. The audit actor is the fixed
 //! `member:self-serve` label — never a subject ID, count, content or secret
 //! (the scope columns already name the pair, like every other receipt).
+//!
+//! Repeat taps never retake the purge's write-blocking locks: an
+//! already-suppressed pair gets the already-opted-out reply, and a pair with
+//! a purge receipt younger than the cooldown gets the cooldown reply. Either
+//! early return writes no new receipt; only a fresh purge locks and deletes.
 
 use sqlx::{Pool, Postgres};
 use twilight_model::application::interaction::{
@@ -20,7 +25,7 @@ use twilight_model::application::interaction::{
 };
 use two_bot_cutover::{
     db::CutoverDb,
-    privacy::{analytics_settings, is_opted_out, opt_back_in, opt_out_member},
+    privacy::{analytics_settings, has_recent_opt_out, is_opted_out, opt_back_in, opt_out_member},
 };
 use two_bot_discord::ActionExecutor;
 
@@ -40,6 +45,20 @@ const GUILD_ONLY_REPLY: &str = "This command only works in a server.";
 const UNKNOWN_MEMBER_REPLY: &str = "Could not identify you for this server; try again.";
 
 const USAGE_REPLY: &str = "Use `/privacy opt-out`, `/privacy opt-in` or `/privacy status`.";
+
+/// Purge cooldown for member self-serve: a pair with a purge receipt younger
+/// than this window gets the cooldown reply instead of a fresh locking
+/// purge, so alternating opt-in/opt-out cannot loop the write-blocking
+/// locks. Assisted operator calls go through the service directly and are
+/// unaffected.
+const OPT_OUT_COOLDOWN_MINUTES: i32 = 10;
+
+const ALREADY_OPTED_OUT_REPLY: &str = "You are already opted out of analytics for this server. \
+     Your stored activity here was deleted and future activity will not be stored. \
+     Use `/privacy opt-in` to resume.";
+
+const OPT_OUT_COOLDOWN_REPLY: &str = "You recently changed your privacy setting; \
+     try `/privacy opt-out` again in a few minutes.";
 
 /// The `/privacy` subcommand the interaction invoked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,21 +140,57 @@ pub(crate) async fn privacy_command(
     let db = CutoverDb::from_pool(pool.clone());
     match privacy_action(interaction) {
         PrivacyAction::OptOut => {
-            match opt_out_member(&db, &guild_id, &member, MEMBER_SELF_SERVE_ACTOR).await {
-                Ok(_) => {
-                    finish(
-                        executor,
-                        interaction,
-                        "You are opted out of analytics for this server. \
+            // Cheap read-only guards first: either early return skips the
+            // locking purge (and its receipt) entirely, so repeat taps and
+            // rapid opt-in/opt-out loops cannot hold or queue the
+            // SHARE ROW EXCLUSIVE locks on every invocation.
+            match is_opted_out(&db, &guild_id, &member).await {
+                Err(err) => {
+                    tracing::warn!(reason = db_class(&err), "privacy opt-out guard failed");
+                    finish(executor, interaction, STORE_FAILURE_REPLY).await;
+                }
+                Ok(true) => {
+                    finish(executor, interaction, ALREADY_OPTED_OUT_REPLY).await;
+                }
+                Ok(false) => {
+                    match has_recent_opt_out(&db, &guild_id, &member, OPT_OUT_COOLDOWN_MINUTES)
+                        .await
+                    {
+                        Err(err) => {
+                            tracing::warn!(
+                                reason = db_class(&err),
+                                "privacy opt-out cooldown check failed"
+                            );
+                            finish(executor, interaction, STORE_FAILURE_REPLY).await;
+                        }
+                        Ok(true) => {
+                            finish(executor, interaction, OPT_OUT_COOLDOWN_REPLY).await;
+                        }
+                        Ok(false) => {
+                            match opt_out_member(&db, &guild_id, &member, MEMBER_SELF_SERVE_ACTOR)
+                                .await
+                            {
+                                Ok(_) => {
+                                    finish(
+                                        executor,
+                                        interaction,
+                                        "You are opted out of analytics for this server. \
                      Your stored activity here was deleted and future activity will not be stored. \
                      Moderation, safety and delivery records are unchanged. \
                      Use `/privacy opt-in` to resume.",
-                    )
-                    .await;
-                }
-                Err(err) => {
-                    tracing::warn!(reason = db_class(&err), "privacy opt-out failed");
-                    finish(executor, interaction, STORE_FAILURE_REPLY).await;
+                                    )
+                                    .await;
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        reason = db_class(&err),
+                                        "privacy opt-out failed"
+                                    );
+                                    finish(executor, interaction, STORE_FAILURE_REPLY).await;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

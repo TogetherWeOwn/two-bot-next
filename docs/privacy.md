@@ -169,6 +169,12 @@ disposable/staging binding first per the rollout gates. Either actor label
 carries attribution only: never put a member ID, content, count or secret
 in it.
 
+Repeat `/privacy opt-out` taps take no purge lock: an already-suppressed
+pair gets the already-opted-out reply, and a pair with a purge receipt
+younger than 10 minutes gets a cooldown reply. Either early return writes
+no new receipt; only a fresh purge locks, deletes and receipts. Assisted
+operator calls go through the service directly and are unaffected.
+
 **Policy note (verified 2026-10-12):** the live Discord Developer Policy
 now lives on Discord's developer support help center (the old
 `discord.com/developers/docs/...` URL redirects there). A direct fetch
