@@ -160,11 +160,14 @@ already-purged rows. Afterwards the pair persists exactly as before, and
 the re-enable itself writes no purge receipt (the receipt table records
 purges, one row per purge).
 
-Until the member self-serve slash command lands, an opt-out is executed by
-a server operator through the reviewed `opt_out_member` service with an
-explicit operator actor label, against a disposable/staging binding first
-per the rollout gates. The actor label carries operator attribution only:
-never put a member ID, content, count or secret in it.
+Members run this themselves with `/privacy opt-out` (`opt-in` to resume,
+`status` to check). The command acts only on the invoker in the invoking
+guild and writes the receipt with the fixed `member:self-serve` actor label.
+A server operator can still execute an assisted opt-out through the reviewed
+`opt_out_member` service with an explicit operator actor label, against a
+disposable/staging binding first per the rollout gates. Either actor label
+carries attribution only: never put a member ID, content, count or secret
+in it.
 
 **Policy note (verified 2026-10-12):** the live Discord Developer Policy
 now lives on Discord's developer support help center (the old

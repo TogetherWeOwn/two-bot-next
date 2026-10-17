@@ -172,6 +172,25 @@ pub async fn opt_back_in(db: &CutoverDb, guild: &str, member: &str) -> Result<bo
     Ok(removed == 1)
 }
 
+/// Whether the member currently suppresses analytics persistence for the
+/// guild (a `privacy_opt_outs` row exists for the pair). Read-only: the
+/// `/privacy status` self-serve reply uses this, never the raw table.
+pub async fn is_opted_out(db: &CutoverDb, guild: &str, member: &str) -> Result<bool, sqlx::Error> {
+    if !valid_identity(guild, member) {
+        return Err(sqlx::Error::InvalidArgument(
+            "invalid opt-out identity".into(),
+        ));
+    }
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
+    )
+    .bind(guild)
+    .bind(member)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(exists)
+}
+
 /// The guild's analytics switches as `(presence, activity, voice)`. A guild
 /// with no settings row has every category enabled: defaults match the
 /// behavior from before the toggles existed.
