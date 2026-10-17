@@ -28,6 +28,7 @@ CLI_MODULES = {
     "crates/bot/src/restore_drill.rs",
     "crates/discord/examples/pipeline_bench.rs",
     "crates/cutover/src/bin/audit_switch.rs",
+    "crates/cutover/src/bin/game_activity_report.rs",
     "crates/cutover/src/bin/gate_stuck_report.rs",
     "crates/cutover/src/bin/gateway_force_identify.rs",
     "crates/cutover/src/bin/ghost_cleanup.rs",
