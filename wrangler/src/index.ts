@@ -1408,7 +1408,7 @@ export class TwoBotContainer extends Container<Env> {
       // guard record restarts the guard rather than blocking alerts.
       try {
         const stored = await this.ctx.storage.get<RemediationState>(REMEDIATION_KEY);
-        const nowSeconds = Date.now() / 1000;
+        const nowSeconds = Math.floor(Date.now() / 1000);
         const remediation = evaluateRemediation(firing, sanitizeRemediationState(stored, nowSeconds), nowSeconds);
         await this.ctx.storage.put(REMEDIATION_KEY, remediation.state);
         for (const message of remediation.messages) {

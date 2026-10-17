@@ -321,3 +321,39 @@ test("a valid guard record passes sanitizing untouched", () => {
   assert.deepEqual(sanitizeRemediationState(state, NOW), state);
   assert.deepEqual(sanitizeRemediationState(EMPTY_REMEDIATION_STATE, NOW), EMPTY_REMEDIATION_STATE);
 });
+
+test("a fractional production clock survives the storage round-trip and still reaches the CEO page", () => {
+  // Production passes `Date.now() / 1000` (fractional). The guard must floor
+  // on write so the next tick's sanitize keeps the cooldown and failure count.
+  const t0 = NOW + 0.13;
+  const first = evaluateRemediation(STALE, EMPTY_REMEDIATION_STATE, t0);
+  assert.equal(first.messages[0]!.action, "creator-map-reload");
+  assert.ok(Number.isSafeInteger(first.state.lastRecommendedAtSeconds));
+  let state = sanitizeRemediationState(structuredClone(first.state), t0);
+  assert.deepEqual(state, first.state);
+
+  const t1 = t0 + REMEDIATION_COOLDOWN_SECONDS + 0.42;
+  const second = evaluateRemediation(STALE, state, t1);
+  assert.equal(second.messages[0]!.action, "same-sha-takeover");
+  assert.equal(second.state.scopes["voice-stall"].consecutiveFailures, 1);
+  state = sanitizeRemediationState(structuredClone(second.state), t1);
+  assert.deepEqual(state, second.state);
+
+  // Takeover restarts the process: the next tick goes quiet even though the
+  // fault survives. The hold-down timestamp must be an integer so sanitize
+  // on the following tick does not wipe the guard.
+  const quietAt = t1 + 60.77;
+  const quiet = evaluateRemediation([], state, quietAt);
+  assert.deepEqual(quiet.messages, []);
+  assert.equal(quiet.state.scopes["voice-stall"].consecutiveFailures, 1);
+  assert.ok(Number.isSafeInteger(quiet.state.scopes["voice-stall"].clearSinceSeconds));
+  const survived = sanitizeRemediationState(structuredClone(quiet.state), quietAt + 60.11);
+  assert.deepEqual(survived, quiet.state);
+  assert.notEqual(survived.lastRecommendedAtSeconds, 0);
+
+  // Refire inside the hold-down keeps the failure count and reaches the stop.
+  const refire = evaluateRemediation(STALE, survived, t0 + 2 * REMEDIATION_COOLDOWN_SECONDS);
+  assert.equal(refire.messages.length, 1);
+  assert.equal(refire.messages[0]!.kind, "ceo-page");
+  assert.equal(refire.state.scopes["voice-stall"].suppressed, true);
+});

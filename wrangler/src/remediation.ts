@@ -96,6 +96,7 @@ function isScopeGuard(value: unknown): value is ScopeGuard {
 const SANITIZE_FUTURE_SKEW_TOLERANCE_SECONDS = 300;
 
 export function sanitizeRemediationState(stored: unknown, nowSeconds: number): RemediationState {
+  nowSeconds = Math.floor(nowSeconds);
   if (typeof stored !== "object" || stored === null) return EMPTY_REMEDIATION_STATE;
   const state = stored as Record<string, unknown>;
   const lastRecommendedAtSeconds = state["lastRecommendedAtSeconds"];
@@ -211,6 +212,12 @@ export function evaluateRemediation(
   prev: RemediationState,
   nowSeconds: number,
 ): RemediationEvaluation {
+  // Callers pass `Date.now() / 1000`, which is fractional (e.g. 1760001860.13).
+  // The persisted guard requires integer seconds, so normalize once here: a
+  // fractional `clearSinceSeconds` would fail `isScopeGuard` on the next tick
+  // and wipe the cooldown plus the failure count. Flooring keeps the 30-minute
+  // hold-down and the two-failure stop reachable on a production clock.
+  nowSeconds = Math.floor(nowSeconds);
   const messages: RemediationMessage[] = [];
   const scopes: Record<RemediationScope, ScopeGuard> = {
     "voice-stall": { ...prev.scopes["voice-stall"] },
