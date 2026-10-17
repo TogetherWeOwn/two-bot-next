@@ -638,8 +638,12 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
                         "provenance_mismatch", "member=image")
             # A complete snapshot carries the serving build's SHA: it
             # becomes the stable gate's expected revision, and an explicit
-            # --expected-sha must agree with it. A pre-stamp snapshot has
-            # no SHA member and keeps the legacy header-only identity.
+            # --expected-sha must agree with it. The receipt is then bound
+            # to live Cloudflare state exactly like a manual rollback's, so
+            # a stale or hand-edited snapshot refuses before any POST
+            # instead of at the stable gate after traffic moved. A
+            # pre-stamp snapshot has no SHA member and keeps the legacy
+            # header-only identity.
             recorded_sha = snap_state.get("serving_sha")
             if recorded_sha is not None:
                 require(isinstance(recorded_sha, str) and SHA.fullmatch(recorded_sha),
@@ -649,6 +653,7 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
                 if expected_sha is not None:
                     receipt.validate(version=restore_version, sha=expected_sha,
                                      image=restore_image)
+                validate_receipt_against_live(client, receipt)
                 expected_sha = receipt.sha
         else:
             # A manual rollback is admitted only as a complete receipt:

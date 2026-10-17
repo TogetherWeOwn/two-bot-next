@@ -704,6 +704,18 @@ class MainProvenanceTests(unittest.TestCase):
                                              self.snapshot_routes(),
                                              "invalid_snapshot_sha")
 
+    def test_snapshot_rollback_revalidates_the_receipt_against_live_state(self):
+        # A stale or hand-edited snapshot whose recorded SHA is not the
+        # version's stamped deploy SHA refuses before any POST, exactly
+        # like a manual rollback: never at the stable gate after restore.
+        routes = self.snapshot_routes()
+        routes[("GET", f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}")] = \
+            version_route(message="f" * 40)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_snapshot(tmp)
+            self.assert_refused_before_posts(self.snapshot_argv(path), routes,
+                                             "provenance_mismatch")
+
 
 class PostStatusTests(unittest.TestCase):
     """A created rollout (201) is success; the 10-16 staging auto-rollback
