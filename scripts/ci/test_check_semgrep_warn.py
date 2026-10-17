@@ -110,6 +110,40 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertEqual(findings, {("rust-empty-expect", "crates/bot/src/logging.rs", 12)})
 
+    def test_macro_empty_expect_keys_to_end_line(self):
+        report = {"results": [{
+            "check_id": "rust-warn.rust-empty-expect-in-macros",
+            "path": "crates/bot/src/logging.rs",
+            "start": {"line": 10}, "end": {"line": 12},
+        }]}
+        findings, error = self.run_report(report)
+        self.assertEqual(error, "")
+        self.assertEqual(
+            findings, {("rust-empty-expect-in-macros", "crates/bot/src/logging.rs", 12)})
+
+    def test_macro_empty_expect_end_line_before_start_is_blindness(self):
+        report = {"results": [{
+            "check_id": "rust-warn.rust-empty-expect-in-macros", "path": "a.rs",
+            "start": {"line": 2}, "end": {"line": 1},
+        }]}
+        findings, error = self.run_report(report)
+        self.assertIsNone(findings)
+        self.assertIn("invalid result location", error)
+
+    def test_macro_duplicate_of_base_collapses_to_base(self):
+        report = {"results": [
+            {"check_id": "rust-warn.rust-empty-expect",
+             "path": "crates/bot/src/logging.rs",
+             "start": {"line": 10}, "end": {"line": 12}},
+            {"check_id": "rust-warn.rust-empty-expect-in-macros",
+             "path": "crates/bot/src/logging.rs",
+             "start": {"line": 10}, "end": {"line": 12}},
+        ]}
+        findings, error = self.run_report(report)
+        self.assertEqual(error, "")
+        self.assertEqual(
+            findings, {("rust-empty-expect", "crates/bot/src/logging.rs", 12)})
+
     def test_findings_keep_rule_path_and_line(self):
         tmp, binary = fake_semgrep(json.dumps(REPORT))
         try:
@@ -448,6 +482,7 @@ class GateTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     EXPECTED_RULES = {"rust-todo-unimplemented", "rust-empty-expect",
+                      "rust-empty-expect-in-macros",
                       "rust-panic-in-prod", "rust-process-exit-in-lib"}
 
     def test_rule_set_is_pinned_and_local(self):
