@@ -4,8 +4,9 @@
 moved the port read inside fixed-message refusals and removed an
 interpolated unknown query key. Nothing stops the next error path from
 echoing rejected input again, so
-`ast-grep-rules/refusal-fixed-vocabulary.yml` flags interpolation and
-`str()`/`format()`/`%` rendering of rejected input inside `Refused`,
+`ast-grep-rules/refusal-fixed-vocabulary.yml` flags interpolation,
+`str()`/`repr()`/`ascii()`/`.join()`/`format()`/`%` rendering,
+`+` concatenation and bare-variable messages inside `Refused`,
 `ReadFailed` and `require` refusal constructors in the three covered
 files, with an allowlist for the fixed-vocabulary sites. `sgconfig.yml`
 already runs every rule in `ast-grep-rules/` against every fixture in
@@ -19,13 +20,17 @@ and pins the three companions the exemptions rest on (`guild_fence`
 literals, the allowlisted-key ordering, `classify_failure` purity).
 
 It is a name-based tripwire, not a proof: it matches the names a
-refusal reaches for, not every way to render rejected input. Known gaps,
-documented rather than gated: `raise Refused(message)` funnels a
-`require` message variable (the `require` call sites themselves are
-covered); control flow the rule cannot see (for example a `parsed.port`
-read moved back outside its `try`); and a mixed line carrying both an
-allowlisted marker and a new interpolation stays exempt until the exact
-allowlist below changes, which fails this suite on purpose.
+refusal reaches for, not every way to render rejected input. Every
+`Refused`/`ReadFailed`/`require` constructor call is collected, not just
+`raise` statements, so `error = Refused(f"...{host}..."); raise error`
+trips at the construction site. Known gaps, documented rather than
+gated: `raise Refused(message)` funnels a pre-built variable (the
+`require` helper relay itself is an explicit allowlist entry; the
+`require` call sites are covered); control flow the rule cannot see
+(for example a `parsed.port` read moved back outside its `try`); and a
+mixed line carrying both an allowlisted marker and a new interpolation
+stays exempt until the exact allowlist below changes, which fails this
+suite on purpose.
 """
 
 import ast
@@ -53,7 +58,10 @@ RULE_ID = "refusal-fixed-vocabulary"
 
 # Pinned literals: the YAML must carry exactly these patterns. A deliberate
 # rule change updates both sides in one reviewed diff.
-EXPECTED_BROAD = r"(\{|\.format\s*\(|%\s*\w|str\s*\()"
+EXPECTED_BROAD = (
+    r"(\{|\.format\s*\(|%\s*\w|str\s*\(|repr\s*\(|ascii\s*\(|\.join\s*\(|\+"
+    r"|Refused\(\s*[a-z_]|ReadFailed\(\s*[a-z_])"
+)
 EXPECTED_PATTERNS = (
     "Refused($MSG)",
     "ReadFailed($MSG)",
@@ -67,6 +75,7 @@ EXPECTED_NOTS = (
     r"has a bad \{key\}",
     r"plan refused the gate",
     r"Refused\(str\(error\)\)",
+    r"Refused\(\s*message\s*\)",
 )
 
 
@@ -86,23 +95,25 @@ def func_id(func):
 
 
 def refusal_statements(path):
-    """(lineno, source segment) for every in-scope refusal constructor call."""
+    """(lineno, source segment) for every in-scope refusal constructor call.
+
+    Every `Refused`/`ReadFailed`/`require` call is collected wherever it
+    sits (`raise`, assignment, `return`), matching the ast-grep rule's
+    scope: the rule flags the constructor call itself, so an assignment
+    like `error = Refused(f"...{host}...")` trips here even though the
+    later `raise error` carries no message.
+    """
     text = path.read_text()
     tree = ast.parse(text)
     found = []
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Raise)
-            and isinstance(node.exc, ast.Call)
-            and func_id(node.exc.func) in ("Refused", "ReadFailed")
+        if isinstance(node, ast.Call) and func_id(node.func) in (
+            "Refused",
+            "ReadFailed",
         ):
             found.append((node.lineno, ast.get_source_segment(text, node)))
-        elif (
-            isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Call)
-            and func_id(node.value.func) == "require"
-        ):
-            assert len(node.value.args) == 2, (
+        elif isinstance(node, ast.Call) and func_id(node.func) == "require":
+            assert len(node.args) == 2, (
                 f"{path}:{node.lineno}: require takes two arguments; "
                 "the ast-grep pattern require($COND, $MSG) would miss this shape"
             )
@@ -150,41 +161,45 @@ EXPECTED_EXEMPTED = {
             'pin and "prod" not in lowered and "@" not in pin and "/" not in pin,\n'
             'f"{label} is empty, production-like or not a bare name",\n'
             ")",
-            "raise Refused(\n"
+            "Refused(\n"
             'f"staging-migrate plan refused the gate (exit {proc.returncode}): "\n'
             'f"{proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() '
             'else \'no detail\'}"\n'
             ")",
+            # The require(condition, message) helper relay.
+            "Refused(message)",
         ]
     ),
     "scripts/ci/production_schema_gate.py": sorted(
         [
             "require(pin and \"@\" not in pin and \"/\" not in pin,\n"
             'f"{label} is empty or not a bare name")',
-            "raise Refused(\n"
+            "Refused(\n"
             'f"production-migrate plan refused the gate (exit {proc.returncode}): "\n'
             'f"{proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() '
             'else \'no detail\'}"\n'
             ")",
+            # The require(condition, message) helper relay.
+            "Refused(message)",
         ]
     ),
     "scripts/staging_events_read.py": sorted(
         [
-            "raise ReadFailed(f\"{classify_failure(done.stderr)} "
+            "ReadFailed(f\"{classify_failure(done.stderr)} "
             "(psql exit {done.returncode})\")",
-            "raise Refused(f\"refusing: ${MEMBER_ENV} must be 15-22 digits\")",
-            "raise Refused(f\"refusing: no valid staging host pin bound (${HOST_ENV})\")",
-            "raise Refused(f\"refusing: no database login bound (${URL_ENV})\")",
-            "raise Refused(f\"refusing: no fixture member bound (${MEMBER_ENV})\")",
-            "raise Refused(f\"refusing: the database login has a bad {key}\")",
-            "raise Refused(f\"refusing: the database must be {DB_NAME}\")",
-            "raise Refused(f\"refusing: the login must be role {DB_ROLE}\")",
-            "raise Refused(f\"refusing: the server does not report role {DB_ROLE} "
+            "Refused(f\"refusing: ${MEMBER_ENV} must be 15-22 digits\")",
+            "Refused(f\"refusing: no valid staging host pin bound (${HOST_ENV})\")",
+            "Refused(f\"refusing: no database login bound (${URL_ENV})\")",
+            "Refused(f\"refusing: no fixture member bound (${MEMBER_ENV})\")",
+            "Refused(f\"refusing: the database login has a bad {key}\")",
+            "Refused(f\"refusing: the database must be {DB_NAME}\")",
+            "Refused(f\"refusing: the login must be role {DB_ROLE}\")",
+            "Refused(f\"refusing: the server does not report role {DB_ROLE} "
             'on database {DB_NAME}")',
-            "raise Refused(f\"refusing: {label} is not a real UTC instant\")",
-            "raise Refused(f\"refusing: {label} must be a UTC instant like "
+            "Refused(f\"refusing: {label} is not a real UTC instant\")",
+            "Refused(f\"refusing: {label} must be a UTC instant like "
             '2026-10-07T14:00:00Z")',
-            "raise Refused(str(error))",
+            "Refused(str(error))",
         ]
     ),
 }
@@ -308,14 +323,21 @@ class MutantTests(unittest.TestCase):
         'raise Refused("bad key %s" % key)',
         'raise Refused(f"was: {error}")',
         'raise Refused(str(output))',
+        'raise Refused(repr(output))',
         'raise ReadFailed(f"row bytes: {output}")',
         'require(port is None, f"pooled ports are refused: {port}")',
+        'raise Refused("refusing: the database login may not set " + key)',
+        'raise Refused("refusing: the database login may not set " + repr(key))',
+        'raise Refused(key)',
+        'raise ReadFailed(output)',
     ]
     FIXED = [
         'raise Refused("refusing: the database login may not set that query parameter")',
         'raise ReadFailed("psql timed out")',
-        "raise Refused(DatabaseError.InvalidPort)",
-        "raise ReadFailed(ReadFailure.Timeout)",
+        "Refused(DatabaseError.InvalidPort)",
+        "ReadFailed(ReadFailure.Timeout)",
+        "Refused(DB_ROLE)",
+        "Refused(message)",
         'raise Refused(f"refusing: the database login has a bad {key}")',
         'raise Refused(f"refusing: the login must be role {DB_ROLE}")',
         'raise ReadFailed(f"{classify_failure(done.stderr)} (psql exit {done.returncode})")',
@@ -363,6 +385,34 @@ class MutantTests(unittest.TestCase):
             self.assertIn("may not set {key}", statement)
             self.assertGreaterEqual(lineno, 215)
             self.assertLessEqual(lineno, 230)
+
+    def test_scratch_assignment_mutant_trips_at_construction(self):
+        """`error = Refused(f"...{host}..."); raise error` must trip.
+
+        The constructor call is collected wherever it sits, so building
+        the interpolated refusal into a variable trips at the
+        construction site even though `raise error` carries no message.
+        """
+        with tempfile.TemporaryDirectory() as scratch:
+            mutant = Path(scratch) / "staging_events_read.py"
+            shutil.copy(ROOT / "scripts/staging_events_read.py", mutant)
+            text = mutant.read_text()
+            probe = (
+                "\n\ndef _mutant_probe(host):\n"
+                '    error = Refused(f"refusing: the database host {host} '
+                'must be a bare name")\n'
+                "    raise error\n"
+            )
+            self.assertNotIn("def _mutant_probe", text)
+            mutant.write_text(text + probe)
+            flagged = []
+            broad, exempt_list = broad_and_exempts()
+            for lineno, segment in refusal_statements(mutant):
+                if classify(segment, broad, exempt_list) == "flagged":
+                    flagged.append((lineno, canon(segment)))
+            self.assertEqual(len(flagged), 1)
+            _, statement = flagged[0]
+            self.assertIn("{host}", statement)
 
 
 class CompanionTests(unittest.TestCase):

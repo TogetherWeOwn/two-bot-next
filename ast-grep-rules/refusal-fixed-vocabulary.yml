@@ -1,7 +1,7 @@
 id: refusal-fixed-vocabulary
 language: python
 severity: error
-message: 'Refusal messages must stay fixed vocabulary: do not interpolate rejected keys, ports, URLs, values or response bytes into Refused/ReadFailed/require. Allowlisted fixed sites: ALL_CAPS constants, {label} call-site labels, the classify_failure sanitizer, type(...).__name__, "has a bad {key}" (allowlisted key names only), "plan refused the gate" (reviewed plan-binary exit relay), and the guild-fence SmokeError relay.'
+message: 'Refusal messages must stay fixed vocabulary: do not interpolate rejected keys, ports, URLs, values or response bytes into Refused/ReadFailed/require. Allowlisted fixed sites: ALL_CAPS constants, {label} call-site labels, the classify_failure sanitizer, type(...).__name__, "has a bad {key}" (allowlisted key names only), "plan refused the gate" (reviewed plan-binary exit relay), the require message relay, and the guild-fence SmokeError relay.'
 files:
   - scripts/ci/staging_schema_gate.py
   - scripts/ci/production_schema_gate.py
@@ -12,7 +12,7 @@ rule:
         - pattern: Refused($MSG)
         - pattern: ReadFailed($MSG)
         - pattern: require($COND, $MSG)
-    - regex: '(\{|\.format\s*\(|%\s*\w|str\s*\()'
+    - regex: '(\{|\.format\s*\(|%\s*\w|str\s*\(|repr\s*\(|ascii\s*\(|\.join\s*\(|\+|Refused\(\s*[a-z_]|ReadFailed\(\s*[a-z_])'
   not:
     any:
       # Module constants (MEMBER_ENV, DB_ROLE, ...): fixed vocabulary by construction.
@@ -29,3 +29,6 @@ rule:
       - regex: 'plan refused the gate'
       # guild_fence raises fixed-vocabulary SmokeError literals only (pinned by test).
       - regex: 'Refused\(str\(error\)\)'
+      # The require(condition, message) helper relays its message argument;
+      # the call sites are covered above, so the bare relay stays exempt.
+      - regex: 'Refused\(\s*message\s*\)'
