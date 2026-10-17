@@ -343,18 +343,22 @@ as dynamic labels.
   `voice_event="voice_creator_orphan"`. No channel, member, token, body or
   ID leaves the process in any label or field.
 - Worker log fields (Workers Logs only, never a metric):
-  `event="container_gateway_failure"` with `phase`/`class`/`release`/`worker_version`,
-  emitted by the Container DO keepalive in `wrangler/src/index.ts` once per
-  tick while the gateway task is failing. `phase` is `durable_gateway`; `class` is one of
+  `event="container_gateway_failure"` with `phase`/`class`/`failed_step`/
+  `error_code`/`build_revision`/`release`/`worker_version`/`log_url`, emitted
+  by the Container DO keepalive in `wrangler/src/index.ts` once per tick while
+  the gateway task is failing. `phase` is `durable_gateway`; `class` is one of
   `store_unavailable`, `gateway_pool_connect_failed`, `checkpoint_load_failed`,
   `onboarding_gates_invalid`, `onboarding_init_failed`,
   `custom_commands_init_failed`, `milestones_load_failed`,
   `automod_config_invalid`, `automod_executor_failed`, `raid_executor_failed`,
   `gateway_runtime_failed` or `gateway_task_panicked` (every `FailureClass`
   variant in `crates/bot/src/gateway_failure.rs`). Only `phase` and `class`
-  use `[a-z0-9_]{1,32}` tokens; anything else is dropped. `release` is the
-  container git SHA from `/readyz` `build_revision` (stamped at deploy time,
-  `"unknown"` when unparseable, never echoed); `worker_version` is the platform
+  use `[a-z0-9_]{1,32}` tokens; anything else is dropped. `failed_step` names
+  the fallible step, `error_code` carries the SQLSTATE (`none` when no database
+  code applies). `release` is the container git SHA from `/readyz`
+  `build_revision` (stamped at deploy time, `"unknown"` when unparseable, never
+  echoed); `build_revision` carries the same SHA under its `/readyz` spelling
+  and `log_url` links the log-query docs; `worker_version` is the platform
   Worker version id. `metrics_alert` lines carry the same `release` and
   `worker_version` from that tick's probe. Group gateway failures by `class`;
   group metrics alerts by the alert rule in `content`. Error-class grouping
@@ -558,7 +562,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `job_stale:<job>` | last success older than 2 x the job cadence (never-succeeded is ignored) | [job stale](runbook.md#alert-job-stale) |
 | `job_consecutive_failures:<job>` | `two_bot_job_consecutive_failures` >= 3 | [job failures](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s > 10% of REST requests between samples, >= 10 requests | [REST 429](runbook.md#alert-rest-429) |
-| `rest_5xx_rate` | 5xx > 10% of REST requests between samples, >= 10 requests | [REST 5xx](runbook.md#alert-rest-5xx) |
+| `rest_5xx_rate` | 5xx responses > 10% of REST requests between samples, >= 10 requests | [REST 5xx](runbook.md#alert-rest-5xx) |
 | `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
 | `db_errors` | 3+ storage failures between samples (restarts skip the window) | [DB errors](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |

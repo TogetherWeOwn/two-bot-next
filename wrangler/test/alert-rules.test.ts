@@ -147,6 +147,7 @@ test("5xx rate uses the delta, baselines legacy state, and ignores resets and ti
     `two_bot_rest_requests_total{route="other",result="5xx"} 50`,
   ], legacy);
   assert.deepEqual(baseline.firing, []);
+  assert.equal(baseline.state.rest5xx, 50);
   const later = ev([
     `two_bot_rest_requests_total{route="other",result="2xx"} 1018`,
     `two_bot_rest_requests_total{route="other",result="5xx"} 62`,
@@ -156,6 +157,20 @@ test("5xx rate uses the delta, baselines legacy state, and ignores resets and ti
   // A 429 burst is not a 5xx burst: the two rates track independently.
   const other = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 180`, `two_bot_rest_requests_total{route="other",result="429"} 20`], first.state);
   assert.deepEqual(other.firing, ["rest_429_rate"]);
+});
+
+test("alert messages carry build revision, failure detail and the log-query link", () => {
+  const firing = transitionMessages([], ["rest_5xx_rate"], {}, {}, {
+    buildRevision: "abc123",
+    failedStep: "gateway_run",
+    errorCode: "42501",
+  })[0]!;
+  assert.match(firing, /Build: abc123/);
+  assert.match(firing, /Failure: gateway_run\/42501/);
+  assert.match(firing, /Logs: https:\/\/developers\.cloudflare\.com/);
+  const fallback = transitionMessages([], ["rest_5xx_rate"])[0]!;
+  assert.match(fallback, /Build: unknown/);
+  assert.doesNotMatch(fallback, /Failure:/);
 });
 
 test("promotion error gate fails a stage only on a 5xx burst", () => {
@@ -791,6 +806,13 @@ test("every rule links to an existing runbook heading", () => {
   }
 });
 
+test("runbook heading slugs are unique", () => {
+  const headings = [...readFileSync(new URL("../../docs/runbook.md", import.meta.url), "utf8").matchAll(/^#+ (.+)$/gm)];
+  const slugs = headings.map((m) =>
+    m[1]!.toLowerCase().replace(/[^a-z0-9 _-]/g, "").replace(/ /g, "-"));
+  assert.equal(new Set(slugs).size, slugs.length, "duplicate runbook heading slug");
+});
+
 test("heading anchors keep literal underscores from inline-code headings", () => {
   const slugs = headingAnchors("## Self-diagnosing gateway failures (`/readyz` `gateway_failure`)\n");
   assert.deepEqual([...slugs], ["self-diagnosing-gateway-failures-readyz-gateway_failure"]);
@@ -890,11 +912,13 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
     const packet = packets.find((p) => p.includes(`: ${rule.summary}. Runbook: `));
     assert.ok(packet, `${rule.id}: no fired packet carries its summary`);
     assert.ok(packet!.includes(runbookUrl(rule)), `${rule.id}: packet lacks full deep link ${runbookUrl(rule)}`);
-    const url = packet!.slice(packet!.indexOf("Runbook: ") + "Runbook: ".length);
+    const afterRunbook = packet!.slice(packet!.indexOf("Runbook: ") + "Runbook: ".length);
+    const url = afterRunbook.split(". Build:")[0]!;
     assert.ok(url.startsWith(RUNBOOK_BASE_URL), `${rule.id}: runbook is not a full docs URL: ${url}`);
     const anchor = url.slice(`${RUNBOOK_BASE_URL}runbook.md#`.length);
     assert.ok(slugs.has(anchor), `${rule.id}: packet URL anchor #${anchor} missing from docs/runbook.md`);
     assert.equal(ruleFor(firing.find((k) => k.startsWith(rule.id))!)?.id, rule.id);
+    assert.match(packet!, /Build: unknown\. Logs: https:\/\//, `${rule.id}: packet lacks build/log context`);
   }
 });
 

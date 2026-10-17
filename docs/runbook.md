@@ -146,10 +146,10 @@ Look for these literal messages:
 - `gateway shard loop started` / `gateway reconnect failed; Twilight will retry`.
 - `durable gateway failed; checkpoint unchanged, readiness unavailable` — fatal
   initialization failure; underlying SQL error deliberately not logged. Its
-  `error_class` is also on `/readyz` as `gateway_failure` for 15 s before exit
-  (startup failures linger 15 s; only a running-gateway failure lingers 75 s)
-  and in Workers Logs as `container_gateway_failure` (see
-  [startup-diagnostics.md](startup-diagnostics.md)).
+  `error_class` plus the failing step and SQLSTATE code are also on `/readyz`
+  as `gateway_failure` for 15 s before exit (startup failures linger 15 s;
+  only a running-gateway failure lingers 75 s) and in Workers Logs as
+  `container_gateway_failure` (see [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
 - Worker: `two-bot container started|stopped`, `two-bot /readyz unhealthy`,
   `two-bot keepalive probe failed`, `two-bot container error`.
@@ -599,14 +599,16 @@ First response: if the failing process is still up (within the linger), read
 the `stage` label on `two_bot_gateway_checkpoint_failures_total` via the
 authorized `/ops/metrics` scrape — `pre_commit` means the commit was skipped
 after a funnel, leveling or acknowledgement failure, while `commit` means the
-durable store write itself failed. Once the process has restarted, the stage
-is not recoverable: the counter resets to zero and the Worker log line
-(`{"event":"container_gateway_failure","phase":…,"class":…,"release":…,"worker_version":…}`)
-carries `phase` and `class` plus the `release`/`worker_version` tags — both
-stages map to `gateway_runtime_failed` — never the `stage`. Do not wait for the stage then; check the `gateway` component on
-`/readyz` and the Neon status for the staging branch instead: a `commit`
-failure next to DB-error or pool alerts points at the database, not the
-gateway. Do not restart manually: the process exits on its own after
+durable store write itself failed. The Worker log line
+(`container_gateway_failure`) and `/readyz` `gateway_failure` carry the phase,
+class, failing step and SQLSTATE code plus the `release`/`worker_version` tags
+— both checkpoint stages map to `gateway_runtime_failed` — but never the
+checkpoint `stage`. Once the process has restarted, the stage is not
+recoverable: the counter resets to zero. Do not wait for the stage then; check
+the `gateway` component on `/readyz` and the Neon status for the staging branch
+instead: a `commit` failure next to DB-error or pool alerts points at the
+database, not the gateway. Do not restart manually: the process exits on its own
+after
 the linger and the supervisor restarts from the committed checkpoint — verify
 the replacement is healthy per the
 [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
