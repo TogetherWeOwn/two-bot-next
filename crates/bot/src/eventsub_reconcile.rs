@@ -708,7 +708,7 @@ mod tests {
             "a failed desired subscription is not healthy"
         );
         assert!(
-            !all_desired_enabled(&desired, &callback(), &[enabled_222.clone()]),
+            !all_desired_enabled(&desired, &callback(), std::slice::from_ref(&enabled_222)),
             "a missing desired subscription is not healthy"
         );
         assert!(
