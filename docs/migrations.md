@@ -58,9 +58,11 @@ Write migrations that stay silent:
   migration.
 - New index on an existing table: `CREATE INDEX CONCURRENTLY` in a
   separate migration run outside a transaction (sqlx no-transaction;
-  `CONCURRENTLY` cannot run inside a transaction block). An index on a
-  table created earlier in the same migration file targets an empty table
-  and is not flagged.
+  `CONCURRENTLY` cannot run inside a transaction block). An index on the
+  same qualified relation (schema and table; an unqualified name means
+  `public`) created earlier in the same migration file targets an empty
+  table and is not flagged. Creating a same-named table in a different
+  schema does not exempt the index.
 - New check: `ADD CONSTRAINT ... CHECK (...) NOT VALID`, then
   `VALIDATE CONSTRAINT` separately.
 - Type change or drop: prefer an additive migration (new column, backfill,
