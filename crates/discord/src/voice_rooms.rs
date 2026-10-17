@@ -1246,6 +1246,10 @@ fn classify_response(status: u16, body: &[u8]) -> RoomHttpError {
 mod http_tests;
 
 #[cfg(test)]
+#[path = "voice_import_deadline_tests.rs"]
+mod voice_import_deadline_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
