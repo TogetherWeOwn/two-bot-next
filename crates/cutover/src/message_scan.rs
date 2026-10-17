@@ -16,6 +16,10 @@ use std::collections::HashMap;
 
 use crate::rest::iso_to_millis;
 
+#[cfg(test)]
+#[path = "message_scan_boundary_tests.rs"]
+mod message_scan_boundary_tests;
+
 /// Ladder depth: the AM7 text bar (legacy `LADDER = MESSAGE_RUNGS.length`).
 pub const LADDER: usize = 3;
 
@@ -30,10 +34,21 @@ pub const THREAD_CHANNEL_TYPES: [u8; 3] = [10, 11, 12];
 /// Bot-output channels are skipped as a cost decision, not a correctness
 /// one: every message in them is bot-authored and would be discarded anyway,
 /// and they are the highest-volume channels (legacy `LOGGY`).
+///
+/// Token list: `log`, `logs`, `wick`, `audit`, `modmail`, `network-status`.
+/// Boundary rule: a token matches only when bounded on both sides by the
+/// start/end of the name or a non-ASCII-alphanumeric character (dash,
+/// underscore, space, etc.). Substrings inside a larger word do not match,
+/// so `catalog`, `dialogue`, `blog`/`blogs`, `catalogue`, `logic`,
+/// `prologue`, `wicked`, and the halves of `network-status` (`network`,
+/// `status`) stay conversation, while `mod-log`, `audit-log`/`audit-logs`,
+/// `bot-logs`/`wick-logs`/`server-log`, bare `log`/`logs`, `modmail`, and
+/// the full `network-status` phrase (including `network-status-updates`)
+/// still skip. Matching is case-insensitive via lowercasing first.
 fn is_loggy(name: &str) -> bool {
     let lower = name.to_lowercase();
-    for needle in ["log", "wick", "audit", "modmail", "network-status"] {
-        if lower.contains(needle) {
+    for needle in ["log", "logs", "wick", "audit", "modmail", "network-status"] {
+        if contains_token(&lower, needle) {
             return true;
         }
     }
@@ -48,6 +63,28 @@ fn is_loggy(name: &str) -> bool {
         && bytes.get(i + 1).is_some_and(|b| b.is_ascii_lowercase())
     {
         return true;
+    }
+    false
+}
+
+/// True when already-lowercased `haystack` contains `needle` as a whole
+/// token: every occurrence must be bounded on both sides by the start/end
+/// of the string or a non-ASCII-alphanumeric byte.
+fn contains_token(haystack: &str, needle: &str) -> bool {
+    let hay = haystack.as_bytes();
+    let ndl = needle.as_bytes();
+    if ndl.is_empty() || hay.len() < ndl.len() {
+        return false;
+    }
+    for i in 0..=(hay.len() - ndl.len()) {
+        if &hay[i..i + ndl.len()] == ndl {
+            let left_ok = i == 0 || !hay[i - 1].is_ascii_alphanumeric();
+            let right_ok =
+                i + ndl.len() == hay.len() || !hay[i + ndl.len()].is_ascii_alphanumeric();
+            if left_ok && right_ok {
+                return true;
+            }
+        }
     }
     false
 }
