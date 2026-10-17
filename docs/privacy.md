@@ -111,7 +111,10 @@ are outside this implementation's scope.
   presence on, play aggregates still persist while voice-derived `in_voice_ms`
   stays 0 (voice spans drain and drop). The table is not a replay fence and
   holds no fence rows; member erasure and opt-out purges have no row to delete
-  there. Operators read these rows through the [game-activity aggregate
+  there. Stale rows do expire by age on the retention cadence (see
+  [Retention](#retention-and-explicit-exceptions)): aggregates whose
+  `updated_at` is older than the horizon are deleted per guild.
+  Operators read these rows through the [game-activity aggregate
   report](game-activity-report.md).
 
 The authoritative, ordered deletion manifest is
@@ -184,7 +187,14 @@ complete in under 72 hours with a receipt unless a replay guard is unresolved,
 in which case the request stays pending with no receipt and is reported as
 deferred (with overdue requests older than 72 hours counted separately).
 Long-term aggregates (counts,
-streaks) are never time-purged, and a departed guild's rows go only through
+streaks) are never time-purged, with one exception: game-activity guild
+aggregates (`game_activity_guild_aggregates`) expire by `updated_at` age on
+the retention cadence (default 90 days, `TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`
+accepts 1..=36,500 days and any missing, malformed, or out-of-range value
+falls back to 90 days, only when `TWO_RETENTION_MODE` is exactly
+`execute`; dry runs count and log the same rows without deleting). After
+expiry a returning game's totals restart from zero with no marker. Apart
+from that window, a departed guild's rows go only through
 the guild-purge queue keyed on a true guild removal (a rejoin cancels the
 queued purge). The live gateway invokes the queue/cancel paths on real
 `GUILD_DELETE`/`GUILD_CREATE` dispatches (outage payloads never queue; an
