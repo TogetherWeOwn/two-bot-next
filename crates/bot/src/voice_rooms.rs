@@ -784,10 +784,12 @@ fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
 /// (empty otherwise) and `retry_after_ms` is 0 unless Discord asked for a
 /// wait. A single callsite per level, not one per decision: each `tracing`
 /// callsite costs release-binary bytes against the container size budget.
+/// The requested name is never logged: it is member-derived text (display
+/// names, stream titles, presence titles), and the decision, IDs and
+/// counts are what the triage needs.
 fn log_rename_decision(
     guild: Snowflake,
     channel: Snowflake,
-    requested_name: &str,
     decision: &str,
     reason: &str,
     retry_after_ms: u64,
@@ -797,7 +799,6 @@ fn log_rename_decision(
         warn!(
             guild = %guild,
             channel = %channel,
-            requested_name = %requested_name,
             decision,
             reason,
             retry_after_ms,
@@ -807,7 +808,6 @@ fn log_rename_decision(
         info!(
             guild = %guild,
             channel = %channel,
-            requested_name = %requested_name,
             decision,
             reason,
             retry_after_ms,
@@ -818,26 +818,36 @@ fn log_rename_decision(
 
 /// The template-render counterpart of [`log_rename_decision`]: what the
 /// naming pass decided before anything was queued, including whether a
-/// game activity was detected at all. `requested_name` is empty when no
-/// name was rendered.
+/// game activity was detected at all. Like its counterpart it logs no
+/// member-derived text. The `channel_unseen` decision is the retry-only
+/// one — the pass resets and retries it, so it can recur on every pass
+/// while the channel stays unseen — and is logged at debug so that loop
+/// cannot flood the info stream.
 fn log_template_name_decision(
     guild: Snowflake,
     channel: Snowflake,
-    game: &str,
     playing_members: u32,
-    requested_name: &str,
     decision: &str,
 ) {
-    info!(
-        guild = %guild,
-        channel = %channel,
-        game = %game,
-        playing_members,
-        activity_detected = playing_members > 0,
-        requested_name = %requested_name,
-        decision,
-        "voice room rename decision"
-    );
+    if decision == "channel_unseen" {
+        debug!(
+            guild = %guild,
+            channel = %channel,
+            playing_members,
+            activity_detected = playing_members > 0,
+            decision,
+            "voice room rename decision"
+        );
+    } else {
+        info!(
+            guild = %guild,
+            channel = %channel,
+            playing_members,
+            activity_detected = playing_members > 0,
+            decision,
+            "voice room rename decision"
+        );
+    }
 }
 
 /// Where one operator notice is delivered.
@@ -6175,7 +6185,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     log_rename_decision(
                         self.live.guild_id,
                         channel_id,
-                        &name,
                         if reason == "rename_no_access" {
                             "permission_denied"
                         } else {
@@ -6211,7 +6220,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     log_rename_decision(
                         self.live.guild_id,
                         channel_id,
-                        &name,
                         "duplicate_name",
                         "",
                         0,
@@ -6241,7 +6249,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     log_rename_decision(
                         self.live.guild_id,
                         channel_id,
-                        &name,
                         "in_flight_deferred",
                         "",
                         0,
@@ -6255,15 +6262,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     );
                     return true;
                 }
-                log_rename_decision(
-                    self.live.guild_id,
-                    channel_id,
-                    &name,
-                    "attempted",
-                    "",
-                    0,
-                    false,
-                );
+                log_rename_decision(self.live.guild_id, channel_id, "attempted", "", 0, false);
                 metrics::global().voice_name("rename_sent");
                 let result = match self.http.detached_rename(channel_id, &name) {
                     Some(request) => {
@@ -6289,7 +6288,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         log_rename_decision(
                             self.live.guild_id,
                             channel_id,
-                            &name,
                             "renamed",
                             "",
                             0,
@@ -6306,7 +6304,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         log_rename_decision(
                             self.live.guild_id,
                             channel_id,
-                            &name,
                             "rate_limited",
                             "",
                             retry_after_ms,
@@ -6328,7 +6325,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         log_rename_decision(
                             self.live.guild_id,
                             channel_id,
-                            &name,
                             "outcome_deferred",
                             "",
                             0,
@@ -6346,7 +6342,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         log_rename_decision(
                             self.live.guild_id,
                             channel_id,
-                            &name,
                             "outcome_unknown",
                             "",
                             0,
@@ -6363,7 +6358,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         log_rename_decision(
                             self.live.guild_id,
                             channel_id,
-                            &name,
                             if matches!(&error, RoomHttpError::AccessDenied) {
                                 "permission_denied"
                             } else {
@@ -6673,15 +6667,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.renames_in_flight.remove(&channel_id);
             let retry_in = match result {
                 Ok(()) => {
-                    log_rename_decision(
-                        self.live.guild_id,
-                        channel_id,
-                        &name,
-                        "renamed",
-                        "",
-                        0,
-                        false,
-                    );
+                    log_rename_decision(self.live.guild_id, channel_id, "renamed", "", 0, false);
                     self.rename_timeouts.remove(&channel_id);
                     if let Some(channel) = self.live.write_state().channels.get_mut(&channel_id) {
                         channel.name = Some(name);
@@ -6692,7 +6678,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     log_rename_decision(
                         self.live.guild_id,
                         channel_id,
-                        &name,
                         "rate_limited",
                         "",
                         retry_after_ms,
@@ -6704,7 +6689,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     log_rename_decision(
                         self.live.guild_id,
                         channel_id,
-                        &name,
                         "outcome_deferred",
                         "",
                         0,
@@ -6716,7 +6700,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     log_rename_decision(
                         self.live.guild_id,
                         channel_id,
-                        &name,
                         "outcome_unknown",
                         "",
                         0,
@@ -6728,7 +6711,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     log_rename_decision(
                         self.live.guild_id,
                         channel_id,
-                        &name,
                         if matches!(&error, RoomHttpError::AccessDenied) {
                             "permission_denied"
                         } else {

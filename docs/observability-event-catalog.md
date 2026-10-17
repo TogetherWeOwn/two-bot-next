@@ -223,17 +223,18 @@ Rename-decision lines without a `voice_event` field:
 `voice room rename decision` (`log_rename_decision` and
 `log_template_name_decision` in `crates/bot/src/voice_rooms.rs`): one line
 per voice-room rename decision so a room that keeps its default name is
-diagnosable from logs alone. Fields: `guild`, `channel`,
-`requested_name` (empty when no name was rendered) and bounded `decision`
-(`queued`, `unchanged`, `channel_unseen`, `template_blocked`,
+diagnosable from logs alone. Fields: `guild`, `channel` and bounded
+`decision` (`queued`, `unchanged`, `channel_unseen`, `template_blocked`,
 `attempted`, `renamed`, `rate_limited`, `permission_denied`,
 `duplicate_name`, `in_flight_deferred`, `outcome_deferred`,
-`outcome_unknown`, `discord_error`, or a `rename_*` skip reason). The
-execution lines also carry `reason` (empty when none) and
-`retry_after_ms` (0 unless Discord asked for a wait); failures log at
-warn. The template lines instead carry `game`, `playing_members` and
-`activity_detected`, so "no game was ever seen" is distinguishable from
-"the rename was refused".
+`outcome_unknown`, `discord_error`, or a `rename_*` skip reason). No
+member-derived text (display names, stream or presence titles, rendered
+room names) is logged. The execution lines also carry `reason` (empty
+when none) and `retry_after_ms` (0 unless Discord asked for a wait);
+failures log at warn. The template lines instead carry `playing_members`
+and `activity_detected`, so "no game was ever seen" is distinguishable
+from "the rename was refused"; the retry-only `channel_unseen` decision
+logs at debug, since the naming pass retries it on every pass.
 
 Adjacent actor message without a `voice_event` field:
 `voice actor load failed; actor respawns on the next guild snapshot`

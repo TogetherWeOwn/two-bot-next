@@ -660,9 +660,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             log_template_name_decision(
                                 self.live.guild_id,
                                 room_id,
-                                &facts.context.game_name,
                                 facts.context.members_playing,
-                                &name,
                                 decision,
                             );
                             metrics::global().voice_name(match outcome {
@@ -675,9 +673,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             log_template_name_decision(
                                 self.live.guild_id,
                                 room_id,
-                                &facts.context.game_name,
                                 facts.context.members_playing,
-                                "",
                                 "channel_unseen",
                             );
                             metrics::global().voice_name("channel_unseen");
@@ -689,9 +685,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     log_template_name_decision(
                         self.live.guild_id,
                         room_id,
-                        &facts.context.game_name,
                         facts.context.members_playing,
-                        "",
                         "template_blocked",
                     );
                     metrics::global().voice_name("blocked");

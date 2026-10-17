@@ -11946,7 +11946,11 @@ async fn a_game_or_stream_change_rerenders_the_room_name() {
     let capture = tracing_capture::Capture::default();
     tracing::subscriber::with_default(capture.clone(), || worker.refresh_template_names(1));
     let decision_log = capture.text();
-    assert!(decision_log.contains("game=Apex Legends"), "{decision_log}");
+    // The decision line carries counts and booleans only: the detected
+    // game title and the rendered name are member-derived text and must
+    // never reach the logs.
+    assert!(!decision_log.contains("Apex"), "{decision_log}");
+    assert!(decision_log.contains("playing_members=1"), "{decision_log}");
     assert!(
         decision_log.contains("activity_detected=true"),
         "{decision_log}"
