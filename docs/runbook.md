@@ -599,9 +599,9 @@ authorized `/ops/metrics` scrape — `pre_commit` means the commit was skipped
 after a funnel, leveling or acknowledgement failure, while `commit` means the
 durable store write itself failed. Once the process has restarted, the stage
 is not recoverable: the counter resets to zero and the Worker log line
-(`{"event":"container_gateway_failure","phase":…,"class":…}`) carries only
-`phase` and `class` — both stages map to `gateway_runtime_failed` — never
-the `stage`. Do not wait for the stage then; check the `gateway` component on
+(`{"event":"container_gateway_failure","phase":…,"class":…,"release":…,"worker_version":…}`)
+carries `phase` and `class` plus the `release`/`worker_version` tags — both
+stages map to `gateway_runtime_failed` — never the `stage`. Do not wait for the stage then; check the `gateway` component on
 `/readyz` and the Neon status for the staging branch instead: a `commit`
 failure next to DB-error or pool alerts points at the database, not the
 gateway. Do not restart manually: the process exits on its own after

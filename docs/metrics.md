@@ -341,16 +341,23 @@ as dynamic labels.
   `voice_event="voice_creator_orphan"`. No channel, member, token, body or
   ID leaves the process in any label or field.
 - Worker log fields (Workers Logs only, never a metric):
-  `event="container_gateway_failure"` with `phase`/`class`, emitted by the
-  Container DO keepalive in `wrangler/src/index.ts` once per tick while the
-  gateway task is failing. `phase` is `durable_gateway`; `class` is one of
+  `event="container_gateway_failure"` with `phase`/`class`/`release`/`worker_version`,
+  emitted by the Container DO keepalive in `wrangler/src/index.ts` once per
+  tick while the gateway task is failing. `phase` is `durable_gateway`; `class` is one of
   `store_unavailable`, `gateway_pool_connect_failed`, `checkpoint_load_failed`,
   `onboarding_gates_invalid`, `onboarding_init_failed`,
   `custom_commands_init_failed`, `milestones_load_failed`,
   `automod_config_invalid`, `automod_executor_failed`, `raid_executor_failed`,
   `gateway_runtime_failed` or `gateway_task_panicked` (every `FailureClass`
-  variant in `crates/bot/src/gateway_failure.rs`). Only `[a-z0-9_]{1,32}`
-  tokens are ever logged; anything else is dropped. See
+  variant in `crates/bot/src/gateway_failure.rs`). Only `phase` and `class`
+  use `[a-z0-9_]{1,32}` tokens; anything else is dropped. `release` is the
+  container git SHA from `/readyz` `build_revision` (stamped at deploy time,
+  `"unknown"` when unparseable, never echoed); `worker_version` is the platform
+  Worker version id. `metrics_alert` lines carry the same `release` and
+  `worker_version` from that tick's probe. Group gateway failures by `class`;
+  group metrics alerts by the alert rule in `content`. Error-class grouping
+  applies to metrics alerts only when `content` includes a validated last error
+  class, as with `job_consecutive_failures`. See
   [startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gateway_failure).
 - `two_bot_voice_join_to_move_seconds` is a label-free histogram from creator
   join gateway receipt to successful member move. Cancelled/failed joins do not
