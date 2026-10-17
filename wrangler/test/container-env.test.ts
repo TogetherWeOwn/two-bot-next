@@ -127,6 +127,29 @@ test("the existing 4 Container vars are unchanged and cannot be overridden", () 
   }
 });
 
+test("gateway readiness failure injection forwards only under the staging marker", () => {
+  const key = "TWO_GATEWAY_READINESS_FAIL_INJECTION";
+  // The switch is never on the generic flag allowlist.
+  assert.equal(forwardedFlagVars({ [key]: "1", TWO_DEPLOY_ENV: "staging" })[key], undefined);
+  // Production shape: no marker (or a non-staging one) forwards nothing,
+  // even with the switch set on the Worker.
+  for (const env of [
+    { [key]: "1" },
+    { [key]: "1", TWO_DEPLOY_ENV: "production" },
+    { [key]: "1", TWO_DEPLOY_ENV: "staging " },
+    { [key]: "true", TWO_DEPLOY_ENV: "staging" },
+    { [key]: "0", TWO_DEPLOY_ENV: "staging" },
+    { TWO_DEPLOY_ENV: "staging" },
+  ]) {
+    assert.equal(containerEnv(env)[key], undefined, JSON.stringify(env));
+  }
+  // The one armed shape: staging marker + exact "1" (marker forwarded too,
+  // so the Rust fence can repeat the check in the Container).
+  const armed = containerEnv({ [key]: "1", TWO_DEPLOY_ENV: "staging" });
+  assert.equal(armed[key], "1");
+  assert.equal(armed["TWO_DEPLOY_ENV"], "staging");
+});
+
 test("eventsub reconcile inputs and Helix credentials reach the Container on explicit lines while forwarded", () => {
   const env = {
     TWO_EVENTSUB: "1",

@@ -56,9 +56,9 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
 | `two_bot_voice_joins_received_total` | Creator joins received by the guild actor; compare with create/move/refused outcomes — received persistently above handled means the actor is not processing joins |
 | `two_bot_voice_join_refused_total{reason}` | Actor-received creator joins refused before queueing; `reason` is `halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked` or `other` |
-| `two_bot_voice_worker_halted` | Guild-actor halt latch: 1 while a store CredentialRefused or Discord 401 halted join processing (only store halts auto-recover; 401s need a token fix + restart) |
-| `two_bot_voice_queue_pending{lane}` | Queued (not in-flight) voice actions; `lane` is `urgent` or `deferred` |
-| `two_bot_voice_queue_oldest_age_seconds` | Age of the oldest queued voice action in seconds; 0 when empty |
+| `two_bot_voice_worker_halted` | Guild-actor halt latch: 1 while any guild actor is halted by a store CredentialRefused or Discord 401 (only store halts auto-recover; 401s need a token fix + restart); aggregated over all current guild actors, so a healthy guild cannot hide another guild's halt |
+| `two_bot_voice_queue_pending{lane}` | Queued (not in-flight) voice actions, summed across all current guild actors per lane; `lane` is `urgent` or `deferred` |
+| `two_bot_voice_queue_oldest_age_seconds` | Age of the oldest queued voice action in seconds, the maximum across all current guild actors; 0 when every queue is empty |
 | `two_bot_voice_rest_in_flight_age_seconds` | Age of the oldest in-flight voice REST attempt in seconds; 0 when idle |
 | `two_bot_voice_creator_map_generation` | Last merged creator-map generation; 0 before the first merge — a flat line across reconnects means the map stopped converging |
 | `two_bot_voice_creator_map_age_seconds` | Seconds since the last successful creator-map merge, republished every actor tick; 0 when never merged — climbing past the 5 min refresh interval means merges stopped landing; the `voice_creator_map_stale` rule pages past 600 s once a merge has landed |
@@ -143,13 +143,13 @@ scheduled-message, feed, self-role recovery, unban-sweep and automod-expiry
 names against that allowlist.
 
 No scheduler or registration gate changes are implied by these labels. Feed
-supervisor cadence is the boot-configured interval (default 300 s, range
-60–86,400 s); live interval changes gate polling inside those fixed opportunities.
-A skipped inner poll returns success and resets the `feeds` consecutive-failure
-streak, so `job_consecutive_failures:feeds` is reliable only while the live
-interval is at most the boot cadence; with a live interval at least twice the boot
-cadence each failed real poll is followed by a skipped tick that zeroes the streak
-before it can reach 3. Self-role recovery runs every 30 s with 0–5 s startup jitter
+supervisor cadence follows the live interval (boot default 300 s, range
+60–86,400 s): a stored change reschedules the next tick to last-run + new
+interval and the per-tick schedule gate mirrors that slot, so ticks normally
+land only when a poll is due. A skipped inner poll (a gate refusal on an
+overlapping or not-yet-due tick) still returns success and resets the `feeds`
+consecutive-failure streak, so a streak can under-report while such refusals
+interleave with failures. Self-role recovery runs every 30 s with 0–5 s startup jitter
 and a 25 s timeout; a successful sweep need not settle every pending repair.
 The member unban sweep runs every 30 s (`UNBAN_SWEEP_INTERVAL_SECONDS`) with
 startup jitter and a 180 s attempt timeout; one attempt may outlive its cadence,
@@ -513,10 +513,19 @@ Both readiness and metrics share the [Discord-only destination validator and
 non-destructive disable switch](container-readiness.md#threshold-and-notifications).
 No Prometheus server, no new infrastructure.
 
-Background alert scrapes share the streaming 64 KiB body cap and a single
-six-second request/body deadline. Non-OK bodies are cancelled without buffering;
-oversize or stalled bodies are cancelled too, without waiting on a cancellation
-hook. Failed scrapes log only `two-bot metrics scrape failed`: no response body,
+Every DO ops read — the background alert scrape, the summary proxy, the
+read-only ops proxies (metrics, gateway, backfill and the signed
+backfill-progress read) and the keepalive `/readyz` probe — shares the
+streaming 64 KiB body cap and a single end-to-end six-second deadline across
+the container fetch and the body read. The deadline does not rely on the SDK
+or the response stream honoring abort: a fetch or body that ignores
+cancellation still settles the caller at six seconds, a response that only
+arrives after the deadline is released and discarded (never proxied, never
+recorded as readiness), and body cancellation is best-effort — a cancel hook
+that stalls or never resolves cannot extend the caller's critical section.
+Non-OK bodies are cancelled without buffering; oversize or stalled bodies are
+cancelled too, without waiting on a cancellation hook. Failed scrapes log
+only `two-bot metrics scrape failed`: no response body,
 exception detail, token or URL. Empty/non-exposition, malformed or interrupted
 bodies, timeouts, and missing/duplicate/invalid alert inputs keep the previous
 firing set, counter baselines and streaks, and emit no `RESOLVED` — except the
@@ -550,10 +559,11 @@ exposition proxy, and ownership and bearer controls are unchanged.
   `404`. Unauthenticated requests never reach the container. `/metrics`
   itself stays `404`. The ownership control path (`/internal/ownership`)
   keeps its own gate and shares neither this bucket nor its budget.
-  The DO container fetch aborts after 6 s (`504`, generic body — the SDK
-  resolves aborts as a 500 Response, which is mapped to 504 without
-  proxying its text) and the upstream body is capped at 64 KiB
-  (larger → `502`, generic body).
+  The DO container fetch and its body read share one end-to-end 6 s
+  deadline (`504` at the deadline, generic body — the SDK resolves aborts
+  as a 500 Response, which is mapped to 504 without proxying its text, and
+  a fetch or stream that ignores abort still settles at the deadline) and
+  the upstream body is capped at 64 KiB (larger → `502`, generic body).
 - Rules live in `wrangler/src/alert-rules.ts`; each links to a
   [runbook](runbook.md#metrics-alerts) section (a test enforces the anchors):
 
@@ -617,10 +627,9 @@ records success, so only a truly wedged sweep tickets — check
 sweep is intentional before treating flat audit deliveries as a wedged job.
 `feeds` is covered by
 the coarse fallback, not a precise cadence, because its cadence is
-boot-configured (60–86400 s) with a live-configurable inner polling gate and
-successful gated ticks are not polling freshness; its failure alerting is
-reliable only while the live interval is at most the boot cadence, since
-skipped gated ticks return success and reset the streak. `self_role_recovery`
+live-configurable (60–86400 s) with an inner polling gate and
+successful gated ticks are not polling freshness; skipped gated ticks return
+success and reset the streak. `self_role_recovery`
 keeps failure-only alerting: twice its 30 s cadence is too close to the ~60 s
 scrape interval for safe `job_stale` paging, and this label-isolation change
 adds no ticker-staleness policy. `member_unban_sweep` keeps failure-only
@@ -630,7 +639,7 @@ failure-only alerting with the coarse 2-hour fallback: its 60 s tick is a
 no-op success until the gateway builds the activation, and it only does real
 expiry work when `TWO_AUTOMOD=1`. `self_role_recovery`, `member_unban_sweep`
 and `automod_expiry` each trigger `job_consecutive_failures` independently at
-three completed failures; `feeds` does the same within its live-interval limit
+three completed failures; `feeds` does the same subject to the skipped-tick caveat
 above. A sweep with no completions is covered only by the coarse 2-hour
 fallback, not a precise cadence.
 `wrangler/test/alert-job-catalog.test.ts` checks website/community cadence

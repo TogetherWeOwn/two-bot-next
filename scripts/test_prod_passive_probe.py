@@ -30,7 +30,7 @@ READY = {
     "components": components(("process", "ready"), ("gateway", "ready"),
                              ("database", "ready"), ("token_invalid", "ready")),
     "jobs": {},
-    "build_revision": "abc123",
+    "build_revision": "0123456789abcdef0123456789abcdef01234567",
     "build_id": "1-1",
 }
 
@@ -130,7 +130,7 @@ class ProdPassiveProbeTests(unittest.TestCase):
         receipt = json.loads(Path(self.evidence).read_text())
         self.assertEqual(receipt["origin"], PROD)
         self.assertEqual(receipt["result"], "pass")
-        self.assertEqual(receipt["build_revision"], "abc123")
+        self.assertEqual(receipt["build_revision"], "0123456789abcdef0123456789abcdef01234567")
         self.assertEqual(receipt["build_id"], "1-1")
         self.assertIsNone(receipt["gateway_failure_class"])
         self.assertIsNone(receipt["gateway_failure_root_cause"])

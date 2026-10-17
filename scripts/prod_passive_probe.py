@@ -54,6 +54,8 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 
+from build_identity import UNSTAMPED, is_build_id_shape, is_build_revision_shape
+
 PROD_HOST = re.compile(r"(?:two-bot-next|two-bot-next-production)\.[a-z0-9-]+\.workers\.dev")
 STAGING_LABEL = "two-bot-next-staging"
 BODY_CAP = 64 << 10
@@ -222,18 +224,27 @@ def parse_readyz(status, value):
     return state, value
 
 
-def printable_str(value):
-    # Remote identity is echoed into output and the receipt: ASCII printable only.
-    return value if isinstance(value, str) and value.isascii() and value.isprintable() else None
+def canonical_build_identity(report):
+    """Return a canonical stamped identity or the exact unstamped pair."""
+    if not isinstance(report, dict):
+        return None
+    revision, build_id = report.get("build_revision"), report.get("build_id")
+    if revision == UNSTAMPED and build_id == UNSTAMPED:
+        return revision, build_id
+    if is_build_revision_shape(revision) and is_build_id_shape(build_id):
+        return revision, build_id
+    return None
 
 
 def check_build(report):
     if not isinstance(report, dict):
         return Result("build", False, "no readyz body to read build identity from")
-    revision = printable_str(report.get("build_revision"))
-    build_id = printable_str(report.get("build_id"))
-    if not revision or not build_id:
-        return Result("build", False, "readyz without the compiled build_revision/build_id")
+    identity = canonical_build_identity(report)
+    if identity is None:
+        return Result("build", False, "readyz build identity has an unexpected shape")
+    revision, build_id = identity
+    if revision == UNSTAMPED:
+        return Result("build", True, "build identity is unstamped (unknown)")
     return Result("build", True, f"build_revision {revision} build_id {build_id}")
 
 
@@ -248,9 +259,11 @@ def run(args, fetch_fn=fetch):
     except ProbeError as error:
         results.append(Result("health", False, str(error)))
     report = None
+    build_result = check_build(report)
     try:
         status, _, value = get_json(fetch_fn, origin + "/readyz", "readyz")
         state, report = parse_readyz(status, value)
+        build_result = check_build(report)
         expected = 200 if all(text == "ready" for text in state.values()) else 503
         if status != expected:
             raise ProbeError(f"readyz {status} contradicts the component breakdown "
@@ -273,17 +286,18 @@ def run(args, fetch_fn=fetch):
                                       "truthful, not a pass"))
     except ProbeError as error:
         results.append(Result("readyz", False, str(error)))
-    results.append(check_build(report))
+    results.append(build_result)
     return origin, results, report
 
 
 def evidence_shape(results, report):
     """Allowlisted receipt: check names, verdicts and shape tokens only."""
     failure = (report or {}).get("gateway_failure") or {}
+    identity = canonical_build_identity(report)
     return {"checks": [{"check": result.name, "verdict": "pass" if result.ok else "fail",
                         "shape": result.reason} for result in results],
-            "build_revision": printable_str((report or {}).get("build_revision")),
-            "build_id": printable_str((report or {}).get("build_id")),
+            "build_revision": identity[0] if identity else None,
+            "build_id": identity[1] if identity else None,
             "gateway_failure_class": failure.get("class"),
             "gateway_failure_root_cause": ("unverified"
                                            if any(result.checkpoint_read_failed

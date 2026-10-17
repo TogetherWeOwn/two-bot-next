@@ -278,7 +278,16 @@ async fn run(cli_args: &[String]) {
     let state = SharedState::new(
         Arc::clone(&gateway),
         store.as_ref().map(|s| s.pool().clone()),
-    );
+    )
+    .with_gateway_fail_injection(server::gateway_failure_injection_from_env());
+    if state.gateway_fail_injected {
+        // Staging rollback drill only (the fence refuses everywhere else):
+        // loud once at boot so the drill is unmistakable in the deploy logs.
+        tracing::warn!(
+            msg = "gateway_readiness_failure_injection_active",
+            "gateway readiness failure injection active; /readyz reports gateway down for the staging rollback drill"
+        );
+    }
 
     // Disable guard: refuse to boot with moderation/automation disabled
     // while releases are still owed (pending tempban unbans, active
@@ -648,12 +657,15 @@ async fn run(cli_args: &[String]) {
                         }));
                     }
 
-                    let shard = build_shard(
-                        token,
-                        intents_from_env(&activation),
-                        saved.as_ref(),
-                        gateway_url.as_deref(),
+                    // One intents value drives both the shard subscription
+                    // and the pipeline's length measurement: without
+                    // MESSAGE_CONTENT, Discord delivers content only for
+                    // bot mentions, so the pipeline must not measure it.
+                    let intents = intents_from_env(&activation);
+                    pipeline.set_message_content_delivered(
+                        intents.contains(twilight_gateway::Intents::MESSAGE_CONTENT),
                     );
+                    let shard = build_shard(token, intents, saved.as_ref(), gateway_url.as_deref());
                     info!(
                         msg = "gateway_connecting",
                         resume = saved.is_some(),

@@ -127,6 +127,56 @@ not production authorization or a migration tool.
    from the container. Re-read rollout/Worker control-plane state after the
    runtime probes.
 
+## Rollback drill: injected gateway failure (staging only)
+
+The one supported way to prove the auto-rollback end to end is a manual
+staging dispatch with the drill switch on:
+
+```sh
+gh workflow run deploy-staging.yml --ref main -f inject_gateway_failure=true
+```
+
+`inject_gateway_failure` is a `workflow_dispatch`-only boolean (default
+false; a push cannot set it, and `deploy-production` never reads it). The
+prepare step turns it into `--inject-gateway-failure` for
+`scripts/staging_rollout.py`, which writes
+`TWO_GATEWAY_READINESS_FAIL_INJECTION = "1"` into the **generated**
+per-deploy staging config only — never a committed `wrangler.toml` var
+(`wrangler/scripts/check-env-bindings.py` rejects it in every vars table).
+The Worker forwards the switch into the container only while its
+`TWO_DEPLOY_ENV` marker is exactly `staging` (a staging-vars-only binding),
+and the Rust readiness fence repeats both checks before reporting the
+gateway `down` on the real `/readyz` path. The gateway itself keeps
+running; only readiness fails, in the exact component shape the gate
+already rejects. With the switch off, absent, misspelled, or on any
+non-staging deployment, nothing changes.
+
+Expected drill shape: deploy and ownership takeover succeed, `verify`
+fails because the new build serves `/readyz` 503 with `gateway: down`,
+and the auto-rollback step restores the pre-deploy Worker version **and**
+container image (with takeover). The run stays red by design — the
+rollback restores service, it never certifies the injected build. The
+next ordinary staging deploy generates its config without the switch, so
+nothing needs to be switched off afterwards.
+
+Evidence to capture from the drill run:
+
+- the run URL and the exact head SHA it deployed;
+- the pre-deploy snapshot printed by the snapshot step (Worker version +
+  container image) and the uploaded `staging-rollout-evidence` artifact,
+  whose generated `staging-deploy.json` shows the injected staging var;
+- the `auto-rollback-evidence.json` from the same artifact naming the
+  restored Worker version and image;
+- a post-rollback `/readyz` read: 200, all components ready, previous
+  build revision.
+
+Stop conditions: do not start the drill while the schema or roles gates
+are red (fix drift first, or the drill proves nothing about readiness);
+do not re-dispatch to "retry" a drill whose rollback step failed or whose
+post-rollback `/readyz` is not 200 (staging may be fenced — diagnose from
+the artifact first, never release the fence to force a rerun); never
+dispatch `deploy-production` as part of the drill.
+
 ## Bounds and fail-closed cases
 
 The verification phase has a five-minute deadline, ten-second network socket

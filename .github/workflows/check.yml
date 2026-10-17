@@ -234,6 +234,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
 
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_probe.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_redirect_refusal.py' -v
 
       - name: soak evidence parser (offline, fixtures only)
         run: |
@@ -697,7 +698,7 @@ jobs:
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
         # The publication regression has its own guarded DB and actual binary
         # in the dedicated step below; never feed it the round-trip fixture URL.
-        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump --skip per_route_bucket_headers_gate_same_bucket_without_hardcoded_limits --skip independent_workers_share_global_pacing --skip reset_after_header_drives_sleep_then_retry_with_no_request_during_pause --skip shared_scope_429_does_not_spend_invalid_budget_while_others_do --skip header_absent_responses_keep_conservative_spacing
+        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump --skip per_route_bucket_headers_gate_same_bucket_without_hardcoded_limits --skip independent_workers_share_global_pacing --skip reset_after_header_drives_sleep_then_retry_with_no_request_during_pause --skip shared_scope_429_does_not_spend_invalid_budget_while_others_do --skip header_absent_responses_keep_conservative_spacing --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
 
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).
@@ -778,6 +779,7 @@ jobs:
           cov_run "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test internal_events -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test raid_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test reengagement_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test game_activity_report_db --locked -- --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test member_moderation_db -- --ignored --test-threads=1 --skip regenerate_reference_docs
           # Merge every collected profile into the mounted workspace report the gate reads.
           # `report` must carry --workspace: without it the report scopes to
@@ -1376,6 +1378,11 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-cutover --test reengagement_list_db --locked -- --ignored
+
+      - name: Game-activity report query (CI service container only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-cutover --test game_activity_report_db --locked
 
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
@@ -2179,8 +2186,12 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_health_contract_probe.py -v
       - name: Verify passive production probe (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe.py -v
+      - name: Verify passive production probe build identity (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_build_identity_acceptance.py -v
       - name: Verify synthetic alert delivery (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
+      - name: Verify synthetic alert history rollover (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert_history_rollover.py -v
       - name: Verify voice denied-copy fixtures (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_voice_denied_copy.py -v
       - name: Verify staging-guild E2E prep skeleton (offline fixtures)
@@ -2207,6 +2218,11 @@ jobs:
         # Version bumps, notes, rollback guard and off-main refusal against a
         # throwaway git repository (no network, no token).
         run: node ../scripts/test-release-on-promote.cjs
+      - name: Verify release latest repair guard
+        if: needs.job-inputs.outputs.worker != 'false'
+        # Repairing an older tag's missing release must not move "Latest"
+        # backward (mocked gh against a throwaway git repository).
+        run: node --test ../scripts/test-release-on-promote-latest-repair.cjs
       - name: Verify the commit-parse guard
         if: needs.job-inputs.outputs.worker != 'false'
         # The PR-side guard uses release-please's pinned conventional-commit
