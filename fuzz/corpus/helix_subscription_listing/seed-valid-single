@@ -1,0 +1,1 @@
+{"data":[{"id":"s1","status":"enabled","type":"stream.online","version":"1","condition":{"broadcaster_user_id":"111"},"transport":{"method":"webhook","callback":"https://hooks.example.com/twitch"}}],"pagination":{}}
