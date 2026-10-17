@@ -34,9 +34,9 @@ is a READER covered by the allowlist test, so a new token-sending script (or
 a new token path in an old one) trips the gate even before anyone adds it to
 READERS.
 
-Five entries in KNOWN_GAPS are still vulnerable and owned by in-flight
-sibling fixes (the alert-history reader and the four voice-synthetic token
-readers). They are allowlisted by (file, function) so the gate stays green
+Four entries in KNOWN_GAPS are still vulnerable and owned by in-flight
+sibling fixes (the four voice-synthetic token readers). They are allowlisted
+by (file, function) so the gate stays green
 while those fixes land; the gate fails on any violation outside the list AND
 on any stale entry whose function is already clean, so each sibling fix must
 drop its lines and the list shrinks to empty -- the strict end state. Reasons
@@ -68,7 +68,6 @@ READERS = (
 # open under a sibling fix. Remove a line with the fix that cleans it; an
 # entry that no longer matches a live violation fails the gate as stale.
 KNOWN_GAPS = frozenset({
-    ("synthetic_alert_history.py", "_get"),
     ("staging_voice_synthetic.py", "metrics_snapshot"),
     ("staging_voice_synthetic.py", "rest"),
     ("staging_voice_synthetic.py", "rest_patch"),
@@ -702,7 +701,7 @@ class TokenRedirectGateTests(unittest.TestCase):
             remaining, stale = check_tree(
                 scripts_dir=scripts, readers=READERS, known_gaps=KNOWN_GAPS)
         self.assertEqual(remaining, [])
-        self.assertIn(("synthetic_alert_history.py", "_get"), stale)
+        self.assertIn(("staging_voice_synthetic.py", "metrics_snapshot"), stale)
 
 
 if __name__ == "__main__":
