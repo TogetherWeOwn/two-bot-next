@@ -131,6 +131,16 @@ def _parse_new_file_header(raw):
     if not raw.startswith("+++ "):
         raise ValueError(f"unsupported +++ diff header: {raw!r}")
     target = raw[len("+++ "):]
+    # Git appends a single TAB to ---/+++ header lines when the path
+    # contains a space (verified with Git 2.47.3, -U0 --no-renames,
+    # core.quotepath=true, for both plain and C-quoted headers). That tab
+    # is a header terminator, not part of the file name: a literal tab in
+    # a name would arrive C-escaped, so strip exactly one trailing TAB
+    # before decoding. Without this, spaced names keep the tab, miss
+    # their LCOV record, and fall through to the no-coverable-lines
+    # success path (fail-open), while quoted spaced names fail to parse.
+    if target.endswith("\t"):
+        target = target[:-1]
     if not target:
         raise ValueError("empty +++ diff header")
     if target == "/dev/null":
