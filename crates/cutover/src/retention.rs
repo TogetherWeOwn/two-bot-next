@@ -61,6 +61,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use two_bot_core::error_chain::{
     db_cause, render_retention_failure, RetentionStep, STORE_UNAVAILABLE_CLASS,
 };
+use two_bot_core::stream_live_store::{
+    count_expired_delivered_live, expire_delivered_live, DELIVERED_DEDUP_RETENTION_DAYS,
+};
 
 // Store class token for retention failure lines: the shared
 // `STORE_UNAVAILABLE_CLASS` from core, so this side cannot drift from the
@@ -94,6 +97,11 @@ pub struct RetentionReport {
     pub voice_raw_deleted: u64,
     /// `operational_audit_log` rows deleted (older than 45 days).
     pub audit_cache_deleted: u64,
+    /// Delivered `stream_live_claims` go-live fences deleted (stamped
+    /// earlier than [`DELIVERED_DEDUP_RETENTION_DAYS`] ago). Only delivered
+    /// rows are eligible: never-started and started-but-ambiguous rows stay
+    /// fenced however old, so a retry inside the horizon still dedups.
+    pub stream_live_delivered_expired: u64,
     /// Guild-scoped rows purged for departed guilds.
     pub guild_rows_purged: u64,
     /// Queued guild purges that failed with a real error in this run,
@@ -155,6 +163,7 @@ impl RetentionReport {
         self.presence_raw_deleted
             + self.voice_raw_deleted
             + self.audit_cache_deleted
+            + self.stream_live_delivered_expired
             + self.guild_rows_purged
     }
 }
@@ -282,6 +291,8 @@ async fn run_retention_inner(
             let presence = count_presence_raw(&mut tx).await?;
             let voice = count_voice_raw(&mut tx).await?;
             let audit = count_audit_cache(&mut tx).await?;
+            let live_expired =
+                count_expired_delivered_live(&mut *tx, DELIVERED_DEDUP_RETENTION_DAYS).await?;
             let pending: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM retention_deletion_requests WHERE status = 'pending'",
             )
@@ -342,6 +353,7 @@ async fn run_retention_inner(
                 presence_raw_deleted: presence,
                 voice_raw_deleted: voice,
                 audit_cache_deleted: audit,
+                stream_live_delivered_expired: live_expired,
                 guild_rows_purged: guild_rows,
                 // The dry run reports what the live run will delete: guarded
                 // requests stay pending, so they are deferred, not completed;
@@ -407,6 +419,12 @@ async fn run_retention_inner(
         .execute(&mut *tx)
         .await?
         .rows_affected();
+            // Delivered go-live fences past the dedup horizon go in the same
+            // time-window stage: the store predicate keeps every row a live
+            // claim or send could reference, and this never runs on the send
+            // path.
+            let live_expired =
+                expire_delivered_live(&mut *tx, DELIVERED_DEDUP_RETENTION_DAYS).await?;
             let overdue = count_overdue_deletions(&mut tx).await?;
             // Schema gaps are computed once per run, before either drain. A
             // gap means no purge or deletion can certify completeness, so
@@ -566,6 +584,7 @@ async fn run_retention_inner(
                 presence_raw_deleted: presence,
                 voice_raw_deleted: voice,
                 audit_cache_deleted: audit,
+                stream_live_delivered_expired: live_expired,
                 guild_rows_purged: guild_rows,
                 guild_purges_failed: guild_failed,
                 guild_purges_deferred: guild_deferred,
@@ -1206,13 +1225,14 @@ mod ledger_tests {
         }
     }
 
-    fn report(values: [u64; 11]) -> RetentionReport {
-        let [presence, voice, audit, guild_rows, failed, deferred_guilds, oldest_secs, completed, deferred, gap, overdue] =
+    fn report(values: [u64; 12]) -> RetentionReport {
+        let [presence, voice, audit, live_expired, guild_rows, failed, deferred_guilds, oldest_secs, completed, deferred, gap, overdue] =
             values;
         RetentionReport {
             presence_raw_deleted: presence,
             voice_raw_deleted: voice,
             audit_cache_deleted: audit,
+            stream_live_delivered_expired: live_expired,
             guild_rows_purged: guild_rows,
             guild_purges_failed: failed,
             guild_purges_deferred: deferred_guilds,
@@ -1227,7 +1247,7 @@ mod ledger_tests {
 
     #[test]
     fn empty_run_deletes_nothing() {
-        let idle = report([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let idle = report([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(idle.total_deleted(), 0);
     }
 
@@ -1237,7 +1257,8 @@ mod ledger_tests {
         // overdue signals vary freely: none of them may leak into the total.
         let mut rng = Ladder(0x1234_5678_9abc_def0);
         for _ in 0..256 {
-            let (presence, voice, audit, guild_rows) = (
+            let (presence, voice, audit, live_expired, guild_rows) = (
+                rng.below(1_000_000),
                 rng.below(1_000_000),
                 rng.below(1_000_000),
                 rng.below(1_000_000),
@@ -1247,6 +1268,7 @@ mod ledger_tests {
                 presence,
                 voice,
                 audit,
+                live_expired,
                 guild_rows,
                 rng.next(),
                 rng.next(),
@@ -1258,8 +1280,8 @@ mod ledger_tests {
             ]);
             assert_eq!(
                 raffle.total_deleted(),
-                presence + voice + audit + guild_rows,
-                "the total must sum exactly the four row classes, got {raffle:?}"
+                presence + voice + audit + live_expired + guild_rows,
+                "the total must sum exactly the five row classes, got {raffle:?}"
             );
         }
     }
@@ -1271,7 +1293,8 @@ mod ledger_tests {
         // The DB acceptance suite exercises the actual #960 projection logic.
         let mut rng = Ladder(0x0bad_f00d_dead_beef);
         for _ in 0..256 {
-            let (presence, voice, audit, guild_rows) = (
+            let (presence, voice, audit, live_expired, guild_rows) = (
+                rng.below(1_000_000),
                 rng.below(1_000_000),
                 rng.below(1_000_000),
                 rng.below(1_000_000),
@@ -1281,6 +1304,7 @@ mod ledger_tests {
                 presence,
                 voice,
                 audit,
+                live_expired,
                 guild_rows,
                 rng.next(),
                 rng.next(),
@@ -1294,6 +1318,7 @@ mod ledger_tests {
                 presence,
                 voice,
                 audit,
+                live_expired,
                 guild_rows,
                 rng.next(),
                 rng.next(),

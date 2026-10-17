@@ -488,10 +488,38 @@ pub struct AbuseFlag {
     pub detail: String,
 }
 
+/// Input coverage for one message detector: `eligible` counts
+/// `message_created` facts classified `eligible_human` (the denominator
+/// both message detectors draw from); `with_input` counts how many of
+/// those the detector could actually consume (for `burst`, messages with
+/// an actor and a parseable timestamp; for `copy_paste`, the detector's
+/// existing usable-`contentLength` counter). A clean week and a mostly
+/// blind week are distinguishable only through these counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DetectorInputCoverage {
+    pub eligible: usize,
+    pub with_input: usize,
+}
+
+/// Per-detector input coverage for the message detectors, serialized as
+/// the literal snake_case `detector_inputs` object with exactly the keys
+/// `burst` and `copy_paste`. Voice denominators are out of scope here.
+/// Populated under the same complete-coverage gate that runs the
+/// detectors; under incomplete coverage it is present with zeros so the
+/// JSON shape stays stable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DetectorInputs {
+    pub burst: DetectorInputCoverage,
+    pub copy_paste: DetectorInputCoverage,
+}
+
 /// The weekly scorecard (legacy `CommunityScorecard`, camelCase JSON keys so
 /// serialized output matches the legacy fixture byte-for-shape). The
 /// anti-gaming additions (`abuse_flags`, `abuse_candidates`,
-/// `abuse_data_quality`, `season_id`, `season_watermarks`) keep snake_case
+/// `abuse_data_quality`, `detector_inputs`, `season_id`,
+/// `season_watermarks`) keep snake_case
 /// keys via explicit renames: operators and the acceptance suite read them
 /// literally.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -534,6 +562,10 @@ pub struct Scorecard {
     /// never a verdict.
     #[serde(rename = "abuse_data_quality")]
     pub abuse_data_quality: Vec<String>,
+    /// Per-detector input coverage (`{eligible, with_input}` for `burst`
+    /// and `copy_paste`). Present with zeros under incomplete coverage.
+    #[serde(rename = "detector_inputs")]
+    pub detector_inputs: DetectorInputs,
     /// Season scope (`YYYY-QN`) of the scorecard week start (event time, AC3).
     #[serde(rename = "season_id")]
     pub season_id: String,
@@ -727,19 +759,22 @@ fn detect_burst(
     facts: &[ParsedFact<'_>],
     flags: &mut Vec<AbuseFlag>,
     candidates: &mut Vec<String>,
-) {
+) -> DetectorInputCoverage {
+    let mut coverage = DetectorInputCoverage::default();
     let mut by_actor: HashMap<&str, Vec<i64>> = HashMap::new();
     let mut per_day: HashMap<(&str, String), usize> = HashMap::new();
     for f in facts {
         if f.row.event_type != "message_created" || f.classification != "eligible_human" {
             continue;
         }
+        coverage.eligible += 1;
         let Some(actor) = f.row.actor_id.as_deref().filter(|a| !a.is_empty()) else {
             continue;
         };
         let Some(ms) = parse_iso_millis(&f.row.occurred_at) else {
             continue;
         };
+        coverage.with_input += 1;
         by_actor.entry(actor).or_default().push(ms);
         let day = f
             .row
@@ -786,6 +821,7 @@ fn detect_burst(
     {
         candidates.push(SPAM_TO_EARN_WATCH.to_owned());
     }
+    coverage
 }
 
 /// Copy/paste detector (AC4, observe-only): `copy_paste` fires on
@@ -802,7 +838,8 @@ fn detect_copy_paste(
     facts: &[ParsedFact<'_>],
     flags: &mut Vec<AbuseFlag>,
     quality: &mut Vec<String>,
-) {
+) -> DetectorInputCoverage {
+    let mut eligible = 0usize;
     let mut groups: HashMap<(&str, String), Vec<(i64, u64)>> = HashMap::new();
     let mut messages = 0usize;
     let mut with_length = 0usize;
@@ -810,6 +847,7 @@ fn detect_copy_paste(
         if f.row.event_type != "message_created" || f.classification != "eligible_human" {
             continue;
         }
+        eligible += 1;
         let Some(actor) = f.row.actor_id.as_deref().filter(|a| !a.is_empty()) else {
             continue;
         };
@@ -827,12 +865,19 @@ fn detect_copy_paste(
         };
         groups.entry((actor, channel)).or_default().push((ms, len));
     }
+    // The reported counts are these same counters: `eligible` is every
+    // eligible human message; `with_input` reuses `with_length` (usable
+    // unsigned-integer `contentLength` after the actor/channel gates).
+    let coverage = DetectorInputCoverage {
+        eligible,
+        with_input: with_length,
+    };
     // Fail closed on sparse coverage, not only on none: when most eligible
     // messages carry no length, the few that do are not a representative
     // sample and no verdict (clean or flagged) is honest.
     if messages > 0 && with_length * 2 < messages {
         quality.push("copy_paste:insufficient_data".to_owned());
-        return;
+        return coverage;
     }
     for ((actor, channel), mut items) in groups {
         items.sort_unstable();
@@ -869,6 +914,7 @@ fn detect_copy_paste(
             }
         }
     }
+    coverage
 }
 
 /// Voice-AFK detector (AC4, observe-only): `voice_afk` fires on
@@ -932,14 +978,21 @@ fn detect_voice_afk(
 /// voice-AFK per-member flags, the week-level watch candidates, and the
 /// data-quality notes. Fail-closed: the caller runs this only under complete
 /// coverage.
-fn detect_abuse(facts: &[ParsedFact<'_>]) -> (Vec<AbuseFlag>, Vec<String>, Vec<String>) {
+fn detect_abuse(
+    facts: &[ParsedFact<'_>],
+) -> (Vec<AbuseFlag>, Vec<String>, Vec<String>, DetectorInputs) {
     let mut flags = Vec::new();
     let mut candidates = Vec::new();
     let mut quality = Vec::new();
-    detect_burst(facts, &mut flags, &mut candidates);
-    detect_copy_paste(facts, &mut flags, &mut quality);
+    let burst = detect_burst(facts, &mut flags, &mut candidates);
+    let copy_paste = detect_copy_paste(facts, &mut flags, &mut quality);
     detect_voice_afk(facts, &mut flags, &mut quality);
-    (flags, candidates, quality)
+    (
+        flags,
+        candidates,
+        quality,
+        DetectorInputs { burst, copy_paste },
+    )
 }
 
 /// Build one weekly scorecard (legacy `buildCommunityScorecard`).
@@ -1390,10 +1443,15 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
     // season transition watermarks, and the abuse detectors. Detectors run
     // only under complete coverage (fail-closed); voice-AFK without occupancy
     // data yields `insufficient_data`, never a verdict.
-    let (abuse_flags, abuse_candidates, abuse_data_quality) = if complete {
+    let (abuse_flags, abuse_candidates, abuse_data_quality, detector_inputs) = if complete {
         detect_abuse(&facts)
     } else {
-        (Vec::new(), Vec::new(), Vec::new())
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            DetectorInputs::default(),
+        )
     };
     // Event-time season (AC3): the scorecard stays in its week's season even
     // when rebuilt after a quarter change. Watermarks fire only when the week
@@ -1453,6 +1511,7 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
         abuse_flags,
         abuse_candidates,
         abuse_data_quality,
+        detector_inputs,
         season_id,
         season_watermarks,
     };
