@@ -3206,7 +3206,10 @@ async fn owner_grant_rewrite_rate_limit_retries_before_saving_the_handoff() {
         .iter()
         .any(|c| c.starts_with("update_ownership")));
     assert!(!worker.dispatch_one(99).await);
-    dispatch(&mut worker, 100).await;
+    // Past the 429 deadline with slack: the wait starts at the real
+    // response time (`elapsed_ms`), so the exact boundary races loaded
+    // runners. Core queue tests pin the exact deadline arithmetic.
+    dispatch(&mut worker, 1_100).await;
     assert!(trace
         .lock()
         .unwrap()
@@ -3573,8 +3576,11 @@ async fn create_429_waits_exactly_and_does_not_consume_the_failure_budget() {
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 100).await;
     assert!(!worker.dispatch_one(1599).await);
-    dispatch(&mut worker, 1600).await;
-    dispatch(&mut worker, 1601).await;
+    // Past the 429 deadline with slack: the wait starts at the real
+    // response time (`elapsed_ms`), so the exact boundary races loaded
+    // runners. Core queue tests pin the exact deadline arithmetic.
+    dispatch(&mut worker, 2600).await;
+    dispatch(&mut worker, 2601).await;
     assert_eq!(
         *trace.lock().unwrap(),
         ["create", "create", "persist:500", "move:300:500"]
@@ -3729,7 +3735,9 @@ async fn a_429_requeue_keeps_one_claim_and_settles_it_once() {
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 100).await;
     assert!(worker.store.settled.lock().unwrap().is_empty());
-    dispatch(&mut worker, 1600).await;
+    // Past the 429 deadline with slack (`elapsed_ms` starts the wait at
+    // the real response time, so the exact boundary races loaded runners).
+    dispatch(&mut worker, 2600).await;
     assert_eq!(*trace.lock().unwrap(), ["create", "create", "persist:500"]);
     assert_eq!(worker.store.claims.lock().unwrap().len(), 1);
     assert_eq!(
@@ -4052,9 +4060,11 @@ async fn long_repeated_429s_reuse_one_durable_capacity_hold() {
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    dispatch(&mut worker, 350_000).await;
+    // Past each 429 deadline with slack (`elapsed_ms` starts the wait at
+    // the real response time, so the exact boundary races loaded runners).
+    dispatch(&mut worker, 351_000).await;
     assert!(worker.store.settled.lock().unwrap().is_empty());
-    dispatch(&mut worker, 700_000).await;
+    dispatch(&mut worker, 702_000).await;
     assert_eq!(worker.store.claims.lock().unwrap().len(), 1);
     assert_eq!(
         *worker.store.settled.lock().unwrap(),
@@ -4076,7 +4086,9 @@ async fn a_429_requeue_with_a_stale_join_releases_its_confirmed_absent_claim() {
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 100).await;
     worker.live.voice_update(MEMBER, None, Some(false));
-    dispatch(&mut worker, 1600).await;
+    // Past the 429 deadline with slack (`elapsed_ms` starts the wait at
+    // the real response time, so the exact boundary races loaded runners).
+    dispatch(&mut worker, 2600).await;
     assert_eq!(*trace.lock().unwrap(), ["create"]);
     assert_eq!(
         *worker.store.settled.lock().unwrap(),
@@ -4101,7 +4113,9 @@ async fn cancelled_create_settlement_refusal_is_reported_and_halts_on_credential
         dispatch(&mut worker, 0).await;
         worker.live.voice_update(MEMBER, None, Some(false));
         worker.store.settle_errors.lock().unwrap().push_back(error);
-        dispatch(&mut worker, 1500).await;
+        // Past the 429 deadline with slack (`elapsed_ms` starts the wait
+        // at the real response time, so the exact boundary races runners).
+        dispatch(&mut worker, 2500).await;
         assert_eq!(
             worker.failures().back(),
             Some(&LifecycleFailure::Persistence {
