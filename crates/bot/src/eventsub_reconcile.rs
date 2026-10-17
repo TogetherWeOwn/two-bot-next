@@ -30,10 +30,12 @@
 //! `reconcile_shutdown_interrupted` with the completed/remaining action
 //! counts and skips verification; the next startup pass re-lists the real
 //! subscription state and re-plans, so nothing is left silently assumed.
-//! The owner retains the spawned handle and [`join`]s it within
-//! [`SHUTDOWN_DRAIN`]; only a task that outlives that drain is aborted, and
-//! that abort logs `reconcile_shutdown_drain_exceeded` because an in-flight
-//! remote mutation outcome is then uncertain until the next startup pass.
+//! The owner retains the spawned handle and [`join`]s it with what is left of
+//! the same shutdown deadline (capped by [`SHUTDOWN_DRAIN`]), never a fresh
+//! drain after the service drain; only a task that outlives that shared
+//! budget is aborted, and that abort logs
+//! `reconcile_shutdown_drain_exceeded` because an in-flight remote mutation
+//! outcome is then uncertain until the next startup pass.
 
 use std::{collections::HashMap, future::Future, time::Duration};
 
@@ -56,12 +58,14 @@ pub const BROADCASTERS_ENV: &str = "TWO_TWITCH_BROADCASTERS";
 /// per pass) and bounds how long a dropped subscription stays dark.
 pub const RECONCILE_INTERVAL_SECS: u64 = 3_600;
 
-/// How long the owner waits for the reconcile task to stop after shutdown
-/// latches before aborting it in [`join`]. A pass stops cooperatively between
-/// Helix calls, so the wait is at most one in-flight action: a create can add
-/// a confirmation listing to its own round trip, hence two Helix transport
-/// timeouts plus margin. The task normally exits long before this expires
-/// because it drains concurrently with the gateway/HTTP drain.
+/// Cap for how long the owner waits for the reconcile task to stop after
+/// shutdown latches before aborting it in [`join`]. A pass stops
+/// cooperatively between Helix calls, so the wait is at most one in-flight
+/// action: a create can add a confirmation listing to its own round trip,
+/// hence two Helix transport timeouts plus margin. The owner passes
+/// `min(SHUTDOWN_DRAIN, deadline - elapsed)` so the whole drain stays bounded
+/// by `SHUTDOWN_TIMEOUT_SECONDS`. The task normally exits long before the cap
+/// expires because it drains concurrently with the gateway/HTTP drain.
 pub const SHUTDOWN_DRAIN: Duration = Duration::from_millis(HELIX_TIMEOUT_MS * 2 + 5_000);
 
 /// What one reconcile pass did, for scalar receiver logs.

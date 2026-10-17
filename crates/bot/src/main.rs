@@ -108,6 +108,7 @@ mod tracing_capture;
 mod website_jobs;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 use tracing::{info, Instrument};
@@ -402,6 +403,16 @@ async fn run(cli_args: &[String]) {
     // mutates. The handle is retained and joined after the supervisor
     // drains below, never detached.
     let reconcile_task = eventsub_reconcile::spawn_if_enabled(shutdown.subscribe());
+    // Record when the shutdown watch latches so the reconcile join below
+    // shares the same `SHUTDOWN_TIMEOUT_SECONDS` budget instead of starting
+    // a second drain after the service drain has spent it.
+    let latch_mark: Arc<std::sync::Mutex<Option<Instant>>> = Arc::new(std::sync::Mutex::new(None));
+    let latch_mark_task = Arc::clone(&latch_mark);
+    let mut latch_rx = shutdown.subscribe();
+    let latch_observer = tokio::spawn(async move {
+        let _ = latch_rx.wait_for(|latched| *latched).await;
+        *latch_mark_task.lock().expect("latch mark") = Some(Instant::now());
+    });
 
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
@@ -755,9 +766,19 @@ async fn run(cli_args: &[String]) {
     // Both branches latch the shutdown watch before returning (the gateway
     // supervisor sends it before its drain; the HTTP/job serve path sends
     // it before joining its supervisor), so the reconcile task has been
-    // draining concurrently. Join it within its bounded drain rather than
-    // exiting over a possibly in-flight subscription mutation.
-    eventsub_reconcile::join(reconcile_task, eventsub_reconcile::SHUTDOWN_DRAIN).await;
+    // draining concurrently. Join it with what is left of the same shutdown
+    // deadline — never a fresh drain — rather than exiting over a possibly
+    // in-flight subscription mutation. The whole drain stays bounded by
+    // `SHUTDOWN_TIMEOUT_SECONDS`; a zero budget still reaps an
+    // already-finished task and only aborts one that outlived the deadline
+    // it already had concurrently.
+    latch_observer.abort();
+    let elapsed = latch_mark
+        .lock()
+        .expect("latch mark")
+        .map(|latched_at| latched_at.elapsed())
+        .unwrap_or_default();
+    eventsub_reconcile::join(reconcile_task, reconcile_join_budget(elapsed)).await;
     if result.is_err() {
         tracing::error!(
             msg = "shutdown_failed",
@@ -916,6 +937,23 @@ fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static 
     Ok((token, url, guild_id))
 }
 
+/// Reconcile join budget sharing the service shutdown deadline.
+///
+/// The reconcile task drains concurrently with the gateway/HTTP drain, so by
+/// the time the supervisor returns it has already had `elapsed_since_latch`
+/// to stop. Waiting another full [`eventsub_reconcile::SHUTDOWN_DRAIN`] would
+/// stack a second drain after [`shutdown::deadline`] (up to ~70 s total).
+/// Instead wait at most what is left of the deadline, capped by
+/// `SHUTDOWN_DRAIN`. No floor: a zero budget still reaps an already-finished
+/// task immediately, and only a still-running task is aborted — the correct
+/// drain-exceeded outcome after it already had the full deadline concurrently.
+/// This keeps the fatal restart path fast instead of delaying `exit(1)`.
+fn reconcile_join_budget(elapsed_since_latch: Duration) -> Duration {
+    shutdown::deadline()
+        .saturating_sub(elapsed_since_latch)
+        .min(eventsub_reconcile::SHUTDOWN_DRAIN)
+}
+
 /// A configured gateway is essential: never leave a health-only zombie after
 /// initialization/dispatch failure, stream termination, or a task panic. Exit
 /// nonzero so the Container supervisor can restart from the committed checkpoint.
@@ -1009,5 +1047,58 @@ async fn healthcheck() -> i32 {
         0
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod reconcile_budget_tests {
+    use super::*;
+
+    /// The reconcile join shares the service shutdown deadline: supervisor
+    /// drain plus reconcile budget never exceeds the deadline, and the budget
+    /// never exceeds `SHUTDOWN_DRAIN`. Paused clock so the simulated drain
+    /// consumes virtual time deterministically.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_join_shares_the_shutdown_budget() {
+        let deadline = shutdown::deadline();
+        // Elapsed since latch that the supervisor could have consumed.
+        for consumed_secs in [0, 1, 5, 30, 34] {
+            let elapsed = Duration::from_secs(consumed_secs);
+            if elapsed > deadline {
+                continue;
+            }
+            let budget = reconcile_join_budget(elapsed);
+            assert!(
+                budget <= eventsub_reconcile::SHUTDOWN_DRAIN,
+                "budget {budget:?} exceeds SHUTDOWN_DRAIN for elapsed {elapsed:?}"
+            );
+            // Simulate the supervisor drain, then the reconcile join, on the
+            // paused clock: the total must stay within the deadline.
+            let start = tokio::time::Instant::now();
+            tokio::time::sleep(elapsed).await;
+            tokio::time::timeout(budget, std::future::pending::<()>())
+                .await
+                .expect_err("pending never completes within budget");
+            assert!(
+                start.elapsed() <= deadline,
+                "total {:?} exceeds deadline {deadline:?} for elapsed {elapsed:?}",
+                start.elapsed()
+            );
+            assert_eq!(
+                elapsed.saturating_add(budget),
+                deadline.min(elapsed.saturating_add(eventsub_reconcile::SHUTDOWN_DRAIN)),
+                "budget must be exactly the remaining deadline capped by SHUTDOWN_DRAIN"
+            );
+        }
+        // Past the deadline there is nothing left: immediate abort, which
+        // still reaps an already-finished task without delaying the restart.
+        assert_eq!(
+            reconcile_join_budget(deadline + Duration::from_secs(1)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            reconcile_join_budget(Duration::from_secs(3_600)),
+            Duration::ZERO
+        );
     }
 }
