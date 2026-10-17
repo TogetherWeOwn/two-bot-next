@@ -37,8 +37,11 @@ IMAGE_MAX_BYTES = 112 * MIB
 # measured the identical 16,777,376 bytes (run 39061090833). The stream
 # retention-expiry slice (ac8fd66, fence-preserving expiry of delivered
 # go-live dedup rows) tipped the full 16 MiB budget with no new
-# dependencies and no release-profile change. 17 MiB restores the tripwire
-# with 1,048,416 bytes (1.00 MiB, 5.9%) headroom; revisit if approached.
+# dependencies and no release-profile change. Main tip 89503f71 measured
+# 16,776,096 bytes (16.00 MiB, 1,120 bytes of headroom) and the voice
+# rename-decision logs (#1064) added 3,160 bytes (merged head 6a9c394e:
+# 16,779,256 bytes, 2,040 over 16 MiB), likewise with no new dependencies.
+# 17 MiB restores the tripwire with ~1.00 MiB headroom; revisit if approached.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
