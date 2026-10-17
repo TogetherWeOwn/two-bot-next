@@ -10,8 +10,8 @@ use two_bot_core::custom_commands::{
 /// the template may reach past the 2000-unit stored bound so oversized paths
 /// stay reachable, while each context field stays small enough that even a
 /// fully-expanded render stays computable without materialising a huge string
-/// (the production renderer measures each expansion before pushing it and
-/// refuses at the first overflow).
+/// (the production renderer measures each expansion in bytes before pushing it
+/// and refuses past a byte tripwire).
 const MAX_TEMPLATE_FIELD_CHARS: usize = 4096;
 const MAX_CTX_FIELD_CHARS: usize = 512;
 /// At most template + four context fields; extras are ignored.
@@ -74,9 +74,9 @@ fuzz_target!(|data: &[u8]| {
     let capped = placeholders_in(&hostile);
     assert!(capped.len() <= MAX_PLACEHOLDERS);
     assert_eq!(capped.len(), MAX_PLACEHOLDERS);
-    // Hostile expansion pin: refusal at the first overflow carries the running
-    // length when the ceiling was crossed (here the first 10_000-unit
-    // expansion already breaches it), never the materialised huge string.
+    // Hostile expansion pin: the byte tripwire refuses before the first push
+    // (here 10_000 expansion bytes already breach it), reporting bytes always
+    // past the ceiling instead of the materialised huge string.
     let big_ctx = TemplateContext {
         user: "y".repeat(10_000),
         username: String::new(),

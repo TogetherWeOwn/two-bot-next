@@ -135,16 +135,15 @@ pub fn validate_template(template: &str) -> Result<(), TemplateError> {
 /// Render a validated template against `ctx` (legacy `renderTemplate`).
 /// Unknown-but-pattern-matching keys render literally (unreachable after
 /// validation, kept so render never invents text); output past Discord's
-/// ceiling is refused. Each expansion is measured before it is pushed and the
-/// render refuses at the first overflow, so a hostile placeholder/context
-/// combination fails as a bounded `RenderTooLong` — carrying the running
-/// length when the ceiling was crossed, always past it — without ever
-/// materialising the huge string. Single-expansion overflows keep their exact
-/// length; only the multi-expansion total is a detected-at-overflow prefix.
+/// ceiling is refused. Each expansion is measured in bytes before it is pushed
+/// and the render refuses past a byte tripwire (`3 *` the ceiling: byte length
+/// upper-bounds UTF-16 length, so past the tripwire the output is certainly
+/// over-ceiling), without ever materialising the huge string. Outputs within
+/// the tripwire render exactly as before, keeping exact lengths; tripwire
+/// refusals report expansion bytes, always past the ceiling.
 pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, TemplateError> {
     let bytes = template.as_bytes();
     let mut out = String::new();
-    let mut units = 0usize;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
@@ -157,9 +156,9 @@ pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, 
                     "channel" => ctx.channel.as_str(),
                     _ => &template[i..end],
                 };
-                units = units.saturating_add(text.encode_utf16().count());
-                if units > MAX_RENDERED_CHARS {
-                    return Err(TemplateError::RenderTooLong(units));
+                let approx = out.len().saturating_add(text.len());
+                if approx > MAX_RENDERED_CHARS * 3 {
+                    return Err(TemplateError::RenderTooLong(approx));
                 }
                 out.push_str(text);
                 i = end;
@@ -167,15 +166,13 @@ pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, 
             }
         }
         // Advance one char (templates are validated UTF-8 by construction).
-        // `i` stays on a char boundary: it starts there and each step moves
-        // past ASCII braces or one full `char`, so this never panics.
         let ch = template[i..].chars().next().expect("char boundary");
-        units = units.saturating_add(ch.len_utf16());
-        if units > MAX_RENDERED_CHARS {
-            return Err(TemplateError::RenderTooLong(units));
-        }
         out.push(ch);
         i += ch.len_utf8();
+    }
+    let len = out.encode_utf16().count();
+    if len > MAX_RENDERED_CHARS {
+        return Err(TemplateError::RenderTooLong(len));
     }
     Ok(out)
 }
@@ -743,9 +740,9 @@ mod tests {
     fn template_render_hostile_expansion_refused_without_panic() {
         // Degenerate expansion: many placeholders over a large context must
         // fail as a bounded RenderTooLong, never panic, hang, or materialise
-        // the huge string. The renderer refuses at the first overflow, so the
-        // reported length is the running length when the ceiling was crossed
-        // (here the first 10_000-unit expansion already breaches it).
+        // the huge string. The byte tripwire refuses before the first push
+        // (here 10_000 expansion bytes already breach it), reporting bytes
+        // always past the ceiling.
         let ctx = TemplateContext {
             user: "y".repeat(10_000),
             username: String::new(),
