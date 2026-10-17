@@ -29,7 +29,7 @@ Keys in
 legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`
 partition in `settings.rs`); every other storable key reports cold.
 
-The thirty-two keys in `STORE_READ_KEYS`
+The thirty-four keys in `STORE_READ_KEYS`
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and
@@ -53,7 +53,11 @@ sweep (`crates/bot/src/audit_runtime.rs`), where blanking all three parks the
 mirror live and a malformed row keeps the last good destinations; ticket operations apply
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery
-and purge (`crates/bot/src/ticket_runtime.rs`). Three boot-only edges
+and purge (`crates/bot/src/ticket_runtime.rs`); the gateway funnel applies
+`TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`
+from the snapshot on every guild message, refreshing the channel classifier
+and the community-facts sink together before the message's channel class is
+stamped (`crates/bot/src/gateway.rs`, `crates/discord/src/leveling_runtime.rs`). Three boot-only edges
 remain: the feed supervisor still wakes on the boot cadence, so a stored
 interval change takes effect no earlier than the previously scheduled slot
 and runs at the stored value rounded up to a multiple of the boot cadence
@@ -81,8 +85,11 @@ When voice is enabled, `build_production_runtime` also reads
 `TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely
 for delete protection, not creator provisioning. Its empty grace is fixed at
 60 seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600) sets it.
-Onboarding, automod, scorecard and classifier typed loaders exist but are not
-called during boot; their defaults below come from empty-map calls. The separate
+Onboarding, automod and scorecard typed loaders exist but are not
+called during boot; their defaults below come from empty-map calls. The
+classifier loader runs when the ordered pipeline is built and again when
+community-facts capture is armed, then refreshes live per guild message as
+above. The separate
 `preflight` operator CLI validates further catalog keys from the environment
 (channel references, panels, onboarding mode) as a read-only pre-deploy check;
 it applies nothing to the running gateway.
@@ -181,14 +188,14 @@ Catalog entries: 130.
 | `TWO_COMMUNITY_AUTOMATION_ACTOR_IDS` | hot | `[]` | stored unwired | Automation actors excluded from human community activity. |
 | `TWO_COMMUNITY_CLASSIFIER_VERSION` | hot | `"community-v1"` | stored unwired | Version label for community classification. |
 | `TWO_COMMUNITY_CORRECTION_CYCLES` | cold | `0` | stored unwired | Non-negative count of operator scorecard corrections. |
-| `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` | hot | Not specified in Next | stored unwired | Channels considered for human community activity. |
+| `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Channels considered for human community activity. |
 | `TWO_COMMUNITY_RAID_ACTOR_IDS` | hot | `[]` | stored unwired | Known raid actors excluded from human activity classification. |
 | `TWO_COMMUNITY_RECOMMENDATIONS` | cold | `true` | stored unwired | Permit scorecard recommendations unless explicitly disabled with 0. |
 | `TWO_COMMUNITY_SCORECARD` | cold | `false` | stored unwired | Enable the weekly scorecard job. Live fact capture covers event_attended, voice_session_started, voice_session_ended, message_created, rules_accepted and member_joined. |
 | `TWO_COMMUNITY_STAGING_ACTOR_IDS` | hot | `[]` | stored unwired | Staging actors excluded from human community activity. |
 | `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | stored unwired | Staging guilds excluded from human community activity. |
 | `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | stored unwired | Test actors excluded from human community activity. |
-| `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | Not specified in Next | stored unwired | Welcome-channel classification for community analytics. |
+| `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Welcome-channel classification for community analytics. |
 | `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token. |
 | `TWO_DB_POOL_MAX` | env_only | Not specified in Next | environment only | Legacy database pool maximum read before the settings store exists. |
 | `TWO_EVENTSUB` | env_only | Not specified in Next | environment only | Master gate for the private EventSub receiver; exactly 1 enables the container listener, any other state stays dark. |

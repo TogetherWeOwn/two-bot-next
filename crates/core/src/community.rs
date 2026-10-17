@@ -27,7 +27,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 
-use super::funnel::{format_iso_millis, parse_iso_millis};
+use super::funnel::{format_iso_millis, parse_iso_millis, Snowflake};
+use super::handlers::ChannelClass;
+use super::internal_actions::is_snowflake;
 
 /// Fact streams, in legacy heartbeat order (legacy `COMMUNITY_FACT_TYPES`).
 pub const COMMUNITY_FACT_TYPES: [&str; 6] = [
@@ -170,6 +172,8 @@ pub struct ClassifierConfig {
     pub staging_guild_ids: HashSet<String>,
     pub staging_actor_ids: HashSet<String>,
     pub test_actor_ids: HashSet<String>,
+    pub human_channel_ids: HashSet<String>,
+    pub welcome_channel_ids: HashSet<String>,
 }
 
 impl Default for ClassifierConfig {
@@ -181,6 +185,8 @@ impl Default for ClassifierConfig {
             staging_guild_ids: HashSet::new(),
             staging_actor_ids: HashSet::new(),
             test_actor_ids: HashSet::new(),
+            human_channel_ids: HashSet::new(),
+            welcome_channel_ids: HashSet::new(),
         }
     }
 }
@@ -243,6 +249,16 @@ fn id_set(vars: &HashMap<String, String>, key: &str) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// Channel sets keep only Discord snowflakes (17-20 ASCII digits, the
+/// [`is_snowflake`] rule): malformed entries drop silently and never
+/// reject their valid siblings, so `from_map` stays infallible.
+fn snowflake_id_set(vars: &HashMap<String, String>, key: &str) -> HashSet<String> {
+    id_set(vars, key)
+        .into_iter()
+        .filter(|id| is_snowflake(id))
+        .collect()
+}
+
 impl ClassifierConfig {
     /// Read classifier config from the process environment (legacy
     /// `loadCommunityClassifierConfig`).
@@ -263,6 +279,23 @@ impl ClassifierConfig {
             staging_guild_ids: id_set(vars, "TWO_COMMUNITY_STAGING_GUILD_IDS"),
             staging_actor_ids: id_set(vars, "TWO_COMMUNITY_STAGING_ACTOR_IDS"),
             test_actor_ids: id_set(vars, "TWO_COMMUNITY_TEST_ACTOR_IDS"),
+            human_channel_ids: snowflake_id_set(vars, "TWO_COMMUNITY_HUMAN_CHANNEL_IDS"),
+            welcome_channel_ids: snowflake_id_set(vars, "TWO_COMMUNITY_WELCOME_CHANNEL_IDS"),
+        }
+    }
+
+    /// Channel class for message attribution: `Welcome` when the channel
+    /// is in the welcome set, else `Human` when in the human set, else
+    /// `Other`. Welcome wins for a channel present in both sets.
+    #[must_use]
+    pub fn channel_class(&self, channel_id: Snowflake) -> ChannelClass {
+        let id = channel_id.to_string();
+        if self.welcome_channel_ids.contains(&id) {
+            ChannelClass::Welcome
+        } else if self.human_channel_ids.contains(&id) {
+            ChannelClass::Human
+        } else {
+            ChannelClass::Other
         }
     }
 }
