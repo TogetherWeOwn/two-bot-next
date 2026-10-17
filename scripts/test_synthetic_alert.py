@@ -81,6 +81,64 @@ class SyntheticAlertTests(unittest.TestCase):
         self.assertTrue(recovery.startswith("two-bot-next RECOVERY synthetic-user-flow:staging"))
         self.assertIn("healthy again", recovery)
 
+    def test_skipped_noop_never_closes_incident_or_fakes_delivery(self):
+        # Post-split history: success means delivered, failure means
+        # undelivered, skipped/None is a no-op that leaves state unchanged.
+        # [(failure, success), (failure, success), (success, skipped)] keeps
+        # the incident open with recovery still due on the next green run.
+        previous = [("success", "skipped"), ("failure", "success"), ("failure", "success")]
+        failures, incident, delivered = history.incident_state(previous)
+        self.assertTrue(incident)
+        self.assertTrue(delivered)
+        self.assertEqual(history.transition("success", previous), "recovery")
+        # Mirror image: a failed post followed by a skipped green no-op must
+        # not read as delivered, so recovery is withheld and the late alert
+        # is still due.
+        undelivered = [("success", "skipped"), ("failure", "failure"), ("failure", "success")]
+        failures, incident, delivered = history.incident_state(undelivered)
+        self.assertTrue(incident)
+        self.assertFalse(delivered)
+        self.assertEqual(history.transition("success", undelivered), "alert")
+
+    def test_history_error_on_green_keeps_incident_open(self):
+        # A history-read error on the first green run after an incident must
+        # not close the incident: decide returns no event (green stays green)
+        # and the next green run with good history still owes the recovery.
+        with mock.patch.object(alert, "previous_probe_outcomes",
+                               side_effect=history.HistoryError("history unavailable")):
+            self.assertIsNone(alert.decide_event({**self.base_env(), "PROBE_OUTCOME": "success",
+                                                  "FORCE_FAIL": "false"}, "staging"))
+        delivered = [("failure", "success"), ("failure", "success")]
+        self.assertEqual(alert.transition("success", delivered), "recovery")
+
+    def test_decide_only_writes_event_and_post_only_delivers_without_history(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as output:
+            output_path = output.name
+        try:
+            with mock.patch.dict(os.environ, {**self.base_env(), "PROBE_OUTCOME": "failure",
+                                                "FORCE_FAIL": "false",
+                                                "GITHUB_OUTPUT": output_path}, clear=True), \
+                    redirect_stderr(io.StringIO()), \
+                    mock.patch.object(alert, "previous_probe_outcomes",
+                                      return_value=[("failure", "success")]):
+                code = alert.main(["--env", "staging", "--evidence", self.evidence,
+                                   "--decide-only"])
+            self.assertEqual(code, 0)
+            self.assertIn("event=alert", Path(output_path).read_text())
+            with mock.patch.dict(os.environ, {**self.base_env(), "ALERT_EVENT": "alert"},
+                                 clear=True), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
+                    mock.patch.object(alert, "post") as post, \
+                    mock.patch.object(alert, "previous_probe_outcomes",
+                                      side_effect=AssertionError("post must not read history")):
+                code = alert.main(["--env", "staging", "--evidence", self.evidence,
+                                   "--post-only"])
+            self.assertEqual(code, 0)
+            post.assert_called_once()
+        finally:
+            Path(output_path).unlink(missing_ok=True)
+
     def test_history_uses_only_prior_scheduled_probe_samples(self):
         runs = {"workflow_runs": [
             {"id": 102, "run_number": 11, "event": "workflow_dispatch"},

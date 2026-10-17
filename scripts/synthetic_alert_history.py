@@ -17,6 +17,13 @@ ALERT_STEPS = {
     "staging": "Alert the ops channel on incident transition",
     "prod": "Alert the ops channel on incident transition",
 }
+# Decide step (writes event to GITHUB_OUTPUT, never posts). The post step
+# above is the only delivery signal: success means delivered, failure means
+# undelivered, skipped/None means no-op and must not move incident state.
+DECIDE_STEPS = {
+    "staging": "Decide the synthetic alert event",
+    "prod": "Decide the synthetic alert event",
+}
 JOB_NAMES = {
     "staging": "staging user-flow synthetic",
     "prod": "prod passive user-flow synthetic",
@@ -28,7 +35,13 @@ class HistoryError(Exception):
 
 
 def incident_state(previous):
-    """Rebuild whether the recent incident was alerted and then recovered."""
+    """Rebuild whether the recent incident was alerted and then recovered.
+
+    Only a post-step conclusion of "success" counts as delivered; "failure"
+    means undelivered. Any other conclusion ("skipped", None, cancelled)
+    is a no-op and leaves incident state unchanged, so a history-read
+    no-op can never close an open incident or fake a delivery.
+    """
     failures = 0
     incident = False
     alert_delivered = False

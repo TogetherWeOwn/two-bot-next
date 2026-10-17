@@ -15,6 +15,7 @@ _HISTORY_SPEC = importlib.util.spec_from_file_location(
 _HISTORY_MODULE = importlib.util.module_from_spec(_HISTORY_SPEC)
 _HISTORY_SPEC.loader.exec_module(_HISTORY_MODULE)
 ALERT_STEPS = _HISTORY_MODULE.ALERT_STEPS
+DECIDE_STEPS = _HISTORY_MODULE.DECIDE_STEPS
 JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
 PROBE_STEPS = _HISTORY_MODULE.PROBE_STEPS
 STATIC_FALSE = "${{ false }}"
@@ -1416,9 +1417,12 @@ def synthetic_user_flow_errors(workflow):
     staging health-contract probe, `prod-passive` runs the reviewed passive
     production probe (observe and alert only, never a deploy gate). Each job
     has an optional target probe, a notice when its binding is absent, an
-    always() evidence upload, and an always() transition step. That step reads
-    recent run history with actions:read, alerts after two failures, and posts
-    recovery once. No wrangler, no deploy route, no `set -x`.
+    always() evidence upload, an always() decide step, and a gated post step.
+    The decide step reads recent run history with actions:read, alerts after
+    two failures, and writes the event to GITHUB_OUTPUT; the post step runs
+    only when an event is due so a no-op is skipped (never success), and only
+    a successful post counts as delivered. No wrangler, no deploy route, no
+    `set -x`.
     """
     name = "synthetic-user-flow.yml"
     errors = []
@@ -1465,10 +1469,10 @@ def synthetic_user_flow_errors(workflow):
             if key in job:
                 errors.append(f"{name}:{job_id}: must not set {key}")
         steps = job.get("steps") or []
-        if len(steps) != 5:
-            errors.append(f"{name}:{job_id}: must run checkout, probe, notice, upload and alert")
+        if len(steps) != 6:
+            errors.append(f"{name}:{job_id}: must run checkout, probe, notice, upload, decide and alert")
             continue
-        checkout, probe_step, notice, upload, alert_step = steps
+        checkout, probe_step, notice, upload, decide_step, alert_step = steps
         if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
                 or (checkout.get("with") or {}).get("persist-credentials") != "false":
             errors.append(f"{name}:{job_id}: checkout must be pinned and must not persist credentials")
@@ -1484,29 +1488,47 @@ def synthetic_user_flow_errors(workflow):
             errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
         if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
             errors.append(f"{name}:{job_id}: must upload the run evidence artifact")
-        if alert_step.get("if") != "always()":
-            errors.append(f"{name}:{job_id}: transition step must run with if: always()")
-        if "scripts/synthetic_alert.py" not in str(alert_step.get("run", "")):
-            errors.append(f"{name}:{job_id}: alert step must call scripts/synthetic_alert.py")
+        if decide_step.get("if") != "always()":
+            errors.append(f"{name}:{job_id}: decide step must run with if: always()")
+        if "scripts/synthetic_alert.py" not in str(decide_step.get("run", "")) \
+                or "--decide-only" not in str(decide_step.get("run", "")):
+            errors.append(f"{name}:{job_id}: decide step must call scripts/synthetic_alert.py --decide-only")
+        if decide_step.get("id") != "decide":
+            errors.append(f"{name}:{job_id}: decide step must expose id decide for the post gate")
+        if alert_step.get("if") != "steps.decide.outputs.event != ''":
+            errors.append(f"{name}:{job_id}: post step must run only when steps.decide.outputs.event != ''")
+        if "scripts/synthetic_alert.py" not in str(alert_step.get("run", "")) \
+                or "--post-only" not in str(alert_step.get("run", "")):
+            errors.append(f"{name}:{job_id}: alert step must call scripts/synthetic_alert.py --post-only")
         environment = "staging" if job_id == "staging" else "prod"
         job_name = JOB_NAMES[environment]
         probe_name = PROBE_STEPS[environment]
         alert_name = ALERT_STEPS[environment]
+        decide_name = DECIDE_STEPS[environment]
         if job.get("name") != job_name:
             errors.append(f"{name}:{job_id}: job name must match synthetic alert history lookup")
         if probe_step.get("name") != probe_name:
             errors.append(f"{name}:{job_id}: probe step name must match synthetic alert history lookup")
+        if decide_step.get("name") != decide_name:
+            errors.append(f"{name}:{job_id}: decide step name must match synthetic alert history lookup")
         if alert_step.get("name") != alert_name:
             errors.append(f"{name}:{job_id}: alert step name must match synthetic alert history lookup")
+        decide_env = decide_step.get("env") or {}
+        if (decide_env.get("GITHUB_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
+                or decide_env.get("PROBE_OUTCOME") != "${{ steps.probe.outcome }}"
+                or "SYNTHETIC_ALERT_WEBHOOK_URL" in decide_env
+                or "secrets." in str(decide_step.get("run", ""))):
+            errors.append(f"{name}:{job_id}: decide step must pass token and outcome via env only")
         alert_env = alert_step.get("env") or {}
-        if (alert_env.get("GITHUB_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
-                or alert_env.get("PROBE_OUTCOME") != "${{ steps.probe.outcome }}"
-                or "SYNTHETIC_ALERT_WEBHOOK_URL" not in alert_env
+        if (alert_env.get("SYNTHETIC_ALERT_WEBHOOK_URL") != "${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}"
+                or alert_env.get("ALERT_EVENT") != "${{ steps.decide.outputs.event }}"
+                or "GITHUB_TOKEN" in alert_env
+                or "PROBE_OUTCOME" in alert_env
                 or "secrets." in str(alert_step.get("run", ""))):
-            errors.append(f"{name}:{job_id}: transition step must pass token, outcome and webhook via env only")
+            errors.append(f"{name}:{job_id}: post step must pass webhook and decided event via env only")
         for step in steps:
-            if step is not alert_step and "secrets." in str(step):
-                errors.append(f"{name}:{job_id}: only the alert step may hold a secret")
+            if step not in (decide_step, alert_step) and "secrets." in str(step):
+                errors.append(f"{name}:{job_id}: only the decide and alert steps may hold a secret")
     text = str(jobs).lower().replace(" ", "")
     for marker in ("wrangler", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
                    "cloudflare_api_token", "ownership_control"):

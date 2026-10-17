@@ -107,45 +107,54 @@ def post(webhook_url, content):
         raise AlertError(f"alert delivery failed with status {status}")
 
 
-def parse_args(argv):
-    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    parser.add_argument("--env", required=True, choices=("staging", "prod"),
-                        help="which synthetic failed")
-    parser.add_argument("--evidence", required=True,
-                        help="probe evidence receipt (missing reads as unknown build)")
-    return parser.parse_args(argv)
-
-
-def main(argv=None):
-    args = parse_args(argv)
-    current = os.environ.get("PROBE_OUTCOME")
-    # A missing/skipped probe (for example, an unset optional target binding)
-    # is not a sample and must not create an alert or recovery transition.
+def decide_event(env, environment):
+    """Compute the alert transition without posting (decide step)."""
+    current = env.get("PROBE_OUTCOME")
     if current not in ("success", "failure"):
-        print("synthetic_alert: no probe sample; no alert transition", file=sys.stderr)
-        return 0
+        return None
     try:
-        previous = previous_probe_outcomes(os.environ, args.env)
+        previous = previous_probe_outcomes(env, environment)
     except HistoryError as error:
         if current == "success":
-            print(f"synthetic_alert: warning: {error}; healthy probe remains green", file=sys.stderr)
-            return 0
-        print(f"synthetic_alert: warning: {error}; sending failure alert without history", file=sys.stderr)
-        previous = []
-        force_fail = True
+            print(f"synthetic_alert: warning: {error}; healthy probe remains green",
+                  file=sys.stderr)
+            return None
+        # Fail open on a real probe failure without history: alert now so a
+        # missing incident is never silent. If the history error landed on
+        # the first failure of an incident this duplicates the alert on the
+        # next failure; that duplicate is intentional versus a lost incident.
+        print(f"synthetic_alert: warning: {error}; sending failure alert without history",
+              file=sys.stderr)
+        return "alert"
+    force_fail = env.get("FORCE_FAIL") == "true"
+    return transition(current, previous, force_fail)
+
+
+def write_event(event):
+    """Record the decide-step event for the post-step gate."""
+    value = event or ""
+    path = os.environ.get("GITHUB_OUTPUT")
+    line = f"event={value}\n"
+    if path:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line)
     else:
-        force_fail = os.environ.get("FORCE_FAIL") == "true"
-    event = transition(current, previous, force_fail)
-    if event is None:
+        print(line, end="")
+    print(f"synthetic_alert: decided event={value or 'none'}", file=sys.stderr)
+
+
+def post_event(env, environment, evidence_path, event):
+    """Post a decided alert/recovery event without re-reading history."""
+    if event not in ("alert", "recovery"):
         print("synthetic_alert: no alert transition", file=sys.stderr)
         return 0
-    webhook_url = os.environ.get("SYNTHETIC_ALERT_WEBHOOK_URL")
+    webhook_url = env.get("SYNTHETIC_ALERT_WEBHOOK_URL")
     if not webhook_url:
         print("synthetic_alert: SYNTHETIC_ALERT_WEBHOOK_URL is not set", file=sys.stderr)
         return 1
-    evidence = load_evidence(args.evidence)
-    content = build_content(args.env, evidence,
-                            os.environ.get("GIT_SHA") or os.environ.get("GITHUB_SHA"),
+    evidence = load_evidence(evidence_path)
+    content = build_content(environment, evidence,
+                            env.get("GIT_SHA") or env.get("GITHUB_SHA"),
                             run_link(), event)
     print(content)
     try:
@@ -153,8 +162,53 @@ def main(argv=None):
     except AlertError as error:
         print(f"synthetic_alert: {error}", file=sys.stderr)
         return 1
-    print(f"synthetic_alert: delivered {event} for {args.env}", file=sys.stderr)
+    print(f"synthetic_alert: delivered {event} for {environment}", file=sys.stderr)
     return 0
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("--env", required=True, choices=("staging", "prod"),
+                        help="which synthetic failed")
+    parser.add_argument("--evidence", required=True,
+                        help="probe evidence receipt (missing reads as unknown build)")
+    parser.add_argument("--decide-only", action="store_true",
+                        help="only compute the transition and write event to GITHUB_OUTPUT")
+    parser.add_argument("--post-only", action="store_true",
+                        help="only post ALERT_EVENT without reading workflow history")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.decide_only and args.post_only:
+        print("synthetic_alert: --decide-only and --post-only are exclusive", file=sys.stderr)
+        return 2
+    if args.decide_only:
+        # Decide step: compute the transition, never post, never need webhook.
+        # A missing/skipped probe is not a sample and writes an empty event.
+        event = decide_event(os.environ, args.env)
+        if event is None and os.environ.get("PROBE_OUTCOME") not in ("success", "failure"):
+            print("synthetic_alert: no probe sample; no alert transition", file=sys.stderr)
+        write_event(event)
+        return 0
+    if args.post_only:
+        # Post step: deliver the decided event without re-reading history, so
+        # a no-op is a skipped step (never success) and only success delivery
+        # closes an incident in history.
+        event = os.environ.get("ALERT_EVENT") or ""
+        return post_event(os.environ, args.env, args.evidence, event)
+    current = os.environ.get("PROBE_OUTCOME")
+    # A missing/skipped probe (for example, an unset optional target binding)
+    # is not a sample and must not create an alert or recovery transition.
+    if current not in ("success", "failure"):
+        print("synthetic_alert: no probe sample; no alert transition", file=sys.stderr)
+        return 0
+    event = decide_event(os.environ, args.env)
+    if event is None:
+        print("synthetic_alert: no alert transition", file=sys.stderr)
+        return 0
+    return post_event(os.environ, args.env, args.evidence, event)
 
 
 if __name__ == "__main__":

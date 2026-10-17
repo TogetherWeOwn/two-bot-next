@@ -23,8 +23,14 @@ only, and never blocks a deploy.
 Two consecutive failed probes open one Discord ops-channel incident via
 `scripts/synthetic_alert.py`; further failed samples are suppressed until a
 successful probe posts one recovery message. This mirrors the Worker's
-failure-threshold and one-alert-per-incident behavior. The manual
-`force_fail: true` staging proof bypasses the threshold intentionally:
+failure-threshold and one-alert-per-incident behavior. A decide step computes
+the transition and writes `event` to `GITHUB_OUTPUT`; the post step runs only
+when `steps.decide.outputs.event != ''`, so a no-op is `skipped` (never
+`success`). Only a successful post counts as delivered in
+`scripts/synthetic_alert_history.py`; `skipped` or missing delivery leaves
+the incident open, so a history-read no-op can never drop a recovery or fake
+a delivery. The manual `force_fail: true` staging proof bypasses the
+threshold intentionally:
 
 ```text
 two-bot-next ALERT synthetic-user-flow:<staging|prod>: <failing checks>. Runbook: <runbook URL> | build <revision> <build_id> (git <sha>) | logs <github run URL>

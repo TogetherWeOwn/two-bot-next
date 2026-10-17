@@ -5,7 +5,10 @@ name: synthetic-user-flow
 # read-only GETs against its own Worker origin. A probe failure posts one
 # Discord ops-channel alert reusing the Worker alert pattern (build revision
 # plus the GitHub run link). Alerts fire after two consecutive failed probes,
-# once per incident, with a recovery message on the first successful probe.
+# once per incident, with a recovery message on the first successful probe
+# after a delivered alert. A decide step writes the event to GITHUB_OUTPUT
+# and the post step runs only when an event is due, so a no-op is skipped
+# (never success): only a successful post counts as delivered in history.
 # Production is passive only: the prod job observes and alerts, it never blocks a deploy.
 #
 # When it runs: every 5 minutes on main, plus manual dispatch. The dispatch
@@ -73,18 +76,27 @@ jobs:
           path: synthetic-staging-${{ github.run_id }}.json
           if-no-files-found: ignore
           retention-days: 14
-      - name: Alert the ops channel on incident transition
+      - name: Decide the synthetic alert event
+        id: decide
         if: always()
         env:
-          SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PROBE_OUTCOME: ${{ steps.probe.outcome }}
           FORCE_FAIL: ${{ inputs.force_fail }}
           RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/synthetic_alert.py --env staging --evidence "synthetic-staging-$RUN_ID.json" --decide-only
+      - name: Alert the ops channel on incident transition
+        if: steps.decide.outputs.event != ''
+        env:
+          SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
+          ALERT_EVENT: ${{ steps.decide.outputs.event }}
+          RUN_ID: ${{ github.run_id }}
           GIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          python3 scripts/synthetic_alert.py --env staging --evidence "synthetic-staging-$RUN_ID.json"
+          python3 scripts/synthetic_alert.py --env staging --evidence "synthetic-staging-$RUN_ID.json" --post-only
   prod-passive:
     name: prod passive user-flow synthetic
     permissions:
@@ -120,14 +132,23 @@ jobs:
           path: synthetic-prod-${{ github.run_id }}.json
           if-no-files-found: ignore
           retention-days: 14
-      - name: Alert the ops channel on incident transition
+      - name: Decide the synthetic alert event
+        id: decide
         if: always()
         env:
-          SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PROBE_OUTCOME: ${{ steps.probe.outcome }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/synthetic_alert.py --env prod --evidence "synthetic-prod-$RUN_ID.json" --decide-only
+      - name: Alert the ops channel on incident transition
+        if: steps.decide.outputs.event != ''
+        env:
+          SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
+          ALERT_EVENT: ${{ steps.decide.outputs.event }}
           RUN_ID: ${{ github.run_id }}
           GIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          python3 scripts/synthetic_alert.py --env prod --evidence "synthetic-prod-$RUN_ID.json"
+          python3 scripts/synthetic_alert.py --env prod --evidence "synthetic-prod-$RUN_ID.json" --post-only
