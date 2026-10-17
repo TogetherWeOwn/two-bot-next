@@ -628,14 +628,18 @@ impl<S: FunnelStore> OrderedLevelingPipeline<S> {
         let pending = DeferredLeveling::default();
         let facts = DeferredCommunityFacts::default();
         let classifier = SettingsChannelClassifier::new(ClassifierConfig::from_env());
+        let pipeline = Pipeline::new(
+            store,
+            Some(pending.clone()),
+            Some(facts.clone()),
+            NoInvites,
+            classifier.clone(),
+        );
+        // The live wrapper fails closed: no lengths are measured until the
+        // gateway runtime declares its `MESSAGE_CONTENT` subscription.
+        pipeline.set_message_content_delivered(false);
         Self {
-            pipeline: Pipeline::new(
-                store,
-                Some(pending.clone()),
-                Some(facts.clone()),
-                NoInvites,
-                classifier.clone(),
-            ),
+            pipeline,
             classifier,
             pending,
             facts,
@@ -655,15 +659,19 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         let pending = DeferredLeveling::default();
         let facts = DeferredCommunityFacts::default();
         let classifier = SettingsChannelClassifier::new(ClassifierConfig::from_env());
+        let pipeline = Pipeline::with_snapshots(
+            store,
+            Some(pending.clone()),
+            Some(facts.clone()),
+            invite_source,
+            classifier.clone(),
+            snapshots,
+        );
+        // Fail closed like `new`: the gateway runtime declares the real
+        // `MESSAGE_CONTENT` subscription before its shard runs.
+        pipeline.set_message_content_delivered(false);
         Self {
-            pipeline: Pipeline::with_snapshots(
-                store,
-                Some(pending.clone()),
-                Some(facts.clone()),
-                invite_source,
-                classifier.clone(),
-                snapshots,
-            ),
+            pipeline,
             classifier,
             pending,
             facts,
@@ -674,6 +682,12 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
 
     pub fn handlers(&self) -> &FunnelHandlers<S, DeferredLeveling, DeferredCommunityFacts> {
         self.pipeline.handlers()
+    }
+
+    /// Declare whether the shard feeding this pipeline subscribed
+    /// `MESSAGE_CONTENT`; message lengths are measured only when it did.
+    pub fn set_message_content_delivered(&self, delivered: bool) {
+        self.pipeline.set_message_content_delivered(delivered);
     }
 
     /// Arm Postgres community-facts capture for all live streams. Called once at boot when `TWO_COMMUNITY_SCORECARD=1`; without
