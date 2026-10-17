@@ -21,12 +21,17 @@ only, and never blocks a deploy.
 ## Failure alerts
 
 Two consecutive failed probes open one Discord ops-channel incident via
-`scripts/synthetic_alert.py`; further failed samples are suppressed until a
-successful probe posts one recovery message. This mirrors the Worker's
-failure-threshold and one-alert-per-incident behavior. A decide step computes
-the transition and writes `event` to `GITHUB_OUTPUT`; the post step runs only
-when `steps.decide.outputs.event != ''`, so a no-op is `skipped` (never
-`success`). Only a successful post counts as delivered in
+`scripts/synthetic_alert.py`. Once that alert is delivered, further failed
+samples are suppressed until a successful probe posts one recovery message;
+an undelivered alert is instead retried on later failed samples, and if none
+was delivered a late ALERT (with the `probe failed` fallback summary, linking
+that green run) posts on the first successful sample before any recovery.
+This mirrors the Worker's failure-threshold and one-alert-per-incident
+behavior. A decide step computes the transition and writes `event` to
+`GITHUB_OUTPUT`; the post step runs only when
+`!cancelled() && steps.decide.outputs.event != ''`, so a no-op is `skipped`
+(never `success`) and a failed probe cannot skip the post via GitHub's
+implicit `success()`. Only a successful post counts as delivered in
 `scripts/synthetic_alert_history.py`; `skipped` or missing delivery leaves
 the incident open, so a history-read no-op can never drop a recovery or fake
 a delivery. The manual `force_fail: true` staging proof bypasses the

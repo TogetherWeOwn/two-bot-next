@@ -9,6 +9,9 @@ name: synthetic-user-flow
 # after a delivered alert. A decide step writes the event to GITHUB_OUTPUT
 # and the post step runs only when an event is due, so a no-op is skipped
 # (never success): only a successful post counts as delivered in history.
+# The post gate carries !cancelled(): without a status function GitHub adds
+# an implicit success() &&, which would skip the post after a failed probe —
+# exactly when an ALERT is due.
 # Production is passive only: the prod job observes and alerts, it never blocks a deploy.
 #
 # When it runs: every 5 minutes on main, plus manual dispatch. The dispatch
@@ -88,7 +91,7 @@ jobs:
           set -euo pipefail
           python3 scripts/synthetic_alert.py --env staging --evidence "synthetic-staging-$RUN_ID.json" --decide-only
       - name: Alert the ops channel on incident transition
-        if: steps.decide.outputs.event != ''
+        if: ${{ !cancelled() && steps.decide.outputs.event != '' }}
         env:
           SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
           ALERT_EVENT: ${{ steps.decide.outputs.event }}
@@ -143,7 +146,7 @@ jobs:
           set -euo pipefail
           python3 scripts/synthetic_alert.py --env prod --evidence "synthetic-prod-$RUN_ID.json" --decide-only
       - name: Alert the ops channel on incident transition
-        if: steps.decide.outputs.event != ''
+        if: ${{ !cancelled() && steps.decide.outputs.event != '' }}
         env:
           SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
           ALERT_EVENT: ${{ steps.decide.outputs.event }}

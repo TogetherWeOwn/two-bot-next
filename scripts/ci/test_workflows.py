@@ -1495,8 +1495,14 @@ def synthetic_user_flow_errors(workflow):
             errors.append(f"{name}:{job_id}: decide step must call scripts/synthetic_alert.py --decide-only")
         if decide_step.get("id") != "decide":
             errors.append(f"{name}:{job_id}: decide step must expose id decide for the post gate")
-        if alert_step.get("if") != "steps.decide.outputs.event != ''":
+        if alert_step.get("if") != "${{ !cancelled() && steps.decide.outputs.event != '' }}":
             errors.append(f"{name}:{job_id}: post step must run only when steps.decide.outputs.event != ''")
+        # Without a status function GitHub adds an implicit success() &&, so
+        # a failed probe would skip the post step and no ALERT would go out
+        # during an outage. Keep this check even if the exact pin above moves.
+        if not any(func in str(alert_step.get("if", ""))
+                   for func in ("!cancelled()", "always()", "failure()", "success()")):
+            errors.append(f"{name}:{job_id}: post step gate must carry a status function so GitHub does not add implicit success()")
         if "scripts/synthetic_alert.py" not in str(alert_step.get("run", "")) \
                 or "--post-only" not in str(alert_step.get("run", "")):
             errors.append(f"{name}:{job_id}: alert step must call scripts/synthetic_alert.py --post-only")
