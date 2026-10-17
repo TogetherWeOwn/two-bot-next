@@ -24,12 +24,50 @@ claim → post replacement → record → delete previous (best-effort).
 | 4 | `activity_eligible`: bot authors (including our own re-post), guild mismatch and absent channel never reach the check, even when a re-post is due | `activity_gate_truth_table`, `ineligible_activity_is_ignored_even_when_repost_is_due`, `eligible_activity_without_enabled_sticky_is_no_sticky` |
 | 5 | `decide_activity` end state: the `Repost` plan names the previous sticky; driven post → record → delete, the old copy is gone and the fresh copy is last; a failed post leaves the old sticky in place and retries next activity; bursts hold inside the window, then chain | `repost_plan_targets_the_previous_sticky_for_deletion`, `successful_repost_leaves_fresh_sticky_at_the_bottom_and_old_gone`, `failed_post_never_drops_the_existing_sticky`, `burst_coalesces_until_window_then_chains_old_then_fresh` |
 
+## Runtime wiring (covered elsewhere, not by this file)
+
+The executor is wired to the sticky path; this pure suite just does not
+exercise it. In `crates/bot/src/command_runtime.rs`:
+
+- `dispatch_with_verdict` sends an accepted `MessageCreate` to `on_message`
+  when automations are enabled.
+- `on_message` runs lookup (`store::get_sticky`) → the `decide_activity`
+  precheck → the atomic `store::claim_sticky_post` → `executor.post_message`
+  → `store::record_sticky_post` → best-effort delete of the previous sticky →
+  a `sticky.run` audit row. A replacement is only recorded when Discord
+  returns a usable non-zero numeric message id. On a post error or an
+  unusable id it releases the claim, audits `post_failed` and keeps the
+  previous sticky, so the next eligible activity can retry. If recording
+  fails or reports the claim moved on, it deletes the just-posted orphan
+  instead of retiring the previous sticky.
+- `/sticky` (`sticky_set`) validates the body and debounce, upserts the row,
+  audits and replies; `/sticky-remove` (`sticky_remove`) deletes the row,
+  best-effort deletes the posted sticky, audits and replies. Rejected
+  `/sticky` input writes no row and audits `rejected`.
+
+That behavior is pinned by the database-backed tests in
+`crates/bot/src/command_runtime_tests.rs` — for example
+`burst_coalesces_to_one_repost_and_retires_previous`,
+`held_claim_blocks_the_second_attempt`, `debounce_window_holds_the_repost`,
+`post_failure_releases_claim_and_audits_post_failed`,
+`unconfirmed_replacement_preserves_previous_and_releases_claim`,
+`sticky_set_writes_row_audits_and_confirms`,
+`sticky_set_rejection_audits_rejected_and_still_replies` and
+`sticky_remove_clears_state_and_deletes_the_message`. They are `#[ignore]`d
+locally, run in CI against the test-database service
+(`cargo test -p two-bot --locked command_runtime_tests -- --ignored`), and
+drive a mock Discord REST server — not a live guild.
+
 ## Not covered here
 
 - Row 5 drives the plan through a test-local channel model in the documented
-  wire order. It proves the plan supports post-before-delete; it does not test
-  an executor, which is not wired to the sticky path yet.
+  wire order. It proves the plan supports post-before-delete; the runtime
+  executor, storage and REST calls are covered by the tests above, not by
+  this file.
 - `decide_activity` is a precheck only. The atomic `claim_sticky_post` race
   (one winner per window) is verified by the ignored live store suite
-  `crates/core/tests/sticky_store_live.rs` against agent-testdb.
-- Body validation, reply text and audit rows are outside this card.
+  `crates/core/tests/sticky_store_live.rs` against agent-testdb, and at the
+  runtime level by `burst_coalesces_to_one_repost_and_retires_previous`.
+- Nothing cited here proves live-guild behavior: real Discord permissions,
+  delivery and ordering in a staging or production guild remain outside both
+  suites.
