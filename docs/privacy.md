@@ -114,6 +114,8 @@ are outside this implementation's scope.
   there. Stale rows do expire by age on the retention cadence (see
   [Retention](#retention-and-explicit-exceptions)): aggregates whose
   `updated_at` is older than the horizon are deleted per guild.
+  Operators read these rows through the [game-activity aggregate
+  report](game-activity-report.md).
 
 The authoritative, ordered deletion manifest is
 [`member_erasure_plan.json`](../crates/cutover/src/member_erasure_plan.json).
