@@ -3100,9 +3100,12 @@ async fn moderation_snapshot_unavailable_stays_fenced_without_effect() {
 }
 
 /// Read one `two_bot_moderation_enforcements_total{verb,outcome}` sample count
-/// from the process-global registry. Callers must hold `MODERATION_FLAG_LOCK`
-/// across the before/after reads: the DB-backed resolver tests in this module
-/// record the same `refused` series.
+/// from the process-global registry. Callers must hold
+/// `super::MODERATION_METRICS_LOCK` across the before/after reads: the
+/// DB-backed resolver tests in this module and the slash preflight test in
+/// `command_runtime_tests` record the same `refused` series, and
+/// `cargo test --workspace --lib --bins` runs them as threads of one
+/// process. Acquire the metrics lock before `MODERATION_FLAG_LOCK`.
 fn moderation_samples(verb: &str, outcome: &str) -> u64 {
     let prefix =
         format!("two_bot_moderation_enforcements_total{{verb=\"{verb}\",outcome=\"{outcome}\"}} ");
@@ -3146,6 +3149,7 @@ fn resolver_refusal_counts_only_action_not_allowed() {
 /// any store use, so the lazy pool never connects and no database is needed.
 #[tokio::test]
 async fn website_kick_departed_target_records_one_refused_sample() {
+    let _metrics = super::MODERATION_METRICS_LOCK.lock().await;
     let _flag = MODERATION_FLAG_LOCK.lock().await;
     let mock = MockMembers::start(200, false).await;
     let discord =
@@ -3203,6 +3207,7 @@ async fn website_kick_departed_target_records_one_refused_sample() {
 /// the executor runs — and must still record exactly one `refused` sample.
 #[tokio::test]
 async fn website_purge_forbidden_actor_records_one_refused_sample() {
+    let _metrics = super::MODERATION_METRICS_LOCK.lock().await;
     let _flag = MODERATION_FLAG_LOCK.lock().await;
     let mock = MockMembers::start(200, true).await;
     let discord =
@@ -3260,6 +3265,7 @@ async fn website_purge_forbidden_actor_records_one_refused_sample() {
 /// without touching Discord or the store.
 #[tokio::test]
 async fn website_member_executor_disabled_records_one_refused_sample() {
+    let _metrics = super::MODERATION_METRICS_LOCK.lock().await;
     let _flag = MODERATION_FLAG_LOCK.lock().await;
     let mock = MockMembers::start(200, true).await;
     let discord =
@@ -3330,6 +3336,7 @@ async fn website_member_executor_disabled_records_one_refused_sample() {
 /// without touching Discord or the store.
 #[tokio::test]
 async fn website_channel_executor_disabled_records_one_refused_sample() {
+    let _metrics = super::MODERATION_METRICS_LOCK.lock().await;
     let _flag = MODERATION_FLAG_LOCK.lock().await;
     let mock = MockMembers::start(200, true).await;
     let discord =

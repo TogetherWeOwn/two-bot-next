@@ -3279,5 +3279,16 @@ fn now_ms() -> u64 {
         })
 }
 
+/// Serializes exact-delta `two_bot_moderation_enforcements_total` assertions
+/// on the process-global registry across test modules (TOG-28482): the
+/// website refusal/executor tests in `tests` and the slash preflight test in
+/// `command_runtime_tests` both record `refused` for the same member verbs,
+/// and `cargo test --workspace --lib --bins` runs them as threads of one
+/// process. Hold across the before/after reads. Test-only; never used in
+/// production. Acquire before any flag lock; flag locks are leaves under it.
+#[cfg(test)]
+pub(crate) static MODERATION_METRICS_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests;
