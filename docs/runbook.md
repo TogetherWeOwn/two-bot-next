@@ -241,7 +241,8 @@ names, never error text or payloads. Take the first action for the reported clas
 | `feed` | Check the configured feed source's availability and recent fetch status through authorized diagnostics; do not copy response bodies. |
 | `recovery_required` | Preserve feed cursor and pending recovery state; follow the established recovery path before any manual replay or cursor change. |
 
-The streak clears on the next successful completion.
+The streak clears on the next successful completion. For feed delivery
+specifically, follow the [feed supervisor operator guide](feed-supervisor.md).
 
 #### Alert: REST 429
 
