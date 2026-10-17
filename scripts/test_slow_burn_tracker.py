@@ -257,6 +257,79 @@ class TrackerUnitTests(unittest.TestCase):
         self.assertEqual(len(fake.issues), 1)
         self.assertEqual(json.loads(Path(ring_path).read_text()), next_ring)
 
+    def test_ring_gap_seconds(self):
+        now = 1_700_000_000
+        self.assertIsNone(tracker.ring_gap_seconds([], now))
+        self.assertIsNone(tracker.ring_gap_seconds("not-a-list", now))
+        ring = [{"t": now - 900, "received": 1, "duplicate": 0, "fastMoves": 1},
+                {"t": now - 300, "received": 2, "duplicate": 0, "fastMoves": 2}]
+        self.assertEqual(tracker.ring_gap_seconds(ring, now), 300)
+        old = [{"t": now - 900, "received": 1, "duplicate": 0, "fastMoves": 0}]
+        self.assertEqual(tracker.ring_gap_seconds(old, now), 900)
+
+    def test_coarse_ring_gap_warns_and_stays_unknown(self):
+        # GitHub runs */5 best-effort: a ring gap of 600 s or more must warn
+        # instead of reading as a clean bill of burn health.
+        now = 1_700_000_000
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(json.dumps(
+            [{"t": now - 900, "received": 25, "duplicate": 0, "fastMoves": 24}]),
+            encoding="utf-8")
+        evidence = str(self.dir / "evidence.json")
+        env = base_env({"STAGING_WORKER_URL": "https://staging.example",
+                        "METRICS_SCRAPE_TOKEN": "token"})
+        next_ring = [{"t": now, "received": 50, "duplicate": 0, "fastMoves": 48}]
+        uncovered = {"slow": False, "fast": False, "held": False,
+                     "ring": next_ring, "slowCovered": False}
+        writes = []
+        with mock.patch.object(tracker, "scrape_metrics", return_value="expo"):
+            with mock.patch.object(tracker, "run_driver", return_value=uncovered):
+                with mock.patch("sys.stdout") as stdout:
+                    with mock.patch.object(tracker.time, "time", return_value=now):
+                        code = tracker.main(
+                            ["--ring", str(ring_path), "--evidence-out", evidence,
+                             "--exposition-out", str(self.dir / "expo.prom")],
+                            env)
+                    for call in stdout.write.call_args_list:
+                        writes.append(call.args[0])
+        self.assertEqual(code, 0)
+        self.assertTrue(any("::warning::" in chunk and "coarse" in chunk
+                            for chunk in writes),
+                        f"expected a coarse-cadence warning, got {writes!r}")
+        stored = json.loads(Path(evidence).read_text())
+        self.assertEqual(stored["verdict"], "unknown")
+        self.assertEqual(stored["cadence"], "coarse")
+        self.assertEqual(stored["stale_gap_seconds"], 900)
+
+    def test_fresh_ring_has_no_cadence_warning(self):
+        now = 1_700_000_000
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(json.dumps(
+            [{"t": now - 300, "received": 25, "duplicate": 0, "fastMoves": 24}]),
+            encoding="utf-8")
+        evidence = str(self.dir / "evidence.json")
+        env = base_env({"STAGING_WORKER_URL": "https://staging.example",
+                        "METRICS_SCRAPE_TOKEN": "token"})
+        next_ring = [{"t": now, "received": 50, "duplicate": 0, "fastMoves": 48}]
+        uncovered = {"slow": False, "fast": False, "held": False,
+                     "ring": next_ring, "slowCovered": False}
+        writes = []
+        with mock.patch.object(tracker, "scrape_metrics", return_value="expo"):
+            with mock.patch.object(tracker, "run_driver", return_value=uncovered):
+                with mock.patch("sys.stdout") as stdout:
+                    with mock.patch.object(tracker.time, "time", return_value=now):
+                        code = tracker.main(
+                            ["--ring", str(ring_path), "--evidence-out", evidence,
+                             "--exposition-out", str(self.dir / "expo.prom")],
+                            env)
+                    for call in stdout.write.call_args_list:
+                        writes.append(call.args[0])
+        self.assertEqual(code, 0)
+        self.assertFalse(any("::warning::" in chunk for chunk in writes),
+                         f"fresh ring must not warn, got {writes!r}")
+        stored = json.loads(Path(evidence).read_text())
+        self.assertEqual(stored["cadence"], "ok")
+
     def test_dry_run_writes_nothing(self):
         fake = FakeGh()
         with mock.patch("subprocess.run", fake):
@@ -311,6 +384,40 @@ class TrackerDriverTests(unittest.TestCase):
         self.assertTrue(verdict["held"])
         self.assertFalse(verdict["slow"])
         self.assertFalse(verdict.get("slowCovered", True))
+
+    def test_coarse_600s_steps_stay_uncovered(self):
+        # Pins the load-bearing cadence: GitHub runs */5 best-effort, and at
+        # 600 s+ steps the slow long-window baseline is already pruned, so a
+        # sustained 8x burn never covers. The tracker must warn (unit-tested
+        # above) instead of filing or clearing on such a ring.
+        now = int(time.time())
+        step = 600
+        snapshots = 48
+        ring = []
+        received = 0
+        fast = 0
+        for index in range(snapshots):
+            received += 25
+            fast += 24
+            ring.append({"t": now - (snapshots - index) * step,
+                         "received": received, "duplicate": 0,
+                         "fastMoves": fast})
+        received += 25
+        fast += 24
+        exposition = (
+            f"two_bot_voice_joins_received_total {received}\n"
+            f'two_bot_voice_join_refused_total{{reason="duplicate"}} 0\n'
+            f'two_bot_voice_join_to_move_seconds_bucket{{le="5"}} {fast}\n'
+        )
+        expo = self.dir / "expo.prom"
+        expo.write_text(exposition, encoding="utf-8")
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(json.dumps(ring), encoding="utf-8")
+        verdict = tracker.run_driver(NODE, str(DRIVER), expo, ring_path, now)
+        self.assertFalse(verdict["slow"])
+        self.assertFalse(verdict.get("slowCovered", True))
+        self.assertGreaterEqual(
+            tracker.ring_gap_seconds(ring, now), 600)
 
     def test_malformed_ring_rebuilds_silently(self):
         now = int(time.time())

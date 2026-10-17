@@ -49,6 +49,12 @@ FIRING_KEY = "voice_join_slow_burn"
 TITLE_PREFIX = "[voice-join-slow-burn]"
 DEFAULT_LABEL = "slow-burn"
 REFRESH_SECONDS = 6 * 3600
+# GitHub runs `*/5` schedules on a best-effort cadence: this repo's other
+# `*/5` workflow has landed 2-3 h apart. The slow long-window baseline sits
+# one long window behind the previous scrape, so once the ring gap reaches
+# this threshold the baseline is already pruned and the verdict stays
+# unknown. Warn instead of reading green.
+CADENCE_WARN_SECONDS = 600
 MARKER_RE = re.compile(r"<!-- slow-burn-tracker:last-update=(\d+) -->")
 TIMEOUT_SECONDS = 6
 MAX_BODY_BYTES = 64 * 1024
@@ -111,6 +117,18 @@ def load_ring(path):
     except ValueError:
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def ring_gap_seconds(ring, now):
+    """Seconds since the newest ring entry, or None for an empty ring."""
+    newest = None
+    for entry in ring if isinstance(ring, list) else []:
+        tick = entry.get("t") if isinstance(entry, dict) else None
+        if isinstance(tick, (int, float)) and tick == tick:
+            newest = tick if newest is None else max(newest, tick)
+    if newest is None:
+        return None
+    return now - newest
 
 
 def run_driver(node, driver, exposition_path, ring_path, now):
@@ -344,7 +362,9 @@ def main(argv=None, env=None):
     ])
     evidence = {"utc": _utc_now(), "origin": "", "mode": args.fixture,
                 "verdict": "unknown", "ring_size": 0,
-                "action": "none", "issue": None, "run_url": run_url}
+                "action": "none", "issue": None, "run_url": run_url,
+                "stale_gap_seconds": None, "cadence": "ok"}
+    cadence_gap = None
 
     if args.fixture == "live":
         origin = env.get("STAGING_WORKER_URL", "")
@@ -367,6 +387,16 @@ def main(argv=None, env=None):
             return 1
         Path(args.exposition_out).write_text(exposition, encoding="utf-8")
         ring = load_ring(args.ring)
+        cadence_gap = ring_gap_seconds(ring, now)
+        if cadence_gap is not None:
+            evidence["stale_gap_seconds"] = cadence_gap
+            if cadence_gap >= CADENCE_WARN_SECONDS:
+                evidence["cadence"] = "coarse"
+                print(f"::warning::slow-burn tracker cadence is coarse "
+                      f"(newest ring entry {int(cadence_gap)}s old, "
+                      f"threshold {CADENCE_WARN_SECONDS}s); the 6h baseline "
+                      f"is pruned and the verdict may stay unknown until "
+                      f"the 5-minute schedule catches up")
     else:
         evidence["origin"] = f"fixture:{args.fixture}"
         exposition, ring = fixture_inputs(args.fixture, now)
