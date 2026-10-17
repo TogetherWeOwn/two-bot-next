@@ -563,11 +563,14 @@ and the pairing rule stays silent. This is page severity (SEV-1 in the
 The bound is 3 samples. Samples arrive about every 60 s, so the third
 consecutive non-ready sample comes about two to three minutes after the
 gateway stopped being ready. The bound matches the sibling unpaired rule, so
-both gateway pages tell one story, and it never fires sooner than the generic
+both gateway pages tell one story, and at the default `UNREADY_ALERT_FAILURES`
+threshold it never fires sooner than the generic
 `container_unready_alert` (about two minutes of failed `/readyz` probes): the
 generic page fires first and this rule attributes the outage to the gateway
 with its own runbook, an order of magnitude inside the 15-minute
-acknowledgement window. Any outage long enough to trip this rule already
+acknowledgement window. (A raised `UNREADY_ALERT_FAILURES` override can invert
+that order; do not rely on generic-first with an override.) Any outage long
+enough to trip this rule already
 tripped the generic unready page a sample earlier, so it adds no new
 false-page class for slow boots.
 

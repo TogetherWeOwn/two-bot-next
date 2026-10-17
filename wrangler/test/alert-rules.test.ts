@@ -670,6 +670,34 @@ test("gateway not ready restart re-baselines the streak and holds a firing alert
   assert.deepEqual(ev(flat(0, 0), restartReady.state, true).firing, []);
 });
 
+test("gateway not ready restart with an invalid sample re-baselines the streak and holds firing", () => {
+  const flat = (disconnects: number, recoveries: number) => [
+    `two_bot_gateway_disconnects_total ${disconnects}`,
+    `two_bot_gateway_resumes_total ${recoveries}`,
+    `two_bot_gateway_events_total{event="READY"} 0`,
+  ];
+  let fired = ev(flat(5, 3), EMPTY_STATE, false);
+  fired = ev(flat(5, 3), fired.state, false);
+  fired = ev(flat(5, 3), fired.state, false);
+  assert.deepEqual(fired.firing, [NOT_READY]);
+  // Counters went backwards but this sample's readiness is invalid: the stale
+  // streak re-baselines to zero instead of surviving the restart, while the
+  // firing alert holds rather than clearing.
+  const restart = ev(flat(0, 0), fired.state, undefined);
+  assert.deepEqual(restart.firing, [NOT_READY]);
+  assert.equal(restart.state.gatewayNotReadyStreak, 0);
+  // The next valid non-ready sample recounts from 1: it cannot fire off the
+  // pre-restart streak.
+  const one = ev(flat(0, 0), restart.state, false);
+  assert.equal(one.state.gatewayNotReadyStreak, 1);
+  // ...and a sub-threshold streak never pages off a restart either.
+  const pending = ev(flat(5, 3), ev(flat(5, 3), EMPTY_STATE, false).state, false);
+  const stale = ev(flat(0, 0), pending.state, undefined);
+  assert.deepEqual(stale.firing, []);
+  assert.equal(stale.state.gatewayNotReadyStreak, 0);
+  assert.deepEqual(ev(flat(0, 0), stale.state, false).firing, []);
+});
+
 test("gateway not ready restart never pages by itself", () => {
   const flat = (disconnects: number, recoveries: number) => [
     `two_bot_gateway_disconnects_total ${disconnects}`,
