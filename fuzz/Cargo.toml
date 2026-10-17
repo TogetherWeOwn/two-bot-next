@@ -142,3 +142,10 @@ path = "fuzz_targets/voice_room_name.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "automation_transfer_import"
+path = "fuzz_targets/automation_transfer_import.rs"
+test = false
+doc = false
+bench = false
