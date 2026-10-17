@@ -265,23 +265,6 @@ containment, when the hot route belongs to a writer this team does not own, or
 when 429s coincide with 5xx/transport failures suggesting a wider Discord or
 network incident.
 
-#### Alert: REST 5xx
-
-More than 10% of Discord REST requests between two keepalive samples (minimum
-10 requests in the window) returned 5xx. This is Discord-side error rate, not
-proof of a bot regression: correlate with Discord status before touching the
-bot. A counter reset (process restart) skips the window rather than firing.
-
-First response: read the hot route from the `route` label on
-`two_bot_rest_requests_total{route,result="5xx"}` via the authorized
-`/ops/metrics` scrape; confirm no deploy is in progress. Do not hammer Discord
-or replay uncertain writes. A 5xx burst next to a 429 burst points at Discord
-or network trouble, not at the send-admission lane.
-
-Escalate when the 5xx share stays above threshold across several windows after
-containment, or when 5xx coincides with transport failures or gateway
-disconnects suggesting a wider incident.
-
 Executor route templates (fixed vocabulary): `GET /guilds/:guild/members/:member`
 counts member fetches, `GET /users/@me` counts current-user reads (literal
 `@me`, never a user id), `PATCH /webhooks/:application/:token/messages/@original`

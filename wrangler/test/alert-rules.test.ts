@@ -626,6 +626,13 @@ test("every rule links to an existing runbook heading", () => {
   }
 });
 
+test("runbook heading slugs are unique", () => {
+  const headings = [...readFileSync(new URL("../../docs/runbook.md", import.meta.url), "utf8").matchAll(/^#+ (.+)$/gm)];
+  const slugs = headings.map((m) =>
+    m[1]!.toLowerCase().replace(/[^a-z0-9 _-]/g, "").replace(/ /g, "-"));
+  assert.equal(new Set(slugs).size, slugs.length, "duplicate runbook heading slug");
+});
+
 test("heading anchors keep literal underscores from inline-code headings", () => {
   const slugs = headingAnchors("## Self-diagnosing gateway failures (`/readyz` `gateway_failure`)\n");
   assert.deepEqual([...slugs], ["self-diagnosing-gateway-failures-readyz-gateway_failure"]);
