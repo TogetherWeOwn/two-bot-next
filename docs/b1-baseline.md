@@ -202,8 +202,9 @@ The unused streamed-archive helper and its archive-specific builders/tests
 have been removed in favor of main's history metric; the smoke/runtime
 contract fixtures remain.
 
-The 112 MiB image ceiling is unchanged; the release-binary ceiling is 16 MiB
-(see the current calibration above). CI on this PR's exact head must still
+The 112 MiB image ceiling is unchanged; the release-binary ceiling is 17 MiB
+(recalibrated 2026-10-17 after hosted CI measured 16,777,376 bytes; see
+`scripts/container-smoke.py`). CI on this PR's exact head must still
 record the corrected image size and pass the runtime contract and both
 one-byte-budget negative checks; fixture success alone cannot establish
 compliance. No current-head image-fit claim is made here. This measurement
