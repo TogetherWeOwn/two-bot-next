@@ -35,10 +35,12 @@ IMAGE_MAX_BYTES = 112 * MIB
 # in hosted CI, leaving 1,120 bytes of headroom — the tripwire is exhausted
 # even before new code lands. This branch's feed-fetch outcome gauges add
 # ~2,240 bytes of bounded-vocabulary counters and pure mapping functions
-# (PR merge head 16,778,336 bytes, 1,120 over 16 MiB), and main's voice
+# (PR merge head 16,778,336 bytes, 1,120 over 16 MiB), main's voice
 # rename-decision logs add 3,160 bytes (merged head 16,779,256 bytes, 2,040
-# over 16 MiB), both with no new dependencies; the release profile is
-# already minimal (opt-level=z, lto, strip). 17 MiB restores ~1.00 MiB
+# over 16 MiB), and the go-live receiver-ledger branch independently measured
+# 16,801,560 bytes (16.02 MiB) after ~450 lines of shipping ledger/receiver
+# code — all with no new dependencies; the release profile is already minimal
+# (opt-level=z, lto, strip). 17 MiB restores ~1.00 MiB
 # of headroom while keeping a working tripwire; revisit if the binary
 # approaches it.
 BINARY_MAX_BYTES = 17 * MIB
