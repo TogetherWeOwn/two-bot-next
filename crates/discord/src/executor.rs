@@ -1069,10 +1069,11 @@ impl ActionExecutor {
     async fn admit(&self, request: &Request, lane: Option<bool>) -> Result<(), GuardError> {
         let guard = &self.inner.transport.guard;
         let essential = is_interaction_callback(request);
-        // Route-aware admission: the guard paces all callers sharing it and
-        // holds same-bucket reads until the header reset (see admit_route).
+        // Route-aware admission on the paced lanes: the guard paces all
+        // executors sharing it and holds same-bucket reads until the header
+        // reset (see admit_route). Lane-less sends keep plain admission.
         let Some(kick_lane) = lane else {
-            return guard.admit_route(request.path(), essential).await;
+            return guard.admit(essential).await;
         };
         let (lock, interval) = if kick_lane {
             (&self.inner.kick_last_at, self.inner.kick_interval)
@@ -1087,8 +1088,10 @@ impl ActionExecutor {
         if earliest > tokio::time::Instant::now() {
             tokio::time::sleep_until(earliest).await;
         }
-        // A global response/breaker may arrive during the lane sleep.
-        guard.admit_route(request.path(), essential).await?;
+        // A global response/breaker may arrive during the lane sleep. The
+        // re-check reserves no second pacing slot: this admission already
+        // holds the one from the first call.
+        guard.admit_route_recheck(request.path(), essential).await?;
         self.stamp_paced_lane(&mut last, kick_lane);
         Ok(())
     }

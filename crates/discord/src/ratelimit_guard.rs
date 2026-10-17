@@ -7,7 +7,7 @@
 //! share [`process_guard`], including callers using an API proxy.
 //!
 //! Rate-limit facts below follow the official rate-limits page
-//! (https://docs.discord.com/developers/topics/rate-limits, verified
+//! (<https://docs.discord.com/developers/topics/rate-limits>, verified
 //! 2026-10-12): per-route buckets via `X-RateLimit-Bucket`/`Limit`/
 //! `Remaining`/`Reset`/`Reset-After`, bots capped at 50 requests/second
 //! globally, 429-only `X-RateLimit-Global`/`Scope` (`user`/`global`/`shared`)
@@ -133,7 +133,7 @@ struct State {
     next_global_id: u64,
     buckets: BucketTable,
     routes: RouteTable,
-    last_admit_wall: Option<std::time::Instant>,
+    last_pace_slot: Option<Instant>,
     counters: GuardSnapshot,
 }
 
@@ -206,7 +206,7 @@ impl RateLimitGuard {
     /// Only interaction acknowledgements are essential at the executor seam.
     /// They may bypass the invalid budget, never global pauses or token_invalid.
     pub async fn admit(&self, essential: bool) -> Result<(), GuardError> {
-        self.admit_inner(None, essential).await
+        self.admit_inner(None, essential, false).await
     }
 
     /// Backfill admission for one request route: everything [`Self::admit`]
@@ -216,17 +216,34 @@ impl RateLimitGuard {
     /// state admit exactly like [`Self::admit`]. This is the interface every
     /// backfill endpoint slice reuses.
     pub async fn admit_route(&self, route: &str, essential: bool) -> Result<(), GuardError> {
-        self.admit_inner(Some(route), essential).await
+        self.admit_inner(Some(route), essential, true).await
     }
 
-    async fn admit_inner(&self, route: Option<&str>, essential: bool) -> Result<(), GuardError> {
+    /// Second look inside one lane admission (after the caller's own pacing
+    /// sleep): re-checks the breaker, global pause and bucket deadline
+    /// exactly like [`Self::admit_route`], but reserves no second pacing
+    /// slot — the admission already holds the one it reserved up front.
+    pub(crate) async fn admit_route_recheck(
+        &self,
+        route: &str,
+        essential: bool,
+    ) -> Result<(), GuardError> {
+        self.admit_inner(Some(route), essential, false).await
+    }
+
+    async fn admit_inner(
+        &self,
+        route: Option<&str>,
+        essential: bool,
+        pace: bool,
+    ) -> Result<(), GuardError> {
         // Reserve the shared pacing slot once for this admission. Re-reserving
         // on every loop pass would push the slot out on each spurious wake and
         // never converge; a fixed slot only ever gets closer.
-        let pace_slot = {
+        let pace_slot = pace.then(|| {
             let mut state = self.state.lock().expect("Discord guard state");
             Self::reserve_pace_slot(&mut state)
-        };
+        });
         enum Step {
             WaitPending,
             Sleep { until: Option<Instant> },
@@ -257,6 +274,12 @@ impl RateLimitGuard {
                             .chain(self.bucket_deadline(&state, route, now))
                             .max();
                     }
+                    // The reserved pacing slot is just another deadline on
+                    // the same runtime clock as every other guard wait.
+                    until = until
+                        .into_iter()
+                        .chain(pace_slot.filter(|slot| *slot > now))
+                        .max();
                     Step::Sleep { until }
                 }
             };
@@ -268,25 +291,14 @@ impl RateLimitGuard {
                 Step::WaitPending => {
                     changed.await;
                 }
-                Step::Sleep { until } => {
-                    let pace = pace_slot.saturating_duration_since(std::time::Instant::now());
-                    if until.is_none() && pace.is_zero() {
-                        return Ok(());
-                    }
-                    if !pace.is_zero() {
-                        tokio::select! {
-                            _ = tokio::time::sleep(pace) => {},
-                            _ = &mut changed => { continue; },
-                        }
-                    }
-                    if let Some(until) = until {
-                        // Another in-flight response may extend the shared pause.
-                        tokio::select! {
-                            _ = tokio::time::sleep_until(until) => {},
-                            _ = &mut changed => {},
-                        }
-                    }
-                }
+                Step::Sleep { until } => match until {
+                    // Another in-flight response may extend the shared pause.
+                    Some(until) => tokio::select! {
+                        _ = tokio::time::sleep_until(until) => {},
+                        _ = &mut changed => {},
+                    },
+                    None => return Ok(()),
+                },
             }
         }
     }
@@ -294,16 +306,17 @@ impl RateLimitGuard {
     /// Reserve the next shared slot on this guard. Concurrent admitters
     /// serialize here: each one reserves behind the previous, so independent
     /// executors on one guard spread to at most
-    /// [`GLOBAL_REQUESTS_PER_SECOND`]. Wall clock, not the runtime clock:
-    /// guards are shared across runtimes in tests, where virtual clocks
-    /// disagree.
-    fn reserve_pace_slot(state: &mut State) -> std::time::Instant {
-        let now = std::time::Instant::now();
-        let slot = state.last_admit_wall.map_or(now, |last| {
+    /// [`GLOBAL_REQUESTS_PER_SECOND`]. Runtime clock, like every other guard
+    /// deadline: a wall-clock slot slept out on a paused runtime clock can
+    /// never fire, so mixed clocks deadlock frozen-clock callers whose only
+    /// time source is explicit advancement of the runtime clock.
+    fn reserve_pace_slot(state: &mut State) -> Instant {
+        let now = Instant::now();
+        let slot = state.last_pace_slot.map_or(now, |last| {
             last.checked_add(GLOBAL_MIN_INTERVAL)
                 .map_or(now, |earliest| earliest.max(now))
         });
-        state.last_admit_wall = Some(slot);
+        state.last_pace_slot = Some(slot);
         slot
     }
 
