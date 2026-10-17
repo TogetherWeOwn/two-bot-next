@@ -7836,10 +7836,20 @@ fn watchdog_due(
     queue_nonempty && now.saturating_duration_since(last_progress) >= stuck_after
 }
 
+/// Creator-map staleness on the actor-uptime clock: seconds since the last
+/// successful merge; 0 when never merged. Pure, unit-tested: the gauge must
+/// keep climbing between merges instead of freezing at the merge-time zero.
+fn creator_map_age_secs(creators_read_ms: Option<u64>, now_ms: u64) -> u64 {
+    creators_read_ms.map_or(0, |last| now_ms.saturating_sub(last) / 1000)
+}
+
 /// Publish the per-tick stall gauges: halt latch plus per-lane queue depth
 /// and oldest-pending age. Cheap atomics; called every actor tick so
 /// `/ops/metrics` always shows the worker's stall posture.
-fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWorker<S, H>) {
+fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(
+    worker: &GuildRoomWorker<S, H>,
+    now_ms: u64,
+) {
     let guild = worker.live.guild_id;
     let (urgent, deferred) = worker.queue.pending_counts(guild);
     let oldest_age_secs = worker
@@ -7848,6 +7858,10 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWor
         .map_or(0, |age| age.as_secs());
     let gauges = metrics::global();
     gauges.set_voice_halted(worker.halted());
+    gauges.set_voice_creator_map(
+        worker.creators_generation,
+        creator_map_age_secs(worker.creators_read_ms, now_ms),
+    );
     // Recompute the in-flight REST age from attempts still live, so the
     // gauge shows a currently-stalled request instead of the begin/drop
     // snapshots (0 at begin, already removed at drop).
@@ -7879,6 +7893,8 @@ struct StallState {
     deferred: usize,
     oldest_age_secs: u64,
     halted: bool,
+    creators_generation: u64,
+    creators_age_secs: u64,
 }
 
 impl<H: RoomWrites> StallShared<H> {
@@ -7886,6 +7902,7 @@ impl<H: RoomWrites> StallShared<H> {
         &self,
         worker: &GuildRoomWorker<S, H>,
         last_progress: tokio::time::Instant,
+        now_ms: u64,
     ) {
         let guild = worker.live.guild_id;
         let (urgent, deferred) = worker.queue.pending_counts(guild);
@@ -7899,6 +7916,8 @@ impl<H: RoomWrites> StallShared<H> {
             deferred,
             oldest_age_secs,
             halted: worker.halted(),
+            creators_generation: worker.creators_generation,
+            creators_age_secs: creator_map_age_secs(worker.creators_read_ms, now_ms),
         };
     }
 
@@ -7917,6 +7936,7 @@ impl<H: RoomWrites> StallShared<H> {
             u64::try_from(snap.deferred).unwrap_or(u64::MAX),
             snap.oldest_age_secs,
         );
+        gauges.set_voice_creator_map(snap.creators_generation, snap.creators_age_secs);
         // Stuck-worker watchdog: queued work with no completed turn for the
         // full window. Log + metric only; the queue keeps its retries so a
         // transient outage still drains on recovery.
@@ -7972,9 +7992,15 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
             deferred: 0,
             oldest_age_secs: 0,
             halted: false,
+            creators_generation: 0,
+            creators_age_secs: 0,
         }),
     });
-    stall.snapshot(worker, last_progress);
+    stall.snapshot(
+        worker,
+        last_progress,
+        start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    );
     let stop_watchdog = Arc::new(AtomicBool::new(false));
     let watchdog = {
         // Weak, not a clone: the actor task owns the only strong ref. If a
@@ -8017,7 +8043,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 if accepted {
                     last_progress = tokio::time::Instant::now();
                 }
-                stall.snapshot(worker, last_progress);
+                stall.snapshot(worker, last_progress, now_ms);
                 dispatch_ready |= accepted;
             }
             // Inbox first between writes, but no timer between a persisted
@@ -8044,13 +8070,14 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 if progressed {
                     last_progress = tokio::time::Instant::now();
                 }
-                stall.snapshot(worker, last_progress);
+                stall.snapshot(worker, last_progress, now_ms);
                 dispatch_ready = progressed;
                 complete_join_pair = worker.moves.len() > pending_moves;
                 dispatch_budget = dispatch_budget.saturating_sub(1);
             }
             _ = timer.tick() => {
-                publish_voice_gauges(worker);
+                let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                publish_voice_gauges(worker, now_ms);
                 // The stuck-worker watchdog lives on the sibling task now, so
                 // it fires while a dispatch is hung: see `StallShared`. The
                 // tick arm keeps the fresh gauge publish plus recovery below.
@@ -8114,7 +8141,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 // V5: re-render template names whose facts changed (create,
                 // join/leave, owner handoff); the rename lane paces them.
                 worker.refresh_template_names(now_ms);
-                stall.snapshot(worker, last_progress);
+                stall.snapshot(worker, last_progress, now_ms);
                 dispatch_ready = true;
                 maintenance_ready = true;
             }

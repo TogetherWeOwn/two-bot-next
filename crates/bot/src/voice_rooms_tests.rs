@@ -13616,6 +13616,19 @@ async fn reload_creators_settles_generation_after_a_successful_merge() {
 }
 
 #[test]
+fn creator_map_age_climbs_between_merges_and_starts_at_zero() {
+    // Observability v1: the creator-map age gauge climbs on the actor-uptime
+    // clock between merges (seconds, truncated) and reads 0 before the first
+    // merge; a backwards clock saturates instead of wrapping.
+    assert_eq!(creator_map_age_secs(None, 0), 0);
+    assert_eq!(creator_map_age_secs(None, 600_000), 0);
+    assert_eq!(creator_map_age_secs(Some(20_000), 20_000), 0);
+    assert_eq!(creator_map_age_secs(Some(20_000), 20_999), 0);
+    assert_eq!(creator_map_age_secs(Some(20_000), 81_000), 61);
+    assert_eq!(creator_map_age_secs(Some(90_000), 20_000), 0);
+}
+
+#[test]
 fn watchdog_due_needs_a_queue_and_an_expired_window() {
     let start = tokio::time::Instant::now();
     let window = Duration::from_secs(120);

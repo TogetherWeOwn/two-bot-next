@@ -60,6 +60,8 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_queue_pending{lane}` | Queued (not in-flight) voice actions; `lane` is `urgent` or `deferred` |
 | `two_bot_voice_queue_oldest_age_seconds` | Age of the oldest queued voice action in seconds; 0 when empty |
 | `two_bot_voice_rest_in_flight_age_seconds` | Age of the oldest in-flight voice REST attempt in seconds; 0 when idle |
+| `two_bot_voice_creator_map_generation` | Last merged creator-map generation; 0 before the first merge — a flat line across reconnects means the map stopped converging |
+| `two_bot_voice_creator_map_age_seconds` | Seconds since the last successful creator-map merge, republished every actor tick; 0 when never merged — climbing past the 5 min refresh interval means merges stopped landing |
 | `two_bot_voice_global_backoff_capped_total` | Global-backoff waits capped (returned RateLimited for tick-driven backoff) instead of parking the actor |
 | `two_bot_voice_dispatch_timeouts_total` | Actor dispatch turns that ran past the observe bound (run to completion; counted after the fact); the queue keeps its retries |
 | `two_bot_voice_watchdog_stucks_total` | Watchdog firings: queued work with no dispatch progress inside the window |
