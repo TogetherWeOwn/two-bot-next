@@ -201,6 +201,138 @@ class SyntheticAlertTests(unittest.TestCase):
                     {"GITHUB_TOKEN": "test-token", "GITHUB_REPOSITORY": "owner/repo",
                      "GITHUB_RUN_ID": "2000"}, "staging")
 
+    def fake_history(self, samples, decide="success"):
+        """Paginated fake for previous_probe_outcomes over chronological samples."""
+        import re
+        import urllib.parse
+
+        class Fake:
+            def __init__(self):
+                self.samples = list(samples)
+                self.jobs_calls = 0
+
+            def __call__(self, path, _token):
+                parsed = urllib.parse.urlparse(path)
+                query = urllib.parse.parse_qs(parsed.query)
+                if "/actions/workflows/" in parsed.path:
+                    runs = [{"id": 10000 + i, "run_number": i + 1, "event": "schedule"}
+                            for i in range(len(self.samples))]
+                    runs.append({"id": 99999, "run_number": len(runs) + 1,
+                                 "event": "schedule"})
+                    newest = sorted(runs, key=lambda run: run["run_number"], reverse=True)
+                    page = int(query.get("page", ["1"])[0])
+                    per_page = min(int(query.get("per_page", ["30"])[0]), 100)
+                    start = (page - 1) * per_page
+                    return {"total_count": len(newest),
+                            "workflow_runs": newest[start:start + per_page]}
+                self.jobs_calls += 1
+                index = int(re.search(r"/actions/runs/(\d+)/jobs", parsed.path).group(1)) - 10000
+                probe, delivery = self.samples[index]
+                steps = [{"name": history.PROBE_STEPS["staging"], "conclusion": probe}]
+                if decide is not None:
+                    steps.append({"name": history.DECIDE_STEPS["staging"],
+                                  "conclusion": decide})
+                steps.append({"name": history.ALERT_STEPS["staging"],
+                              "conclusion": delivery})
+                return {"jobs": [{"name": history.JOB_NAMES["staging"], "steps": steps}]}
+
+            def env(self, current):
+                return {"GITHUB_TOKEN": "test-token", "GITHUB_REPOSITORY": "owner/repo",
+                        "GITHUB_RUN_ID": "99999", "PROBE_OUTCOME": current,
+                        "FORCE_FAIL": "false"}
+
+        return Fake()
+
+    def test_long_quiet_history_keeps_debounce_and_stops_early(self):
+        # 250 healthy prior runs (past the 200-run bound) then S,F,F,F,F,S,S:
+        # a known-closed healthy sample checkpoints reconstruction, so the
+        # two-failure debounce survives a quiet day and each decision reads
+        # only a few jobs instead of scanning to the bound.
+        fake = self.fake_history([("success", "skipped")] * 250)
+        events, worst_jobs = [], 0
+        for current in ("success", "failure", "failure", "failure",
+                        "failure", "success", "success"):
+            fake.jobs_calls = 0
+            with mock.patch.object(history, "_get", side_effect=fake):
+                event = alert.decide_event(fake.env(current), "staging")
+            events.append(event)
+            worst_jobs = max(worst_jobs, fake.jobs_calls)
+            fake.samples.append((current, "success" if event else "skipped"))
+        self.assertEqual(events, [None, None, "alert", None, None, "recovery", None])
+        self.assertLess(worst_jobs, 10,
+                        f"steady state read {worst_jobs} jobs in one decision")
+
+    def test_known_closed_sample_closes_state_and_raw_skipped_stays_ambiguous(self):
+        # A ("success", "closed") sample is the explicit checkpoint record;
+        # a raw ("success", "skipped") sample with no decide record still
+        # leaves an open incident open (test_skipped_noop_* above).
+        closed = [("success", "closed"), ("failure", "skipped"), ("failure", "success")]
+        self.assertEqual(history.incident_state(closed), (0, False, False))
+        fake = self.fake_history([("success", "skipped")] * 250)
+        with mock.patch.object(history, "_get", side_effect=fake):
+            outcomes = history.previous_probe_outcomes(fake.env("failure"), "staging")
+        self.assertTrue(outcomes)
+        self.assertTrue(all(sample == ("success", "closed") for sample in outcomes))
+        self.assertLessEqual(fake.jobs_calls, 3)
+
+    def test_failed_decide_step_keeps_healthy_sample_ambiguous(self):
+        # History was unknown on the healthy run after a delivered outage
+        # (decide step failed to record it): recovery is still owed.
+        samples = [("failure", "skipped"), ("failure", "success"),
+                   ("failure", "skipped"), ("success", "skipped")]
+        fake = self.fake_history(samples, decide="failure")
+        with mock.patch.object(history, "_get", side_effect=fake):
+            outcomes = history.previous_probe_outcomes(fake.env("success"), "staging")
+        self.assertIn(("success", "skipped"), outcomes)
+        self.assertNotIn(("success", "closed"), outcomes)
+        with mock.patch.object(history, "_get", side_effect=fake):
+            self.assertEqual(alert.decide_event(fake.env("success"), "staging"), "recovery")
+
+    def test_bound_over_all_healthy_skipped_settles_closed_not_unknown(self):
+        # More healthy no-post samples than the bound, none with a decide
+        # record: settle closed instead of latching into HistoryError.
+        fake = self.fake_history([("success", "skipped")] * 20, decide=None)
+        with mock.patch.object(history, "MAX_HISTORY_RUNS", 5), \
+                mock.patch.object(history, "_get", side_effect=fake):
+            outcomes = history.previous_probe_outcomes(fake.env("failure"), "staging")
+        self.assertIsNone(history.transition("failure", outcomes),
+                          "a single failure after a long quiet stretch must not alert")
+        # But a post step that ran on a healthy sample is incident
+        # evidence: the same over-bound shape still reports unknown.
+        # (Repeated failed posts never converge: an open undelivered
+        # incident and a closed state replay them differently forever.)
+        fake = self.fake_history([("success", "failure")] * 20, decide=None)
+        with mock.patch.object(history, "MAX_HISTORY_RUNS", 5), \
+                mock.patch.object(history, "_get", side_effect=fake):
+            with self.assertRaisesRegex(history.HistoryError, "unknown"):
+                history.previous_probe_outcomes(fake.env("failure"), "staging")
+
+    def test_decide_only_fails_step_only_for_unknown_healthy(self):
+        import tempfile
+        cases = (("success", history.HistoryError("history unavailable"), 1, "event=\n"),
+                 ("failure", history.HistoryError("history unavailable"), 0, "event=alert\n"),
+                 ("success", [("success", "closed")], 0, "event=\n"))
+        for outcome, previous, expected_code, expected_line in cases:
+            with self.subTest(outcome=outcome, expected_code=expected_code):
+                with tempfile.NamedTemporaryFile(mode="w+", delete=False) as output:
+                    output_path = output.name
+                try:
+                    env = {**self.base_env(), "PROBE_OUTCOME": outcome,
+                           "FORCE_FAIL": "false", "GITHUB_OUTPUT": output_path}
+                    with mock.patch.dict(os.environ, env, clear=True), \
+                            redirect_stderr(io.StringIO()), \
+                            mock.patch.object(alert, "previous_probe_outcomes",
+                                              side_effect=previous
+                                              if isinstance(previous, Exception)
+                                              else None,
+                                              return_value=previous):
+                        code = alert.main(["--env", "staging", "--evidence", self.evidence,
+                                           "--decide-only"])
+                    self.assertEqual(code, expected_code)
+                    self.assertEqual(Path(output_path).read_text(), expected_line)
+                finally:
+                    Path(output_path).unlink(missing_ok=True)
+
     def test_non_discord_destination_refuses_before_any_request(self):
         with self.assertRaisesRegex(alert.AlertError, "not a Discord webhook"):
             alert.post("https://example.com/hook", "content")

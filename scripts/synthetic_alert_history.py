@@ -20,6 +20,11 @@ ALERT_STEPS = {
 # Decide step (writes event to GITHUB_OUTPUT, never posts). The post step
 # above is the only delivery signal: success means delivered, failure means
 # undelivered, skipped/None means no-op and must not move incident state.
+# The decide step's own conclusion is the known-history record: a healthy
+# run whose history read failed fails its decide step (see
+# synthetic_alert.main), so decide=success with a skipped post on a healthy
+# probe is an explicit known-closed checkpoint, while decide!=success
+# leaves that healthy sample ambiguous and state must not move.
 DECIDE_STEPS = {
     "staging": "Decide the synthetic alert event",
     "prod": "Decide the synthetic alert event",
@@ -60,6 +65,11 @@ def _advance(state, outcome, delivery):
         if failures >= 2:
             incident = True
     else:
+        if delivery == "closed":
+            # Explicit known-closed checkpoint (healthy probe, decide step
+            # succeeded with known history, no event due): the incident
+            # state after this sample is closed whatever came before it.
+            return 0, False, False
         failures = 0
         if incident:
             if alert_delivered and delivery == "success":
@@ -108,7 +118,10 @@ def incident_state(previous):
     Only a post-step conclusion of "success" counts as delivered; "failure"
     means undelivered. Any other conclusion ("skipped", None, cancelled)
     is a no-op and leaves incident state unchanged, so a history-read
-    no-op can never close an open incident or fake a delivery.
+    no-op can never close an open incident or fake a delivery. The one
+    synthetic exception is "closed", produced only by _run_outcome for a
+    healthy run with a successful decide step and a skipped post step: an
+    explicit known-closed checkpoint that resets the state.
     """
     return _replay(reversed(previous))
 
@@ -154,9 +167,21 @@ def _run_outcome(repo, run, environment, token):
                   if step.get("name") == PROBE_STEPS[environment]), None)
     alert = next((step for step in steps
                   if step.get("name") == ALERT_STEPS[environment]), None)
+    decide = next((step for step in steps
+                   if step.get("name") == DECIDE_STEPS[environment]), None)
     outcome = probe.get("conclusion") if probe else None
     if outcome in ("success", "failure"):
-        return outcome, alert.get("conclusion") if alert else None
+        delivery = alert.get("conclusion") if alert else None
+        if (outcome == "success" and delivery == "skipped"
+                and decide is not None and decide.get("conclusion") == "success"):
+            # Known-closed checkpoint, not a mere skipped post: the decide
+            # step succeeded, which it only does when that run's history was
+            # known, and with an open incident a healthy run would have
+            # decided recovery/alert so the post step would have run. A raw
+            # ("success", "skipped") sample (no such decide record) stays
+            # ambiguous below.
+            delivery = "closed"
+        return outcome, delivery
     return None
 
 
@@ -165,10 +190,14 @@ def previous_probe_outcomes(env, environment):
 
     Pages are read lazily and jobs newest-first; the scan stops early once
     the collected suffix is a confirmed checkpoint (its incident state no
-    longer depends on older history, confirmed by one further sample). If
-    MAX_HISTORY_RUNS prior runs are scanned with no checkpoint and more
-    history may exist, the state is unknown: raise HistoryError rather than
-    return a partial suffix that would silently invent one.
+    longer depends on older history, confirmed by one further sample). A
+    known-closed healthy sample is such a checkpoint on its own, so the
+    healthy steady state stops after a couple of jobs reads instead of
+    scanning back to the last incident. If MAX_HISTORY_RUNS prior runs are
+    scanned with no checkpoint and more history may exist, the state is
+    unknown: raise HistoryError rather than return a partial suffix that
+    would silently invent one — unless every collected sample is healthy
+    with no post step run, which settles closed as documented at the raise.
     """
     token = env.get("GITHUB_TOKEN")
     repository = env.get("GITHUB_REPOSITORY")
@@ -219,6 +248,20 @@ def previous_probe_outcomes(env, environment):
         if isinstance(total, int) and page * RUNS_PAGE_SIZE >= total:
             return outcomes
         page += 1
+    if outcomes and all(outcome == "success" and delivery in ("skipped", "closed")
+                         for outcome, delivery in outcomes):
+        # Bound reached over an all-healthy suffix in which no post step
+        # ever ran (conclusion exactly skipped, or the closed checkpoint):
+        # settle closed (the same replay-from-closed the exhausted-history
+        # path above uses) instead of reporting unknown forever. Without
+        # this, MAX_HISTORY_RUNS healthy samples recorded while history was
+        # unreadable would latch every later decision into HistoryError.
+        # The accepted cost: an incident whose evidence rolled past the
+        # bound behind MAX_HISTORY_RUNS consecutive healthy samples loses
+        # its recovery post. A post step that ran (success/failure) is
+        # incident evidence and still reports unknown below, as does a
+        # cancelled or missing post step, which may have had an event due.
+        return outcomes
     raise HistoryError(
         "synthetic workflow history is incomplete beyond the reconstruction "
         f"bound of {MAX_HISTORY_RUNS} prior runs; incident state is unknown")

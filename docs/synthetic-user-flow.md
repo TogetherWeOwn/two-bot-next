@@ -41,9 +41,18 @@ on `main` (the only state store; no extra permissions or infrastructure).
 Reconstruction pages the runs list (GitHub caps a page at 100) and reads jobs
 newest-first until the collected samples determine the incident state by
 themselves — replaying them from any prior state converges, confirmed by one
-further sample — or the history runs out. The scan is bounded at 200 prior
-runs (about sixteen hours at the five-minute schedule); it normally stops at
-the current incident's boundary long before that. Delivery evidence on the
+further sample — or the history runs out. A healthy sample whose decide step
+succeeded and whose post step was skipped is an explicit known-closed
+checkpoint: with an open incident a healthy sample always decides recovery or
+the late alert, so the post step would have run. To keep that record honest,
+a healthy run whose history read failed fails its decide step after writing
+the empty event (its job shows red even though the probe passed); later
+reconstruction treats such a sample as ambiguous, never as closed. In the
+healthy steady state the newest sample is such a checkpoint, so a decision
+costs one runs-list read plus a couple of jobs reads; during an outage the
+scan reaches back to the delivered opening alert and costs about the
+outage's length, capped by the bound. The scan is bounded at 200 prior runs
+(about sixteen hours at the five-minute schedule). Delivery evidence on the
 oldest retained failure counts, so an outage that outlives any fixed window
 keeps its once-per-incident contract: one delivered opening alert, no
 duplicate while it stays down, and exactly one recovery on the first healthy
@@ -52,7 +61,12 @@ When reconstruction cannot be completed — the history read fails, or no
 checkpoint is found within the bound — the incident state is unknown rather
 than guessed: the documented fail-open policy applies (alert on a real probe
 failure, send nothing on a healthy sample), and a fail-open alert that
-delivers becomes fresh delivery evidence for later samples. Skipped,
+delivers becomes fresh delivery evidence for later samples. One bound
+exception: if all 200 scanned samples are healthy and no post step ever ran,
+reconstruction settles closed (the same replay-from-closed as when history
+runs out), so a long history outage cannot latch every later decision into
+unknown; the accepted cost is that an incident whose evidence rolled past
+the bound behind 200 such samples loses its recovery post. Skipped,
 cancelled and manually dispatched runs are not probe samples and never move
 the state. The manual `force_fail: true` staging proof bypasses the
 threshold intentionally; it applies to staging only, and production stays
