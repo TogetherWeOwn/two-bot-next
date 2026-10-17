@@ -167,9 +167,10 @@ class SyntheticAlertTests(unittest.TestCase):
 
     def test_http_error_reports_status_only(self):
         import urllib.error
-        with mock.patch.object(alert.urllib.request, "urlopen",
-                               side_effect=urllib.error.HTTPError(
-                                   HOOK, 400, "bad", {}, None)):
+        opener = mock.Mock()
+        opener.open.side_effect = urllib.error.HTTPError(
+            HOOK, 400, "bad", {}, None)
+        with mock.patch.object(alert.urllib.request, "build_opener", return_value=opener):
             with self.assertRaisesRegex(alert.AlertError, "status 400"):
                 alert.post(HOOK, "content")
 
@@ -178,10 +179,10 @@ class SyntheticAlertTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PROBE_OUTCOME": "failure"}, clear=True), \
                 redirect_stdout(out), redirect_stderr(err), \
                 mock.patch.object(alert, "previous_probe_outcomes", return_value=[("failure", "success")]), \
-                mock.patch.object(alert.urllib.request, "urlopen") as opened:
+                mock.patch.object(alert.urllib.request, "build_opener") as opener:
             code = alert.main(["--env", "staging", "--evidence", self.evidence])
         self.assertEqual(code, 1)
-        opened.assert_not_called()
+        opener.assert_not_called()
         self.assertIn("not set", err.getvalue())
 
     def test_missing_probe_sample_and_non_transition_do_not_post(self):
@@ -229,10 +230,12 @@ class SyntheticAlertTests(unittest.TestCase):
             return FakeResponse()
 
         out, err = io.StringIO(), io.StringIO()
+        opener = mock.Mock()
+        opener.open.side_effect = fake
         with mock.patch.dict(os.environ, self.base_env(), clear=True), \
                 redirect_stdout(out), redirect_stderr(err), \
                 mock.patch.object(alert, "previous_probe_outcomes", return_value=[]), \
-                mock.patch.object(alert.urllib.request, "urlopen", side_effect=fake):
+                mock.patch.object(alert.urllib.request, "build_opener", return_value=opener):
             code = alert.main(["--env", "staging", "--evidence", self.evidence])
         self.assertEqual(code, 0)
         self.assertEqual(seen["url"], HOOK)
@@ -254,11 +257,12 @@ class SyntheticAlertTests(unittest.TestCase):
                 return b""
 
         err = io.StringIO()
+        opener = mock.Mock()
+        opener.open.return_value = FakeResponse()
         with mock.patch.dict(os.environ, self.base_env(), clear=True), \
                 redirect_stdout(io.StringIO()), redirect_stderr(err), \
                 mock.patch.object(alert, "previous_probe_outcomes", return_value=[]), \
-                mock.patch.object(alert.urllib.request, "urlopen",
-                                  return_value=FakeResponse()):
+                mock.patch.object(alert.urllib.request, "build_opener", return_value=opener):
             code = alert.main(["--env", "prod", "--evidence", self.evidence])
         self.assertEqual(code, 1)
         self.assertIn("status 500", err.getvalue())
