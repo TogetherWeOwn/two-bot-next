@@ -27,7 +27,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 
-use super::funnel::{format_iso_millis, parse_iso_millis};
+use super::funnel::{format_iso_millis, parse_iso_millis, Snowflake};
+use super::handlers::ChannelClass;
+use super::internal_actions::is_snowflake;
 
 /// Fact streams, in legacy heartbeat order (legacy `COMMUNITY_FACT_TYPES`).
 pub const COMMUNITY_FACT_TYPES: [&str; 6] = [
@@ -170,6 +172,8 @@ pub struct ClassifierConfig {
     pub staging_guild_ids: HashSet<String>,
     pub staging_actor_ids: HashSet<String>,
     pub test_actor_ids: HashSet<String>,
+    pub human_channel_ids: HashSet<String>,
+    pub welcome_channel_ids: HashSet<String>,
 }
 
 impl Default for ClassifierConfig {
@@ -181,6 +185,8 @@ impl Default for ClassifierConfig {
             staging_guild_ids: HashSet::new(),
             staging_actor_ids: HashSet::new(),
             test_actor_ids: HashSet::new(),
+            human_channel_ids: HashSet::new(),
+            welcome_channel_ids: HashSet::new(),
         }
     }
 }
@@ -243,6 +249,16 @@ fn id_set(vars: &HashMap<String, String>, key: &str) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// Channel sets keep only Discord snowflakes (17-20 ASCII digits, the
+/// [`is_snowflake`] rule): malformed entries drop silently and never
+/// reject their valid siblings, so `from_map` stays infallible.
+fn snowflake_id_set(vars: &HashMap<String, String>, key: &str) -> HashSet<String> {
+    id_set(vars, key)
+        .into_iter()
+        .filter(|id| is_snowflake(id))
+        .collect()
+}
+
 impl ClassifierConfig {
     /// Read classifier config from the process environment (legacy
     /// `loadCommunityClassifierConfig`).
@@ -263,6 +279,23 @@ impl ClassifierConfig {
             staging_guild_ids: id_set(vars, "TWO_COMMUNITY_STAGING_GUILD_IDS"),
             staging_actor_ids: id_set(vars, "TWO_COMMUNITY_STAGING_ACTOR_IDS"),
             test_actor_ids: id_set(vars, "TWO_COMMUNITY_TEST_ACTOR_IDS"),
+            human_channel_ids: snowflake_id_set(vars, "TWO_COMMUNITY_HUMAN_CHANNEL_IDS"),
+            welcome_channel_ids: snowflake_id_set(vars, "TWO_COMMUNITY_WELCOME_CHANNEL_IDS"),
+        }
+    }
+
+    /// Channel class for message attribution: `Welcome` when the channel
+    /// is in the welcome set, else `Human` when in the human set, else
+    /// `Other`. Welcome wins for a channel present in both sets.
+    #[must_use]
+    pub fn channel_class(&self, channel_id: Snowflake) -> ChannelClass {
+        let id = channel_id.to_string();
+        if self.welcome_channel_ids.contains(&id) {
+            ChannelClass::Welcome
+        } else if self.human_channel_ids.contains(&id) {
+            ChannelClass::Human
+        } else {
+            ChannelClass::Other
         }
     }
 }
@@ -758,11 +791,13 @@ fn detect_burst(
 /// Copy/paste detector (AC4, observe-only): `copy_paste` fires on
 /// [`ABUSE_COPY_PASTE_COUNT`] or more same-channel messages with lengths
 /// within ±2 chars inside an hour. Lengths come from the `contentLength`
-/// metadata on message facts; facts without one cannot participate. The live
-/// message-fact writer records no lengths yet, so a week of production facts
-/// reports `copy_paste:insufficient_data` instead of a verdict — the same
-/// fail-closed shape as the voice-AFK occupancy gap — while fixtures
-/// carrying lengths still exercise the detector.
+/// metadata on message facts; facts without one cannot participate. The
+/// writer records a length only when the gateway delivered content (the
+/// `MESSAGE_CONTENT` intent), so a week whose lengths cover fewer than half
+/// of the eligible messages reports `copy_paste:insufficient_data` instead
+/// of a verdict — the same fail-closed shape as the voice-AFK occupancy
+/// gap. A sparse sample (for example the few bot-mention messages Discord
+/// delivers content for without the intent) must never clear that note.
 fn detect_copy_paste(
     facts: &[ParsedFact<'_>],
     flags: &mut Vec<AbuseFlag>,
@@ -792,7 +827,10 @@ fn detect_copy_paste(
         };
         groups.entry((actor, channel)).or_default().push((ms, len));
     }
-    if messages > 0 && with_length == 0 {
+    // Fail closed on sparse coverage, not only on none: when most eligible
+    // messages carry no length, the few that do are not a representative
+    // sample and no verdict (clean or flagged) is honest.
+    if messages > 0 && with_length * 2 < messages {
         quality.push("copy_paste:insufficient_data".to_owned());
         return;
     }
@@ -1879,5 +1917,54 @@ mod tests {
         let gates = ScorecardGates::from_map(&vars).expect("parses");
         assert!(gates.enabled && !gates.recommendations_enabled);
         assert_eq!(gates.correction_cycles, 2);
+    }
+
+    #[test]
+    fn copy_paste_sparse_lengths_stay_insufficient_data() {
+        // Mixed coverage: most eligible messages carry no length and only a
+        // few do (the bot-mention shape a deployment without MESSAGE_CONTENT
+        // would produce if mentions were measured). Even though the five
+        // length-carrying messages would flag on their own, the detector
+        // must report insufficient data and no verdict.
+        let rows: Vec<FactRow> = (0..15)
+            .map(|i| FactRow {
+                id: i + 1,
+                guild_id: GUILD.to_owned(),
+                event_type: "message_created".to_owned(),
+                source_event_id: format!("msg-{i}"),
+                actor_id: Some("member-1".to_owned()),
+                occurred_at: format!("2026-09-01T10:{:02}:00.000Z", i * 2),
+                source: "gateway".to_owned(),
+                classifier_version: VERSION.to_owned(),
+                classification: "eligible_human".to_owned(),
+                matched_rule: String::new(),
+                metadata: None,
+                idempotency_key: format!("msg-{i}"),
+            })
+            .collect();
+        let facts: Vec<ParsedFact<'_>> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let meta = if i < 5 {
+                    serde_json::json!({"channelId": "chan-1", "contentLength": 12})
+                } else {
+                    serde_json::json!({"channelId": "chan-1"})
+                };
+                ParsedFact {
+                    row,
+                    classification: "eligible_human",
+                    meta: meta.as_object().expect("object").clone(),
+                }
+            })
+            .collect();
+        let mut flags = Vec::new();
+        let mut quality = Vec::new();
+        detect_copy_paste(&facts, &mut flags, &mut quality);
+        assert!(
+            flags.is_empty(),
+            "sparse lengths give no verdict: {flags:?}"
+        );
+        assert_eq!(quality, vec!["copy_paste:insufficient_data".to_owned()]);
     }
 }

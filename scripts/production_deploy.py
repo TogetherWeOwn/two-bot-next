@@ -13,23 +13,23 @@ single-line nonzero refusal that echoes no remote value.
 
 import argparse
 import json
-import re
 import sys
 import tomllib
 from pathlib import Path
 
-SHA = re.compile(r"[0-9a-f]{40}")
-DIGITS = re.compile(r"[0-9]+")
-UNSTAMPED = "unknown"
+from build_identity import (
+    DIGITS,
+    SHA,
+    UNSTAMPED,
+    is_build_id_shape,
+    is_build_revision_shape,
+)
+
 EXCERPT_BYTES = 2048
 
 # Well below CPython's default recursion limit (1000): any report deeper
 # than this is refused up front with an explicit stack instead of recursing.
 MAX_READYZ_DEPTH = 100
-# Remote build IDs are `<run id>-<attempt>` (digits-digits); bound both the
-# total and each half so an overlong value never reaches diagnostics.
-MAX_BUILD_ID_LEN = 64
-MAX_BUILD_ID_PART_LEN = 20
 
 
 class DuplicateKeyError(ValueError):
@@ -69,20 +69,8 @@ def _too_deeply_nested(record, limit=MAX_READYZ_DEPTH):
     return False
 
 
-def _is_build_id_shape(value):
-    """Digits-digits run shape, bounded so overlong never reaches output."""
-    if not isinstance(value, str) or len(value) > MAX_BUILD_ID_LEN:
-        return False
-    parts = value.split("-")
-    return (
-        len(parts) == 2
-        and all(part and len(part) <= MAX_BUILD_ID_PART_LEN and DIGITS.fullmatch(part)
-                for part in parts)
-    )
-
-
 def render(args):
-    if not (SHA.fullmatch(args.sha) and DIGITS.fullmatch(args.run_id) and DIGITS.fullmatch(args.attempt)):
+    if not (is_build_revision_shape(args.sha) and DIGITS.fullmatch(args.run_id) and DIGITS.fullmatch(args.attempt)):
         sys.exit("render: needs a 40-hex SHA and numeric run id and attempt")
     source = Path(args.config).resolve()
     config = tomllib.loads(source.read_text())
@@ -153,9 +141,9 @@ def readyz(args):
     # echo, so a hostile answer cannot forge log/summary lines or leak into
     # evidence. The explicit unstamped rollback exception below is preserved,
     # as are valid historical numeric run-attempt build IDs.
-    if revision != UNSTAMPED and not SHA.fullmatch(revision):
+    if revision != UNSTAMPED and not is_build_revision_shape(revision):
         return reject("/readyz build_revision has an unexpected shape")
-    if build_id != UNSTAMPED and not _is_build_id_shape(build_id):
+    if build_id != UNSTAMPED and not is_build_id_shape(build_id):
         return reject("/readyz build_id has an unexpected shape")
     if revision == args.sha:
         if args.mode == "deploy" and build_id != args.build_id:

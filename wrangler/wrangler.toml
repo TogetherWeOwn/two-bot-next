@@ -121,6 +121,14 @@ BOT_PORT = "8080"
 # (outbound-only, invisible to Container idle billing) never sleeps.
 KEEPALIVE_SECONDS = "60"
 TWO_GUILD_NAME = "TWO Staging"
+# Deployment-environment marker for the staging rollback-drill fence
+# (docs/staging-rollout-gate.md): forwarded into the container via
+# FORWARDED_FLAGS so the Rust readiness fence can refuse the gateway
+# failure injection outside staging. Exactly "staging", staging vars only:
+# never top-level and never production (check-env-bindings.py). The
+# injection switch itself is never a committed var anywhere; only the
+# generated per-deploy staging config from a manual dispatch carries it.
+TWO_DEPLOY_ENV = "staging"
 # TOG-12980: staging-only, default-dark Worker ingress for POST /internal/actions
 # (the private receiver, docs/internal-actions-receiver.md). The route stays 404
 # until the Operator also sets the Worker secret TWO_INTERNAL_ACTIONS=1, last.

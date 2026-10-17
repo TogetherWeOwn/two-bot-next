@@ -45,6 +45,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `retention lifecycle skipped; schema gap, nothing to cancel` | `crates/bot/src/gateway.rs` (`retention_lifecycle`) | Rejoin-cancel hit a schema gap (missing table/permission, SQLSTATE only); skipped, nothing to cancel, gateway survives a database behind the binary |
 | `retention purge skipped; schema gap, operator replay required` | `crates/bot/src/gateway.rs` (`retention_lifecycle`) | Real guild removal hit a schema gap; gateway acked past the only purge-queue write, Operator must replay it per privacy.md once the migration lands |
 | `gateway prerequisites missing; gateway parked, /readyz reports down` | `crates/bot/src/main.rs` (`run`) | Token, database URL or guild ID missing; shard never starts |
+| `gateway readiness failure injection active; /readyz reports gateway down for the staging rollback drill` | `crates/bot/src/main.rs` (`run`) | Staging-fenced rollback-drill injection is on; `/readyz` reports the gateway component down so the staging gate fails and rolls back. The fence refuses outside staging, so this line never appears in production |
 | `feature gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs` (`build_interaction_runtime`) | Feature-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
 | `moderation gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs` (`build_interaction_runtime`) | Moderation-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
 | `durable gateway failed; checkpoint unchanged, readiness unavailable` | `crates/bot/src/main.rs` (`publish_gateway_failure`) | Gateway task failed with the fixed class in `error_class`; checkpoint not advanced |
@@ -78,8 +79,8 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `eventsub reconcile refused: Twitch credentials are missing or invalid` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; Operator Twitch client credentials unreadable, no Helix call (`error_class = "reconcile_config_invalid"`) |
 | `eventsub reconcile refused: webhook secret is missing or invalid` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; signing secret unreadable, no Helix call (`error_class = "reconcile_config_invalid"`) |
 | `eventsub reconcile found failed subscriptions on our callback; deleting and re-creating` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`) | Error; failed subscriptions on our callback counted before the pass (`error_class = "reconcile_prior_failed"`), then deleted and re-created |
-| `eventsub subscriptions re-created but none verified yet` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`) | Warn; pass re-created subscriptions but none is `enabled` yet (`status = "pending"`, `error_class = "reconcile_pending"`) |
-| `eventsub subscriptions reconciled` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`) | Info; every desired broadcaster holds a healthy subscription on our callback (`status = "healthy"`) |
+| `eventsub subscriptions re-created but not all verified yet` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`) | Warn; pass re-created subscriptions but at least one desired broadcaster is not `enabled` yet (`status = "pending"`, `error_class = "reconcile_pending"`) |
+| `eventsub subscriptions reconciled` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`) | Info; every desired broadcaster holds an `enabled` subscription on our callback (`status = "healthy"`) |
 | `eventsub reconcile action failed; continuing with the rest of the plan` | `crates/bot/src/eventsub_reconcile.rs` (`run_plan`) | Error; one delete or create was rejected or failed in transport (`action = "delete"` or `"create"`, `error` names the status, `error_class = "reconcile_action_failed"`); the later actions and the follow-up listing still run |
 | `eventsub reconcile did not converge: an action failed or a healthy subscription is missing` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`) | Error; after the follow-up listing, at least one action failed or a desired broadcaster lacks a healthy subscription; the pass fails loudly with `failed` and `missing` counts (`error_class = "reconcile_unhealthy"`) |
 | `eventsub reconcile failed` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; the pass returned an error after the gate and config checks (`error_class = "reconcile_failed"`) |
@@ -127,6 +128,41 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert) |
 
+## Voice stall gauge series
+
+Aggregated across all current guild actors. Before the aggregation change a
+single guild actor's publish overwrote the process values, so a healthy
+guild could hide another guild's halt between scrapes; now each actor keeps
+its latest contribution in a process-local map keyed by an opaque actor key
+under an incarnation generation, and exposition renders aggregates under
+the existing series names.
+
+Sources, by stable anchor rather than line number: per-actor contributions
+are recorded by `set_voice_actor_halted`, `set_voice_actor_queue` and
+`remove_voice_actor` in `crates/core/src/metrics.rs` and rendered by
+`render` in the same file; the guild actor publishes its incarnation's
+contribution every tick from `publish_voice_gauges` in
+`crates/bot/src/voice_rooms.rs` and retires it on loop exit through the
+actor metric guard's `Drop` in the same file, so a late publish from a
+replaced incarnation cannot resurrect it. Full semantics live in
+`docs/metrics.md`.
+
+The received-vs-handled drift signal stays with the `voice_join_received`
+row in the voice structured-fields section below and is not duplicated
+here: that row counts every delivery into the guild actor, while these
+gauges show the actor-side stall posture (halted, queued depth, oldest
+wait). Bounded cardinality holds: the only label is the fixed
+`lane="urgent" | "deferred"` pair on the queue-depth family (two series,
+never per-actor/per-guild/per-channel/per-member); the halt and oldest-age
+gauges are label-free. Queue sums saturate instead of wrapping, and no
+actor, guild, channel, member, token or body content ever reaches a label.
+
+| Series | Labels | Scrape inputs | Alert usage | Meaning |
+| --- | --- | --- | --- | --- |
+| `two_bot_voice_worker_halted` | None (label-free gauge) | Additional series: accepted but not required by the scrape validator, which pins only the alert-input label sets; read manually from the container exposition or the authenticated pull | Consumed by no alert rule; manual check named in the runbook fast-burn, slow-burn and creator-map-stale first responses | 1 while any current guild actor is halted by a store CredentialRefused or Discord 401, otherwise 0; a healthy guild cannot hide another guild's halt |
+| `two_bot_voice_queue_pending` | Fixed `lane`: `urgent` or `deferred` (exactly two series) | Same additional-series handling as above | Consumed by no alert rule; manual queue-side complement to the join-budget burn rules | Queued (not in-flight) voice actions per lane, saturating-summed across all current guild actors |
+| `two_bot_voice_queue_oldest_age_seconds` | None (label-free gauge) | Same additional-series handling as above | Consumed by no alert rule; manual queue-side complement to the join-budget burn rules | Age in seconds of the oldest queued voice action, the maximum across all current guild actors; 0 when every queue is empty |
+
 ## EventSub delivery series
 
 Counters emitted by the Twitch EventSub receiver render. Unknown `kind`
@@ -165,6 +201,7 @@ is the single shared spelling also pinned in `evidence.rs`
 
 | Rule | Input series | Meaning |
 | --- | --- | --- |
+| `rest_5xx_rate` | `two_bot_rest_requests_total{result="5xx"}` and all `two_bot_rest_requests_total` samples | Pages when at least 10 new REST requests arrive between samples and more than 10% are 5xx; a counter reset suppresses the window. |
 | `job_unknown_stale` | `two_bot_job_last_success_timestamp_seconds{job}` for labels outside `JOB_INTERVAL_SECONDS`, `TICKER_STALE_JOBS` and `UNKNOWN_STALE_EXCLUDED` | Ticket when a job without a cadence entry has a nonzero success timestamp older than 2 hours; never-succeeded stays silent; `session_checkpoint` is event-driven and excluded |
 | `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` against `two_bot_gateway_resumes_total` plus fresh `two_bot_gateway_events_total{event="READY"}` | Pages after 3 consecutive samples with disconnect growth and no RESUMED or fresh READY growth (pairing in `pairGatewayDisconnects`); any recovery growth clears at once; the disconnect counter increments in `gateway.rs` (`transport_disconnected`) |
 | `voice_join_fast_burn` | `two_bot_voice_joins_received_total` minus benign `duplicate` refusals in `two_bot_voice_join_refused_total` against `two_bot_voice_join_to_move_seconds_bucket{le="5"}` | Pages when the creator-join budget (99.5% moved within 5 s) burns faster than 14.4x in both the 1 h and 5 min windows; every non-duplicate refusal, failed move and slow (>5 s) move is burn; each window needs at least 10 genuine joins and two bad moves, receive counts lag one scrape, and incomplete post-restart windows stay inactive; missing inputs hold the previous state |

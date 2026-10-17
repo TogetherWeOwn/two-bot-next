@@ -8,7 +8,11 @@ Part of the [operations runbook](runbook.md#sustained-unready-alerts).
 The singleton Durable Object's existing keepalive probes `/readyz` on each tick
 and records the result in its own durable storage (not the bot database).
 Non-2xx responses and exceptions/timeouts count as failures. A 2xx result resets
-the streak. Inbound `/health` and `/readyz` requests do **not** count as monitoring
+the streak. Each probe's fetch and body read share one end-to-end six-second
+deadline that does not rely on the SDK honoring abort, and body cancellation
+is best-effort: a probe that stalls, or a valid answer that only arrives after
+the deadline, is recorded as a failed sample — never as readiness or recovery
+— and the tick still rearms. Inbound `/health` and `/readyz` requests do **not** count as monitoring
 samples; the keepalive loop is the single sampling source. Arming checks the
 SDK's persisted schedule before inserting a task and coalesces concurrent
 callers. Container startup, health traffic and DO reconstruction reuse the
@@ -27,8 +31,8 @@ signal, not a readiness sample or proof that a successor has been scheduled.
 ### Threshold and notifications
 
 - `KEEPALIVE_SECONDS` defaults to 60. Without tuning, the alert threshold is
-  `max(1, ceil(600 / KEEPALIVE_SECONDS))` consecutive failed samples: ten failures
-  at the default cadence, approximately ten minutes after arming the loop.
+  `max(1, ceil(120 / KEEPALIVE_SECONDS))` consecutive failed samples: two failures
+  at the default cadence, approximately two minutes after arming the loop.
   Probes, cold startup, webhook latency and delayed alarms can extend that time;
   this is a sample-count threshold, not a wall-clock deadline.
 - Optional plain Worker var `UNREADY_ALERT_FAILURES` overrides that count. Use a
@@ -36,7 +40,8 @@ signal, not a readiness sample or proof that a successor has been scheduled.
   independently; omission or invalid runtime values use the default.
 - At the threshold, one JSON log has `event: "container_unready_alert"`,
   `service: "two-bot-next"`, `consecutive_failures`, `threshold`, `status`,
-  `first_failure_at` and `observed_at` (Unix milliseconds). `status: null` means
+  `first_failure_at`, `observed_at` (Unix milliseconds), `build_revision`,
+  `failed_step`, `error_code` and `log_url`. `status: null` means
   the probe threw/timed out, rather than returning an HTTP response.
 - Continued failures do not produce another alert for that incident. The first
   subsequent ready sample produces one `container_unready_recovery` log; a

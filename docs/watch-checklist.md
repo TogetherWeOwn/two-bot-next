@@ -22,7 +22,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 
 | Alert | Fires when | Reads from | Runbook |
 |---|---|---|---|
-| `container_unready_alert` | keepalive `/readyz` probes fail 10 consecutive samples (≈10 min at default 60 s cadence) | Worker logs (structured JSON event) | [container-readiness.md](container-readiness.md#responding-to-an-alert) |
+| `container_unready_alert` | keepalive `/readyz` probes fail 2 consecutive samples (≈2 min at default 60 s cadence) | Worker logs (structured JSON event) | [container-readiness.md](container-readiness.md#responding-to-an-alert) |
 | `container_unready_recovery` | first ready sample after an alert | Worker logs | same as above |
 | `container_keepalive_arm_failed` | keepalive schedule lookup/insert fails (monitoring outage, not a readiness sample) | Worker logs | [container-readiness.md](container-readiness.md) |
 | `container_unready_webhook_failed` | alert/recovery webhook POST failed or timed out (type + HTTP status only) | Worker logs | [container-readiness.md](container-readiness.md) |
@@ -126,7 +126,7 @@ provisioner and records the receipt on the execution card:
   `wrangler.toml`, a PR or a log); forwarding must also be on.
 - [ ] Scrape token provisioned as the production Worker secret backing
   `GET /ops/metrics`; an off-container scrape returns exposition.
-- [ ] Readiness threshold confirmed: default (≈10 min) or the
+- [ ] Readiness threshold confirmed: default (≈2 min) or the
   per-environment override value.
 - [ ] No `container_keepalive_arm_failed` in recent Worker logs
   (the loop is actually armed).

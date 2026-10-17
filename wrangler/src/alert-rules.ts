@@ -158,7 +158,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "job_stale", summary: `scheduled job has no success for more than ${STALE_INTERVALS} intervals`, runbook: "runbook.md#alert-job-stale" },
   { id: "job_consecutive_failures", summary: `scheduled job failed ${FAILURE_THRESHOLD}+ times in a row`, runbook: "runbook.md#alert-job-failures" },
   { id: "rest_429_rate", summary: `Discord REST 429s exceed ${REST_429_RATIO * 100}% of requests`, runbook: "runbook.md#alert-rest-429" },
-  { id: "rest_5xx_rate", summary: `Discord REST 5xx exceed ${REST_5XX_RATIO * 100}% of requests`, runbook: "runbook.md#alert-rest-5xx" },
+  { id: "rest_5xx_rate", summary: `Discord REST 5xx responses exceed ${REST_5XX_RATIO * 100}% of requests`, runbook: "runbook.md#alert-rest-5xx" },
   { id: "db_pool_saturated", summary: `database pool exhausted for ${POOL_SATURATED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-db-pool" },
   { id: "db_errors", summary: `database errors reached ${DB_ERROR_MIN_ERRORS}+ between samples`, runbook: "runbook.md#alert-db-errors" },
   { id: "send_admission_blocked", summary: `Discord sends refused admission for ${SEND_BLOCKED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-send-admission-blocked" },
@@ -185,6 +185,36 @@ export const RUNBOOK_BASE_URL = "https://github.com/TogetherWeOwn/two-bot-next/b
 /** Full deep link for a rule's runbook anchor. */
 export function runbookUrl(rule: RuleDef): string {
   return `${RUNBOOK_BASE_URL}${rule.runbook}`;
+}
+
+/**
+ * Public docs link for the Worker/Container log query backing every alert.
+ * A stable docs URL (not an account-scoped dashboard link) so webhook
+ * messages stay public-safe: the operator opens the environment's Workers
+ * Observability logs from there.
+ */
+export const LOG_QUERY_URL = "https://developers.cloudflare.com/workers/observability/logs/workers-logs/";
+
+/** Build/SHA context appended to every alert message and alert log line. */
+export interface AlertContext {
+  /** Container Git SHA from `/readyz` (`unknown` when the probe failed). */
+  buildRevision?: string | undefined;
+  /** Failing gateway step from `/readyz` (`gateway_failure.failed_step`). */
+  failedStep?: string | undefined;
+  /** SQLSTATE class from `/readyz` (`gateway_failure.error_code`). */
+  errorCode?: string | undefined;
+}
+
+/** Shared suffix carrying build, failure detail and the log-query link. */
+export function alertContextSuffix(context?: AlertContext): string {
+  const build = context?.buildRevision?.trim() ? context.buildRevision.trim() : "unknown";
+  let suffix = ` Build: ${build}. Logs: ${LOG_QUERY_URL}`;
+  const step = context?.failedStep?.trim();
+  const code = context?.errorCode?.trim();
+  if (step || code) {
+    suffix += ` Failure: ${step || "unknown"}/${code || "none"}.`;
+  }
+  return suffix;
 }
 
 export interface MetricsAlertState {
@@ -816,20 +846,22 @@ export function transitionMessages(
   after: string[],
   beforeJobErrorClasses?: Record<string, JobErrorClass>,
   afterJobErrorClasses?: Record<string, JobErrorClass>,
+  context?: AlertContext,
 ): string[] {
   const out: string[] = [];
+  const suffix = alertContextSuffix(context);
   for (const key of after.filter((k) => !before.includes(k))) {
     const rule = ruleFor(key);
     const runbook = rule ? runbookUrl(rule) : `${RUNBOOK_BASE_URL}runbook.md`;
     const errorClass = jobErrorClassForAlert(key, afterJobErrorClasses);
     const classSuffix = errorClass ? ` (last error class: ${errorClass})` : "";
     const severity = rule?.severity ? ` (${rule.severity})` : "";
-    out.push(`two-bot-next ALERT ${key}${classSuffix}${severity}: ${rule?.summary ?? key}. Runbook: ${runbook}`);
+    out.push(`two-bot-next ALERT ${key}${classSuffix}${severity}: ${rule?.summary ?? key}. Runbook: ${runbook}.${suffix}`);
   }
   for (const key of before.filter((k) => !after.includes(k))) {
     const errorClass = jobErrorClassForAlert(key, beforeJobErrorClasses);
     const classSuffix = errorClass ? ` (last error class: ${errorClass})` : "";
-    out.push(`two-bot-next RESOLVED ${key}${classSuffix}.`);
+    out.push(`two-bot-next RESOLVED ${key}${classSuffix}.${suffix}`);
   }
   return out;
 }
