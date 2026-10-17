@@ -16,7 +16,9 @@ existing disposable Postgres service, rather than the lint-only `check` lane.
   committed docs and must never run in CI. Suites whose
   guards accept only the `agent_test` database are re-measured with their
   accepted URL (`cargo llvm-cov --no-report` per suite, merged with a final
-  `cargo llvm-cov report --lcov`): the channel-moderation, feeds-store,
+  `cargo llvm-cov report --workspace --lcov` — without `--workspace` the
+  report scopes to the root package only and exports an empty report): the
+  channel-moderation, feeds-store,
   legacy-verify and staging-migrate suites under the exact `agent_test` URL,
   the internal-events, raid-list and reengagement-list suites under the
   empty-password form, and member-moderation behind `MEMBER_TESTDB`.

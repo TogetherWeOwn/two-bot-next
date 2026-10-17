@@ -779,12 +779,16 @@ jobs:
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test reengagement_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test member_moderation_db -- --ignored --test-threads=1 --skip regenerate_reference_docs
           # Merge every collected profile into the mounted workspace report the gate reads.
-          # Path-based export flakes on some runners (reports success while the
-          # file is absent/empty in the job container), so retry via stdout.
-          cov_run "$COV" llvm-cov report --lcov --output-path "$report_path"
+          # `report` must carry --workspace: without it the report scopes to
+          # the current (root) package only and excludes every crates/*
+          # member directory, and the root library (a single const) has no
+          # coverable lines, so the export succeeds with an empty file.
+          # Keep a stdout retry as a second export path if the file is still
+          # missing or empty; the check below stays fail-closed either way.
+          cov_run "$COV" llvm-cov report --workspace --lcov --output-path "$report_path"
           if [ ! -s "$report_path" ]; then
             echo "::warning::llvm-cov reported a saved LCOV report, but the file is missing or empty; retrying via stdout"
-            cov_run "$COV" llvm-cov report --lcov > "$report_path"
+            cov_run "$COV" llvm-cov report --workspace --lcov > "$report_path"
           fi
           if [ ! -s "$report_path" ]; then
             echo "::error::patch coverage measurement produced no lcov report"

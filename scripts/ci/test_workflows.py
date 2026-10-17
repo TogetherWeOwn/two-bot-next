@@ -1604,15 +1604,26 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertIn('report_path="$GITHUB_WORKSPACE/lcov.info"', step["run"])
         self.assertIn('[ ! -s "$report_path" ]', step["run"])
-        self.assertIn('llvm-cov report --lcov --output-path "$report_path"', step["run"])
+        self.assertIn(
+            'llvm-cov report --workspace --lcov --output-path "$report_path"',
+            step["run"],
+        )
         self.assertIn('retrying via stdout', step["run"])
-        self.assertIn('llvm-cov report --lcov > "$report_path"', step["run"])
+        self.assertIn(
+            'llvm-cov report --workspace --lcov > "$report_path"', step["run"]
+        )
         self.assertNotIn("/dev/stdout", step["run"])
+        # `report` without --workspace scopes to the current (root) package
+        # only and excludes every crates/* member directory from the export;
+        # the root library is a single const with no coverable lines, so the
+        # merged report comes out empty. Every report invocation must carry
+        # --workspace; the bare form must never reappear.
+        self.assertNotIn("llvm-cov report --lcov", step["run"])
         # Guarded suites are measured per suite with their accepted URL and
         # merged: --no-report per run, one final report. Selected ignored runs
         # are serial and never execute the reference-docs regen.
         self.assertIn("--no-report", step["run"])
-        self.assertIn("llvm-cov report --lcov", step["run"])
+        self.assertIn("llvm-cov report --workspace --lcov", step["run"])
         # Non-ignored tests stay parallel; only the ignored sweep is serial.
         self.assertIn("-- --ignored --test-threads=1", step["run"])
         self.assertIn("--test-threads=1", step["run"])
