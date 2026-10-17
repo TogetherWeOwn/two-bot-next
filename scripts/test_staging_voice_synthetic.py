@@ -375,9 +375,22 @@ class PrivacyFactsTest(unittest.TestCase):
             {"id": self.GUILD, "type": 0, "allow": "0", "deny": str(self.CONNECT)}])
         self.assertFalse(facts["privacy_public_baseline"])
 
-    def test_everyone_allow_connect_breaks_public_baseline(self):
+    def test_everyone_allow_connect_keeps_public_baseline(self):
+        # Private is an @everyone Connect *deny* (everyone_connect_overwrite
+        # in private_runtime.rs); a public room inherits its source's
+        # overwrites, which commonly allow Connect explicitly. An allow
+        # alone must not read as private.
         facts = self.facts(overwrites=[
             {"id": self.GUILD, "type": 0, "allow": str(self.CONNECT), "deny": "0"}])
+        self.assertTrue(facts["privacy_public_baseline"])
+
+    def test_privacy_facts_report_everyone_allow_deny_and_count(self):
+        facts = self.facts(overwrites=[
+            {"id": self.GUILD, "type": 0,
+             "allow": str(self.VIEW | self.CONNECT), "deny": str(self.CONNECT)}])
+        self.assertEqual(facts["privacy_everyone_allow"], self.VIEW | self.CONNECT)
+        self.assertEqual(facts["privacy_everyone_deny"], self.CONNECT)
+        self.assertEqual(facts["privacy_everyone_count"], 1)
         self.assertFalse(facts["privacy_public_baseline"])
 
     def test_duplicate_everyone_overwrites_break_public_baseline(self):
