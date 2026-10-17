@@ -915,6 +915,30 @@ impl Metrics {
         }
     }
 
+    /// One actor's recorded stall contribution as `(generation, halted,
+    /// queue_pending by lane, oldest_age_secs)`, or `None` when the actor
+    /// has no recorded contribution. Test/diagnostic seam only: the actor
+    /// key is process-local and this lookup is never rendered, labelled
+    /// or persisted.
+    #[doc(hidden)]
+    pub fn voice_actor_contribution(
+        &self,
+        actor: u64,
+    ) -> Option<(u64, bool, [u64; VOICE_QUEUE_LANES.len()], u64)> {
+        let values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_actors.get(&actor).map(|entry| {
+            (
+                entry.generation,
+                entry.halted,
+                entry.queue_pending,
+                entry.oldest_age_secs,
+            )
+        })
+    }
+
     /// Age of the oldest in-flight voice REST attempt in seconds; 0 idles it.
     /// Last writer wins.
     pub fn set_voice_rest_in_flight_age_secs(&self, age_secs: u64) {
