@@ -54,9 +54,13 @@ two-bot-next ALERT synthetic-user-flow:<staging|prod>: <failing checks>. Runbook
 
 `allowed_mentions` is off. The destination is Discord-only: any non-Discord
 webhook URL refuses before any request, and the URL itself is never printed.
-Runs with no incident transition send nothing and need no webhook. When an
-alert or recovery transition is due, a missing webhook fails that step, so a
-silent notification path cannot read as delivered.
+HTTP 301, 302, 303, 307, and 308 responses are refused; no redirect destination
+is contacted and no redirect retry occurs. A redirect is a failed delivery, not
+a successful alert. Errors expose only fixed safe classifications or HTTP status
+codes, never the webhook URL, token, or response body. Runs with no incident
+transition send nothing and need no webhook. When an alert or recovery transition
+is due, a missing webhook fails that step, so a silent notification path cannot
+read as delivered.
 
 ## Operator bindings
 
