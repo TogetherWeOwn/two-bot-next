@@ -144,6 +144,15 @@ export const JOIN_BURN_MIN_JOINS = 10;
 export const JOIN_BURN_MIN_BAD = 2;
 /** Burn snapshots older than the slow window plus this margin are pruned. */
 export const JOIN_BURN_HISTORY_MARGIN_SECONDS = 600;
+/** Creator-map refresh cadence in seconds (`CREATORS_REFRESH_INTERVAL_MS` in `crates/bot/src/voice_rooms.rs`). */
+export const CREATOR_MAP_REFRESH_SECONDS = 300;
+/**
+ * Creator-map staleness bound: two missed refresh intervals. The age gauge
+ * counts from the last *successful* merge, so one failed refresh only reaches
+ * the bound as the next attempt also fails; scheduling jitter inside one
+ * interval never fires. Mirrors the `STALE_INTERVALS` two-interval rule.
+ */
+export const CREATOR_MAP_STALE_SECONDS = 2 * CREATOR_MAP_REFRESH_SECONDS;
 
 export const RULES: readonly RuleDef[] = [
   { id: "job_stale", summary: `scheduled job has no success for more than ${STALE_INTERVALS} intervals`, runbook: "runbook.md#alert-job-stale" },
@@ -163,6 +172,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "gateway_checkpoint_failures", summary: `gateway checkpoint commit failures increased between samples`, runbook: "runbook.md#alert-checkpoint-failures" },
   { id: "voice_join_fast_burn", summary: `creator-join error budget burning faster than ${JOIN_FAST_BURN}x over 1 h and 5 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-fast-burn" },
   { id: "voice_join_slow_burn", summary: `creator-join error budget burning faster than ${JOIN_SLOW_BURN}x over 6 h and 30 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-slow-burn", severity: "ticket" },
+  { id: "voice_creator_map_stale", summary: `voice creator map has not merged for more than ${CREATOR_MAP_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-voice-creator-map-stale" },
 ];
 
 /**
@@ -381,11 +391,11 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
 }
 
 /**
- * One cumulative counter series with exactly these labels, or undefined when
+ * One series (counter or gauge) with exactly these labels, or undefined when
  * absent, duplicated, mislabeled or not a safe nonnegative integer. Keeps a
- * Rust rename or malformed value from silently holding the burn rules off.
+ * Rust rename or malformed value from silently holding its rules off.
  */
-function exactCounter(matches: Sample[], labels: Record<string, string>): number | undefined {
+function exactSeries(matches: Sample[], labels: Record<string, string>): number | undefined {
   const rows = matches.filter((s) =>
     Object.keys(s.labels).length === Object.keys(labels).length
     && Object.entries(labels).every(([key, value]) => s.labels[key] === value));
@@ -413,9 +423,9 @@ interface JoinBurnResult {
  */
 function joinBurnEvaluation(samples: Sample[], ring: JoinBurnSnapshot[], nowSeconds: number): JoinBurnResult {
   const gauge = (name: string) => samples.filter((s) => s.name === name);
-  const received = exactCounter(gauge("two_bot_voice_joins_received_total"), {});
-  const duplicate = exactCounter(gauge("two_bot_voice_join_refused_total"), { reason: "duplicate" });
-  const fastMoves = exactCounter(gauge("two_bot_voice_join_to_move_seconds_bucket"), { le: "5" });
+  const received = exactSeries(gauge("two_bot_voice_joins_received_total"), {});
+  const duplicate = exactSeries(gauge("two_bot_voice_join_refused_total"), { reason: "duplicate" });
+  const fastMoves = exactSeries(gauge("two_bot_voice_join_to_move_seconds_bucket"), { le: "5" });
   if (received === undefined || duplicate === undefined || fastMoves === undefined) {
     return { fast: false, slow: false, held: true, ring };
   }
@@ -641,6 +651,24 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   else if (prev.firing.includes("voice_join_fast_burn") && joinBurn.held) firing.push("voice_join_fast_burn");
   if (joinBurn.slow) firing.push("voice_join_slow_burn");
   else if (prev.firing.includes("voice_join_slow_burn") && joinBurn.held) firing.push("voice_join_slow_burn");
+
+  // Creator-map staleness: the voice actor re-merges the creator map from
+  // the store every 5 minutes; `two_bot_voice_creator_map_age_seconds`
+  // counts from the last successful merge (a failed read never resets it,
+  // and the stall watchdog keeps it climbing while the actor is hung), so
+  // an age past two intervals means merges stopped landing and joins are
+  // served from a stale map. Generation 0 means no merge has landed yet —
+  // boot, or voice parked — where the age is defined as 0 and this rule
+  // cannot tell parked from wedged, so it stays silent. The gauges postdate
+  // older containers and are optional scrape inputs: missing or malformed
+  // series hold the previous firing state instead of resolving it.
+  const creatorMapGeneration = exactSeries(gauge("two_bot_voice_creator_map_generation"), {});
+  const creatorMapAge = exactSeries(gauge("two_bot_voice_creator_map_age_seconds"), {});
+  if (creatorMapGeneration !== undefined && creatorMapAge !== undefined) {
+    if (creatorMapGeneration > 0 && creatorMapAge > CREATOR_MAP_STALE_SECONDS) firing.push("voice_creator_map_stale");
+  } else if (prev.firing.includes("voice_creator_map_stale")) {
+    firing.push("voice_creator_map_stale");
+  }
 
   // Gateway missed events (sequence gaps inside one session): any increase
   // between two samples fails the zero-missed-events acceptance. The first

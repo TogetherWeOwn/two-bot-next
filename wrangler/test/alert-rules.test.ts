@@ -30,6 +30,30 @@ test("job stale fires only past two intervals and ignores never-succeeded", () =
   assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="rank"} 0`]).firing, []);
 });
 
+test("creator-map staleness fires past two refresh intervals once a merge landed", () => {
+  const map = (generation: number, age: number) => [
+    `two_bot_voice_creator_map_generation ${generation}`,
+    `two_bot_voice_creator_map_age_seconds ${age}`,
+  ];
+  // At the bound is not past it; one failed refresh alone cannot fire.
+  assert.deepEqual(ev(map(3, 600)).firing, []);
+  const stale = ev(map(3, 601));
+  assert.deepEqual(stale.firing, ["voice_creator_map_stale"]);
+  // Generation 0 is never-merged (boot or voice parked): the age is defined
+  // as 0 there, so even a synthetic large age must not fire.
+  assert.deepEqual(ev(map(0, 99999)).firing, []);
+  // A landed merge resets the age and resolves the alert.
+  assert.deepEqual(ev(map(4, 0), stale.state).firing, []);
+  // Older containers lack the optional gauges: absence holds a firing alert
+  // instead of resolving it, and never fires on its own.
+  assert.deepEqual(ev([], stale.state).firing, ["voice_creator_map_stale"]);
+  assert.deepEqual(ev([]).firing, []);
+  // Duplicated or labeled rows are malformed for a label-free gauge: held,
+  // not resolved and not newly fired.
+  assert.deepEqual(ev([...map(3, 601), "two_bot_voice_creator_map_age_seconds 601"], stale.state).firing, ["voice_creator_map_stale"]);
+  assert.deepEqual(ev([`two_bot_voice_creator_map_generation 3`, `two_bot_voice_creator_map_age_seconds{guild="1"} 601`]).firing, []);
+});
+
 test("consecutive failures fire at 3 and retain classless messages for older exposition", () => {
   assert.deepEqual(ev([`two_bot_job_consecutive_failures{job="counter"} 2`]).firing, []);
   const failed = ev([`two_bot_job_consecutive_failures{job="counter"} 3`]);
@@ -774,6 +798,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "gateway_checkpoint_failures",
     "voice_join_fast_burn",
     "voice_join_slow_burn",
+    "voice_creator_map_stale",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -792,6 +817,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("gateway_checkpoint_failures", window), `evidence-gateway_checkpoint_failures-${window}.json`);
   assert.equal(packetFilename("voice_join_fast_burn", window), `evidence-voice_join_fast_burn-${window}.json`);
   assert.equal(packetFilename("voice_join_slow_burn", window), `evidence-voice_join_slow_burn-${window}.json`);
+  assert.equal(packetFilename("voice_creator_map_stale", window), `evidence-voice_creator_map_stale-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -905,6 +931,7 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   burn = evaluateMetrics(parseExposition(body(joinLines(900, 9, 720))), burn.state, burnBase + 3300);
   burn = evaluateMetrics(parseExposition(body(joinLines(1000, 10, 800))), burn.state, burnBase + 3600);
   firing.push(...burn.firing);
+  firing.push(...ev(["two_bot_voice_creator_map_generation 3", "two_bot_voice_creator_map_age_seconds 601"]).firing);
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);
