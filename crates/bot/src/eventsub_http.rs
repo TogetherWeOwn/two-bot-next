@@ -77,14 +77,11 @@ pub struct BoundEventsubReceiver {
     state: Arc<ReceiverState>,
 }
 
-pub async fn bind(config: EventsubReceiverConfig) -> std::io::Result<BoundEventsubReceiver> {
-    bind_with_delivery(config, None).await
-}
-
 /// Bind with optional go-live delivery dependencies: verified
 /// notifications then run the durable ledger flow instead of ack-only.
 /// Boot passes the production dependencies while delivery is enabled and
-/// `None` while it stays dark.
+/// `None` while it stays dark. Binding completes before any gateway/job
+/// task starts; invalid enabled configuration and bind failure are fatal.
 pub async fn bind_with_delivery(
     config: EventsubReceiverConfig,
     delivery: Option<DeliveryDeps>,
