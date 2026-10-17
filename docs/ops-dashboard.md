@@ -34,9 +34,15 @@ Connect form; the page sends the headers on its `GET /ops/summary` fetches.
 Install the pair as Worker secrets (never `wrangler.toml` vars):
 
 ```sh
-wrangler secret put --env staging OPS_DASHBOARD_CLIENT_ID
-wrangler secret put --env staging OPS_DASHBOARD_CLIENT_SECRET  # >= 32 chars
+wrangler versions secret put --env staging OPS_DASHBOARD_CLIENT_ID --message <sha>
+wrangler versions secret put --env staging OPS_DASHBOARD_CLIENT_SECRET --message <sha>  # >= 32 chars
+wrangler versions deploy --env staging
 ```
+
+Stamp with the SHA of the last successful deploy (the run summary's `SHA:`
+line, or the live `/readyz` `build_revision`): a plain `wrangler secret put`
+publishes an unstamped version that can never form a rollback receipt
+(see `docs/production-deploy.md`).
 
 Same for `--env production`. Closing the summary requires removing both the
 dashboard pair and `METRICS_SCRAPE_TOKEN`: removing only the dashboard pair

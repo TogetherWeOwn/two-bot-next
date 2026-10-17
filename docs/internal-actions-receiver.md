@@ -80,8 +80,11 @@ with the `TWO_INTERNAL_CONTAINER` marker; other binds still pass
 Every Worker secret change publishes a new Worker version, and the ownership
 fence keeps a new version from serving until the Operator transfers ownership
 (see [persisted ownership control](runbook.md#persisted-ownership-control)).
-Stage the secrets with `wrangler versions secret put --env staging` (a version
+Stage the secrets with `wrangler versions secret put --env staging <KEY> --message <sha>` (a version
 that is not yet deployed), deploy that one version, then run the takeover once.
+Stamp with the SHA of the last successful deploy (the run summary's `SHA:` line,
+or the live `/readyz` `build_revision`); an unstamped secret-change version can
+never form a rollback receipt (see `docs/production-deploy.md`).
 
 1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS`, `TWO_INTERNAL_CHANNEL_KEYS` and `TWO_INTERNAL_ROLE_KEYS` (plain values).

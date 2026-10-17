@@ -75,11 +75,14 @@ environment. Names only — values never go in cards, logs, or PRs:
 
 - `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` — GitHub Actions secrets,
   used by `deploy-staging.yml`.
-- `DISCORD_TOKEN` — Worker secret (`wrangler secret put --env staging`),
+- `DISCORD_TOKEN` — Worker secret (staged with `wrangler versions secret put
+  --env staging DISCORD_TOKEN --message <sha>`, then `wrangler versions deploy`),
   the staging bot token.
-- `GUILD_ID` — Worker secret (`wrangler secret put --env staging`),
+- `GUILD_ID` — Worker secret (staged with `wrangler versions secret put
+  --env staging GUILD_ID --message <sha>`, then `wrangler versions deploy`),
   the TWO Staging guild (`1545644954272137297`).
-- `DATABASE_URL` — Worker secret (`wrangler secret put --env staging`),
+- `DATABASE_URL` — Worker secret (staged with `wrangler versions secret put
+  --env staging DATABASE_URL --message <sha>`, then `wrangler versions deploy`),
   the direct, unpooled URL for the bot's dedicated `two_bot` database and role
   on the Neon **staging** branch (`br-summer-sunset`, project
   `rough-dream-43123587`), separate from the web's `two` / `two_app`.
@@ -87,6 +90,11 @@ environment. Names only — values never go in cards, logs, or PRs:
 - `STAGING_WORKER_URL` — GitHub Actions **variable** (not a secret), the
   staging Worker URL, used by the `/readyz` gate. If it is missing the gate
   fails closed with instructions instead of deploying blind.
+
+`<sha>` above is the SHA of the last successful deploy (the run summary's
+`SHA:` line, or the live `/readyz` `build_revision`): a plain
+`wrangler secret put` publishes an unstamped version that can never form a
+rollback receipt (see `docs/production-deploy.md`).
 
 ## Starting the soak
 
