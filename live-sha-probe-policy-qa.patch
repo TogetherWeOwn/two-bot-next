@@ -1,0 +1,107 @@
+--- a/scripts/ci/test_workflows.py
++++ b/scripts/ci/test_workflows.py
+@@ -967,12 +967,27 @@
+             or any(marker in guard_text for marker in guard_markers)):
+         errors.append(f"{name}:guard: deployment/probe alternative outside the production job")
+     guard_script = "\n".join(step.get("run", "") for step in guard.get("steps", []))
+-    for required in ('urllib.request.urlopen(worker_url + "/readyz", timeout=10)',
++    # The guard probes live /readyz through a Request carrying the fixed
++    # rollout User-Agent (edge-reviewed), then compares build_revision to
++    # the requested SHA. Pin every leg: the Request endpoint, its exact
++    # target, the headers kwarg, the header name, the exact User-Agent
++    # value, the request-based urlopen with its timeout, and the SHA
++    # comparison. Returning to a bare urlopen(worker_url + ...) would
++    # reintroduce the reviewed edge rejection, so the request-based
++    # urlopen pin fails that rewind closed.
++    for required in ('urllib.request.Request(',
++                     'worker_url + "/readyz"',
++                     'headers=',
++                     '"User-Agent"',
++                     '"two-bot-next-production-rollout/1.0"',
++                     'urllib.request.urlopen(request, timeout=10)',
+                      'live_report.get("build_revision") != sha'):
+         if required not in guard_script:
+             errors.append(f"{name}:guard: missing live-SHA check {required}")
+     if guard_script.count("urllib.request.urlopen(") != 1:
+         errors.append(f"{name}:guard: unexpected live production probe")
++    if guard_script.count("urllib.request.Request(") != 1:
++        errors.append(f"{name}:guard: unexpected live production probe")
+     # Lexical regression pins on the guard script. deploy-staging runs
+     # execute (TOG-12856), so every production SHA needs a staging deploy
+     # run on that SHA that concluded `success` (a `skipped` run does not
+@@ -1843,6 +1858,75 @@
+                             step["run"] = step["run"].replace(pin, "")
+                 self.assertTrue(mutated(drop))
+ 
++    def test_production_live_sha_probe_policy_is_pinned_and_mutations_fail(self):
++        # The guard probes live /readyz through a Request carrying the fixed
++        # rollout User-Agent, then compares build_revision to the requested
++        # SHA with exactly one probe. Every softening (dropped User-Agent or
++        # header wiring, retargeted or unwrapped probe, lost timeout, lost
++        # SHA comparison, doubled probe) must fail closed here.
++        production = self.workflows["deploy-production.yml"]
++        self.assertEqual(production_errors(production), [])
++
++        def mutated(change):
++            workflow = deepcopy(production)
++            change(workflow)
++            return production_errors(workflow)
++
++        for pin in ('urllib.request.Request(',
++                    'worker_url + "/readyz"',
++                    'headers=',
++                    '"User-Agent"',
++                    '"two-bot-next-production-rollout/1.0"',
++                    'urllib.request.urlopen(request, timeout=10)',
++                    'live_report.get("build_revision") != sha'):
++            with self.subTest(dropped=pin):
++                def drop(w, pin=pin):
++                    for step in w["jobs"]["guard"]["steps"]:
++                        if "run" in step:
++                            step["run"] = step["run"].replace(pin, "")
++                self.assertTrue(mutated(drop))
++        with self.subTest(dropped="request timeout"):
++            def drop_timeout(w):
++                for step in w["jobs"]["guard"]["steps"]:
++                    if "run" in step:
++                        step["run"] = step["run"].replace(
++                            "urllib.request.urlopen(request, timeout=10)",
++                            "urllib.request.urlopen(request)")
++            self.assertTrue(mutated(drop_timeout))
++        with self.subTest(rewound="bare urlopen"):
++            # Rewinding to urlopen(worker_url + ...) reintroduces the
++            # reviewed edge rejection and must fail closed.
++            def rewind(w):
++                for step in w["jobs"]["guard"]["steps"]:
++                    if "run" in step:
++                        step["run"] = step["run"].replace(
++                            "urllib.request.urlopen(request, timeout=10)",
++                            'urllib.request.urlopen(worker_url + "/readyz", timeout=10)')
++            self.assertTrue(mutated(rewind))
++        with self.subTest(duplicated="second probe"):
++            def duplicate(w):
++                for step in w["jobs"]["guard"]["steps"]:
++                    if "run" in step and "urllib.request.urlopen(request, timeout=10)" in step["run"]:
++                        step["run"] = step["run"].replace(
++                            "urllib.request.urlopen(request, timeout=10)",
++                            "urllib.request.urlopen(request, timeout=10)\n"
++                            "                      with urllib.request.urlopen(request, timeout=10) as response2:\n"
++                            "                          status2, body2 = response2.status, response2.read()")
++            self.assertTrue(mutated(duplicate))
++        with self.subTest(duplicated="second Request"):
++            def duplicate_request(w):
++                for step in w["jobs"]["guard"]["steps"]:
++                    if "run" in step and "urllib.request.Request(" in step["run"]:
++                        step["run"] = step["run"].replace(
++                            "urllib.request.Request(",
++                            "urllib.request.Request(\n"
++                            "                          worker_url + \"/readyz\",\n"
++                            "                          headers={\"User-Agent\": \"two-bot-next-production-rollout/1.0\"},\n"
++                            "                      )\n"
++                            "                      spare = urllib.request.Request(",
++                            1)
++            self.assertTrue(mutated(duplicate_request))
++
+     def test_production_schema_gate_shape_is_pinned_and_mutations_fail(self):
+         import copy
+         production = self.workflows["deploy-production.yml"]
