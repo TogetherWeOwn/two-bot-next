@@ -1594,6 +1594,56 @@ for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) 
   });
 }
 
+test("DO failed EventSub reconcile passes ticket once, survive a failed scrape, and recover on a healthy pass", async (t) => {
+  const h = await alertHarness(t, ALERT_ENV);
+  let healthy = 10;
+  let pending = 2;
+  let failedPasses = 4;
+  let scrapeFails = false;
+  // Complete scrapes from the shared fixture with only the pass counters moving.
+  const bodyWithPasses = () => metricsBody()
+    .replace('two_bot_eventsub_reconcile_passes_total{outcome="healthy"} 0', `two_bot_eventsub_reconcile_passes_total{outcome="healthy"} ${healthy}`)
+    .replace('two_bot_eventsub_reconcile_passes_total{outcome="pending"} 0', `two_bot_eventsub_reconcile_passes_total{outcome="pending"} ${pending}`)
+    .replace('two_bot_eventsub_reconcile_passes_total{outcome="failed"} 0', `two_bot_eventsub_reconcile_passes_total{outcome="failed"} ${failedPasses}`);
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path !== "/metrics") return new Response(null, { status: 200 });
+    if (scrapeFails) return new Response(null, { status: 503 });
+    return new Response(bodyWithPasses());
+  });
+  await h.tick();
+  assert.equal(h.posts.length, 0, "the first valid sample is only a baseline");
+  assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
+
+  failedPasses = 5;
+  await h.tick();
+  assert.equal(h.posts.length, 1, "one failed-pass increase raises one ticket");
+  assert.match(JSON.parse(h.posts[0]!.init.body as string).content, /ALERT eventsub_reconcile_failed \(ticket\):/);
+  assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["eventsub_reconcile_failed"]);
+
+  failedPasses = 6;
+  await h.tick();
+  assert.equal(h.posts.length, 1, "repeated failed passes do not re-alert");
+
+  scrapeFails = true;
+  await h.tick();
+  assert.equal(h.posts.length, 1, "a failed scrape must not send RESOLVED");
+  assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["eventsub_reconcile_failed"]);
+
+  scrapeFails = false;
+  await h.tick();
+  assert.equal(h.posts.length, 1, "a flat failed counter after the gap is not recovery");
+  pending = 3;
+  await h.tick();
+  assert.equal(h.posts.length, 1, "a verification-pending pass is not recovery");
+
+  healthy = 11;
+  await h.tick();
+  assert.equal(h.posts.length, 2, "a healthy-pass increase with no failed increase recovers");
+  assert.match(JSON.parse(h.posts[1]!.init.body as string).content, /RESOLVED eventsub_reconcile_failed\. Build: unknown\. Logs: /);
+  assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
+});
+
 type AlertSender = "readiness" | "metrics";
 async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<Env>, values?: Map<string, unknown>) {
   const h = await alertHarness(t, { UNREADY_ALERT_FAILURES: "1", ...env }, values);
