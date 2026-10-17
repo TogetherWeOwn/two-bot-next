@@ -63,6 +63,7 @@ pub fn job(database_url: &str) -> Job {
     Job {
         name: NAME,
         cadence,
+        cadence_source: None,
         startup_jitter: jobs::startup_jitter(cadence, rand::random()),
         timeout: TIMEOUT,
         action: Arc::new(move || {

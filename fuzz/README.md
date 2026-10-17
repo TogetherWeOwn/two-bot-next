@@ -3,10 +3,10 @@
 This is a separate `cargo-fuzz` workspace, explicitly excluded from the root
 workspace. Normal `cargo build`, workspace tests/clippy, `check` and cargo-deny
 keep their existing members, dependency lockfile and stable toolchain. The required
-`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all seventeen targets
+`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all eighteen targets
 on pinned nightly `nightly-2026-10-01` + `cargo-fuzz 0.13.2` and then replays
 the `eventsub_delivery` seed corpus once (`-runs=0`, no fuzzing). The other
-sixteen targets are compile-only in required CI; bounded manual smokes exist for
+seventeen targets are compile-only in required CI; bounded manual smokes exist for
 `vote_kick` and `helix_token`. No scheduled or continuous fuzz campaign exists.
 
 ## Coverage
@@ -66,7 +66,7 @@ set -euo pipefail
 : "${FUZZ_OUTPUT_DIR:?set an absolute non-source output directory}"
 FUZZ_SECONDS=${FUZZ_SECONDS:-300}
 mkdir -p "$FUZZ_OUTPUT_DIR/target" "$FUZZ_OUTPUT_DIR/logs"
-for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp settings_map vote_kick vote_kick_reason slash_input_bounds cutover_parse lfg_select internal_action_validators eventsub_delivery helix_token automation_transfer_import; do
+for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp settings_map vote_kick vote_kick_reason slash_input_bounds cutover_parse lfg_select internal_action_validators eventsub_delivery helix_token voice_room_name automation_transfer_import; do
   mkdir -p "$FUZZ_OUTPUT_DIR/corpus/$target" "$FUZZ_OUTPUT_DIR/artifacts/$target"
   max_len=65536
   if [[ "$target" == helix_token ]]; then max_len=131072; fi

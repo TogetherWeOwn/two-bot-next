@@ -22,7 +22,11 @@ existing disposable Postgres service, rather than the lint-only `check` lane.
   legacy-verify and staging-migrate suites under the exact `agent_test` URL,
   the internal-events, raid-list and reengagement-list suites under the
   empty-password form, and member-moderation behind `MEMBER_TESTDB`.
-  Shortfalls and missing or empty reports fail the PR. The step runs after the
+  Shortfalls and missing or empty reports fail the PR. Diff paths Git
+  C-quotes (non-ASCII or escaped file names) are decoded to the same
+  repository-relative names the LCOV report uses, so they count like any
+  other changed file; a diff header the parser cannot read fails closed
+  instead of dropping the file from the denominator. The step runs after the
   ordinary rust-tests steps and uses `always()` so their failures do not suppress
   coverage output or get hidden by a coverage shortfall. Measurement also uses
   `--ignore-run-fail` to preserve LCOV output when tests invoked by llvm-cov fail.
