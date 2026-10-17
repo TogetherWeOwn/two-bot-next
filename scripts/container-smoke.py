@@ -31,12 +31,18 @@ IMAGE_MAX_BYTES = 112 * MIB
 # (15.04 MiB) before the event-executor merge; the combined-head
 # measurement comes from hosted CI on the merged head. 16 MiB restores a
 # working tripwire with headroom; revisit if the binary approaches it.
-# 17 MiB holds for the EventSub go-live stack: the receiver-ledger wiring
-# head measured 16,794,312 bytes (16.02 MiB) and the delivery-provisioning
-# head 16,794,832 bytes (16.02 MiB) on hosted CI, ~17 KiB over the old
-# 16 MiB budget with no new dependencies (durable ledger store plus the
-# receiver delivery path; release profile already minimal). 17 MiB restores
-# a working tripwire with headroom; revisit if the binary approaches it.
+# 2026-10-17: 17 MiB ceiling. PR #1074's head failed the 16 MiB gate in CI
+# (actions run 39045612916, step "Runtime contract and size budgets") after
+# a week of feature merges plus ~450 lines of shipping ledger/receiver code
+# on that branch. Every other assertion in that step was verified against
+# the same head locally (see that PR's body): /health 200, /readyz 503 with
+# the exact components/jobs bodies, --healthcheck 0 against live / 1
+# without a server, SIGTERM exit 0 — so size is the cause by elimination.
+# Backfill from hosted CI: the receiver-ledger wiring head measured
+# 16,794,312 bytes (16.02 MiB) and the stacked delivery-provisioning head
+# 16,794,832 bytes (16.02 MiB), ~17 KiB over the old 16 MiB budget with no
+# new dependencies. 17 MiB restores a working tripwire with headroom;
+# revisit if the binary approaches it.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
