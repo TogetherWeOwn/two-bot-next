@@ -111,6 +111,8 @@ are outside this implementation's scope.
   presence on, play aggregates still persist while voice-derived `in_voice_ms`
   stays 0 (voice spans drain and drop). The table is not a replay fence and
   holds no fence rows; member erasure and opt-out purges have no row to delete
+  there. Operators read these rows through the [game-activity aggregate
+  report](game-activity-report.md).
   there.
 
 The authoritative, ordered deletion manifest is
