@@ -13496,6 +13496,35 @@ async fn reload_creators_keeps_the_view_on_a_failed_read() {
 }
 
 #[tokio::test]
+async fn creator_map_age_keeps_climbing_through_a_store_outage() {
+    // The age gauge counts from the last *successful* merge, never from a
+    // failed attempt: during a store outage every refresh fails, yet the
+    // age must sail past the 5 min refresh interval instead of sawing back
+    // toward 0 on each attempt (creators_read_ms stamps attempts only to
+    // pace retries, and must not feed the gauge).
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    assert_eq!(worker.creators_merged_ms, Some(0));
+    worker.store.creators_error = Some(StoreError::Unavailable);
+    worker.reload_creators(300_000).await;
+    worker.reload_creators(600_000).await;
+    assert_eq!(
+        worker.creators_merged_ms,
+        Some(0),
+        "failed reads must not move the merge stamp"
+    );
+    assert_eq!(
+        creator_map_age_secs(worker.creators_merged_ms, 600_000),
+        600,
+        "the age must climb past the refresh interval while merges fail"
+    );
+    worker.store.creators_error = None;
+    worker.reload_creators(900_000).await;
+    assert_eq!(creator_map_age_secs(worker.creators_merged_ms, 900_000), 0);
+}
+
+#[tokio::test]
 async fn reload_creators_converges_after_a_gateway_reconnect() {
     // A gateway reconnect (GuildCreate/Resumed) bumps the live generation but
     // sends no channel event, so no RefreshCreators flag is set and the
@@ -13626,6 +13655,37 @@ fn creator_map_age_climbs_between_merges_and_starts_at_zero() {
     assert_eq!(creator_map_age_secs(Some(20_000), 20_999), 0);
     assert_eq!(creator_map_age_secs(Some(20_000), 81_000), 61);
     assert_eq!(creator_map_age_secs(Some(90_000), 20_000), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_creator_map_age_climbs_from_a_frozen_snapshot() {
+    // While a dispatch is hung the main task takes no new snapshots, so the
+    // watchdog sibling must derive the age from the stored merge stamp on
+    // its own clock: the same frozen snapshot yields a climbing age.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    let stall = StallShared {
+        guild: worker.live.guild_id,
+        http: Arc::clone(&worker.http),
+        start: tokio::time::Instant::now(),
+        state: Mutex::new(StallState {
+            last_progress: tokio::time::Instant::now(),
+            urgent: 0,
+            deferred: 0,
+            oldest_age_secs: 0,
+            halted: false,
+            creators_generation: 0,
+            creators_merged_ms: None,
+        }),
+    };
+    stall.snapshot(&worker, tokio::time::Instant::now());
+    let snap = *stall.state.lock().unwrap();
+    assert_eq!(snap.creators_merged_ms, Some(0));
+    assert_eq!(stall.snapshot_creator_map_age_secs(&snap), 0);
+    // No new snapshot (the hung-dispatch case): the age still climbs.
+    tokio::time::advance(Duration::from_secs(400)).await;
+    assert_eq!(stall.snapshot_creator_map_age_secs(&snap), 400);
 }
 
 #[test]

@@ -2503,8 +2503,13 @@ pub struct GuildRoomWorker<S, H> {
     /// re-read; the maintenance tick merges it, debounced. Set by
     /// `ActorCommand::RefreshCreators`, cleared by `reload_creators`.
     creators_refresh_due: bool,
-    /// Actor clock of the last creator-view merge (periodic refresh).
+    /// Actor clock of the last creator refresh *attempt* (success or
+    /// failure); paces the interval/debounce retries.
     creators_read_ms: Option<u64>,
+    /// Actor clock of the last *successful* creator-view merge. The age
+    /// gauge counts from this field only, so it keeps climbing through a
+    /// store outage instead of resetting on every failed attempt.
+    creators_merged_ms: Option<u64>,
     /// Live generation the creator view was last merged at. A gateway
     /// reconnect (GuildCreate/Resumed) bumps the generation but sends no
     /// channel event, so with no RefreshCreators flag the merge would wait
@@ -2897,6 +2902,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             creators,
             creators_refresh_due: false,
             creators_read_ms: None,
+            creators_merged_ms: None,
             creators_generation,
             creator_misses: HashSet::new(),
             creator_revalidate_cooldown_until: None,
@@ -3278,6 +3284,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         match self.store.creators(self.live.guild_id).await {
             Ok(rows) => {
                 self.creators_generation = generation;
+                self.creators_merged_ms = Some(now_ms);
                 self.creator_misses.clear();
                 self.creator_revalidate_cooldown_until = None;
                 let mut added = 0u64;
@@ -7839,8 +7846,8 @@ fn watchdog_due(
 /// Creator-map staleness on the actor-uptime clock: seconds since the last
 /// successful merge; 0 when never merged. Pure, unit-tested: the gauge must
 /// keep climbing between merges instead of freezing at the merge-time zero.
-fn creator_map_age_secs(creators_read_ms: Option<u64>, now_ms: u64) -> u64 {
-    creators_read_ms.map_or(0, |last| now_ms.saturating_sub(last) / 1000)
+fn creator_map_age_secs(creators_merged_ms: Option<u64>, now_ms: u64) -> u64 {
+    creators_merged_ms.map_or(0, |last| now_ms.saturating_sub(last) / 1000)
 }
 
 /// Publish the per-tick stall gauges: halt latch plus per-lane queue depth
@@ -7860,7 +7867,7 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(
     gauges.set_voice_halted(worker.halted());
     gauges.set_voice_creator_map(
         worker.creators_generation,
-        creator_map_age_secs(worker.creators_read_ms, now_ms),
+        creator_map_age_secs(worker.creators_merged_ms, now_ms),
     );
     // Recompute the in-flight REST age from attempts still live, so the
     // gauge shows a currently-stalled request instead of the begin/drop
@@ -7883,6 +7890,10 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(
 struct StallShared<H> {
     guild: Snowflake,
     http: Arc<H>,
+    /// Actor start instant: the sibling computes the creator-map age from
+    /// the stored merge stamp on this clock, so the age keeps climbing
+    /// while the main task (and its snapshots) are hung in a dispatch.
+    start: tokio::time::Instant,
     state: Mutex<StallState>,
 }
 
@@ -7894,7 +7905,7 @@ struct StallState {
     oldest_age_secs: u64,
     halted: bool,
     creators_generation: u64,
-    creators_age_secs: u64,
+    creators_merged_ms: Option<u64>,
 }
 
 impl<H: RoomWrites> StallShared<H> {
@@ -7902,7 +7913,6 @@ impl<H: RoomWrites> StallShared<H> {
         &self,
         worker: &GuildRoomWorker<S, H>,
         last_progress: tokio::time::Instant,
-        now_ms: u64,
     ) {
         let guild = worker.live.guild_id;
         let (urgent, deferred) = worker.queue.pending_counts(guild);
@@ -7917,8 +7927,15 @@ impl<H: RoomWrites> StallShared<H> {
             oldest_age_secs,
             halted: worker.halted(),
             creators_generation: worker.creators_generation,
-            creators_age_secs: creator_map_age_secs(worker.creators_read_ms, now_ms),
+            creators_merged_ms: worker.creators_merged_ms,
         };
+    }
+
+    /// Creator-map age for a snapshot, computed on the sibling's own clock:
+    /// a frozen snapshot (hung dispatch) still yields a climbing age.
+    fn snapshot_creator_map_age_secs(&self, snap: &StallState) -> u64 {
+        let now_ms = self.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        creator_map_age_secs(snap.creators_merged_ms, now_ms)
     }
 
     /// Watchdog + gauge publish from the shared snapshot. Reads only: safe
@@ -7936,7 +7953,10 @@ impl<H: RoomWrites> StallShared<H> {
             u64::try_from(snap.deferred).unwrap_or(u64::MAX),
             snap.oldest_age_secs,
         );
-        gauges.set_voice_creator_map(snap.creators_generation, snap.creators_age_secs);
+        gauges.set_voice_creator_map(
+            snap.creators_generation,
+            self.snapshot_creator_map_age_secs(&snap),
+        );
         // Stuck-worker watchdog: queued work with no completed turn for the
         // full window. Log + metric only; the queue keeps its retries so a
         // transient outage still drains on recovery.
@@ -7986,6 +8006,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     let stall = Arc::new(StallShared {
         guild: worker.live.guild_id,
         http: Arc::clone(&worker.http),
+        start,
         state: Mutex::new(StallState {
             last_progress,
             urgent: 0,
@@ -7993,14 +8014,10 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
             oldest_age_secs: 0,
             halted: false,
             creators_generation: 0,
-            creators_age_secs: 0,
+            creators_merged_ms: None,
         }),
     });
-    stall.snapshot(
-        worker,
-        last_progress,
-        start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-    );
+    stall.snapshot(worker, last_progress);
     let stop_watchdog = Arc::new(AtomicBool::new(false));
     let watchdog = {
         // Weak, not a clone: the actor task owns the only strong ref. If a
@@ -8043,7 +8060,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 if accepted {
                     last_progress = tokio::time::Instant::now();
                 }
-                stall.snapshot(worker, last_progress, now_ms);
+                stall.snapshot(worker, last_progress);
                 dispatch_ready |= accepted;
             }
             // Inbox first between writes, but no timer between a persisted
@@ -8070,7 +8087,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 if progressed {
                     last_progress = tokio::time::Instant::now();
                 }
-                stall.snapshot(worker, last_progress, now_ms);
+                stall.snapshot(worker, last_progress);
                 dispatch_ready = progressed;
                 complete_join_pair = worker.moves.len() > pending_moves;
                 dispatch_budget = dispatch_budget.saturating_sub(1);
@@ -8141,7 +8158,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 // V5: re-render template names whose facts changed (create,
                 // join/leave, owner handoff); the rename lane paces them.
                 worker.refresh_template_names(now_ms);
-                stall.snapshot(worker, last_progress, now_ms);
+                stall.snapshot(worker, last_progress);
                 dispatch_ready = true;
                 maintenance_ready = true;
             }
@@ -8150,6 +8167,9 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 maintenance_ready = false;
                 let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 worker.reload_creators(now_ms).await;
+                // Republish the merge stamp now, not next tick: until then
+                // the watchdog sibling would keep ageing the pre-merge stamp.
+                stall.snapshot(worker, last_progress);
                 worker.reload_name_settings(now_ms).await;
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
