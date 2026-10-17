@@ -454,6 +454,30 @@ Same signals, same first response, same escalation, lower urgency. Do not
 close it as "fast burn resolved": the fast window can clear while the slow
 grind continues.
 
+#### Alert: voice creator-map stale
+
+The voice actor re-merges the creator map from the store every 5 minutes;
+`two_bot_voice_creator_map_age_seconds` counts from the last *successful*
+merge (a failed read never resets it, and the stall watchdog keeps it
+climbing while the actor is hung). This alert fires when the age passes two
+refresh intervals (600 s) with `two_bot_voice_creator_map_generation` above
+0, meaning merges stopped landing and creator joins are served from a stale
+map: new or changed creators are invisible (`unknown_creator` refusals) and
+removed creators keep working. Generation 0 (no merge yet: boot, or voice
+parked) never fires, and a container old enough to lack the gauges holds the
+previous state instead of resolving it.
+
+First response: confirm via the authorized `/ops/metrics` scrape that the
+generation is flat while the age climbs, then look for the cause one layer
+down — store read failures (`db_errors`, pool saturation) or a halted actor
+(`two_bot_voice_worker_halted`). Read the container logs for
+`voice_join_received` refusal lines: a rising `unknown_creator` share with a
+flat generation is this alert becoming member-visible.
+
+Escalate when the store cause is not self-clearing, when `unknown_creator`
+refusals dominate, or when the flat generation survives a restart — the fix
+belongs to the on-call engineer, not another redeploy.
+
 #### Alert: gateway missed events
 
 `two_bot_gateway_missed_events_total` increased between two keepalive
