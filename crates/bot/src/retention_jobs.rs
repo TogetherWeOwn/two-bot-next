@@ -162,17 +162,15 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
     }
 }
 
-/// Delete (execute) or count (any drier mode) per-guild game-activity
-/// aggregate rows older than the configured horizon, one guild scope at a
-/// time. Each guild's statement is its own, so one guild's store failure
-/// never rolls back another guild's sweep; any failure returns
-/// [`ErrorClass::Database`] so the supervisor retries on the next bounded
-/// opportunity. Expiry is idempotent (deleted rows stay deleted), and the
-/// horizon parser only yields values inside
+/// Delete (execute) or preview (any drier mode) stale per-guild
+/// game-activity aggregates. The listing carries each stale guild's row
+/// count under the same predicate the delete uses, so the dry run sums
+/// exactly what execute deletes with no extra query. Deletes stay one
+/// guild scope at a time, so one guild's failure never rolls back another's;
+/// any failure returns [`ErrorClass::Database`] for a bounded retry.
+/// Expiry is idempotent and the horizon parser only yields values inside
 /// `1..=MAX_AGGREGATE_RETENTION_DAYS`, so a misconfigured setting falls back
-/// to the safe default instead of widening into a wipe or overflowing the
-/// interval arithmetic. Both modes log the same event with the mode
-/// attached, so the dry run previews exactly what execute will delete.
+/// to the safe default instead of widening into a wipe.
 async fn expire_stale_game_aggregates(
     pool: &PgPool,
     mode: RetentionMode,
@@ -186,16 +184,14 @@ async fn expire_stale_game_aggregates(
         .await
         .map_err(|_| aggregate_expiry_failed())?;
     let mut stale = 0u64;
-    for guild_id in &guilds {
-        if mode == RetentionMode::Execute {
+    if mode == RetentionMode::Execute {
+        for (guild_id, _) in &guilds {
             stale += game_activity_store::expire_stale_guild_aggregates(pool, guild_id, horizon)
                 .await
                 .map_err(|_| aggregate_expiry_failed())?;
-        } else {
-            stale += game_activity_store::count_stale_guild_aggregates(pool, guild_id, horizon)
-                .await
-                .map_err(|_| aggregate_expiry_failed())?;
         }
+    } else {
+        stale = guilds.iter().map(|(_, count)| *count).sum();
     }
     if stale > 0 {
         tracing::info!(
@@ -203,7 +199,7 @@ async fn expire_stale_game_aggregates(
             stale_rows = stale,
             horizon_days = horizon,
             mode = ?mode,
-            "aggregate expiry sweep",
+            "sweep",
         );
     }
     Ok(())
