@@ -557,8 +557,8 @@ mod tests {
         )];
         let rsvp_totals = vec![CommandDefinition::new("attendance", "Show RSVP totals")];
         let merged = merge_commands(&[scorecard, rsvp_totals], &[]).expect("merges");
-        assert_eq!(merged.len(), 4); // rank, leaderboard, help, attendance×1
-        assert_eq!(merged[3].description, "Record a verified attendee");
+        assert_eq!(merged.len(), 5); // rank, leaderboard, help, privacy, attendance×1
+        assert_eq!(merged[4].description, "Record a verified attendee");
     }
 
     #[test]

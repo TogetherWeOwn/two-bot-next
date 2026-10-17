@@ -267,10 +267,11 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 28 legacy builtins plus the 21 gated voice commands and
-        // `/templateassistant` (voice `kick` loses first-wins to moderation
-        // `/kick`): matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (50 live)"));
+        // 28 legacy builtins plus the Next-only help and privacy commands,
+        // plus the 21 gated voice commands and `/templateassistant` (voice
+        // `kick` loses first-wins to moderation `/kick`): matches the
+        // regenerated `docs/commands.md` total.
+        assert!(text.contains("**Server commands** (51 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"

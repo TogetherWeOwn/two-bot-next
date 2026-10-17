@@ -616,7 +616,7 @@ mod tests {
             &names[20..25],
             ["ban", "tempban", "kick", "timeout", "warn"]
         );
-        assert_eq!(&names[24..], ["purge", "slowmode", "lockdown", "unlock"]);
+        assert_eq!(&names[25..], ["purge", "slowmode", "lockdown", "unlock"]);
         assert!(merged.iter().all(|d| !d.dm_permission));
     }
 
