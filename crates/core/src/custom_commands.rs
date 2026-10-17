@@ -36,10 +36,6 @@ pub const MAX_TEXT_TRIGGER_CHARS: usize = MAX_COMMAND_NAME_CHARS + 1;
 /// capping at 64 preserves `validate_template`'s unknown-placeholder refusal
 /// exactly while keeping hostile inputs total-bounded in time and memory.
 pub const MAX_PLACEHOLDERS: usize = 64;
-/// Initial render allocation cap, bytes. A successful render holds at most
-/// `MAX_RENDERED_CHARS` UTF-16 units (at most ~6000 UTF-8 bytes), so a larger
-/// `template.len()` reservation would only serve a path that refuses anyway.
-const MAX_RENDER_CAPACITY_BYTES: usize = 8192;
 
 /// Said to anybody who reaches a custom command while automations are off
 /// (legacy `AUTOMATIONS_DISABLED_REPLY`; one constant shared with the router).
@@ -139,39 +135,33 @@ pub fn validate_template(template: &str) -> Result<(), TemplateError> {
 /// Render a validated template against `ctx` (legacy `renderTemplate`).
 /// Unknown-but-pattern-matching keys render literally (unreachable after
 /// validation, kept so render never invents text); output past Discord's
-/// ceiling is refused. Each expansion is measured before it is pushed, so a
-/// hostile placeholder/context combination fails as a bounded `RenderTooLong`
-/// carrying the exact length without ever materialising the huge string: past
-/// the ceiling the loop keeps counting units but stops pushing.
+/// ceiling is refused. Each expansion is measured before it is pushed and the
+/// render refuses at the first overflow, so a hostile placeholder/context
+/// combination fails as a bounded `RenderTooLong` — carrying the running
+/// length when the ceiling was crossed, always past it — without ever
+/// materialising the huge string. Single-expansion overflows keep their exact
+/// length; only the multi-expansion total is a detected-at-overflow prefix.
 pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, TemplateError> {
     let bytes = template.as_bytes();
-    let user_units = ctx.user.encode_utf16().count();
-    let username_units = ctx.username.encode_utf16().count();
-    let server_units = ctx.server.encode_utf16().count();
-    let channel_units = ctx.channel.encode_utf16().count();
-    let mut out = String::with_capacity(template.len().min(MAX_RENDER_CAPACITY_BYTES));
-    let mut total_units = 0usize;
-    let mut too_long = false;
+    let mut out = String::new();
+    let mut units = 0usize;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
             if let Some(end) = placeholder_end(bytes, i) {
                 let key = &template[i + 1..end - 1];
-                let (text, units): (&str, usize) = match key {
-                    "user" => (ctx.user.as_str(), user_units),
-                    "username" => (ctx.username.as_str(), username_units),
-                    "server" => (ctx.server.as_str(), server_units),
-                    "channel" => (ctx.channel.as_str(), channel_units),
-                    _ => (&template[i..end], template[i..end].encode_utf16().count()),
+                let text = match key {
+                    "user" => ctx.user.as_str(),
+                    "username" => ctx.username.as_str(),
+                    "server" => ctx.server.as_str(),
+                    "channel" => ctx.channel.as_str(),
+                    _ => &template[i..end],
                 };
-                total_units = total_units.saturating_add(units);
-                if !too_long {
-                    if total_units > MAX_RENDERED_CHARS {
-                        too_long = true;
-                    } else {
-                        out.push_str(text);
-                    }
+                units = units.saturating_add(text.encode_utf16().count());
+                if units > MAX_RENDERED_CHARS {
+                    return Err(TemplateError::RenderTooLong(units));
                 }
+                out.push_str(text);
                 i = end;
                 continue;
             }
@@ -180,20 +170,13 @@ pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, 
         // `i` stays on a char boundary: it starts there and each step moves
         // past ASCII braces or one full `char`, so this never panics.
         let ch = template[i..].chars().next().expect("char boundary");
-        total_units = total_units.saturating_add(ch.len_utf16());
-        if !too_long {
-            if total_units > MAX_RENDERED_CHARS {
-                too_long = true;
-            } else {
-                out.push(ch);
-            }
+        units = units.saturating_add(ch.len_utf16());
+        if units > MAX_RENDERED_CHARS {
+            return Err(TemplateError::RenderTooLong(units));
         }
+        out.push(ch);
         i += ch.len_utf8();
     }
-    if too_long {
-        return Err(TemplateError::RenderTooLong(total_units));
-    }
-    debug_assert_eq!(out.encode_utf16().count(), total_units);
     Ok(out)
 }
 
@@ -759,7 +742,10 @@ mod tests {
     #[test]
     fn template_render_hostile_expansion_refused_without_panic() {
         // Degenerate expansion: many placeholders over a large context must
-        // fail as a bounded RenderTooLong, never panic or hang.
+        // fail as a bounded RenderTooLong, never panic, hang, or materialise
+        // the huge string. The renderer refuses at the first overflow, so the
+        // reported length is the running length when the ceiling was crossed
+        // (here the first 10_000-unit expansion already breaches it).
         let ctx = TemplateContext {
             user: "y".repeat(10_000),
             username: String::new(),
@@ -771,7 +757,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(TemplateError::RenderTooLong(len)) if len == 500 * 10_000
+                Err(TemplateError::RenderTooLong(len)) if len > MAX_RENDERED_CHARS
             ),
             "expected bounded RenderTooLong, got {result:?}"
         );

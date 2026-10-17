@@ -11,7 +11,7 @@ use two_bot_core::custom_commands::{
 /// stay reachable, while each context field stays small enough that even a
 /// fully-expanded render stays computable without materialising a huge string
 /// (the production renderer measures each expansion before pushing it and
-/// only counts once past the ceiling).
+/// refuses at the first overflow).
 const MAX_TEMPLATE_FIELD_CHARS: usize = 4096;
 const MAX_CTX_FIELD_CHARS: usize = 512;
 /// At most template + four context fields; extras are ignored.
@@ -74,16 +74,21 @@ fuzz_target!(|data: &[u8]| {
     let capped = placeholders_in(&hostile);
     assert!(capped.len() <= MAX_PLACEHOLDERS);
     assert_eq!(capped.len(), MAX_PLACEHOLDERS);
-    // Hostile expansion pin: measured refusal carries the exact length.
+    // Hostile expansion pin: refusal at the first overflow carries the running
+    // length when the ceiling was crossed (here the first 10_000-unit
+    // expansion already breaches it), never the materialised huge string.
     let big_ctx = TemplateContext {
         user: "y".repeat(10_000),
         username: String::new(),
         server: String::new(),
         channel: String::new(),
     };
-    assert_eq!(
-        render_template(&"{user}".repeat(500), &big_ctx),
-        Err(TemplateError::RenderTooLong(500 * 10_000))
+    assert!(
+        matches!(
+            render_template(&"{user}".repeat(500), &big_ctx),
+            Err(TemplateError::RenderTooLong(len)) if len > MAX_RENDERED_CHARS
+        ),
+        "hostile expansion must refuse as bounded RenderTooLong"
     );
 
     // Member-supplied templates arrive as UTF-8 text. Invalid UTF-8 is
@@ -179,7 +184,7 @@ fuzz_target!(|data: &[u8]| {
     );
 
     // Rendering never panics on any input: success stays within Discord's
-    // ceiling, refusal carries the exact over-ceiling length, single-pass
+    // ceiling, refusal carries the detected over-ceiling length, single-pass
     // substitution never re-expands context text, and both paths are
     // deterministic. No database, Discord client, network or secret is touched
     // here; only these pure string functions run.
