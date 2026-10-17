@@ -3,10 +3,10 @@
 This is a separate `cargo-fuzz` workspace, explicitly excluded from the root
 workspace. Normal `cargo build`, workspace tests/clippy, `check` and cargo-deny
 keep their existing members, dependency lockfile and stable toolchain. The required
-`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all seventeen targets
+`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all eighteen targets
 on pinned nightly `nightly-2026-10-01` + `cargo-fuzz 0.13.2` and then replays
 the `eventsub_delivery` seed corpus once (`-runs=0`, no fuzzing). The other
-sixteen targets are compile-only in required CI; bounded manual smokes exist for
+seventeen targets are compile-only in required CI; bounded manual smokes exist for
 `vote_kick` and `helix_token`. No scheduled or continuous fuzz campaign exists.
 
 ## Coverage
@@ -30,6 +30,7 @@ sixteen targets are compile-only in required CI; bounded manual smokes exist for
 | `eventsub_delivery` | `twitch_eventsub::verify_delivery`, `twitch_eventsub::classify` | Structured delivery inputs (signature, timestamp skew, message type, body) signed with public synthetic test material so MAC failure cannot starve the JSON parser. Fixed matrix pins challenge / notification / revocation happy paths plus tampered-signature (`BadSignature`), stale-timestamp (`StaleTimestamp`), unknown-type (`Ignored`) and oversize (`BodyTooLarge`) refusals; fuzzed inputs assert tampered inputs never verify (signature-bypass mutant fails), stale inputs never verify (freshness-widening mutant fails), and verified templates classify to their exact variant (misrouting mutant fails). Raw bodies get a signature-independent `classify` pass for parser coverage. Message ids stay in the header alphabet, types are capped at 64 chars, raw bodies at 8 KiB. Seeds cover challenge, notification, revocation, tampered signature, stale timestamp and unknown message type; keyword-guided inputs suppress byte-derived hostile flags so each seed reaches its named shape (pinned in the fixed matrix), and CI replays the seeds once. No database, Discord client, network or secret. |
 | `helix_token` | `twitch_helix::parse_token_response` | Arbitrary bounded bytes decode as JSON before the production token parser; successful parses must retain a nonnegative expiry and redacted token formatting. Seeds cover a valid response, near-expiry token, missing fields, wrong types and a >64 KiB body. The target caps each input at 128 KiB; it uses a fixed synthetic clock and no network, database, credentials or secrets. The separate `helix-token-fuzz-smoke` workflow runs a bounded 60-second seed-backed campaign and uploads the receipt. |
 | `fb_page_events` | `fb_page_events::webhook::{verify_challenge, verify_signature, parse_envelope}` | Raw bytes are the POST body verbatim while the lossy text split on NUL (`mode\0token\0challenge`) feeds the challenge verifier, so every input exercises all three seams with no keyword routing. The HMAC is recomputed with public synthetic test material; correct signatures verify exactly within the 64 KiB transport cap, tampered/re-prefixed ones never do. The challenge verdict must equal an independent accept-oracle, the envelope parse must be deterministic with every accepted value inside its bound, and every refusal must be a bounded `DriverError::Failed` that leaks no secret. Seeds cover a valid challenge, a bad-token challenge, a valid envelope, a wrong-object envelope, a malformed envelope and a >64 KiB body. No network, database, Discord client, clock or secret. |
+| `voice_room_name` | `voice_room_name::{decide_custom_name, decide_template_name, is_literal_name}` | Arbitrary member/game text and templates through the V3 `/name` decision parsers with member-controlled render facts (bounded owner/game names). Every decided name is never empty, fits `MAX_CHANNEL_NAME_CHARS`, and carries no C0 controls, DEL, `@` or backticks; refusal replies stay short. Seeds cover literal, token, format-only, overlong, conditional-blocked and unicode-fold names. No database, Discord client, network or secret. |
 
 All seeds use synthetic IDs/text; no token, environment secret, database,
 Discord client or network is needed at runtime. MEE6's crate currently has SQLx
@@ -66,7 +67,7 @@ set -euo pipefail
 : "${FUZZ_OUTPUT_DIR:?set an absolute non-source output directory}"
 FUZZ_SECONDS=${FUZZ_SECONDS:-300}
 mkdir -p "$FUZZ_OUTPUT_DIR/target" "$FUZZ_OUTPUT_DIR/logs"
-for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp settings_map vote_kick vote_kick_reason slash_input_bounds cutover_parse lfg_select internal_action_validators eventsub_delivery helix_token fb_page_events; do
+for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp settings_map vote_kick vote_kick_reason slash_input_bounds cutover_parse lfg_select internal_action_validators eventsub_delivery helix_token fb_page_events voice_room_name; do
   mkdir -p "$FUZZ_OUTPUT_DIR/corpus/$target" "$FUZZ_OUTPUT_DIR/artifacts/$target"
   max_len=65536
   if [[ "$target" == helix_token || "$target" == fb_page_events ]]; then max_len=131072; fi
