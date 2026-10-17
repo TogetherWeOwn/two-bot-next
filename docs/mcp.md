@@ -15,6 +15,14 @@ the `/mcp` route in `wrangler/src/index.ts` (method + bearer gate).
 | `get_config` | Worker snapshot | Redacted non-secret vars only; never secrets |
 | `get_audit` | Stub | `{"implemented": false}`; real audit read is follow-up work, never faked data |
 
+Inbound intake is bounded separately from container reads: after the bearer
+and rate gates, at most 64 KiB of request bytes are collected under a
+six-second body deadline before JSON parsing. The byte count is measured on
+the bytes actually read, never on Content-Length alone. Oversize,
+deadline-expired, aborted/errored and malformed bodies all produce the one
+fixed non-echoing `-32700 parse error` refusal (`id: null`), the body reader
+is cancelled/released, and no container request occurs.
+
 Every container-backed tool call is bounded: 6 s timeout plus a 64 KiB body
 cap (same bound as the metrics scrape). Oversize surfaces a generic
 `-32000` JSON-RPC error without echoing upstream bytes; timeouts and
