@@ -720,11 +720,21 @@ async fn run(cli_args: &[String]) {
                         }));
                     }
 
+                    let intents = intents_from_env(&activation);
+                    // Voice-room game names need GUILD_PRESENCES; record
+                    // whether this boot requested it so a missing game
+                    // rename is diagnosable from logs alone (the flag may
+                    // be a secret binding whose value is never printed).
+                    info!(
+                        msg = "gateway_intents",
+                        voice_presences =
+                            intents.contains(twilight_model::gateway::Intents::GUILD_PRESENCES),
+                        "gateway intents resolved"
+                    );
                     // One intents value drives both the shard subscription
                     // and the pipeline's length measurement: without
                     // MESSAGE_CONTENT, Discord delivers content only for
                     // bot mentions, so the pipeline must not measure it.
-                    let intents = intents_from_env(&activation);
                     pipeline.set_message_content_delivered(
                         intents.contains(twilight_gateway::Intents::MESSAGE_CONTENT),
                     );

@@ -31,18 +31,17 @@ IMAGE_MAX_BYTES = 112 * MIB
 # (15.04 MiB) before the event-executor merge; the combined-head
 # measurement comes from hosted CI on the merged head. 16 MiB restores a
 # working tripwire with headroom; revisit if the binary approaches it.
-# 2026-10-17: 17 MiB ceiling. PR #1074's head failed the 16 MiB gate in CI
-# (actions run 39045612916, step "Runtime contract and size budgets") after
-# a week of feature merges plus ~450 lines of shipping ledger/receiver code
-# on that branch. Every other assertion in that step was verified against
-# the same head locally (see that PR's body): /health 200, /readyz 503 with
-# the exact components/jobs bodies, --healthcheck 0 against live / 1
-# without a server, SIGTERM exit 0 — so size is the cause by elimination.
-# Calibrated from the next green run: 16801560 bytes (16.02 MiB) on run
-# 39056648109 job 117470241279, just 24344 bytes over the 16 MiB tripwire.
-# Minimal one-MiB ceiling step per the 15-to-16 precedent (which likewise kept
-# a tight tripwire instead of the 1.4x figure); revisit if the binary
-# approaches this limit.
+# 2026-10-17 recalibration: main tip 89503f71 measured 16,776,096 bytes
+# (16.00 MiB) in hosted CI, leaving 1,120 bytes of headroom — the tripwire
+# is exhausted even before new code lands. This branch's voice
+# rename-decision logs add 3,160 bytes (merged head 6a9c394e: 16,779,256
+# bytes, 2,040 over 16 MiB) with no new dependencies; the release profile
+# is already minimal (opt-level=z, lto, strip). The go-live receiver-ledger
+# branch independently measured 16801560 bytes (16.02 MiB) on CI run
+# 39056648109 job 117470241279, 24344 bytes over the 16 MiB tripwire, after
+# ~450 lines of shipping ledger/receiver code. 17 MiB restores ~1.00 MiB
+# of headroom while keeping a working tripwire; revisit if the binary
+# approaches it.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
