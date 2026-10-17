@@ -204,10 +204,10 @@ async fn failed_send_releases_the_claim_for_the_retry() {
 
 async fn age_delivered(pool: &Pool<Postgres>, key: &str, days_ago: i64) {
     sqlx::query(
-        "UPDATE stream_live_claims SET delivered_at = clock_timestamp() - make_interval(days => $2) WHERE dedup_key = $1",
+        "UPDATE stream_live_claims SET delivered_at = clock_timestamp() - make_interval(days => $2::int) WHERE dedup_key = $1",
     )
     .bind(key)
-    .bind(days_ago as f64)
+    .bind(days_ago as i32)
     .execute(pool)
     .await
     .unwrap();
