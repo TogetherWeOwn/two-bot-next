@@ -97,6 +97,15 @@ export const REST_429_MIN_REQUESTS = 10;
 export const REST_5XX_RATIO = 0.1;
 /** ...and the window must hold at least this many requests. */
 export const REST_5XX_MIN_REQUESTS = 10;
+/**
+ * Promotion canary gate: firing keys that fail a promotion stage so the
+ * existing per-stage auto-rollback restores the pre-promote version. 5xx
+ * only: a 5xx burst is never healthy backpressure (Discord-side failure or
+ * a broken request shape from the fresh build), while 429s are rate-limit
+ * backpressure and `transport` failures already surface through job timeout
+ * classes. See docs/runbook.md#alert-rest-5xx.
+ */
+export const PROMOTION_ERROR_GATE_RULES: readonly string[] = ["rest_5xx_rate"];
 /** Pool at max with zero idle for this many consecutive samples. */
 export const POOL_SATURATED_SAMPLES = 3;
 /** DB errors must reach this many between two samples... */
@@ -755,6 +764,27 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
 export function ruleFor(key: string): RuleDef | undefined {
   const id = key.split(":")[0];
   return RULES.find((r) => r.id === id);
+}
+
+/** Promotion-stage verdict: `fail` true means the stage must fail so auto-rollback runs. */
+export interface PromotionGateVerdict {
+  fail: boolean;
+  /** Gate rule ids present in the firing list, in gate order. */
+  reasons: string[];
+}
+
+/**
+ * Canary error-rate gate over an `evaluateMetrics` firing list. Fails when
+ * any `PROMOTION_ERROR_GATE_RULES` entry fires (exact match: this gate's
+ * rules carry no `:subject` suffix). A 429-only burst passes: backpressure
+ * is not a rollback trigger. Callers wire the failure into their per-stage
+ * health gate (staging verify, production gate, or the shared
+ * gradual-promotion smoke wrapper) so the existing auto-rollback restores
+ * the recorded pre-promote version.
+ */
+export function evaluatePromotionGate(firing: string[]): PromotionGateVerdict {
+  const reasons = PROMOTION_ERROR_GATE_RULES.filter((rule) => firing.includes(rule));
+  return { fail: reasons.length > 0, reasons };
 }
 
 /**

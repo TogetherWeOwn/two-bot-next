@@ -296,12 +296,14 @@ anything the burst may have executed twice.
 Evaluate rollback when the burst starts with the deployed revision: compare the
 alert's first-firing window with the staging-rollout evidence (or the gated
 production run) for that SHA. A 5xx share introduced by a promotion stage
-requires a manual rollback decision unless a 5xx-specific per-stage health gate
-is configured and wired to the shared gradual-promotion action. When its
-configured gate fails, the action restores the recorded pre-promote version; a
-manual rollback names the recorded Worker version and container image from the
-failed run's snapshot. A burst on an unchanged revision is a Discord incident
-or a dependency regression, not a rollback.
+requires a manual rollback decision unless a promotion stage invokes the
+`evaluatePromotionGate` helper (`wrangler/src/alert-rules.ts`, 5xx-only) and
+fails on its verdict. When that configured gate fails, the existing per-stage
+auto-rollback (staging verify, production gate, or the shared
+gradual-promotion action once wired) restores the recorded pre-promote
+version; a manual rollback names the recorded Worker version and container
+image from the failed run's snapshot. A burst on an unchanged revision is a
+Discord incident or a dependency regression, not a rollback.
 
 Escalate when the 5xx share stays above threshold across several windows after
 containment, or when 5xx coincide with 429/transport failures suggesting a

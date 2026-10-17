@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import worker, { type Env } from "../src/index.ts";
 import {
-  EMPTY_STATE, JOB_ERROR_CLASSES, RULES, RUNBOOK_BASE_URL, evaluateMetrics, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
+  EMPTY_STATE, JOB_ERROR_CLASSES, PROMOTION_ERROR_GATE_RULES, RULES, RUNBOOK_BASE_URL, evaluateMetrics, evaluatePromotionGate, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
   type MetricsAlertState,
 } from "../src/alert-rules.ts";
 
@@ -171,6 +171,20 @@ test("alert messages carry build revision, failure detail and the log-query link
   const fallback = transitionMessages([], ["rest_5xx_rate"])[0]!;
   assert.match(fallback, /Build: unknown/);
   assert.doesNotMatch(fallback, /Failure:/);
+});
+
+test("promotion error gate fails a stage only on a 5xx burst", () => {
+  assert.deepEqual(PROMOTION_ERROR_GATE_RULES, ["rest_5xx_rate"]);
+  // Injected 5xx spike through the real evaluator fails the gate.
+  const first = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 100`, `two_bot_rest_requests_total{route="other",result="5xx"} 0`]);
+  const hot = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 180`, `two_bot_rest_requests_total{route="other",result="5xx"} 20`], first.state);
+  assert.deepEqual(hot.firing, ["rest_5xx_rate"]);
+  assert.deepEqual(evaluatePromotionGate(hot.firing), { fail: true, reasons: ["rest_5xx_rate"] });
+  // 429 backpressure passes: it is not a rollback trigger.
+  assert.deepEqual(evaluatePromotionGate(["rest_429_rate"]), { fail: false, reasons: [] });
+  // Quiet windows and unrelated subjects pass.
+  assert.deepEqual(evaluatePromotionGate([]), { fail: false, reasons: [] });
+  assert.deepEqual(evaluatePromotionGate(["job_stale:rank"]), { fail: false, reasons: [] });
 });
 
 test("db pool saturation needs three consecutive samples", () => {
