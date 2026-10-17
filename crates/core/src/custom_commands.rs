@@ -772,12 +772,14 @@ mod tests {
             channel: String::new(),
         };
         let template = "{user}".repeat(500);
-        match render_template(&template, &ctx) {
-            Err(TemplateError::RenderTooLong(len)) => {
-                assert_eq!(len, 500 * 10_000);
-            }
-            other => panic!("expected bounded RenderTooLong, got {other:?}"),
-        }
+        let result = render_template(&template, &ctx);
+        assert!(
+            matches!(
+                result,
+                Err(TemplateError::RenderTooLong(len)) if len == 500 * 10_000
+            ),
+            "expected bounded RenderTooLong, got {result:?}"
+        );
     }
 
     #[test]
