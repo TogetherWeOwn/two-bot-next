@@ -202,8 +202,10 @@ deploy passed on one such poll ~10 s after rollout while already
 crash-looping (see the detection gap in
 [production-incident-2026-10-15-postmortem.md](production-incident-2026-10-15-postmortem.md)).
 Green requires the follow-up ready observation in the first table row: the
-200-ready answer held for 18 consecutive polls (~3 min). Every other answer
-keeps polling, then fails. After a takeover, a failed gate rolls back
+200-ready answer held for 18 consecutive polls (~3 min). A nonpassing answer
+resets the stability streak, but the gate keeps polling and can still pass on
+a later 18-consecutive-poll 200-ready window within the 60-poll stability
+budget (~10 min); if no such window completes, the gate fails. After a takeover, a failed gate rolls back
 automatically when the deploy and pre-deploy snapshot succeeded; without a
 takeover or snapshot the run just fails (see below).
 
