@@ -405,6 +405,33 @@ pub const EVENTSUB_DELIVERY_KINDS: [&str; 6] = [
 /// Go-live post attempts by bounded outcome. The outcome vocabulary is fixed;
 /// post identifiers and error details are never retained.
 pub const EVENTSUB_POST_OUTCOMES: [&str; 4] = ["attempted", "succeeded", "failed", "other"];
+/// Feed-fetch attempts by bounded outcome (TOG-28423): `success` for a 2xx
+/// fetch, `invalid_source` for a source refused before dialling (bad URL or
+/// non-public address), `refused_redirect` for a redirect refused by policy,
+/// and `failure` for every other fetch failure (including non-2xx HTTP).
+/// Per-outcome, never per-feed: no source URL, host or feed id reaches a label.
+pub const FEED_FETCH_OUTCOMES: &[&str] =
+    &["success", "invalid_source", "refused_redirect", "failure"];
+/// Feed-fetch failure causes for `two_bot_feed_fetch_errors_total{error_class}`
+/// (TOG-28423). The vocabulary mirrors [`crate::feeds_http::FetchError`] plus
+/// the connector layers (`resolve`, `transport`, `deadline`,
+/// `unsupported_encoding`) and `http_error` for a completed non-2xx fetch.
+/// Unknown classes collapse to the trailing `other`. No URL, host, header or
+/// body bytes ever reach a label.
+pub const FEED_FETCH_ERROR_CLASSES: &[&str] = &[
+    "invalid_source",
+    "non_public_address",
+    "redirect_refused",
+    "too_large",
+    "invalid_encoding",
+    "unsupported_content_type",
+    "unsupported_encoding",
+    "resolve",
+    "transport",
+    "deadline",
+    "http_error",
+    "other",
+];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -525,6 +552,8 @@ struct Values {
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
     presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
+    feed_fetch: [u64; FEED_FETCH_OUTCOMES.len()],
+    feed_fetch_errors: [u64; FEED_FETCH_ERROR_CLASSES.len()],
     last_ready_unix: Option<u64>,
     last_resume_unix: Option<u64>,
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
@@ -634,6 +663,35 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter =
             &mut values.presence_capture[bounded_index(outcome, PRESENCE_CAPTURE_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One feed-fetch attempt (TOG-28423): `success` for a 2xx fetch,
+    /// `invalid_source` for a source refused before dialling,
+    /// `refused_redirect` for a redirect refused by policy, `failure` for
+    /// every other failure. Call once per fetch, never per feed id: the
+    /// outcome is the whole label vocabulary and an unrecognised outcome
+    /// collapses to `failure`.
+    pub fn feed_fetch(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.feed_fetch[bounded_index(outcome, FEED_FETCH_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One failed feed fetch by bounded error class (see
+    /// [`FEED_FETCH_ERROR_CLASSES`]). Call once per failed fetch alongside
+    /// [`Self::feed_fetch`]; successes record nothing here. Unknown classes
+    /// collapse to `other`.
+    pub fn feed_fetch_error(&self, error_class: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.feed_fetch_errors[bounded_index(error_class, FEED_FETCH_ERROR_CLASSES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -1242,6 +1300,35 @@ impl Metrics {
             writeln!(
                 out,
                 "two_bot_presence_capture_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_feed_fetches_total",
+            "counter",
+            "Feed fetch attempts by bounded outcome; per-outcome, never per-feed.",
+        );
+        for (outcome, count) in FEED_FETCH_OUTCOMES.iter().zip(values.feed_fetch) {
+            writeln!(
+                out,
+                "two_bot_feed_fetches_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_feed_fetch_errors_total",
+            "counter",
+            "Failed feed fetches by bounded error class; successes record nothing here.",
+        );
+        for (error_class, count) in FEED_FETCH_ERROR_CLASSES
+            .iter()
+            .zip(values.feed_fetch_errors)
+        {
+            writeln!(
+                out,
+                "two_bot_feed_fetch_errors_total{{error_class=\"{error_class}\"}} {count}"
             )
             .unwrap();
         }
@@ -1952,6 +2039,8 @@ mod tests {
             metrics.voice_vote_kick(&hostile);
             metrics.checkpoint_failure(&hostile);
             metrics.presence_capture(&hostile);
+            metrics.feed_fetch(&hostile);
+            metrics.feed_fetch_error(&hostile);
             metrics.internal_action(&hostile, &hostile);
         }
         let text = metrics.render(None);
@@ -2713,5 +2802,99 @@ mod tests {
             "two_bot_gateway_missed_events_total {}\n",
             u64::MAX
         )));
+    }
+
+    #[test]
+    fn feed_fetches_stay_bounded_and_saturate() {
+        // TOG-28423: per-outcome, never per-feed. Four outcome series plus
+        // twelve error-class series exist from process start at zero.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_feed_fetches_total counter\n"));
+        assert!(text.contains("# TYPE two_bot_feed_fetch_errors_total counter\n"));
+        for outcome in FEED_FETCH_OUTCOMES {
+            assert!(text.contains(&format!(
+                "two_bot_feed_fetches_total{{outcome=\"{outcome}\"}} 0\n"
+            )));
+        }
+        for error_class in FEED_FETCH_ERROR_CLASSES {
+            assert!(text.contains(&format!(
+                "two_bot_feed_fetch_errors_total{{error_class=\"{error_class}\"}} 0\n"
+            )));
+        }
+        assert_eq!(FEED_FETCH_OUTCOMES.len(), 4);
+        assert_eq!(FEED_FETCH_ERROR_CLASSES.len(), 12);
+        metrics.feed_fetch("success");
+        metrics.feed_fetch("invalid_source");
+        metrics.feed_fetch("refused_redirect");
+        metrics.feed_fetch("failure");
+        metrics.feed_fetch_error("invalid_source");
+        metrics.feed_fetch_error("redirect_refused");
+        metrics.feed_fetch_error("http_error");
+        metrics.feed_fetch_error("transport");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"success\"} 1\n"));
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"invalid_source\"} 1\n"));
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"refused_redirect\"} 1\n"));
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"failure\"} 1\n"));
+        assert!(
+            text.contains("two_bot_feed_fetch_errors_total{error_class=\"invalid_source\"} 1\n")
+        );
+        assert!(
+            text.contains("two_bot_feed_fetch_errors_total{error_class=\"redirect_refused\"} 1\n")
+        );
+        assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"http_error\"} 1\n"));
+        assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"transport\"} 1\n"));
+        // Fixed cardinality: exactly the allowlisted series render.
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_feed_fetches_total{"))
+                .count(),
+            FEED_FETCH_OUTCOMES.len()
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_feed_fetch_errors_total{"))
+                .count(),
+            FEED_FETCH_ERROR_CLASSES.len()
+        );
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.feed_fetch = [u64::MAX; FEED_FETCH_OUTCOMES.len()];
+            values.feed_fetch_errors = [u64::MAX; FEED_FETCH_ERROR_CLASSES.len()];
+        }
+        metrics.feed_fetch("success");
+        metrics.feed_fetch_error("transport");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_feed_fetches_total{{outcome=\"success\"}} {}\n",
+            u64::MAX
+        )));
+        assert!(text.contains(&format!(
+            "two_bot_feed_fetch_errors_total{{error_class=\"transport\"}} {}\n",
+            u64::MAX
+        )));
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn feed_fetch_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.feed_fetch(&hostile);
+            metrics.feed_fetch_error(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"failure\"} 100\n"));
+        assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"other\"} 100\n"));
     }
 }

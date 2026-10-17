@@ -78,6 +78,8 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures. Requests rejected before body intake are not deliveries; label-free counter |
 | `two_bot_eventsub_classified_total{kind}` | EventSub deliveries classified by fixed `kind`: `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`. `ignored` covers known unrecognized or invalid outcomes, including deterministic 2xx acknowledgments, invalid challenges, and non-signature verification failures; `other` marks unknown/future classification errors, which return retryable 503. Only `BadSignature` is `tampered`. No IDs, tokens, headers, body text or secrets become labels |
 | `two_bot_eventsub_posts_total{outcome}` | Go-live post outcomes: `attempted`, `succeeded`, `failed` or `other`. The current receiver slice does not send go-live posts, so these remain zero until the sender is wired; no IDs, content or errors become labels |
+| `two_bot_feed_fetches_total{outcome}` | Feed fetch attempts by bounded outcome: `success` (2xx fetch), `invalid_source` (source refused before dialling), `refused_redirect` (redirect refused by policy) or `failure` (every other failure, including non-2xx HTTP). One sample per fetch; per-outcome, never per-feed, so no source URL, host or feed id reaches a label |
+| `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class: `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`. One sample per failed fetch alongside `two_bot_feed_fetches_total`; successes record nothing here. No URL, host, header or body bytes reach a label |
 
 ## REST admission guard
 
@@ -336,6 +338,19 @@ as dynamic labels.
   `crates/bot/src/gateway.rs` (`apply_dispatch`), in both warn-and-continue
   arms; the existing warn log lines are unchanged. No error text, SQL or
   identifier becomes a label.
+- `two_bot_feed_fetches_total{outcome}` — `outcome` is `success`,
+  `invalid_source`, `refused_redirect` or `failure`
+  (`crates/core/src/metrics.rs` `FEED_FETCH_OUTCOMES`). Recorded once per
+  fetch in `crates/bot/src/feed_jobs.rs` via
+  `crates/core/src/feeds_connector.rs` `record_feed_fetch`; per-outcome,
+  never per-feed, so no source URL, host or feed id becomes a label.
+- `two_bot_feed_fetch_errors_total{error_class}` — `error_class` is
+  `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`,
+  `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`,
+  `resolve`, `transport`, `deadline`, `http_error` or `other`
+  (`crates/core/src/metrics.rs` `FEED_FETCH_ERROR_CLASSES`). Recorded once
+  per failed fetch alongside the outcome above; successes record nothing
+  here. No URL, host, header or body bytes become labels.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,

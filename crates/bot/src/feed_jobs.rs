@@ -15,10 +15,10 @@ use two_bot_core::{
         delivery_action, parse_xml_feed_report, poll_candidates, DeliveryAction, DeliveryClaim,
         FeedItem, FeedPollSchedule, FeedPost, FeedRelay, MAX_FEED_POSTS_PER_POLL,
     },
-    feeds_connector::fetch_feed,
+    feeds_connector::{fetch_feed, record_feed_fetch},
     feeds_store::{self as store, FeedAudit},
     funnel::now_millis_for_test,
-    FeatureGates,
+    metrics, FeatureGates,
 };
 use two_bot_discord::{ActionExecutor, DiscordError};
 
@@ -127,9 +127,11 @@ struct PublicFeedFetch;
 impl FeedFetch for PublicFeedFetch {
     fn fetch(&self, feed: FeedRelay) -> FetchFuture {
         Box::pin(async move {
-            let fetched = fetch_feed(&feed.source)
-                .await
-                .map_err(|_| ErrorClass::Feed)?;
+            let result = fetch_feed(&feed.source).await;
+            // One outcome plus (on failure) one error-class sample per fetch;
+            // per-outcome, never per-feed, so no source URL reaches a label.
+            record_feed_fetch(metrics::global(), &result);
+            let fetched = result.map_err(|_| ErrorClass::Feed)?;
             parse_fetched(fetched, &feed)
         })
     }
