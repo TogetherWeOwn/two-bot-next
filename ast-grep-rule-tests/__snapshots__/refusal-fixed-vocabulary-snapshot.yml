@@ -1,0 +1,62 @@
+id: refusal-fixed-vocabulary
+snapshots:
+  "raise Refused(f\"refusing: the database login may not set {key}\")":
+    labels:
+    - source: "Refused(f\"refusing: the database login may not set {key}\")"
+      style: primary
+      start: 6
+      end: 64
+  "raise Refused(f\"plan database port {port} is refused\")":
+    labels:
+    - source: "Refused(f\"plan database port {port} is refused\")"
+      style: primary
+      start: 6
+      end: 54
+  "raise Refused(f\"the binding port {parsed.port} is refused\")":
+    labels:
+    - source: "Refused(f\"the binding port {parsed.port} is refused\")"
+      style: primary
+      start: 6
+      end: 59
+  "raise Refused(f\"psql said: {done.stderr}\")":
+    labels:
+    - source: "Refused(f\"psql said: {done.stderr}\")"
+      style: primary
+      start: 6
+      end: 42
+  "raise ReadFailed(f\"row bytes: {output}\")":
+    labels:
+    - source: "ReadFailed(f\"row bytes: {output}\")"
+      style: primary
+      start: 6
+      end: 40
+  "raise Refused(f\"bad value {value} for key\")":
+    labels:
+    - source: "Refused(f\"bad value {value} for key\")"
+      style: primary
+      start: 6
+      end: 43
+  "raise Refused(f\"bad binding {url}\")":
+    labels:
+    - source: "Refused(f\"bad binding {url}\")"
+      style: primary
+      start: 6
+      end: 35
+  "raise Refused(\"bad key {}\".format(key))":
+    labels:
+    - source: "Refused(\"bad key {}\".format(key))"
+      style: primary
+      start: 6
+      end: 39
+  "raise Refused(\"bad key %s\" % key)":
+    labels:
+    - source: "Refused(\"bad key %s\" % key)"
+      style: primary
+      start: 6
+      end: 33
+  "require(port is None, f\"pooled ports are refused: {port}\")":
+    labels:
+    - source: "require(port is None, f\"pooled ports are refused: {port}\")"
+      style: primary
+      start: 0
+      end: 58
