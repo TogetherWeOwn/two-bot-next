@@ -147,7 +147,13 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             .required()
             .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
         CommandDefinition::new("schedule-list", "List scheduled messages for this server")
-            .permissions(PERM_MANAGE_GUILD),
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![CommandOption::new(
+                "page",
+                "Page of the schedule list (1-based)",
+                CommandOptionType::Integer,
+            )
+            .min_value(1)]),
         CommandDefinition::new("sticky", "Set this channel's sticky message")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![

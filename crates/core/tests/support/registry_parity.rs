@@ -1,7 +1,8 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{
-    CommandDefinition, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS,
+    CommandDefinition, CommandOption, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS,
+    OCCURRENCE_ID_MAX_CHARS,
 };
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
@@ -32,6 +33,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("lfg-close", "docs/parity.md §1 #27 caps"),
     ("feed-add", "docs/parity.md §1 #28 caps"),
     ("feed-remove", "docs/parity.md §1 #29 caps"),
+    ("schedule-list", "docs/parity.md §1 #19 page"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -291,6 +293,37 @@ pub fn expected_registry() -> Value {
             "legacy {name}/{option_name}"
         );
         option["max_length"] = json!(max_length);
+    }
+    // Schedule-list pagination: the Next-only additive `page` option keeps
+    // every configured id discoverable within Discord's 2,000-unit cap.
+    // Legacy publishes no options on `schedule-list`; permissions and the
+    // command name stay legacy-identical.
+    {
+        let _ = INTENTIONAL_DIFFERENCES
+            .iter()
+            .find(|(command, _)| *command == "schedule-list")
+            .expect("page has a documented command exception");
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "schedule-list")
+            .expect("docs/parity.md §1 #19 page");
+        assert!(
+            command["options"]
+                .as_array()
+                .expect("command options array")
+                .is_empty(),
+            "legacy schedule-list has no options"
+        );
+        let page = serde_json::to_value(
+            CommandOption::new(
+                "page",
+                "Page of the schedule list (1-based)",
+                two_bot_core::commands::CommandOptionType::Integer,
+            )
+            .min_value(1),
+        )
+        .expect("page option serializes");
+        command["options"] = json!([page]);
     }
     canonical_registry(json!(commands))
 }
