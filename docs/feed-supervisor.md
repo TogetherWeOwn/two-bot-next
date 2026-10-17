@@ -74,8 +74,10 @@ As coded (`crates/bot/src/feed_jobs.rs:33-41,227-267`):
   for the pending boot-cadence slot, and an increase pushes the pending
   tick out a full new interval. The effective interval is the stored value,
   never rounded to a boot multiple. An unchanged stored value leaves the
-  pending slot untouched (no-op); an out-of-range stored value is refused
-  and keeps the current schedule. Overlapping passes stay suppressed: the
+  pending slot untouched (no-op); an out-of-range stored value falls back
+  to the boot interval end to end (see below), rescheduling the pending run
+  when the current schedule is not already boot. Overlapping passes stay
+  suppressed: the
   gate refuses a tick while a pass is running, and the supervisor skips a
   tick while the previous pass is still active.
 - Stored live values are not boot configuration. An absent, unparsable, or
