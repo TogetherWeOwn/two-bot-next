@@ -351,6 +351,7 @@ test("voice join slow burn tickets on a sustained 6 h grind that never trips fas
   const grinding = evAt(joinLines(361 * 100, 0, 361 * 96), state, 361 * 60);
   // 361 ticks: 36,100 genuine, 34,656 fast, 1,444 slow = 8x burn.
   assert.deepEqual(grinding.firing, ["voice_join_slow_burn"]);
+  assert.equal(grinding.joinSlowCovered, true);
   assert.equal(ruleFor("voice_join_slow_burn")?.severity, "ticket");
   // The same 8x never reaches the 14.4x fast line in any 1 h / 5 min window.
   assert.ok(!grinding.firing.includes("voice_join_fast_burn"));
@@ -366,9 +367,31 @@ test("voice join burn holds the previous firing state when the join series go mi
   const firing = evAt(joinLines(361 * 100, 0, 361 * 96), state, 361 * 60);
   assert.deepEqual(firing.firing, ["voice_join_slow_burn"]);
   assert.equal(firing.joinHeld, false);
+  assert.equal(firing.joinSlowCovered, true);
   const held = evAt([], firing.state, 362 * 60);
   assert.deepEqual(held.firing, ["voice_join_slow_burn"]);
   assert.equal(held.joinHeld, true);
+  assert.equal(held.joinSlowCovered, false);
+});
+
+test("voice join burn reports slow-window coverage separately from the firing verdict", () => {
+  // A fresh ring is silent but uncovered: the tracker must read coverage,
+  // not silence, before it may resolve the card.
+  const first = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0);
+  assert.deepEqual(first.firing, []);
+  assert.equal(first.joinSlowCovered, false);
+  const second = evAt(joinLines(12, 0, 10), first.state, 60);
+  assert.deepEqual(second.firing, []);
+  assert.equal(second.joinSlowCovered, false);
+  // Full quiet history is covered and stays silent: covered-but-quiet may
+  // still resolve, uncovered may not.
+  let state = EMPTY_STATE;
+  for (let now = -21600; now <= 0; now += 60) {
+    state = evAt(joinLines(0, 0, 0), state, now).state;
+  }
+  const quiet = evAt(joinLines(0, 0, 0), state, 60);
+  assert.deepEqual(quiet.firing, []);
+  assert.equal(quiet.joinSlowCovered, true);
 });
 
 test("voice join burn stays silent on healthy traffic, quiet windows and benign duplicates", () => {
@@ -411,7 +434,9 @@ test("voice join burn waits for full window history after a fresh ring", () => {
   state = evAt(joinLines(12, 0, 10), state, 60).state;
   // The next scrape sees the received counter, but no long-window boundary
   // has a snapshot before it yet. A partial ring must not act like full windows.
-  assert.deepEqual(evAt(joinLines(12, 0, 10), state, 120).firing, []);
+  const partial = evAt(joinLines(12, 0, 10), state, 120);
+  assert.deepEqual(partial.firing, []);
+  assert.equal(partial.joinSlowCovered, false);
 });
 
 test("voice join burn stays silent when healthy bursts land on window edges", () => {
@@ -426,6 +451,7 @@ test("voice join burn stays silent when healthy bursts land on window edges", ()
   }
   const settled = evAt(joinLines(state.joinBurn?.at(-1)?.received ?? 0, 0, state.joinBurn?.at(-1)?.fastMoves ?? 0), state, 360 * 60 + 60);
   assert.deepEqual(settled.firing, []);
+  assert.equal(settled.joinSlowCovered, true);
   assert.ok(!settled.firing.includes("voice_join_fast_burn"), "healthy bursts must not page");
   assert.ok(!settled.firing.includes("voice_join_slow_burn"), "healthy bursts must not ticket");
 });

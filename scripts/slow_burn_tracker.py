@@ -5,8 +5,9 @@ The `voice_join_slow_burn` Worker rule only alerts: this scheduled tracker
 turns the first firing into one GitHub tracking issue and closes it when the
 burn clears. While the burn keeps firing the open issue is left alone (a
 refresh comment lands at most every six hours), so a refire never duplicates
-the card. An unknown verdict (failed scrape, failed evaluation, or unusable
-join series) never closes an open card: silence is not recovery.
+the card. An unknown verdict (failed scrape, failed evaluation, unusable
+join series, or slow windows without full history) never closes an open
+card: silence is not recovery.
 
 The firing verdict comes from the checked-in evaluator
 (`wrangler/src/alert-rules.ts`) through `wrangler/scripts/slow-burn-decide.mjs`;
@@ -130,6 +131,7 @@ def run_driver(node, driver, exposition_path, ring_path, now):
         raise TrackError("burn evaluation failed: driver answer is not JSON")
     if (not isinstance(verdict, dict) or not isinstance(verdict.get("slow"), bool)
             or not isinstance(verdict.get("held"), bool)
+            or not isinstance(verdict.get("slowCovered"), bool)
             or not isinstance(verdict.get("ring"), list)):
         raise TrackError("burn evaluation failed: driver answer has no verdict")
     return verdict
@@ -330,7 +332,9 @@ def parse_args(argv):
 
 
 def main(argv=None, env=None):
-    args = parse_args(argv or [])
+    # argv=None reads sys.argv: never substitute an empty list, or the
+    # workflow's --fixture/--label/--dry-run flags are silently dropped.
+    args = parse_args(argv)
     env = env if env is not None else dict(__import__("os").environ)
     now = int(time.time())
     repo = env.get("GITHUB_REPOSITORY", "")
@@ -395,7 +399,23 @@ def main(argv=None, env=None):
                                            encoding="utf-8")
         print(f"slow-burn tracker: verdict=held action=none ring={len(next_ring)}")
         return 0
-    evidence["verdict"] = "slow-fire" if verdict["slow"] else "clear"
+    slow_covered = verdict["slowCovered"]
+    if verdict["slow"]:
+        evidence["verdict"] = "slow-fire"
+    elif slow_covered:
+        evidence["verdict"] = "clear"
+    else:
+        # The slow windows lack full history (late start, a gap at the long
+        # edge, or a rebuilt ring): this is unknown, not a clear. The ring
+        # still persists so history rebuilds, but no issue is filed,
+        # refreshed or closed; silence here is not recovery.
+        evidence["verdict"] = "unknown"
+        if args.fixture == "live":
+            Path(args.ring).write_text(json.dumps(next_ring) + "\n", encoding="utf-8")
+        Path(args.evidence_out).write_text(json.dumps(evidence, indent=2) + "\n",
+                                           encoding="utf-8")
+        print(f"slow-burn tracker: verdict=unknown action=none ring={len(next_ring)}")
+        return 0
     if args.fixture == "live":
         Path(args.ring).write_text(json.dumps(next_ring) + "\n", encoding="utf-8")
 

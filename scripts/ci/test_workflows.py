@@ -1696,10 +1696,21 @@ def slow_burn_tracker_errors(workflow):
     if not str(setup_node.get("uses", "")).startswith("actions/setup-node@") \
             or (setup_node.get("with") or {}).get("node-version") != "24":
         errors.append(f"{name}:tracker: setup-node must be pinned at node 24 for the verdict driver")
-    for cache_step in (restore, save):
-        if not str(cache_step.get("uses", "")).startswith("actions/cache@") \
-                or "slow-burn-ring-v1-" not in str((cache_step.get("with") or {}).get("key", "")):
-            errors.append(f"{name}:tracker: ring cache steps must use the rotating slow-burn-ring key")
+    # Split restore/save: a full actions/cache step restores in its main
+    # phase, so the save step would overwrite the tracker's fresh ring with
+    # the stale cached copy before saving it back.
+    restore_with = restore.get("with") or {}
+    if (not str(restore.get("uses", "")).startswith("actions/cache/restore@")
+            or "slow-burn-ring-v1-" not in str(restore_with.get("key", ""))
+            or "slow-burn-ring-v1-" not in str(restore_with.get("restore-keys", ""))):
+        errors.append(f"{name}:tracker: ring restore must use actions/cache/restore "
+                      "with the rotating key and prefix fallback")
+    save_with = save.get("with") or {}
+    if (not str(save.get("uses", "")).startswith("actions/cache/save@")
+            or "slow-burn-ring-v1-" not in str(save_with.get("key", ""))
+            or "restore-keys" in save_with):
+        errors.append(f"{name}:tracker: ring save must use actions/cache/save "
+                      "with the rotating key and no restore")
     if save.get("if") != "${{ !cancelled() && steps.track.outputs.fixture != 'fire' && steps.track.outputs.fixture != 'clear' }}":
         errors.append(f"{name}:tracker: ring save must skip fixture proof runs")
     if track.get("id") != "track":
