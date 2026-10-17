@@ -56,18 +56,27 @@ fn check_source(text: &str) {
     );
     // An accepted literal must be public; an accepted domain must not be
     // localhost (trailing-dot and case-insensitive, like production).
-    if let Ok(ip) = url
-        .host()
-        .expect("host checked")
-        .to_string()
-        .parse::<IpAddr>()
-    {
-        assert!(is_public_address(ip), "private literal accepted: {text:?}");
-    } else if let Some(host) = url.host_str() {
-        assert!(
-            !host.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
-            "localhost accepted: {text:?}"
-        );
+    // Match the typed host: `Host` displays IPv6 with brackets, so a
+    // string round-trip through `IpAddr::from_str` never parses IPv6.
+    match url.host().expect("host checked") {
+        url::Host::Ipv4(ip) => {
+            assert!(
+                is_public_address(ip.into()),
+                "private literal accepted: {text:?}"
+            );
+        }
+        url::Host::Ipv6(ip) => {
+            assert!(
+                is_public_address(ip.into()),
+                "private literal accepted: {text:?}"
+            );
+        }
+        url::Host::Domain(host) => {
+            assert!(
+                !host.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
+                "localhost accepted: {text:?}"
+            );
+        }
     }
 }
 
@@ -91,7 +100,16 @@ fn check_public(ip: IpAddr) {
             }
         }
         IpAddr::V6(v6) => {
-            if v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() {
+            // ULA (fc00::/7) and link-local (fe80::/10) read from the first
+            // segment so the ipv6-link-local seed can actually fail.
+            let unique_local = (v6.segments()[0] & 0xfe00) == 0xfc00;
+            let link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+            if v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || unique_local
+                || link_local
+            {
                 assert!(!first, "non-unicast IPv6 accepted: {ip}");
             }
         }
