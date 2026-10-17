@@ -10,7 +10,8 @@ use two_bot_core::custom_commands::{
 /// the template may reach past the 2000-unit stored bound so oversized paths
 /// stay reachable, while each context field stays small enough that even a
 /// fully-expanded render stays computable without materialising a huge string
-/// (the production renderer measures before building).
+/// (the production renderer measures each expansion before pushing it and
+/// only counts once past the ceiling).
 const MAX_TEMPLATE_FIELD_CHARS: usize = 4096;
 const MAX_CTX_FIELD_CHARS: usize = 512;
 /// At most template + four context fields; extras are ignored.

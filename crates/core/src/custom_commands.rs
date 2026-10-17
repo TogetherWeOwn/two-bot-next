@@ -139,29 +139,39 @@ pub fn validate_template(template: &str) -> Result<(), TemplateError> {
 /// Render a validated template against `ctx` (legacy `renderTemplate`).
 /// Unknown-but-pattern-matching keys render literally (unreachable after
 /// validation, kept so render never invents text); output past Discord's
-/// ceiling is refused. The rendered length is measured first without building
-/// the string, so hostile placeholder/context expansion fails as a bounded
-/// `RenderTooLong` instead of materialising a huge allocation.
+/// ceiling is refused. Each expansion is measured before it is pushed, so a
+/// hostile placeholder/context combination fails as a bounded `RenderTooLong`
+/// carrying the exact length without ever materialising the huge string: past
+/// the ceiling the loop keeps counting units but stops pushing.
 pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, TemplateError> {
     let bytes = template.as_bytes();
     let user_units = ctx.user.encode_utf16().count();
     let username_units = ctx.username.encode_utf16().count();
     let server_units = ctx.server.encode_utf16().count();
     let channel_units = ctx.channel.encode_utf16().count();
+    let mut out = String::with_capacity(template.len().min(MAX_RENDER_CAPACITY_BYTES));
     let mut total_units = 0usize;
+    let mut too_long = false;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
             if let Some(end) = placeholder_end(bytes, i) {
                 let key = &template[i + 1..end - 1];
-                let units = match key {
-                    "user" => user_units,
-                    "username" => username_units,
-                    "server" => server_units,
-                    "channel" => channel_units,
-                    _ => template[i..end].encode_utf16().count(),
+                let (text, units): (&str, usize) = match key {
+                    "user" => (ctx.user.as_str(), user_units),
+                    "username" => (ctx.username.as_str(), username_units),
+                    "server" => (ctx.server.as_str(), server_units),
+                    "channel" => (ctx.channel.as_str(), channel_units),
+                    _ => (&template[i..end], template[i..end].encode_utf16().count()),
                 };
                 total_units = total_units.saturating_add(units);
+                if !too_long {
+                    if total_units > MAX_RENDERED_CHARS {
+                        too_long = true;
+                    } else {
+                        out.push_str(text);
+                    }
+                }
                 i = end;
                 continue;
             }
@@ -171,32 +181,17 @@ pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, 
         // past ASCII braces or one full `char`, so this never panics.
         let ch = template[i..].chars().next().expect("char boundary");
         total_units = total_units.saturating_add(ch.len_utf16());
-        i += ch.len_utf8();
-    }
-    if total_units > MAX_RENDERED_CHARS {
-        return Err(TemplateError::RenderTooLong(total_units));
-    }
-    let mut out = String::with_capacity(template.len().min(MAX_RENDER_CAPACITY_BYTES));
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(end) = placeholder_end(bytes, i) {
-                let key = &template[i + 1..end - 1];
-                match key {
-                    "user" => out.push_str(&ctx.user),
-                    "username" => out.push_str(&ctx.username),
-                    "server" => out.push_str(&ctx.server),
-                    "channel" => out.push_str(&ctx.channel),
-                    _ => out.push_str(&template[i..end]),
-                }
-                i = end;
-                continue;
+        if !too_long {
+            if total_units > MAX_RENDERED_CHARS {
+                too_long = true;
+            } else {
+                out.push(ch);
             }
         }
-        // Advance one char (templates are validated UTF-8 by construction).
-        let ch = template[i..].chars().next().expect("char boundary");
-        out.push(ch);
         i += ch.len_utf8();
+    }
+    if too_long {
+        return Err(TemplateError::RenderTooLong(total_units));
     }
     debug_assert_eq!(out.encode_utf16().count(), total_units);
     Ok(out)
