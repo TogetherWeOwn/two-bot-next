@@ -182,8 +182,12 @@ claim them as shipped acceptance:
   provisioned yet — without it the step records a skip (never a silent pass).
   Until then, the `inject_error_rate_spike` dispatch input judges a rehearsal
   5xx firing to prove the fail-to-rollback chain with no traffic. Do not claim
-  live 5xx enforcement on staging until a run shows a `live` verdict in
-  `error-rate-gate.json`. Production has no error-rate gate yet.
+  live 5xx enforcement on staging until a run shows a `live` verdict of `pass`
+  with `rest_requests >= 10` in `error-rate-gate.json`: a quieter window
+  records `insufficient_data` (exit 0 with a warning), which proves nothing
+  and must never be read as a healthy pass. Traffic between container boot
+  and the first scrape lands in the baseline and is not judged; only requests
+  between the two scrapes count. Production has no error-rate gate yet.
 - The shared central gradual-promotion action promotes 5-50-100% with
   per-stage health gates and automatic rollback to the recorded pre-promote
   version. This repository has no caller wiring to it yet, so do not treat

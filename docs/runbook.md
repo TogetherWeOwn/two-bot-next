@@ -307,7 +307,9 @@ The gate enforces live traffic only once the `STAGING_METRICS_SCRAPE_TOKEN`
 secret is provisioned — without it the step records a skip, and the
 dispatch-only `inject_error_rate_spike` input judges a rehearsal firing to
 prove the rollback chain (see `docs/runbook-observability.md` for the exact
-coverage limits). Production has no error-rate gate: a burst on the
+coverage limits). A live window with fewer than 10 REST requests records
+`insufficient_data`, never a pass, so only a `pass` with `rest_requests >= 10`
+counts as enforcement proof. Production has no error-rate gate: a burst on the
 production revision still needs a manual rollback decision. A burst on an
 unchanged revision is a Discord incident or a dependency regression, not a
 rollback.

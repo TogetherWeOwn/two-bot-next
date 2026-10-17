@@ -17,6 +17,10 @@
 //   and docs/runbook.md; a missing or short token is a controlled skip,
 //   never a silent pass and never a failure: the gate enforces only once
 //   the Operator provisions the secret (see docs/runbook-observability.md).
+//   A live window with fewer REST requests than REST_5XX_MIN_REQUESTS records
+//   `insufficient_data` (exit 0 with a warning), never `pass`, with the
+//   judged volume in `restRequests`: a gate that cannot judge must not
+//   certify the build.
 // Query or parse failures in live mode exit non-zero (fail closed): a gate
 // that cannot read metrics must not certify the build.
 import { realpathSync, writeFileSync } from "node:fs";
@@ -26,6 +30,7 @@ import {
   EMPTY_STATE,
   evaluateMetrics,
   evaluatePromotionGate,
+  REST_5XX_MIN_REQUESTS,
 } from "../src/alert-rules.ts";
 
 const USER_AGENT = "two-bot-next-staging-rollout/1.0";
@@ -96,6 +101,11 @@ async function fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, r
 /**
  * Live gate over two scrapes (delta mirrors the keepalive evaluation).
  * Deps are injectable so tests prove verdicts without the network.
+ *
+ * `restDelta` is the judged REST request volume between the two scrapes
+ * (second minus baseline counters). A negative delta means the counters
+ * reset between scrapes (process restart): the window cannot judge, same
+ * as a too-quiet one.
  */
 export async function runLiveGate({
   metricsUrl,
@@ -117,7 +127,22 @@ export async function runLiveGate({
     firing: evaluation.firing,
     sampleCount: second.samples.length,
     restTotal: evaluation.state.restTotal,
+    restDelta: evaluation.state.restTotal - baseline.state.restTotal,
   };
+}
+
+/**
+ * Map a live firing list plus judged request volume to a recorded verdict.
+ * A window with fewer REST requests than REST_5XX_MIN_REQUESTS cannot judge
+ * the 5xx share, so it records `insufficient_data` (exit 0 with a warning),
+ * never `pass`: a too-quiet window must not read as a healthy one, and the
+ * runbook accepts only a `pass` with enough requests as enforcement proof.
+ */
+export function decideLiveVerdict({ firing, restDelta }) {
+  const { fail, reasons } = judgeFiring(firing);
+  if (fail) return { fail: true, verdict: "fail", reasons };
+  if (restDelta < REST_5XX_MIN_REQUESTS) return { fail: false, verdict: "insufficient_data", reasons: [] };
+  return { fail: false, verdict: "pass", reasons: [] };
 }
 
 function parseArgs(argv) {
@@ -189,20 +214,26 @@ async function main(argv, env) {
     sampleIntervalSeconds: config.sampleIntervalSeconds,
     timeoutSeconds: config.timeoutSeconds,
   });
-  const { fail, reasons } = judgeFiring(live.firing);
+  const { fail, verdict, reasons } = decideLiveVerdict({ firing: live.firing, restDelta: live.restDelta });
   const evidence = {
     mode,
     sha: config.sha,
     firing: live.firing,
-    verdict: fail ? "fail" : "pass",
+    verdict,
     reasons,
-    detail: `live delta over ${config.sampleIntervalSeconds}s (samples=${live.sampleCount})`,
+    restRequests: live.restDelta,
+    detail: `live delta over ${config.sampleIntervalSeconds}s (rest_requests=${live.restDelta}, samples=${live.sampleCount})`,
   };
   writeEvidence(config.evidence, evidence);
   console.log(JSON.stringify(evidence));
   if (fail) {
     console.log(`::error::promotion error-rate gate failed: ${reasons.join(",")}`);
     return 1;
+  }
+  if (verdict === "insufficient_data") {
+    console.log(
+      `::warning::promotion error-rate gate could not judge: only ${live.restDelta} REST requests in the window (minimum ${REST_5XX_MIN_REQUESTS}); not a pass`,
+    );
   }
   return 0;
 }

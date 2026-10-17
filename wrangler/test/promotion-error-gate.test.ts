@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { relative } from "node:path";
 import {
+  decideLiveVerdict,
   decideMode,
   isDirectInvocation,
   judgeFiring,
@@ -88,9 +89,16 @@ test("live gate fails the stage on a 5xx burst between scrapes", async () => {
   });
   assert.deepEqual(verdict.firing, ["rest_5xx_rate"]);
   assert.deepEqual(judgeFiring(verdict.firing), { fail: true, reasons: ["rest_5xx_rate"] });
+  assert.equal(verdict.restDelta, 100);
+  assert.deepEqual(decideLiveVerdict({ firing: verdict.firing, restDelta: verdict.restDelta }), {
+    fail: true,
+    verdict: "fail",
+    reasons: ["rest_5xx_rate"],
+  });
 });
 
-test("live gate passes quiet windows and tiny samples", async () => {
+test("live gate passes busy quiet windows, flags too-quiet ones", async () => {
+  // Enough requests and no 5xx: a genuine pass with the judged volume.
   const quiet = stubFetch([restBody(100, 0), restBody(180, 0)]);
   const quietVerdict = await runLiveGate({
     metricsUrl: "https://staging.example",
@@ -100,8 +108,13 @@ test("live gate passes quiet windows and tiny samples", async () => {
     nowSeconds: () => 1_000_000,
   });
   assert.deepEqual(quietVerdict.firing, []);
-  assert.deepEqual(judgeFiring(quietVerdict.firing).fail, false);
-  // Below the 10-request minimum the window cannot judge: pass, not fail.
+  assert.equal(quietVerdict.restDelta, 80);
+  assert.deepEqual(
+    decideLiveVerdict({ firing: quietVerdict.firing, restDelta: quietVerdict.restDelta }),
+    { fail: false, verdict: "pass", reasons: [] },
+  );
+  // Below the 10-request minimum the window cannot judge: insufficient_data,
+  // never a pass, so a too-quiet window cannot certify the build.
   const tiny = stubFetch([restBody(0, 0), restBody(5, 2)]);
   const tinyVerdict = await runLiveGate({
     metricsUrl: "https://staging.example",
@@ -111,6 +124,11 @@ test("live gate passes quiet windows and tiny samples", async () => {
     nowSeconds: () => 1_000_000,
   });
   assert.deepEqual(tinyVerdict.firing, []);
+  assert.equal(tinyVerdict.restDelta, 7);
+  assert.deepEqual(
+    decideLiveVerdict({ firing: tinyVerdict.firing, restDelta: tinyVerdict.restDelta }),
+    { fail: false, verdict: "insufficient_data", reasons: [] },
+  );
 });
 
 test("live gate fails closed when metrics are unreadable", async () => {
