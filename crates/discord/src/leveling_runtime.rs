@@ -20,7 +20,7 @@ use two_bot_core::{
     classify,
     community_store::{
         member_join_fact, member_join_metadata, message_fact, record_fact, rules_accepted_fact,
-        voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite,
+        voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite, MessageFactInput,
     },
     leveling::{
         leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
@@ -382,16 +382,16 @@ impl FactsSink for DeferredCommunityFacts {
             is_test: false,
         };
         let verdict = classify(&state.config, &input);
-        state.pending.push(message_fact(
-            &input.guild_id,
-            fact.message_id,
-            &fact.channel_id.to_string(),
-            fact.channel_class.as_str(),
-            &input,
-            fact.occurred_at,
-            fact.content_length,
-            verdict,
-        ));
+        state.pending.push(message_fact(MessageFactInput {
+            guild_id: &input.guild_id,
+            message_id: fact.message_id,
+            channel_id: &fact.channel_id.to_string(),
+            channel_class: fact.channel_class.as_str(),
+            actor: &input,
+            occurred_at: fact.occurred_at,
+            content_length: fact.content_length,
+            classification: verdict,
+        }));
     }
 
     fn record_voice_started(&self, fact: VoiceStartedFact<'_>) -> Option<String> {

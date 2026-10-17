@@ -122,21 +122,34 @@ pub async fn record_fact(
     Ok(inserted.is_some())
 }
 
-/// Message fact (legacy `recordMessage` inputs, minus the classifier).
+/// Inputs for [`message_fact`] (legacy `recordMessage` inputs, minus the
+/// classifier). A struct, not positional parameters: the function already
+/// sat at the argument-count limit before `content_length` arrived.
 /// `content_length` is the Unicode scalar count measured where the gateway
 /// content was in hand; only the integer is threaded here, never content.
+pub struct MessageFactInput<'a> {
+    pub guild_id: &'a str,
+    pub message_id: &'a str,
+    pub channel_id: &'a str,
+    pub channel_class: &'a str,
+    pub actor: &'a ClassifyInput,
+    pub occurred_at: &'a str,
+    pub content_length: Option<usize>,
+    pub classification: Classification,
+}
+
 #[must_use]
-#[allow(clippy::too_many_arguments)]
-pub fn message_fact(
-    guild_id: &str,
-    message_id: &str,
-    channel_id: &str,
-    channel_class: &str,
-    actor: &ClassifyInput,
-    occurred_at: &str,
-    content_length: Option<usize>,
-    classification: Classification,
-) -> FactWrite {
+pub fn message_fact(input: MessageFactInput<'_>) -> FactWrite {
+    let MessageFactInput {
+        guild_id,
+        message_id,
+        channel_id,
+        channel_class,
+        actor,
+        occurred_at,
+        content_length,
+        classification,
+    } = input;
     // A measured length is recorded; absent or zero records no key at all,
     // so an unknown length never masquerades as a measured zero.
     let length_part = match content_length {
@@ -178,7 +191,7 @@ pub async fn record_message_fact(
     content_length: Option<usize>,
     classification: Classification,
 ) -> Result<bool, CommunityStoreError> {
-    let write = message_fact(
+    let write = message_fact(MessageFactInput {
         guild_id,
         message_id,
         channel_id,
@@ -187,7 +200,7 @@ pub async fn record_message_fact(
         occurred_at,
         content_length,
         classification,
-    );
+    });
     record_fact(pool, &write).await
 }
 
@@ -805,16 +818,16 @@ mod tests {
                 "2026-09-01T11:00:00.000Z"
             };
             let input = actor(who);
-            let write = message_fact(
-                GUILD,
-                id,
-                "general",
-                "human",
-                &input,
-                at,
-                None,
-                verdict(class),
-            );
+            let write = message_fact(MessageFactInput {
+                guild_id: GUILD,
+                message_id: id,
+                channel_id: "general",
+                channel_class: "human",
+                actor: &input,
+                occurred_at: at,
+                content_length: None,
+                classification: verdict(class),
+            });
             record_fact(pool, &write).await.expect("seed message");
         }
         for (id, who, at, class) in [
@@ -1082,16 +1095,16 @@ mod tests {
         // Discord message id, carries the classifier verdict, and stores no
         // message text.
         let input = actor("human-1");
-        let write = message_fact(
-            GUILD,
-            "msg-1",
-            "chan-9",
-            "human",
-            &input,
-            "2026-09-02T10:00:00.000Z",
-            None,
-            verdict("eligible_human"),
-        );
+        let write = message_fact(MessageFactInput {
+            guild_id: GUILD,
+            message_id: "msg-1",
+            channel_id: "chan-9",
+            channel_class: "human",
+            actor: &input,
+            occurred_at: "2026-09-02T10:00:00.000Z",
+            content_length: None,
+            classification: verdict("eligible_human"),
+        });
         assert_eq!(write.event_type, "message_created");
         assert_eq!(write.source_event_id, "msg-1");
         assert_eq!(write.idempotency_key, "discord-message:msg-1");
