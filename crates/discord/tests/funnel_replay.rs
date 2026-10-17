@@ -348,7 +348,7 @@ fn handlers_replay_matches_legacy_oracle() {
             channel_class: ChannelClass::Human,
             capture_only: false,
             occurred_at: Some(stamp(at)),
-            content: None,
+            content_length: None,
         });
     }
     h.on_voice_join(VoiceInput {

@@ -708,7 +708,10 @@ impl<
                     channel_class: self.classifier.classify(channel_id),
                     capture_only: eligibility.capture_only,
                     occurred_at: Some(legacy_stamp(msg.timestamp)),
-                    content: Some(msg.content.clone()),
+                    // Measured here, where the content is already in hand;
+                    // the content itself is dropped with this statement and
+                    // only the scalar count is threaded onward.
+                    content_length: Some(msg.content.chars().count()).filter(|n| *n > 0),
                 };
                 self.cache.update(event);
                 if deliver {

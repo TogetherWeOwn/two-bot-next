@@ -123,7 +123,10 @@ pub async fn record_fact(
 }
 
 /// Message fact (legacy `recordMessage` inputs, minus the classifier).
+/// `content_length` is the Unicode scalar count measured where the gateway
+/// content was in hand; only the integer is threaded here, never content.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn message_fact(
     guild_id: &str,
     message_id: &str,
@@ -131,11 +134,13 @@ pub fn message_fact(
     channel_class: &str,
     actor: &ClassifyInput,
     occurred_at: &str,
-    content: Option<&str>,
+    content_length: Option<usize>,
     classification: Classification,
 ) -> FactWrite {
-    let length_part = match content {
-        Some(c) if !c.is_empty() => format!(",\"contentLength\":{}", c.chars().count()),
+    // A measured length is recorded; absent or zero records no key at all,
+    // so an unknown length never masquerades as a measured zero.
+    let length_part = match content_length {
+        Some(n) if n > 0 => format!(",\"contentLength\":{n}"),
         _ => String::new(),
     };
     FactWrite {
@@ -170,7 +175,7 @@ pub async fn record_message_fact(
     channel_class: &str,
     actor: &ClassifyInput,
     occurred_at: &str,
-    content: Option<&str>,
+    content_length: Option<usize>,
     classification: Classification,
 ) -> Result<bool, CommunityStoreError> {
     let write = message_fact(
@@ -180,7 +185,7 @@ pub async fn record_message_fact(
         channel_class,
         actor,
         occurred_at,
-        content,
+        content_length,
         classification,
     );
     record_fact(pool, &write).await

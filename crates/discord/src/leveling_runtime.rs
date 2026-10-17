@@ -389,7 +389,7 @@ impl FactsSink for DeferredCommunityFacts {
             fact.channel_class.as_str(),
             &input,
             fact.occurred_at,
-            fact.content,
+            fact.content_length,
             verdict,
         ));
     }
@@ -866,7 +866,7 @@ mod tests {
             channel_id: 10,
             channel_class: two_bot_core::ChannelClass::Human,
             occurred_at: "2026-09-20T12:01:00.000Z",
-            content: None,
+            content_length: None,
         });
         assert_eq!(
             buffer.record_voice_started(VoiceStartedFact {
