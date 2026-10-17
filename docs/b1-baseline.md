@@ -116,6 +116,7 @@ headroom below are historical, not measurements of the current PR head:
 | Runtime image | Historical Docker image inspect `Size` from 2026-09-30 PR #78 (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
 | Release binary | `stat` of `/home/two-bot/two-bot` in the final image, event-executors head | 15.04 MiB / 15,770,928 bytes (2026-10-10; [event-executors CI smoke](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38062362788/job/114254309361)) | 16 MiB / 16,777,216 bytes | 0.96 MiB / 6.4% |
 | Release binary — automation-only head before event-executor merge | `stat` of `/home/two-bot/two-bot` in the final image | 15.04 MiB / 15,769,872 bytes | 16 MiB / 16,777,216 bytes | 0.96 MiB / 6.0% |
+| Release binary — eventsub shutdown-join head (2026-10-17) | `stat` of `/home/two-bot/two-bot` in the final image, [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39048259974/job/117459657137) | 16.00 MiB / 16,777,832 bytes | 17 MiB / 17,825,792 bytes | 1.05 MiB / 6.2% |
 
 The runtime-image row above is the historical inspect `Size` result, not the
 current gate metric. The linked event-executors job measured the current metric,
@@ -165,6 +166,16 @@ This branch's automation-only head separately measured 15,769,872 bytes
 (15.04 MiB) before the event-executor merge. This PR keeps the current-main
 16 MiB binary ceiling; the combined exact-head CI measurement is still
 required.
+
+On 2026-10-17 main itself measured 16,776,096 bytes (16.00 MiB, 1,120 bytes
+under the 16 MiB ceiling) in the
+[container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39056849541/job/117466497800),
+and the eventsub shutdown-join head measured 16,777,832 bytes (+1,736 bytes
+of join/drain logic, 616 bytes over the ceiling) with no new dependencies
+and the same minimal release profile. The ceiling moves to 17 MiB, leaving
+about 1.05 MiB (6.2%) of headroom — the same working-tripwire shape as the
+16 MiB step — and is revisited if the binary approaches it. The 112 MiB
+image ceiling is unchanged.
 
 ### Docker history image measurement and immutable-ID pinning
 
