@@ -29,7 +29,10 @@
 //! which kind) is pinned in `stream_metrics_wiring_acceptance.rs`.
 
 use std::collections::HashSet;
-use two_bot_core::metrics::{Metrics, EVENTSUB_DELIVERY_KINDS, EVENTSUB_POST_OUTCOMES};
+use two_bot_core::metrics::{
+    Metrics, EVENTSUB_DELIVERY_KINDS, EVENTSUB_POST_OUTCOMES, EVENTSUB_RECONCILE_ACTIONS,
+    EVENTSUB_RECONCILE_ERROR_CLASSES, EVENTSUB_RECONCILE_OUTCOMES,
+};
 
 #[test]
 fn stream_metrics_eventsub_vocabularies_are_exactly_the_allowlists() {
@@ -78,14 +81,20 @@ fn stream_metrics_eventsub_series_render_at_zero_before_any_delivery() {
         );
     }
     // Fixed cardinality: one received sample, one sample per kind, one per
-    // post outcome — nothing else in the eventsub namespace.
+    // post outcome, plus the reconcile outcome families (passes by outcome,
+    // actions by action, errors by error_class) — nothing else in the
+    // eventsub namespace.
     let samples: Vec<&str> = text
         .lines()
         .filter(|line| line.starts_with("two_bot_eventsub_"))
         .collect();
     assert_eq!(
         samples.len(),
-        1 + EVENTSUB_DELIVERY_KINDS.len() + EVENTSUB_POST_OUTCOMES.len(),
+        1 + EVENTSUB_DELIVERY_KINDS.len()
+            + EVENTSUB_POST_OUTCOMES.len()
+            + EVENTSUB_RECONCILE_OUTCOMES.len()
+            + EVENTSUB_RECONCILE_ACTIONS.len()
+            + EVENTSUB_RECONCILE_ERROR_CLASSES.len(),
         "eventsub samples: {samples:?}"
     );
 }
