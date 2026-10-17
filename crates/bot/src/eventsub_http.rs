@@ -230,7 +230,11 @@ async fn receive_with_timeout(
 /// settle flow and answer its disposition — 200 acknowledges (posted,
 /// duplicate, or not ours), a retryable 503 asks Twitch to redeliver after
 /// a transient ledger/send failure. The claim fences make that redelivery
-/// safe: it can never double-post (see `deliver_go_live`).
+/// safe: it can never double-post (see `deliver_go_live`). Delivery runs in
+/// a spawned task so the 20 s request timeout cannot cancel it after
+/// `mark_started` commits but before the send settles; the task keeps
+/// running to settle even if the request times out, and the Twitch retry is
+/// then answered as a duplicate instead of losing the announcement.
 async fn handle_notification(
     state: &Arc<ReceiverState>,
     stream: &two_bot_core::stream_funnel::StreamOnline,
@@ -244,13 +248,31 @@ async fn handle_notification(
         );
         return ack(id);
     };
-    let delivery = deliver_go_live(
-        deps.ledger.as_ref(),
-        deps.sender.as_ref(),
-        &deps.config,
-        stream,
-    )
-    .await;
+    let task_deps = Arc::clone(deps);
+    let task_stream = (*stream).clone();
+    let delivery = match tokio::spawn(async move {
+        deliver_go_live(
+            task_deps.ledger.as_ref(),
+            task_deps.sender.as_ref(),
+            &task_deps.config,
+            &task_stream,
+        )
+        .await
+    })
+    .await
+    {
+        Ok(delivery) => delivery,
+        Err(_) => {
+            return refuse(
+                state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                true,
+                id,
+                bounded_message_type("notification"),
+            );
+        }
+    };
     let metrics = two_bot_core::metrics::global();
     let (attempted, succeeded, failed) = post_metric_counts(&delivery.outcome);
     if attempted {

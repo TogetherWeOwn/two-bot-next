@@ -124,27 +124,32 @@ def post(webhook_url, content):
         raise AlertError(f"alert delivery failed with status {status}")
 
 
-def decide_event(env, environment):
-    """Compute the alert transition without posting (decide step)."""
+def _decide(env, environment):
+    """(event, history_known) for the decide step; see decide_event."""
     current = env.get("PROBE_OUTCOME")
     if current not in ("success", "failure"):
-        return None
+        return None, True
     try:
         previous = previous_probe_outcomes(env, environment)
     except HistoryError as error:
         if current == "success":
             print(f"synthetic_alert: warning: {error}; healthy probe remains green",
                   file=sys.stderr)
-            return None
+            return None, False
         # Fail open on a real probe failure without history: alert now so a
         # missing incident is never silent. If the history error landed on
         # the first failure of an incident this duplicates the alert on the
         # next failure; that duplicate is intentional versus a lost incident.
         print(f"synthetic_alert: warning: {error}; sending failure alert without history",
               file=sys.stderr)
-        return "alert"
+        return "alert", False
     force_fail = env.get("FORCE_FAIL") == "true"
-    return transition(current, previous, force_fail)
+    return transition(current, previous, force_fail), True
+
+
+def decide_event(env, environment):
+    """Compute the alert transition without posting (decide step)."""
+    return _decide(env, environment)[0]
 
 
 def write_event(event):
@@ -204,10 +209,20 @@ def main(argv=None):
     if args.decide_only:
         # Decide step: compute the transition, never post, never need webhook.
         # A missing/skipped probe is not a sample and writes an empty event.
-        event = decide_event(os.environ, args.env)
+        event, history_known = _decide(os.environ, args.env)
         if event is None and os.environ.get("PROBE_OUTCOME") not in ("success", "failure"):
             print("synthetic_alert: no probe sample; no alert transition", file=sys.stderr)
         write_event(event)
+        if not history_known and os.environ.get("PROBE_OUTCOME") == "success":
+            # Record "history unknown" explicitly in this run's step
+            # conclusions: a failed decide step keeps later reconstruction
+            # from reading this healthy sample's skipped post as a
+            # known-closed checkpoint. The empty event above already keeps
+            # the post step skipped. On a failed probe the step must stay
+            # green so the fail-open alert still posts.
+            print("synthetic_alert: history unknown on a healthy probe; "
+                  "failing the decide step to record it", file=sys.stderr)
+            return 1
         return 0
     if args.post_only:
         # Post step: deliver the decided event without re-reading history, so

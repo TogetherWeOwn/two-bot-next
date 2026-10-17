@@ -38,11 +38,11 @@ IMAGE_MAX_BYTES = 112 * MIB
 # the same head locally (see that PR's body): /health 200, /readyz 503 with
 # the exact components/jobs bodies, --healthcheck 0 against live / 1
 # without a server, SIGTERM exit 0 — so size is the cause by elimination.
-# Backfill from hosted CI: the receiver-ledger wiring head measured
-# 16,794,312 bytes (16.02 MiB) and the stacked delivery-provisioning head
-# 16,794,832 bytes (16.02 MiB), ~17 KiB over the old 16 MiB budget with no
-# new dependencies. 17 MiB restores a working tripwire with headroom;
-# revisit if the binary approaches it.
+# Calibrated from the next green run: 16801560 bytes (16.02 MiB) on run
+# 39056648109 job 117470241279, just 24344 bytes over the 16 MiB tripwire.
+# Minimal one-MiB ceiling step per the 15-to-16 precedent (which likewise kept
+# a tight tripwire instead of the 1.4x figure); revisit if the binary
+# approaches this limit.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.

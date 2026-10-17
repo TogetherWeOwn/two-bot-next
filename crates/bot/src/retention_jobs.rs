@@ -84,6 +84,7 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
     Job {
         name: NAME,
         cadence,
+        cadence_source: None,
         startup_jitter: jobs::startup_jitter(cadence, rand::random()),
         timeout: TIMEOUT,
         action: Arc::new(move || {
@@ -114,6 +115,7 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                         presence_raw_deleted = report.presence_raw_deleted,
                         voice_raw_deleted = report.voice_raw_deleted,
                         audit_cache_deleted = report.audit_cache_deleted,
+                        stream_live_delivered_expired = report.stream_live_delivered_expired,
                         guild_rows_purged = report.guild_rows_purged,
                         guild_purges_failed = report.guild_purges_failed,
                         guild_purges_deferred = report.guild_purges_deferred,
@@ -133,6 +135,7 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                         presence_raw_deleted = report.presence_raw_deleted,
                         voice_raw_deleted = report.voice_raw_deleted,
                         audit_cache_deleted = report.audit_cache_deleted,
+                        stream_live_delivered_expired = report.stream_live_delivered_expired,
                         guild_rows_purged = report.guild_rows_purged,
                         guild_purges_failed = report.guild_purges_failed,
                         guild_purges_deferred = report.guild_purges_deferred,
