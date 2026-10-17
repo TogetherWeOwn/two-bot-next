@@ -84,6 +84,10 @@ REDIRECT_METHODS = frozenset({
     "http_error_308",
 })
 
+# The per-status overrides; redirect_request is the funnel every default
+# http_error_30x path goes through.
+HTTP_ERROR_METHODS = REDIRECT_METHODS - {"redirect_request"}
+
 REQUEST_FUNCS = frozenset({"get", "post", "put", "patch", "delete", "head", "request"})
 
 
@@ -119,6 +123,67 @@ def _method_refuses(node):
             else:
                 return False
     return refuses
+
+
+def _handler_refuses(node):
+    """Whether a redirect-handler class refuses on every redirect path.
+
+    A lone ``http_error_307`` override still inherits redirect-following
+    behavior for every other status, so the class counts only when each
+    locally defined redirect method refuses AND the class either refuses
+    ``redirect_request`` (the funnel every default ``http_error_30x`` path
+    goes through) or refuses every ``http_error_30x`` method. Same-class
+    aliases (``http_error_302 = http_error_301``) resolve to the method they
+    name; anything else bound to a redirect name does not count.
+    """
+    funcs = {}
+    aliases = {}
+    for item in node.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if item.name in REDIRECT_METHODS:
+                funcs[item.name] = item
+        elif isinstance(item, ast.Assign) and isinstance(item.value, ast.Name):
+            for target in item.targets:
+                if isinstance(target, ast.Name) and target.id in REDIRECT_METHODS:
+                    aliases[target.id] = item.value.id
+        elif (isinstance(item, ast.AnnAssign)
+                and isinstance(item.target, ast.Name)
+                and item.target.id in REDIRECT_METHODS
+                and isinstance(item.value, ast.Name)):
+            aliases[item.target.id] = item.value.id
+
+    def _refuses(name, seen):
+        if name in seen:
+            return False
+        seen.add(name)
+        if name in funcs:
+            return _method_refuses(funcs[name])
+        if name in aliases:
+            return _refuses(aliases[name], seen)
+        return False
+
+    methods = set(funcs) | set(aliases)
+    if not methods or not all(_refuses(name, set()) for name in methods):
+        return False
+    return "redirect_request" in methods or HTTP_ERROR_METHODS <= methods
+
+
+def _receiver_key(expr):
+    """Dotted path for a Name/Attribute receiver (``self.session``), else None."""
+    parts = []
+    while isinstance(expr, ast.Attribute):
+        parts.append(expr.attr)
+        expr = expr.value
+    if not isinstance(expr, ast.Name):
+        return None
+    parts.append(expr.id)
+    return ".".join(reversed(parts))
+
+
+def _session_receiver(expr, modules, session_bound):
+    """Whether a call receiver is the requests module or a bound session."""
+    key = _receiver_key(expr)
+    return key is not None and (key in modules or key in session_bound)
 
 
 def _request_aliases(tree):
@@ -165,7 +230,9 @@ def find_violations(path):
     text = Path(path).read_text()
     tree = ast.parse(text)
     file_name = Path(path).name
-    sends_token = "Authorization" in text
+    # Header names are case-insensitive on the wire (and add_header
+    # normalizes them), so match lowercase: `authorization` counts.
+    sends_token = "authorization" in text.lower()
     if not sends_token:
         return []
 
@@ -175,11 +242,8 @@ def find_violations(path):
             continue
         if not any(_is_redirect_base(base) for base in node.bases):
             continue
-        for item in node.body:
-            if (isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and item.name in REDIRECT_METHODS and _method_refuses(item)):
-                refusing_handler.add(node.name)
-                break
+        if _handler_refuses(node):
+            refusing_handler.add(node.name)
 
     modules, verbs, sessions = _request_aliases(tree)
 
@@ -188,10 +252,29 @@ def find_violations(path):
                  and isinstance(func.value, ast.Name) and func.value.id in modules)
                 or (isinstance(func, ast.Name) and func.id in sessions))
 
-    # Names in each function scope bound to a session construction result, so
-    # method calls on them are checked like direct requests calls.
+    # Receivers file-wide that hold a session construction result, so method
+    # calls on them are checked like direct requests calls. Keys are simple
+    # names (``sess``) or dotted paths (``self.session``); dotted paths match
+    # whole, so an unrelated object that merely has a ``session`` attribute
+    # never counts.
     session_bound = set()
+
+    def _bind_target(target):
+        if isinstance(target, (ast.Name, ast.Attribute)):
+            key = _receiver_key(target)
+            if key is not None:
+                session_bound.add(key)
+
     for node in ast.walk(tree):
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if not isinstance(item.context_expr, ast.Call):
+                    continue
+                if not _is_session_maker(item.context_expr.func):
+                    continue
+                if item.optional_vars is not None:
+                    _bind_target(item.optional_vars)
+            continue
         if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
             continue
         targets = []
@@ -204,8 +287,7 @@ def find_violations(path):
         if not _is_session_maker(node.value.func):
             continue
         for target in targets:
-            if isinstance(target, ast.Name):
-                session_bound.add(target.id)
+            _bind_target(target)
 
     violations = []
 
@@ -231,9 +313,7 @@ def find_violations(path):
                     if not names & refusing_handler:
                         violations.append((file_name, site[0], site[1]))
                 elif (isinstance(target, ast.Attribute) and target.attr in REQUEST_FUNCS
-                        and ((isinstance(target.value, ast.Name)
-                              and (target.value.id in modules
-                                   or target.value.id in session_bound))
+                        and (_session_receiver(target.value, modules, session_bound)
                              or (isinstance(target.value, ast.Call)
                                  and _is_session_maker(target.value.func)))
                         and _redirects_allowed(child)):
@@ -459,6 +539,108 @@ class TokenRedirectGateTests(unittest.TestCase):
         self.assertEqual(len(violations), 1)
         self.assertEqual(violations[0][1], "_get")
 
+    def test_partial_http_error_handler_trips_the_gate(self):
+        """A lone http_error_307 override still follows other statuses."""
+        mutant = (
+            "import urllib.request\n"
+            "class _Partial(urllib.request.HTTPRedirectHandler):\n"
+            "    def http_error_307(self, *args, **kwargs):\n"
+            "        return None\n"
+            "def _get(path, token):\n"
+            "    opener = urllib.request.build_opener(_Partial)\n"
+            "    request = urllib.request.Request(\n"
+            "        'https://api.example' + path,\n"
+            "        headers={'Authorization': 'Bearer ' + token})\n"
+            "    with opener.open(request, timeout=10) as response:\n"
+            "        return response.read()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            mutant_path = Path(tmp) / "partial_handler.py"
+            mutant_path.write_text(mutant)
+            violations = find_violations(mutant_path)
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0][1], "_get")
+
+    def test_aliased_refusing_handler_passes_the_gate(self):
+        """`http_error_302 = http_error_301` covers the aliased statuses."""
+        fixed = (
+            "import urllib.request\n"
+            "class _Refuse(urllib.request.HTTPRedirectHandler):\n"
+            "    def http_error_301(self, req, fp, code, msg, headers):\n"
+            "        fp.close()\n"
+            "        raise ValueError('refusing')\n"
+            "    http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_301\n"
+            "def _get(path, token):\n"
+            "    opener = urllib.request.build_opener(_Refuse)\n"
+            "    request = urllib.request.Request(\n"
+            "        'https://api.example' + path,\n"
+            "        headers={'Authorization': 'Bearer ' + token})\n"
+            "    with opener.open(request, timeout=10) as response:\n"
+            "        return response.read()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fixed_path = Path(tmp) / "aliased_handler.py"
+            fixed_path.write_text(fixed)
+            self.assertEqual(find_violations(fixed_path), [])
+
+    def test_lowercase_authorization_header_trips_the_gate(self):
+        """Header names are case-insensitive, so lowercase still counts."""
+        mutant = (
+            "import urllib.request\n"
+            "def _get(path, token):\n"
+            "    request = urllib.request.Request(\n"
+            "        'https://api.example' + path,\n"
+            "        headers={'authorization': 'Bearer ' + token})\n"
+            "    with urllib.request.urlopen(request, timeout=10) as response:\n"
+            "        return response.read()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            mutant_path = Path(tmp) / "lowercase_auth.py"
+            mutant_path.write_text(mutant)
+            violations = find_violations(mutant_path)
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0][1], "_get")
+
+    def test_session_context_manager_and_attribute_trip_the_gate(self):
+        for source, name in (
+                ("import requests\n"
+                 "def _get(path, token):\n"
+                 "    with requests.Session() as sess:\n"
+                 "        return sess.get('https://api.example' + path,\n"
+                 "            headers={'Authorization': 'Bearer ' + token})\n",
+                 "context_manager"),
+                ("import requests\n"
+                 "class Client:\n"
+                 "    def _get(self, path, token):\n"
+                 "        self.session = requests.Session()\n"
+                 "        return self.session.get('https://api.example' + path,\n"
+                 "            headers={'Authorization': 'Bearer ' + token})\n",
+                 "attribute"),
+        ):
+            with self.subTest(style=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    mutant_path = Path(tmp) / f"session_{name}.py"
+                    mutant_path.write_text(source)
+                    violations = find_violations(mutant_path)
+                self.assertEqual(len(violations), 1, name)
+                self.assertEqual(violations[0][1], "_get")
+
+    def test_unrelated_session_attribute_passes_the_gate(self):
+        """An unbound `.session` attribute on another object is not a session."""
+        source = (
+            "import requests\n"
+            "def _get(path, token):\n"
+            "    return requests.get('https://api.example' + path,\n"
+            "        headers={'Authorization': 'Bearer ' + token},\n"
+            "        allow_redirects=False)\n"
+            "def other(holder):\n"
+            "    return holder.session.get('https://api.example')\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fixed_path = Path(tmp) / "unrelated_session.py"
+            fixed_path.write_text(source)
+            self.assertEqual(find_violations(fixed_path), [])
+
     def test_sweep_covers_token_senders_outside_the_reader_list(self):
         """Authorization files beyond READERS must already be violation-free.
 
@@ -470,7 +652,7 @@ class TokenRedirectGateTests(unittest.TestCase):
         for path in sorted(SCRIPTS.glob("*.py")):
             if path.name in READERS:
                 continue
-            if "Authorization" not in path.read_text():
+            if "authorization" not in path.read_text().lower():
                 continue
             offenders.extend(
                 f"{file_name}:{func}:{line}"
