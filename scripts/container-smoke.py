@@ -29,9 +29,13 @@ IMAGE_MAX_BYTES = 112 * MIB
 # hot-reload head measured 15,730,600 bytes (15.00 MiB), also below this
 # limit. This branch's automation-only head measured 15,769,872 bytes
 # (15.04 MiB) before the event-executor merge; the combined-head
-# measurement comes from hosted CI on the merged head. 16 MiB restores a
-# working tripwire with headroom; revisit if the binary approaches it.
-BINARY_MAX_BYTES = 16 * MIB
+# measurement comes from hosted CI on the merged head. The game-activity
+# aggregate-expiry slice (PR 1082) measured 16,782,608 bytes (16.01 MiB) on
+# hosted CI, 5,392 bytes over the 16 MiB budget with no new dependencies:
+# the store expiry plus its per-guild stale listing and the retention-cadence
+# driver. 17 MiB restores a working tripwire with headroom; revisit if the
+# binary approaches it.
+BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"
