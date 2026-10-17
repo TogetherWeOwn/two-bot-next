@@ -700,6 +700,40 @@ as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
 
+#### Alert: EventSub post failed share
+
+`two_bot_eventsub_posts_total{outcome}` failed share between two keepalive
+samples: failed posts exceed 10% of attempted posts in the window, with at
+least 10 attempted posts. `eventsub_post_failed_share` is a **ticket, not a
+page**. The denominator is attempted posts, not succeeded plus failed: growth
+in `succeeded` from earlier attempts or in `other` never counts as delivery
+failure. Low-volume windows (fewer than 10 attempted) stay quiet at any share,
+and a valid window at or below the 10% line stays quiet. The first valid sample
+is baseline only, even when every post so far failed. Missing or invalid samples
+preserve the active ticket and the baseline; a counter reset (any outcome
+moving backwards, including a process restart) rebaselines without firing. Each
+valid window recomputes the share, so a valid flat or sub-floor window resolves
+the ticket. Recovery is a healthy full-volume window with the failed share back
+at or below the line; the resolve transition fires exactly once.
+
+First response: read-only diagnosis only. Read the attempted/failed counters
+through the existing authorized `/ops/metrics` path and correlate the window
+with `eventsub_receiver` log lines; do not re-post announcements, touch the
+durable ledger, retry sends, or reconcile subscriptions from this alert. No
+broadcaster, body, token or free-text label ever reaches the alert. For delivery
+shape and subscription health, follow the existing [stream funnel](stream-funnel.md#transport-webhook)
+transport/webhook section and the [EventSub operator runbook](eventsub-runbook.md)
+(refusal matrix, challenge verification, dark-unless-enabled behavior) through
+their authorized read paths. Record only fixed outcome names and sanitized
+counts, never broadcaster IDs, tokens, bodies or scrape secrets.
+
+Do not post announcements, write ledger rows, retry deliveries, or reconcile
+subscriptions to clear this ticket. This alert adds neither posting, ledger,
+retry, nor reconciliation behavior: it labels the existing transition delivery
+as `(ticket)` and supplies this runbook. Route a continuing delivery failure to
+the on-call engineer through the normal triage path. No new webhook, production
+activation or live load test is authorized.
+
 #### Auto-remediation: guarded stall and crash-loop response
 
 Execution-path decision: the Worker cannot restart containers, so remediation

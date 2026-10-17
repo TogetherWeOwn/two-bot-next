@@ -97,6 +97,12 @@ export const REST_429_MIN_REQUESTS = 10;
 export const REST_5XX_RATIO = 0.1;
 /** ...and the window must hold at least this many requests. */
 export const REST_5XX_MIN_REQUESTS = 10;
+/** Failed EventSub announcement posts must exceed this share of attempted posts... */
+export const EVENTSUB_POST_FAILED_SHARE_RATIO = 0.1;
+/** ...and the window must hold at least this many attempted posts. */
+export const EVENTSUB_POST_FAILED_SHARE_MIN_ATTEMPTED = 10;
+/** Fixed outcomes for `two_bot_eventsub_posts_total`, pinned to Rust `EVENTSUB_POST_OUTCOMES`. */
+export const EVENTSUB_POST_OUTCOMES: readonly string[] = ["attempted", "succeeded", "failed", "other"];
 /**
  * Promotion canary gate: firing keys that fail a promotion stage so the
  * existing per-stage auto-rollback restores the pre-promote version. 5xx
@@ -173,6 +179,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_join_fast_burn", summary: `creator-join error budget burning faster than ${JOIN_FAST_BURN}x over 1 h and 5 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-fast-burn" },
   { id: "voice_join_slow_burn", summary: `creator-join error budget burning faster than ${JOIN_SLOW_BURN}x over 6 h and 30 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-slow-burn", severity: "ticket" },
   { id: "voice_creator_map_stale", summary: `voice creator map has not merged for more than ${CREATOR_MAP_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-voice-creator-map-stale" },
+  { id: "eventsub_post_failed_share", summary: `EventSub announcement post failures exceed ${EVENTSUB_POST_FAILED_SHARE_RATIO * 100}% of attempted posts (min ${EVENTSUB_POST_FAILED_SHARE_MIN_ATTEMPTED} attempted)`, runbook: "runbook.md#alert-eventsub-post-failed-share", severity: "ticket" },
 ];
 
 /**
@@ -267,6 +274,10 @@ export interface MetricsAlertState {
    * older Worker versions; the first valid sample only stores a baseline.
    */
   joinBurn?: JoinBurnSnapshot[];
+  /** Baseline for `two_bot_eventsub_posts_total` by fixed outcome; absent before the first valid sample or in legacy storage. */
+  eventsubPosts?: Record<string, number>;
+  /** False until the first valid sample stores the post baseline: the first sample never fires. */
+  eventsubPostsSeen?: boolean;
 }
 
 /** One cumulative creator-join SLI snapshot feeding the burn-rate windows. */
@@ -277,7 +288,7 @@ export interface JoinBurnSnapshot {
   fastMoves: number;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, eventsubPosts: {}, eventsubPostsSeen: false };
 
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
@@ -402,6 +413,24 @@ function exactSeries(matches: Sample[], labels: Record<string, string>): number 
   if (rows.length !== 1) return undefined;
   const value = rows[0]!.value;
   return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * Fixed `two_bot_eventsub_posts_total` counters by outcome, or undefined when
+ * the sample is missing or malformed. Each fixed outcome needs exactly one row
+ * with only its `outcome` label and a safe nonnegative integer. Unknown
+ * outcomes (including hostile `__proto__` rows) are ignored, never subjects;
+ * a Rust rename or malformed value fails closed via the scrape validator and
+ * holds here for direct `evaluateMetrics` callers.
+ */
+function eventsubPostCounts(matches: Sample[]): Record<string, number> | undefined {
+  const counts: Record<string, number> = Object.create(null);
+  for (const outcome of EVENTSUB_POST_OUTCOMES) {
+    const value = exactSeries(matches, { outcome });
+    if (value === undefined) return undefined;
+    counts[outcome] = value;
+  }
+  return counts;
 }
 
 interface JoinBurnResult {
@@ -566,6 +595,48 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const reset5xx = rest5xx < prevRest5xx || restTotal < prev.restTotal;
   const d5xx = rest5xx - prevRest5xx;
   if (hasRest5xxBaseline && !reset5xx && dTotal >= REST_5XX_MIN_REQUESTS && d5xx / dTotal > REST_5XX_RATIO) firing.push("rest_5xx_rate");
+
+  // Failed share of go-live announcement posts: failed delta over attempted
+  // delta (mirroring `rest_5xx_rate`) raises one ticket; low-volume windows
+  // stay quiet. The first valid sample is baseline only; missing/invalid
+  // samples preserve firing and baseline; any backwards counter (restart)
+  // rebaselines. Valid windows recompute, so flat or sub-floor windows
+  // resolve. Unknown outcomes are ignored, never subjects; no broadcaster,
+  // body, token or free-text label ever reaches firing keys or messages.
+  const eventsubWasFiring = prev.firing.includes("eventsub_post_failed_share");
+  const eventsubCounts = eventsubPostCounts(gauge("two_bot_eventsub_posts_total"));
+  let eventsubPosts: Record<string, number>;
+  let eventsubPostsSeen = true;
+  if (eventsubCounts === undefined) {
+    eventsubPosts = prev.eventsubPosts ?? {};
+    eventsubPostsSeen = prev.eventsubPostsSeen ?? false;
+    if (eventsubWasFiring) firing.push("eventsub_post_failed_share");
+  } else {
+    const prevCounts = prev.eventsubPosts;
+    const seen = prev.eventsubPostsSeen ?? false;
+    const hasBaseline = seen && prevCounts !== undefined
+      && EVENTSUB_POST_OUTCOMES.every((outcome) =>
+        typeof prevCounts[outcome] === "number" && Number.isSafeInteger(prevCounts[outcome]) && (prevCounts[outcome] as number) >= 0);
+    if (!hasBaseline) {
+      eventsubPosts = { ...eventsubCounts };
+      eventsubPostsSeen = true;
+    } else {
+      const resetPost = EVENTSUB_POST_OUTCOMES.some((outcome) =>
+        (eventsubCounts[outcome] as number) < (prevCounts[outcome] as number));
+      if (resetPost) {
+        eventsubPosts = { ...eventsubCounts };
+        eventsubPostsSeen = true;
+      } else {
+        const dAttempted = (eventsubCounts["attempted"] as number) - (prevCounts["attempted"] as number);
+        const dFailed = (eventsubCounts["failed"] as number) - (prevCounts["failed"] as number);
+        if (dAttempted >= EVENTSUB_POST_FAILED_SHARE_MIN_ATTEMPTED && dFailed / dAttempted > EVENTSUB_POST_FAILED_SHARE_RATIO) {
+          firing.push("eventsub_post_failed_share");
+        }
+        eventsubPosts = { ...eventsubCounts };
+        eventsubPostsSeen = true;
+      }
+    }
+  }
 
   const configured = gauge("two_bot_db_pool_configured")[0]?.value === 1;
   const size = gauge("two_bot_db_pool_connections")[0]?.value;
@@ -786,7 +857,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring } };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
