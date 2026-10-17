@@ -416,6 +416,42 @@ identified, when a dead-letter or orphan names a stranded member, or when
 failures coincide with 429, DB-error or pool alerts — the fix then belongs
 to the on-call engineer, not another redeploy.
 
+#### Alert: voice join fast burn
+
+Creator joins are burning the 99.5%-moved-within-5 s error budget faster than
+14.4x in both the last hour and the last 5 minutes
+(`two_bot_voice_joins_received_total` minus benign `duplicate` refusals in
+`two_bot_voice_join_refused_total`, against
+`two_bot_voice_join_to_move_seconds_bucket{le="5"}`). Every non-duplicate
+refusal, failed move and slow (>5 s) move is burn. Each window needs at least
+10 genuine joins and two bad moves; one event alone cannot page or ticket.
+Receive counters lag one scrape so an in-flight move can complete. After startup
+or restart, a window stays inactive until its full history is available; a
+counter reset rebuilds the ring instead of firing.
+
+First response: confirm the spike is joins, not moves, via the authorized
+`/ops/metrics` scrape — compare `joins_received` growth against
+`voice_join_refused` by `reason` and `voice_operations{op="move"}` outcomes.
+`halted` means the actor is parked (check `two_bot_voice_worker_halted`);
+`unknown_creator`/`stale_ticket` point at creator-map or ticket generation
+drift; `discord`/`persistence` move outcomes point at REST or storage. Then
+read the container logs for `voice_event="voice_join_received"` refusal lines
+and `voice_event="voice_join"` terminal lines with their stage durations.
+
+Escalate when the burn persists across hours (the slow-burn ticket below will
+already be open), when `halted` refusals dominate, or when the stall matches a
+deploy — the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: voice join slow burn
+
+The same creator-join budget is burning faster than 6x in both the last 6
+hours and the last 30 minutes. This is the ticket-severity companion to the
+fast-burn page above: a moderate but sustained degradation — a slow leak of
+refusals or p95 creep past 5 s — that never spikes hard enough to page.
+Same signals, same first response, same escalation, lower urgency. Do not
+close it as "fast burn resolved": the fast window can clear while the slow
+grind continues.
+
 #### Alert: gateway missed events
 
 `two_bot_gateway_missed_events_total` increased between two keepalive

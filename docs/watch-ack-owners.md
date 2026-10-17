@@ -41,6 +41,7 @@ the `RESOLVED` line before closing the incident
 | `ticker_stale:<job>` | on-call operator | 15 min from the page |
 | `receiver_refusals:<family>` | on-call operator | 15 min from the page |
 | `gateway_checkpoint_failures` | on-call operator | 15 min from the page |
+| `voice_join_fast_burn` | on-call operator | 15 min from the page |
 
 Log-only findings (gateway session starts, handler-latency quantiles,
 unban-queue depth, restart counts) need no ack; they are recorded on the
