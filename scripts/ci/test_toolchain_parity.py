@@ -85,13 +85,15 @@ def workflow_toolchain_errors(root):
 
 
 def _rust_stages(text):
-    """Every `FROM rust:<tag>[@sha256:<digest>]` stage, in file order.
+    """Every `FROM [flags] rust:<tag>[@sha256:<digest>]` stage, in file order.
 
     Tag and digest are read from the SAME line in one pass, so a later rust
     stage can never supply the digest for an earlier stage's tag (or vice
-    versa) once this file grows a second rust stage.
+    versa) once this file grows a second rust stage. Optional `FROM` flags
+    such as `--platform=$BUILDPLATFORM` are skipped so flagged rust stages
+    stay covered instead of silently invisible to the tag and digest checks.
     """
-    return re.findall(r"(?m)^FROM\s+rust:([^\s@]+)(?:@sha256:([0-9a-f]{64}))?", text)
+    return re.findall(r"(?m)^FROM\s+(?:--\S+\s+)*rust:([^\s@]+)(?:@sha256:([0-9a-f]{64}))?", text)
 
 
 def dockerfile_parity_errors(root):
@@ -333,6 +335,23 @@ class ToolchainParityTests(unittest.TestCase):
             errors = container_image_errors(root)
             self.assertEqual(len(errors), 1, errors)
             self.assertIn("no pinned rust builder digest", errors[0])
+
+    def test_platform_flag_rust_stage_is_checked(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch)
+            (root / "Dockerfile").write_text(
+                f"FROM --platform=$BUILDPLATFORM rust:1.98-trixie@sha256:{PINNED_DIGEST} AS builder\n"
+            )
+            self.assertEqual(toolchain_parity_errors(root), [])
+            (root / "Dockerfile").write_text(
+                f"FROM --platform=$BUILDPLATFORM rust:1.99-trixie@sha256:{PINNED_DIGEST} AS builder\n"
+            )
+            errors = dockerfile_parity_errors(root)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("1.99-trixie", errors[0])
+            wired = toolchain_parity_errors(root)
+            self.assertTrue(wired, "flagged-stage tag drift must fail through the CI entry point")
+            self.assertTrue(any("1.99-trixie" in error for error in wired))
 
     def test_each_container_image_is_covered(self):
         for name, job_ids in CONTAINER_WORKFLOWS.items():
