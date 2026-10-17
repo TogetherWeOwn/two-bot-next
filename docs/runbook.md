@@ -297,14 +297,23 @@ anything the burst may have executed twice.
 Evaluate rollback when the burst starts with the deployed revision: compare the
 alert's first-firing window with the staging-rollout evidence (or the gated
 production run) for that SHA. A 5xx share introduced by a promotion stage
-requires a manual rollback decision unless a promotion stage invokes the
-`evaluatePromotionGate` helper (`wrangler/src/alert-rules.ts`, 5xx-only) and
-fails on its verdict. When that configured gate fails, the existing per-stage
-auto-rollback (staging verify, production gate, or the shared
-gradual-promotion action once wired) restores the recorded pre-promote
-version; a manual rollback names the recorded Worker version and container
-image from the failed run's snapshot. A burst on an unchanged revision is a
-Discord incident or a dependency regression, not a rollback.
+requires a manual rollback decision unless the staging `error_rate_gate`
+step invokes the `evaluatePromotionGate` helper
+(`wrangler/src/alert-rules.ts`, 5xx-only, via
+`wrangler/scripts/promotion-error-gate.mjs`) and fails on its verdict. When
+that gate fails, the existing staging auto-rollback restores the recorded
+pre-promote Worker version and container image; a manual rollback names the
+recorded Worker version and container image from the failed run's snapshot.
+The gate enforces live traffic only once the `STAGING_METRICS_SCRAPE_TOKEN`
+secret is provisioned — without it the step records a skip, and the
+dispatch-only `inject_error_rate_spike` input judges a rehearsal firing to
+prove the rollback chain (see `docs/runbook-observability.md` for the exact
+coverage limits). A live window with fewer than 10 REST requests records
+`insufficient_data`, never a pass, so only a `pass` with `rest_requests >= 10`
+counts as enforcement proof. Production has no error-rate gate: a burst on the
+production revision still needs a manual rollback decision. A burst on an
+unchanged revision is a Discord incident or a dependency regression, not a
+rollback.
 
 Escalate when the 5xx share stays above threshold across several windows after
 containment, or when 5xx coincide with 429/transport failures suggesting a
@@ -1286,7 +1295,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 | Control | Ported contract | Current operational boundary |
 |---|---|---|
 | Audit kill switch | Durable `audit_kill_switch`, singleton `id=1`; `engage_halt(actor_id)` / `disengage_halt()` library methods. Halt blocks queue discovery/claim/preparation, not fact recording or an already prepared/in-flight send. | Store exists, delivery service/operator endpoint not wired. No supported command in this binary. Durable DB errors propagate; legacy pure-model read-fail-open is **not** send authorization. See [audit store](audit-store.md). |
-| Automod | Exact `TWO_AUTOMOD=1` enables config. Dry-run by default; exact `TWO_AUTOMOD_ENFORCE=1` selects enforce. | Forwarded and composed into the gateway when activation/configuration permit. Requires valid Owen/protected-role configuration; enforcement can sanction. `TWO_AUTOMOD=1` requests MESSAGE_CONTENT intent. Flags alone do not override identity/permission gates or stop the bot. |
+| Automod | Exact `TWO_AUTOMOD=1` enables config. Dry-run by default; exact `TWO_AUTOMOD_ENFORCE=1` selects enforce. | Forwarded and composed into the gateway when activation/configuration permit. Requires valid Owen/protected-role configuration; enforcement can sanction. `TWO_AUTOMOD=1` requests MESSAGE_CONTENT intent. Flags alone do not override identity/permission gates or stop the bot. Filter/effect semantics, repeat expiry, corpus care and triage: [automod operator guide](automod-operator-guide.md). |
 | Moderation | Exact `TWO_MODERATION=1`; enabled config requires `TWO_OWEN_USER_ID`; protected-role policy applies. | Forwarded; channel handlers `/purge`, `/slowmode`, `/lockdown`, `/unlock` are registered and subject to activation and permission checks. Do not infer every member-moderation builtin executes. No config toggle demonstrated as an emergency stop. |
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Per-feature gates, not operational containment. Verify the affected deployed handler; registry publishing or a periodic job alone does not prove a specific action is active. |
 | Onboarding | `TWO_ONBOARDING_MODE=legacy|session|anchor`, default legacy; `TWO_ONBOARDING_DRY_RUN=1`. | Mode/dry-run contracts are feature-scoped, not bot-wide stop controls. Verify the affected handler and staging evidence; a catalogue value alone is not a runtime activation or reload receipt. |
