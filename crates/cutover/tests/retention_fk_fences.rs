@@ -6,6 +6,7 @@
 //! fence must survive a guild purge, and guard-refused deletions must be
 //! reported as deferred/overdue instead of silent.
 
+use two_bot_core::error_chain::RetentionStep;
 use two_bot_cutover::retention::{
     handle_guild_delete, request_user_deletion, run_retention, RetentionMode,
 };
@@ -517,5 +518,45 @@ async fn schema_gap_defers_request_without_rolling_back_time_window() {
         settled.guild_rows_purged > 0,
         "the deferred guild's rows must purge once the gap is gone, got {settled:?}"
     );
+    db.close().await.unwrap();
+}
+
+/// An unexpected FK failure while draining a user deletion reports the active
+/// deletion-intake stage instead of inheriting the Execute-mode expiry stage.
+#[tokio::test]
+async fn deletion_drain_database_failure_reports_deletion_intake_step() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    sqlx::query("INSERT INTO members (guild_id, member_id) VALUES ($1, $2)")
+        .bind(GONE_GUILD)
+        .bind(MEMBER)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE retention_failure_probe (
+            parent_guild TEXT NOT NULL,
+            parent_member TEXT NOT NULL,
+            FOREIGN KEY (parent_guild, parent_member)
+                REFERENCES members (guild_id, member_id) ON DELETE RESTRICT
+        )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO retention_failure_probe VALUES ($1, $2)")
+        .bind(GONE_GUILD)
+        .bind(MEMBER)
+        .execute(pool)
+        .await
+        .unwrap();
+    request_user_deletion(pool, GONE_GUILD, MEMBER)
+        .await
+        .unwrap();
+
+    let failure = run_retention(pool, RetentionMode::Execute)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.step(), RetentionStep::DeletionIntake);
     db.close().await.unwrap();
 }

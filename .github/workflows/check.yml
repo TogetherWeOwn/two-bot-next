@@ -2070,10 +2070,9 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Builds all fifteen libFuzzer targets. No fuzz campaign or corpus
-      # output; the workflow's existing weekly run also builds these targets
-      # and replays only the bounded eventsub_delivery seeds below. The bounded
-      # vote_kick smoke stays a manual non-controller step (see fuzz/README.md).
+      # Builds all sixteen libFuzzer targets. No campaign or generated corpus
+      # output; the existing weekly run replays only the bounded eventsub_delivery
+      # seeds below. Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -2086,7 +2085,7 @@ jobs:
       # and exits without fuzzing. A signing-key drift between the harness
       # and production, or seed misrouting, panics an assertion here instead
       # of passing a compile-only gate. Compile stays the only gate for the
-      # other fourteen targets.
+      # other fifteen targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
@@ -2178,6 +2177,10 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic.py -v
       - name: Verify staging health-contract probe (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_health_contract_probe.py -v
+      - name: Verify passive production probe (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe.py -v
+      - name: Verify synthetic alert delivery (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
       - name: Verify voice denied-copy fixtures (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_voice_denied_copy.py -v
       - name: Verify staging-guild E2E prep skeleton (offline fixtures)

@@ -68,8 +68,8 @@ exempt: it can take up to 30 minutes, and image security stays gated through
 the SBOM job. The legacy `required-checks` aggregate is removed.
 
 Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
-WARN, required voice synthetic, test-target inventory HARD) run in their
-respective lanes on the existing routed runner; see
+HARD, required voice synthetic, test-target inventory HARD) run as steps of
+the `check` lane on the existing routed runner; see
 [`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs in
 `rust-tests` with the disposable Postgres service and ignored database-backed
 tests. New checks start in WARN (report, never fail) and flip to HARD only with

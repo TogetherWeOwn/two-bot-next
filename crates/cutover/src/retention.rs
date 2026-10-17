@@ -58,6 +58,14 @@
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use two_bot_core::error_chain::{
+    db_cause, render_retention_failure, RetentionStep, STORE_UNAVAILABLE_CLASS,
+};
+
+// Store class token for retention failure lines: the shared
+// `STORE_UNAVAILABLE_CLASS` from core, so this side cannot drift from the
+// bot gateway's `FailureClass::StoreUnavailable` token (equality is pinned
+// by the bot `backfill_retention_chains` test).
 
 /// Raw presence/voice rows older than this roll off.
 pub const PRESENCE_RAW_RETENTION_DAYS: i32 = 30;
@@ -184,6 +192,48 @@ fn next_request_id() -> String {
     format!("del-{nanos:x}-{seq:x}")
 }
 
+/// Render a deletion-intake failure line for the warn sites below (user-
+/// deletion deferrals, schema-gap purges, replay-guard deferrals, purge
+/// failures). One helper owns the step attribution so it is pinned in one
+/// place: `deletion_intake_failure_pins_its_step` fails if any site ever
+/// renders a different step, where the substring-only wiring pin would stay
+/// green.
+fn deletion_intake_failure(chain: &str) -> String {
+    render_retention_failure(
+        STORE_UNAVAILABLE_CLASS,
+        RetentionStep::DeletionIntake,
+        chain,
+    )
+}
+
+/// A retention run failure with its stage and a fixed, safe cause token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionFailure {
+    step: RetentionStep,
+    cause: &'static str,
+}
+
+impl RetentionFailure {
+    fn from_sqlx(step: RetentionStep, error: &sqlx::Error) -> Self {
+        Self {
+            step,
+            cause: two_bot_core::error_chain::db_cause(error),
+        }
+    }
+
+    /// Stage active when the database operation failed.
+    #[must_use]
+    pub const fn step(self) -> RetentionStep {
+        self.step
+    }
+
+    /// Fixed database-cause token; never includes database error text.
+    #[must_use]
+    pub const fn cause(self) -> &'static str {
+        self.cause
+    }
+}
+
 /// Run the retention job: rolling-window deletes, pending user-deletion
 /// completion, then guild-purge drain. Dry run reports counts and changes
 /// nothing. Deletion and queue writes happen in ONE transaction with the
@@ -206,11 +256,26 @@ fn next_request_id() -> String {
 pub async fn run_retention(
     pool: &PgPool,
     mode: RetentionMode,
+) -> Result<RetentionReport, RetentionFailure> {
+    let mut step = match mode {
+        RetentionMode::DryRun => RetentionStep::DryRun,
+        RetentionMode::Execute => RetentionStep::Expiry,
+    };
+    run_retention_inner(pool, mode, &mut step)
+        .await
+        .map_err(|error| RetentionFailure::from_sqlx(step, &error))
+}
+
+async fn run_retention_inner(
+    pool: &PgPool,
+    mode: RetentionMode,
+    active_step: &mut RetentionStep,
 ) -> Result<RetentionReport, sqlx::Error> {
     let started = std::time::Instant::now();
     let mut tx = pool.begin().await?;
     let report = match mode {
         RetentionMode::DryRun => {
+            *active_step = RetentionStep::DryRun;
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .execute(&mut *tx)
                 .await?;
@@ -224,10 +289,10 @@ pub async fn run_retention(
             .await?;
             let overdue = count_overdue_deletions(&mut tx).await?;
             let pendings: Vec<(String, String)> = sqlx::query_as(
-                "SELECT guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
-            )
-            .fetch_all(&mut *tx)
-            .await?;
+            "SELECT guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
             // A schema-coverage refusal defers every pending request (the
             // live drain rolls back only that request's savepoint), so the
             // dry run mirrors it: with gaps, all pendings are deferred.
@@ -293,6 +358,7 @@ pub async fn run_retention(
             }
         }
         RetentionMode::Execute => {
+            *active_step = RetentionStep::Expiry;
             sqlx::query("SET LOCAL lock_timeout = '5s'")
                 .execute(&mut *tx)
                 .await?;
@@ -322,30 +388,31 @@ pub async fn run_retention(
                 .execute(&mut *tx)
                 .await?;
             let presence =
-                sqlx::query("DELETE FROM presence_probe WHERE observed_at < to_char(now() - make_interval(days => $1), 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")
-                    .bind(PRESENCE_RAW_RETENTION_DAYS)
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected();
+            sqlx::query("DELETE FROM presence_probe WHERE observed_at < to_char(now() - make_interval(days => $1), 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")
+                .bind(PRESENCE_RAW_RETENTION_DAYS)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
             let voice = sqlx::query(
-                "DELETE FROM events WHERE event_type IN ('voice_session_started', 'voice_session_ended') AND occurred_at < now() - make_interval(days => $1)",
-            )
-            .bind(VOICE_RAW_RETENTION_DAYS)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            "DELETE FROM events WHERE event_type IN ('voice_session_started', 'voice_session_ended') AND occurred_at < now() - make_interval(days => $1)",
+        )
+        .bind(VOICE_RAW_RETENTION_DAYS)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
             let audit = sqlx::query(
-                "DELETE FROM operational_audit_log WHERE occurred_at < now() - make_interval(days => $1)",
-            )
-            .bind(AUDIT_CACHE_RETENTION_DAYS)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            "DELETE FROM operational_audit_log WHERE occurred_at < now() - make_interval(days => $1)",
+        )
+        .bind(AUDIT_CACHE_RETENTION_DAYS)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
             let overdue = count_overdue_deletions(&mut tx).await?;
             // Schema gaps are computed once per run, before either drain. A
             // gap means no purge or deletion can certify completeness, so
             // every pending request defers and every queued guild stays
             // queued; the exact gaps ride the warn logs for the code fix.
+            *active_step = RetentionStep::DeletionIntake;
             let schema_gaps = crate::member_erasure::schema_gaps(&mut tx).await?;
             let schema_gapped = !schema_gaps.is_empty();
             // Pending deletions drain BEFORE guild purges so a departed
@@ -354,10 +421,10 @@ pub async fn run_retention(
             // schema-coverage refusal rolls back only that request, leaving
             // it pending, while other failures abort the run.
             let pendings: Vec<(String, String, String)> = sqlx::query_as(
-                "SELECT request_id, guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
-            )
-            .fetch_all(&mut *tx)
-            .await?;
+            "SELECT request_id, guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
             let mut completed = 0u64;
             let mut deferred = 0u64;
             let mut gap_deferred = 0u64;
@@ -402,20 +469,25 @@ pub async fn run_retention(
                 }
             }
             if !deferred_ids.is_empty() {
+                let failure =
+                    deletion_intake_failure("replay guard or schema gap deferred the request");
                 tracing::warn!(
                     deferred = deferred,
                     schema_gap_deferrals = gap_deferred,
                     overdue = overdue,
                     requests = ?deferred_ids,
                     schema_gaps = ?schema_gaps,
+                    class = STORE_UNAVAILABLE_CLASS,
+                    step = RetentionStep::DeletionIntake.as_str(),
+                    failure = %failure,
                     "retention user deletions deferred by unresolved replay guard or schema coverage"
                 );
             }
             let guilds: Vec<(String, i64)> = sqlx::query_as(
-                "SELECT guild_id, (EXTRACT(EPOCH FROM (clock_timestamp() - enqueued_at)))::BIGINT FROM retention_guild_purge_queue",
-            )
-            .fetch_all(&mut *tx)
-            .await?;
+            "SELECT guild_id, (EXTRACT(EPOCH FROM (clock_timestamp() - enqueued_at)))::BIGINT FROM retention_guild_purge_queue",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
             let mut guild_rows = 0u64;
             let mut guild_failed = 0u64;
             let mut guild_deferred = 0u64;
@@ -428,9 +500,13 @@ pub async fn run_retention(
             if schema_gapped {
                 guild_failed = guilds.len() as u64;
                 if !guilds.is_empty() {
+                    let failure = deletion_intake_failure("schema gap deferred the purge");
                     tracing::warn!(
                         guilds = ?guilds,
                         schema_gaps = ?schema_gaps,
+                        class = STORE_UNAVAILABLE_CLASS,
+                        step = RetentionStep::DeletionIntake.as_str(),
+                        failure = %failure,
                         "retention guild purges deferred by schema coverage, kept queued"
                     );
                 }
@@ -460,16 +536,24 @@ pub async fn run_retention(
                                 guild_deferred += 1;
                                 guild_deferred_oldest =
                                     guild_deferred_oldest.max((*waited_secs).max(0) as u64);
+                                let failure =
+                                    deletion_intake_failure("replay guard deferred the purge");
                                 tracing::warn!(
                                     guild_id = %guild,
                                     waited_secs = (*waited_secs).max(0),
+                                    class = STORE_UNAVAILABLE_CLASS,
+                                    step = RetentionStep::DeletionIntake.as_str(),
+                                    failure = %failure,
                                     "retention guild purge deferred by unresolved replay guard, kept queued"
                                 );
                             } else {
                                 guild_failed += 1;
+                                let failure = deletion_intake_failure(db_cause(&err));
                                 tracing::warn!(
                                     guild_id = %guild,
-                                    error = %format!("{err:?}"),
+                                    class = STORE_UNAVAILABLE_CLASS,
+                                    step = RetentionStep::DeletionIntake.as_str(),
+                                    failure = %failure,
                                     "retention guild purge failed, kept queued"
                                 );
                             }
@@ -625,8 +709,8 @@ pub async fn fulfill_user_deletion(
 fn is_deferrable_refusal(err: &sqlx::Error) -> bool {
     let display = format!("{err}");
     let debug = format!("{err:?}");
-    display.contains("unresolved erasure replay guard")
-        || debug.contains("unresolved erasure replay guard")
+    display.contains(crate::member_erasure::REPLAY_GUARD_REFUSAL)
+        || debug.contains(crate::member_erasure::REPLAY_GUARD_REFUSAL)
         || is_schema_gap_refusal(err)
 }
 
@@ -636,8 +720,8 @@ fn is_deferrable_refusal(err: &sqlx::Error) -> bool {
 fn is_schema_gap_refusal(err: &sqlx::Error) -> bool {
     let display = format!("{err}");
     let debug = format!("{err:?}");
-    display.contains("erasure schema coverage incomplete")
-        || debug.contains("erasure schema coverage incomplete")
+    display.contains(crate::member_erasure::SCHEMA_GAP_REFUSAL)
+        || debug.contains(crate::member_erasure::SCHEMA_GAP_REFUSAL)
 }
 
 /// Delete the requesting member's full footprint and settle the request,
@@ -656,12 +740,12 @@ async fn complete_request(
     // is swallowed or fatal.
     if !crate::member_erasure::schema_gaps(tx).await?.is_empty() {
         return Err(sqlx::Error::InvalidArgument(
-            "erasure schema coverage incomplete".into(),
+            crate::member_erasure::SCHEMA_GAP_REFUSAL.into(),
         ));
     }
     if crate::member_erasure::has_unresolved_guards(tx, guild_id, user_id).await? {
         return Err(sqlx::Error::InvalidArgument(
-            "unresolved erasure replay guard".into(),
+            crate::member_erasure::REPLAY_GUARD_REFUSAL.into(),
         ));
     }
     // Full erasure-plan footprint in the same transaction: every plan table's
@@ -859,7 +943,7 @@ async fn purge_guild(
     }
     if crate::member_erasure::has_unresolved_guild_guards(tx, guild_id).await? {
         return Err(sqlx::Error::InvalidArgument(
-            "unresolved erasure replay guard".into(),
+            crate::member_erasure::REPLAY_GUARD_REFUSAL.into(),
         ));
     }
     let mut purged = 0u64;
@@ -1047,4 +1131,396 @@ async fn count_queued_guild_rows(
         }
     }
     Ok((total, deferred_guilds, deferred_oldest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_abort_step_follows_mode() {
+        let pool = PgPool::connect_lazy("postgres://unused:unused@localhost/unused").unwrap();
+        pool.close().await;
+
+        for (mode, expected_step) in [
+            (RetentionMode::DryRun, RetentionStep::DryRun),
+            (RetentionMode::Execute, RetentionStep::Expiry),
+        ] {
+            let failure = run_retention(&pool, mode).await.unwrap_err();
+            assert_eq!(failure.step(), expected_step);
+            assert_eq!(failure.cause(), "pool_closed");
+        }
+    }
+
+    #[test]
+    fn deletion_intake_failure_pins_its_step() {
+        // Every warn site renders through `deletion_intake_failure`, so this
+        // pins all four at once: a mutant swapping in any other step fails
+        // here, where the substring-only wiring pin would stay green.
+        let line = deletion_intake_failure("pool_timeout");
+        assert!(
+            line.contains("step=deletion_intake"),
+            "deletion-intake warns must attribute DeletionIntake: {line:?}"
+        );
+        for other in ["step=expiry", "step=dry_run"] {
+            assert!(
+                !line.contains(other),
+                "deletion-intake warns must not attribute {other}: {line:?}"
+            );
+        }
+        assert!(
+            line.contains(&format!("class={STORE_UNAVAILABLE_CLASS} ")),
+            "deletion-intake warns must carry the shared store class: {line:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    //! Offline ledger laws for retention deferral and dry-run counting.
+    //!
+    //! The DB-backed acceptance suites prove the behavior against a live
+    //! schema. These offline tests pin refusal classification, purge predicate
+    //! shape, and report aggregation without a database. The #958 savepoint
+    //! behavior and #960 projection's agreement with Execute are exercised by
+    //! the acceptance suites; the offline total test only checks that equal
+    //! row-class inputs produce equal aggregate totals.
+
+    use super::*;
+
+    /// Deterministic xorshift generator for property sweeps without new deps.
+    struct Ladder(u64);
+
+    impl Ladder {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0 | 1;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    fn report(values: [u64; 11]) -> RetentionReport {
+        let [presence, voice, audit, guild_rows, failed, deferred_guilds, oldest_secs, completed, deferred, gap, overdue] =
+            values;
+        RetentionReport {
+            presence_raw_deleted: presence,
+            voice_raw_deleted: voice,
+            audit_cache_deleted: audit,
+            guild_rows_purged: guild_rows,
+            guild_purges_failed: failed,
+            guild_purges_deferred: deferred_guilds,
+            guild_purges_deferred_oldest_secs: oldest_secs,
+            deletions_completed: completed,
+            deletions_deferred: deferred,
+            schema_gap_deferrals: gap,
+            deletions_overdue: overdue,
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn empty_run_deletes_nothing() {
+        let idle = report([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(idle.total_deleted(), 0);
+    }
+
+    #[test]
+    fn total_counts_each_row_once_and_nothing_else() {
+        // Row classes stay disjoint while receipts, deferrals, failures and
+        // overdue signals vary freely: none of them may leak into the total.
+        let mut rng = Ladder(0x1234_5678_9abc_def0);
+        for _ in 0..256 {
+            let (presence, voice, audit, guild_rows) = (
+                rng.below(1_000_000),
+                rng.below(1_000_000),
+                rng.below(1_000_000),
+                rng.below(1_000_000),
+            );
+            let raffle = report([
+                presence,
+                voice,
+                audit,
+                guild_rows,
+                rng.next(),
+                rng.next(),
+                rng.next(),
+                rng.next(),
+                rng.next(),
+                rng.next(),
+                rng.next(),
+            ]);
+            assert_eq!(
+                raffle.total_deleted(),
+                presence + voice + audit + guild_rows,
+                "the total must sum exactly the four row classes, got {raffle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dry_and_execute_totals_agree_on_shared_classes() {
+        // Report aggregation is mode-independent: when callers provide the
+        // same row-class counts, mode-specific signals do not change totals.
+        // The DB acceptance suite exercises the actual #960 projection logic.
+        let mut rng = Ladder(0x0bad_f00d_dead_beef);
+        for _ in 0..256 {
+            let (presence, voice, audit, guild_rows) = (
+                rng.below(1_000_000),
+                rng.below(1_000_000),
+                rng.below(1_000_000),
+                rng.below(1_000_000),
+            );
+            let dry = report([
+                presence,
+                voice,
+                audit,
+                guild_rows,
+                rng.next(),
+                rng.next(),
+                rng.next(),
+                rng.next(),
+                rng.next(),
+                rng.next(),
+                rng.next(),
+            ]);
+            let live = report([
+                presence,
+                voice,
+                audit,
+                guild_rows,
+                rng.next(),
+                rng.next(),
+                rng.next(),
+                rng.next(),
+                rng.next(),
+                rng.next(),
+                rng.next(),
+            ]);
+            assert_eq!(
+                dry.total_deleted(),
+                live.total_deleted(),
+                "equal row classes must agree on the total, dry {dry:?} vs live {live:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deferral_decision_table_keeps_known_refusals_and_aborts_the_rest() {
+        // The #958 law: these two refusals roll back only their request's
+        // savepoint and stay pending; anything else aborts the run.
+        let gap = sqlx::Error::InvalidArgument(crate::member_erasure::SCHEMA_GAP_REFUSAL.into());
+        assert!(is_deferrable_refusal(&gap));
+        assert!(is_schema_gap_refusal(&gap));
+
+        let guard =
+            sqlx::Error::InvalidArgument(crate::member_erasure::REPLAY_GUARD_REFUSAL.into());
+        assert!(is_deferrable_refusal(&guard));
+        assert!(!is_schema_gap_refusal(&guard));
+
+        for fatal in [
+            sqlx::Error::RowNotFound,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::InvalidArgument("boom".into()),
+            sqlx::Error::InvalidArgument(String::new()),
+        ] {
+            assert!(
+                !is_deferrable_refusal(&fatal),
+                "{fatal:?} must abort the run, not defer"
+            );
+            assert!(!is_schema_gap_refusal(&fatal));
+        }
+    }
+
+    #[test]
+    fn gap_deferral_is_a_strict_subset_of_deferrable() {
+        // Gap-deferred requests are always a subset of deferred requests, and
+        // the guard refusal proves the subset is strict: deferrable without
+        // being a gap.
+        let guard =
+            sqlx::Error::InvalidArgument(crate::member_erasure::REPLAY_GUARD_REFUSAL.into());
+        assert!(is_deferrable_refusal(&guard) && !is_schema_gap_refusal(&guard));
+
+        for err in [
+            sqlx::Error::InvalidArgument(crate::member_erasure::SCHEMA_GAP_REFUSAL.into()),
+            sqlx::Error::InvalidArgument(
+                "erase_member: erasure schema coverage incomplete: retention_deferral_acceptance_probe.owner_id"
+                    .into(),
+            ),
+            guard,
+            sqlx::Error::RowNotFound,
+            sqlx::Error::PoolClosed,
+        ] {
+            if is_schema_gap_refusal(&err) {
+                assert!(
+                    is_deferrable_refusal(&err),
+                    "a gap deferral must also be deferrable, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refusal_matching_is_exact_not_fuzzy() {
+        // Producers and classifiers share these constants, preventing their
+        // refusal wording from drifting independently. Near-misses must not
+        // silently flip a deferral into a run abort (or a fatal error into one).
+        for near_miss in [
+            "erasure schema coverage",
+            "schema coverage incomplete",
+            "coverage incomplete",
+            "unresolved erasure guard",
+            "unresolved replay guard",
+            "UNRESOLVED ERASURE REPLAY GUARD",
+            "erasure schema coverage Complete",
+        ] {
+            let err = sqlx::Error::InvalidArgument(near_miss.into());
+            assert!(
+                !is_deferrable_refusal(&err),
+                "{near_miss:?} must not classify"
+            );
+            assert!(!is_schema_gap_refusal(&err));
+        }
+        // Context-wrapped producer strings still defer: callers may add the
+        // path that raised the refusal.
+        let wrapped = sqlx::Error::InvalidArgument(format!(
+            "purge_guild: {} for guild 123",
+            crate::member_erasure::REPLAY_GUARD_REFUSAL
+        ));
+        assert!(is_deferrable_refusal(&wrapped));
+        assert!(!is_schema_gap_refusal(&wrapped));
+    }
+
+    #[test]
+    fn projection_excludes_every_execute_time_window_stage() {
+        // The #960 coverage law: every Execute time-window delete on a
+        // guild-purged table has a dry-run projection exclusion with the same
+        // retention window, and no other table grows a stray exclusion that
+        // would hide rows from the projection.
+        let (events_condition, events_days) = guild_projection_time_exclusion("events", 2)
+            .expect("events needs a projection exclusion");
+        assert!(events_condition.contains("$2"), "{events_condition}");
+        assert_eq!(events_days, VOICE_RAW_RETENTION_DAYS);
+
+        let (audit_condition, audit_days) =
+            guild_projection_time_exclusion("operational_audit_log", 2)
+                .expect("operational_audit_log needs a projection exclusion");
+        assert!(audit_condition.contains("$2"), "{audit_condition}");
+        assert_eq!(audit_days, AUDIT_CACHE_RETENTION_DAYS);
+
+        let mut without_exclusion: Vec<String> = crate::member_erasure::plan()
+            .tables
+            .iter()
+            .map(|entry| entry.table.clone())
+            .collect();
+        without_exclusion.push("presence_probe".to_owned());
+        for table in without_exclusion {
+            if table == "events" || table == "operational_audit_log" {
+                continue;
+            }
+            assert!(
+                guild_projection_time_exclusion(&table, 2).is_none(),
+                "{table} must not grow a projection exclusion"
+            );
+        }
+    }
+
+    #[test]
+    fn projection_placeholders_track_caller_numbering() {
+        // The exclusion binds the caller's placeholder, so stacked user
+        // exclusions keep numbering without collision.
+        let (condition, days) = guild_projection_time_exclusion("events", 4)
+            .expect("events needs a projection exclusion");
+        assert!(condition.contains("$4"), "{condition}");
+        assert!(!condition.contains("$2"), "{condition}");
+        assert_eq!(days, VOICE_RAW_RETENTION_DAYS);
+    }
+
+    #[test]
+    fn guild_purge_predicate_shape_covers_plan_tables_except_the_ledger() {
+        // Pin the generated predicate shape for plan tables other than the
+        // deletion ledger. Runtime ledger preservation is covered by DB-backed
+        // acceptance tests; this offline check does not execute purge_guild.
+        let plan = crate::member_erasure::plan();
+        assert!(
+            plan.tables
+                .iter()
+                .any(|entry| entry.table == "retention_deletion_requests"),
+            "the ledger skip must stay meaningful"
+        );
+        for entry in &plan.tables {
+            if entry.table == "retention_deletion_requests" {
+                continue;
+            }
+            let predicate = guild_purge_predicate(&entry.table);
+            assert!(
+                predicate.contains("$1"),
+                "{table} purge must bind the guild",
+                table = entry.table
+            );
+            let sql = guild_purge_sql(&entry.table);
+            assert!(sql.starts_with("DELETE FROM "), "{sql} must be a delete");
+            assert!(sql.contains(&predicate), "{sql} must apply its predicate");
+        }
+    }
+
+    #[test]
+    fn purge_predicates_keep_the_operator_released_replay_fence() {
+        // Done/operator-released idempotency rows are an indefinite replay
+        // fence: the purge must never select them.
+        for table in ["moderation_idempotency", "moderation_channel_executions"] {
+            let predicate = guild_purge_predicate(table);
+            assert!(
+                predicate.contains(
+                    "(state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released')"
+                ),
+                "{table} must exclude the released fence rows: {predicate}"
+            );
+        }
+    }
+
+    #[test]
+    fn cascade_exclusions_reference_live_plan_parents() {
+        // Every CASCADE parent the projection excludes through must resolve
+        // to a live plan table, so a plan rename fails here instead of
+        // silently double-counting cascade-removed rows.
+        let plan = crate::member_erasure::plan();
+        let names: Vec<&str> = plan
+            .tables
+            .iter()
+            .map(|entry| entry.table.as_str())
+            .collect();
+        let mut covered = 0;
+        for child in [
+            "lfg_signups",
+            "lfg_roles",
+            "feed_deliveries",
+            "ticket_transcripts",
+            "voice_room_blocks",
+            "voice_join_grants",
+            "voice_owner_grants",
+        ] {
+            for (parent, _) in guild_projection_cascade_parents(child) {
+                assert!(
+                    names.contains(parent),
+                    "{child} references a missing plan table {parent}"
+                );
+                covered += 1;
+            }
+        }
+        assert!(covered > 0, "the cascade map must not go empty");
+        let signups: Vec<&str> = guild_projection_cascade_parents("lfg_signups")
+            .iter()
+            .map(|(parent, _)| *parent)
+            .collect();
+        assert!(signups.contains(&"lfg_posts"));
+        assert!(guild_projection_cascade_parents("members").is_empty());
+        assert!(guild_projection_cascade_parents("presence_probe").is_empty());
+    }
 }

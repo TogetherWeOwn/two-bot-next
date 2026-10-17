@@ -355,12 +355,12 @@ alongside an unconfirmed Next gateway.
   `FORWARDED_DISCORD_IDS`:
   [configuration](../crates/core/src/config.rs#L24),
   [tool connection](../crates/cutover/src/cli.rs#L180),
-  [Worker environment](../wrangler/src/index.ts#L480).
+  [Worker environment](../wrangler/src/index.ts#L550).
 - Configured server startup runs embedded migrations; it is not a read-only
   preflight. Gateway boot wires the funnel pipeline, not the full feature/job
   stack. Domain/store libraries and command definitions are not activated
-  runtime evidence: [boot](../crates/bot/src/main.rs#L120),
-  [pipeline construction](../crates/bot/src/gateway.rs#L1765).
+  runtime evidence: [boot](../crates/bot/src/main.rs),
+  [pipeline construction](../crates/bot/src/gateway.rs).
 - Fresh checkpoints (up to 15 minutes old) automatically trigger RESUME.
   Persistence deduplicates funnel batches, not all Discord effects:
   [session policy](../crates/core/src/gateway_session.rs#L4),

@@ -115,7 +115,7 @@ can log it many times before a RESUME.)
 | Level | Condition | Action |
 |---|---|---|
 | Warn | Single 503 sample that recovers; single reconnect paired with a later RESUME or READY | Record the finding with timestamp; keep watching |
-| Page | 503 sustained past 60 s after a restart/deploy event; `container_unready_alert` (10 consecutive failed keepalive samples, ~10 min at defaults); reconnects with no later RESUME or fresh READY in the same window | Freeze writers, investigate, evaluate rollback per the 48-hour watch |
+| Page | 503 sustained past 60 s after a restart/deploy event; `container_unready_alert` (2 consecutive failed keepalive samples, ~2 min at defaults); reconnects with no later RESUME or fresh READY in the same window | Freeze writers, investigate, evaluate rollback per the 48-hour watch |
 
 Sources: [gateway recovery](gateway-recovery.md),
 [container readiness](container-readiness.md),

@@ -160,6 +160,7 @@ impl<B> MakeSpan<B> for RedactedHttpMakeSpan {
             "request",
             http.request.method = %request.method(),
             http.request.path = %redacted_path(request.uri()),
+            request_id = %crate::logging::incoming_request_id(request.headers()),
         )
     }
 }
@@ -185,8 +186,9 @@ pub(crate) struct ReadinessReport {
     pub(crate) health: HealthReport,
     // Informational component: not included in HealthReport::ready().
     pub(crate) jobs: std::collections::BTreeMap<String, crate::jobs::JobStatus>,
-    /// Fixed-vocabulary phase/class of the last gateway task failure; absent
-    /// while none has happened. Never carries error text.
+    /// Fixed-vocabulary phase/class plus the failing step and SQLSTATE code of
+    /// the last gateway task failure; absent while none has happened. Never
+    /// carries error text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) gateway_failure: Option<GatewayFailure>,
     pub(crate) build_revision: &'static str,
@@ -617,8 +619,10 @@ mod tests {
         assert!(text.contains("http.request.method=GET"), "method missing");
         for known in ["/health", "/healthz", "/readyz", "/metrics", "/ops/summary"] {
             assert!(
-                text.lines()
-                    .any(|l| l.ends_with(&format!("http.request.path={known}"))),
+                text.lines().any(|line| {
+                    line.split_whitespace()
+                        .any(|field| field == format!("http.request.path={known}"))
+                }),
                 "known route missing"
             );
         }
@@ -628,7 +632,10 @@ mod tests {
             .count();
         let marked = text
             .lines()
-            .filter(|l| l.ends_with("http.request.path=[REDACTED]"))
+            .filter(|line| {
+                line.split_whitespace()
+                    .any(|field| field == "http.request.path=[REDACTED]")
+            })
             .count();
         assert_eq!(spans, cases.len(), "one span per request");
         assert_eq!(marked, 10, "unknown paths must carry the marker");
@@ -805,13 +812,15 @@ mod tests {
         };
         assert!(fetch(shared.clone()).await.get("gateway_failure").is_none());
         for class in FailureClass::ALL {
-            shared
-                .failure
-                .record(GatewayFailure::durable_gateway(class));
+            shared.failure.record(GatewayFailure::durable_gateway(
+                class,
+                "checkpoint_load",
+                "42P01",
+            ));
             let json = fetch(shared.clone()).await;
             assert_eq!(
                 json["gateway_failure"],
-                serde_json::json!({"phase": "durable_gateway", "class": class.as_str()})
+                serde_json::json!({"phase": "durable_gateway", "class": class.as_str(), "failed_step": "checkpoint_load", "error_code": "42P01"})
             );
             // The component breakdown is untouched by the new field.
             assert_eq!(

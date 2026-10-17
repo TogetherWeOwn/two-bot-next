@@ -912,6 +912,17 @@ impl ActionExecutor {
         Self::build(token, proxy_url, None)
     }
 
+    /// Build a loopback test executor with an explicit moderation request budget.
+    #[cfg(feature = "test-support")]
+    pub fn with_proxy_and_moderation_timeout(
+        token: String,
+        proxy_url: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let transport = HyperTransport::build(token.clone(), proxy_url.clone(), None)?;
+        Self::assemble_with_timeout(token, proxy_url, transport, timeout)
+    }
+
     /// Mandatory for non-loopback sends; every retry uses this same lane.
     pub fn with_admission(
         token: String,
@@ -948,10 +959,24 @@ impl ActionExecutor {
         proxy_url: Option<String>,
         transport: HyperTransport,
     ) -> Result<Self, String> {
+        Self::assemble_with_timeout(
+            token,
+            proxy_url,
+            transport,
+            Duration::from_millis(MODERATION_TIMEOUT_MS),
+        )
+    }
+
+    fn assemble_with_timeout(
+        token: String,
+        proxy_url: Option<String>,
+        transport: HyperTransport,
+        moderation_timeout: Duration,
+    ) -> Result<Self, String> {
         let mut builder = TwilightClient::builder()
             .token(token)
             .ratelimiter(None)
-            .timeout(Duration::from_millis(MODERATION_TIMEOUT_MS));
+            .timeout(moderation_timeout);
         if proxy_url.is_some() {
             // Reuse the already-validated origin, never reparse raw input for
             // the nested request factory with a different set of rules.
@@ -970,7 +995,7 @@ impl ActionExecutor {
                 command_identities: crate::command_identity::CommandIdentities::default(),
                 pace_interval: Duration::from_millis(PACE_INTERVAL_MS),
                 kick_interval: Duration::from_millis(KICK_INTERVAL_MS),
-                moderation_timeout: Duration::from_millis(MODERATION_TIMEOUT_MS),
+                moderation_timeout,
                 boot_until: tokio::time::Instant::now() + Duration::from_millis(BOOT_WINDOW_MS),
                 pace_last_at: tokio::sync::Mutex::new(
                     tokio::time::Instant::now() - Duration::from_secs(60),

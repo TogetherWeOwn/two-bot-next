@@ -1,6 +1,7 @@
 """Offline workflow policy fixtures; never dispatch, deploy or probe staging."""
 
 from copy import deepcopy
+import importlib.util
 from pathlib import Path
 import re
 import tomllib
@@ -9,6 +10,14 @@ import unittest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+_HISTORY_SPEC = importlib.util.spec_from_file_location(
+    "synthetic_alert_history", ROOT / "scripts/synthetic_alert_history.py")
+_HISTORY_MODULE = importlib.util.module_from_spec(_HISTORY_SPEC)
+_HISTORY_SPEC.loader.exec_module(_HISTORY_MODULE)
+ALERT_STEPS = _HISTORY_MODULE.ALERT_STEPS
+DECIDE_STEPS = _HISTORY_MODULE.DECIDE_STEPS
+JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
+PROBE_STEPS = _HISTORY_MODULE.PROBE_STEPS
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
     # The nextest branch adds its required lane; main adds the production schema gate.
@@ -46,13 +55,20 @@ JOB_INVENTORY = {
     "sbom.yml": {"image", "verify"},
     # Live staging voice synthetic (docs/voice-synthetic.md); pinned shape below.
     "voice-synthetic.yml": {"synthetic"},
+    # Five-minute user-flow synthetic (docs/synthetic-user-flow.md): staging
+    # health-contract plus passive production probes; pinned shape below.
+    "synthetic-user-flow.yml": {"staging", "prod-passive"},
     # SDLC separation gate (org test-guard reusable, warn mode): one
     # reusable call, least-privilege grant pinned below.
     "test-guard.yml": {"test-guard"},
+    # Advisory changed-file review rules; no deploy route or new required gate.
+    "review-rules.yml": {"review-rules"},
     # TOG-21027: manual, bounded vote_kick libFuzzer smoke on a GitHub-hosted
     # runner. Read-only, no secrets, no deploy route: the generic
     # deployment/probe scan already passes, so only the inventory pin is needed.
     "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke"},
+    # Manual, bounded Helix token parser fuzz smoke; read-only and secret-free.
+    "helix-token-fuzz-smoke.yml": {"helix-token-smoke"},
     # SDLC 2.3 CI speed evidence (the shared nextest lane graduated to a
     # required check.yml job): dorny/paths-filter affected-only selection
     # and the minutes-per-merged-PR report.
@@ -73,6 +89,8 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
                    ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
+                   # Read-only shadow engine. Repin with its caller after central merge.
+                   ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@c0b2e33692266088af0d7caf9f448dde2f723d75",
                    # SDLC 2.3 CI speed pilot, promoted: required check.yml
                    # caller to the shared nextest lane (local path until
                    # the central move).
@@ -946,13 +964,36 @@ def production_errors(workflow):
     production, guard = jobs.get("production", {}), jobs.get("guard", {})
     needs = production.get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
+    expected_production_if = (
+        "always() && needs.guard.result == 'success' && "
+        "(needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || "
+        "(needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))"
+    )
     if production.get("environment") != "production" or set(needs) != {"guard", "schema-gate", "roles-gate"}:
         errors.append(f"{name}:production: must wait for the guard, the schema gate, the roles gate and the protected Environment")
-    if "if" in production:
-        errors.append(f"{name}:production: a job condition could bypass the guard outputs")
-    if ("environment" in guard or "uses" in guard
-            or any(marker in str(guard).lower() for marker in DEPLOY_MARKERS)):
+    if production.get("if") != expected_production_if:
+        errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates")
+    expected_gate_if = "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
+    for gate_name in ("schema-gate", "roles-gate"):
+        if jobs.get(gate_name, {}).get("if") != expected_gate_if:
+            errors.append(f"{name}:{gate_name}: must run only for ordinary deploys")
+    guard_text = str(guard).lower()
+    guard_markers = tuple(marker for marker in DEPLOY_MARKERS if marker not in ("production_worker_url", "/readyz"))
+    if ("environment" in guard or "uses" in guard or "curl " in guard_text
+            or any(marker in guard_text for marker in guard_markers)):
         errors.append(f"{name}:guard: deployment/probe alternative outside the production job")
+    guard_script = "\n".join(step.get("run", "") for step in guard.get("steps", []))
+    for required in ('urllib.request.Request(',
+                     'worker_url + "/readyz"',
+                     '"User-Agent": "two-bot-next-production-rollout/1.0"',
+                     'urllib.request.urlopen(request, timeout=10)',
+                     'live_report.get("build_revision") != sha'):
+        if required not in guard_script:
+            errors.append(f"{name}:guard: missing live-SHA check {required}")
+    if guard_script.count("urllib.request.urlopen(") != 1:
+        errors.append(f"{name}:guard: unexpected live production probe")
+    if guard_script.count("urllib.request.Request(") != 1:
+        errors.append(f"{name}:guard: unexpected live production probe")
     # Lexical regression pins on the guard script. deploy-staging runs
     # execute (TOG-12856), so every production SHA needs a staging deploy
     # run on that SHA that concluded `success` (a `skipped` run does not
@@ -1018,7 +1059,7 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:schema-gate: must keep contents:read only")
     if "if" in gate:
-        errors.append(f"{name}:schema-gate: a job condition would let drift deploy silently")
+        errors.append(f"{name}:schema-gate: a job condition would bypass the stage gate")
     if "needs" in gate:
         errors.append(f"{name}:schema-gate: must wait for nothing (it is the wait)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
@@ -1071,17 +1112,15 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
 def production_schema_gate_errors(workflow, name="deploy-production.yml"):
     """Pre-deploy production schema-drift gate: read-only plan, fail closed.
 
-    One job runs on every deploy-production dispatch after the guard (it
-    needs the guarded SHA: a dispatch SHA is an input, not github.sha),
-    through the no-reviewer `production-migrate-plan` environment, builds the
-    reviewed `staging-migrate` binary and fails the run with a `schema drift`
-    error when the guarded source is ahead of the production ledger. The
-    production job must `needs` both the guard and the gate, so drift can
-    never deploy silently. Plan-only: no migrator binding, no `--apply`, no
-    role/grant route, no wrangler, no secret indexing. Rollback and live-SHA
-    takeover redeploys serve no new schema and waive the ledger check inside
-    the reviewed script (recorded, never a job-level skip: the job carries
-    no `if:`).
+    Ordinary deploys run one post-guard job (it needs the guarded SHA: a
+    dispatch SHA is an input, not github.sha) through the no-reviewer
+    `production-migrate-plan` environment. The job builds the reviewed
+    `staging-migrate` binary and fails with `schema drift` when the guarded
+    source is ahead of the production ledger. Rollback and live-SHA takeover
+    modes explicitly skip it; the production job accepts those guard-validated
+    waivers but otherwise requires this gate to succeed. Plan-only: no
+    migrator binding, no `--apply`, no role/grant route, no wrangler, no
+    secret indexing.
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -1090,8 +1129,8 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:schema-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:schema-gate: must keep contents:read only")
-    if "if" in gate:
-        errors.append(f"{name}:schema-gate: a job condition would let drift deploy silently")
+    if gate.get("if") != "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'":
+        errors.append(f"{name}:gate: must run only for ordinary deploys")
     if gate.get("needs") != "guard":
         errors.append(f"{name}:schema-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
@@ -1240,16 +1279,14 @@ python3 scripts/ci/roles_gate.py \\
 def production_roles_gate_errors(workflow, name="deploy-production.yml"):
     """Pre-deploy production role-drift gate: read-only verify, fail closed.
 
-    One job runs on every deploy-production dispatch after the guard (it
-    needs the guarded SHA: a dispatch SHA is an input, not github.sha),
-    through the no-reviewer `production-migrate-plan` environment, builds the
-    reviewed `two-bot` binary and fails the run when `db roles verify` reports
-    any finding on a new build. The production job must `needs` the guard and
-    both gates, so drift can never deploy silently. Verify-only: no migrator
-    write binding, no `--apply`, no `roles plan` subcommand, no wrangler, no
-    secret indexing. Rollback and live-SHA takeover redeploys serve no
-    new-table grants and waive the findings check inside the reviewed script
-    (recorded, never a job-level skip: the job carries no `if:`).
+    Ordinary deploys run one post-guard job (it needs the guarded SHA: a
+    dispatch SHA is an input, not github.sha) through the no-reviewer
+    `production-migrate-plan` environment. It builds the reviewed `two-bot`
+    binary and fails when `db roles verify` reports any finding. Rollback and
+    live-SHA takeover modes explicitly skip it; the production job accepts
+    those guard-validated waivers but otherwise requires this gate to succeed.
+    Verify-only: no migrator write binding, no `--apply`, no `roles plan`
+    subcommand, no wrangler, no secret indexing.
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -1258,8 +1295,8 @@ def production_roles_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:roles-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:roles-gate: must keep contents:read only")
-    if "if" in gate:
-        errors.append(f"{name}:roles-gate: a job condition would let drift deploy silently")
+    if gate.get("if") != "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'":
+        errors.append(f"{name}:roles-gate: must run only for ordinary deploys")
     if gate.get("needs") != "guard":
         errors.append(f"{name}:roles-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("roles-gate", gate.get("runs-on")):
@@ -1395,6 +1432,143 @@ def voice_synthetic_errors(workflow):
     return errors
 
 
+def synthetic_user_flow_errors(workflow):
+    """Five-minute user-flow synthetic (docs/synthetic-user-flow.md).
+
+    Runs on a 5-minute schedule and manual dispatch, only from main, through
+    the `synthetic-alerts` environment. Two jobs: `staging` runs the reviewed
+    staging health-contract probe, `prod-passive` runs the reviewed passive
+    production probe (observe and alert only, never a deploy gate). Each job
+    has an optional target probe, a notice when its binding is absent, an
+    always() evidence upload, an always() decide step, and a gated post step.
+    The decide step reads recent run history with actions:read, alerts after
+    two failures, and writes the event to GITHUB_OUTPUT; the post step runs
+    only when an event is due so a no-op is skipped (never success), and only
+    a successful post counts as delivered. No wrangler, no deploy route, no
+    `set -x`.
+    """
+    name = "synthetic-user-flow.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent")
+    on = workflow.get("on") or {}
+    if set(on) != {"schedule", "workflow_dispatch"}:
+        errors.append(f"{name}: triggers must be exactly schedule and workflow_dispatch")
+    else:
+        schedules = on.get("schedule") or []
+        if schedules != [{"cron": "*/5 * * * *"}]:
+            errors.append(f"{name}: schedule must stay every 5 minutes")
+        dispatch = on.get("workflow_dispatch") or {}
+        inputs = (dispatch.get("inputs") or {}) if isinstance(dispatch, dict) else {}
+        if set(dispatch) != {"inputs"} or set(inputs) != {"force_fail"}:
+            errors.append(f"{name}: workflow_dispatch must carry only the force_fail input")
+        else:
+            field = inputs["force_fail"] or {}
+            if field.get("type") != "boolean" or field.get("default") not in (False, "false"):
+                errors.append(f"{name}: force_fail must be an opt-in boolean defaulting to false")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "synthetic-user-flow", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own synthetic-user-flow group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"staging", "prod-passive"}:
+        errors.append(f"{name}: jobs must be exactly staging and prod-passive")
+        return errors
+    expected_script = {"staging": "scripts/staging_health_contract_probe.py",
+                       "prod-passive": "scripts/prod_passive_probe.py"}
+    for job_id in ("staging", "prod-passive"):
+        job = jobs[job_id]
+        if job.get("environment") != "synthetic-alerts":
+            errors.append(f"{name}:{job_id}: must read only the synthetic-alerts Environment")
+        if job.get("if") != "github.ref == 'refs/heads/main'":
+            errors.append(f"{name}:{job_id}: must run only from main")
+        if job.get("permissions") != {"actions": "read", "contents": "read"}:
+            errors.append(f"{name}:{job_id}: must keep actions:read plus contents:read only")
+        if job.get("timeout-minutes") != "10":
+            errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
+        if not runner_allowed(job_id, job.get("runs-on")):
+            errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
+        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+            if key in job:
+                errors.append(f"{name}:{job_id}: must not set {key}")
+        steps = job.get("steps") or []
+        if len(steps) != 6:
+            errors.append(f"{name}:{job_id}: must run checkout, probe, notice, upload, decide and alert")
+            continue
+        checkout, probe_step, notice, upload, decide_step, alert_step = steps
+        if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+                or (checkout.get("with") or {}).get("persist-credentials") != "false":
+            errors.append(f"{name}:{job_id}: checkout must be pinned and must not persist credentials")
+        if expected_script[job_id] not in str(probe_step.get("run", "")) or "uses" in probe_step:
+            errors.append(f"{name}:{job_id}: probe step must call {expected_script[job_id]}")
+        expected_target = "STAGING_WORKER_URL" if job_id == "staging" else "PRODUCTION_WORKER_URL"
+        if probe_step.get("id") != "probe" or expected_target not in str(probe_step.get("if", "")):
+            errors.append(f"{name}:{job_id}: probe must be skipped when {expected_target} is unset")
+        expected_notice = expected_target + " is unset"
+        if expected_notice not in str(notice.get("run", "")) or "::warning::" not in str(notice.get("run", "")):
+            errors.append(f"{name}:{job_id}: missing-binding skip must emit a notice")
+        if upload.get("if") != "always()":
+            errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
+        if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
+            errors.append(f"{name}:{job_id}: must upload the run evidence artifact")
+        if decide_step.get("if") != "always()":
+            errors.append(f"{name}:{job_id}: decide step must run with if: always()")
+        if "scripts/synthetic_alert.py" not in str(decide_step.get("run", "")) \
+                or "--decide-only" not in str(decide_step.get("run", "")):
+            errors.append(f"{name}:{job_id}: decide step must call scripts/synthetic_alert.py --decide-only")
+        if decide_step.get("id") != "decide":
+            errors.append(f"{name}:{job_id}: decide step must expose id decide for the post gate")
+        if alert_step.get("if") != "${{ !cancelled() && steps.decide.outputs.event != '' }}":
+            errors.append(f"{name}:{job_id}: post step must run only when steps.decide.outputs.event != ''")
+        # Without a status function GitHub adds an implicit success() &&, so
+        # a failed probe would skip the post step and no ALERT would go out
+        # during an outage. Keep this check even if the exact pin above moves.
+        if not any(func in str(alert_step.get("if", ""))
+                   for func in ("!cancelled()", "always()", "failure()", "success()")):
+            errors.append(f"{name}:{job_id}: post step gate must carry a status function so GitHub does not add implicit success()")
+        if "scripts/synthetic_alert.py" not in str(alert_step.get("run", "")) \
+                or "--post-only" not in str(alert_step.get("run", "")):
+            errors.append(f"{name}:{job_id}: alert step must call scripts/synthetic_alert.py --post-only")
+        environment = "staging" if job_id == "staging" else "prod"
+        job_name = JOB_NAMES[environment]
+        probe_name = PROBE_STEPS[environment]
+        alert_name = ALERT_STEPS[environment]
+        decide_name = DECIDE_STEPS[environment]
+        if job.get("name") != job_name:
+            errors.append(f"{name}:{job_id}: job name must match synthetic alert history lookup")
+        if probe_step.get("name") != probe_name:
+            errors.append(f"{name}:{job_id}: probe step name must match synthetic alert history lookup")
+        if decide_step.get("name") != decide_name:
+            errors.append(f"{name}:{job_id}: decide step name must match synthetic alert history lookup")
+        if alert_step.get("name") != alert_name:
+            errors.append(f"{name}:{job_id}: alert step name must match synthetic alert history lookup")
+        decide_env = decide_step.get("env") or {}
+        if (decide_env.get("GITHUB_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
+                or decide_env.get("PROBE_OUTCOME") != "${{ steps.probe.outcome }}"
+                or "SYNTHETIC_ALERT_WEBHOOK_URL" in decide_env
+                or "secrets." in str(decide_step.get("run", ""))):
+            errors.append(f"{name}:{job_id}: decide step must pass token and outcome via env only")
+        alert_env = alert_step.get("env") or {}
+        if (alert_env.get("SYNTHETIC_ALERT_WEBHOOK_URL") != "${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}"
+                or alert_env.get("ALERT_EVENT") != "${{ steps.decide.outputs.event }}"
+                or "GITHUB_TOKEN" in alert_env
+                or "PROBE_OUTCOME" in alert_env
+                or "secrets." in str(alert_step.get("run", ""))):
+            errors.append(f"{name}:{job_id}: post step must pass webhook and decided event via env only")
+        for step in steps:
+            if step not in (decide_step, alert_step) and "secrets." in str(step):
+                errors.append(f"{name}:{job_id}: only the decide and alert steps may hold a secret")
+    text = str(jobs).lower().replace(" ", "")
+    for marker in ("wrangler", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                   "cloudflare_api_token", "ownership_control"):
+        if marker in text:
+            errors.append(f"{name}: must not contain {marker!r}")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"synthetic_alert_webhook_url", "github_token"}:
+        errors.append(f"{name}: must read only the webhook secret and read-only GitHub token")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
@@ -1419,6 +1593,11 @@ def workflow_policy_errors(workflows):
             # Pinned shape above; the generic environment scan below would
             # flag its voice-synthetic Environment binding.
             errors.extend(voice_synthetic_errors(workflow))
+            continue
+        if name == "synthetic-user-flow.yml":
+            # Pinned shape above; the generic environment/marker scan below
+            # would flag its synthetic-alerts binding and probe paths.
+            errors.extend(synthetic_user_flow_errors(workflow))
             continue
         if name == "staging-rollback-drill.yml":
             # Manual drill (TOG-14008): pinned shape above; the generic
@@ -1868,16 +2047,25 @@ class WorkflowTests(unittest.TestCase):
             rollout_dir = temp / "rollout"
             rollout_dir.mkdir()
             (rollout_dir / "receipt.json").write_text('{"worker_version":"test-version"}', encoding="utf-8")
-            base_env = dict(os.environ, ROLLOUT_DIR=str(rollout_dir))
-            shell = 'node() { printf \'%s\\n\' "$MOCK_CONTROL_OUTPUT"; return 1; }\n' + run
+            bin_dir = temp / "bin"
+            bin_dir.mkdir()
+            node = bin_dir / "node"
+            node.write_text('#!/bin/sh\nprintf \'%s\\n\' "$MOCK_CONTROL_OUTPUT"\nexit "${MOCK_CONTROL_EXIT:-1}"\n', encoding="utf-8")
+            node.chmod(0o755)
+            bash_env = temp / "bash-env"
+            bash_env.write_text(f'export PATH="{bin_dir}:$PATH"\n', encoding="utf-8")
+            base_env = dict(os.environ, ROLLOUT_DIR=str(rollout_dir),
+                            PATH=f"{bin_dir}:{os.environ.get('PATH', '')}", BASH_ENV=str(bash_env))
+            shell = run
             cases = (
                 ("Singleton is intentionally fenced or uninitialized; explicit staging release required",
-                 "Staging singleton fenced", True),
-                ("HTTP 401 Unauthorized", "Staging ownership takeover failed (not a fence refusal)", False),
+                 "Staging singleton fenced", True, 1),
+                ("HTTP 401 Unauthorized", "Staging ownership takeover failed (not a fence refusal)", False, 1),
+                ("", "Staging ownership takeover timed out after 390 seconds", False, 124),
             )
-            for output, expected, is_fenced in cases:
-                with self.subTest(output=output):
-                    env = dict(base_env, MOCK_CONTROL_OUTPUT=output)
+            for output, expected, is_fenced, exit_code in cases:
+                with self.subTest(output=output, exit_code=exit_code):
+                    env = dict(base_env, MOCK_CONTROL_OUTPUT=output, MOCK_CONTROL_EXIT=str(exit_code))
                     proc = subprocess.run(
                         ["bash", "-c", shell], cwd=ROOT / "wrangler", env=env,
                         capture_output=True, text=True, timeout=10,
@@ -1886,6 +2074,29 @@ class WorkflowTests(unittest.TestCase):
                     self.assertEqual(proc.returncode, 1, output_text)
                     self.assertIn(expected, output_text)
                     self.assertEqual("release_fence" in output_text, is_fenced)
+
+    def test_staging_takeover_outer_timeout_exceeds_the_client_retry_window(self):
+        # The workflow's `timeout` must never kill the control client inside
+        # its own retry window: a final attempt may start at the window edge
+        # and still spend one GET plus one POST, each bounded by the client's
+        # AbortSignal. Killing it there could terminate it after the POST
+        # committed an epoch and roll back a healthy deploy. Pin both sides:
+        # above window + one in-flight attempt, yet close enough that a true
+        # hang still fails fast instead of fencing staging.
+        steps = self.workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        run = next(step for step in steps if step.get("id") == "takeover")["run"]
+        outer = re.search(r"timeout --signal=TERM --kill-after=\d+s (\d+)s", run)
+        self.assertIsNotNone(outer, run)
+        client = (ROOT / "wrangler/scripts/ownership-control.mjs").read_text(encoding="utf-8")
+        window = re.search(r"takeoverWindowMs = (\d+)", client)
+        abort = re.search(r"AbortSignal\.timeout\((\d+)\)", client)
+        self.assertIsNotNone(window)
+        self.assertIsNotNone(abort)
+        outer_ms = int(outer.group(1)) * 1000
+        minimum_ms = int(window.group(1)) + 2 * int(abort.group(1))
+        self.assertGreater(outer_ms, minimum_ms)
+        self.assertLess(outer_ms, minimum_ms + 120_000)
+        self.assertIn(f"timed out after {outer.group(1)} seconds", run)
 
     def test_staging_runs_unconditionally_for_push_and_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
@@ -2027,7 +2238,9 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(mutated(lambda w, s=step: w["jobs"]["guard"]["steps"].append(s)))
         with self.subTest(guard="environment"):
             self.assertTrue(mutated(lambda w: w["jobs"]["guard"].update({"environment": "production"})))
-        for pin in ('status="success"', "deploy-staging.yml/runs", '"required_reviewers"'):
+        for pin in ('status="success"', "deploy-staging.yml/runs", '"required_reviewers"',
+                      '"User-Agent": "two-bot-next-production-rollout/1.0"',
+                      "urllib.request.Request("):
             with self.subTest(dropped=pin):
                 def drop(w, pin=pin):
                     for step in w["jobs"]["guard"]["steps"]:
@@ -2066,7 +2279,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(production["jobs"]["schema-gate"].get("needs"), "guard")
         self.assertEqual(production["jobs"]["schema-gate"].get("environment"),
                          "production-migrate-plan")
-        self.assertNotIn("if", production["jobs"]["schema-gate"])
+        self.assertEqual(production["jobs"]["schema-gate"].get("if"),
+                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'")
 
     def test_production_roles_gate_shape_is_pinned_and_mutations_fail(self):
         import copy
@@ -2109,7 +2323,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(production["jobs"]["roles-gate"].get("needs"), "guard")
         self.assertEqual(production["jobs"]["roles-gate"].get("environment"),
                          "production-migrate-plan")
-        self.assertNotIn("if", production["jobs"]["roles-gate"])
+        self.assertEqual(production["jobs"]["roles-gate"].get("if"),
+                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'")
 
     def test_staging_migrate_runner_shape_is_pinned(self):
         # TOG-11572: the slice's own workflow must satisfy its carve-out, and
@@ -2812,6 +3027,17 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             yaml.load("jobs:\n  deploy:\n    if: '${{ false }}'\n    if: true\n", Loader=UniqueKeyLoader)
 
+    def test_review_rules_stays_read_only_and_shadow(self):
+        workflow = self.workflows["review-rules.yml"]
+        self.assertEqual(set(workflow["on"]), {"pull_request", "merge_group"})
+        self.assertEqual(workflow["permissions"], {})
+        job = workflow["jobs"]["review-rules"]
+        self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertEqual(job["with"], {"packs": "rust,security,python-shell-ci", "mode": "warn"})
+        self.assertNotIn("secrets", job)
+        self.assertNotIn("environment", job)
+        self.assertEqual(job["uses"], REUSABLE_CALLS[("review-rules.yml", "review-rules")])
+
     def test_private_runner_and_service_isolation(self):
         for name, workflow in self.workflows.items():
             for job_id, job in workflow["jobs"].items():
@@ -3159,7 +3385,11 @@ class WorkflowTests(unittest.TestCase):
             for job_id, job in workflow["jobs"].items():
                 with self.subTest(workflow=name, job=job_id):
                     expected = {"contents": "read"}
-                    if (name, job_id) == ("supply-chain.yml", "pr-lint"):
+                    if (name, job_id) in (("synthetic-user-flow.yml", "staging"),
+                                          ("synthetic-user-flow.yml", "prod-passive")):
+                        # Read workflow/job history to debounce alerts and detect recovery.
+                        expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
                         # Marker-label actor audit via the issue-events API.

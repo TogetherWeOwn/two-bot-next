@@ -15,8 +15,10 @@
  * before parsing anything; this module only bounds what may reach it (POST,
  * exact path, no query, content type, 64 KiB body, timeouts, header
  * allowlist, rate caps) and never relays Container error text. Nothing here
- * is ever logged except scalar event/status/error_class: no header values,
- * challenge, body bytes or query.
+ * is ever logged except scalar event/status/error_class/request_id: no header
+ * values, challenge, body bytes or query. The request id is the validated
+ * `x-request-id` shape (or a fresh one), so it joins the DO and container
+ * logs without carrying secrets.
  *
  * The receiver listener itself (port below) lands in the follow-up slice with
  * the Operator secret provisioning. Until it does, an enabled route forwards
@@ -26,6 +28,7 @@
  */
 
 import { TokenBuckets } from "./redirect.ts";
+import { REQUEST_ID_HEADER, ensureRequestId, newRequestId } from "./request-id.ts";
 
 export const EVENTSUB_PATH = "/hooks/twitch";
 /**
@@ -102,17 +105,22 @@ export function notFound(): Response {
   return new Response("not found", { status: 404 });
 }
 
-/** The receiver's envelope, with a fixed message: never Container text. */
+/**
+ * The receiver's envelope, with a fixed message: never Container text. The
+ * id is the flow's `x-request-id` (honored inbound or minted at the edge),
+ * so one value joins the Worker, DO and container logs with this response.
+ */
 export function envelope(
   status: number,
   code: string,
   retryable: boolean,
   headers: Record<string, string> = {},
+  requestId: string = newRequestId(),
 ): Response {
   return Response.json(
     {
       ok: false,
-      request_id: crypto.randomUUID(),
+      request_id: requestId,
       error: { code, message: "request refused", retryable },
     },
     { status, headers: { "cache-control": "no-store", ...headers } },
@@ -124,9 +132,10 @@ function refuse(
   code: string,
   retryable: boolean,
   headers?: Record<string, string>,
+  requestId: string = newRequestId(),
 ): Response {
-  console.warn(JSON.stringify({ event: "eventsub_ingress", status, error_class: code }));
-  return envelope(status, code, retryable, headers);
+  console.warn(JSON.stringify({ event: "eventsub_ingress", status, error_class: code, request_id: requestId }));
+  return envelope(status, code, retryable, headers, requestId);
 }
 
 /** True when the receiver would answer 404 for this request shape. */
@@ -140,48 +149,58 @@ export function isEventsubRequest(request: Request): boolean {
  * The allowlisted headers, or the refusal that explains the first bad one.
  * `authorization`, `cookie`, `cf-connecting-ip`, the retry/subscription
  * informational headers and any caller-supplied deployment header are never
- * copied. The signature keeps its `sha256=` prefix verbatim: the receiver
- * strips and hex-decodes it during verification.
+ * copied. `x-request-id` is the one caller header that flows on: only its
+ * validated generated shape (a non-secret 26-char token; anything else is
+ * replaced with a fresh id), so the DO and container can join this delivery
+ * in their own logs. The signature keeps its `sha256=` prefix verbatim: the
+ * receiver strips and hex-decodes it during verification.
  */
-export function allowlistedHeaders(source: Headers): { headers: Headers } | { refusal: Response } {
+export function allowlistedHeaders(
+  source: Headers,
+  requestId: string = ensureRequestId(source.get(REQUEST_ID_HEADER)),
+): { headers: Headers } | { refusal: Response } {
   const media = source.get("content-type");
   if (
     media === null || media.length > 128 || !CONTENT_TYPES.includes(media.toLowerCase()) ||
     source.has("content-encoding")
   ) {
-    return { refusal: refuse(415, "unsupported_media_type", false) };
+    return { refusal: refuse(415, "unsupported_media_type", false, undefined, requestId) };
   }
   const headers = new Headers({ "content-type": media });
   for (const [name, max, alphabet] of DELIVERY_HEADERS) {
     const value = source.get(name);
-    if (value === null || value === "") return { refusal: refuse(401, "unauthorized", false) };
+    if (value === null || value === "") return { refusal: refuse(401, "unauthorized", false, undefined, requestId) };
     if (value.length > max || !alphabet.test(value)) {
-      return { refusal: refuse(400, "malformed", false) };
+      return { refusal: refuse(400, "malformed", false, undefined, requestId) };
     }
     headers.set(name, value);
   }
   const signature = source.get(SIGNATURE_HEADER);
-  if (signature === null || signature === "") return { refusal: refuse(401, "unauthorized", false) };
+  if (signature === null || signature === "") return { refusal: refuse(401, "unauthorized", false, undefined, requestId) };
   if (
     signature.length > SIGNATURE_MAX || !HEADER_VALUE.test(signature) ||
     !signature.startsWith(SIGNATURE_PREFIX)
   ) {
-    return { refusal: refuse(400, "malformed", false) };
+    return { refusal: refuse(400, "malformed", false, undefined, requestId) };
   }
   headers.set(SIGNATURE_HEADER, signature);
+  headers.set(REQUEST_ID_HEADER, requestId);
   return { headers };
 }
 
 export type BodyRead = { bytes: Uint8Array } | { refusal: Response };
 
 /** Read at most MAX_BODY_BYTES within BODY_TIMEOUT_MS, byte for byte. */
-export async function readBody(request: Request): Promise<BodyRead> {
+export async function readBody(
+  request: Request,
+  requestId: string = ensureRequestId(request.headers.get(REQUEST_ID_HEADER)),
+): Promise<BodyRead> {
   const declared = request.headers.get("content-length");
   if (declared !== null) {
-    if (!/^\d{1,10}$/.test(declared)) return { refusal: refuse(400, "malformed", false) };
-    if (Number(declared) > MAX_BODY_BYTES) return { refusal: refuse(413, "payload_too_large", false) };
+    if (!/^\d{1,10}$/.test(declared)) return { refusal: refuse(400, "malformed", false, undefined, requestId) };
+    if (Number(declared) > MAX_BODY_BYTES) return { refusal: refuse(413, "payload_too_large", false, undefined, requestId) };
   }
-  if (request.body === null) return { refusal: refuse(400, "malformed", false) };
+  if (request.body === null) return { refusal: refuse(400, "malformed", false, undefined, requestId) };
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -194,22 +213,22 @@ export async function readBody(request: Request): Promise<BodyRead> {
       const step = await Promise.race([reader.read(), timeout]);
       if (step === "timeout") {
         void reader.cancel().catch(() => {});
-        return { refusal: refuse(408, "request_timeout", true) };
+        return { refusal: refuse(408, "request_timeout", true, undefined, requestId) };
       }
       if (step.done) break;
       total += step.value.byteLength;
       if (total > MAX_BODY_BYTES) {
         void reader.cancel().catch(() => {});
-        return { refusal: refuse(413, "payload_too_large", false) };
+        return { refusal: refuse(413, "payload_too_large", false, undefined, requestId) };
       }
       chunks.push(step.value);
     }
   } catch {
-    return { refusal: refuse(400, "malformed", false) };
+    return { refusal: refuse(400, "malformed", false, undefined, requestId) };
   } finally {
     clearTimeout(timer);
   }
-  if (total === 0) return { refusal: refuse(400, "malformed", false) };
+  if (total === 0) return { refusal: refuse(400, "malformed", false, undefined, requestId) };
   const bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
@@ -239,16 +258,17 @@ export async function handleEventsubIngress(
   forward: (sanitized: Request) => Promise<Response>,
 ): Promise<Response> {
   if (!isEventsubRequest(request)) return notFound();
+  const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
   const verdict = eventsubBuckets.take(clientKey);
   if (!verdict.allowed) {
-    return refuse(429, "rate_limited", true, { "retry-after": String(verdict.retryAfter) });
+    return refuse(429, "rate_limited", true, { "retry-after": String(verdict.retryAfter) }, requestId);
   }
-  const checked = allowlistedHeaders(request.headers);
+  const checked = allowlistedHeaders(request.headers, requestId);
   if ("refusal" in checked) return checked.refusal;
-  if (inFlight >= MAX_IN_FLIGHT) return refuse(429, "rate_limited", true, { "retry-after": "1" });
+  if (inFlight >= MAX_IN_FLIGHT) return refuse(429, "rate_limited", true, { "retry-after": "1" }, requestId);
   inFlight++;
   try {
-    const body = await readBody(request);
+    const body = await readBody(request, requestId);
     if ("refusal" in body) return body.refusal;
     const sanitized = forwardRequest(
       `https://worker.invalid${EVENTSUB_PATH}`,
@@ -261,11 +281,11 @@ export async function handleEventsubIngress(
     });
     try {
       const upstream = await Promise.race([forward(sanitized), deadline]);
-      if (upstream === "timeout") return refuse(504, "upstream_timeout", true);
+      if (upstream === "timeout") return refuse(504, "upstream_timeout", true, undefined, requestId);
       return upstream;
     } catch {
       // DO construction/binding failures: never serialize the exception.
-      return refuse(503, "unavailable", true);
+      return refuse(503, "unavailable", true, undefined, requestId);
     } finally {
       clearTimeout(timer);
     }
@@ -290,7 +310,10 @@ const RELAYED_RESPONSE_HEADERS = ["content-type", "retry-after"];
  * cancel failures all resolve to the same fixed 503 envelope; no exception,
  * wire body or header value ever leaves.
  */
-export async function relayEventsubResponse(upstream: Response): Promise<Response> {
+export async function relayEventsubResponse(
+  upstream: Response,
+  requestId: string = newRequestId(),
+): Promise<Response> {
   const media = upstream.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
   const bodyless = upstream.status === 204 || upstream.status === 205 || upstream.status === 304;
   // Only a 200 challenge may be text; any other text body is not ours.
@@ -304,7 +327,7 @@ export async function relayEventsubResponse(upstream: Response): Promise<Respons
         // Ignore: the fixed refusal below stands.
       }
     }
-    return refuse(503, "unavailable", true);
+    return refuse(503, "unavailable", true, undefined, requestId);
   }
   const limit = isChallenge ? MAX_CHALLENGE_BYTES : MAX_RESPONSE_BYTES;
   const reader = upstream.body?.getReader();
@@ -325,7 +348,7 @@ export async function relayEventsubResponse(upstream: Response): Promise<Respons
         } catch {
           // Ignore: the fixed refusal below stands.
         }
-        return refuse(503, "unavailable", true);
+        return refuse(503, "unavailable", true, undefined, requestId);
       }
       if (step.done) break;
       total += step.value.byteLength;
@@ -335,12 +358,12 @@ export async function relayEventsubResponse(upstream: Response): Promise<Respons
         } catch {
           // Ignore: the fixed refusal below stands.
         }
-        return refuse(503, "unavailable", true);
+        return refuse(503, "unavailable", true, undefined, requestId);
       }
       chunks.push(step.value);
     }
   } catch {
-    return refuse(503, "unavailable", true);
+    return refuse(503, "unavailable", true, undefined, requestId);
   }
   const body = new Uint8Array(total);
   let offset = 0;

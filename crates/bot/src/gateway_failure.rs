@@ -95,26 +95,54 @@ impl FailureClass {
     }
 }
 
-/// `/readyz` `gateway_failure` value: `{"phase":"durable_gateway","class":"…"}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// `/readyz` `gateway_failure` value: `{"phase":"durable_gateway","class":"…",
+/// `"failed_step":"…","error_code":"…"}`. The step names the fallible step
+/// (`checkpoint_load`, `gateway_run`, …) and the code carries the Postgres
+/// SQLSTATE (`42501`, `42P01`, …) or `"none"` when no database code applies.
+/// Both are fixed vocabulary: steps are our own `&'static str` literals and
+/// codes are 5-character server codes, so no message, URL or credential can
+/// reach the field.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GatewayFailure {
     pub phase: FailurePhase,
     pub class: FailureClass,
+    pub failed_step: &'static str,
+    pub error_code: String,
 }
 
 impl GatewayFailure {
+    /// Build from the fixed class plus the failing step and the sanitized
+    /// SQLSTATE (`"none"` when no database code applies). The code is
+    /// restricted to `"none"` or a 5-character `[0-9A-Z]` server code so no
+    /// message text can reach `/readyz`.
     #[must_use]
-    pub const fn durable_gateway(class: FailureClass) -> Self {
+    pub fn durable_gateway(class: FailureClass, step: &'static str, code: &str) -> Self {
         Self {
             phase: FailurePhase::DurableGateway,
             class,
+            failed_step: step,
+            error_code: sanitize_code(code).to_owned(),
         }
     }
 }
 
+/// Restrict the served code to fixed vocabulary.
+fn sanitize_code(code: &str) -> &str {
+    if code == "none" {
+        return "none";
+    }
+    if code.len() == 5
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b.is_ascii_uppercase()))
+    {
+        return code;
+    }
+    "none"
+}
+
 /// The last failure, shared between the gateway task (writer) and `/readyz`
-/// (reader). A plain mutex over a `Copy` value: held for a copy, never across
-/// an await.
+/// (reader). A plain mutex held for a clone, never across an await.
 #[derive(Debug, Clone, Default)]
 pub struct FailureSlot(Arc<Mutex<Option<GatewayFailure>>>);
 
@@ -125,7 +153,7 @@ impl FailureSlot {
 
     #[must_use]
     pub fn get(&self) -> Option<GatewayFailure> {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -155,10 +183,13 @@ pub fn step_failure(class: FailureClass, step: &'static str, error: sqlx::Error)
 /// failure: the table is missing (`42P01 undefined_table`, an unapplied
 /// migration) or the login lacks the grant (`42501 insufficient_privilege`,
 /// an unapplied ACL plan). Retrying these on every boot is futile — the
-/// schema only changes through the Operator apply path — so gateway-adjacent
-/// auxiliary writes skip them with a warn instead of holding the cursor
-/// (TOG-25067: a missing auxiliary table must never crash-loop the gateway).
-/// Every other error still fails the step: transient faults replay.
+/// schema only changes through the Operator apply path — so callers normally
+/// skip gateway-adjacent auxiliary writes on these errors (TOG-25067: a
+/// missing auxiliary table must not crash-loop the gateway). The retention
+/// lifecycle keeps the cursor held for a `42501` on an available
+/// `GUILD_CREATE`: without the cancel grant, a queued purge could erase a
+/// guild that has rejoined. Every other error still fails the step: transient
+/// faults replay.
 #[must_use]
 pub fn is_schema_gap(error: &sqlx::Error) -> bool {
     match error {
@@ -218,10 +249,56 @@ mod tests {
     #[test]
     fn serialized_form_matches_the_token_and_the_documented_shape() {
         for class in FailureClass::ALL {
-            let value = serde_json::to_value(GatewayFailure::durable_gateway(class)).unwrap();
+            let value = serde_json::to_value(GatewayFailure::durable_gateway(
+                class,
+                "checkpoint_load",
+                "42P01",
+            ))
+            .unwrap();
             assert_eq!(
                 value,
-                serde_json::json!({"phase": "durable_gateway", "class": class.as_str()})
+                serde_json::json!({"phase": "durable_gateway", "class": class.as_str(), "failed_step": "checkpoint_load", "error_code": "42P01"})
+            );
+        }
+    }
+
+    #[test]
+    fn served_code_is_fixed_vocabulary_only() {
+        assert_eq!(
+            GatewayFailure::durable_gateway(
+                FailureClass::CheckpointLoadFailed,
+                "checkpoint_load",
+                "42501"
+            )
+            .error_code,
+            "42501"
+        );
+        assert_eq!(
+            GatewayFailure::durable_gateway(
+                FailureClass::CheckpointLoadFailed,
+                "checkpoint_load",
+                "none"
+            )
+            .error_code,
+            "none"
+        );
+        // Message text, URLs and lowercase codes never reach the field.
+        for bad in [
+            "permission denied for table foo",
+            "postgres://user:hunter2@db.internal/app",
+            "42501 ",
+            "42p01",
+            "",
+        ] {
+            assert_eq!(
+                GatewayFailure::durable_gateway(
+                    FailureClass::CheckpointLoadFailed,
+                    "checkpoint_load",
+                    bad
+                )
+                .error_code,
+                "none",
+                "bad code {bad:?} must coerce to none"
             );
         }
     }
@@ -284,15 +361,21 @@ mod tests {
         assert_eq!(slot.get(), None);
         slot.record(GatewayFailure::durable_gateway(
             FailureClass::CheckpointLoadFailed,
+            "checkpoint_load",
+            "42P01",
         ));
         let shared = slot.clone();
         shared.record(GatewayFailure::durable_gateway(
             FailureClass::GatewayRuntimeFailed,
+            "gateway_run",
+            "none",
         ));
         assert_eq!(
             slot.get(),
             Some(GatewayFailure::durable_gateway(
-                FailureClass::GatewayRuntimeFailed
+                FailureClass::GatewayRuntimeFailed,
+                "gateway_run",
+                "none",
             ))
         );
     }
@@ -307,8 +390,12 @@ mod tests {
         );
         assert_eq!(failure.class.as_str(), "gateway_pool_connect_failed");
         assert_eq!(failure.step, "gateway_pool_connect");
-        let serialized =
-            serde_json::to_string(&GatewayFailure::durable_gateway(failure.class)).unwrap();
+        let serialized = serde_json::to_string(&GatewayFailure::durable_gateway(
+            failure.class,
+            failure.step,
+            "none",
+        ))
+        .unwrap();
         assert!(!serialized.contains("hunter2") && !serialized.contains("postgres"));
     }
 

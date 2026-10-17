@@ -154,7 +154,7 @@ class RunGateArgvTests(unittest.TestCase):
             captured.append(list(argv))
             return types.SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps({"pending_before": []}) + "\n",
+                stdout=json.dumps({"pending_before": [], "pending_store_before": []}) + "\n",
                 stderr="",
             )
 
@@ -230,7 +230,7 @@ class MainTests(unittest.TestCase):
 
         def capture(*args):
             seen.append(args)
-            return {"pending_before": []}
+            return {"pending_before": [], "pending_store_before": []}
 
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "manifest.json"
@@ -246,8 +246,32 @@ class MainTests(unittest.TestCase):
             self.assertEqual(
                 self.run_main(["--binary", "bin", "--source-sha", SHA,
                                "--mode", "deploy"],
-                              lambda *args: {"pending_before": []}, out), 0)
-            self.assertEqual(json.loads(out.read_text())["pending_before"], [])
+                              lambda *args: {"pending_before": [], "pending_store_before": []}, out), 0)
+            manifest = json.loads(out.read_text())
+            self.assertEqual(manifest["pending_before"], [])
+            self.assertEqual(manifest["pending_store_before"], [])
+
+    def test_store_chain_drift_fails_even_when_cutover_is_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "manifest.json"
+            result = self.run_main(
+                ["--binary", "bin", "--source-sha", SHA, "--mode", "deploy"],
+                lambda *args: {"pending_before": [], "pending_store_before": [400, 401]}, out)
+            self.assertEqual(result, 1)
+            self.assertEqual(
+                json.loads(out.read_text())["pending_store_before"], [400, 401])
+
+    def test_malformed_store_pending_refuses_the_gate(self):
+        for store_pending in (None, ["400"], [401, 400], True):
+            with self.subTest(store_pending=store_pending), tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / "manifest.json"
+                with self.assertRaises(Refused):
+                    self.run_main(
+                        ["--binary", "bin", "--source-sha", SHA, "--mode", "deploy"],
+                        lambda *args: {
+                            "pending_before": [],
+                            "pending_store_before": store_pending,
+                        }, out)
 
     def test_drift_fails_with_the_pending_list(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -255,7 +279,7 @@ class MainTests(unittest.TestCase):
             self.assertEqual(
                 self.run_main(["--binary", "bin", "--source-sha", SHA,
                                "--mode", "deploy"],
-                              lambda *args: {"pending_before": [424, 425]}, out), 1)
+                              lambda *args: {"pending_before": [424, 425], "pending_store_before": []}, out), 1)
 
     def test_refused_binding_exits_unusable(self):
         def refuse(*args):
@@ -273,15 +297,18 @@ class MainTests(unittest.TestCase):
             with self.assertRaises(Refused):
                 self.run_main(["--binary", "bin", "--source-sha", "abc",
                                "--mode", "deploy"],
-                              lambda *args: {"pending_before": []}, out)
+                              lambda *args: {"pending_before": [], "pending_store_before": []}, out)
 
 
 class PendingVersionsTests(unittest.TestCase):
     def test_empty_pending_means_no_drift(self):
-        self.assertEqual(pending_versions({"pending_before": []}), [])
+        self.assertEqual(pending_versions({"pending_before": [], "pending_store_before": []}), [])
 
     def test_nonempty_pending_is_returned_in_order(self):
         self.assertEqual(pending_versions({"pending_before": [424, 425]}), [424, 425])
+
+    def test_empty_store_pending_means_no_drift(self):
+        self.assertEqual(pending_versions({"pending_store_before": []}, "pending_store_before"), [])
 
     def test_malformed_manifest_fails_closed(self):
         for bad in ({}, {"pending_before": None}, {"pending_before": ["424"]},
@@ -289,6 +316,13 @@ class PendingVersionsTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(Refused):
                     pending_versions(bad)
+        for bad in ({}, {"pending_store_before": None},
+                    {"pending_store_before": ["424"]},
+                    {"pending_store_before": [425, 424]},
+                    {"pending_store_before": True}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(Refused):
+                    pending_versions(bad, "pending_store_before")
 
 
 class DriftMessageTests(unittest.TestCase):
@@ -301,6 +335,24 @@ class DriftMessageTests(unittest.TestCase):
         self.assertIn("production-migrate", message)
         self.assertIn("apply", message)
         self.assertIn("deploy-production", message)
+        self.assertIn("cutover chain", message)
+        self.assertIn("expected_pending", message)
+
+    def test_names_only_store_chain_and_its_apply_pin(self):
+        message = drift_message([], SHA, [400, 401])
+        self.assertIn("store chain", message)
+        self.assertIn("400,401", message)
+        self.assertIn("expected_store_pending", message)
+        self.assertNotIn("expected_pending", message)
+        self.assertIn("production-migrate", message)
+        self.assertIn("deploy-production", message)
+
+    def test_names_both_lagging_chains(self):
+        message = drift_message([424], SHA, [400])
+        self.assertIn("cutover chain pending versions [424]", message)
+        self.assertIn("store chain pending versions [400]", message)
+        self.assertIn("expected_pending", message)
+        self.assertIn("expected_store_pending", message)
 
 
 class ConnectionWarningTests(unittest.TestCase):
