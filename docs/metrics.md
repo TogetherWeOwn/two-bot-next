@@ -315,7 +315,10 @@ as dynamic labels.
   `verdict` or `other`. Recorded once on the verdict-refusal arm in
   `crates/discord/src/custom_commands.rs` for prefix candidates only: the arm
   still returns `Refused` for every contained create, but unmatched content,
-  scope mismatches and the disabled fast path never increment it.
+  scope mismatches and the disabled fast path never increment it. Alert rule
+  `prefix_trigger_verdict_refusals` tickets when the `verdict` series rises
+  in 3 consecutive keepalive samples (first sample is baseline-only;
+  `other` is normal refusal volume and never counts).
 - `two_bot_dispatch_drops_total{lane}` — `lane` is one of `messages`,
   `interactions`, `registry`, `privileged`, `busy` or `reactions`, in the
   bot's `DISPATCH_LIMITS` order (`crates/core/src/metrics.rs`
@@ -607,6 +610,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `voice_join_fast_burn` | creator-join budget (99.5% moved within 5 s) burning faster than 14.4x in both the 1 h and 5 min windows; each window requires at least 10 genuine joins and two bad moves; receive counts lag one scrape and incomplete post-restart windows stay inactive | [voice join fast burn](runbook.md#alert-voice-join-fast-burn) |
 | `voice_join_slow_burn` | **ticket**, not page: same budget burning faster than 6x in both the 6 h and 30 min windows, with the same per-window volume and bad-move floors (sustained grind the fast rule never catches) | [voice join slow burn](runbook.md#alert-voice-join-slow-burn) |
 | `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` > 600 (two missed 5 min refreshes) with `two_bot_voice_creator_map_generation` > 0; generation 0 (never merged) never fires, missing gauges on older containers hold the previous state | [voice creator-map stale](runbook.md#alert-voice-creator-map-stale) |
+| `prefix_trigger_verdict_refusals` | **ticket**, not page: `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` rises in 3 consecutive keepalive samples; first sample is baseline, flat/reset clears, missing/invalid retains active alerts | [prefix trigger verdict refusals](runbook.md#alert-prefix-trigger-verdict-refusals) |
 
 `dispatch_drops` covers `messages`, `interactions`, `registry`, `privileged`,
 `busy` and `reactions` independently (the Worker allowlist is pinned to Rust).
