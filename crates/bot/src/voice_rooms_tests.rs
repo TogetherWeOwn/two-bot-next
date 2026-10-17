@@ -11928,7 +11928,22 @@ async fn a_game_or_stream_change_rerenders_the_room_name() {
     );
     assert_eq!(room, Some(500));
     worker.room_facts_changed(500, 1);
-    worker.refresh_template_names(1);
+    tracing_capture::global();
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || worker.refresh_template_names(1));
+    let decision_log = capture.text();
+    assert!(
+        decision_log.contains("game=\"Apex Legends\""),
+        "{decision_log}"
+    );
+    assert!(
+        decision_log.contains("activity_detected=true"),
+        "{decision_log}"
+    );
+    assert!(
+        decision_log.contains("decision=\"queued\""),
+        "{decision_log}"
+    );
     assert_eq!(worker.desired_names[&500], "Apex Legends");
     // Going live through Discord adds the live marker on the next render.
     assert_eq!(worker.live.set_self_stream(MEMBER, true), Some(500));

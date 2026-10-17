@@ -648,12 +648,18 @@ async fn run(cli_args: &[String]) {
                         }));
                     }
 
-                    let shard = build_shard(
-                        token,
-                        intents_from_env(&activation),
-                        saved.as_ref(),
-                        gateway_url.as_deref(),
+                    let intents = intents_from_env(&activation);
+                    // Voice-room game names need GUILD_PRESENCES; record
+                    // whether this boot requested it so a missing game
+                    // rename is diagnosable from logs alone (the flag may
+                    // be a secret binding whose value is never printed).
+                    info!(
+                        msg = "gateway_intents",
+                        voice_presences =
+                            intents.contains(twilight_model::gateway::Intents::GUILD_PRESENCES),
+                        "gateway intents resolved"
                     );
+                    let shard = build_shard(token, intents, saved.as_ref(), gateway_url.as_deref());
                     info!(
                         msg = "gateway_connecting",
                         resume = saved.is_some(),
