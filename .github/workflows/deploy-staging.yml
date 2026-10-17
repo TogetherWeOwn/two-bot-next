@@ -237,9 +237,10 @@ jobs:
             --receipt "$ROLLOUT_DIR/baseline.json" \
             --output "$WRANGLER_OUTPUT_FILE_PATH" \
             --deploy-config "$ROLLOUT_DIR/staging-deploy.json" "${inject[@]}"
-      # Snapshot the serving Worker version and container image BEFORE
-      # replacing anything: a failed verify below auto-rolls back to exactly
-      # this state. Allowlisted IDs only, safe to keep as a run artifact.
+      # Snapshot the serving Worker version, its stamped Git SHA and the
+      # container image BEFORE replacing anything: a failed verify below
+      # auto-rolls back to exactly this provenance receipt. Allowlisted IDs
+      # only, safe to keep as a run artifact.
       - name: Snapshot the pre-deploy rollback state
         id: snapshot
         env:
@@ -260,7 +261,10 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           environment: staging
           wranglerVersion: "4.149.0"
-          command: deploy --config ${{ env.ROLLOUT_DIR }}/staging-deploy.json --env staging
+          # --message stamps the version's immutable workers/message
+          # annotation with this commit, the SHA member of the rollback
+          # provenance receipt the next snapshot records (as production).
+          command: deploy --config ${{ env.ROLLOUT_DIR }}/staging-deploy.json --env staging --message ${{ github.sha }}
       # Ordering (TOG-12939): ownership must not move to a deploy whose Wrangler
       # receipt is not valid, fresh and pinned, so that part of the gate runs
       # here, before the transfer. It reads only the local NDJSON (no network,
@@ -349,9 +353,10 @@ jobs:
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
         run: |
           set -euo pipefail
-          # No --expected-sha: the snapshot restores the previous serving
-          # build, whose /readyz reports the previous revision, not the
-          # failed SHA. Identity rests on the restored Worker version header.
+          # No --expected-sha flag: the snapshot's recorded serving SHA is
+          # the receipt member the stable gate pins (the restored build
+          # reports the previous revision, not the failed SHA). A pre-stamp
+          # snapshot carries none and identity rests on the version header.
           python3 ../scripts/worker_container_rollback.py rollback \
             --variant staging \
             --worker-url "$STAGING_WORKER_URL" \
