@@ -11,13 +11,28 @@ request through an opener built with a redirect-refusing handler (a
 raise), which turns a 3xx into an error before any second destination is
 contacted.
 
-The gate parses each reader with ``ast`` (no imports, no network, no DB) and
+The gate parses each file with ``ast`` (no imports, no network, no DB) and
 fails when a token-bearing file keeps a redirect-following call site:
 
-- any ``urlopen(...)`` call in a file that also sends Authorization, or
-- any ``build_opener(...)`` without a refusing handler class in the file, or
-- any ``requests.*`` call with Authorization and without
+- any ``urlopen(...)`` call in a file that also sends Authorization
+  (``urlopen`` follows redirects with no opt-out), or
+- any ``build_opener(...)`` call whose own arguments name no refusing
+  handler (a dead handler class elsewhere in the file excuses nothing), or
+- any ``requests`` call -- ``requests.<verb>``, an ``import requests as`` alias,
+  a ``from requests import`` verb, or a method on a session receiver (any
+  factory spelling, subclass, or inline construction) -- without
   ``allow_redirects=False`` (no current reader uses requests; future-proof).
+
+A handler counts as refusing only when a redirect method in it raises or
+returns None on every path: no ``super()`` call, no delegation to another
+redirect method, no non-None return. Conditional refusal that still follows
+some statuses does not count.
+
+Coverage is not just the READERS list: a sweep test asserts every
+``scripts/*.py`` file that mentions Authorization is violation-free unless it
+is a READER covered by the allowlist test, so a new token-sending script (or
+a new token path in an old one) trips the gate even before anyone adds it to
+READERS.
 
 Five entries in KNOWN_GAPS are still vulnerable and owned by in-flight
 sibling fixes (the alert-history reader and the four voice-synthetic token
@@ -77,16 +92,72 @@ def _is_redirect_base(base):
             or (isinstance(base, ast.Attribute) and base.attr == "HTTPRedirectHandler"))
 
 
+def _returns_none(value):
+    return value is None or (isinstance(value, ast.Constant) and value.value is None)
+
+
 def _method_refuses(node):
-    """A redirect method refuses when it returns None or raises."""
+    """A redirect method refuses only when it never follows.
+
+    Any ``super()`` call, any call delegating to another redirect method, or
+    any non-None return disqualifies it: a handler that refuses some statuses
+    while following others still leaks the token.
+    """
+    refuses = False
     for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            target = child.func
+            if isinstance(target, ast.Name) and target.id == "super":
+                return False
+            if isinstance(target, ast.Attribute) and target.attr in REDIRECT_METHODS:
+                return False
         if isinstance(child, ast.Raise):
-            return True
+            refuses = True
         if isinstance(child, ast.Return):
-            value = child.value
-            if value is None or (isinstance(value, ast.Constant) and value.value is None):
-                return True
-    return False
+            if _returns_none(child.value):
+                refuses = True
+            else:
+                return False
+    return refuses
+
+
+def _request_aliases(tree):
+    """Names bound to the requests module, its verbs, and its Session."""
+    modules = {"requests"}
+    verbs = set()
+    session = {"Session"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "requests":
+                    modules.add(alias.asname or "requests")
+        elif isinstance(node, ast.ImportFrom) and node.module == "requests":
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                if alias.name.lower() == "session":
+                    session.add(bound)
+                else:
+                    verbs.add(bound)
+    # Subclasses of requests.Session are session makers too.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for base in node.bases:
+            if ((isinstance(base, ast.Attribute) and base.attr.lower() == "session"
+                 and isinstance(base.value, ast.Name) and base.value.id in modules)
+                    or (isinstance(base, ast.Name) and base.id in session)):
+                session.add(node.name)
+                break
+    return modules, verbs, session
+
+
+def _redirects_allowed(call):
+    """Whether a requests call explicitly opts out of redirects."""
+    for keyword in call.keywords:
+        if keyword.arg == "allow_redirects":
+            return not (isinstance(keyword.value, ast.Constant)
+                        and keyword.value.value is False)
+    return True
 
 
 def find_violations(path):
@@ -95,6 +166,8 @@ def find_violations(path):
     tree = ast.parse(text)
     file_name = Path(path).name
     sends_token = "Authorization" in text
+    if not sends_token:
+        return []
 
     refusing_handler = set()
     for node in ast.walk(tree):
@@ -108,51 +181,69 @@ def find_violations(path):
                 refusing_handler.add(node.name)
                 break
 
-    urlopen_sites = []  # (function, line)
-    opener_sites = []
-    requests_sites = []
-    stack = []
+    modules, verbs, sessions = _request_aliases(tree)
+
+    def _is_session_maker(func):
+        return ((isinstance(func, ast.Attribute) and func.attr.lower() == "session"
+                 and isinstance(func.value, ast.Name) and func.value.id in modules)
+                or (isinstance(func, ast.Name) and func.id in sessions))
+
+    # Names in each function scope bound to a session construction result, so
+    # method calls on them are checked like direct requests calls.
+    session_bound = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            continue
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif node.value is not None:
+            targets = [node.target]
+        if not isinstance(node.value, ast.Call):
+            continue
+        if not _is_session_maker(node.value.func):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                session_bound.add(target.id)
+
+    violations = []
 
     def visit(node, func):
-        nonlocal stack
+        current = func
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            stack.append(node.name)
             current = node.name
-        else:
-            current = func
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.Call):
                 target = child.func
+                site = (current or "<module>", child.lineno)
                 if ((isinstance(target, ast.Attribute) and target.attr == "urlopen")
                         or (isinstance(target, ast.Name) and target.id == "urlopen")):
-                    urlopen_sites.append((current or "<module>", child.lineno))
+                    violations.append((file_name, site[0], site[1]))
                 elif ((isinstance(target, ast.Attribute) and target.attr == "build_opener")
                         or (isinstance(target, ast.Name) and target.id == "build_opener")):
-                    opener_sites.append((current or "<module>", child.lineno))
+                    names = set()
+                    for descendant in ast.walk(child):
+                        if isinstance(descendant, ast.Name):
+                            names.add(descendant.id)
+                        elif isinstance(descendant, ast.Attribute):
+                            names.add(descendant.attr)
+                    if not names & refusing_handler:
+                        violations.append((file_name, site[0], site[1]))
                 elif (isinstance(target, ast.Attribute) and target.attr in REQUEST_FUNCS
-                        and isinstance(target.value, ast.Name)
-                        and target.value.id == "requests"):
-                    keywords = {kw.arg for kw in child.keywords if kw.arg}
-                    values = {kw.arg: kw.value for kw in child.keywords if kw.arg}
-                    redirect_off = False
-                    allow = values.get("allow_redirects")
-                    if isinstance(allow, ast.Constant) and allow.value is False:
-                        redirect_off = True
-                    if "allow_redirects" not in keywords or not redirect_off:
-                        requests_sites.append((current or "<module>", child.lineno))
+                        and ((isinstance(target.value, ast.Name)
+                              and (target.value.id in modules
+                                   or target.value.id in session_bound))
+                             or (isinstance(target.value, ast.Call)
+                                 and _is_session_maker(target.value.func)))
+                        and _redirects_allowed(child)):
+                    violations.append((file_name, site[0], site[1]))
+                elif (isinstance(target, ast.Name) and target.id in verbs
+                        and _redirects_allowed(child)):
+                    violations.append((file_name, site[0], site[1]))
             visit(child, current)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            stack.pop()
 
     visit(tree, "<module>")
-
-    violations = []
-    if sends_token:
-        for func, line in urlopen_sites:
-            violations.append((file_name, func, line))
-        if opener_sites and not refusing_handler:
-            violations.extend((file_name, func, line) for func, line in opener_sites)
-        violations.extend((file_name, func, line) for func, line in requests_sites)
     return violations
 
 
@@ -260,6 +351,131 @@ class TokenRedirectGateTests(unittest.TestCase):
             plain_path = Path(tmp) / "plain_reader.py"
             plain_path.write_text(plain)
             self.assertEqual(find_violations(plain_path), [])
+
+    def test_dead_handler_does_not_excuse_a_bare_opener(self):
+        """A refusing class elsewhere in the file excuses no opener site."""
+        mutant = (
+            "import urllib.request\n"
+            "class _NoRedirect(urllib.request.HTTPRedirectHandler):\n"
+            "    def redirect_request(self, *args, **kwargs):\n"
+            "        return None\n"
+            "def _get(path, token):\n"
+            "    opener = urllib.request.build_opener()\n"
+            "    request = urllib.request.Request(\n"
+            "        'https://api.example' + path,\n"
+            "        headers={'Authorization': 'Bearer ' + token})\n"
+            "    with opener.open(request, timeout=10) as response:\n"
+            "        return response.read()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            mutant_path = Path(tmp) / "dead_handler.py"
+            mutant_path.write_text(mutant)
+            violations = find_violations(mutant_path)
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0][1], "_get")
+
+    def test_requests_alias_and_from_import_trip_the_gate(self):
+        for source, name in (
+                ("import requests as rq\n"
+                 "def _get(path, token):\n"
+                 "    return rq.get('https://api.example' + path,\n"
+                 "        headers={'Authorization': 'Bearer ' + token})\n", "alias"),
+                ("from requests import get\n"
+                 "def _get(path, token):\n"
+                 "    return get('https://api.example' + path,\n"
+                 "        headers={'Authorization': 'Bearer ' + token})\n", "from_import"),
+                ("import requests\n"
+                 "def _get(path, token):\n"
+                 "    sess = requests.Session()\n"
+                 "    return sess.get('https://api.example' + path,\n"
+                 "        headers={'Authorization': 'Bearer ' + token})\n", "session"),
+        ):
+            with self.subTest(style=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    mutant_path = Path(tmp) / f"requests_{name}.py"
+                    mutant_path.write_text(source)
+                    violations = find_violations(mutant_path)
+                self.assertEqual(len(violations), 1, name)
+                self.assertEqual(violations[0][1], "_get")
+
+    def test_requests_session_factory_spellings_trip_the_gate(self):
+        for source, name in (
+                ("import requests\n"
+                 "def _get(path, token):\n"
+                 "    sess = requests.session()\n"
+                 "    return sess.get('https://api.example' + path,\n"
+                 "        headers={'Authorization': 'Bearer ' + token})\n",
+                 "lowercase_factory"),
+                ("import requests\n"
+                 "class Pinned(requests.Session):\n"
+                 "    pass\n"
+                 "def _get(path, token):\n"
+                 "    return Pinned().get('https://api.example' + path,\n"
+                 "        headers={'Authorization': 'Bearer ' + token})\n",
+                 "subclass"),
+        ):
+            with self.subTest(style=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    mutant_path = Path(tmp) / f"session_{name}.py"
+                    mutant_path.write_text(source)
+                    violations = find_violations(mutant_path)
+                self.assertEqual(len(violations), 1, name)
+                self.assertEqual(violations[0][1], "_get")
+
+    def test_requests_with_redirects_off_passes(self):
+        source = (
+            "import requests\n"
+            "def _get(path, token):\n"
+            "    return requests.get('https://api.example' + path,\n"
+            "        headers={'Authorization': 'Bearer ' + token},\n"
+            "        allow_redirects=False)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fixed_path = Path(tmp) / "requests_fixed.py"
+            fixed_path.write_text(source)
+            self.assertEqual(find_violations(fixed_path), [])
+
+    def test_delegating_handler_does_not_count_as_refusing(self):
+        """Refusing one status while delegating the rest still leaks."""
+        mutant = (
+            "import urllib.request\n"
+            "class _Picky(urllib.request.HTTPRedirectHandler):\n"
+            "    def redirect_request(self, req, resp, code, msg, headers, new):\n"
+            "        if code == 307:\n"
+            "            return None\n"
+            "        return super().redirect_request(req, resp, code, msg, headers, new)\n"
+            "def _get(path, token):\n"
+            "    opener = urllib.request.build_opener(_Picky)\n"
+            "    request = urllib.request.Request(\n"
+            "        'https://api.example' + path,\n"
+            "        headers={'Authorization': 'Bearer ' + token})\n"
+            "    with opener.open(request, timeout=10) as response:\n"
+            "        return response.read()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            mutant_path = Path(tmp) / "picky_handler.py"
+            mutant_path.write_text(mutant)
+            violations = find_violations(mutant_path)
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0][1], "_get")
+
+    def test_sweep_covers_token_senders_outside_the_reader_list(self):
+        """Authorization files beyond READERS must already be violation-free.
+
+        READERS itself is covered by the allowlist test above; this sweep
+        means a new token-sending script (or a new token path in an old one)
+        trips the gate before anyone adds it to READERS.
+        """
+        offenders = []
+        for path in sorted(SCRIPTS.glob("*.py")):
+            if path.name in READERS:
+                continue
+            if "Authorization" not in path.read_text():
+                continue
+            offenders.extend(
+                f"{file_name}:{func}:{line}"
+                for file_name, func, line in find_violations(path))
+        self.assertEqual(offenders, [])
 
     def test_stale_allowlist_entry_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
