@@ -1866,7 +1866,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
         self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 10)
+        self.assertEqual(len(guarded), 11)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -1886,6 +1886,7 @@ class WorkflowTests(unittest.TestCase):
             "--test internal_events": True,
             "--test raid_list_db": False,
             "--test reengagement_list_db": False,
+            "--test game_activity_report_db": False,
             "--test member_moderation_db": True,
         }
         for needle, wants_db_feature in guarded_needles.items():
