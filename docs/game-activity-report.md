@@ -20,7 +20,8 @@ the [privacy analytics note](privacy.md#what-is-stored).
 ## Invocation
 
 Two report arguments exist (`--guild`, `--allow-live-guild`), plus `--help`.
-Anything else is refused.
+Anything else is refused. `--help` short-circuits: combined with any other
+argument it still prints usage and exits 0 without further validation.
 
 ```sh
 cargo run -p two-bot-cutover --bin game-activity-report -- --guild <GUILD_ID>
@@ -87,9 +88,12 @@ invent one.
 - **Sessions.** One session is one member's contiguous run of Playing (or
   Streaming) observations for one game: observations merge while each step
   stays within the collector's gap timeout (15 minutes); a game change, a
-  streaming-flag change, a gap beyond the timeout, or that member's own
-  non-playing delta closes it. Other members' observations never disturb
-  it. `session_count` is how many such intervals folded into the row. The
+  streaming-flag change, or that member's own non-playing delta closes the
+  run. Silence alone does not: the collector fills same-game gaps wider
+  than the timeout with synthetic ticks, so a quiet stretch between two
+  updates for the same game stays one session, and only the 24h carry TTL
+  ends a run with no fresh observation. Other members' observations never
+  disturb it. `session_count` is how many such intervals folded into the row. The
   collector flushes hourly and closes each still-playing interval at the
   flush, reopening it for the next window, so one long play can span more
   than one session: it closes once at the first flush after it starts, and
