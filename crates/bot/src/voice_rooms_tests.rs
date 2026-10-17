@@ -299,7 +299,8 @@ impl RoomPersistence for Store {
         Ok(())
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
-        if let Some(delay) = self.rooms_delay.lock().unwrap().take() {
+        let delay = self.rooms_delay.lock().unwrap().take();
+        if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
         if let Some(error) = self.rooms_errors.lock().unwrap().pop_front() {
