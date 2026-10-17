@@ -53,3 +53,43 @@ pub fn budget_fraction_consumed(burn: f64, window_secs: f64, period_secs: f64) -
 pub fn allowed_errors(window_events: u64, budget_error_ratio: f64, burn: f64) -> u64 {
     (burn * budget_error_ratio * window_events as f64).ceil() as u64
 }
+
+/// Fast-burn page decision over the two policy windows: page only when the
+/// long window (15 min of eligible events) and the short confirmation window
+/// (2 min) both burn at or above `FAST_BURN_RATE`. One bad window alone never
+/// pages, and an empty window (no eligible events) stays silent instead of
+/// dividing by zero. The Worker (`error_budget_fast_burn` in
+/// `wrangler/src/alert-rules.ts`) evaluates this policy on its keepalive
+/// schedule against cumulative REST counters; this function is the exact
+/// offline pin of that decision, without the Worker's scrape-quantization
+/// allowance.
+pub fn fast_burn_pages(
+    long_errors: u64,
+    long_events: u64,
+    short_errors: u64,
+    short_events: u64,
+) -> bool {
+    fn burns(errors: u64, events: u64) -> bool {
+        if events == 0 {
+            return false;
+        }
+        burn_rate(errors as f64 / events as f64, BUDGET_ERROR_RATIO) >= FAST_BURN_RATE
+    }
+    burns(long_errors, long_events) && burns(short_errors, short_events)
+}
+
+/// Fast-burn page message. Carries the container build SHA and the public
+/// log-query URL so the responder can jump from the page to the failing
+/// build and its logs; names the fast-burn alert for the runbook lookup.
+pub fn fast_burn_page_message(
+    build_sha: &str,
+    log_query_url: &str,
+    long_burn: f64,
+    short_burn: f64,
+) -> String {
+    format!(
+        "two-bot-next fast-burn page: error budget burning at {long_burn:.1}x \
+         over 15 min and {short_burn:.1}x over 2 min (threshold {FAST_BURN_RATE:.0}x). \
+         Build: {build_sha}. Logs: {log_query_url}"
+    )
+}
