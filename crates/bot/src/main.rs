@@ -178,6 +178,26 @@ async fn run(cli_args: &[String]) {
         );
         std::process::exit(1);
     });
+    // Go-live delivery is a second, independent gate on the receiver: an
+    // enabled-but-invalid delivery config (including delivery without the
+    // receiver) refuses startup, never silently acks only.
+    let eventsub_delivery_config =
+        two_bot_core::eventsub_delivery_config::EventsubDeliveryConfig::from_env().unwrap_or_else(
+            |_| {
+                tracing::error!(
+                    error_class = "receiver_config_invalid",
+                    "eventsub startup refused"
+                );
+                std::process::exit(1);
+            },
+        );
+    if eventsub_delivery_config.is_some() && eventsub_config.is_none() {
+        tracing::error!(
+            error_class = "receiver_config_invalid",
+            "eventsub startup refused"
+        );
+        std::process::exit(1);
+    }
     let config = Config::from_env().unwrap_or_else(|err| {
         if receiver_config.is_some() {
             tracing::error!(
@@ -352,21 +372,58 @@ async fn run(cli_args: &[String]) {
         None => None,
     };
 
-    // Private EventSub listener: verified deliveries only. Boot injects no
-    // delivery dependencies yet (no announcements-channel/invite config is
-    // provisioned), so notifications are acknowledged without a send; see
-    // `eventsub_delivery`. Enabled failures never fall back; a bound
-    // listener that later fails stops the container.
+    // Private EventSub listener: verified deliveries only. While delivery
+    // stays dark boot injects no dependencies and notifications are
+    // acknowledged without a send; with delivery enabled boot builds the
+    // production deps (bot pool ledger plus an admission-backed executor,
+    // the same send-admission construction as the command runtime) or
+    // refuses startup — see `eventsub_delivery`. Enabled failures never
+    // fall back; a bound listener that later fails stops the container.
     let eventsub_receiver = match eventsub_config {
-        Some(eventsub_config) => Some(eventsub_http::bind(eventsub_config).await.unwrap_or_else(
-            |_| {
-                tracing::error!(
-                    error_class = "receiver_bind_failed",
-                    "eventsub startup refused"
-                );
-                std::process::exit(1);
-            },
-        )),
+        Some(eventsub_config) => {
+            let delivery = eventsub_delivery_config.map(|delivery_config| {
+                let refuse = |error_class: &'static str| -> ! {
+                    tracing::error!(error_class, "eventsub startup refused");
+                    std::process::exit(1);
+                };
+                let Some(db) = store.as_ref() else {
+                    refuse("receiver_prerequisites_invalid")
+                };
+                let pool = db.pool().clone();
+                let Some(token) = config
+                    .discord_token
+                    .as_ref()
+                    .map(|secret| secret.expose().as_str())
+                    .filter(|token| !token.is_empty())
+                else {
+                    refuse("receiver_prerequisites_invalid")
+                };
+                let admission =
+                    two_bot_core::send_admission::PgSendAdmission::new(pool.clone(), token)
+                        .unwrap_or_else(|_| refuse("receiver_prerequisites_invalid"));
+                let proxy = std::env::var("DISCORD_API_BASE")
+                    .ok()
+                    .filter(|value| !value.is_empty());
+                let executor = two_bot_discord::ActionExecutor::with_admission(
+                    token.to_owned(),
+                    proxy,
+                    Arc::new(admission),
+                )
+                .unwrap_or_else(|_| refuse("receiver_prerequisites_invalid"));
+                eventsub_delivery::DeliveryDeps::production(pool, executor, &delivery_config)
+            });
+            Some(
+                eventsub_http::bind_with_delivery(eventsub_config, delivery)
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::error!(
+                            error_class = "receiver_bind_failed",
+                            "eventsub startup refused"
+                        );
+                        std::process::exit(1);
+                    }),
+            )
+        }
         None => None,
     };
 
