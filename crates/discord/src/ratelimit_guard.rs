@@ -424,14 +424,18 @@ impl RateLimitGuard {
 
     /// Learn one response's per-route bucket state from its `X-RateLimit-*`
     /// headers. Only an exhausted bucket (`Remaining` 0 with a resolvable
-    /// reset) installs a deadline; a response with remaining budget retires a
-    /// live one only when its own reset does not predate the stored deadline.
-    /// Every number honored arrives in the headers — the relative
+    /// reset) installs a deadline; a response with remaining budget never
+    /// retires a live one. A same-window straggler is indistinguishable from
+    /// a newer window by its reset timing — the earlier-generated reply
+    /// carries the larger `Reset-After` and arrives later, so its computed
+    /// deadline is always at or above the stored one — while a live deadline
+    /// already expires on its own at reset plus the pad (`refresh` prunes it
+    /// before every admission). Every number honored arrives in the headers — the relative
     /// `Reset-After` wins when present, the absolute `Reset` epoch is measured
     /// against the wall clock otherwise, and the only constant is the legacy
-    /// 250 ms safety pad the 429 path already uses. Wakes admission only when
-    /// a live deadline is cleared; setting one never needs to (sleepers wait
-    /// on the deadline itself).
+    /// 250 ms safety pad the 429 path already uses. Installing a deadline
+    /// never wakes admission (sleepers wait on the deadline itself), and
+    /// nothing here removes one.
     pub fn observe_bucket(&self, route: &str, headers: &http::HeaderMap) {
         let observed_at = Instant::now();
         let value = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
@@ -454,7 +458,7 @@ impl RateLimitGuard {
                 target.duration_since(std::time::SystemTime::now()).ok()
             });
         let mut state = self.state.lock().expect("Discord guard state");
-        let cleared_live = match (remaining, reset_wait) {
+        match (remaining, reset_wait) {
             (Some(0), Some(wait)) => {
                 let wait = wait
                     .checked_add(Duration::from_millis(two_bot_core::RETRY_AFTER_PADDING_MS))
@@ -468,45 +472,15 @@ impl RateLimitGuard {
                 let entry = state.buckets.0.entry(bucket.clone()).or_insert(until);
                 *entry = (*entry).max(until);
                 state.routes.0.insert(route.to_owned(), bucket);
-                false
             }
             (Some(_), _) => {
-                // A response with remaining budget retires a live deadline
-                // only when its own reset does not predate the stored one:
-                // in-flight replies can arrive out of order within one
-                // resource, and without reset timing there is nothing to
-                // order against, so a live deadline stands. Cross-resource
-                // interference is already impossible: the key is scoped per
-                // top-level resource above.
-                let stored = state
-                    .buckets
-                    .0
-                    .get(bucket.as_str())
-                    .copied()
-                    .filter(|until| *until > observed_at);
-                let response_until = reset_wait
-                    .and_then(|wait| {
-                        wait.checked_add(Duration::from_millis(
-                            two_bot_core::RETRY_AFTER_PADDING_MS,
-                        ))
-                    })
-                    .and_then(|wait| observed_at.checked_add(wait));
-                let clears = match (stored, response_until) {
-                    (Some(stored), Some(response_until)) => response_until >= stored,
-                    (Some(_), None) | (None, _) => false,
-                };
-                if clears {
-                    state.buckets.0.remove(bucket.as_str());
-                }
+                // A live deadline expires on its own at reset + pad; a reply
+                // with remaining budget cannot be told from a same-window
+                // straggler, so it never retires one.
                 state.routes.0.insert(route.to_owned(), bucket);
-                clears
             }
-            (None, _) => false,
+            (None, _) => {}
         };
-        drop(state);
-        if cleared_live {
-            self.changed.notify_waiters();
-        }
     }
 
     /// Withdraw one invalid-request tally (a `shared`-scope 429 whose body
@@ -1178,7 +1152,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn remaining_budget_clears_a_live_bucket_deadline_and_prunes_orphans() {
+    async fn remaining_budget_keeps_a_live_bucket_deadline_and_prunes_orphans() {
         let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
         let bucketed = |remaining: &str| {
             http::HeaderMap::from_iter([
@@ -1203,8 +1177,8 @@ mod tests {
         );
         guard.observe_bucket("GET /guilds/1/roles", &bucketed("5"));
         assert!(
-            guard.check_route_now("GET /guilds/1/roles", false).is_ok(),
-            "remaining budget must clear the learned deadline"
+            guard.check_route_now("GET /guilds/1/roles", false).is_err(),
+            "remaining budget must not clear the learned deadline"
         );
         // A second route learns the same bucket, then outlives it: the next
         // admission prunes the expired bucket and its orphaned mapping, so a
@@ -1273,18 +1247,30 @@ mod tests {
                 .is_err(),
             "a sibling channel's remaining budget cleared a live deadline"
         );
-        // A late, out-of-order same-route reply with an older reset must not
-        // clear it either.
-        tokio::time::advance(Duration::from_secs(1)).await;
+        // A late, out-of-order same-window straggler must not clear it: the
+        // earlier-generated reply carries the larger Reset-After and arrives
+        // later, so its computed deadline sits above the stored one.
+        tokio::time::advance(Duration::from_millis(30)).await;
         guard.observe_bucket(
             "GET channels/111/messages",
-            &headers("bucket-shared", "1", Some("0.5")),
+            &headers("bucket-shared", "1", Some("5")),
         );
         assert!(
             guard
                 .check_route_now("GET channels/111/messages", false)
                 .is_err(),
-            "an out-of-order reply with an older reset cleared a live deadline"
+            "a same-window straggler with a larger reset cleared a live deadline"
+        );
+        // An equal Reset-After straggler must not clear it either.
+        guard.observe_bucket(
+            "GET channels/111/messages",
+            &headers("bucket-shared", "1", Some("4.97")),
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/111/messages", false)
+                .is_err(),
+            "a same-window straggler with an equal reset cleared a live deadline"
         );
         // A response with remaining budget but no reset timing carries
         // nothing to order against: the live deadline stands.
@@ -1297,17 +1283,6 @@ mod tests {
                 .check_route_now("GET channels/111/messages", false)
                 .is_err(),
             "an untimed reply cleared a live deadline"
-        );
-        // A same-route reply whose reset postdates the stored one retires it.
-        guard.observe_bucket(
-            "GET channels/111/messages",
-            &headers("bucket-shared", "3", Some("10")),
-        );
-        assert!(
-            guard
-                .check_route_now("GET channels/111/messages", false)
-                .is_ok(),
-            "a newer reset with remaining budget must retire the deadline"
         );
         // Webhook tokens scope separately under one hash, and unrecognized
         // shapes fall back to the full path.
