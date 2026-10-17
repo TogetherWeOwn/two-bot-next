@@ -132,8 +132,8 @@ unpacked snapshots and is logged separately, not compared to that ceiling.
 See [Docker's store documentation](https://docs.docker.com/engine/storage/containerd/)
 and [Moby's layer-history implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_history.go).
 The 112 MiB image ceiling is unchanged. The binary budget was 15 MiB at the
-2026-10-01 calibration and is now 16 MiB; the 2026-10-10 measurements below
-explain the tighter tripwire.
+2026-10-01 calibration and is now 17 MiB (2026-10-17 recalibration below);
+the 2026-10-10 measurements record the tighter tripwire it replaced.
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
 at source `307b50708ec42e8fc4744c1b804216a22a17625e`. The 2026-09-30
@@ -171,8 +171,8 @@ the binary ceiling moves to 17 MiB; revisit if the binary approaches it. The
 112 MiB image ceiling is unchanged (42.43 MiB measured on the same builds).
 
 This branch's automation-only head separately measured 15,769,872 bytes
-(15.04 MiB) before the event-executor merge. This PR keeps the current-main
-16 MiB binary ceiling; the combined exact-head CI measurement is still
+(15.04 MiB) before the event-executor merge. This PR raises the binary
+ceiling to 17 MiB; the combined exact-head CI measurement is still
 required.
 
 ### Docker history image measurement and immutable-ID pinning
