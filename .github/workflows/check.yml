@@ -2210,6 +2210,11 @@ jobs:
         # Version bumps, notes, rollback guard and off-main refusal against a
         # throwaway git repository (no network, no token).
         run: node ../scripts/test-release-on-promote.cjs
+      - name: Verify release latest repair guard
+        if: needs.job-inputs.outputs.worker != 'false'
+        # Repairing an older tag's missing release must not move "Latest"
+        # backward (mocked gh against a throwaway git repository).
+        run: node --test ../scripts/test-release-on-promote-latest-repair.cjs
       - name: Verify the commit-parse guard
         if: needs.job-inputs.outputs.worker != 'false'
         # The PR-side guard uses release-please's pinned conventional-commit
