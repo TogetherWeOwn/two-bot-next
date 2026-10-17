@@ -106,9 +106,10 @@ impl From<GuardSnapshot> for two_bot_core::metrics::RestGuardSnapshot {
 }
 
 /// Per-route bucket deadlines learned from `X-RateLimit-*` response headers,
-/// keyed by bucket id (or the request route when the response carries no
-/// bucket id). Debug reports the count only: keys name routes and buckets,
-/// and metrics stay low-cardinality (no tokens, routes, guild IDs or bodies).
+/// keyed by bucket id scoped to the request's top-level resource (or the
+/// request route when the response carries no bucket id). Debug reports the
+/// count only: keys name routes and buckets, and metrics stay low-cardinality
+/// (no tokens, routes, guild IDs or bodies).
 #[derive(Default)]
 struct BucketTable(HashMap<String, Instant>);
 
@@ -363,6 +364,53 @@ impl RateLimitGuard {
         }
     }
 
+    /// Scope a Discord bucket hash to the request's top-level resource.
+    /// `X-RateLimit-Bucket` is non-inclusive of top-level resources in the path
+    /// (official rate-limits page, verified 2026-10-12): one hash is reused
+    /// across channels, guilds and webhooks whose limits are calculated
+    /// independently. Keying deadlines on the bare hash lets one channel's
+    /// remaining budget delete another channel's live deadline (the next read
+    /// 429s and spends invalid budget) and lets one exhausted channel stall
+    /// every other channel sharing the hash.
+    fn scoped_bucket_key(bucket_hash: &str, route: &str) -> String {
+        format!("{bucket_hash}:{}", Self::top_level_resource(route))
+    }
+
+    /// Top-level resource for one request route (`channels/{id}`,
+    /// `guilds/{id}`, `webhooks/{id}[/{token}]`); the route is the executor's
+    /// bucket key (HTTP method plus path, without the query string), so the
+    /// method prefix and any stray leading slash or query are stripped first.
+    /// Unrecognized shapes fall back to the full path: unrelated routes never
+    /// share a deadline, at the cost of one entry per distinct path.
+    fn top_level_resource(route: &str) -> String {
+        let path = route.split_once(' ').map_or(route, |(_, path)| path);
+        let path = path.strip_prefix('/').unwrap_or(path);
+        let path = path.split('?').next().unwrap_or(path);
+        let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+        let first = segments.next().unwrap_or("");
+        let second = segments.next().unwrap_or("");
+        match first {
+            // `webhooks/{id}/{token}` names the webhook; deeper segments are
+            // message ids under it.
+            "webhooks" => {
+                let third = segments.next().unwrap_or("");
+                if third.is_empty() {
+                    format!("webhooks/{second}")
+                } else {
+                    format!("webhooks/{second}/{third}")
+                }
+            }
+            "channels" | "guilds" => {
+                if second.is_empty() {
+                    first.to_owned()
+                } else {
+                    format!("{first}/{second}")
+                }
+            }
+            _ => path.to_owned(),
+        }
+    }
+
     /// Deadline for one request route from learned bucket state, if any.
     fn bucket_deadline(&self, state: &State, route: &str, now: Instant) -> Option<Instant> {
         let key = state.routes.0.get(route).map_or(route, String::as_str);
@@ -376,8 +424,9 @@ impl RateLimitGuard {
 
     /// Learn one response's per-route bucket state from its `X-RateLimit-*`
     /// headers. Only an exhausted bucket (`Remaining` 0 with a resolvable
-    /// reset) installs a deadline; a response with remaining budget clears a
-    /// stale one. Every number honored arrives in the headers — the relative
+    /// reset) installs a deadline; a response with remaining budget retires a
+    /// live one only when its own reset does not predate the stored deadline.
+    /// Every number honored arrives in the headers — the relative
     /// `Reset-After` wins when present, the absolute `Reset` epoch is measured
     /// against the wall clock otherwise, and the only constant is the legacy
     /// 250 ms safety pad the 429 path already uses. Wakes admission only when
@@ -386,7 +435,10 @@ impl RateLimitGuard {
     pub fn observe_bucket(&self, route: &str, headers: &http::HeaderMap) {
         let observed_at = Instant::now();
         let value = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-        let bucket = value("x-ratelimit-bucket").unwrap_or(route).to_owned();
+        let bucket = match value("x-ratelimit-bucket") {
+            Some(hash) => Self::scoped_bucket_key(hash, route),
+            None => route.to_owned(),
+        };
         let remaining = value("x-ratelimit-remaining").and_then(|v| v.parse::<u64>().ok());
         let reset_wait = value("x-ratelimit-reset-after")
             .and_then(|v| v.parse::<f64>().ok())
@@ -419,14 +471,35 @@ impl RateLimitGuard {
                 false
             }
             (Some(_), _) => {
-                let live = state
+                // A response with remaining budget retires a live deadline
+                // only when its own reset does not predate the stored one:
+                // in-flight replies can arrive out of order within one
+                // resource, and without reset timing there is nothing to
+                // order against, so a live deadline stands. Cross-resource
+                // interference is already impossible: the key is scoped per
+                // top-level resource above.
+                let stored = state
                     .buckets
                     .0
                     .get(bucket.as_str())
-                    .is_some_and(|until| *until > observed_at);
-                state.buckets.0.remove(bucket.as_str());
+                    .copied()
+                    .filter(|until| *until > observed_at);
+                let response_until = reset_wait
+                    .and_then(|wait| {
+                        wait.checked_add(Duration::from_millis(
+                            two_bot_core::RETRY_AFTER_PADDING_MS,
+                        ))
+                    })
+                    .and_then(|wait| observed_at.checked_add(wait));
+                let clears = match (stored, response_until) {
+                    (Some(stored), Some(response_until)) => response_until >= stored,
+                    (Some(_), None) | (None, _) => false,
+                };
+                if clears {
+                    state.buckets.0.remove(bucket.as_str());
+                }
                 state.routes.0.insert(route.to_owned(), bucket);
-                live
+                clears
             }
             (None, _) => false,
         };
@@ -1146,6 +1219,133 @@ mod tests {
         assert!(
             guard.check_route_now("GET /guilds/2/roles", false).is_err(),
             "a repruned route must gate again after relearning"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_bucket_hash_scopes_deadlines_per_top_level_resource() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let headers = |bucket: &str, remaining: &str, reset_after: Option<&str>| {
+            let mut headers = http::HeaderMap::from_iter([
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-bucket"),
+                    http::HeaderValue::from_str(bucket).unwrap(),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-remaining"),
+                    http::HeaderValue::from_str(remaining).unwrap(),
+                ),
+            ]);
+            if let Some(reset_after) = reset_after {
+                headers.insert(
+                    "x-ratelimit-reset-after",
+                    http::HeaderValue::from_str(reset_after).unwrap(),
+                );
+            }
+            headers
+        };
+        // One channel exhausts the shared hash: only that channel is gated.
+        guard.observe_bucket(
+            "GET channels/111/messages",
+            &headers("bucket-shared", "0", Some("5")),
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/111/messages", false)
+                .is_err(),
+            "the exhausted channel must wait out its reset"
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/222/messages", false)
+                .is_ok(),
+            "one exhausted channel must not stall another sharing the hash"
+        );
+        // The other channel's remaining budget must not delete the live
+        // deadline: the next channel-111 read would 429 and spend budget.
+        guard.observe_bucket(
+            "GET channels/222/messages",
+            &headers("bucket-shared", "4", Some("5")),
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/111/messages", false)
+                .is_err(),
+            "a sibling channel's remaining budget cleared a live deadline"
+        );
+        // A late, out-of-order same-route reply with an older reset must not
+        // clear it either.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        guard.observe_bucket(
+            "GET channels/111/messages",
+            &headers("bucket-shared", "1", Some("0.5")),
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/111/messages", false)
+                .is_err(),
+            "an out-of-order reply with an older reset cleared a live deadline"
+        );
+        // A response with remaining budget but no reset timing carries
+        // nothing to order against: the live deadline stands.
+        guard.observe_bucket(
+            "GET channels/111/messages",
+            &headers("bucket-shared", "2", None),
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/111/messages", false)
+                .is_err(),
+            "an untimed reply cleared a live deadline"
+        );
+        // A same-route reply whose reset postdates the stored one retires it.
+        guard.observe_bucket(
+            "GET channels/111/messages",
+            &headers("bucket-shared", "3", Some("10")),
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/111/messages", false)
+                .is_ok(),
+            "a newer reset with remaining budget must retire the deadline"
+        );
+        // Webhook tokens scope separately under one hash, and unrecognized
+        // shapes fall back to the full path.
+        guard.observe_bucket(
+            "POST webhooks/1/token-a",
+            &headers("bucket-webhook", "0", Some("5")),
+        );
+        assert!(
+            guard
+                .check_route_now("POST webhooks/1/token-b", false)
+                .is_ok(),
+            "one webhook's exhaustion must not stall another sharing the hash"
+        );
+        guard.observe_bucket("GET webhooks/7", &headers("bucket-webhook", "0", Some("5")));
+        assert!(
+            guard.check_route_now("GET webhooks/7", false).is_err(),
+            "a token-less webhook route must still gate its own scope"
+        );
+        guard.observe_bucket("GET guilds", &headers("bucket-bare", "0", Some("5")));
+        assert!(
+            guard.check_route_now("GET guilds", false).is_err(),
+            "a bare resource route must still gate its own scope"
+        );
+        guard.observe_bucket(
+            "GET interactions/1/abc/callback",
+            &headers("bucket-other", "0", Some("5")),
+        );
+        assert!(
+            guard
+                .check_route_now("GET interactions/2/def/callback", false)
+                .is_ok(),
+            "unrecognized shapes must not share a deadline across paths"
+        );
+        assert!(
+            guard
+                .check_route_now("GET interactions/1/abc/callback", false)
+                .is_err(),
+            "an unrecognized shape must still gate its own path"
         );
     }
 
