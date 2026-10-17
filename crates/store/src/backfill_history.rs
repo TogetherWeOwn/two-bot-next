@@ -94,9 +94,10 @@ impl From<sqlx::Error> for BackfillHistoryError {
 ///
 /// `limit` clamps into Discord's 1-100 range. Exactly one of `before` (page
 /// backward from the previous page's floor), `after` (page forward) or
-/// `around` (anchored read) may be set; passing more than one panics, mirroring
-/// the acceptance helper so a misuse fails loudly in tests rather than paging
-/// the wrong window live.
+/// `around` (anchored read) may be set; passing more than one returns
+/// [`BackfillHistoryError::Invalid`], mirroring the acceptance helper so a
+/// misuse surfaces as a typed error the caller can handle rather than
+/// paging the wrong window live.
 #[must_use]
 pub fn history_messages_path(
     channel_id: &str,
@@ -104,17 +105,27 @@ pub fn history_messages_path(
     before: Option<&str>,
     after: Option<&str>,
     around: Option<&str>,
-) -> String {
+) -> Result<String, BackfillHistoryError> {
+    if [before.is_some(), after.is_some(), around.is_some()]
+        .into_iter()
+        .filter(|present| *present)
+        .count()
+        > 1
+    {
+        return Err(BackfillHistoryError::Invalid(
+            "one cursor shape per history read",
+        ));
+    }
     let limit = limit.clamp(1, 100);
     let mut path = format!("/channels/{channel_id}/messages?limit={limit}");
-    match (before, after, around) {
-        (Some(cursor), None, None) => path.push_str(&format!("&before={cursor}")),
-        (None, Some(cursor), None) => path.push_str(&format!("&after={cursor}")),
-        (None, None, Some(cursor)) => path.push_str(&format!("&around={cursor}")),
-        (None, None, None) => {}
-        _ => panic!("one cursor shape per history read"),
+    if let Some(cursor) = before {
+        path.push_str(&format!("&before={cursor}"));
+    } else if let Some(cursor) = after {
+        path.push_str(&format!("&after={cursor}"));
+    } else if let Some(cursor) = around {
+        path.push_str(&format!("&around={cursor}"));
     }
-    path
+    Ok(path)
 }
 
 /// Persist one fetched message as metadata only: ids plus the send timestamp.
@@ -223,35 +234,50 @@ mod tests {
     #[test]
     fn history_path_clamps_limit_and_admits_one_cursor_shape() {
         assert_eq!(
-            history_messages_path("123", 2, None, None, None),
+            history_messages_path("123", 2, None, None, None).unwrap(),
             "/channels/123/messages?limit=2"
         );
         // Discord's 1-100 range: 0 clamps to 1, 200 clamps to 100.
         assert_eq!(
-            history_messages_path("123", 0, None, None, None),
+            history_messages_path("123", 0, None, None, None).unwrap(),
             "/channels/123/messages?limit=1"
         );
         assert_eq!(
-            history_messages_path("123", 200, None, None, None),
+            history_messages_path("123", 200, None, None, None).unwrap(),
             "/channels/123/messages?limit=100"
         );
         assert_eq!(
-            history_messages_path("123", 2, Some("9"), None, None),
+            history_messages_path("123", 2, Some("9"), None, None).unwrap(),
             "/channels/123/messages?limit=2&before=9"
         );
         assert_eq!(
-            history_messages_path("123", 2, None, Some("9"), None),
+            history_messages_path("123", 2, None, Some("9"), None).unwrap(),
             "/channels/123/messages?limit=2&after=9"
         );
         assert_eq!(
-            history_messages_path("123", 2, None, None, Some("9")),
+            history_messages_path("123", 2, None, None, Some("9")).unwrap(),
             "/channels/123/messages?limit=2&around=9"
         );
     }
 
     #[test]
-    #[should_panic(expected = "one cursor shape per history read")]
-    fn history_path_rejects_two_cursor_shapes() {
-        let _ = history_messages_path("123", 2, Some("1"), Some("2"), None);
+    fn history_path_rejects_every_multi_cursor_shape_with_a_typed_error() {
+        for (before, after, around) in [
+            (Some("1"), Some("2"), None),
+            (Some("1"), None, Some("3")),
+            (None, Some("2"), Some("3")),
+            (Some("1"), Some("2"), Some("3")),
+        ] {
+            match history_messages_path("123", 2, before, after, around) {
+                Err(BackfillHistoryError::Invalid(reason)) => assert!(
+                    reason.contains("cursor"),
+                    "error reason must name the cursor problem, got: {reason:?}"
+                ),
+                Err(BackfillHistoryError::Db(_)) => {
+                    panic!("expected Invalid cursor error, got Db error")
+                }
+                Ok(path) => panic!("expected typed cursor error, got Ok path: {path}"),
+            }
+        }
     }
 }

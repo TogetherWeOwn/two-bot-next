@@ -82,7 +82,7 @@ existing disposable Postgres service, rather than the lint-only `check` lane.
   `cfg_attr(..., allow/expect/ignore)` count as waivers. The
   guard reads that table from the base branch, so a PR cannot exempt itself.
 
-## Semgrep backlog (50 `panic!` hits, grandfathered until 2027-01-15)
+## Semgrep backlog (49 `panic!` hits, grandfathered until 2027-01-15)
 
 Grandfathered on the HARD promotion: these pre-existing hits stay silent
 (the gate only fails on lines the diff adds) until 2027-01-15. Work them
@@ -103,5 +103,4 @@ output if they drift.
   `channel_moderation_store.rs`, `community_store.rs`,
   `disable_preflight.rs`, `game_activity_store.rs`, `inactivity_store.rs`,
   `internal_actions.rs`, `presence_store.rs`, `settings.rs`,
-  `voice_rooms.rs`, `crates/cutover/src/privacy.rs`, `staging_migrate.rs`,
-  `crates/store/src/backfill_history.rs`: 1 each
+  `voice_rooms.rs`, `crates/cutover/src/privacy.rs`, `staging_migrate.rs`: 1 each
