@@ -13,18 +13,17 @@
 use std::sync::Arc;
 
 use two_bot_core::stream_live::GoLiveOutcome;
-use two_bot_core::stream_live_store::{
-    LiveDeliveryConfig, LiveLedger, LiveSendError, LiveSender, SendFuture,
-};
+use two_bot_core::stream_live_store::{LiveDeliveryConfig, LiveLedger, LiveSender};
 use two_bot_discord::ActionExecutor;
 
 /// Injected delivery dependencies: the durable ledger, the one-shot
 /// sender, and the static allowlist/invite/channel inputs. Held behind
 /// trait objects so receiver tests inject in-memory fakes and no test
 /// touches a database or the Discord wire. The production shape is the
-/// bot's Postgres pool as `ledger` (it implements `LiveLedger`) and an
-/// admission-backed REST executor as `sender` (below); boot constructs
-/// that via [`DeliveryDeps::production`] when delivery is enabled.
+/// bot's Postgres pool as `ledger` (it implements `LiveLedger`) and the
+/// shared REST executor as `sender` (its `LiveSender` impl lives with the
+/// type in `crates/discord/src/executor.rs`); boot constructs that via
+/// [`DeliveryDeps::production`] when delivery is enabled.
 pub struct DeliveryDeps {
     pub ledger: Arc<dyn LiveLedger>,
     pub sender: Arc<dyn LiveSender>,
@@ -33,9 +32,9 @@ pub struct DeliveryDeps {
 
 impl DeliveryDeps {
     /// Production dependencies: the bot Postgres pool as the durable
-    /// ledger and the executor (built by boot with the pool-backed send
-    /// admission) as the sender, with the validated delivery inputs
-    /// mapped to the store's static config.
+    /// ledger and the shared REST executor (built by boot with the
+    /// pool-backed send admission) as the sender, with the validated
+    /// delivery inputs mapped to the store's static config.
     #[must_use]
     pub fn production(
         pool: sqlx::PgPool,
@@ -44,38 +43,13 @@ impl DeliveryDeps {
     ) -> Self {
         Self {
             ledger: Arc::new(pool),
-            sender: Arc::new(ExecutorSender { executor }),
+            sender: Arc::new(executor),
             config: LiveDeliveryConfig {
                 broadcasters: config.broadcasters().to_vec(),
                 invite_url: config.invite_url().to_owned(),
                 channel_id: config.channel_id().to_owned(),
             },
         }
-    }
-}
-
-/// The shared executor behind a local newtype is the production
-/// `LiveSender` (the orphan rule keeps the impl off `ActionExecutor`
-/// itself: neither it nor `LiveSender` lives in this crate).
-/// `post_message` builds the exact no-ping body
-/// (`allowed_mentions: { parse: [] }`, pinned in
-/// `crates/discord/src/executor.rs`) and makes a single attempt.
-/// Only an error that proves no effect (explicit rejection, 429, or a
-/// local guard refusal) may release the claim; timeouts and transport
-/// failures are ambiguous and stay fenced.
-pub struct ExecutorSender {
-    executor: ActionExecutor,
-}
-
-impl LiveSender for ExecutorSender {
-    fn send_live<'a>(&'a self, channel_id: &'a str, content: &'a str) -> SendFuture<'a> {
-        Box::pin(async move {
-            match self.executor.post_message(channel_id, content, None).await {
-                Ok(message_id) => Ok(message_id),
-                Err(error) if error.proves_no_effect() => Err(LiveSendError::ProvenNoSend),
-                Err(_) => Err(LiveSendError::Ambiguous),
-            }
-        })
     }
 }
 

@@ -31,7 +31,13 @@ IMAGE_MAX_BYTES = 112 * MIB
 # (15.04 MiB) before the event-executor merge; the combined-head
 # measurement comes from hosted CI on the merged head. 16 MiB restores a
 # working tripwire with headroom; revisit if the binary approaches it.
-BINARY_MAX_BYTES = 16 * MIB
+# 17 MiB holds for the EventSub go-live stack: the receiver-ledger wiring
+# head measured 16,794,312 bytes (16.02 MiB) and the delivery-provisioning
+# head 16,794,832 bytes (16.02 MiB) on hosted CI, ~17 KiB over the old
+# 16 MiB budget with no new dependencies (durable ledger store plus the
+# receiver delivery path; release profile already minimal). 17 MiB restores
+# a working tripwire with headroom; revisit if the binary approaches it.
+BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"

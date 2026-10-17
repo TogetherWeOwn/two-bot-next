@@ -82,9 +82,10 @@ pub async fn bind_with_delivery(
     delivery: Option<DeliveryDeps>,
 ) -> std::io::Result<BoundEventsubReceiver> {
     let listener = TcpListener::bind(config.listen_addr()).await?;
+    let state = ReceiverState::with_delivery(&config, delivery);
     Ok(BoundEventsubReceiver {
         listener,
-        state: Arc::new(ReceiverState::with_delivery(&config, delivery)),
+        state: Arc::new(state),
     })
 }
 
