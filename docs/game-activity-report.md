@@ -19,7 +19,8 @@ the [privacy analytics note](privacy.md#what-is-stored).
 
 ## Invocation
 
-Exactly two value/flag arguments exist. Anything else is refused.
+Two report arguments exist (`--guild`, `--allow-live-guild`), plus `--help`.
+Anything else is refused.
 
 ```sh
 cargo run -p two-bot-cutover --bin game-activity-report -- --guild <GUILD_ID>
@@ -34,12 +35,16 @@ cargo run -p two-bot-cutover --bin game-activity-report -- --help
   `326474832151838730` only. That guild is otherwise refused. Use it
   solely for an owner-approved rollout, never for routine checks.
 - `--help`: prints usage and exits 0 without touching a database.
-- Unknown flags, `key=value`-style values, and positional arguments are
-  refused with `unknown or malformed argument`.
+- `--guild=<ID>` works like `--guild <ID>`. `--allow-live-guild` takes no
+  value: `--allow-live-guild=x` (or repeating it) is refused with
+  `input error: --allow-live-guild is a bare opt-in and does not accept a value`.
+- Unknown flags and positional arguments are refused with
+  `unknown or malformed argument`.
 
 Exit codes: `0` a report was printed (populated, empty and unscoped
-alike); `2` usage error, live-guild refusal, query failure, or stdout
-write failure; `1` the database could not be opened (details redacted).
+alike); `2` usage error, missing `TWO_DATABASE_URL`, live-guild refusal,
+query failure, or stdout write failure; `1` the database could not be
+opened (details redacted).
 
 ## Environment and role
 
@@ -47,8 +52,15 @@ write failure; `1` the database could not be opened (details redacted).
   and `--help` paths never read it and never open a connection.
 - `TWO_DB_POOL_MAX`: optional pool cap (default 5); `1` is enough for a
   one-shot report.
+- `TWO_DATABASE_TLS`: unset means `Required`. Only remote hosts with an
+  explicit `sslmode` in the URL connect; loopback, single-label and
+  unix-socket URLs are refused. A refused URL exits 1 with only
+  `cannot open database; connection details redacted`. See
+  [database TLS](database-tls.md). `local-only` is test-only.
 - Run with a read-only database login that holds `SELECT` on
   `game_activity_guild_aggregates` (see [database roles](database-roles.md)).
+  For inspection, a login holding `two_bot_migrator_ro` (SELECT on bot
+  tables) suffices; the app pool (`two_bot_runtime`) also reads.
   The report applies no migrations and creates no schema: a missing table
   fails loudly instead of emitting an empty report. Never point it at a
   database you would not read from directly.
@@ -71,10 +83,13 @@ invent one.
 
 - **Sessions.** One session is one member's contiguous run of Playing (or
   Streaming) observations for one game: observations merge while each step
-  stays within the collector's gap timeout; a game change, a
+  stays within the collector's gap timeout (15 minutes); a game change, a
   streaming-flag change, a gap beyond the timeout, or that member's own
   non-playing delta closes it. Other members' observations never disturb
-  it. `session_count` is how many such intervals folded into the row.
+  it. `session_count` is how many such intervals folded into the row. The
+  collector flushes hourly and closes each still-playing interval at the
+  flush, reopening it for the next window: one long continuous play counts
+  as about one session per hour, not one session total.
 - **Play time.** `total_play_ms` sums session wall-clock spans
   (`last - first`). A session built from a single observation still counts
   one minute (one polling tick, conservative against inflation) instead of
@@ -83,8 +98,11 @@ invent one.
   carries each member's last-seen game forward as their current state until
   the next delta, rather than counting one tick per sighting. A long
   session therefore means sustained presence across the gap timeout, not
-  one poll. Custom status never creates a session; Streaming counts via
-  the same carry with a streaming flag.
+  one poll. The carry expires after 24 hours (`GAME_ACTIVITY_CARRY_TTL_MS`)
+  with no fresh observation: a long silent stretch stops accruing play
+  time. Rows appear only after a flush, so a report run right after play
+  can lag by up to an hour. Custom status never creates a session;
+  Streaming counts via the same carry with a streaming flag.
 - **In-voice overlap.** `in_voice_ms` sums each session's intersection
   with that member's voice spans (overlapping spans merged, never
   double-counted); it never exceeds `total_play_ms`. With voice
