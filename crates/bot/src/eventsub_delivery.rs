@@ -54,15 +54,23 @@ impl DeliveryDeps {
 }
 
 /// Build the production delivery dependencies from already-validated boot
-/// inputs: the bot pool, the Discord bot token, the optional API override
-/// and the validated delivery config. Pure construction (no I/O, no sends);
-/// `Err` carries the catalogued `error_class` boot refuses startup with.
+/// inputs: the bot pool, the Discord bot token, the optional API override,
+/// the validated delivery config and the boot identity's announcements
+/// permission. Pure construction (no I/O, no sends); `Err` carries the
+/// catalogued `error_class` boot refuses startup with. A refused identity
+/// fails here — before any key derivation — so an enabled delivery on a
+/// live or unknown identity refuses startup instead of posting go-lives
+/// under an identity where Announcements is not cleared.
 pub fn build_delivery_deps(
     pool: sqlx::PgPool,
     token: &str,
     proxy: Option<String>,
     config: &two_bot_core::eventsub_delivery_config::EventsubDeliveryConfig,
+    announcements_permitted: bool,
 ) -> Result<DeliveryDeps, &'static str> {
+    if !announcements_permitted {
+        return Err("receiver_prerequisites_invalid");
+    }
     let admission = two_bot_core::send_admission::PgSendAdmission::new(pool.clone(), token)
         .map_err(|_| "receiver_prerequisites_invalid")?;
     let executor = ActionExecutor::with_admission(token.to_owned(), proxy, Arc::new(admission))
@@ -142,12 +150,20 @@ mod tests {
 
     #[tokio::test]
     async fn build_delivery_deps_wires_pool_ledger_and_governed_sender() {
+        use two_bot_core::activation::LiveCapability;
         crate::gateway::ensure_crypto_provider();
+        // The staging identity permits Announcements, so this pins the boot
+        // call-site wiring (`activation.permitted(Announcements)`), not just
+        // a hardcoded `true`.
+        let permitted =
+            crate::activation::fixtures::staging().permitted(LiveCapability::Announcements);
+        assert!(permitted);
         let deps = build_delivery_deps(
             lazy_pool(),
             "synthetic-delivery-token",
             None,
             &delivery_config(),
+            permitted,
         )
         .expect("synthetic inputs build");
         assert_eq!(deps.config.broadcasters, ["111", "222"]);
@@ -156,9 +172,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_delivery_deps_refuses_an_identity_without_announcements() {
+        use two_bot_core::activation::LiveCapability;
+        crate::gateway::ensure_crypto_provider();
+        // Every refused identity (the live pair, cleared for self_roles only,
+        // plus unknown/mismatched/missing identities) must refuse startup
+        // with the catalogued class before any key derivation, so an enabled
+        // delivery can never post go-lives under an uncleared identity.
+        for (label, activation) in crate::activation::fixtures::refused() {
+            assert!(
+                !activation.permitted(LiveCapability::Announcements),
+                "{label} must not permit announcements"
+            );
+            assert!(matches!(
+                build_delivery_deps(
+                    lazy_pool(),
+                    "synthetic-delivery-token",
+                    None,
+                    &delivery_config(),
+                    activation.permitted(LiveCapability::Announcements),
+                ),
+                Err("receiver_prerequisites_invalid"),
+                "{label} must refuse delivery deps"
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn build_delivery_deps_refuses_credentials_the_admission_rejects() {
         assert!(matches!(
-            build_delivery_deps(lazy_pool(), "has space", None, &delivery_config()),
+            build_delivery_deps(lazy_pool(), "has space", None, &delivery_config(), true),
             Err("receiver_prerequisites_invalid")
         ));
     }
@@ -172,6 +215,7 @@ mod tests {
                 "synthetic-delivery-token",
                 Some("http://exa mple.com".to_owned()),
                 &delivery_config(),
+                true,
             ),
             Err("receiver_prerequisites_invalid")
         ));

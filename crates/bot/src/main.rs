@@ -377,7 +377,10 @@ async fn run(cli_args: &[String]) {
     // acknowledged without a send; with delivery enabled boot builds the
     // production deps (bot pool ledger plus an admission-backed executor,
     // the same send-admission construction as the command runtime) or
-    // refuses startup — see `eventsub_delivery`. Enabled failures never
+    // refuses startup — see `eventsub_delivery`. The identity activation
+    // fence is evaluated first, like every other bot-identity posting job:
+    // a refused Announcements capability refuses startup rather than
+    // posting go-lives under an uncleared identity. Enabled failures never
     // fall back; a bound listener that later fails stops the container.
     let eventsub_receiver = match eventsub_config {
         Some(eventsub_config) => {
@@ -401,8 +404,16 @@ async fn run(cli_args: &[String]) {
                 let proxy = std::env::var("DISCORD_API_BASE")
                     .ok()
                     .filter(|value| !value.is_empty());
-                eventsub_delivery::build_delivery_deps(pool, token, proxy, &delivery_config)
-                    .unwrap_or_else(|error_class| refuse(error_class))
+                let announcements_permitted =
+                    activation.permitted(two_bot_core::activation::LiveCapability::Announcements);
+                eventsub_delivery::build_delivery_deps(
+                    pool,
+                    token,
+                    proxy,
+                    &delivery_config,
+                    announcements_permitted,
+                )
+                .unwrap_or_else(|error_class| refuse(error_class))
             });
             Some(
                 eventsub_http::bind_with_delivery(eventsub_config, delivery)

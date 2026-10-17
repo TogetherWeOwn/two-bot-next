@@ -256,7 +256,10 @@ container on explicit lines only while the receiver forward is active:
 An enabled-but-invalid delivery state — the gate at `"1"` with any input
 missing or invalid, or delivery requested without the receiver —
 refuses container startup (`eventsub startup refused`); it never
-degrades to ack-only. Because a bad value crash-loops the container, set
+degrades to ack-only. An enabled delivery on a boot identity where
+Announcements is not cleared (live or unknown identity) refuses startup
+the same way, like every other bot-identity posting job. Because a bad value
+crash-loops the container, set
 the three inputs first, redeploy, and flip the gate last. Enable on
 staging first and keep the posted go-live as enablement evidence;
 production enablement is its own rollout decision. To stop posting
