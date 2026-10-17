@@ -265,6 +265,8 @@ pub const HOT_WIRED: &[&str] = &[
     "TWO_AUTOMOD_REPEAT_WINDOW_SECONDS",
     "TWO_AUTOMOD_SANCTIONS",
     "TWO_FEED_POLL_SECONDS",
+    "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
+    "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
 ];
 
 /// The catalogue class for `key`, or `None` for a name this file has never
@@ -1037,7 +1039,7 @@ mod tests {
 
     #[test]
     fn hot_wired_is_a_hot_subset() {
-        assert_eq!(HOT_WIRED.len(), 22);
+        assert_eq!(HOT_WIRED.len(), 24);
         for key in HOT_WIRED {
             assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
         }

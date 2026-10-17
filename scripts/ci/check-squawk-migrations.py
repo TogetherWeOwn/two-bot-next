@@ -65,8 +65,9 @@ ADVICE = {
     "creating-index": (
         "CREATE INDEX without CONCURRENTLY blocks writes on existing tables; "
         "use CREATE INDEX CONCURRENTLY in a separate migration run outside "
-        "a transaction (sqlx no-transaction). Indexes on a table created "
-        "earlier in the same file target an empty table and are not flagged"
+        "a transaction (sqlx no-transaction). Indexes on the same qualified "
+        "relation created earlier in the same file target an empty table "
+        "and are not flagged"
     ),
     "adding-check-constraint": (
         "CHECK constraint without NOT VALID scans and locks the table; "
@@ -123,20 +124,40 @@ INDEX_TARGET = re.compile(
 DOLLAR_OPEN = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
 
 
-def normalize_table(raw):
-    """Lowercase unqualified table name for same-file empty-table checks.
+def _normalize_part(part):
+    """Normalise one dot-separated identifier part from blanked() output.
 
-    Inputs arrive via blanked(), which maps every quoted identifier to a
-    placeholder: simple lowercase names (``"guilds"``) become ``_qq_guilds_``
-    (the same placeholder for the same name) while every other quoted name
-    becomes a case-sensitive ``_qq_<n>_`` token. Placeholders never match
-    keyword regexes (``\\b`` cannot fire inside ``_..._``), so quoted
-    keyword names such as ``"default"`` stay inert. Stripping the wrapper
-    restores equality: ``_qq_guilds_`` compares equal to unquoted ``guilds``.
+    blanked() maps every quoted identifier to a placeholder: simple
+    lowercase names (``"guilds"``) become ``_qq_guilds_`` (the same
+    placeholder for the same name) while every other quoted name becomes
+    a case-sensitive ``_qq_<n>_`` token. Placeholders never match keyword
+    regexes (``\\b`` cannot fire inside ``_..._``), so quoted keyword
+    names such as ``"default"`` stay inert. Lowercasing folds unquoted
+    names as Postgres does, and stripping the wrapper restores equality:
+    ``_qq_guilds_`` compares equal to unquoted ``guilds``, while a
+    case-sensitive ``_qq_<n>_`` never equals a folded unquoted name.
     """
-    base = raw.strip().split(".")[-1].strip().lower()
+    base = part.strip().lower()
     match = re.fullmatch(r"_qq_(.+)_", base)
     return match.group(1) if match else base
+
+
+def normalize_relation(raw):
+    """Return the (schema, table) identity of a possibly qualified relation.
+
+    The same-file empty-table exemption belongs to the exact relation
+    that was created, schema and table together: ``scratch.items`` must
+    never exempt an index on ``public.items``, which may already hold
+    data. An unqualified name means the ``public`` schema (the one
+    justified compatibility, in either direction); any other explicitly
+    named schema is a different relation. Names with more than two
+    parts keep every part, so an ambiguous identity only ever matches
+    itself exactly and never broadens the exemption.
+    """
+    parts = tuple(_normalize_part(part) for part in raw.strip().split("."))
+    if len(parts) == 1:
+        return ("public", parts[0])
+    return parts
 
 
 class SquawkError(ValueError):
@@ -152,7 +173,7 @@ def blanked(text):
     such as ``"default"`` never reads as a live keyword. Simple lowercase
     names (``"guilds"``) emit ``_qq_guilds_`` (the same placeholder for the
     same name) so they compare equal to the unquoted form once
-    normalize_table() strips the wrapper, as Postgres folds unquoted names
+    _normalize_part() strips the wrapper, as Postgres folds unquoted names
     to lowercase. Every other quoted identifier maps to a unique
     placeholder per distinct name (``_qq_<n>_``), so two different quoted
     table names never collapse to one token while the same quoted name
@@ -348,7 +369,7 @@ def index_on_existing_table(sql, created_tables):
     match = INDEX_TARGET.search(sql)
     if not match:
         return True
-    return normalize_table(match.group("name")) not in created_tables
+    return normalize_relation(match.group("name")) not in created_tables
 
 
 def has_dropping_object(sql):
@@ -414,7 +435,7 @@ def lint_text(text, path=None):
             if path is None or not is_waived_finding(path, rule, sql):
                 findings.append((line, rule))
         for match in CREATE_TABLE.finditer(sql):
-            created.add(normalize_table(match.group("name")))
+            created.add(normalize_relation(match.group("name")))
     return findings
 
 

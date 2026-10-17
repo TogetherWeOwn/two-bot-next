@@ -62,13 +62,6 @@ _EMITTED_REASON = "emitted series documented in docs/metrics.md; no catalog row 
 # Every emitted family absent from the catalog, with why it stays out.
 # A name here that gains a catalog row fails until its exemption is removed.
 EXEMPT_SERIES = {
-    # REST route family: templates are pinned by the sibling
-    # test_doc_route_list_equals_rest_routes; the catalog tracks event
-    # names, not REST routes.
-    "two_bot_rest_requests_total": (
-        "route templates pinned by test_doc_route_list_equals_rest_routes "
-        "and docs/metrics.md; the catalog tracks event names, not REST routes"
-    ),
     "two_bot_rest_guard_invalid_requests_total": _GUARD_REASON,
     "two_bot_rest_guard_rejected_requests_total": _GUARD_REASON,
     "two_bot_rest_guard_breaker_opens_total": _GUARD_REASON,
@@ -109,17 +102,25 @@ EXEMPT_SERIES = {
         "manual check documented in docs/metrics.md, consumed by no alert "
         "rule; catalog row lands with the halt-gauge change"
     ),
-    # Voice stall-observability families (lobby-stall follow-up): refusal
-    # labels, backoff cap, halt gauge, and the per-tick stall gauges. All rows
-    # live in docs/metrics.md; the catalog covers voice_event log fields.
-    # (joins_received, dispatch_timeouts, watchdog_stucks, halt_recoveries are
-    # cataloged, so they carry no exemption.)
-    "two_bot_voice_join_refused_total": _VOICE_SERIES_REASON,
+    # Voice stall-observability remainder (lobby-stall follow-up): backoff cap
+    # and in-flight REST age. All rows live in docs/metrics.md; the catalog
+    # covers voice_event log fields. (joins_received, dispatch_timeouts,
+    # watchdog_stucks, halt_recoveries and the creator-map generation/age
+    # pair are cataloged as alert inputs, and the worker-halted / queue-pending
+    # / queue-oldest-age stall gauges gained catalog rows, so none of those
+    # carry an exemption.)
     "two_bot_voice_global_backoff_capped_total": _VOICE_SERIES_REASON,
-    "two_bot_voice_worker_halted": _VOICE_SERIES_REASON,
-    "two_bot_voice_queue_pending": _VOICE_SERIES_REASON,
-    "two_bot_voice_queue_oldest_age_seconds": _VOICE_SERIES_REASON,
     "two_bot_voice_rest_in_flight_age_seconds": _VOICE_SERIES_REASON,
+    # Histogram `_bucket` child consumed as an alert input: the gate
+    # normalizes catalog families (stripping `_bucket`) but compares raw
+    # alert-input names, so only an exemption covers this spelling. The base
+    # family row lives in the catalog voice_event section.
+    "two_bot_voice_join_to_move_seconds_bucket": (
+        "histogram _bucket child of the cataloged "
+        "two_bot_voice_join_to_move_seconds family; alert input for "
+        "voice_join_fast_burn and voice_join_slow_burn (cumulative le=\"5\" "
+        "count); documented in docs/metrics.md and the catalog alert-rule rows"
+    ),
     # Event-store S1 consumer-lag gauge: label-free manual check, not an
     # alert input. Documented in docs/metrics.md; the catalog tracks event
     # names, not this operational gauge.
@@ -168,7 +169,6 @@ EXEMPT_RULES = {
     "job_stale": _NO_ROW_YET_REASON,
     "job_consecutive_failures": _NO_ROW_YET_REASON,
     "rest_429_rate": _NO_ROW_YET_REASON,
-    "rest_5xx_rate": _NO_ROW_YET_REASON,
     "db_pool_saturated": _NO_ROW_YET_REASON,
     "db_errors": _NO_ROW_YET_REASON,
     "send_admission_blocked": _NO_ROW_YET_REASON,

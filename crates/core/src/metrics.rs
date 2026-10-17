@@ -3,6 +3,7 @@
 
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     fmt::Write,
     sync::{Mutex, OnceLock},
     time::Duration,
@@ -254,6 +255,13 @@ pub const VOICE_JOIN_REFUSAL_REASONS: &[&str] = &[
     "name_blocked",
     "other",
 ];
+/// Rendered `le` labels for `two_bot_voice_join_to_move_seconds_bucket`: the
+/// eight finite `BUCKETS_MICROS` bounds as seconds plus `+Inf`. The rendered
+/// exposition is tested against this list, and the Worker scrape validator
+/// (`wrangler/src/metrics-scrape.ts`) and its fixture are checked against it.
+pub const VOICE_JOIN_TO_MOVE_BUCKET_LE: &[&str] = &[
+    "0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf",
+];
 /// Action-queue lanes for the `two_bot_voice_queue_pending{lane}` gauge.
 pub const VOICE_QUEUE_LANES: &[&str] = &["urgent", "deferred"];
 /// Vote-kick outcomes for `two_bot_voice_vote_kick_total{outcome}` (M4.30):
@@ -451,6 +459,17 @@ struct JobMetrics {
     last_error_class: Option<JobErrorClass>,
 }
 
+/// One guild actor incarnation's stall contribution. `generation` fences
+/// replacement: a report older than the recorded generation is ignored,
+/// and a newer generation replaces the whole contribution.
+#[derive(Clone, Copy, Default)]
+struct VoiceActorStall {
+    generation: u64,
+    halted: bool,
+    queue_pending: [u64; VOICE_QUEUE_LANES.len()],
+    oldest_age_secs: u64,
+}
+
 #[derive(Default)]
 struct Values {
     events: [u64; EVENTS.len()],
@@ -474,14 +493,22 @@ struct Values {
     voice_joins_received: u64,
     /// Actor-received creator joins refused before queueing, by reason.
     voice_join_refused: [u64; VOICE_JOIN_REFUSAL_REASONS.len()],
-    /// Guild-actor halt latch (CredentialRefused): 1 while halted.
-    voice_worker_halted: u64,
-    /// Queued (not in-flight) action depth by lane; last writer wins.
-    voice_queue_pending: [u64; VOICE_QUEUE_LANES.len()],
-    /// Age of the oldest queued action in seconds; 0 when the queue is empty.
-    voice_queue_oldest_age_secs: u64,
+    /// Per-guild-actor stall contributions, keyed by an opaque
+    /// process-local actor key that is never rendered, labelled or
+    /// persisted. The public halt/queue series are aggregates over this
+    /// set (any halted, per-lane sums, maximum oldest age), so a healthy
+    /// actor cannot overwrite a stalled actor's signal. Entries live only
+    /// while their actor does; removal deletes the entry.
+    voice_actors: HashMap<u64, VoiceActorStall>,
     /// Age of the oldest in-flight voice REST attempt in seconds; 0 when idle.
     voice_rest_in_flight_age_secs: u64,
+    /// Last merged creator-map generation (live snapshot generation stamped
+    /// by `reload_creators`); 0 before the first merge. Last writer wins.
+    creator_map_generation: u64,
+    /// Seconds since the last successful creator-map merge on the actor clock;
+    /// 0 when never merged. Last writer wins; the per-tick publish refreshes
+    /// it so the gauge shows staleness, not the merge-time zero.
+    creator_map_age_secs: u64,
     /// Global-backoff waits refused (capped) instead of parking the actor.
     voice_global_backoff_capped: u64,
     /// Actor dispatches that exceeded the per-dispatch timeout.
@@ -519,13 +546,37 @@ struct Values {
     eventsub_posts: [u64; EVENTSUB_POST_OUTCOMES.len()],
 }
 
-/// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
+/// Storage is fixed-size, except the per-actor voice stall map, which is
+/// bounded by the live guild-actor set. Unknown labels collapse to
+/// `other`, including hostile input.
 #[derive(Default)]
 pub struct Metrics(Mutex<Values>);
 
 pub fn global() -> &'static Metrics {
     static METRICS: OnceLock<Metrics> = OnceLock::new();
     METRICS.get_or_init(Metrics::default)
+}
+
+/// The recorded contribution for `actor`, fenced by generation: an older
+/// generation gets `None` (a stale incarnation cannot erase or resurrect
+/// state), a newer one first resets the whole contribution (replacement
+/// retires the old incarnation).
+fn voice_actor_entry(
+    values: &mut Values,
+    actor: u64,
+    generation: u64,
+) -> Option<&mut VoiceActorStall> {
+    let entry = values.voice_actors.entry(actor).or_default();
+    if generation < entry.generation {
+        return None;
+    }
+    if generation > entry.generation {
+        entry.generation = generation;
+        entry.halted = false;
+        entry.queue_pending = [0; VOICE_QUEUE_LANES.len()];
+        entry.oldest_age_secs = 0;
+    }
+    Some(entry)
 }
 
 impl Metrics {
@@ -805,24 +856,87 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
-    /// Guild-actor halt latch state: 1 while CredentialRefused halted the
-    /// worker, 0 otherwise. Last writer wins.
-    pub fn set_voice_halted(&self, halted: bool) {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .voice_worker_halted = u64::from(halted);
-    }
-
-    /// Queued action depth by lane plus the oldest pending item's age.
-    /// Last writer wins; render 0 age when the queue is empty.
-    pub fn set_voice_queue(&self, urgent: u64, deferred: u64, oldest_age_secs: u64) {
+    /// Record one guild actor's halt latch. `actor` is an opaque
+    /// process-local key, never rendered. The public
+    /// `two_bot_voice_worker_halted` gauge is 1 while ANY current actor
+    /// is halted, so a healthy actor cannot hide another's stall.
+    /// Reports from a generation older than the one recorded for the
+    /// actor are ignored; a newer generation replaces that actor's
+    /// whole recorded contribution.
+    pub fn set_voice_actor_halted(&self, actor: u64, generation: u64, halted: bool) {
         let mut values = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        values.voice_queue_pending = [urgent, deferred];
-        values.voice_queue_oldest_age_secs = oldest_age_secs;
+        if let Some(entry) = voice_actor_entry(&mut values, actor, generation) {
+            entry.halted = halted;
+        }
+    }
+
+    /// Record one guild actor's queued depth by lane plus its oldest
+    /// pending age (0 when its queue is empty). The public
+    /// `two_bot_voice_queue_pending{lane}` gauges are saturating sums
+    /// across current actors and
+    /// `two_bot_voice_queue_oldest_age_seconds` is their maximum.
+    /// Generation fencing matches [`Self::set_voice_actor_halted`].
+    pub fn set_voice_actor_queue(
+        &self,
+        actor: u64,
+        generation: u64,
+        urgent: u64,
+        deferred: u64,
+        oldest_age_secs: u64,
+    ) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = voice_actor_entry(&mut values, actor, generation) {
+            entry.queue_pending = [urgent, deferred];
+            entry.oldest_age_secs = oldest_age_secs;
+        }
+    }
+
+    /// Retire one guild actor incarnation's stall contribution (actor
+    /// shutdown / guild removal). A generation older than the recorded
+    /// one must not erase a replacement actor's state; removing an
+    /// unknown actor changes nothing.
+    pub fn remove_voice_actor(&self, actor: u64, generation: u64) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if values
+            .voice_actors
+            .get(&actor)
+            .is_some_and(|entry| generation >= entry.generation)
+        {
+            values.voice_actors.remove(&actor);
+        }
+    }
+
+    /// One actor's recorded stall contribution as `(generation, halted,
+    /// queue_pending by lane, oldest_age_secs)`, or `None` when the actor
+    /// has no recorded contribution. Test/diagnostic seam only: the actor
+    /// key is process-local and this lookup is never rendered, labelled
+    /// or persisted.
+    #[doc(hidden)]
+    pub fn voice_actor_contribution(
+        &self,
+        actor: u64,
+    ) -> Option<(u64, bool, [u64; VOICE_QUEUE_LANES.len()], u64)> {
+        let values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_actors.get(&actor).map(|entry| {
+            (
+                entry.generation,
+                entry.halted,
+                entry.queue_pending,
+                entry.oldest_age_secs,
+            )
+        })
     }
 
     /// Age of the oldest in-flight voice REST attempt in seconds; 0 idles it.
@@ -832,6 +946,18 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .voice_rest_in_flight_age_secs = age_secs;
+    }
+
+    /// Creator-map freshness: last merged generation plus seconds since that
+    /// merge. Last writer wins; the actor tick republishes every tick so age
+    /// keeps climbing between merges instead of freezing at the merge-time 0.
+    pub fn set_voice_creator_map(&self, generation: u64, age_secs: u64) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.creator_map_generation = generation;
+        values.creator_map_age_secs = age_secs;
     }
 
     /// One global-backoff wait capped instead of parking the actor: the call
@@ -1323,25 +1449,31 @@ impl Metrics {
             )
             .unwrap();
         }
+        // Aggregates over the current guild-actor set: any actor halted,
+        // per-lane saturating sums, maximum oldest-pending age.
+        let voice_halted = u64::from(values.voice_actors.values().any(|actor| actor.halted));
+        let mut voice_queue_pending = [0_u64; VOICE_QUEUE_LANES.len()];
+        let mut voice_queue_oldest_age_secs = 0_u64;
+        for actor in values.voice_actors.values() {
+            for (total, depth) in voice_queue_pending.iter_mut().zip(actor.queue_pending) {
+                *total = total.saturating_add(depth);
+            }
+            voice_queue_oldest_age_secs = voice_queue_oldest_age_secs.max(actor.oldest_age_secs);
+        }
         header(
             &mut out,
             "two_bot_voice_worker_halted",
             "gauge",
-            "Guild-actor halt latch: 1 while CredentialRefused halted join processing.",
+            "Guild-actor halt latch: 1 while any guild actor is halted (CredentialRefused halted join processing).",
         );
-        writeln!(
-            out,
-            "two_bot_voice_worker_halted {}",
-            values.voice_worker_halted
-        )
-        .unwrap();
+        writeln!(out, "two_bot_voice_worker_halted {voice_halted}").unwrap();
         header(
             &mut out,
             "two_bot_voice_queue_pending",
             "gauge",
-            "Queued (not in-flight) voice actions by lane.",
+            "Queued (not in-flight) voice actions by lane, summed across guild actors.",
         );
-        for (lane, count) in VOICE_QUEUE_LANES.iter().zip(values.voice_queue_pending) {
+        for (lane, count) in VOICE_QUEUE_LANES.iter().zip(voice_queue_pending) {
             writeln!(
                 out,
                 "two_bot_voice_queue_pending{{lane=\"{lane}\"}} {count}"
@@ -1352,12 +1484,11 @@ impl Metrics {
             &mut out,
             "two_bot_voice_queue_oldest_age_seconds",
             "gauge",
-            "Age of the oldest queued voice action in seconds; 0 when empty.",
+            "Age of the oldest queued voice action in seconds, maximum across guild actors; 0 when empty.",
         );
         writeln!(
             out,
-            "two_bot_voice_queue_oldest_age_seconds {}",
-            values.voice_queue_oldest_age_secs
+            "two_bot_voice_queue_oldest_age_seconds {voice_queue_oldest_age_secs}"
         )
         .unwrap();
         header(
@@ -1370,6 +1501,30 @@ impl Metrics {
             out,
             "two_bot_voice_rest_in_flight_age_seconds {}",
             values.voice_rest_in_flight_age_secs
+        )
+        .unwrap();
+        header(
+            &mut out,
+            "two_bot_voice_creator_map_generation",
+            "gauge",
+            "Last merged creator-map generation; 0 before the first merge.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_creator_map_generation {}",
+            values.creator_map_generation
+        )
+        .unwrap();
+        header(
+            &mut out,
+            "two_bot_voice_creator_map_age_seconds",
+            "gauge",
+            "Seconds since the last successful creator-map merge; 0 when never merged.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_creator_map_age_seconds {}",
+            values.creator_map_age_secs
         )
         .unwrap();
         scalar(
@@ -1987,6 +2142,22 @@ mod tests {
     }
 
     #[test]
+    fn voice_join_bucket_labels_match_the_pinned_contract() {
+        let metrics = Metrics::default();
+        metrics.voice_join_to_move(Duration::from_millis(1));
+        let text = metrics.render(None);
+        let rendered: Vec<&str> = text
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("two_bot_voice_join_to_move_seconds_bucket{le=\"")?
+                    .split('"')
+                    .next()
+            })
+            .collect();
+        assert_eq!(rendered, VOICE_JOIN_TO_MOVE_BUCKET_LE);
+    }
+
+    #[test]
     fn voice_join_occupancy_buckets_cap_without_new_series() {
         // Seeding TEST (occupancy-to-join curve): one counter per occupancy
         // bucket, capped at 7+ so cardinality stays fixed. No channel, member
@@ -2457,6 +2628,45 @@ mod tests {
             "bad sample: {}",
             series[0]
         );
+    }
+
+    #[test]
+    fn creator_map_gauges_are_label_free_generation_and_age() {
+        // Observability v1: the creator-map freshness renders as two label-free
+        // gauge series — the last merged generation and the seconds since that
+        // merge, both 0 before the first merge — so no channel, creator,
+        // guild or timestamp label can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_creator_map_generation gauge\n"));
+        assert!(text.contains("two_bot_voice_creator_map_generation 0\n"));
+        assert!(text.contains("# TYPE two_bot_voice_creator_map_age_seconds gauge\n"));
+        assert!(text.contains("two_bot_voice_creator_map_age_seconds 0\n"));
+        metrics.set_voice_creator_map(7, 42);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_creator_map_generation 7\n"));
+        assert!(text.contains("two_bot_voice_creator_map_age_seconds 42\n"));
+        assert!(!text.contains("two_bot_voice_creator_map_generation{"));
+        assert!(!text.contains("two_bot_voice_creator_map_age_seconds{"));
+        // Last writer wins on both series together.
+        metrics.set_voice_creator_map(9, 300);
+        metrics.set_voice_creator_map(8, 301);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_creator_map_generation 8\n"));
+        assert!(text.contains("two_bot_voice_creator_map_age_seconds 301\n"));
+        // Fixed cardinality: exactly one series each, parseable numbers.
+        for name in [
+            "two_bot_voice_creator_map_generation",
+            "two_bot_voice_creator_map_age_seconds",
+        ] {
+            let series: Vec<_> = text
+                .lines()
+                .filter(|line| line.starts_with(&format!("{name} ")))
+                .collect();
+            assert_eq!(series.len(), 1, "missing series: {name}");
+            let (_, value) = series[0].rsplit_once(' ').unwrap();
+            value.parse::<u64>().expect("bad sample");
+        }
     }
 
     #[test]

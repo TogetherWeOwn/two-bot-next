@@ -107,6 +107,10 @@ name = "reengagement-list"
 path = "src/bin/reengagement_list.rs"
 
 [[bin]]
+name = "game-activity-report"
+path = "src/bin/game_activity_report.rs"
+
+[[bin]]
 name = "rollback-delta"
 path = "src/bin/rollback_delta.rs"
 

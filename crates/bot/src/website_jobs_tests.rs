@@ -180,6 +180,7 @@ async fn recovery_registration_does_not_unpark_unavailable_jobs() {
     let recovery = Job {
         name: RECOVERY_JOB_NAME,
         cadence: Duration::from_secs(30),
+        cadence_source: None,
         startup_jitter: Duration::ZERO,
         timeout: Duration::from_secs(25),
         action: Arc::new(|| Box::pin(async { Ok(()) })),
@@ -427,6 +428,7 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
             vec![Job {
                 name,
                 cadence: Duration::from_secs(600),
+                cadence_source: None,
                 startup_jitter: Duration::ZERO,
                 timeout: Duration::from_secs(10),
                 action: Arc::new(move || {

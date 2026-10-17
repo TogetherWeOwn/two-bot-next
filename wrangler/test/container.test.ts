@@ -471,7 +471,38 @@ test("keepalive logs the gateway failure phase and class once, as strict tokens"
   const failure = { phase: "durable_gateway", class: "checkpoint_load_failed" };
   const h = await keepaliveSeeing(t, readyzWith(failure));
   assert.deepEqual(gatewayFailureLogs(h.logs), [JSON.stringify({
-    event: "container_gateway_failure", phase: "durable_gateway", class: "checkpoint_load_failed",
+    event: "container_gateway_failure",
+    phase: "durable_gateway",
+    class: "checkpoint_load_failed",
+    failed_step: "unknown",
+    error_code: "none",
+    build_revision: "unknown",
+    release: "unknown",
+    worker_version: ID,
+    log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
+  })]);
+});
+
+test("keepalive logs build revision plus failed step and SQLSTATE when served", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    {
+      phase: "durable_gateway",
+      class: "gateway_runtime_failed",
+      failed_step: "gateway_run",
+      error_code: "42501",
+    },
+    { build_revision: "abc1234", build_id: "build-1" },
+  ));
+  assert.deepEqual(gatewayFailureLogs(h.logs), [JSON.stringify({
+    event: "container_gateway_failure",
+    phase: "durable_gateway",
+    class: "gateway_runtime_failed",
+    failed_step: "gateway_run",
+    error_code: "42501",
+    build_revision: "abc1234",
+    release: "abc1234",
+    worker_version: ID,
+    log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
   })]);
 });
 
@@ -521,9 +552,75 @@ test("keepalive logs only phase and class even when the failure object carries m
   }));
   const [line] = gatewayFailureLogs(h.logs);
   assert.equal(line, JSON.stringify({
-    event: "container_gateway_failure", phase: "durable_gateway", class: "gateway_runtime_failed",
+    event: "container_gateway_failure",
+    phase: "durable_gateway",
+    class: "gateway_runtime_failed",
+    failed_step: "unknown",
+    error_code: "none",
+    build_revision: "unknown",
+    release: "unknown",
+    worker_version: ID,
+    log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
   }));
   assert.ok(h.logs.every((entry) => !entry.includes("hunter2")));
+});
+
+// Release-tagged error tracking groups gateway failures by `class`: the keepalive
+// re-emits the container failure with the /readyz git SHA as `release`
+// (Workers Logs filters by release and groups by class).
+const RELEASE_SHA = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
+
+test("keepalive tags the gateway failure with the container release and worker version", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: RELEASE_SHA, build_id: "123-1" },
+  ));
+  assert.deepEqual(gatewayFailureLogs(h.logs), [JSON.stringify({
+    event: "container_gateway_failure",
+    phase: "durable_gateway",
+    class: "checkpoint_load_failed",
+    failed_step: "unknown",
+    error_code: "none",
+    build_revision: RELEASE_SHA,
+    release: RELEASE_SHA,
+    worker_version: ID,
+    log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
+  })]);
+});
+
+test("keepalive tags an unparseable build revision as unknown without echoing it", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: "postgres://user:hunter2@db.internal/app" },
+  ));
+  const [line] = gatewayFailureLogs(h.logs);
+  assert.equal(JSON.parse(line!).release, "unknown");
+  assert.equal(JSON.parse(line!).worker_version, ID);
+  assert.ok(h.logs.every((entry) => !entry.includes("hunter2")));
+});
+
+test("metrics alert lines carry the keepalive release and worker version", async (t) => {
+  const h = await harness(t);
+  const rankClass = `two_bot_job_last_error_class{job="rank",class="database"} 1`;
+  const failing = metricsBody(3).replace(
+    'two_bot_job_last_error_class{job="rank",class="database"} 0', rankClass);
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") return new Response(failing);
+    return new Response(JSON.stringify({
+      components: [["process", "ready"]],
+      build_revision: RELEASE_SHA, build_id: "123-1",
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  });
+  await tickKeepalive(h.bot);
+  const alerts = h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line))
+    .filter((event) => event.event === "metrics_alert");
+  assert.ok(alerts.length > 0, "expected a metrics alert line");
+  for (const alert of alerts) {
+    assert.equal(alert.release, RELEASE_SHA);
+    assert.equal(alert.worker_version, ID);
+  }
+  assert.match(alerts[0].content, /last error class: database/);
 });
 
 test("keepalive ignores a gateway failure in a non-bot (text) probe answer", async (t) => {
@@ -1492,7 +1589,7 @@ for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) 
     await h.tick();
     await h.tick();
     assert.equal(h.posts.length, 2, "only the second valid (flat) sample proves recovery");
-    assert.equal(JSON.parse(h.posts[1]!.init.body as string).content, "two-bot-next RESOLVED dispatch_drops:reactions.");
+    assert.match(JSON.parse(h.posts[1]!.init.body as string).content, /RESOLVED dispatch_drops:reactions\. Build: unknown\. Logs: /);
     assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
   });
 }
@@ -1552,13 +1649,13 @@ test("real SDK keeps one persistent chain across concurrent health traffic, rest
   await h.bot.onStart();
   assert.deepEqual(h.pending(), [initialTask], "eviction must reuse the persisted task");
   t.mock.timers.tick(60_000);
-  for (let failures = 1; failures <= 10; failures++) {
+  for (let failures = 1; failures <= 3; failures++) {
     await fireSdkAlarm(t, h.bot);
     assert.equal(h.values.get("two-bot:readiness")?.failures, failures);
     assert.equal(h.pending().length, 1, "exactly one successor per firing");
     assert.equal(h.requests.filter((r) => r.pathname === "/readyz").length, failures);
     const events = h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
-    assert.equal(events.length, failures === 10 ? 1 : 0, "traffic must not accelerate the threshold");
+    assert.equal(events.length, failures === 2 ? 1 : failures > 2 ? 1 : 0, "traffic must not accelerate the threshold");
   }
   h.setProbeStatus(200);
   await fireSdkAlarm(t, h.bot);
@@ -1715,15 +1812,15 @@ for (const status of [200, 503]) {
   });
 }
 
-test("default threshold is ten failed minute ticks; absent binding is log-only", async (t) => {
+test("default threshold is two failed minute ticks; absent binding is log-only", async (t) => {
   const h = await alertHarness(t);
-  for (let i = 0; i < 9; i++) await h.tick();
+  await h.tick();
   assert.equal(h.events().length, 0);
   await h.tick();
   assert.equal(h.events().length, 1);
   assert.equal(h.events()[0].event, "container_unready_alert");
-  assert.equal(h.events()[0].consecutive_failures, 10);
-  assert.equal(h.events()[0].threshold, 10);
+  assert.equal(h.events()[0].consecutive_failures, 2);
+  assert.equal(h.events()[0].threshold, 2);
   assert.equal(h.events()[0].status, 503);
   assert.equal(typeof h.events()[0].first_failure_at, "number");
   await h.tick();
@@ -1732,7 +1829,7 @@ test("default threshold is ten failed minute ticks; absent binding is log-only",
   await h.tick();
   assert.deepEqual(h.events().map((e) => e.event), ["container_unready_alert", "container_unready_recovery"]);
   assert.equal(h.posts.length, 0);
-  assert.equal(h.schedules.mock.callCount(), 13);
+  assert.equal(h.schedules.mock.callCount(), 5);
 });
 
 test("configured threshold sends one mention-free alert and recovery per incident", async (t) => {
@@ -1959,12 +2056,11 @@ for (const sender of ["readiness", "metrics"] as const) {
 }
 
 for (const count of [undefined, "", "0", "-1", "1.5", "NaN", "Infinity", "1e1", " 2 ", "9007199254740992"]) {
-  test(`invalid or absent threshold ${JSON.stringify(count)} defaults to a ten-minute tick count`, async (t) => {
+  test(`invalid or absent threshold ${JSON.stringify(count)} defaults to a two-minute tick count`, async (t) => {
     const h = await alertHarness(t, { KEEPALIVE_SECONDS: "120", UNREADY_ALERT_FAILURES: count });
-    for (let i = 0; i < 4; i++) await h.tick();
-    assert.equal(h.events().length, 0);
     await h.tick();
-    assert.equal(h.events()[0].threshold, 5);
+    assert.equal(h.events().length, 1);
+    assert.equal(h.events()[0].threshold, 1);
   });
 }
 

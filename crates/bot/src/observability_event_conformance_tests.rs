@@ -40,10 +40,11 @@ const GATEWAY_RS_EVENTS: [&str; 20] = [
     "retention purge skipped; schema gap, operator replay required",
 ];
 
-/// `crates/bot/src/main.rs`: the seven cataloged `tracing` messages.
-const MAIN_RS_TRACED_EVENTS: [&str; 7] = [
+/// `crates/bot/src/main.rs`: the eight cataloged `tracing` messages.
+const MAIN_RS_TRACED_EVENTS: [&str; 8] = [
     "durable gateway initialized; shard connecting",
     "gateway prerequisites missing; gateway parked, /readyz reports down",
+    "gateway readiness failure injection active; /readyz reports gateway down for the staging rollback drill",
     "container service failed",
     "durable gateway failed; checkpoint unchanged, readiness unavailable",
     "shutdown_deadline_exceeded: abandoning in-flight work",
@@ -724,7 +725,7 @@ const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 11] = [
     "eventsub reconcile found failed subscriptions on our callback; deleting and re-creating",
     "eventsub reconcile action failed; continuing with the rest of the plan",
     "eventsub reconcile did not converge: an action failed or a healthy subscription is missing",
-    "eventsub subscriptions re-created but none verified yet",
+    "eventsub subscriptions re-created but not all verified yet",
     "eventsub subscriptions reconciled",
     "eventsub reconcile failed",
 ];

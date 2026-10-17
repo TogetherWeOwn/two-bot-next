@@ -16,7 +16,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex, RwLock, Weak,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -2503,8 +2503,13 @@ pub struct GuildRoomWorker<S, H> {
     /// re-read; the maintenance tick merges it, debounced. Set by
     /// `ActorCommand::RefreshCreators`, cleared by `reload_creators`.
     creators_refresh_due: bool,
-    /// Actor clock of the last creator-view merge (periodic refresh).
+    /// Actor clock of the last creator refresh *attempt* (success or
+    /// failure); paces the interval/debounce retries.
     creators_read_ms: Option<u64>,
+    /// Actor clock of the last *successful* creator-view merge. The age
+    /// gauge counts from this field only, so it keeps climbing through a
+    /// store outage instead of resetting on every failed attempt.
+    creators_merged_ms: Option<u64>,
     /// Live generation the creator view was last merged at. A gateway
     /// reconnect (GuildCreate/Resumed) bumps the generation but sends no
     /// channel event, so with no RefreshCreators flag the merge would wait
@@ -2897,6 +2902,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             creators,
             creators_refresh_due: false,
             creators_read_ms: None,
+            creators_merged_ms: None,
             creators_generation,
             creator_misses: HashSet::new(),
             creator_revalidate_cooldown_until: None,
@@ -3278,6 +3284,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         match self.store.creators(self.live.guild_id).await {
             Ok(rows) => {
                 self.creators_generation = generation;
+                self.creators_merged_ms = Some(now_ms);
                 self.creator_misses.clear();
                 self.creator_revalidate_cooldown_until = None;
                 let mut added = 0u64;
@@ -7836,10 +7843,62 @@ fn watchdog_due(
     queue_nonempty && now.saturating_duration_since(last_progress) >= stuck_after
 }
 
+/// Creator-map staleness on the actor-uptime clock: seconds since the last
+/// successful merge; 0 when never merged. Pure, unit-tested: the gauge must
+/// keep climbing between merges instead of freezing at the merge-time zero.
+fn creator_map_age_secs(creators_merged_ms: Option<u64>, now_ms: u64) -> u64 {
+    creators_merged_ms.map_or(0, |last| now_ms.saturating_sub(last) / 1000)
+}
+
+/// Process-wide guild-actor incarnation counter for the per-actor stall
+/// gauges. Each actor loop start takes the next generation, so a
+/// replacement actor's first publish retires the old incarnation's
+/// contribution and late publishes from the old incarnation (e.g. its
+/// watchdog sibling outliving it by a tick) are fenced out.
+static VOICE_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn next_voice_actor_generation() -> u64 {
+    VOICE_ACTOR_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1)
+}
+
+/// Retires one actor incarnation's stall-gauge contribution when the
+/// actor loop ends — including a panic unwind, which skips the loop's
+/// own shutdown steps. Retirement fences the watchdog sibling first:
+/// setting `retired` under the snapshot lock (the lock the sibling
+/// publishes under) means an in-flight sibling publish either completes
+/// before the removal or never happens, so it cannot resurrect the
+/// contribution after removal. A dead weak means no sibling can publish
+/// again, which fences it the same way.
+struct VoiceActorMetricGuard<H> {
+    actor: Snowflake,
+    generation: u64,
+    stall: Weak<StallShared<H>>,
+}
+
+impl<H> Drop for VoiceActorMetricGuard<H> {
+    fn drop(&mut self) {
+        if let Some(stall) = self.stall.upgrade() {
+            let _state = stall
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            stall.retired.store(true, Ordering::Relaxed);
+        }
+        metrics::global().remove_voice_actor(self.actor, self.generation);
+    }
+}
+
 /// Publish the per-tick stall gauges: halt latch plus per-lane queue depth
-/// and oldest-pending age. Cheap atomics; called every actor tick so
-/// `/ops/metrics` always shows the worker's stall posture.
-fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWorker<S, H>) {
+/// and oldest-pending age, as this guild actor incarnation's contribution
+/// to the process-wide aggregates. Cheap atomics; called every actor tick
+/// so `/ops/metrics` always shows the worker's stall posture.
+fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(
+    worker: &GuildRoomWorker<S, H>,
+    generation: u64,
+    now_ms: u64,
+) {
     let guild = worker.live.guild_id;
     let (urgent, deferred) = worker.queue.pending_counts(guild);
     let oldest_age_secs = worker
@@ -7847,12 +7906,18 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWor
         .oldest_pending_age(guild)
         .map_or(0, |age| age.as_secs());
     let gauges = metrics::global();
-    gauges.set_voice_halted(worker.halted());
+    gauges.set_voice_actor_halted(guild, generation, worker.halted());
+    gauges.set_voice_creator_map(
+        worker.creators_generation,
+        creator_map_age_secs(worker.creators_merged_ms, now_ms),
+    );
     // Recompute the in-flight REST age from attempts still live, so the
     // gauge shows a currently-stalled request instead of the begin/drop
     // snapshots (0 at begin, already removed at drop).
     worker.http.republish_rest_age();
-    gauges.set_voice_queue(
+    gauges.set_voice_actor_queue(
+        guild,
+        generation,
         u64::try_from(urgent).unwrap_or(u64::MAX),
         u64::try_from(deferred).unwrap_or(u64::MAX),
         oldest_age_secs,
@@ -7868,7 +7933,18 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWor
 /// main task recovers once the write returns.
 struct StallShared<H> {
     guild: Snowflake,
+    /// Actor incarnation generation for the per-actor stall gauges; the
+    /// sibling publishes under the same generation as the main task.
+    generation: u64,
+    /// Set by the metric guard under the `state` lock when the actor loop
+    /// ends; `observe` checks it under the same lock before publishing,
+    /// so no sibling publish can follow the contribution's removal.
+    retired: AtomicBool,
     http: Arc<H>,
+    /// Actor start instant: the sibling computes the creator-map age from
+    /// the stored merge stamp on this clock, so the age keeps climbing
+    /// while the main task (and its snapshots) are hung in a dispatch.
+    start: tokio::time::Instant,
     state: Mutex<StallState>,
 }
 
@@ -7879,6 +7955,8 @@ struct StallState {
     deferred: usize,
     oldest_age_secs: u64,
     halted: bool,
+    creators_generation: u64,
+    creators_merged_ms: Option<u64>,
 }
 
 impl<H: RoomWrites> StallShared<H> {
@@ -7899,24 +7977,49 @@ impl<H: RoomWrites> StallShared<H> {
             deferred,
             oldest_age_secs,
             halted: worker.halted(),
+            creators_generation: worker.creators_generation,
+            creators_merged_ms: worker.creators_merged_ms,
         };
+    }
+
+    /// Creator-map age for a snapshot, computed on the sibling's own clock:
+    /// a frozen snapshot (hung dispatch) still yields a climbing age.
+    fn snapshot_creator_map_age_secs(&self, snap: &StallState) -> u64 {
+        let now_ms = self.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        creator_map_age_secs(snap.creators_merged_ms, now_ms)
     }
 
     /// Watchdog + gauge publish from the shared snapshot. Reads only: safe
     /// to run on the sibling task while the main task is hung in dispatch.
     fn observe(&self, stuck_after: Duration, last_fire: &mut Option<tokio::time::Instant>) {
-        let snap = *self.state.lock().expect("stall snapshot lock");
-        // Recompute the in-flight REST age from attempts still live, so the
-        // gauge shows a currently-stalled request instead of the begin/drop
-        // snapshots (0 at begin, already removed at drop).
-        self.http.republish_rest_age();
-        let gauges = metrics::global();
-        gauges.set_voice_halted(snap.halted);
-        gauges.set_voice_queue(
-            u64::try_from(snap.urgent).unwrap_or(u64::MAX),
-            u64::try_from(snap.deferred).unwrap_or(u64::MAX),
-            snap.oldest_age_secs,
-        );
+        // Publish under the snapshot lock: the metric guard sets `retired`
+        // under the same lock before removing this actor's contribution,
+        // so a publish either lands before that removal or not at all.
+        let snap = {
+            let state = self.state.lock().expect("stall snapshot lock");
+            if self.retired.load(Ordering::Relaxed) {
+                return;
+            }
+            let snap = *state;
+            // Recompute the in-flight REST age from attempts still live, so
+            // the gauge shows a currently-stalled request instead of the
+            // begin/drop snapshots (0 at begin, already removed at drop).
+            self.http.republish_rest_age();
+            let gauges = metrics::global();
+            gauges.set_voice_actor_halted(self.guild, self.generation, snap.halted);
+            gauges.set_voice_actor_queue(
+                self.guild,
+                self.generation,
+                u64::try_from(snap.urgent).unwrap_or(u64::MAX),
+                u64::try_from(snap.deferred).unwrap_or(u64::MAX),
+                snap.oldest_age_secs,
+            );
+            gauges.set_voice_creator_map(
+                snap.creators_generation,
+                self.snapshot_creator_map_age_secs(&snap),
+            );
+            snap
+        };
         // Stuck-worker watchdog: queued work with no completed turn for the
         // full window. Log + metric only; the queue keeps its retries so a
         // transient outage still drains on recovery.
@@ -7951,6 +8054,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     tick: Duration,
     limits: ActorLimits,
 ) {
+    let generation = next_voice_actor_generation();
     let start = tokio::time::Instant::now();
     let mut timer = tokio::time::interval(tick);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -7965,16 +8069,29 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     // gauges. The sibling never touches `worker`.
     let stall = Arc::new(StallShared {
         guild: worker.live.guild_id,
+        generation,
+        retired: AtomicBool::new(false),
         http: Arc::clone(&worker.http),
+        start,
         state: Mutex::new(StallState {
             last_progress,
             urgent: 0,
             deferred: 0,
             oldest_age_secs: 0,
             halted: false,
+            creators_generation: 0,
+            creators_merged_ms: None,
         }),
     });
     stall.snapshot(worker, last_progress);
+    // Retires this incarnation's stall contribution on every exit path
+    // (inbox close or panic unwind). Declared after `stall`, so it drops
+    // while the strong ref is still alive and its retire fence can engage.
+    let _metric_guard = VoiceActorMetricGuard {
+        actor: worker.live.guild_id,
+        generation,
+        stall: Arc::downgrade(&stall),
+    };
     let stop_watchdog = Arc::new(AtomicBool::new(false));
     let watchdog = {
         // Weak, not a clone: the actor task owns the only strong ref. If a
@@ -8050,7 +8167,8 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 dispatch_budget = dispatch_budget.saturating_sub(1);
             }
             _ = timer.tick() => {
-                publish_voice_gauges(worker);
+                let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                publish_voice_gauges(worker, generation, now_ms);
                 // The stuck-worker watchdog lives on the sibling task now, so
                 // it fires while a dispatch is hung: see `StallShared`. The
                 // tick arm keeps the fresh gauge publish plus recovery below.
@@ -8123,6 +8241,9 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 maintenance_ready = false;
                 let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 worker.reload_creators(now_ms).await;
+                // Republish the merge stamp now, not next tick: until then
+                // the watchdog sibling would keep ageing the pre-merge stamp.
+                stall.snapshot(worker, last_progress);
                 worker.reload_name_settings(now_ms).await;
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;

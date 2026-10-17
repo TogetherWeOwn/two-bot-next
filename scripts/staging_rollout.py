@@ -625,6 +625,41 @@ def save(path, value):
     Path(path).write_text(json.dumps(value, indent=2) + "\n")
 
 
+DEPLOY_ENV_VAR = "TWO_DEPLOY_ENV"
+GATEWAY_FAIL_INJECTION_VAR = "TWO_GATEWAY_READINESS_FAIL_INJECTION"
+
+
+def apply_gateway_fail_injection(config, enabled):
+    """Stage the rollback-drill injection in the GENERATED config only.
+
+    The committed TOML may never carry the switch or a deploy-env marker
+    outside staging (wrangler/scripts/check-env-bindings.py); this helper
+    refuses such a source again so a hand-generated config cannot smuggle
+    either past CI. When `enabled`, the staging fence marker must already
+    be exactly "staging" and only the staging vars of the generated config
+    gain the switch — top-level, production and every other environment
+    stay untouched, and the checked-in file is never modified. When not
+    enabled nothing is added, so a plain push deploy is byte-identical in
+    behavior to before the drill existed.
+    """
+    envs = config.get("env") or {}
+    tables = [("top-level", config.get("vars") or {})]
+    tables += [(name, (env or {}).get("vars") or {}) for name, env in envs.items()]
+    for _name, variables in tables:
+        require(GATEWAY_FAIL_INJECTION_VAR not in variables,
+                "gateway_fail_injection_in_source_config")
+    for name, variables in tables:
+        if name != "staging":
+            require(DEPLOY_ENV_VAR not in variables, "deploy_env_outside_staging")
+    if not enabled:
+        return
+    staging = mapping(mapping(config.get("env")).get("staging"))
+    variables = staging.get("vars")
+    require(isinstance(variables, dict) and variables.get(DEPLOY_ENV_VAR) == "staging",
+            "gateway_fail_injection_fence_missing")
+    variables[GATEWAY_FAIL_INJECTION_VAR] = "1"
+
+
 def prepare(args, client):
     staging_url()
     revision = os.environ.get("GITHUB_SHA", "")
@@ -652,6 +687,9 @@ def prepare(args, client):
         container["image_build_context"] = str(source.parent.parent)
     containers[0]["image_vars"] = {"BOT_BUILD_REVISION": revision, "BOT_BUILD_ID": build_id}
     containers[0]["rollout_kind"] = "full_auto"
+    # Rollback drill only: the dispatch-only workflow input reaches the
+    # deployed build solely as this flag on the generated staging config.
+    apply_gateway_fail_injection(config, bool(getattr(args, "inject_gateway_failure", False)))
     save(args.deploy_config, config)
     save(args.receipt, {"started": started, "application_id": app["id"],
                         "namespace_id": app["durable_objects"]["namespace_id"],
@@ -897,7 +935,12 @@ def main():
     parser.add_argument("--config", default="wrangler.toml")
     parser.add_argument("--deploy-config", default="staging-deploy.json")
     parser.add_argument("--evidence", default="staging-rollout-evidence.json")
+    parser.add_argument("--inject-gateway-failure", action="store_true",
+                        help="prepare only: staging rollback drill — the generated "
+                             "staging deploy config reports gateway not-ready")
     args = parser.parse_args()
+    if args.inject_gateway_failure and args.mode != "prepare":
+        parser.error("--inject-gateway-failure is prepare-only")
     client = None
     try:
         deadline = time.monotonic() + VERIFY_TIMEOUT_SECONDS if args.mode == "verify" else None

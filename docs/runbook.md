@@ -146,10 +146,10 @@ Look for these literal messages:
 - `gateway shard loop started` / `gateway reconnect failed; Twilight will retry`.
 - `durable gateway failed; checkpoint unchanged, readiness unavailable` — fatal
   initialization failure; underlying SQL error deliberately not logged. Its
-  `error_class` is also on `/readyz` as `gateway_failure` for 15 s before exit
-  (startup failures linger 15 s; only a running-gateway failure lingers 75 s)
-  and in Workers Logs as `container_gateway_failure` (see
-  [startup-diagnostics.md](startup-diagnostics.md)).
+  `error_class` plus the failing step and SQLSTATE code are also on `/readyz`
+  as `gateway_failure` for 15 s before exit (startup failures linger 15 s;
+  only a running-gateway failure lingers 75 s) and in Workers Logs as
+  `container_gateway_failure` (see [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
 - Worker: `two-bot container started|stopped`, `two-bot /readyz unhealthy`,
   `two-bot keepalive probe failed`, `two-bot container error`.
@@ -241,7 +241,8 @@ names, never error text or payloads. Take the first action for the reported clas
 | `feed` | Check the configured feed source's availability and recent fetch status through authorized diagnostics; do not copy response bodies. |
 | `recovery_required` | Preserve feed cursor and pending recovery state; follow the established recovery path before any manual replay or cursor change. |
 
-The streak clears on the next successful completion.
+The streak clears on the next successful completion. For feed delivery
+specifically, follow the [feed supervisor operator guide](feed-supervisor.md).
 
 #### Alert: REST 429
 
@@ -296,12 +297,14 @@ anything the burst may have executed twice.
 Evaluate rollback when the burst starts with the deployed revision: compare the
 alert's first-firing window with the staging-rollout evidence (or the gated
 production run) for that SHA. A 5xx share introduced by a promotion stage
-requires a manual rollback decision unless a 5xx-specific per-stage health gate
-is configured and wired to the shared gradual-promotion action. When its
-configured gate fails, the action restores the recorded pre-promote version; a
-manual rollback names the recorded Worker version and container image from the
-failed run's snapshot. A burst on an unchanged revision is a Discord incident
-or a dependency regression, not a rollback.
+requires a manual rollback decision unless a promotion stage invokes the
+`evaluatePromotionGate` helper (`wrangler/src/alert-rules.ts`, 5xx-only) and
+fails on its verdict. When that configured gate fails, the existing per-stage
+auto-rollback (staging verify, production gate, or the shared
+gradual-promotion action once wired) restores the recorded pre-promote
+version; a manual rollback names the recorded Worker version and container
+image from the failed run's snapshot. A burst on an unchanged revision is a
+Discord incident or a dependency regression, not a rollback.
 
 Escalate when the 5xx share stays above threshold across several windows after
 containment, or when 5xx coincide with 429/transport failures suggesting a
@@ -415,6 +418,66 @@ Escalate when failures persist across windows after the suspect deploy is
 identified, when a dead-letter or orphan names a stranded member, or when
 failures coincide with 429, DB-error or pool alerts — the fix then belongs
 to the on-call engineer, not another redeploy.
+
+#### Alert: voice join fast burn
+
+Creator joins are burning the 99.5%-moved-within-5 s error budget faster than
+14.4x in both the last hour and the last 5 minutes
+(`two_bot_voice_joins_received_total` minus benign `duplicate` refusals in
+`two_bot_voice_join_refused_total`, against
+`two_bot_voice_join_to_move_seconds_bucket{le="5"}`). Every non-duplicate
+refusal, failed move and slow (>5 s) move is burn. Each window needs at least
+10 genuine joins and two bad moves; one event alone cannot page or ticket.
+Receive counters lag one scrape so an in-flight move can complete. After startup
+or restart, a window stays inactive until its full history is available; a
+counter reset rebuilds the ring instead of firing.
+
+First response: confirm the spike is joins, not moves, via the authorized
+`/ops/metrics` scrape — compare `joins_received` growth against
+`voice_join_refused` by `reason` and `voice_operations{op="move"}` outcomes.
+`halted` means the actor is parked (check `two_bot_voice_worker_halted`);
+`unknown_creator`/`stale_ticket` point at creator-map or ticket generation
+drift; `discord`/`persistence` move outcomes point at REST or storage. Then
+read the container logs for `voice_event="voice_join_received"` refusal lines
+and `voice_event="voice_join"` terminal lines with their stage durations.
+
+Escalate when the burn persists across hours (the slow-burn ticket below will
+already be open), when `halted` refusals dominate, or when the stall matches a
+deploy — the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: voice join slow burn
+
+The same creator-join budget is burning faster than 6x in both the last 6
+hours and the last 30 minutes. This is the ticket-severity companion to the
+fast-burn page above: a moderate but sustained degradation — a slow leak of
+refusals or p95 creep past 5 s — that never spikes hard enough to page.
+Same signals, same first response, same escalation, lower urgency. Do not
+close it as "fast burn resolved": the fast window can clear while the slow
+grind continues.
+
+#### Alert: voice creator-map stale
+
+The voice actor re-merges the creator map from the store every 5 minutes;
+`two_bot_voice_creator_map_age_seconds` counts from the last *successful*
+merge (a failed read never resets it, and the stall watchdog keeps it
+climbing while the actor is hung). This alert fires when the age passes two
+refresh intervals (600 s) with `two_bot_voice_creator_map_generation` above
+0, meaning merges stopped landing and creator joins are served from a stale
+map: new or changed creators are invisible (`unknown_creator` refusals) and
+removed creators keep working. Generation 0 (no merge yet: boot, or voice
+parked) never fires, and a container old enough to lack the gauges holds the
+previous state instead of resolving it.
+
+First response: confirm via the authorized `/ops/metrics` scrape that the
+generation is flat while the age climbs, then look for the cause one layer
+down — store read failures (`db_errors`, pool saturation) or a halted actor
+(`two_bot_voice_worker_halted`). Read the container logs for
+`voice_join_received` refusal lines: a rising `unknown_creator` share with a
+flat generation is this alert becoming member-visible.
+
+Escalate when the store cause is not self-clearing, when `unknown_creator`
+refusals dominate, or when the flat generation survives a restart — the fix
+belongs to the on-call engineer, not another redeploy.
 
 #### Alert: gateway missed events
 
@@ -561,14 +624,16 @@ First response: if the failing process is still up (within the linger), read
 the `stage` label on `two_bot_gateway_checkpoint_failures_total` via the
 authorized `/ops/metrics` scrape — `pre_commit` means the commit was skipped
 after a funnel, leveling or acknowledgement failure, while `commit` means the
-durable store write itself failed. Once the process has restarted, the stage
-is not recoverable: the counter resets to zero and the Worker log line
-(`{"event":"container_gateway_failure","phase":…,"class":…}`) carries only
-`phase` and `class` — both stages map to `gateway_runtime_failed` — never
-the `stage`. Do not wait for the stage then; check the `gateway` component on
-`/readyz` and the Neon status for the staging branch instead: a `commit`
-failure next to DB-error or pool alerts points at the database, not the
-gateway. Do not restart manually: the process exits on its own after
+durable store write itself failed. The Worker log line
+(`container_gateway_failure`) and `/readyz` `gateway_failure` carry the phase,
+class, failing step and SQLSTATE code plus the `release`/`worker_version` tags
+— both checkpoint stages map to `gateway_runtime_failed` — but never the
+checkpoint `stage`. Once the process has restarted, the stage is not
+recoverable: the counter resets to zero. Do not wait for the stage then; check
+the `gateway` component on `/readyz` and the Neon status for the staging branch
+instead: a `commit` failure next to DB-error or pool alerts points at the
+database, not the gateway. Do not restart manually: the process exits on its own
+after
 the linger and the supervisor restarts from the committed checkpoint — verify
 the replacement is healthy per the
 [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
@@ -1221,7 +1286,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 | Control | Ported contract | Current operational boundary |
 |---|---|---|
 | Audit kill switch | Durable `audit_kill_switch`, singleton `id=1`; `engage_halt(actor_id)` / `disengage_halt()` library methods. Halt blocks queue discovery/claim/preparation, not fact recording or an already prepared/in-flight send. | Store exists, delivery service/operator endpoint not wired. No supported command in this binary. Durable DB errors propagate; legacy pure-model read-fail-open is **not** send authorization. See [audit store](audit-store.md). |
-| Automod | Exact `TWO_AUTOMOD=1` enables config. Dry-run by default; exact `TWO_AUTOMOD_ENFORCE=1` selects enforce. | Forwarded and composed into the gateway when activation/configuration permit. Requires valid Owen/protected-role configuration; enforcement can sanction. `TWO_AUTOMOD=1` requests MESSAGE_CONTENT intent. Flags alone do not override identity/permission gates or stop the bot. |
+| Automod | Exact `TWO_AUTOMOD=1` enables config. Dry-run by default; exact `TWO_AUTOMOD_ENFORCE=1` selects enforce. | Forwarded and composed into the gateway when activation/configuration permit. Requires valid Owen/protected-role configuration; enforcement can sanction. `TWO_AUTOMOD=1` requests MESSAGE_CONTENT intent. Flags alone do not override identity/permission gates or stop the bot. Filter/effect semantics, repeat expiry, corpus care and triage: [automod operator guide](automod-operator-guide.md). |
 | Moderation | Exact `TWO_MODERATION=1`; enabled config requires `TWO_OWEN_USER_ID`; protected-role policy applies. | Forwarded; channel handlers `/purge`, `/slowmode`, `/lockdown`, `/unlock` are registered and subject to activation and permission checks. Do not infer every member-moderation builtin executes. No config toggle demonstrated as an emergency stop. |
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Per-feature gates, not operational containment. Verify the affected deployed handler; registry publishing or a periodic job alone does not prove a specific action is active. |
 | Onboarding | `TWO_ONBOARDING_MODE=legacy|session|anchor`, default legacy; `TWO_ONBOARDING_DRY_RUN=1`. | Mode/dry-run contracts are feature-scoped, not bot-wide stop controls. Verify the affected handler and staging evidence; a catalogue value alone is not a runtime activation or reload receipt. |

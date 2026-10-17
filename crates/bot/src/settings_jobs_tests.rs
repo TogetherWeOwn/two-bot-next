@@ -272,6 +272,7 @@ async fn supervised_poll_applies_real_guild_settings_writes() {
         vec![Job {
             name: NAME,
             cadence: Duration::from_millis(40),
+            cadence_source: None,
             startup_jitter: Duration::ZERO,
             timeout: Duration::from_secs(5),
             action: Arc::new(move || {
