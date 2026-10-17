@@ -29,6 +29,7 @@
 //! production guild or tokens.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use twilight_cache_inmemory::{DefaultInMemoryCache, InMemoryCache};
@@ -347,6 +348,14 @@ pub struct Pipeline<
     /// Set once at startup by the runtime that wants audit entries
     /// (containment).
     audit_entry_observer: OnceLock<Arc<dyn AuditEntryObserver>>,
+    /// Whether the shard subscribed privileged `MESSAGE_CONTENT`, so
+    /// `msg.content` is actually delivered for ordinary guild messages.
+    /// Without it Discord sends content only for messages that mention the
+    /// bot, and measuring those would record a biased handful of lengths.
+    /// Direct pipelines (replay, tests) feed already-delivered events and
+    /// default to measuring; the live wrapper starts unmeasured and the
+    /// gateway runtime declares the real subscription before the shard runs.
+    message_content_delivered: AtomicBool,
 }
 
 impl<S, L, F, I, C, P> std::fmt::Debug for Pipeline<S, L, F, I, C, P> {
@@ -408,7 +417,21 @@ impl<
             vanity_guilds: Mutex::new(HashSet::new()),
             join_observer: OnceLock::new(),
             audit_entry_observer: OnceLock::new(),
+            message_content_delivered: AtomicBool::new(true),
         }
+    }
+
+    /// Declare whether the shard feeding this pipeline subscribed
+    /// `MESSAGE_CONTENT`. The gateway runtime sets this from the exact
+    /// intents it builds the shard with, before the shard runs; lengths are
+    /// measured only when content is delivered for ordinary messages.
+    pub fn set_message_content_delivered(&self, delivered: bool) {
+        self.message_content_delivered
+            .store(delivered, Ordering::Release);
+    }
+
+    fn content_delivered(&self) -> bool {
+        self.message_content_delivered.load(Ordering::Acquire)
     }
 
     /// Register the join observer. First registration wins; a second call is
@@ -740,6 +763,16 @@ impl<
                     channel_class: self.classifier.classify(channel_id),
                     capture_only: eligibility.capture_only,
                     occurred_at: Some(legacy_stamp(msg.timestamp)),
+                    // Measured here, where the content is already in hand;
+                    // the content itself is dropped with this statement and
+                    // only the scalar count is threaded onward. Measured
+                    // only when `MESSAGE_CONTENT` was subscribed: without
+                    // it, Discord delivers content solely for bot mentions,
+                    // whose lengths would be a biased sample.
+                    content_length: self
+                        .content_delivered()
+                        .then(|| msg.content.chars().count())
+                        .filter(|n| *n > 0),
                 };
                 self.cache.update(event);
                 if deliver {
@@ -935,5 +968,65 @@ mod tests {
         assert!(!Arc::ptr_eq(&old, &fresh));
         chains.remove_after_leave(GUILD, 3, &old);
         assert_eq!(chains.len(), 1, "stale leave keeps the fresh chain");
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLengths(Arc<Mutex<Vec<Option<usize>>>>);
+
+    impl FactsSink for CapturedLengths {
+        fn record_member_join(&self, _fact: two_bot_core::MemberJoinFact<'_>) {}
+
+        fn record_rules_accepted(&self, _fact: two_bot_core::RulesAcceptedFact<'_>) {}
+
+        fn record_message(&self, fact: two_bot_core::MessageFact<'_>) {
+            self.0.lock().expect("capture").push(fact.content_length);
+        }
+
+        fn record_voice_started(
+            &self,
+            _fact: two_bot_core::VoiceStartedFact<'_>,
+        ) -> Option<String> {
+            None
+        }
+
+        fn record_voice_ended(&self, _fact: two_bot_core::VoiceEndedFact<'_>) {}
+    }
+
+    #[test]
+    fn lengths_measured_only_when_content_delivered() {
+        let message: twilight_model::channel::Message = serde_json::from_value(serde_json::json!({
+            "id": "10",
+            "guild_id": "7",
+            "channel_id": "8",
+            "type": 0,
+            "author": {"id": "9", "username": "member", "discriminator": "0", "avatar": null},
+            "content": "hello world",
+            "timestamp": "2026-09-01T10:00:00.000000+00:00",
+            "edited_timestamp": null,
+            "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
+            "attachments": [], "embeds": [], "pinned": false
+        }))
+        .expect("fixture message deserializes");
+        let event = Event::MessageCreate(Box::new(
+            twilight_model::gateway::payload::incoming::MessageCreate(message),
+        ));
+
+        for (delivered, expected) in [(true, Some(11)), (false, None)] {
+            let captured = CapturedLengths::default();
+            let pipeline = Pipeline::new(
+                two_bot_core::MemStore::new(),
+                Some(two_bot_core::NoopLeveling),
+                Some(captured.clone()),
+                ScriptedInvites::new(),
+                NoClassification,
+            );
+            pipeline.set_message_content_delivered(delivered);
+            pipeline.handle_at(&event, "2026-09-01T10:00:01.000Z");
+            assert_eq!(
+                *captured.0.lock().expect("capture"),
+                vec![expected],
+                "delivered={delivered}"
+            );
+        }
     }
 }
