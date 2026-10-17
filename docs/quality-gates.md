@@ -1,13 +1,32 @@
 # Quality gates
 
 Deterministic CI gates (no reviewer needed). WARN reports without failing;
-HARD fails the PR. All Rust gates run as steps of the `check` lane in
-`check.yml` on the existing routed runner, so no new runner minutes beyond
-the step itself.
+HARD fails the PR. Gates run in their designated lanes in `check.yml` on the
+existing routed runner. Patch coverage runs in `rust-tests`, alongside the
+existing disposable Postgres service, rather than the lint-only `check` lane.
 
-- Patch coverage (WARN): `cargo llvm-cov --workspace --lib` plus
+- Patch coverage (HARD): `cargo llvm-cov --workspace --lib --bins --tests
+  --features two-bot-core/db -- --include-ignored` plus
   `scripts/ci/check-patch-coverage.py` requires 80% line coverage over the
-  lines the PR adds. Shortfalls annotate the PR and pass.
+  lines the PR adds. Measurement uses the `rust-tests` lane's disposable
+  Postgres service and test database so ignored database-backed tests can run.
+  Non-ignored tests run at full parallelism; ignored tests run serially
+  (`--test-threads=1`): the ignored stores share tables and locks, so
+  parallel runs race. The reference-docs regen is skipped: it rewrites
+  committed docs and must never run in CI. Suites whose
+  guards accept only the `agent_test` database are re-measured with their
+  accepted URL (`cargo llvm-cov --no-report` per suite, merged with a final
+  `cargo llvm-cov report --workspace --lcov` — without `--workspace` the
+  report scopes to the root package only and exports an empty report): the
+  channel-moderation, feeds-store,
+  legacy-verify and staging-migrate suites under the exact `agent_test` URL,
+  the internal-events, raid-list and reengagement-list suites under the
+  empty-password form, and member-moderation behind `MEMBER_TESTDB`.
+  Shortfalls and missing or empty reports fail the PR. The step runs after the
+  ordinary rust-tests steps and uses `always()` so their failures do not suppress
+  coverage output or get hidden by a coverage shortfall. Measurement also uses
+  `--ignore-run-fail` to preserve LCOV output when tests invoked by llvm-cov fail.
+  A build or report-generation failure fails this gate.
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which
   includes advisories) runs on every PR, not only Rust-selected ones.
 - Request-path unwrap (HARD): the local `sgconfig.yml` runs the request-path

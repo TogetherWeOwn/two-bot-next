@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""WARN gate: changed-lines coverage must stay at or above the threshold.
+"""HARD gate: changed-lines coverage must stay at or above the threshold.
 
 Inputs are a ``cargo llvm-cov --lcov`` report and a zero-context
 ``git diff base head`` over Rust files. A changed line counts when lcov lists
 it as executable (a ``DA`` record); it is covered when its execution count is
-positive. The gate reports covered/coverable over the intersection and warns
+positive. The gate reports covered/coverable over the intersection and fails
 below ``--threshold`` percent (default 80). A patch with no coverable changed
-lines passes with a note.
+lines passes with a note. A changed line in a measured Rust source file
+(``crates/*/src/**`` or ``src/**``) that has no lcov record at all counts as
+uncovered when the file defines a function body, so uninstrumented code can
+never pass as "nothing to measure" while functionless module/re-export files
+remain outside the executable-line denominator.
 
-WARN mode: a shortfall prints ``::warning::`` annotations and the script
-exits 0. A blind gate (missing lcov, unreadable diff) also warns instead of
-failing; it must never turn a PR red. Only malformed arguments exit non-zero.
+HARD mode: a shortfall prints ``::error::`` annotations and exits 1. A blind
+gate (missing or unusable lcov, unreadable diff) also errors and exits 1; it
+must never turn a blind PR green. The check.yml measurement wrapper uses
+``--ignore-run-fail`` to collect coverage despite unit-test failures, which are
+owned HARD by the rust-tests lane. Build or report-generation failures still
+fail this lane. Malformed arguments exit non-zero.
 """
 
 import argparse
@@ -29,19 +36,37 @@ def read_lcov(path):
         text = Path(path).read_text()
     except OSError as exc:
         return None, f"lcov report unreadable: {exc}"
+    if not text.strip():
+        return None, "lcov report is empty"
     hits = {}
     current = None
+    data_records = 0
+    malformed_records = False
     for raw in text.splitlines():
         if raw.startswith("SF:"):
-            current = raw[3:].strip()
-        elif raw.startswith("DA:") and current is not None:
+            if current is not None:
+                malformed_records = True
+            current = raw[3:].strip() or None
+        elif raw.startswith("DA:"):
             parts = raw[3:].split(",")
             try:
-                hits[(current, int(parts[0]))] = int(parts[1])
+                line, count = int(parts[0]), int(parts[1])
             except (ValueError, IndexError):
+                malformed_records = True
                 continue
+            if current is None or line < 1 or count < 0:
+                malformed_records = True
+                continue
+            hits[(current, line)] = count
+            data_records += 1
         elif raw.strip() == "end_of_record":
             current = None
+    if current is not None:
+        malformed_records = True
+    if malformed_records:
+        return None, "lcov report contains malformed DA records"
+    if not data_records:
+        return None, "lcov report contains no valid DA records"
     return hits, ""
 
 
@@ -90,6 +115,126 @@ def normalize(path):
         return text.lstrip("./")
 
 
+def is_measurable_source(path):
+    """Workspace-relative Rust sources the lib+bins+tests report must instrument.
+
+    Test-only files (``*_test.rs``, ``*_tests.rs``, ``test_*.rs``,
+    ``tests.rs``, or anything under a ``tests`` directory) are excluded:
+    changing only tests must not fail the gate.
+    """
+    if not path.endswith(".rs"):
+        return False
+    parts = path.split("/")
+    filename = parts[-1]
+    if filename in ("tests.rs",):
+        return False
+    if (filename.startswith("test_") or filename.endswith("_test.rs")
+            or filename.endswith("_tests.rs")):
+        return False
+    if "tests" in parts:
+        return False
+    if len(parts) >= 4 and parts[0] == "crates" and parts[2] == "src":
+        return True
+    if len(parts) >= 2 and parts[0] == "src":
+        return True
+    return False
+
+
+def _contains_fn_body(source):
+    """Whether any ``fn`` item has a ``{`` body before its closing ``;``.
+
+    Linear scan (no regular expressions): ``;`` inside ``()``/``[]`` pairs
+    (for example ``[u8; 32]``) never terminates the signature, so only a
+    ``{`` or ``;`` at nesting depth zero decides. Double-quoted strings,
+    character literals, and ``//``/``/* */`` comments are skipped *after* an
+    ``fn`` token so a brace
+    inside them cannot fake a body. No text before an ``fn`` token is ever
+    used to skip it (a glob like ``src/*`` in a comment or string is an
+    unbalanced ``/*`` that would hide every later function), so an ``fn``
+    token inside a comment still scans forward. That is the fail-closed
+    choice: it can only report a body (uncovered), never silence a
+    measurable file.
+    """
+    total = len(source)
+    pos = 0
+    while True:
+        idx = source.find("fn", pos)
+        if idx == -1:
+            return False
+        before = source[idx - 1] if idx > 0 else " "
+        after_pos = idx + 2
+        after = source[after_pos] if after_pos < total else " "
+        if (before.isalnum() or before == "_") or (after.isalnum() or after == "_"):
+            pos = idx + 2
+            continue
+        depth_paren = 0
+        depth_bracket = 0
+        cursor = after_pos
+        in_string = False
+        while cursor < total:
+            ch = source[cursor]
+            if in_string:
+                if ch == "\\":
+                    cursor += 2
+                    continue
+                if ch == '"':
+                    in_string = False
+                cursor += 1
+                continue
+            if ch == '"':
+                in_string = True
+                cursor += 1
+                continue
+            if ch == "'":
+                # Skip Rust char literals, but leave lifetimes (for example
+                # `'a`) to the normal signature scan.
+                char_end = cursor + 1
+                if char_end < total and source[char_end] == "\\":
+                    char_end += 2
+                    if char_end < total and source[char_end - 1] == "u" and source[char_end] == "{":
+                        close = source.find("}", char_end + 1)
+                        char_end = close + 1 if close != -1 else total
+                else:
+                    char_end += 1
+                if char_end < total and source[char_end] == "'":
+                    cursor = char_end + 1
+                    continue
+            if ch == "/" and cursor + 1 < total and source[cursor + 1] == "/":
+                line_end = source.find("\n", cursor + 2)
+                cursor = total if line_end == -1 else line_end + 1
+                continue
+            if ch == "/" and cursor + 1 < total and source[cursor + 1] == "*":
+                close = source.find("*/", cursor + 2)
+                cursor = total if close == -1 else close + 2
+                continue
+            if ch == "(":
+                depth_paren += 1
+            elif ch == ")":
+                if depth_paren > 0:
+                    depth_paren -= 1
+            elif ch == "[":
+                depth_bracket += 1
+            elif ch == "]":
+                if depth_bracket > 0:
+                    depth_bracket -= 1
+            elif ch == "{" and depth_paren == 0 and depth_bracket == 0:
+                return True
+            elif ch == ";" and depth_paren == 0 and depth_bracket == 0:
+                break
+            cursor += 1
+        pos = idx + 2
+
+
+def has_instrumentable_function(path):
+    """Whether a source file contains a function body the coverage report can map."""
+    try:
+        source = (ROOT / path).read_text()
+    except OSError:
+        # An unreadable changed source is not evidence that the gate may skip it.
+        return True
+    return _contains_fn_body(source)
+
+
 def evaluate(hits, added):
     """(covered, coverable, uncovered-added-lines) over changed executable lines."""
     by_file = {}
@@ -97,7 +242,16 @@ def evaluate(hits, added):
         by_file.setdefault(normalize(path), {})[line] = count
     covered, uncovered = 0, []
     for path, line in sorted(added):
-        count = by_file.get(path, {}).get(line)
+        norm = normalize(path)
+        file_cov = by_file.get(norm)
+        if file_cov is None:
+            # No lcov record for this file at all. A changed source file the
+            # report must instrument counts as uncovered, so bin code or a new
+            # file can never pass as "nothing to measure".
+            if is_measurable_source(norm) and has_instrumentable_function(norm):
+                uncovered.append((path, line))
+            continue
+        count = file_cov.get(line)
         if count is None:
             continue
         if count > 0:
@@ -107,8 +261,8 @@ def evaluate(hits, added):
     return covered, covered + len(uncovered), uncovered
 
 
-def warn(message):
-    print(f"::warning::{message}", flush=True)
+def error(message):
+    print(f"::error::{message}", flush=True)
 
 
 def main(argv=None):
@@ -121,15 +275,15 @@ def main(argv=None):
     if not 0 < args.threshold <= 100:
         parser.error("--threshold must be in (0, 100]")
 
-    hits, error = read_lcov(args.lcov)
+    hits, read_error = read_lcov(args.lcov)
     if hits is None:
-        warn(f"patch coverage gate is blind ({error}); treating as pass")
-        return 0
+        error(f"patch coverage gate is blind ({read_error}); failing closed")
+        return 1
 
-    added, error = added_lines(args.base_ref, args.head_ref)
+    added, diff_error = added_lines(args.base_ref, args.head_ref)
     if added is None:
-        warn(f"patch coverage gate could not read the diff ({error}); treating as pass")
-        return 0
+        error(f"patch coverage gate could not read the diff ({diff_error}); failing closed")
+        return 1
 
     covered, coverable, uncovered = evaluate(hits, added)
     if not coverable:
@@ -140,11 +294,11 @@ def main(argv=None):
     if pct >= args.threshold:
         return 0
     for path, line in uncovered[:MAX_ANNOTATIONS]:
-        warn(f"{path}:{line} changed but not covered by tests")
+        error(f"{path}:{line} changed but not covered by tests")
     if len(uncovered) > MAX_ANNOTATIONS:
-        warn(f"... and {len(uncovered) - MAX_ANNOTATIONS} more uncovered changed line(s)")
-    warn(f"patch coverage gate: {pct:.1f}% below the {args.threshold:g}% WARN threshold")
-    return 0
+        error(f"... and {len(uncovered) - MAX_ANNOTATIONS} more uncovered changed line(s)")
+    error(f"patch coverage gate: {pct:.1f}% below the {args.threshold:g}% HARD threshold")
+    return 1
 
 
 if __name__ == "__main__":

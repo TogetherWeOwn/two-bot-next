@@ -1686,7 +1686,6 @@ class WorkflowTests(unittest.TestCase):
         expected_head = "${{ github.sha }}"
         for name in (
             "Floor guard (HARD, CONSTRAINTS.md floor)",
-            "Patch coverage (WARN, 80% of added lines)",
             "Unwrap in request paths (HARD)",
             "Semgrep Rust rules (HARD)",
         ):
@@ -1696,6 +1695,247 @@ class WorkflowTests(unittest.TestCase):
                 head_key = "FLOOR_HEAD" if name.startswith("Floor guard") else "QUALITY_HEAD"
                 self.assertEqual(step["env"][base_key], expected_base)
                 self.assertEqual(step["env"][head_key], expected_head)
+
+    def test_rust_tests_timeout_leaves_headroom_for_coverage_measurement(self):
+        # The HARD patch-coverage step re-runs the suite under llvm-cov
+        # (measured 30 min of a 42m16s job; four earlier runs of this design
+        # took 36-42 min), so every event keeps 60 minutes: a slow runner
+        # reports a coverage verdict, not a job timeout.
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        # BaseLoader keeps scalars as strings; "60" is the 60-minute limit.
+        self.assertEqual(job["timeout-minutes"], "60")
+
+    def test_rust_test_container_pins_disposable_database_service_address(self):
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        prerequisites = next(
+            step for step in job["steps"]
+            if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
+        )
+        self.assertEqual(prerequisites.get("shell"), "bash")
+        run = prerequisites["run"]
+        self.assertIn("set -e", run)
+        hosts_tmp = run.index('hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"')
+        resolve = run.index("getent ahostsv4 agent-testdb")
+        remove_stale_pin = run.index("sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > \"$hosts_tmp\"")
+        self.assertNotIn("sed -i -E", run)
+        self.assertLess(hosts_tmp, remove_stale_pin)
+        copy_hosts = run.index('cat "$hosts_tmp" > /etc/hosts')
+        cleanup_hosts = run.index('rm -f "$hosts_tmp"')
+        self.assertLess(remove_stale_pin, copy_hosts)
+        self.assertLess(copy_hosts, cleanup_hosts)
+        pin = run.index("printf '%s agent-testdb\\n' \"$service_ip\" >> /etc/hosts")
+        verify_pin = run.index('getent ahostsv4 agent-testdb | awk \'NR == 1 { print $1; exit }\'')
+        forward = run.index("TCP:agent-testdb:5432")
+        ready = run.index("pg_isready -q -h 127.0.0.1")
+        self.assertIn("for attempt in $(seq 1 30)", run[:resolve])
+        self.assertLess(remove_stale_pin, resolve)
+        self.assertLess(resolve, pin)
+        self.assertLess(pin, verify_pin)
+        mismatch_check = run.index('if [ "$pinned_ip" != "$service_ip" ]; then')
+        mismatch_exit = run.index("exit 1", mismatch_check)
+        self.assertLess(verify_pin, mismatch_check)
+        self.assertLess(mismatch_exit, forward)
+        self.assertLess(verify_pin, forward)
+        self.assertLess(forward, ready)
+        self.assertIn("sleep 1", run)
+        fail_closed = run.index('if [ -z "$service_ip" ]; then')
+        self.assertLess(fail_closed, pin)
+        self.assertLess(run.index("exit 1", fail_closed), pin)
+        self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
+
+    def test_rust_test_postgres_wal_budget_is_bounded(self):
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        prepare = next(
+            step for step in job["steps"]
+            if step.get("name") == "Prepare isolated test databases"
+        )
+        verify = next(
+            step for step in job["steps"]
+            if step.get("name") == "Verify disposable Postgres defaults"
+        )
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+        self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assertIn("'min_wal_size': '64MB'", verify["run"])
+
+    def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+        )
+        expected_base = "${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}"
+        self.assertEqual(step["env"]["QUALITY_BASE"], expected_base)
+        self.assertEqual(step["env"]["QUALITY_HEAD"], "${{ github.sha }}")
+        self.assertIn("--ignore-run-fail", step["run"])
+        self.assertIn("--features two-bot-core/db", step["run"])
+        self.assertIn("--lib --bins --tests", step["run"])
+        self.assertIn(
+            "--no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs",
+            step["run"],
+        )
+        self.assertIn(
+            "--locked -- channel_moderation --include-ignored --test-threads=1",
+            step["run"],
+        )
+        self.assertIn('report_path="$GITHUB_WORKSPACE/lcov.info"', step["run"])
+        self.assertIn('[ ! -s "$report_path" ]', step["run"])
+        self.assertIn(
+            'llvm-cov report --workspace --lcov --output-path "$report_path"',
+            step["run"],
+        )
+        self.assertIn('retrying via stdout', step["run"])
+        self.assertIn(
+            'llvm-cov report --workspace --lcov > "$report_path"', step["run"]
+        )
+        self.assertNotIn("/dev/stdout", step["run"])
+        # `report` without --workspace scopes to the current (root) package
+        # only and excludes every crates/* member directory from the export;
+        # the root library is a single const with no coverable lines, so the
+        # merged report comes out empty. Every report invocation must carry
+        # --workspace; the bare form must never reappear.
+        self.assertNotIn("llvm-cov report --lcov", step["run"])
+        # Guarded suites are measured per suite with their accepted URL and
+        # merged: --no-report per run, one final report. Selected ignored runs
+        # are serial and never execute the reference-docs regen.
+        self.assertIn("--no-report", step["run"])
+        self.assertIn("llvm-cov report --workspace --lcov", step["run"])
+        # Non-ignored tests stay parallel; only the ignored sweep is serial.
+        self.assertIn("-- --ignored --test-threads=1", step["run"])
+        self.assertIn("--test-threads=1", step["run"])
+        self.assertIn("--skip regenerate_reference_docs", step["run"])
+        self.assertIn(
+            "TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test",
+            step["run"],
+        )
+        self.assertIn(
+            "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test",
+            step["run"],
+        )
+        self.assertIn("MEMBER_TESTDB=agent-testdb", step["run"])
+        for target in (
+            "channel_moderation_runtime",
+            "internal_channel_moderation",
+            "feeds_store",
+            "legacy_verify_db",
+            "staging_migrate_db",
+            "internal_events",
+            "raid_list_db",
+            "reengagement_list_db",
+            "member_moderation_db",
+        ):
+            with self.subTest(target=target):
+                self.assertIn(target, step["run"])
+        # Per-invocation pins: whole-script substring checks let one surviving
+        # occurrence mask a flag dropped from another invocation (e.g.
+        # --ignore-run-fail removed from either sweep). Join line
+        # continuations, then assert flags on each cov_run separately.
+        logical_lines = []
+        pending = ""
+        for raw_line in step["run"].splitlines():
+            stripped = raw_line.strip()
+            pending = f"{pending} {stripped}".strip() if pending else stripped
+            if stripped.endswith("\\"):
+                pending = pending[:-1].strip()
+                continue
+            logical_lines.append(pending)
+            pending = ""
+        if pending:
+            logical_lines.append(pending)
+        cov_runs = [line for line in logical_lines if line.startswith("cov_run ")]
+        # cov_run's failure annotation must go to stderr: the stdout report
+        # retry redirects cov_run's stdout into the lcov file.
+        self.assertIn(
+            'echo "::error::patch coverage measurement failed to build or report" >&2',
+            step["run"],
+        )
+        sweeps = [run for run in cov_runs if "--workspace --lib --bins --tests" in run]
+        self.assertEqual(len(sweeps), 2)
+        for sweep in sweeps:
+            with self.subTest(sweep=sweep):
+                # A failing test must never suppress coverage collection.
+                self.assertIn("--ignore-run-fail", sweep)
+                self.assertIn("--no-report", sweep)
+                self.assertIn("--features two-bot-core/db", sweep)
+                self.assertIn("--locked", sweep)
+        ignored_sweeps = [run for run in sweeps if "-- --ignored" in run]
+        self.assertEqual(len(ignored_sweeps), 1)
+        self.assertIn("--test-threads=1", ignored_sweeps[0])
+        self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
+        guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
+        self.assertEqual(len(guarded), 10)
+        for run in guarded:
+            with self.subTest(guarded=run):
+                self.assertIn("--test-threads=1", run)
+                self.assertIn("--skip regenerate_reference_docs", run)
+                self.assertIn("--locked", run)
+                # Deliberate: a guard panic in a guarded suite fails the step.
+                self.assertNotIn("--ignore-run-fail", run)
+        # needle -> carries `--features db` (core/discord suites need the db
+        # feature to build their guarded targets; cutover suites do not).
+        guarded_needles = {
+            "-- channel_moderation --include-ignored": True,
+            "--test channel_moderation_runtime": True,
+            "--test internal_channel_moderation": True,
+            "--test feeds_store": True,
+            "--test legacy_verify_db": False,
+            "--test staging_migrate_db": False,
+            "--test internal_events": True,
+            "--test raid_list_db": False,
+            "--test reengagement_list_db": False,
+            "--test member_moderation_db": True,
+        }
+        for needle, wants_db_feature in guarded_needles.items():
+            with self.subTest(needle=needle):
+                matches = [run for run in guarded if needle in run]
+                self.assertEqual(len(matches), 1)
+                self.assertIn("--test-threads=1", matches[0])
+                if wants_db_feature:
+                    self.assertIn("--features db", matches[0])
+                else:
+                    self.assertNotIn("--features db", matches[0])
+        env_wrapped = [
+            run for run in cov_runs
+            if run.startswith('cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV"')
+        ]
+        self.assertEqual(len(env_wrapped), 1)
+        self.assertIn("--test channel_moderation_runtime", env_wrapped[0])
+        reports = [run for run in cov_runs if "llvm-cov report" in run]
+        self.assertEqual(len(reports), 2)
+        for report in reports:
+            with self.subTest(report=report):
+                self.assertIn("llvm-cov report --workspace --lcov", report)
+        self.assertEqual(
+            step["env"]["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        self.assertIn("agent-testdb", job["services"])
+        self.assertEqual(
+            step["if"],
+            "always() && !cancelled() && steps.prepare_test_databases.outcome == 'success' "
+            "&& steps.verify_disposable_postgres.outcome == 'success'",
+        )
+        test_steps = [
+            index for index, candidate in enumerate(job["steps"])
+            if "cargo test" in str(candidate.get("run", ""))
+        ]
+        self.assertTrue(test_steps)
+        self.assertGreater(job["steps"].index(step), max(test_steps))
+        self.assertEqual(
+            next(candidate for candidate in job["steps"]
+                 if candidate.get("name") == "Prepare isolated test databases")["id"],
+            "prepare_test_databases",
+        )
+        self.assertEqual(
+            next(candidate for candidate in job["steps"]
+                 if candidate.get("name") == "Verify disposable Postgres defaults")["id"],
+            "verify_disposable_postgres",
+        )
+        checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"]["fetch-depth"], "0")
 
     def test_voice_synthetic_shape_is_pinned_and_mutations_fail(self):
         import copy
