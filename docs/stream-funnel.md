@@ -116,8 +116,11 @@ the Twitch client id/secret; they never appear in code, logs or PR text.
 The public Worker route (`POST /hooks/twitch`, `wrangler/src/eventsub.ts`)
 is staging-only and dark unless `EVENTSUB_INGRESS` and `TWO_EVENTSUB` are
 both exactly `"1"`. The private container receiver below lands in this
-slice; Operator secret provisioning stays an Operator action. The ledger
-below is present but is not called by a runtime receiver yet.
+slice; Operator secret provisioning stays an Operator action. The receiver
+calls the ledger below through `deliver_go_live` when delivery
+dependencies are injected at bind time; boot injects none yet (no
+announcements-channel or invite configuration is provisioned), so posting
+stays dark even on an enabled receiver.
 
 ## Durable go-live ledger
 
@@ -139,8 +142,7 @@ below is present but is not called by a runtime receiver yet.
   may post. A crash before send is answered 5xx while the lease is fresh
   and recovers by takeover only if a retry arrives after the lease
   expires. Twitch documents no retry schedule and this slice has no
-  sweeper, so a go-live that is never retried is not recovered here; the
-  route stays dark until a receiver wires this flow.
+  sweeper, so a go-live that is never retried is not recovered here.
 - Ownership is fenced by a claim token (migration 0443): claiming
   generates one, takeover rotates it, and `mark_live_send_started`,
   `mark_live_delivered`, `release_live` and `release_started_live` act
@@ -163,14 +165,18 @@ below is present but is not called by a runtime receiver yet.
 - Delivered rows are retained indefinitely as dedup fences. This slice adds no
   purge; the retained policy is one row per go-live, kept forever, which never
   weakens the active dedup fence.
-- The receiver MUST post with `allowed_mentions: { parse: [] }`. No sender
-  exists in this slice, so that no-ping contract has not been runtime-verified.
+- The sender posts with `allowed_mentions: { parse: [] }`: the production
+  `LiveSender` is the shared REST executor's `post_message`, whose body
+  pins exactly that shape.
 - A send that provably never reached Discord deletes its unposted row
   (`release_live` before the send starts, `release_started_live` after
   it starts) and the receiver answers 5xx so Twitch retries; a
   delivered row is stamped and never deleted, so retries after a successful
   stamp cannot double-post. The claim → send → settle table is
-  `stream_live::disposition`; its async glue belongs with the receiver.
+  `stream_live::disposition`; its async glue is
+  `stream_live_store::deliver_go_live`, called by the receiver for a
+  verified notification when delivery dependencies are injected
+  (`crates/bot/src/eventsub_delivery.rs`).
 
 ## Private container receiver
 
@@ -185,17 +191,20 @@ below is present but is not called by a runtime receiver yet.
 - Runs `verify_delivery` plus `classify` with the Operator secret. Nothing
   is parsed before verification passes.
 - Echoes `Delivery::Challenge` as `200 text/plain`; acknowledges
-  `Notification`, `Revocation`, `Ignored` and deterministic classification
+  `Revocation`, `Ignored` and deterministic classification
   errors (`WrongSubscription`, `InvalidBody`) as `200 {"ok":true}` so Twitch
-  does not retry what will never succeed.
+  does not retry what will never succeed. A verified `Notification` is
+  acknowledged the same way while no delivery dependencies are injected;
+  with them, it runs `deliver_go_live` and answers its disposition (200, or
+  a retryable 503 after a transient ledger/send failure).
 - Answers `400` for a malformed challenge, `401` for a missing or mismatched
   signature, stale timestamp or malformed delivery headers, `405` for a
   non-POST, `408` for a body slower than the read budget, `413` for an
   oversize body, `415` for a wrong content type, `404` for a wrong path, and
   `503` (`retryable: true`) while the receiver is busy or past the overall
-  20 s budget. Only the `408` and `503` paths are retriable; this slice has no send or
-  durable ledger, so a verified delivery retries only on a pathological
-  scheduling stall, and the retry re-acks with no side effects. No header
+  20 s budget. Only the `408` and `503` paths are retriable; with delivery
+  dependencies injected, a transient ledger/send failure also answers the
+  retryable 503, and the claim fences make that redelivery safe. No header
   value, challenge, body byte or query is ever logged; only scalar
   `event`/`status`/`error_class`.
 - Keeps the callback path out of trace spans: `/hooks/twitch` is not in
