@@ -102,7 +102,8 @@ fn full_ties_order_by_title_with_untitled_first_and_output_is_stable() {
         "rendering is input-order independent"
     );
     assert_eq!(forward, render_game_activity_report(GUILD, &rows));
-    let games: Vec<_> = rows_of(&parse(&forward))
+    let parsed = parse(&forward);
+    let games: Vec<_> = rows_of(&parsed)
         .iter()
         .map(|row| row["game"].as_str().expect("game is a string"))
         .collect();
