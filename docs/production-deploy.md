@@ -154,11 +154,13 @@ production drill record.
 
 A deploy stamps its image the way `deploy-staging` does. The rendered Wrangler
 config sets `image_vars` on the production container: `BOT_BUILD_REVISION` is
-the guarded 40-hex SHA, and `BOT_BUILD_ID` is `<run id>-<run attempt>`. Wrangler
-passes both to `docker build` as build arguments, the Rust binary compiles them
-in, and `/readyz` reports them as `build_revision` and `build_id`. Neither value
-is secret. The SHA comes from the guard, not `GITHUB_SHA`: a dispatch runs on
-the head of `main`, which can be newer than the commit being deployed.
+the guarded 40-character lowercase hexadecimal SHA, and `BOT_BUILD_ID` is
+`<run id>-<run attempt>`: exactly two non-empty decimal components, each at most
+20 digits and 64 characters total. Wrangler passes both to `docker build` as
+build arguments, the Rust binary compiles them in, and `/readyz` reports them as
+`build_revision` and `build_id`. Neither value is secret. The SHA comes from the
+guard, not `GITHUB_SHA`: a dispatch runs on the head of `main`, which can be
+newer than the commit being deployed.
 
 Production renders its own config instead of calling `staging_rollout.py
 prepare`. That path also snapshots the staging Cloudflare application and

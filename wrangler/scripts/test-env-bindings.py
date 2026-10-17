@@ -180,6 +180,38 @@ class AlertBindingTests(unittest.TestCase):
                 config = BASE.replace('TWO_VOICE_PRESENCE = "1"', f"TWO_VOICE_PRESENCE = {value}")
                 self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
 
+    def test_deploy_env_marker_is_staging_only_and_exact(self):
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('TWO_DEPLOY_ENV = "staging"', staging)
+        self.assertEqual(self.check_config(BASE), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nTWO_DEPLOY_ENV = "staging"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("TWO_DEPLOY_ENV is staging-only" in e for e in errors), errors)
+        # Absent is fine (the drill then simply cannot arm); any other
+        # spelling is not the fence marker.
+        self.assertEqual(self.check_config(BASE.replace('TWO_DEPLOY_ENV = "staging"\n', "")), [])
+        for value in ['"production"', '"Staging"', '"staging "', '""', "1"]:
+            with self.subTest(value=value):
+                config = BASE.replace('TWO_DEPLOY_ENV = "staging"', f"TWO_DEPLOY_ENV = {value}")
+                self.assertTrue(any('must be exactly "staging"' in e for e in self.check_config(config)))
+
+    def test_gateway_failure_injection_is_never_a_committed_var(self):
+        # Even staging must not commit it: only the generated per-deploy
+        # config from a manual drill dispatch may carry the switch.
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]", f'[{section}]\nTWO_GATEWAY_READINESS_FAIL_INJECTION = "1"', 1
+                )
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("TWO_GATEWAY_READINESS_FAIL_INJECTION must never be a committed var" in e for e in errors),
+                    errors,
+                )
+        self.assertEqual(self.check_config(BASE), [])
+
     def test_dashboard_secrets_are_never_toml_vars(self):
         # TOG-22861: the dashboard service-token pair gates human access; a
         # committed value would hand out that access. Both keys must stay

@@ -690,6 +690,56 @@ fn event_guild_id(event: &Event) -> String {
     }
 }
 
+/// Per-message channel-classifier refresh from the poller-published
+/// snapshot: the deployment environment is the base, stored human/welcome
+/// channel sets overlay it (both are `HOT_WIRED`, so only they can arrive
+/// from the snapshot). Parked or pre-first-poll readers layer nothing and
+/// the refresh is a no-op once the config compares equal.
+fn refresh_channel_classifier_from_poller<I: InviteSource>(
+    pipeline: &GatewayPipeline<I>,
+    event: &Event,
+) {
+    let Event::MessageCreate(msg) = event else {
+        return;
+    };
+    let Some(guild_id) = msg.guild_id else {
+        return;
+    };
+    let Some(live) = crate::settings_jobs::live() else {
+        return;
+    };
+    let deployment: HashMap<String, String> = std::env::vars().collect();
+    pipeline.refresh_classifier_config(classifier_config_from_live(
+        &deployment,
+        &guild_id.get().to_string(),
+        &live,
+    ));
+}
+
+/// Classifier config with one guild's stored channel sets layered over
+/// the deployment environment: stored rows win, deleted rows fall back
+/// to the boot value (the automod `layered_vars` shape). Only the two
+/// channel keys overlay, so the paired facts-sink config keeps its
+/// environment values for every other field.
+fn classifier_config_from_live(
+    deployment: &HashMap<String, String>,
+    guild_id: &str,
+    live: &two_bot_core::settings::LiveSettings,
+) -> two_bot_core::ClassifierConfig {
+    let mut vars = deployment.clone();
+    vars.extend(
+        live.env_snapshot(Some(guild_id))
+            .into_iter()
+            .filter(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "TWO_COMMUNITY_HUMAN_CHANNEL_IDS" | "TWO_COMMUNITY_WELCOME_CHANNEL_IDS"
+                )
+            }),
+    );
+    two_bot_core::ClassifierConfig::from_map(&vars)
+}
+
 /// One blocking-worker dispatch step: run the funnel/leveling drain, await the
 /// interaction completion, serialize any onboarding job and commit the
 /// checkpoint — or record the first failure as a typed error and skip the
@@ -786,6 +836,9 @@ fn apply_dispatch<I: InviteSource>(
             &dispatch.observed_at,
             checkpoint.sequence,
         );
+        // Stored human/welcome channel sets reclassify live: refresh
+        // before the funnel stamps this message's channel class.
+        refresh_channel_classifier_from_poller(pipeline, &dispatch.event);
         // Exactly one funnel call per dispatch, then drain deferred
         // XP awards through the leveling runtime under the
         // checkpoint deadline before the cursor commits. Without a
@@ -1896,6 +1949,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn stored_channel_sets_overlay_env_for_the_classifier() {
+        use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+        use two_bot_core::ChannelClass;
+
+        const HUMAN: u64 = 200_000_000_000_000_001;
+        const WELCOME: u64 = 300_000_000_000_000_001;
+        let deployment: HashMap<String, String> = [(
+            "TWO_COMMUNITY_HUMAN_CHANNEL_IDS".to_owned(),
+            WELCOME.to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let (mut writer, live) = live_channel();
+
+        // Pre-publish, the boot environment is the whole config.
+        let boot = classifier_config_from_live(&deployment, "22", &live);
+        assert_eq!(boot.channel_class(WELCOME), ChannelClass::Human);
+        assert_eq!(boot.channel_class(HUMAN), ChannelClass::Other);
+
+        // Stored rows win over the boot value for the same key, and a
+        // stored welcome set classifies welcome (winning over human).
+        writer.publish(&SettingsSnapshot {
+            revision: 1,
+            rows: vec![
+                SettingRow {
+                    guild_id: "22".to_owned(),
+                    key: "TWO_COMMUNITY_HUMAN_CHANNEL_IDS".to_owned(),
+                    value: serde_json::json!([HUMAN.to_string(), WELCOME.to_string()]),
+                    version: 1,
+                },
+                SettingRow {
+                    guild_id: "22".to_owned(),
+                    key: "TWO_COMMUNITY_WELCOME_CHANNEL_IDS".to_owned(),
+                    value: serde_json::json!([WELCOME.to_string()]),
+                    version: 1,
+                },
+            ],
+        });
+        let stored = classifier_config_from_live(&deployment, "22", &live);
+        assert_eq!(stored.channel_class(HUMAN), ChannelClass::Human);
+        assert_eq!(stored.channel_class(WELCOME), ChannelClass::Welcome);
+
+        // Another guild's stored rows never layer onto this guild.
+        let other = classifier_config_from_live(&deployment, "23", &live);
+        assert_eq!(other.channel_class(HUMAN), ChannelClass::Other);
+        assert_eq!(other.channel_class(WELCOME), ChannelClass::Human);
     }
 
     #[test]

@@ -8,7 +8,11 @@ Part of the [operations runbook](runbook.md#sustained-unready-alerts).
 The singleton Durable Object's existing keepalive probes `/readyz` on each tick
 and records the result in its own durable storage (not the bot database).
 Non-2xx responses and exceptions/timeouts count as failures. A 2xx result resets
-the streak. Inbound `/health` and `/readyz` requests do **not** count as monitoring
+the streak. Each probe's fetch and body read share one end-to-end six-second
+deadline that does not rely on the SDK honoring abort, and body cancellation
+is best-effort: a probe that stalls, or a valid answer that only arrives after
+the deadline, is recorded as a failed sample — never as readiness or recovery
+— and the tick still rearms. Inbound `/health` and `/readyz` requests do **not** count as monitoring
 samples; the keepalive loop is the single sampling source. Arming checks the
 SDK's persisted schedule before inserting a task and coalesces concurrent
 callers. Container startup, health traffic and DO reconstruction reuse the
