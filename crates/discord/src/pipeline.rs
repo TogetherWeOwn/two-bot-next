@@ -36,9 +36,9 @@ use twilight_model::gateway::event::Event;
 use twilight_model::util::Timestamp;
 use two_bot_core::automod_runtime::FunnelDisposition;
 use two_bot_core::{
-    ChannelClass, ExpectedJoins, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput,
-    InviteSnapshotStore, InviteState, InviteTracker, JoinInput, LevelingHook, MessageInput,
-    Snowflake, VoiceInput,
+    ChannelClass, ClassifierConfig, ExpectedJoins, FactsSink, FunnelHandlers, FunnelStore,
+    GateClearedInput, InviteSnapshotStore, InviteState, InviteTracker, JoinInput, LevelingHook,
+    MessageInput, Snowflake, VoiceInput,
 };
 
 /// Legacy `occurred_at` shape: millis precision with a `Z` suffix
@@ -202,6 +202,38 @@ pub struct NoClassification;
 impl ChannelClassifier for NoClassification {
     fn classify(&self, _channel_id: Snowflake) -> ChannelClass {
         ChannelClass::Other
+    }
+}
+
+/// Settings-backed classifier: a shared handle over the live
+/// [`ClassifierConfig`] channel sets. Every clone reads the same config,
+/// and [`Self::refresh`] replaces it for all clones, so a settings change
+/// reclassifies without rebuilding the pipeline that holds a clone.
+#[derive(Debug, Clone, Default)]
+pub struct SettingsChannelClassifier(Arc<Mutex<ClassifierConfig>>);
+
+impl SettingsChannelClassifier {
+    #[must_use]
+    pub fn new(config: ClassifierConfig) -> Self {
+        Self(Arc::new(Mutex::new(config)))
+    }
+
+    /// Replace the live config for every clone. Unchanged configs are a
+    /// no-op so per-delivery refreshes stay cheap after comparison.
+    pub fn refresh(&self, config: ClassifierConfig) {
+        let mut live = self.0.lock().expect("channel classifier lock");
+        if *live != config {
+            *live = config;
+        }
+    }
+}
+
+impl ChannelClassifier for SettingsChannelClassifier {
+    fn classify(&self, channel_id: Snowflake) -> ChannelClass {
+        self.0
+            .lock()
+            .expect("channel classifier lock")
+            .channel_class(channel_id)
     }
 }
 

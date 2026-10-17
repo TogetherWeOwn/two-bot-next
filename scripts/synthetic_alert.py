@@ -36,6 +36,13 @@ class AlertError(Exception):
     """A fixed-vocabulary alert failure (never carries the webhook URL)."""
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Turn every redirect into an HTTPError without contacting its target."""
+
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
 def load_evidence(path):
     try:
         with open(path, encoding="utf-8") as handle:
@@ -95,14 +102,24 @@ def post(webhook_url, content):
     request = urllib.request.Request(
         webhook_url, data=payload, method="POST",
         headers={"Content-Type": "application/json", "User-Agent": "two-bot-next-synthetic-alert/1"})
+    # urllib's default redirect handler can turn a redirected POST into a GET.
+    # Reject redirects at the opener so only the allowlisted URL is contacted.
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPSHandler(),
+        urllib.request.HTTPErrorProcessor(),
+        _NoRedirectHandler(),
+    )
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
             status = response.status
             response.read(1 << 10)
     except urllib.error.HTTPError as error:
+        if error.code in (301, 302, 303, 307, 308):
+            raise AlertError(f"alert delivery refused redirect with status {error.code}")
         raise AlertError(f"alert delivery failed with status {error.code}")
-    except (OSError, ValueError) as error:
-        raise AlertError(f"alert delivery failed ({error.__class__.__name__})")
+    except (OSError, ValueError):
+        raise AlertError("alert delivery failed (transport)")
     if not 200 <= status < 300:
         raise AlertError(f"alert delivery failed with status {status}")
 

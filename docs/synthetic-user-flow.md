@@ -18,6 +18,17 @@ Each job writes one JSON evidence receipt (`synthetic-staging-<run>.json`,
 or fence refusal. Production is passive: the prod job observes and alerts
 only, and never blocks a deploy.
 
+The production probe accepts only a stamped identity with a 40-character,
+lowercase hexadecimal `build_revision` and a `build_id` containing exactly two
+non-empty decimal components separated by one hyphen (each at most 20 digits;
+64 characters total maximum), or the exact unstamped pair
+`build_revision: "unknown"` and `build_id: "unknown"`. A mixed pair or any
+other shape fails the separate build check with a fixed diagnostic; malformed
+remote values are omitted from stdout, stderr and the receipt. This check does
+not change the independent `/readyz` health classification. The identity is
+observational only: this workflow does not compare it to a deployment SHA and
+does not gate or authorize a deploy.
+
 ## Failure alerts
 
 Two consecutive failed probes open one Discord ops-channel incident via
@@ -43,9 +54,13 @@ two-bot-next ALERT synthetic-user-flow:<staging|prod>: <failing checks>. Runbook
 
 `allowed_mentions` is off. The destination is Discord-only: any non-Discord
 webhook URL refuses before any request, and the URL itself is never printed.
-Runs with no incident transition send nothing and need no webhook. When an
-alert or recovery transition is due, a missing webhook fails that step, so a
-silent notification path cannot read as delivered.
+HTTP 301, 302, 303, 307, and 308 responses are refused; no redirect destination
+is contacted and no redirect retry occurs. A redirect is a failed delivery, not
+a successful alert. Errors expose only fixed safe classifications or HTTP status
+codes, never the webhook URL, token, or response body. Runs with no incident
+transition send nothing and need no webhook. When an alert or recovery transition
+is due, a missing webhook fails that step, so a silent notification path cannot
+read as delivered.
 
 ## Operator bindings
 
