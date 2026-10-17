@@ -202,6 +202,25 @@ async fn failed_send_releases_the_claim_for_the_retry() {
     cleanup(pool, &schema).await;
 }
 
+async fn age_delivered(pool: &Pool<Postgres>, key: &str, days_ago: i64) {
+    sqlx::query(
+        "UPDATE stream_live_claims SET delivered_at = clock_timestamp() - make_interval(days => $2::int) WHERE dedup_key = $1",
+    )
+    .bind(key)
+    .bind(days_ago as i32)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn row_count(pool: &Pool<Postgres>, key: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM stream_live_claims WHERE dedup_key = $1")
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 async fn age_claim(pool: &Pool<Postgres>, key: &str, seconds_ago: i64) {
     sqlx::query(
         "UPDATE stream_live_claims SET claimed_at = clock_timestamp() - make_interval(secs => $2) WHERE dedup_key = $1",
@@ -467,5 +486,125 @@ async fn reclaiming_a_missing_key_claims_it_fresh() {
         claim_live(&pool, &claim(&key)).await.expect("retry"),
         ClaimOutcome::InFlight
     );
+    cleanup(pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the disposable agent-testdb container"]
+async fn delivered_rows_expire_only_past_the_horizon_with_the_fence_intact() {
+    let (pool, schema) = setup().await;
+    const HORIZON_DAYS: i32 = 30;
+    let old_delivered = format!("{:064x}", 0x0111u64);
+    let fresh_delivered = format!("{:064x}", 0x0222u64);
+    let old_started = format!("{:064x}", 0x0333u64);
+    let old_claimed = format!("{:064x}", 0x0444u64);
+
+    // Delivered long ago: the only row the purge may take.
+    let token = claimed(
+        claim_live(&pool, &claim(&old_delivered))
+            .await
+            .expect("claim old delivered"),
+    );
+    assert!(
+        mark_live_delivered(&pool, &old_delivered, &token, "100000000000000011")
+            .await
+            .expect("stamp old delivered")
+    );
+    age_delivered(&pool, &old_delivered, (HORIZON_DAYS + 1).into()).await;
+    // Delivered just now: the fence must hold, so a retry dedups.
+    let fresh_token = claimed(
+        claim_live(&pool, &claim(&fresh_delivered))
+            .await
+            .expect("claim fresh delivered"),
+    );
+    assert!(
+        mark_live_delivered(&pool, &fresh_delivered, &fresh_token, "100000000000000012")
+            .await
+            .expect("stamp fresh delivered")
+    );
+    // Started but never stamped (a send may already have reached Discord):
+    // ambiguous rows are never eligible, however stale.
+    let started_token = claimed(
+        claim_live(&pool, &claim(&old_started))
+            .await
+            .expect("claim old started"),
+    );
+    assert!(mark_live_send_started(&pool, &old_started, &started_token)
+        .await
+        .expect("start old started"));
+    age_claim(
+        &pool,
+        &old_started,
+        (i64::from(HORIZON_DAYS) + 1) * 24 * 3600,
+    )
+    .await;
+    // Never started and long past the stale lease: reclaimable, but never
+    // expirable by the purge.
+    claimed(
+        claim_live(&pool, &claim(&old_claimed))
+            .await
+            .expect("claim old claimed"),
+    );
+    age_claim(
+        &pool,
+        &old_claimed,
+        (i64::from(HORIZON_DAYS) + 1) * 24 * 3600,
+    )
+    .await;
+
+    // The dry-run projection sees exactly the one eligible row.
+    assert_eq!(
+        count_expired_delivered_live(&pool, HORIZON_DAYS)
+            .await
+            .expect("count expired"),
+        1,
+        "only the stale delivered row is eligible"
+    );
+    assert_eq!(
+        expire_delivered_live(&pool, HORIZON_DAYS)
+            .await
+            .expect("expire"),
+        1,
+        "exactly the eligible set is deleted"
+    );
+    // Privacy: the purge deletes the full row, leaving no tombstone behind.
+    assert_eq!(row_count(&pool, &old_delivered).await, 0);
+    for key in [&fresh_delivered, &old_started, &old_claimed] {
+        assert_eq!(
+            row_count(&pool, key).await,
+            1,
+            "ineligible row must survive"
+        );
+    }
+    assert_eq!(
+        count_expired_delivered_live(&pool, HORIZON_DAYS)
+            .await
+            .expect("recount expired"),
+        0,
+        "a second run must find nothing eligible"
+    );
+    // Dedup still holds inside the horizon: retries of the surviving
+    // delivered and ambiguous rows cannot double-post.
+    assert_eq!(
+        claim_live(&pool, &claim(&fresh_delivered))
+            .await
+            .expect("retry fresh delivered"),
+        ClaimOutcome::Duplicate
+    );
+    assert_eq!(
+        claim_live(&pool, &claim(&old_started))
+            .await
+            .expect("retry old started"),
+        ClaimOutcome::Duplicate
+    );
+    // The never-started row keeps its lease semantics: the purge left it
+    // alone, so the stale retry takes it over instead of finding it gone.
+    match claim_live(&pool, &claim(&old_claimed))
+        .await
+        .expect("retry old claimed")
+    {
+        ClaimOutcome::Claimed(_) => {}
+        other => panic!("stale never-started claim must be taken over, got {other:?}"),
+    }
     cleanup(pool, &schema).await;
 }

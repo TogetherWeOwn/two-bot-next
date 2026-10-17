@@ -23,6 +23,7 @@
 
 use std::{collections::HashMap, future::Future, time::Duration};
 
+use two_bot_core::metrics::Metrics;
 use two_bot_core::twitch_eventsub::{
     CallbackUrl, ExistingSubscription, SubscriptionAction, WebhookSecret,
 };
@@ -242,6 +243,15 @@ async fn run_plan<T: HelixTransport>(
     run
 }
 
+/// Record the successful mutations of one executed plan in the metrics
+/// registry: 2xx creates and deletes. Zero counts are no-ops; 409
+/// already-exists confirmations fold into the pass outcome, not into actions.
+fn record_actions(metrics: &Metrics, outcomes: &[ActionOutcome]) {
+    let summary = summarize(outcomes);
+    metrics.eventsub_reconcile_action("create", summary.created as u64);
+    metrics.eventsub_reconcile_action("delete", summary.deleted as u64);
+}
+
 /// List, diff with `plan_boot_actions` (deletes before creates, our callback
 /// only), run the plan action by action, then confirm with a follow-up
 /// `list_subscriptions` that always runs: the pass fails loudly, with the
@@ -253,9 +263,48 @@ pub async fn reconcile_all<T: HelixTransport>(
     desired: &[String],
     secret: &WebhookSecret,
 ) -> Result<ReconcileSummary, HelixError> {
-    let existing = client.list_subscriptions().await?;
+    reconcile_all_with_metrics(
+        client,
+        callback,
+        desired,
+        secret,
+        two_bot_core::metrics::global(),
+    )
+    .await
+}
+
+/// [`reconcile_all`] against an explicit metrics registry. Every pass that
+/// reaches Helix records exactly one
+/// `two_bot_eventsub_reconcile_passes_total{outcome}` sample (`healthy`,
+/// `pending`, `failed`), the successful creates/deletes in
+/// `two_bot_eventsub_reconcile_actions_total{action}`, and each failure site in
+/// `two_bot_eventsub_reconcile_errors_total{error_class}` under the
+/// failure-site `error_class` log strings (`reconcile_action_failed`,
+/// `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed`).
+/// `reconcile_pending`, config refusals and parked startup passes stay
+/// log-only, and the `startup_reconcile` wrapper's `reconcile_failed` line
+/// surfaces the same failure the pass already counted. Cardinality is bounded
+/// per-outcome, never per-subscription: no broadcaster, subscription id,
+/// status code or body byte reaches a label. Callers pass a fresh
+/// [`Metrics`] in tests; production passes the global registry.
+pub async fn reconcile_all_with_metrics<T: HelixTransport>(
+    client: &mut HelixClient<T>,
+    callback: &CallbackUrl,
+    desired: &[String],
+    secret: &WebhookSecret,
+    metrics: &Metrics,
+) -> Result<ReconcileSummary, HelixError> {
+    let existing = match client.list_subscriptions().await {
+        Ok(existing) => existing,
+        Err(error) => {
+            metrics.eventsub_reconcile_pass("failed");
+            metrics.eventsub_reconcile_error("reconcile_failed");
+            return Err(error);
+        }
+    };
     let prior_failed = count_prior_failed(&existing, callback);
     if prior_failed > 0 {
+        metrics.eventsub_reconcile_error("reconcile_prior_failed");
         tracing::error!(
             event = "eventsub_reconcile",
             error_class = "reconcile_prior_failed",
@@ -264,11 +313,32 @@ pub async fn reconcile_all<T: HelixTransport>(
             "eventsub reconcile found failed subscriptions on our callback; deleting and re-creating"
         );
     }
-    let plan = plan_boot_actions(desired, callback, &existing)?;
+    let plan = match plan_boot_actions(desired, callback, &existing) {
+        Ok(plan) => plan,
+        Err(error) => {
+            metrics.eventsub_reconcile_pass("failed");
+            metrics.eventsub_reconcile_error("reconcile_failed");
+            return Err(error);
+        }
+    };
     let run = run_plan(client, &plan, callback, secret).await;
-    let confirmed = client.list_subscriptions().await?;
+    for _ in 0..run.failed {
+        metrics.eventsub_reconcile_error("reconcile_action_failed");
+    }
+    let confirmed = match client.list_subscriptions().await {
+        Ok(confirmed) => confirmed,
+        Err(error) => {
+            record_actions(metrics, &run.outcomes);
+            metrics.eventsub_reconcile_pass("failed");
+            metrics.eventsub_reconcile_error("reconcile_failed");
+            return Err(error);
+        }
+    };
     let missing = unconfirmed_broadcasters(desired, callback, &confirmed);
     if run.failed > 0 || !missing.is_empty() {
+        record_actions(metrics, &run.outcomes);
+        metrics.eventsub_reconcile_error("reconcile_unhealthy");
+        metrics.eventsub_reconcile_pass("failed");
         tracing::error!(
             event = "eventsub_reconcile",
             error_class = "reconcile_unhealthy",
@@ -283,6 +353,7 @@ pub async fn reconcile_all<T: HelixTransport>(
         )));
     }
     let mut summary = summarize(&run.outcomes);
+    record_actions(metrics, &run.outcomes);
     summary.prior_failed = prior_failed;
     let status = if all_desired_enabled(desired, callback, &confirmed) {
         "healthy"
@@ -291,6 +362,7 @@ pub async fn reconcile_all<T: HelixTransport>(
     };
     summary.status = Some(status);
     if status == "pending" {
+        metrics.eventsub_reconcile_pass("pending");
         tracing::warn!(
             event = "eventsub_reconcile",
             error_class = "reconcile_pending",
@@ -304,6 +376,7 @@ pub async fn reconcile_all<T: HelixTransport>(
         );
         return Ok(summary);
     }
+    metrics.eventsub_reconcile_pass("healthy");
     tracing::info!(
         event = "eventsub_reconcile",
         status = "healthy",
@@ -1079,6 +1152,224 @@ mod tests {
         );
         assert_eq!(seen[2].method, Method::DELETE);
         assert_eq!(seen[3].method, Method::POST);
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_healthy_pass_creates_and_deletes() {
+        let listing = json!({
+            "data": [
+                subscription_entry("stale-id", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("keep-id", "enabled", "222", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let confirmed = json!({
+            "data": [
+                subscription_entry("keep-id", "enabled", "222", "https://hooks.example.com/twitch"),
+                subscription_entry("fresh-id", "enabled", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let metrics = two_bot_core::metrics::Metrics::default();
+        let summary = reconcile_all_with_metrics(
+            &mut client,
+            &callback(),
+            &["222".to_owned(), "444".to_owned()],
+            &test_secret(),
+            &metrics,
+        )
+        .await
+        .expect("healthy follow-up must succeed");
+        assert_eq!(summary.status, Some("healthy"));
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"healthy\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"pending\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 1\n"));
+        for error_class in [
+            "reconcile_action_failed",
+            "reconcile_prior_failed",
+            "reconcile_unhealthy",
+            "reconcile_failed",
+        ] {
+            assert!(
+                text.contains(&format!(
+                    "two_bot_eventsub_reconcile_errors_total{{error_class=\"{error_class}\"}} 0\n"
+                )),
+                "no {error_class} on a clean healthy pass"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_pending_pass_with_prior_failed() {
+        let listing = json!({
+            "data": [
+                subscription_entry("failed-id", "webhook_callback_verification_failed", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let confirmed = json!({
+            "data": [
+                subscription_entry("fresh-id", "webhook_callback_verification_pending", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let metrics = two_bot_core::metrics::Metrics::default();
+        let summary = reconcile_all_with_metrics(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+            &metrics,
+        )
+        .await
+        .expect("pending follow-up after a prior failure must still succeed");
+        assert_eq!(summary.status, Some("pending"));
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"pending\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"healthy\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_prior_failed\"} 1\n"
+        ));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_unhealthy\"} 0\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_failed_pass_when_initial_listing_fails() {
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                Err(HelixError::BadResponse("fixture listing must fail")),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let metrics = two_bot_core::metrics::Metrics::default();
+        reconcile_all_with_metrics(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+            &metrics,
+        )
+        .await
+        .expect_err("a failed listing must fail the pass");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"healthy\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"pending\"} 0\n"));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_failed\"} 1\n"
+        ));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 0\n"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_failed_pass_when_followup_listing_fails() {
+        let listing = json!({"data": [], "pagination": {}});
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                Err(HelixError::BadResponse(
+                    "fixture follow-up listing must fail",
+                )),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let metrics = two_bot_core::metrics::Metrics::default();
+        reconcile_all_with_metrics(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+            &metrics,
+        )
+        .await
+        .expect_err("a failed follow-up listing must fail the pass");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_failed\"} 1\n"
+        ));
+        // The successful create still counts even though confirmation never ran.
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 1\n"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_unhealthy_verdict_with_partial_actions() {
+        let listing = json!({"data": [], "pagination": {}});
+        let confirmed = json!({
+            "data": [
+                subscription_entry("id-111", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("id-333", "enabled", "333", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::rejected(StatusCode::BAD_REQUEST),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let metrics = two_bot_core::metrics::Metrics::default();
+        reconcile_all_with_metrics(
+            &mut client,
+            &callback(),
+            &["111".to_owned(), "222".to_owned(), "333".to_owned()],
+            &test_secret(),
+            &metrics,
+        )
+        .await
+        .expect_err("a rejected create must fail the pass");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_action_failed\"} 1\n"
+        ));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_unhealthy\"} 1\n"
+        ));
+        // The two successful creates still count even though the pass failed.
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 2\n"));
     }
 
     #[tokio::test(start_paused = true)]
