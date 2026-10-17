@@ -555,6 +555,25 @@ impl<T: HelixTransport> HelixClient<T> {
                 .await?;
             let document: serde_json::Value = serde_json::from_slice(&response.body)
                 .map_err(|_| HelixError::BadResponse("subscription listing is not JSON"))?;
+            // A successful answer is only listing evidence when it is an
+            // object carrying a `data` array. `parse_subscriptions` is
+            // deliberately lenient per entry (other types, versions,
+            // transports and malformed entries are skipped), but a missing
+            // or non-array `data` envelope must not read as "no
+            // subscriptions": reconciliation would plan creates from
+            // invalid evidence, and a malformed later page would truncate
+            // the accumulated pages into partial success. Fail the whole
+            // listing instead; the message is static and carries no bytes
+            // from the response.
+            if document
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .is_none()
+            {
+                return Err(HelixError::BadResponse(
+                    "subscription listing has no data array",
+                ));
+            }
             subscriptions.extend(parse_subscriptions(&document));
 
             let next_cursor = match document.get("pagination") {
