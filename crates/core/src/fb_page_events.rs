@@ -147,10 +147,13 @@ pub mod webhook {
     pub const FB_WEBHOOK_ID_MAX: usize = 128;
     /// Longest change `field` accepted per change.
     pub const FB_WEBHOOK_FIELD_MAX: usize = 64;
-    /// Most entries accepted per envelope.
-    pub const FB_WEBHOOK_MAX_ENTRIES: usize = 32;
-    /// Most changes accepted per envelope, across all entries.
-    pub const FB_WEBHOOK_MAX_CHANGES: usize = 128;
+    /// Most entries accepted per envelope: sized to Meta's documented batch
+    /// of up to 1000 updates, so authenticated deliveries are never refused
+    /// for their size; the body cap still bounds memory.
+    pub const FB_WEBHOOK_MAX_ENTRIES: usize = 1000;
+    /// Most changes accepted per envelope, across all entries: sized to
+    /// Meta's documented batch of up to 1000 updates.
+    pub const FB_WEBHOOK_MAX_CHANGES: usize = 1000;
     /// Upper bound every [`DriverError::Failed`] message from this module
     /// stays under, so hostile input can never inflate an error.
     pub const FB_WEBHOOK_ERROR_MAX: usize = 128;
@@ -252,7 +255,9 @@ pub mod webhook {
     /// [`verify_signature`] first. Malformed envelopes fail as bounded
     /// [`DriverError::Failed`]; entries and changes beyond
     /// [`FB_WEBHOOK_MAX_ENTRIES`] / [`FB_WEBHOOK_MAX_CHANGES`] are refused
-    /// rather than truncated so a flood can never silently shrink.
+    /// rather than truncated so a flood can never silently shrink. The caps
+    /// match Meta's documented batch of up to 1000 updates, so a correctly
+    /// signed delivery is never refused for its size.
     #[must_use = "handle the parsed changes or the refusal, never drop it"]
     pub fn parse_envelope(body: &[u8]) -> Result<FbPageEnvelope, DriverError> {
         if body.len() > FB_WEBHOOK_MAX_BODY_BYTES {
@@ -2485,7 +2490,7 @@ mod tests {
 
     #[test]
     fn fb_envelope_rejects_hostile_shapes() {
-        use webhook::parse_envelope;
+        use webhook::{parse_envelope, FB_WEBHOOK_MAX_CHANGES, FB_WEBHOOK_MAX_ENTRIES};
 
         let overlong_field = "f".repeat(65);
         let overlong_id = "1".repeat(129);
@@ -2544,19 +2549,33 @@ mod tests {
                 String::from_utf8_lossy(&body[..body.len().min(120)])
             );
         }
-        // Floods are refused, never silently truncated.
-        let many_entries: Vec<_> = (0..33)
+        // Floods beyond Meta's documented 1000-update batch are refused,
+        // never silently truncated; a full 1000-update batch parses.
+        let many_entries: Vec<_> = (0..FB_WEBHOOK_MAX_ENTRIES + 1)
             .map(|i| serde_json::json!({"id": i.to_string(), "changes": []}))
             .collect();
         let flooded = serde_json::json!({"object": "page", "entry": many_entries}).to_string();
         assert!(parse_envelope(flooded.as_bytes()).is_err());
-        let many_changes: Vec<_> = (0..129)
+        let many_changes: Vec<_> = (0..FB_WEBHOOK_MAX_CHANGES + 1)
             .map(|_| serde_json::json!({"field": "feed"}))
             .collect();
         let flooded = serde_json::json!({"object": "page",
             "entry": [{"id": "1", "changes": many_changes}]})
         .to_string();
         assert!(parse_envelope(flooded.as_bytes()).is_err());
+        let full_entries: Vec<_> = (0..FB_WEBHOOK_MAX_ENTRIES)
+            .map(|i| serde_json::json!({"id": i.to_string(), "changes": []}))
+            .collect();
+        let full = serde_json::json!({"object": "page", "entry": full_entries}).to_string();
+        assert!(parse_envelope(full.as_bytes()).is_ok());
+        let full_changes: Vec<_> = (0..FB_WEBHOOK_MAX_CHANGES)
+            .map(|_| serde_json::json!({"field": "feed"}))
+            .collect();
+        let full = serde_json::json!({"object": "page",
+            "entry": [{"id": "1", "changes": full_changes}]})
+        .to_string();
+        let parsed = parse_envelope(full.as_bytes()).expect("1000-change batch parses");
+        assert_eq!(parsed.changes.len(), FB_WEBHOOK_MAX_CHANGES);
         // Invalid UTF-8 never panics the JSON parser.
         assert!(parse_envelope(&[0xff, 0xfe, 0x00]).is_err());
     }
@@ -2598,7 +2617,7 @@ mod tests {
                         "no secret in errors: {rendered:?}"
                     );
                     assert!(
-                        !rendered.contains("fixture-fb-app-secret"),
+                        !rendered.contains(fixture_secret().as_str()),
                         "no secret in errors: {rendered:?}"
                     );
                 }

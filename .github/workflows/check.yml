@@ -2092,7 +2092,7 @@ jobs:
       # and exits without fuzzing. A signing-key drift between the harness
       # and production, or seed misrouting, panics an assertion here instead
       # of passing a compile-only gate. Compile stays the only gate for the
-      # other sixteen targets.
+      # other seventeen targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
