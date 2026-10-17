@@ -292,7 +292,7 @@ async fn run_retention_inner(
             let voice = count_voice_raw(&mut tx).await?;
             let audit = count_audit_cache(&mut tx).await?;
             let live_expired =
-                count_expired_delivered_live(&mut **tx, DELIVERED_DEDUP_RETENTION_DAYS).await?;
+                count_expired_delivered_live(&mut *tx, DELIVERED_DEDUP_RETENTION_DAYS).await?;
             let pending: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM retention_deletion_requests WHERE status = 'pending'",
             )
@@ -424,7 +424,7 @@ async fn run_retention_inner(
             // claim or send could reference, and this never runs on the send
             // path.
             let live_expired =
-                expire_delivered_live(&mut **tx, DELIVERED_DEDUP_RETENTION_DAYS).await?;
+                expire_delivered_live(&mut *tx, DELIVERED_DEDUP_RETENTION_DAYS).await?;
             let overdue = count_overdue_deletions(&mut tx).await?;
             // Schema gaps are computed once per run, before either drain. A
             // gap means no purge or deletion can certify completeness, so

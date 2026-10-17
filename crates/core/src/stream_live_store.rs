@@ -407,11 +407,12 @@ mod tests {
 
     #[test]
     fn delivered_dedup_horizon_outlives_any_retry_window() {
-        assert!(
-            DELIVERED_DEDUP_RETENTION_DAYS >= 30,
-            "the fence must outlive any Twitch retry window, got {} days",
-            DELIVERED_DEDUP_RETENTION_DAYS
-        );
+        // Const context: clippy `assertions_on_constants` rejects this as a
+        // runtime assert, and a horizon edited below the retry window fails
+        // the build here.
+        const _: () = {
+            assert!(DELIVERED_DEDUP_RETENTION_DAYS >= 30);
+        };
     }
 
     #[test]
