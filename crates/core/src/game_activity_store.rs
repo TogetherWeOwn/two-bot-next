@@ -116,6 +116,71 @@ pub async fn upsert_guild_aggregates(
     Ok(written)
 }
 
+/// How long a quiet guild's aggregate rows survive: rows whose `updated_at`
+/// is older than this many days expire on the retention cadence. Long enough
+/// to keep operator trend reports useful across quiet spells, short enough
+/// that abandoned guilds stop accumulating rows forever.
+pub const GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS: i32 = 90;
+
+/// Process-environment key overriding
+/// [`GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`]. Read on the retention cadence,
+/// never on the flush/send path.
+pub const AGGREGATE_RETENTION_DAYS_SETTING: &str = "TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS";
+
+/// Parse the [`AGGREGATE_RETENTION_DAYS_SETTING`] value. Missing or malformed
+/// values fall back to [`GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`], never to a
+/// wider horizon: an unreadable setting must not widen into a full-table wipe
+/// (non-positive values refuse below in [`expire_stale_guild_aggregates`]).
+#[must_use]
+pub fn aggregate_retention_days_from_setting(value: Option<&str>) -> i32 {
+    match value.and_then(|raw| raw.trim().parse::<i32>().ok()) {
+        Some(days) if days >= 1 => days,
+        _ => GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS,
+    }
+}
+
+/// Guilds holding at least one aggregate row, oldest guild key first, so the
+/// retention cadence can expire each guild's stale rows under its own guild
+/// scope.
+pub async fn list_aggregate_guilds(
+    pool: &Pool<Postgres>,
+) -> Result<Vec<String>, GameActivityStoreError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT guild_id FROM game_activity_guild_aggregates ORDER BY guild_id ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(guild_id,)| guild_id).collect())
+}
+
+/// Delete one guild's aggregate rows older than `retention_days`, leaving
+/// every other guild untouched. Only deletes: opt-out filtering stays at the
+/// write-time gate ([`aggregate_filtered`]/[`upsert_guild_aggregates`]), so
+/// expiry can neither persist an opted-out member's data nor resurrect it.
+/// Non-positive horizons are refused (fail-closed) instead of widening into a
+/// full-guild wipe.
+pub async fn expire_stale_guild_aggregates(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    retention_days: i32,
+) -> Result<u64, GameActivityStoreError> {
+    if retention_days < 1 {
+        return Err(GameActivityStoreError::Db(sqlx::Error::InvalidArgument(
+            "game-activity aggregate retention horizon must be at least one day".into(),
+        )));
+    }
+    Ok(sqlx::query(
+        "DELETE FROM game_activity_guild_aggregates
+          WHERE guild_id = $1
+            AND updated_at < now() - make_interval(days => $2)",
+    )
+    .bind(guild_id)
+    .bind(retention_days)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
 /// A guild's stored rows, oldest game key first (`''`/untitled first), for
 /// the operator trend report. No per-member reader exists by design.
 pub async fn read_guild_aggregates(
@@ -518,6 +583,116 @@ mod tests {
                 .iter()
                 .all(|(guild, game)| guild == "guild-a" && (game == "Apex" || game.is_empty())),
             "rows carry guild and game only, got {stored:?}"
+        );
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[test]
+    fn aggregate_retention_horizon_defaults_safe_and_never_widens() {
+        assert_eq!(aggregate_retention_days_from_setting(None), 90);
+        assert_eq!(
+            aggregate_retention_days_from_setting(None),
+            GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS
+        );
+        assert_eq!(aggregate_retention_days_from_setting(Some("30")), 30);
+        assert_eq!(aggregate_retention_days_from_setting(Some(" 45 ")), 45);
+        // Malformed or non-positive input falls back to the safe default;
+        // nothing parses into a wider-than-default horizon here, and the
+        // wider-or-equal explicit values stay exact.
+        for fallback in [None, Some(""), Some("soon"), Some("0"), Some("-7")] {
+            assert_eq!(
+                aggregate_retention_days_from_setting(fallback),
+                GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS,
+                "unreadable horizon must fall back, got {fallback:?}"
+            );
+        }
+        assert_eq!(aggregate_retention_days_from_setting(Some("365")), 365);
+    }
+
+    #[tokio::test]
+    async fn stale_rows_expire_per_guild_and_fresh_rows_survive() {
+        let Some((pool, schema)) = test_pool("tog_28386_expire")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping game_activity_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // Guild-a holds one stale game and one fresh game; guild-b holds one
+        // stale game. Backdating `updated_at` stands in for a quiet guild:
+        // the flush path always refreshes it on write.
+        upsert_guild_aggregates(
+            &pool,
+            &[
+                aggregate("guild-a", Some("Apex"), 30 * MIN_MS, MIN_MS, 1),
+                aggregate("guild-a", Some("Valorant"), 10 * MIN_MS, 0, 1),
+                aggregate("guild-b", Some("Apex"), 99 * MIN_MS, 0, 9),
+            ],
+        )
+        .await
+        .expect("seed flush");
+        for (guild, game) in [("guild-a", "Apex"), ("guild-b", "Apex")] {
+            sqlx::query(
+                "UPDATE game_activity_guild_aggregates
+                    SET updated_at = now() - make_interval(days => 100)
+                  WHERE guild_id = $1 AND game = $2",
+            )
+            .bind(guild)
+            .bind(game)
+            .execute(&pool)
+            .await
+            .expect("backdate stale row");
+        }
+        assert_eq!(
+            list_aggregate_guilds(&pool).await.expect("guild listing"),
+            vec!["guild-a".to_owned(), "guild-b".to_owned()],
+        );
+        // A non-positive horizon refuses instead of wiping the guild.
+        assert!(
+            expire_stale_guild_aggregates(&pool, "guild-a", 0)
+                .await
+                .is_err(),
+            "zero-day horizon must fail closed"
+        );
+        // Expiring guild-a deletes only its stale row: the fresh row stays,
+        // and guild-b's equally stale row is untouched (per-guild isolation).
+        assert_eq!(
+            expire_stale_guild_aggregates(&pool, "guild-a", 90)
+                .await
+                .expect("expire guild-a"),
+            1
+        );
+        let kept = read_guild_aggregates(&pool, "guild-a")
+            .await
+            .expect("read guild-a");
+        assert_eq!(kept.len(), 1, "fresh row survives, got {kept:?}");
+        assert_eq!(kept[0].game.as_deref(), Some("Valorant"));
+        assert_eq!(kept[0].total_play_ms, 10 * MIN_MS);
+        assert_eq!(
+            read_guild_aggregates(&pool, "guild-b")
+                .await
+                .expect("read guild-b")
+                .len(),
+            1,
+            "other guilds keep their rows until their own expiry"
+        );
+        // Guild-b's own expiry then clears it, and re-expiring an empty or
+        // fresh guild deletes nothing.
+        assert_eq!(
+            expire_stale_guild_aggregates(&pool, "guild-b", 90)
+                .await
+                .expect("expire guild-b"),
+            1
+        );
+        assert!(read_guild_aggregates(&pool, "guild-b")
+            .await
+            .expect("read emptied guild")
+            .is_empty());
+        assert_eq!(
+            expire_stale_guild_aggregates(&pool, "guild-a", 90)
+                .await
+                .expect("re-expire fresh guild"),
+            0
         );
         drop_schema(&pool, &schema).await;
     }

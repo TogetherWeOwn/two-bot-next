@@ -14,6 +14,7 @@
 use std::{sync::Arc, time::Duration};
 
 use sqlx::PgPool;
+use two_bot_core::game_activity_store;
 use two_bot_cutover::retention::{run_retention, RetentionMode};
 
 use crate::backfill_retention_chains::render_retention_failure;
@@ -103,6 +104,13 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                     );
                     ErrorClass::Database
                 })?;
+                // Stale per-guild game-activity aggregates expire on this same
+                // cadence, never on the hourly flush/send path: quiet guilds
+                // stop accumulating rows while active guilds keep every fresh
+                // row. Execute only; the dry run deletes nothing by contract.
+                if mode == RetentionMode::Execute {
+                    expire_stale_game_aggregates(&pool).await?;
+                }
                 let partial = report.guild_purges_failed > 0
                     || report.guild_purges_deferred > 0
                     || report.deletions_deferred > 0
@@ -150,4 +158,45 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
             })
         }),
     }
+}
+
+/// Delete per-guild game-activity aggregate rows older than the configured
+/// horizon, one guild scope at a time. Each guild's delete is its own
+/// statement, so one guild's store failure never rolls back another guild's
+/// expiry; any failure returns [`ErrorClass::Database`] so the supervisor
+/// retries on the next bounded opportunity. Expiry is idempotent (deleted
+/// rows stay deleted), and the horizon parser never yields a sub-day value,
+/// so a misconfigured setting falls back to the safe default instead of
+/// widening into a wipe.
+async fn expire_stale_game_aggregates(pool: &PgPool) -> Result<(), ErrorClass> {
+    let horizon = game_activity_store::aggregate_retention_days_from_setting(
+        std::env::var(game_activity_store::AGGREGATE_RETENTION_DAYS_SETTING)
+            .ok()
+            .as_deref(),
+    );
+    let guilds = game_activity_store::list_aggregate_guilds(pool)
+        .await
+        .map_err(|_| {
+            tracing::warn!("game_activity_aggregate_expiry_failed");
+            ErrorClass::Database
+        })?;
+    let mut expired = 0u64;
+    for guild_id in &guilds {
+        match game_activity_store::expire_stale_guild_aggregates(pool, guild_id, horizon).await {
+            Ok(rows) => expired += rows,
+            Err(_) => {
+                tracing::warn!("game_activity_aggregate_expiry_failed");
+                return Err(ErrorClass::Database);
+            }
+        }
+    }
+    if expired > 0 {
+        tracing::info!(
+            message = "game_activity_aggregate_expiry",
+            expired_rows = expired,
+            horizon_days = horizon,
+            "retention cadence expired stale per-guild game-activity aggregates",
+        );
+    }
+    Ok(())
 }
