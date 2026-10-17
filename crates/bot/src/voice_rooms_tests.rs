@@ -11932,10 +11932,7 @@ async fn a_game_or_stream_change_rerenders_the_room_name() {
     let capture = tracing_capture::Capture::default();
     tracing::subscriber::with_default(capture.clone(), || worker.refresh_template_names(1));
     let decision_log = capture.text();
-    assert!(
-        decision_log.contains("game=\"Apex Legends\""),
-        "{decision_log}"
-    );
+    assert!(decision_log.contains("game=Apex Legends"), "{decision_log}");
     assert!(
         decision_log.contains("activity_detected=true"),
         "{decision_log}"
