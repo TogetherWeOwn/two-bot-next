@@ -75,7 +75,10 @@ gh workflow run release.yml --ref main -f dry_run=true
 `scripts/test-release-on-promote.cjs` (worker CI) pins the parsing, the bump
 rules and the note rendering. It also dry-runs the script on a throwaway git
 repository: the version, the rollback guard, `release-as`, the off-main refusal and an
-invalid SHA. `scripts/test-release-on-promote-latest-repair.cjs` (worker CI,
+invalid SHA. Its one non-dry-run case runs a fresh cut — an untagged commit
+above the highest tag — against a mocked `gh` and pins the single
+`release create` call's target and its `--latest` flag, the main promote path
+the dry runs never reach. `scripts/test-release-on-promote-latest-repair.cjs` (worker CI,
 `node --test`) pins "Latest" selection during repair against a mocked `gh`:
 an older repair keeps the newer Latest, the newest repair stays
 latest-eligible, and the no-op, untagged-rollback and dry-run guards hold. `scripts/ci/test_workflows.py` and `scripts/test-deploy-production.py` pin
