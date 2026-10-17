@@ -318,11 +318,14 @@ fn writer_without_lengths_stays_fail_closed() {
     );
 }
 
+/// Captured message ids with their recorded integer lengths.
+type CapturedMessages = std::sync::Arc<Mutex<Vec<(String, Option<usize>)>>>;
+
 /// Facts sink that captures what the handler records, so the handler path
 /// (input → sink) is observable without a database.
 #[derive(Clone, Default)]
 struct CaptureFacts {
-    messages: std::sync::Arc<Mutex<Vec<(String, Option<usize>)>>>,
+    messages: CapturedMessages,
 }
 
 impl FactsSink for CaptureFacts {
