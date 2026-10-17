@@ -320,8 +320,10 @@ fn live_poll_seconds_prefers_the_stored_value() {
     assert_eq!(live_poll_seconds_with(GUILD, 300, Some(&live)), 300);
 }
 
-/// The per-tick schedule gate observes a stored increase without a restart:
-/// after the interval moves 60 s to 3600 s, a tick one minute later skips.
+/// The per-tick schedule gate reschedules the pending run when the stored
+/// interval changes, mirroring the supervisor's cadence policy: the next run
+/// moves to last-begin + new interval, in both directions, without a
+/// restart. An unchanged value leaves the pending slot untouched.
 #[test]
 fn schedule_gate_observes_a_stored_increase_without_restart() {
     use two_bot_core::feeds::FeedPollSchedule;
@@ -340,12 +342,98 @@ fn schedule_gate_observes_a_stored_increase_without_restart() {
     assert!(!schedule.set_interval_seconds(59), "out of range refused");
     assert_eq!(schedule.interval_seconds(), 3600);
 
-    // The next run gates on the new interval, and the tick one boot interval
-    // after it skips: the stored increase applied without a restart.
-    assert!(schedule.begin(61_000));
+    // The pending run rescheduled from t=60 s to last-begin + 3600 s: a tick
+    // at the old slot skips, the run lands at the new slot.
+    assert!(!schedule.begin(61_000), "old slot no longer due");
+    assert!(schedule.begin(3_600_000), "new slot due");
     schedule.finish();
-    assert!(!schedule.begin(122_000));
-    assert!(schedule.begin(3_661_000));
+
+    // A stored decrease pulls the pending run in to last-begin + 60 s.
+    assert!(schedule.set_interval_seconds(60));
+    assert!(!schedule.begin(3_659_999));
+    assert!(schedule.begin(3_660_000));
+    schedule.finish();
+
+    // Unchanged interval: the pending slot stays exactly one interval out.
+    assert!(!schedule.set_interval_seconds(60));
+    assert!(!schedule.begin(3_719_999));
+    assert!(schedule.begin(3_720_000));
+}
+
+/// End to end through the real supervisor: a stored interval decrease below
+/// the boot cadence takes effect at last-run + new interval without waiting
+/// for the pending boot-cadence slot, and the schedule gate admits exactly
+/// that run (no duplicate, no skip). Paused time only; no network or DB.
+#[tokio::test(start_paused = true)]
+async fn supervisor_applies_a_hot_reloaded_feed_interval_without_restart() {
+    use std::sync::atomic::AtomicU64;
+
+    use crate::jobs::{statuses, supervise};
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let action: JobAction = Arc::new({
+        let runs = runs.clone();
+        move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    });
+    // Boot cadence 3600 s; the stored interval starts at the boot value.
+    let stored = Arc::new(AtomicU64::new(3600));
+    let interval = {
+        let stored = stored.clone();
+        Arc::new(move || stored.load(Ordering::SeqCst))
+    };
+    let job = scheduled_job_dynamic(3600, action, interval).expect("valid boot interval");
+    assert_eq!(job.cadence, Duration::from_secs(3600));
+    assert!(job.cadence_source.is_some(), "supervisor cadence is live");
+
+    let status = statuses(&[NAME], false);
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(supervise(vec![job], status, rx));
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "immediate first run at t=0");
+
+    // Unchanged stored interval: nothing runs inside the boot cadence.
+    tokio::time::advance(Duration::from_secs(300)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    // The stored interval drops to 60 s at t=300. The next run reschedules to
+    // last-run + 60 s (already past), so one prompt run fires on observation
+    // instead of waiting for the t=3600 boot slot.
+    stored.store(60, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "decrease applies promptly");
+
+    // The new 60 s cadence continues: one run per interval, no duplicates.
+    tokio::time::advance(Duration::from_secs(60)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+
+    // An increase back to 3600 s pushes the pending tick out a full new
+    // interval from the last run.
+    stored.store(3600, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(600)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        3,
+        "increase defers the next run"
+    );
+    stop.send(true).unwrap();
+    task.await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]

@@ -14,6 +14,9 @@ pub use two_bot_core::metrics::JobErrorClass as ErrorClass;
 
 pub type JobFuture = Pin<Box<dyn Future<Output = Result<(), ErrorClass>> + Send>>;
 pub type JobAction = Arc<dyn Fn() -> JobFuture + Send + Sync>;
+/// Live cadence reader for jobs whose period can change without a restart.
+/// Must be cheap and non-blocking: the supervisor calls it on its own lane.
+pub type CadenceSource = Arc<dyn Fn() -> Duration + Send + Sync>;
 pub type SharedStatus = Arc<RwLock<BTreeMap<String, JobStatus>>>;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -29,11 +32,24 @@ pub struct JobStatus {
 
 pub struct Job {
     pub name: &'static str,
+    /// Boot cadence: the supervisor's period at startup, and the fallback
+    /// whenever [`Job::cadence_source`] is absent or reports no change.
     pub cadence: Duration,
+    /// Optional live cadence. When set, the supervisor re-reads it at every
+    /// tick and on a bounded recheck while waiting; a changed value
+    /// reschedules the next tick to last-run + new cadence (one prompt run
+    /// if that instant is already past, never a catch-up burst), an
+    /// unchanged value preserves the fixed phase. A zero value is ignored.
+    pub cadence_source: Option<CadenceSource>,
     pub startup_jitter: Duration,
     pub timeout: Duration,
     pub action: JobAction,
 }
+
+/// How often the supervisor re-reads a dynamic job's cadence source while
+/// waiting for its next tick, so a decrease below the pending slot is
+/// observed promptly instead of at the old deadline.
+const CADENCE_RECHECK: Duration = Duration::from_secs(5);
 
 pub fn statuses(names: &[&str], parked: bool) -> SharedStatus {
     Arc::new(RwLock::new(
@@ -118,14 +134,38 @@ async fn record_completion(
     }
 }
 
+/// The source's cadence when it moved away from `current`; updates `current`
+/// in that case. Absent source, zero and unchanged values are all "no move",
+/// so a static job's fixed phase is never disturbed.
+fn refreshed_cadence(source: &Option<CadenceSource>, current: &mut Duration) -> Option<Duration> {
+    let next = source.as_ref()?();
+    if next.is_zero() || next == *current {
+        return None;
+    }
+    *current = next;
+    Some(next)
+}
+
+fn cadence_interval(first_tick: Instant, cadence: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(first_tick, cadence);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    interval
+}
+
 async fn run_job(
     job: Job,
     status: SharedStatus,
     mut shutdown: watch::Receiver<bool>,
     metrics: &Metrics,
 ) {
-    let mut interval = tokio::time::interval_at(Instant::now() + job.startup_jitter, job.cadence);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let first_deadline = Instant::now() + job.startup_jitter;
+    let mut cadence = job.cadence;
+    let mut interval = cadence_interval(first_deadline, cadence);
+    let mut recheck = cadence_interval(first_deadline + CADENCE_RECHECK, CADENCE_RECHECK);
+    // Scheduled instant of the tick that started the latest run: the anchor
+    // a reschedule counts the new cadence from. Before the first run, a
+    // changed cadence applies from the first tick instead of moving it.
+    let mut last_run_tick: Option<Instant> = None;
     let mut active: Option<JoinHandle<Result<(), ErrorClass>>> = None;
     let mut completed_at = None;
     loop {
@@ -149,6 +189,14 @@ async fn run_job(
                 let current = statuses.get_mut(job.name).expect("registered job");
                 current.last_start = Some(timestamp());
                 current.running = true;
+                drop(statuses);
+                last_run_tick = Some(deadline);
+                // A cadence change first observed at this tick reschedules
+                // the next one deadline + new cadence, discarding the old
+                // period's already-queued slot.
+                if let Some(next) = refreshed_cadence(&job.cadence_source, &mut cadence) {
+                    interval = cadence_interval(deadline + next, next);
+                }
                 let action = Arc::clone(&job.action);
                 let timeout = job.timeout;
                 active = Some(tokio::spawn(async move {
@@ -156,6 +204,16 @@ async fn run_job(
                     tokio::time::timeout(timeout, async move { action().await }).await
                         .unwrap_or(Err(ErrorClass::Timeout))
                 }));
+            }
+            _ = recheck.tick(), if job.cadence_source.is_some() => {
+                // Between ticks: a changed cadence reschedules the pending
+                // tick to last-run + new cadence. A past instant ticks once
+                // promptly; Skip collapses any further missed slots, so the
+                // job never bursts to catch up.
+                if let Some(next) = refreshed_cadence(&job.cadence_source, &mut cadence) {
+                    let first = last_run_tick.map_or(first_deadline, |tick| tick + next);
+                    interval = cadence_interval(first, next);
+                }
             }
         }
     }
