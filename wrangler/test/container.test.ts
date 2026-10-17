@@ -477,6 +477,8 @@ test("keepalive logs the gateway failure phase and class once, as strict tokens"
     failed_step: "unknown",
     error_code: "none",
     build_revision: "unknown",
+    release: "unknown",
+    worker_version: ID,
     log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
   })]);
 });
@@ -489,7 +491,7 @@ test("keepalive logs build revision plus failed step and SQLSTATE when served", 
       failed_step: "gateway_run",
       error_code: "42501",
     },
-    { build_revision: "abc123", build_id: "build-1" },
+    { build_revision: "abc1234", build_id: "build-1" },
   ));
   assert.deepEqual(gatewayFailureLogs(h.logs), [JSON.stringify({
     event: "container_gateway_failure",
@@ -497,7 +499,9 @@ test("keepalive logs build revision plus failed step and SQLSTATE when served", 
     class: "gateway_runtime_failed",
     failed_step: "gateway_run",
     error_code: "42501",
-    build_revision: "abc123",
+    build_revision: "abc1234",
+    release: "abc1234",
+    worker_version: ID,
     log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
   })]);
 });
@@ -554,9 +558,69 @@ test("keepalive logs only phase and class even when the failure object carries m
     failed_step: "unknown",
     error_code: "none",
     build_revision: "unknown",
+    release: "unknown",
+    worker_version: ID,
     log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
   }));
   assert.ok(h.logs.every((entry) => !entry.includes("hunter2")));
+});
+
+// Release-tagged error tracking groups gateway failures by `class`: the keepalive
+// re-emits the container failure with the /readyz git SHA as `release`
+// (Workers Logs filters by release and groups by class).
+const RELEASE_SHA = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
+
+test("keepalive tags the gateway failure with the container release and worker version", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: RELEASE_SHA, build_id: "123-1" },
+  ));
+  assert.deepEqual(gatewayFailureLogs(h.logs), [JSON.stringify({
+    event: "container_gateway_failure",
+    phase: "durable_gateway",
+    class: "checkpoint_load_failed",
+    failed_step: "unknown",
+    error_code: "none",
+    build_revision: RELEASE_SHA,
+    release: RELEASE_SHA,
+    worker_version: ID,
+    log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
+  })]);
+});
+
+test("keepalive tags an unparseable build revision as unknown without echoing it", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: "postgres://user:hunter2@db.internal/app" },
+  ));
+  const [line] = gatewayFailureLogs(h.logs);
+  assert.equal(JSON.parse(line!).release, "unknown");
+  assert.equal(JSON.parse(line!).worker_version, ID);
+  assert.ok(h.logs.every((entry) => !entry.includes("hunter2")));
+});
+
+test("metrics alert lines carry the keepalive release and worker version", async (t) => {
+  const h = await harness(t);
+  const rankClass = `two_bot_job_last_error_class{job="rank",class="database"} 1`;
+  const failing = metricsBody(3).replace(
+    'two_bot_job_last_error_class{job="rank",class="database"} 0', rankClass);
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") return new Response(failing);
+    return new Response(JSON.stringify({
+      components: [["process", "ready"]],
+      build_revision: RELEASE_SHA, build_id: "123-1",
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  });
+  await tickKeepalive(h.bot);
+  const alerts = h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line))
+    .filter((event) => event.event === "metrics_alert");
+  assert.ok(alerts.length > 0, "expected a metrics alert line");
+  for (const alert of alerts) {
+    assert.equal(alert.release, RELEASE_SHA);
+    assert.equal(alert.worker_version, ID);
+  }
+  assert.match(alerts[0].content, /last error class: database/);
 });
 
 test("keepalive ignores a gateway failure in a non-bot (text) probe answer", async (t) => {

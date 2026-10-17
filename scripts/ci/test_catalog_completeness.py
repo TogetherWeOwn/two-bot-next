@@ -107,12 +107,21 @@ EXEMPT_SERIES = {
     # live in docs/metrics.md; the catalog covers voice_event log fields.
     # (joins_received, dispatch_timeouts, watchdog_stucks, halt_recoveries are
     # cataloged, so they carry no exemption.)
-    "two_bot_voice_join_refused_total": _VOICE_SERIES_REASON,
     "two_bot_voice_global_backoff_capped_total": _VOICE_SERIES_REASON,
     "two_bot_voice_worker_halted": _VOICE_SERIES_REASON,
     "two_bot_voice_queue_pending": _VOICE_SERIES_REASON,
     "two_bot_voice_queue_oldest_age_seconds": _VOICE_SERIES_REASON,
     "two_bot_voice_rest_in_flight_age_seconds": _VOICE_SERIES_REASON,
+    # Histogram `_bucket` child consumed as an alert input: the gate
+    # normalizes catalog families (stripping `_bucket`) but compares raw
+    # alert-input names, so only an exemption covers this spelling. The base
+    # family row lives in the catalog voice_event section.
+    "two_bot_voice_join_to_move_seconds_bucket": (
+        "histogram _bucket child of the cataloged "
+        "two_bot_voice_join_to_move_seconds family; alert input for "
+        "voice_join_fast_burn and voice_join_slow_burn (cumulative le=\"5\" "
+        "count); documented in docs/metrics.md and the catalog alert-rule rows"
+    ),
     # Event-store S1 consumer-lag gauge: label-free manual check, not an
     # alert input. Documented in docs/metrics.md; the catalog tracks event
     # names, not this operational gauge.

@@ -40,9 +40,14 @@ No Gatus or third-party monitor is used.
    not copy webhook URLs, bearer values, member identifiers, message content,
    database URLs, request headers, or raw remote error bodies into the incident.
 2. Open the corresponding Cloudflare Workers Observability logs for the
-   environment and time window. For Container failures, use the `containers`
-   dataset or the dashboard's Container logs; do not rely on the Wrangler
-   `logs` tail to show Rust stdout.
+   environment and time window. Filter `container_gateway_failure` and
+   `metrics_alert` lines by `release` (the deployed git SHA) to scope errors
+   to that release. Group gateway failures by `class`; group metrics alerts by
+   the alert rule in `content`. Error-class grouping applies to metrics alerts
+   only when `content` includes a validated last error class, as with
+   `job_consecutive_failures`. For Container failures, use the `containers`
+   dataset or the dashboard's Container logs; do not rely on the
+   Wrangler `logs` tail to show Rust stdout.
 3. Read `/readyz` and, when authorized, the read-only `/ops/gateway` summary.
    Capture `build_revision` and `build_id` from the response. Never treat the
    Worker version ID as the Git SHA.
@@ -69,10 +74,11 @@ counter between metric samples. `gateway_unpaired_disconnect` detects a
 sustained disconnect without RESUMED or fresh READY. `rest_5xx_rate` fires when
 Discord 5xx responses exceed 10% of REST requests in a window. Read the class
 and failed step from the Container's structured `gateway_failed` log line,
-which carries `failed_step` and the sanitized `error_code`. The Worker
-re-emits the same phase, class, failed step and SQLSTATE code in its
-`container_gateway_failure` event, and `/readyz` serves the step plus the code
-in `gateway_failure.failed_step`/`error_code` alongside the phase/class. SQL
+which carries `failed_step` and the sanitized `error_code`. The Worker re-emits
+the same phase, class, failed step and SQLSTATE code in its
+`container_gateway_failure` event plus the `release`/`worker_version` tags, and
+`/readyz` serves the step plus the code in
+`gateway_failure.failed_step`/`error_code` alongside the phase/class. SQL
 errors are never emitted verbatim. A PostgreSQL SQLSTATE code appears only when
 the producer explicitly extracts it; do not infer one from a generic
 `database` class. A missing grant (`42501`) or missing table (`42P01`) is a
@@ -140,8 +146,21 @@ ids: they join to themselves, not to an inbound request.
 These are deliberate, visible limits of the current implementation; do not
 claim them as shipped acceptance:
 
-- Release-tagged external error tracking is not configured. Production Workers
-  Logs are enabled unsampled; traces remain disabled to avoid recording
+- Worker/DO alert log lines and Discord messages do not yet consistently carry
+  the Container Git SHA and a direct log-query URL. Use the build/deploy
+  correlation procedure above.
+- Worker/DO request-span and dispatch lines do not carry the container
+  `build_sha`/`release`: the Worker version ID is distinct from the Git SHA.
+  The release-tagged error events above are the exception. Correlate other
+  Worker/DO activity via the procedure above.
+- Release-tagged error grouping is provided by Workers Logs, not an external
+  error-tracking service. Every `container_gateway_failure` and `metrics_alert`
+  line carries `release` (the container git SHA) and `worker_version` plus the
+  `failed_step`/`error_code`/`build_revision`/`log_url` detail. Filter a deploy
+  window by `release`; group gateway failures by `class` and metrics alerts by
+  the alert rule in `content`. A last error class is available only when
+  metrics-alert `content` includes a validated one. Production Workers Logs are
+  enabled unsampled; traces remain disabled to avoid recording
   credential-bearing URLs.
 - This repository's synthetic workflow is staging-oriented. Do not describe it
   as a passive five-minute production user-flow check unless the production

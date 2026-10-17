@@ -108,6 +108,7 @@ import {
   type MetricsAlertState,
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
+import { parseRelease, releaseTag, workerVersionTag } from "./error-events.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
 import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
 import { handleMcp } from "./mcp.ts";
@@ -662,6 +663,10 @@ export class TwoBotContainer extends Container<Env> {
   private readonly ownership = new OwnershipFence(this.ctx.storage);
   private readonly initialization: Promise<void>;
   private recoveryFailed = false;
+  // Last container git SHA seen on /readyz this tick. Tags the keepalive
+  // error events (gateway failures by class; metrics alerts by rule/content);
+  // a failed probe leaves "unknown" rather than a stale release from a replaced image.
+  private lastRelease: string | null = null;
   private static readonly KEEPALIVE_KEY = "two-bot:keepalive:v1";
 
   constructor(ctx: DurableObjectState<{}>, env: Env) {
@@ -1186,11 +1191,16 @@ export class TwoBotContainer extends Container<Env> {
             // is a failed probe, never a buffered parse. Small bodies still
             // drain fully, so the SDK 0.3.7 proxy pipe settles cleanly.
             const body = await readBoundedText(res, MAX_PROBE_BODY_BYTES);
+            // Refresh the release tag before any error event below: a failed
+            // probe must not reuse a previous image's SHA.
+            this.lastRelease = null;
             if (body === null) {
               status = null;
               console.warn("two-bot keepalive probe failed");
             } else {
-              probe = isBotProbeResponse(res) ? probeDetail(body) : { failure: null };
+              const botBody = isBotProbeResponse(res);
+              probe = botBody ? probeDetail(body) : { failure: null };
+              this.lastRelease = botBody ? parseRelease(body) : null;
               const failure = probe.failure;
               if (failure) {
                 console.warn(JSON.stringify({
@@ -1200,6 +1210,8 @@ export class TwoBotContainer extends Container<Env> {
                   failed_step: failure.failedStep ?? "unknown",
                   error_code: failure.errorCode ?? "none",
                   build_revision: probe.buildRevision ?? "unknown",
+                  release: releaseTag(this.lastRelease),
+                  worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
                   log_url: LOG_QUERY_URL,
                 }));
               }
@@ -1210,6 +1222,7 @@ export class TwoBotContainer extends Container<Env> {
               throw error;
             }
             status = null;
+            this.lastRelease = null;
             console.warn("two-bot keepalive probe failed");
           }
           const context: AlertContext = {
@@ -1283,6 +1296,8 @@ export class TwoBotContainer extends Container<Env> {
       first_failure_at: ready ? previous!.firstFailureAt : state.firstFailureAt,
       observed_at: now,
       build_revision: context?.buildRevision ?? "unknown",
+      release: releaseTag(this.lastRelease),
+      worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
       failed_step: context?.failedStep ?? "unknown",
       error_code: context?.errorCode ?? "none",
       log_url: LOG_QUERY_URL,
@@ -1331,6 +1346,8 @@ export class TwoBotContainer extends Container<Env> {
           service: "two-bot-next",
           content,
           build_revision: context?.buildRevision ?? "unknown",
+          release: releaseTag(this.lastRelease),
+          worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
           log_url: LOG_QUERY_URL,
         }));
         await this.postWebhookText(content);

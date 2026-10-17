@@ -21,6 +21,9 @@ Logs only, never `/metrics`.
 - `failed_step` names the fallible step, `error_code` carries the SQLSTATE
   (`none` when no database code applies), `build_revision` carries the
   container Git SHA, and `log_url` links the log-query docs.
+- `release` is the container git SHA (`"unknown"` when the probe answer has
+  none); `worker_version` is the platform Worker version id. Filter by
+  `release` to scope errors to the deploy that produced them.
 - `class` is one of the twelve `FailureClass` tokens:
 
 | `class` | Failing step |
