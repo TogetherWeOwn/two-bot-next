@@ -70,6 +70,83 @@ def read_lcov(path):
     return hits, ""
 
 
+_C_SIMPLE_ESCAPES = {
+    "a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13,
+    '"': 34, "\\": 92,
+}
+
+
+def _decode_git_c_quoted(token):
+    """Decode a Git C-quoted path token (``"b/..."``) to its path string.
+
+    Git quotes a diff path when it contains bytes outside printable ASCII
+    (or a quote/backslash): the whole ``b/<path>`` is wrapped in double
+    quotes, special characters use C escapes (``\\t``, ``\\"``, ``\\\\``)
+    and every other non-printable byte is a three-digit octal escape, so
+    non-ASCII names arrive as octal-escaped UTF-8 bytes. Decode the bytes
+    first, then UTF-8, to recover the repository-relative name coverage
+    data uses. Raises ValueError on anything Git would not emit.
+    """
+    if len(token) < 2 or not token.startswith('"') or not token.endswith('"'):
+        raise ValueError(f"unterminated quoted diff path: {token!r}")
+    inner = token[1:-1]
+    out = bytearray()
+    pos = 0
+    while pos < len(inner):
+        ch = inner[pos]
+        if ch == '"':
+            raise ValueError(f"unescaped quote in quoted diff path: {token!r}")
+        if ch != "\\":
+            out.extend(ch.encode("utf-8"))
+            pos += 1
+            continue
+        if pos + 1 >= len(inner):
+            raise ValueError(f"trailing backslash in quoted diff path: {token!r}")
+        esc = inner[pos + 1]
+        if esc in "01234567":
+            digits = inner[pos + 1: pos + 4]
+            if len(digits) != 3 or any(c not in "01234567" for c in digits):
+                raise ValueError(f"bad octal escape in quoted diff path: {token!r}")
+            out.append(int(digits, 8))
+            pos += 4
+        elif esc in _C_SIMPLE_ESCAPES:
+            out.append(_C_SIMPLE_ESCAPES[esc])
+            pos += 2
+        else:
+            raise ValueError(f"unsupported escape \\{esc} in quoted diff path: {token!r}")
+    try:
+        return bytes(out).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"quoted diff path is not valid UTF-8: {token!r}") from exc
+
+
+def _parse_new_file_header(raw):
+    """B-side path from a ``+++ `` diff header, or None for ``/dev/null``.
+
+    Accepts the two shapes Git emits -- ``+++ b/<path>`` and the C-quoted
+    ``+++ "b/<path>"`` -- and raises ValueError for anything else, so a
+    malformed header fails the gate closed instead of leaving the
+    preceding file selected.
+    """
+    if not raw.startswith("+++ "):
+        raise ValueError(f"unsupported +++ diff header: {raw!r}")
+    target = raw[len("+++ "):]
+    if not target:
+        raise ValueError("empty +++ diff header")
+    if target == "/dev/null":
+        return None
+    if target.startswith('"'):
+        decoded = _decode_git_c_quoted(target)
+        if decoded == "/dev/null":
+            return None
+        if decoded.startswith("b/") and decoded[2:]:
+            return decoded[2:]
+        raise ValueError(f"quoted +++ header is not a b/ path: {raw!r}")
+    if target.startswith("b/") and target[2:]:
+        return target[2:]
+    raise ValueError(f"unsupported +++ diff header: {raw!r}")
+
+
 def added_lines(base_ref, head_ref):
     """Added (file, new-line) pairs from a zero-context diff of Rust files."""
     try:
@@ -86,20 +163,38 @@ def added_lines(base_ref, head_ref):
         return None, f"git diff exited {proc.returncode}: {proc.stderr.strip()[:200]}"
     added = set()
     path, new_line = None, 0
+    in_hunk = False
+    header_seen = False
     for raw in proc.stdout.splitlines():
-        if raw.startswith("+++ b/"):
-            path = raw[len("+++ b/"):]
+        if raw.startswith("diff --git "):
+            # Every file boundary resets the selected file: lines from a
+            # file whose header is missing or malformed must never be
+            # attributed to the preceding file.
+            path, in_hunk, header_seen = None, False, False
+            continue
+        if not in_hunk and raw.startswith("+++"):
+            try:
+                path = _parse_new_file_header(raw)
+            except ValueError as exc:
+                return None, f"unreadable diff header ({exc})"
+            header_seen = True
             continue
         match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
         if match:
+            if not header_seen:
+                return None, "diff hunk without a +++ file header; failing closed"
             new_line = int(match.group(1))
+            in_hunk = True
             continue
-        if path is None:
+        if not in_hunk or path is None:
             continue
-        if raw.startswith("+") and not raw.startswith("+++"):
+        if raw.startswith("+"):
             added.add((path, new_line))
             new_line += 1
-        elif raw.startswith("-") and not raw.startswith("---"):
+        elif raw.startswith("-"):
+            continue
+        elif raw.startswith("\\"):
+            # "\ No newline at end of file" annotates the previous line.
             continue
         else:
             new_line += 1
