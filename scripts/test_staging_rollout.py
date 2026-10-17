@@ -1095,9 +1095,16 @@ class OrchestrationTests(OfflineTestCase):
         self.config.write_text(CONFIG + '[env.staging.vars]\nTWO_DEPLOY_ENV = "staging"\n')
         self.prepare_baseline()
         generated = json.loads(Path(self.args.deploy_config).read_text())
-        self.assertEqual(generated["env"]["staging"]["vars"], {"TWO_DEPLOY_ENV": "staging"})
+        self.assertEqual(generated["env"]["staging"]["vars"], {"TWO_DEPLOY_ENV": "staging", rollout.CONTAINER_RELEASE_VAR: REVISION})
         self.assertNotIn(rollout.GATEWAY_FAIL_INJECTION_VAR, json.dumps(generated))
         self.assertEqual(json.loads(Path(self.args.receipt).read_text()), baseline())
+
+    def test_prepare_stamps_container_release_for_worker_edge_span_lines(self):
+        self.prepare_baseline()
+        generated = json.loads(Path(self.args.deploy_config).read_text())
+        self.assertEqual(generated["env"]["staging"]["vars"], {rollout.CONTAINER_RELEASE_VAR: REVISION})
+        self.assertEqual(generated["env"]["production"]["vars"], {"PRESERVED": "production-fixture"})
+        self.assertEqual(self.config.read_text(), CONFIG)
 
     def test_prepare_with_drill_flag_injects_only_generated_staging_vars(self):
         config = CONFIG + '[env.staging.vars]\nTWO_DEPLOY_ENV = "staging"\n'
@@ -1107,7 +1114,7 @@ class OrchestrationTests(OfflineTestCase):
         generated = json.loads(Path(self.args.deploy_config).read_text())
         self.assertEqual(
             generated["env"]["staging"]["vars"],
-            {"TWO_DEPLOY_ENV": "staging", rollout.GATEWAY_FAIL_INJECTION_VAR: "1"},
+            {"TWO_DEPLOY_ENV": "staging", rollout.GATEWAY_FAIL_INJECTION_VAR: "1", rollout.CONTAINER_RELEASE_VAR: REVISION},
         )
         # Production, top level and the checked-in source stay untouched.
         self.assertEqual(generated["env"]["production"]["vars"], {"PRESERVED": "production-fixture"})

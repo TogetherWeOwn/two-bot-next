@@ -12,6 +12,7 @@ import { randomBytes } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import { OWNER_KEY, DEPLOYMENT_HEADER } from "../src/ownership.ts";
+import { LOG_QUERY_URL } from "../src/alert-rules.ts";
 import { isRequestId } from "../src/request-id.ts";
 import {
   ACTIONS_PATH,
@@ -558,7 +559,7 @@ test("the ownership fence refuses ingress; a stale or spoofed deployment never f
   assert.equal(h.seen.length, before);
 });
 
-test("logs carry only scalar event, status, error class and request id", async (t) => {
+test("logs carry only scalar event, status, error class, request id, release and log url", async (t) => {
   const h = await harness(t, ENABLED_ENV);
   await h.warm();
   const secrets = [SIGNATURE, NONCE, BODY, KEYS, "203.0.113", INTENT_ID];
@@ -571,9 +572,11 @@ test("logs carry only scalar event, status, error class and request id", async (
   assert.ok(ingress.length >= 3, "refusals are logged");
   for (const line of ingress) {
     const record = JSON.parse(line) as Record<string, unknown>;
-    assert.deepEqual(Object.keys(record).sort(), ["error_class", "event", "request_id", "status"]);
+    assert.deepEqual(Object.keys(record).sort(), ["error_class", "event", "log_url", "release", "request_id", "status"]);
     assert.match(String(record["error_class"]), /^[a-z_]+$/);
     assert.ok(isRequestId(String(record["request_id"])), `bad id shape: ${line}`);
+    assert.match(String(record["release"]), /^(?:[0-9a-f]{7,40}|unknown)$/, `bad release shape: ${line}`);
+    assert.equal(record["log_url"], LOG_QUERY_URL, `bad log url: ${line}`);
   }
   for (const line of h.logs) for (const secret of secrets) assert.ok(!line.includes(secret), secret);
 });

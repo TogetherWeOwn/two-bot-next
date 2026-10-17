@@ -627,6 +627,10 @@ def save(path, value):
 
 DEPLOY_ENV_VAR = "TWO_DEPLOY_ENV"
 GATEWAY_FAIL_INJECTION_VAR = "TWO_GATEWAY_READINESS_FAIL_INJECTION"
+# Worker-edge span lines log this SHA as `release` (same commit as the
+# container image). Generated-only: a committed value would go stale, so the
+# committed TOML must never carry it (like the drill switch above).
+CONTAINER_RELEASE_VAR = "CONTAINER_RELEASE"
 
 
 def apply_gateway_fail_injection(config, enabled):
@@ -687,6 +691,12 @@ def prepare(args, client):
         container["image_build_context"] = str(source.parent.parent)
     containers[0]["image_vars"] = {"BOT_BUILD_REVISION": revision, "BOT_BUILD_ID": build_id}
     containers[0]["rollout_kind"] = "full_auto"
+    # The Worker edge has no container probe, so edge span lines would log the
+    # visible `unknown` bucket; stamping the same commit here lets them carry
+    # the real release like the DO-side alert lines do.
+    staging_vars = staging.setdefault("vars", {})
+    require(isinstance(staging_vars, dict), "wrong_staging_config")
+    staging_vars[CONTAINER_RELEASE_VAR] = revision
     # Rollback drill only: the dispatch-only workflow input reaches the
     # deployed build solely as this flag on the generated staging config.
     apply_gateway_fail_injection(config, bool(getattr(args, "inject_gateway_failure", False)))

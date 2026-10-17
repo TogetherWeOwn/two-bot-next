@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import { DEPLOYMENT_HEADER, OWNER_KEY } from "../src/ownership.ts";
+import { LOG_QUERY_URL } from "../src/alert-rules.ts";
 import { isRequestId } from "../src/request-id.ts";
 import {
   EVENTSUB_PATH,
@@ -614,7 +615,7 @@ test("public ingress never starts the container: a cold instance answers 503 wit
   assert.deepEqual(h.starts, [], "container not started");
 });
 
-test("logs carry only scalar event/status/error_class/request_id: no header value, challenge or body ever lands", async (t) => {
+test("logs carry only scalar event/status/error_class/request_id/release/log_url: no header value, challenge or body ever lands", async (t) => {
   const h = await harness(t, ENABLED_ENV);
   await h.warm();
   h.serveEventsubReceiver();
@@ -633,8 +634,10 @@ test("logs carry only scalar event/status/error_class/request_id: no header valu
   assert.ok(ingress.length >= 1, "refusals are logged");
   for (const line of ingress) {
     const record = JSON.parse(line) as Record<string, unknown>;
-    assert.deepEqual(Object.keys(record).sort(), ["error_class", "event", "request_id", "status"]);
+    assert.deepEqual(Object.keys(record).sort(), ["error_class", "event", "log_url", "release", "request_id", "status"]);
     assert.ok(isRequestId(String(record["request_id"])), `bad id shape: ${line}`);
+    assert.match(String(record["release"]), /^(?:[0-9a-f]{7,40}|unknown)$/, `bad release shape: ${line}`);
+    assert.equal(record["log_url"], LOG_QUERY_URL, `bad log url: ${line}`);
   }
 });
 
