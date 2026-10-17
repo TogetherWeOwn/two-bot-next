@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Pool, Postgres};
 use two_bot_core::{
-    analytics_family::AnalyticsCategory, EventType, FunnelEvent, FunnelStore,
-    InviteSnapshotStore, InviteState,
+    analytics_family::AnalyticsCategory, EventType, FunnelEvent, FunnelStore, InviteSnapshotStore,
+    InviteState,
 };
 use two_bot_store::{migrate, PgFunnelStore, PgInviteSnapshots, DB_POOL_MAX};
 

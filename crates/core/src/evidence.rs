@@ -27,8 +27,8 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::funnel::{idempotency_key, now_iso, parse_iso_millis};
 use crate::analytics_family::AnalyticsCategory;
+use crate::funnel::{idempotency_key, now_iso, parse_iso_millis};
 use crate::{EventType, FunnelEvent, FunnelStore, RecordOutcome, Snowflake};
 
 /// Schema version stamped on every exported packet.

@@ -29,7 +29,7 @@
 use sqlx::{PgConnection, Pool, Postgres};
 
 pub use crate::analytics_family::{
-    AnalyticsCategory, category_of_event, community_category, toggle_column,
+    category_of_event, community_category, toggle_column, AnalyticsCategory,
 };
 
 /// True when the pair holds a guild-scoped suppression row. Anonymous writes
