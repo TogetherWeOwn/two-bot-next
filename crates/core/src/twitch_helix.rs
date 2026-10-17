@@ -391,7 +391,7 @@ fn subscriptions_url(broadcaster_user_id: Option<&str>, cursor: Option<&str>) ->
 /// cursor, if any.
 ///
 /// A successful answer is only listing evidence when it is an object carrying
-/// a `data` array. [`parse_subscriptions`](crate::twitch_eventsub::parse_subscriptions)
+/// a `data` array. [`parse_subscriptions`]
 /// is deliberately lenient per entry (other types, versions, transports and
 /// malformed entries are skipped), but a missing or non-array `data` envelope
 /// must not read as "no subscriptions": reconciliation would plan creates from

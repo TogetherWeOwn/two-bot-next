@@ -104,10 +104,17 @@ fn assert_bounded_envelope_error(
     // The error carries no page bytes: the only variable content it could
     // echo is excluded by construction, pinned here against long page-unique
     // substrings (short pages may coincide with the literal by chance).
+    // Skip probes that coincide with either static rendering: Debug wraps the
+    // literal in quotes, so a JSON string page starting with `"subscription`
+    // would otherwise read as echoed bytes for correct behavior.
     if page.len() > 64 {
         let probe = &page[..32];
         if let Ok(probe) = std::str::from_utf8(probe) {
-            if probe.len() >= 8 && !expected.contains(probe) {
+            if probe.len() >= 8
+                && !expected.contains(probe)
+                && !rendered.contains(probe)
+                && !debug.contains(probe)
+            {
                 assert!(
                     !rendered.contains(probe) && !debug.contains(probe),
                     "envelope error must not echo response bytes"
