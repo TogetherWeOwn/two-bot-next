@@ -31,14 +31,7 @@ IMAGE_MAX_BYTES = 112 * MIB
 # (15.04 MiB) before the event-executor merge; the combined-head
 # measurement comes from hosted CI on the merged head. 16 MiB restores a
 # working tripwire with headroom; revisit if the binary approaches it.
-# 2026-10-17: main itself reached 16,776,096 bytes (16.00 MiB, 1,120 bytes
-# under the ceiling) and the eventsub shutdown-join head measured 16,777,832
-# bytes (+1,736 bytes of join/drain logic, 616 bytes over the ceiling), both
-# on hosted CI with no new dependencies and the same minimal release profile
-# (opt-level=z, lto, strip). 17 MiB restores the working tripwire with about
-# 1.05 MiB (6.2%) headroom above the shutdown-join head; revisit if the
-# binary approaches it.
-BINARY_MAX_BYTES = 17 * MIB
+BINARY_MAX_BYTES = 16 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"
