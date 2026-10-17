@@ -161,6 +161,15 @@ event-executors measurement. No new dependencies or release-profile changes;
 revisit if the binary approaches the limit. The 112 MiB image ceiling is
 unchanged.
 
+On 2026-10-17 the 16 MiB ceiling was reached: main at `f2baa19` measured
+16,776,096 bytes (1,120 bytes of headroom), and the stream delivered-dedup
+expiry slice (PR #1079, `ac8fd66`) added 1,280 bytes with no new dependencies,
+measuring 16,777,376 bytes — 160 bytes over the ceiling on hosted CI and
+failing the check workflow on main twice, including a re-run of the failed
+jobs. The release profile is already minimal (opt-level=z, lto, strip), so
+the binary ceiling moves to 17 MiB; revisit if the binary approaches it. The
+112 MiB image ceiling is unchanged (42.43 MiB measured on the same builds).
+
 This branch's automation-only head separately measured 15,769,872 bytes
 (15.04 MiB) before the event-executor merge. This PR keeps the current-main
 16 MiB binary ceiling; the combined exact-head CI measurement is still
@@ -202,7 +211,7 @@ The unused streamed-archive helper and its archive-specific builders/tests
 have been removed in favor of main's history metric; the smoke/runtime
 contract fixtures remain.
 
-The 112 MiB image ceiling is unchanged; the release-binary ceiling is 16 MiB
+The 112 MiB image ceiling is unchanged; the release-binary ceiling is 17 MiB
 (see the current calibration above). CI on this PR's exact head must still
 record the corrected image size and pass the runtime contract and both
 one-byte-budget negative checks; fixture success alone cannot establish

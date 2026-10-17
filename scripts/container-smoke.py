@@ -31,7 +31,16 @@ IMAGE_MAX_BYTES = 112 * MIB
 # (15.04 MiB) before the event-executor merge; the combined-head
 # measurement comes from hosted CI on the merged head. 16 MiB restores a
 # working tripwire with headroom; revisit if the binary approaches it.
-BINARY_MAX_BYTES = 16 * MIB
+# 2026-10-17 recalibration: main at f2baa19 measured 16,776,096 bytes
+# with 1,120 bytes of headroom; the stream delivered-dedup expiry slice
+# (#1079) added 1,280 bytes with no new dependencies (two store methods
+# plus retention wiring) and measured 16,777,376 bytes — 160 bytes over
+# the 16 MiB ceiling on hosted CI, failing the check workflow on main
+# twice (including a re-run of the failed jobs). The release profile is
+# already minimal (opt-level=z, lto, strip). 17 MiB restores a working
+# tripwire with room for ordinary slices; revisit if the binary
+# approaches it.
+BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"
