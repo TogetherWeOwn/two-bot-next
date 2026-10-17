@@ -1144,6 +1144,7 @@ pub fn delivery_action(claim: DeliveryClaim, posted_this_poll: usize) -> Deliver
 pub struct FeedPollSchedule {
     interval_ms: i64,
     next_ms: i64,
+    last_begin_ms: Option<i64>,
     running: bool,
 }
 
@@ -1157,6 +1158,7 @@ impl FeedPollSchedule {
         Ok(Self {
             interval_ms: seconds as i64 * 1000,
             next_ms: i64::MIN,
+            last_begin_ms: None,
             running: false,
         })
     }
@@ -1166,6 +1168,7 @@ impl FeedPollSchedule {
             return false;
         }
         self.running = true;
+        self.last_begin_ms = Some(now_ms);
         self.next_ms = now_ms.saturating_add(self.interval_ms);
         true
     }
@@ -1174,9 +1177,14 @@ impl FeedPollSchedule {
         self.running = false;
     }
 
-    /// Hot-reload the poll interval without a restart (TOG-19027): the next
-    /// `begin` gates on the new interval. Out-of-range values are refused and
-    /// keep the current interval. Returns true when the interval changed.
+    /// Hot-reload the poll interval without a restart (TOG-19027): a changed
+    /// interval reschedules the pending run to last-begin + new interval, in
+    /// both directions, mirroring the supervisor's cadence policy so the
+    /// timer and this gate admit the same slot. Before the first run there
+    /// is no pending slot to move: the first `begin` stays immediate and
+    /// counts the new interval from itself. Out-of-range and unchanged
+    /// values are refused and keep the current schedule. Returns true when
+    /// the interval changed.
     pub fn set_interval_seconds(&mut self, seconds: u64) -> bool {
         if !(60..=86400).contains(&seconds) {
             return false;
@@ -1186,6 +1194,9 @@ impl FeedPollSchedule {
             return false;
         }
         self.interval_ms = interval_ms;
+        if let Some(last_begin_ms) = self.last_begin_ms {
+            self.next_ms = last_begin_ms.saturating_add(interval_ms);
+        }
         true
     }
 
