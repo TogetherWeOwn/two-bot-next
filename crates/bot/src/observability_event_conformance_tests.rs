@@ -40,8 +40,9 @@ const GATEWAY_RS_EVENTS: [&str; 20] = [
     "retention purge skipped; schema gap, operator replay required",
 ];
 
-/// `crates/bot/src/main.rs`: the eight cataloged `tracing` messages.
-const MAIN_RS_TRACED_EVENTS: [&str; 8] = [
+/// `crates/bot/src/main.rs`: the nine cataloged `tracing` messages.
+const MAIN_RS_TRACED_EVENTS: [&str; 9] = [
+    "gateway intents resolved",
     "durable gateway initialized; shard connecting",
     "gateway prerequisites missing; gateway parked, /readyz reports down",
     "gateway readiness failure injection active; /readyz reports gateway down for the staging rollback drill",
@@ -79,7 +80,8 @@ const SHUTDOWN_RS_EVENTS: [&str; 2] = [
 const JOBS_RS_EVENTS: [&str; 1] = ["periodic job failed"];
 
 /// `crates/bot/src/voice_rooms.rs`: the cataloged voice messages.
-const VOICE_RS_CATALOG_MESSAGES: [&str; 15] = [
+const VOICE_RS_CATALOG_MESSAGES: [&str; 16] = [
+    "voice room rename decision",
     "voice join completed",
     "voice_operation succeeded",
     "voice_operation failed",
