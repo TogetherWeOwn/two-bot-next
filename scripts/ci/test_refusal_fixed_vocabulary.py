@@ -37,7 +37,7 @@ shape must never join its valid fixtures. `Refused`/`ReadFailed` take
 exactly one message argument: a second argument stringifies into a tuple
 that `scripts/staging_events_read.py:371/374` prints, so the pin asserts
 the single-argument shape (mirroring the `require` arity assert) and
-treats any extra argument as flagged. The ast-grep `Refused($MSG)` /
+treats any extra argument, `*args` splat or `**kwargs` as flagged. The ast-grep `Refused($MSG)` /
 `ReadFailed($MSG)` patterns only bind single-argument calls, so the YAML
 still misses that family and this pin decides it. This pin decides CI.
 Known gaps, documented rather than
@@ -152,6 +152,15 @@ def message_segment(text, node, where=""):
         )
         target = node.args[1]
     elif func_id(node.func) in ("Refused", "ReadFailed"):
+        if any(isinstance(arg, ast.Starred) for arg in node.args) or any(
+            kw.arg is None for kw in node.keywords
+        ):
+            raise AssertionError(
+                f"{where}: Refused/ReadFailed take exactly one message "
+                "argument, not *args/**kwargs; "
+                "the ast-grep patterns Refused($MSG)/ReadFailed($MSG) would "
+                "miss this shape"
+            )
         assert len(node.args) + len(node.keywords) == 1, (
             f"{where}: Refused/ReadFailed take exactly one argument; "
             "the ast-grep patterns Refused($MSG)/ReadFailed($MSG) would "
@@ -255,13 +264,18 @@ def classify(segment, message, broad, exempts, probes=()):
 def snippet_verdict(snippet):
     """classify() for one fixture or mutant snippet.
 
-    Out-of-contract arity raises in message_segment(); map it to flagged
-    so a two-argument Refused/ReadFailed trips the pin even though the
-    single-argument ast-grep patterns miss it.
+    Out-of-contract arity (a second argument, or *args/**kwargs
+    splatting) raises in message_segment(); map it to flagged so those
+    shapes trip the pin even though the single-argument ast-grep patterns
+    miss them. A snippet with no refusal call at all still raises from
+    first_call() so a typo'd constructor name can never read as flagged.
     """
     broad, exempts = broad_and_exempts()
+    # first_call stays outside the try: a snippet with no refusal call
+    # (for example a typo'd constructor name) must raise loudly, never
+    # read as "flagged". Only out-of-contract arity maps to flagged.
+    node = first_call(snippet)
     try:
-        node = first_call(snippet)
         message = message_segment(snippet.strip(), node)
     except AssertionError:
         return "flagged"
@@ -483,6 +497,8 @@ class MutantTests(unittest.TestCase):
         # on arity (pin-only: no YAML fixture change).
         'raise Refused("refusing: the database host must be a bare name", host)',
         'raise ReadFailed("psql failed", done.stderr)',
+        # A *splat smuggles the tuple through the same hole.
+        "raise Refused(*error.args)",
     ]
     FIXED = [
         'raise Refused("refusing: the database login may not set that query parameter")',
@@ -505,6 +521,19 @@ class MutantTests(unittest.TestCase):
         for snippet in self.INTERPOLATED:
             with self.subTest(snippet=snippet):
                 self.assertEqual(snippet_verdict(snippet), "flagged")
+
+    def test_snippets_without_a_refusal_call_raise(self):
+        # A typo'd constructor (or any snippet with no refusal call) must
+        # raise from first_call(), never read as "flagged": silent
+        # flagged verdicts let misspelled mutants pass without a signal.
+        for snippet in (
+            'raise Refuse(f"x {host}")',
+            "x = 1",
+            "foo(bar)",
+        ):
+            with self.subTest(snippet=snippet):
+                with self.assertRaises(AssertionError):
+                    snippet_verdict(snippet)
 
     def test_fixed_mutants_stay_clean(self):
         for snippet in self.FIXED:
