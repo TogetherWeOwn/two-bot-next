@@ -135,3 +135,10 @@ path = "fuzz_targets/helix_token.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "voice_assistant_reply"
+path = "fuzz_targets/voice_assistant_reply.rs"
+test = false
+doc = false
+bench = false
