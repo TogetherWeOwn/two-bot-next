@@ -188,11 +188,14 @@ where
     /// Records one `two_bot_moderation_enforcements_total` sample per terminal
     /// call (TOG-28482): `success` for completed enforcements including
     /// idempotent replays, otherwise the bounded
-    /// `ActionError::enforcement_outcome` class — including the pre-service
-    /// validation and actor/target checks, mirroring
-    /// `InternalChannelExecutor`. The verb is the request's
-    /// `ModerationAction::command_name`; no user id, reason text or free-form
-    /// detail ever becomes a label.
+    /// `ActionError::enforcement_outcome` class — including this executor's
+    /// own pre-service validation and actor/target identity checks, mirroring
+    /// `InternalChannelExecutor`. The website receiver's resolver refusals
+    /// (non-member target, actor not member or forbidden) return before this
+    /// method runs and are recorded by the website effect instead, so each
+    /// terminal website request still yields exactly one sample. The verb is
+    /// the request's `ModerationAction::command_name`; no user id, reason
+    /// text or free-form detail ever becomes a label.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,

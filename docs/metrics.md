@@ -341,15 +341,20 @@ as dynamic labels.
   rejections that prove no mutation happened), `discord_error` (uncertain
   Discord failures: timeout, unreachable, rate-limited), `storage_error`
   (persistence failures) or `other`. Recorded once per terminal member
-  enforcement (slash `MemberRuntime` and website `InternalMemberExecutor`),
-  including definitive preflight refusals (unknown roles, non-member target);
-  actor cooldowns and indeterminate preflight failures are not outcomes.
+  enforcement (slash `MemberRuntime`, website `ModerationExecutor` plus
+  `InternalMemberExecutor`), including definitive preflight refusals (slash:
+  unknown roles and non-member target; website: resolver `ActionNotAllowed`
+  such as non-member target, actor not member, or actor forbidden, recorded
+  by the website effect before the executor runs); actor cooldowns, Discord
+  snapshot failures and other indeterminate reads are not outcomes.
   Recorded once per terminal channel enforcement (slash
-  `ChannelModerationRuntime` and website `InternalChannelExecutor`); retries
-  and rate-limit backoffs are not outcomes. Channel enforcement records
-  uncertain outcomes as `other`. A purge timeout that proves no deletion
-  was sent is recorded as `refused`. No user id, reason text or
-  free-form detail ever becomes a label.
+  `ChannelModerationRuntime`, website `ChannelModerationExecutor` plus
+  `InternalChannelExecutor`), with the same boundary: website resolver
+  `ActionNotAllowed` records `refused` at the effect, snapshot failures stay
+  unsampled. Retries and rate-limit backoffs are not outcomes. Channel
+  enforcement records uncertain outcomes as `other`. A purge timeout that
+  proves no deletion was sent is recorded as `refused`. No user id, reason
+  text or free-form detail ever becomes a label.
 - `two_bot_community_facts_drain_failures_total{reason}` — `reason` is `error`,
   `timeout` or `other`. Recorded once per failed community-facts drain in
   `crates/bot/src/gateway.rs` (`apply_dispatch`), in both warn-and-continue
