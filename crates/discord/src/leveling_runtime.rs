@@ -20,7 +20,7 @@ use two_bot_core::{
     classify,
     community_store::{
         member_join_fact, member_join_metadata, message_fact, record_fact, rules_accepted_fact,
-        voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite,
+        voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite, MessageFactInput,
     },
     leveling::{
         leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
@@ -225,6 +225,13 @@ impl DeferredCommunityFacts {
         std::mem::take(&mut self.0.lock().expect("community facts lock").joins)
     }
 
+    /// Take every buffered fact write (`message_created`,
+    /// `voice_session_started` / `voice_session_ended`), leaving that
+    /// buffer empty. Order is arrival order.
+    pub fn take_pending(&self) -> Vec<FactWrite> {
+        std::mem::take(&mut self.0.lock().expect("community facts lock").pending)
+    }
+
     /// Buffered gate-clearing count (tests, health). Rules only.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -377,7 +384,8 @@ impl FactsSink for DeferredCommunityFacts {
             return;
         }
         // Content-minimized by construction: IDs plus the classifier verdict
-        // plus the channel class only, never message content. Bots, webhooks
+        // plus the channel class plus the measured content-length integer
+        // only, never message content. Bots, webhooks
         // and staff automation are classified and captured here; the funnel
         // gate in `on_message` already keeps them out of the XP/activity
         // counts, so this sink never filters.
@@ -392,15 +400,16 @@ impl FactsSink for DeferredCommunityFacts {
             is_test: false,
         };
         let verdict = classify(&state.config, &input);
-        state.pending.push(message_fact(
-            &input.guild_id,
-            fact.message_id,
-            &fact.channel_id.to_string(),
-            fact.channel_class.as_str(),
-            &input,
-            fact.occurred_at,
-            verdict,
-        ));
+        state.pending.push(message_fact(MessageFactInput {
+            guild_id: &input.guild_id,
+            message_id: fact.message_id,
+            channel_id: &fact.channel_id.to_string(),
+            channel_class: fact.channel_class.as_str(),
+            actor: &input,
+            occurred_at: fact.occurred_at,
+            content_length: fact.content_length,
+            classification: verdict,
+        }));
     }
 
     fn record_voice_started(&self, fact: VoiceStartedFact<'_>) -> Option<String> {
@@ -938,6 +947,7 @@ mod tests {
             channel_id: 10,
             channel_class: two_bot_core::ChannelClass::Human,
             occurred_at: "2026-09-20T12:01:00.000Z",
+            content_length: None,
         });
         assert_eq!(
             buffer.record_voice_started(VoiceStartedFact {
