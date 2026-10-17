@@ -148,15 +148,54 @@ mod tests {
         assert_eq!(deps.config.channel_id, "777");
     }
 
+    #[test]
+    fn boot_delivery_fence_delegates_to_tested_helper() {
+        // The capability choice lives in the tested
+        // `BootActivation::go_live_delivery_permitted` helper (pinned by
+        // `go_live_delivery_is_staging_only` in activation.rs), and boot must
+        // stay a one-line delegation: a swap to a live-cleared capability (or
+        // a hardcoded `true`) at the call site would keep every other
+        // delivery test green while restoring the live-identity bypass.
+        // Mirrors the `rank_heal_permitted` source scan.
+        let source = include_str!("main.rs");
+        assert!(
+            source.contains("go_live_delivery_permitted"),
+            "main.rs must build delivery behind go_live_delivery_permitted"
+        );
+        let fence = source
+            .split_once("let delivery = eventsub_delivery_config.map")
+            .expect("delivery fence site moved")
+            .1
+            .split_once("bind_with_delivery")
+            .expect("delivery bind site moved")
+            .0;
+        assert!(
+            fence.contains("go_live_delivery_permitted"),
+            "the delivery fence must delegate to go_live_delivery_permitted"
+        );
+        assert!(
+            !fence.contains("LiveCapability::"),
+            "the delivery fence must not name a LiveCapability directly; keep the choice in go_live_delivery_permitted"
+        );
+        assert!(
+            !fence.contains("activation.permitted"),
+            "the delivery fence must not call the generic fence directly; delegate to go_live_delivery_permitted"
+        );
+        let activation = include_str!("activation.rs");
+        assert!(
+            activation.contains("LiveCapability::Announcements"),
+            "go-live delivery must sit behind the Announcements capability"
+        );
+    }
+
     #[tokio::test]
     async fn build_delivery_deps_wires_pool_ledger_and_governed_sender() {
-        use two_bot_core::activation::LiveCapability;
         crate::gateway::ensure_crypto_provider();
-        // The staging identity permits Announcements, so this pins the boot
-        // call-site wiring (`activation.permitted(Announcements)`), not just
-        // a hardcoded `true`.
-        let permitted =
-            crate::activation::fixtures::staging().permitted(LiveCapability::Announcements);
+        // The staging identity clears delivery through the same tested helper
+        // boot calls, so this exercises the success path with a real fence
+        // decision rather than a hardcoded `true`. The call-site delegation
+        // itself is pinned by `boot_delivery_fence_delegates_to_tested_helper`.
+        let permitted = crate::activation::fixtures::staging().go_live_delivery_permitted();
         assert!(permitted);
         let deps = build_delivery_deps(
             lazy_pool(),
@@ -173,17 +212,14 @@ mod tests {
 
     #[tokio::test]
     async fn build_delivery_deps_refuses_an_identity_without_announcements() {
-        use two_bot_core::activation::LiveCapability;
         crate::gateway::ensure_crypto_provider();
         // Every refused identity (the live pair, cleared for self_roles only,
         // plus unknown/mismatched/missing identities) must refuse startup
         // with the catalogued class before any key derivation, so an enabled
         // delivery can never post go-lives under an uncleared identity.
         for (label, activation) in crate::activation::fixtures::refused() {
-            assert!(
-                !activation.permitted(LiveCapability::Announcements),
-                "{label} must not permit announcements"
-            );
+            let permitted = activation.go_live_delivery_permitted();
+            assert!(!permitted, "{label} must not permit go-live delivery");
             assert!(
                 matches!(
                     build_delivery_deps(
@@ -191,7 +227,7 @@ mod tests {
                         "synthetic-delivery-token",
                         None,
                         &delivery_config(),
-                        activation.permitted(LiveCapability::Announcements),
+                        permitted,
                     ),
                     Err("receiver_prerequisites_invalid")
                 ),

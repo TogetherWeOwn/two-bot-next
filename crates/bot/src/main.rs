@@ -404,8 +404,10 @@ async fn run(cli_args: &[String]) {
                 let proxy = std::env::var("DISCORD_API_BASE")
                     .ok()
                     .filter(|value| !value.is_empty());
-                let announcements_permitted =
-                    activation.permitted(two_bot_core::activation::LiveCapability::Announcements);
+                // One-line delegation: the capability choice lives in the
+                // tested `go_live_delivery_permitted` helper so a swap to a
+                // live-cleared capability cannot slip past the delivery tests.
+                let announcements_permitted = activation.go_live_delivery_permitted();
                 eventsub_delivery::build_delivery_deps(
                     pool,
                     token,
