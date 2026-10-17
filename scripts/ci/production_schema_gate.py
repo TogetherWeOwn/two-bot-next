@@ -84,7 +84,10 @@ def pins_from_url(url):
     host = (parsed.hostname or "").lower()
     require(host and "@" not in host and "/" not in host, "plan database host is not a bare name")
     require("-pooler" not in host, "pooler endpoints are refused; use the direct endpoint")
-    port = parsed.port
+    try:
+        port = parsed.port
+    except ValueError:
+        raise Refused("plan database binding is not a valid database URL") from None
     require(port is None or port == 5432, "pooled ports are refused; use the direct 5432 endpoint")
     username = (parsed.username or "")
     require("|" not in username, "pooler-style usernames are refused; use the direct role login")
