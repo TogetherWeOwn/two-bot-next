@@ -6873,6 +6873,84 @@ enum ActorCommand {
     },
 }
 
+impl ActorCommand {
+    /// True for fire-and-forget state that can wait for the worker:
+    /// snapshots, voice frames and config swaps apply in arrival order
+    /// once it loads. Anything else carries a one-shot reply no worker
+    /// exists to answer yet (status, room commands, vote-kick, test
+    /// probes), so [`load_actor_worker`] drops it while initialization is
+    /// pending: the caller sees `None` and takes the existing "syncing,
+    /// try again shortly" path instead of hanging until recovery.
+    /// Fail-fast is the default, so a future reply-bearing variant can
+    /// never hang the init window by omission.
+    fn is_bufferable(&self) -> bool {
+        matches!(
+            self,
+            ActorCommand::Reconcile
+                | ActorCommand::Display { .. }
+                | ActorCommand::NameSettingsChanged(_)
+                | ActorCommand::RoomFactsChanged(_)
+                | ActorCommand::Join { .. }
+                | ActorCommand::CreatorAdded(_)
+                | ActorCommand::RefreshCreators
+                | ActorCommand::AccessChanged(_)
+        )
+    }
+}
+
+/// Cap on commands buffered while actor initialization is pending: voice
+/// state converges on the latest frame and `Reconcile` is idempotent, so
+/// a long outage sheds the oldest instead of growing without bound.
+const VOICE_ACTOR_INIT_BUFFER_CAP: usize = 512;
+
+/// Buffer one command that arrived while initialization is pending.
+/// Reply-bearing commands are dropped (see [`ActorCommand::is_bufferable`]);
+/// the rest apply in arrival order once the worker loads.
+fn buffer_init_command(buffered: &mut VecDeque<ActorCommand>, command: ActorCommand) {
+    if !command.is_bufferable() {
+        return;
+    }
+    if buffered.len() >= VOICE_ACTOR_INIT_BUFFER_CAP {
+        let _ = buffered.pop_front();
+    }
+    buffered.push_back(command);
+}
+
+#[cfg(test)]
+mod voice_actor_init_buffer_tests {
+    use super::{buffer_init_command, ActorCommand, VecDeque, VOICE_ACTOR_INIT_BUFFER_CAP};
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn reply_bearing_commands_fail_fast_while_fire_and_forget_buffers() {
+        let mut buffered = VecDeque::new();
+        buffer_init_command(&mut buffered, ActorCommand::Reconcile);
+        buffer_init_command(&mut buffered, ActorCommand::RefreshCreators);
+        let (status_tx, _) = oneshot::channel();
+        buffer_init_command(&mut buffered, ActorCommand::Status(status_tx));
+        let (kick_tx, _) = oneshot::channel();
+        buffer_init_command(
+            &mut buffered,
+            ActorCommand::KickRoomOf {
+                member: 7,
+                reply: kick_tx,
+            },
+        );
+        assert_eq!(buffered.len(), 2, "replies must not hang the init buffer");
+        assert!(matches!(buffered[0], ActorCommand::Reconcile));
+        assert!(matches!(buffered[1], ActorCommand::RefreshCreators));
+    }
+
+    #[test]
+    fn init_buffer_sheds_oldest_at_cap() {
+        let mut buffered = VecDeque::new();
+        for _ in 0..VOICE_ACTOR_INIT_BUFFER_CAP + 10 {
+            buffer_init_command(&mut buffered, ActorCommand::Reconcile);
+        }
+        assert_eq!(buffered.len(), VOICE_ACTOR_INIT_BUFFER_CAP);
+    }
+}
+
 /// A V2 ownership command from an interaction. `Reclaim` takes the caller's
 /// room back as its original creator (or claims one whose owner is gone);
 /// `Transfer` hands the caller's room to an occupant and makes them the
@@ -7880,15 +7958,18 @@ where
 /// [`voice_actor_load_backoff`] between attempts, and the same single
 /// spawned task owns every attempt — retries never spawn a second actor.
 ///
-/// While initialization is pending, inbox commands are buffered in order
-/// and handed to `run_actor_with_initial`, so a snapshot or voice frame
-/// that arrived during the outage is applied after recovery under the
-/// usual live-state and ticket guards. Cancellation is the inbox closing
-/// (every sender dropped): `remove_guild` and runtime drop both end the
-/// retry loop, and a load that finishes after removal is discarded
-/// instead of resurrecting the guild. A [`StoreError::CredentialRefused`]
-/// attempt is never retried: no credential replacement or permission
-/// repair is attempted here.
+/// While initialization is pending, fire-and-forget inbox commands are
+/// buffered in order (capped, oldest shed) and handed to
+/// `run_actor_with_initial`, so a snapshot or voice frame that arrived
+/// during the outage is applied after recovery under the usual live-state
+/// and ticket guards. Reply-bearing commands are dropped while no worker
+/// exists (see [`ActorCommand::is_bufferable`]), so status and room-command
+/// callers get the existing "syncing" fallback instead of hanging until
+/// recovery. Cancellation is the inbox closing (every sender dropped):
+/// `remove_guild` and runtime drop both end the retry loop, and a load
+/// that finishes after removal is discarded instead of resurrecting the
+/// guild. A [`StoreError::CredentialRefused`] attempt is never retried:
+/// no credential replacement or permission repair is attempted here.
 async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
     make: &(dyn Fn() -> (S, H) + Send + Sync),
     live: LiveGuild,
@@ -7916,7 +7997,7 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
                     break;
                 }
                 command = inbox.recv() => match command {
-                    Some(command) => buffered.push_back(command),
+                    Some(command) => buffer_init_command(&mut buffered, command),
                     None => return None,
                 },
             }
@@ -7955,7 +8036,7 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
             tokio::select! {
                 () = &mut wait => break,
                 command = inbox.recv() => match command {
-                    Some(command) => buffered.push_back(command),
+                    Some(command) => buffer_init_command(&mut buffered, command),
                     None => return None,
                 },
             }
