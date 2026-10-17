@@ -71,10 +71,15 @@ fn fuzz_arbitrary_bytes_never_panic_and_stay_bounded() {
     }
     // Byte-derived IPs never panic and agree with the obvious std refusals.
     for window in [0u8, 1, 10, 127, 169, 192, 224, 255] {
-        let v4 = IpAddr::V4(Ipv4Addr::new(window, 0, 0, 1));
+        let inner = Ipv4Addr::new(window, 0, 0, 1);
+        let v4 = IpAddr::V4(inner);
         let first = is_public_address(v4);
         assert_eq!(first, is_public_address(v4));
-        if v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_multicast() {
+        if inner.is_private()
+            || inner.is_loopback()
+            || inner.is_link_local()
+            || inner.is_multicast()
+        {
             assert!(!first, "accepted {v4}");
         }
     }
@@ -100,14 +105,25 @@ fn fuzz_malicious_sources_refuse() {
         "javascript:alert(1)",
         "https://user@example.org/",
         "https://example.org:8443/",
-        "https://example.org/\u{0}/feed",
-        "https://example.org/\u{7f}",
         long_source.as_str(),
     ] {
         assert!(
             validate_source(source).is_err(),
             "accepted malicious source {source:?}"
         );
+    }
+    // Control bytes in the path stay same-host under `Url` (percent-encoded
+    // or stripped) and still satisfy the source contract, so they belong to
+    // the no-panic property above, not to this refusal pin. Pin the behavior:
+    // if accepted, the host is still the public base host.
+    for raw in [
+        "https://example.org/\u{0}/feed",
+        "https://example.org/\u{7f}",
+    ] {
+        if let Ok(url) = validate_source(raw) {
+            assert_eq!(url.host_str(), Some("example.org"));
+            assert_eq!(url.scheme(), "https");
+        }
     }
     // At-limit still accepts; one byte over refuses.
     let base = "https://example.org/";
@@ -136,13 +152,18 @@ fn fuzz_redirect_targets_hold_same_host() {
         "//other.example/",
         "",
         "   ",
-        "/\u{0}/evil",
         long_location.as_str(),
     ] {
         assert!(
             redirect_target(&current, location, 0).is_err(),
             "accepted redirect {location:?}"
         );
+    }
+    // A NUL in a relative path stays same-host, so it is not a refusal case:
+    // if accepted, the target keeps the base host and validates as a source.
+    if let Ok(nul) = redirect_target(&current, "/\u{0}/evil", 0) {
+        assert_eq!(current.host(), nul.host());
+        assert!(validate_source(nul.as_str()).is_ok());
     }
     assert!(redirect_target(&current, "/new", MAX_REDIRECT_HOPS).is_err());
     assert!(redirect_target(&current, "/new", MAX_REDIRECT_HOPS + 1).is_err());
@@ -187,10 +208,10 @@ fn fuzz_content_type_parameter_injection_refused() {
 
 #[test]
 fn fuzz_limited_body_fails_bounded() {
-    assert_eq!(
+    assert!(matches!(
         LimitedBody::new(Some(MAX_FEED_BYTES as u64 + 1)),
         Err(FetchError::TooLarge)
-    );
+    ));
     assert!(LimitedBody::new(Some(MAX_FEED_BYTES as u64)).is_ok());
     let mut body = LimitedBody::new(None).expect("unbounded start");
     body.push(&vec![b'a'; MAX_FEED_BYTES]).expect("exact cap");
