@@ -443,10 +443,11 @@ jobs:
     # Runner routing: see the note on `check`.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'rust-tests') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     # The HARD patch-coverage step re-runs the whole suite under llvm-cov
-    # (~17 min of a ~26 min job), so a PR run gets 45 minutes: a cache-cold
+    # (measured 30 min of a 42m16s job; four earlier runs of this design
+    # took 36-42 min), so every event gets 60 minutes: a cache-cold or slow
     # runner must still finish measuring and report a coverage verdict, not
     # be killed mid-measurement as a job timeout on an unrelated PR.
-    timeout-minutes: ${{ github.event_name == 'push' && 60 || 45 }}
+    timeout-minutes: 60
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
@@ -745,7 +746,7 @@ jobs:
           COV="$RUNNER_TEMP/cargo-llvm-cov"
           cov_run() {
             if ! "$@"; then
-              echo "::error::patch coverage measurement failed to build or report"
+              echo "::error::patch coverage measurement failed to build or report" >&2
               exit 1
             fi
           }

@@ -1519,13 +1519,12 @@ class WorkflowTests(unittest.TestCase):
 
     def test_rust_tests_timeout_leaves_headroom_for_coverage_measurement(self):
         # The HARD patch-coverage step re-runs the suite under llvm-cov
-        # (16m36s of a 26m19s job at the exact head), so the PR-event limit must
-        # stay well above that: a slow runner reports a verdict, not a timeout.
+        # (measured 30 min of a 42m16s job; four earlier runs of this design
+        # took 36-42 min), so every event keeps 60 minutes: a slow runner
+        # reports a coverage verdict, not a job timeout.
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
-        self.assertEqual(
-            job["timeout-minutes"],
-            "${{ github.event_name == 'push' && 60 || 45 }}",
-        )
+        # BaseLoader keeps scalars as strings; "60" is the 60-minute limit.
+        self.assertEqual(job["timeout-minutes"], "60")
 
     def test_rust_test_container_pins_disposable_database_service_address(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
@@ -1650,6 +1649,86 @@ class WorkflowTests(unittest.TestCase):
         ):
             with self.subTest(target=target):
                 self.assertIn(target, step["run"])
+        # Per-invocation pins: whole-script substring checks let one surviving
+        # occurrence mask a flag dropped from another invocation (e.g.
+        # --ignore-run-fail removed from either sweep). Join line
+        # continuations, then assert flags on each cov_run separately.
+        logical_lines = []
+        pending = ""
+        for raw_line in step["run"].splitlines():
+            stripped = raw_line.strip()
+            pending = f"{pending} {stripped}".strip() if pending else stripped
+            if stripped.endswith("\\"):
+                pending = pending[:-1].strip()
+                continue
+            logical_lines.append(pending)
+            pending = ""
+        if pending:
+            logical_lines.append(pending)
+        cov_runs = [line for line in logical_lines if line.startswith("cov_run ")]
+        # cov_run's failure annotation must go to stderr: the stdout report
+        # retry redirects cov_run's stdout into the lcov file.
+        self.assertIn(
+            'echo "::error::patch coverage measurement failed to build or report" >&2',
+            step["run"],
+        )
+        sweeps = [run for run in cov_runs if "--workspace --lib --bins --tests" in run]
+        self.assertEqual(len(sweeps), 2)
+        for sweep in sweeps:
+            with self.subTest(sweep=sweep):
+                # A failing test must never suppress coverage collection.
+                self.assertIn("--ignore-run-fail", sweep)
+                self.assertIn("--no-report", sweep)
+                self.assertIn("--features two-bot-core/db", sweep)
+                self.assertIn("--locked", sweep)
+        ignored_sweeps = [run for run in sweeps if "-- --ignored" in run]
+        self.assertEqual(len(ignored_sweeps), 1)
+        self.assertIn("--test-threads=1", ignored_sweeps[0])
+        self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
+        guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
+        self.assertEqual(len(guarded), 10)
+        for run in guarded:
+            with self.subTest(guarded=run):
+                self.assertIn("--test-threads=1", run)
+                self.assertIn("--skip regenerate_reference_docs", run)
+                self.assertIn("--locked", run)
+                # Deliberate: a guard panic in a guarded suite fails the step.
+                self.assertNotIn("--ignore-run-fail", run)
+        # needle -> carries `--features db` (core/discord suites need the db
+        # feature to build their guarded targets; cutover suites do not).
+        guarded_needles = {
+            "-- channel_moderation --include-ignored": True,
+            "--test channel_moderation_runtime": True,
+            "--test internal_channel_moderation": True,
+            "--test feeds_store": True,
+            "--test legacy_verify_db": False,
+            "--test staging_migrate_db": False,
+            "--test internal_events": True,
+            "--test raid_list_db": False,
+            "--test reengagement_list_db": False,
+            "--test member_moderation_db": True,
+        }
+        for needle, wants_db_feature in guarded_needles.items():
+            with self.subTest(needle=needle):
+                matches = [run for run in guarded if needle in run]
+                self.assertEqual(len(matches), 1)
+                self.assertIn("--test-threads=1", matches[0])
+                if wants_db_feature:
+                    self.assertIn("--features db", matches[0])
+                else:
+                    self.assertNotIn("--features db", matches[0])
+        env_wrapped = [
+            run for run in cov_runs
+            if run.startswith('cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV"')
+        ]
+        self.assertEqual(len(env_wrapped), 1)
+        self.assertIn("--test channel_moderation_runtime", env_wrapped[0])
+        reports = [run for run in cov_runs if "llvm-cov report" in run]
+        self.assertEqual(len(reports), 2)
+        for report in reports:
+            with self.subTest(report=report):
+                self.assertIn("llvm-cov report --workspace --lcov", report)
         self.assertEqual(
             step["env"]["TWO_TEST_DATABASE_URL"],
             "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
