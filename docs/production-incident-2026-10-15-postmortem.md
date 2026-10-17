@@ -77,7 +77,8 @@ What is still missing: the 10-15 log line carries no cause/source chain, so
 no log names the failing step. That is exactly what #978 adds (every
 `*_failed` event carries `failed_step` plus the sanitized reason and SQL
 error code; the retention lifecycle skips `42P01`/`42501` instead of holding
-the cursor). Until a log line confirms the step, the mechanism above is a
+the cursor, except `42501` on an available `GUILD_CREATE`, which holds the
+cursor). Until a log line confirms the step, the mechanism above is a
 strong fit, not proof.
 
 ## Detection gap: the gate passed a 503 "parked" gateway
@@ -265,7 +266,9 @@ prompts.
 - Strict ready gate: DONE (#979). A 503-`starting` answer never passes a
   deploy on a single early poll: green requires 200 with gateway `ready`
   held for 18 consecutive polls (~3 min), and any parked answer keeps
-  polling, then fails and auto-rolls back. See the gate table in
+  polling, then fails. After a takeover, a failed gate rolls back
+  automatically when the deploy and pre-deploy snapshot succeeded;
+  otherwise the run just fails without restoring. See the gate table in
   [production-deploy.md](production-deploy.md#build-identity-and-the-readyz-gate).
 - Rollback inputs: record a pinned known-good Worker version + Git SHA +
   image after every production deploy (version discovery above), and make the
