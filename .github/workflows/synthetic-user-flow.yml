@@ -15,9 +15,10 @@ name: synthetic-user-flow
 # unknown build identity plus the run link.
 #
 # Operator bindings (never in this file): repository vars STAGING_WORKER_URL
-# and PRODUCTION_WORKER_URL carry the two Worker origins (the latter must
-# match the production Environment value), and the `synthetic-alerts`
-# environment secret SYNTHETIC_ALERT_WEBHOOK_URL carries the Discord webhook.
+# and PRODUCTION_WORKER_URL carry the two Worker origins. PRODUCTION_WORKER_URL
+# is the single source for deploy and passive synthetic checks; remove any
+# production Environment override. The `synthetic-alerts` environment secret
+# SYNTHETIC_ALERT_WEBHOOK_URL carries the Discord webhook.
 # Missing target vars skip that probe with a notice; an event that needs a
 # notification fails if the webhook is missing or delivery fails.
 on:

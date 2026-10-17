@@ -130,9 +130,12 @@ def main(argv=None):
         if current == "success":
             print(f"synthetic_alert: warning: {error}; healthy probe remains green", file=sys.stderr)
             return 0
-        print(f"synthetic_alert: {error}", file=sys.stderr)
-        return 1
-    event = transition(current, previous, os.environ.get("FORCE_FAIL") == "true")
+        print(f"synthetic_alert: warning: {error}; sending failure alert without history", file=sys.stderr)
+        previous = []
+        force_fail = True
+    else:
+        force_fail = os.environ.get("FORCE_FAIL") == "true"
+    event = transition(current, previous, force_fail)
     if event is None:
         print("synthetic_alert: no alert transition", file=sys.stderr)
         return 0

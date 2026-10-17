@@ -66,12 +66,16 @@ class SyntheticAlertTests(unittest.TestCase):
         self.assertIn("synthetic-user-flow:prod", content)
         self.assertIn("build unknown unknown (git unknown)", content)
 
-    def test_alert_transition_requires_two_failures_and_recovers_once(self):
+    def test_alert_transition_retries_failed_delivery_and_recovers_once(self):
         self.assertIsNone(alert.transition("failure", []))
-        self.assertEqual(alert.transition("failure", ["failure"]), "alert")
-        self.assertIsNone(alert.transition("failure", ["failure", "failure"]))
-        self.assertEqual(alert.transition("success", ["failure", "failure"]), "recovery")
-        self.assertIsNone(alert.transition("success", ["success", "failure"]))
+        self.assertEqual(alert.transition("failure", [("failure", "success")]), "alert")
+        delivered = [("failure", "success"), ("failure", "success")]
+        self.assertIsNone(alert.transition("failure", delivered))
+        self.assertEqual(alert.transition("success", delivered), "recovery")
+        self.assertIsNone(alert.transition("success", [("success", "success"), *delivered[:1]]))
+        undelivered = [("failure", "failure"), ("failure", "success")]
+        self.assertEqual(alert.transition("failure", undelivered), "alert")
+        self.assertEqual(alert.transition("success", undelivered), "alert")
         self.assertEqual(alert.transition("failure", [], force_fail=True), "alert")
         recovery = alert.build_content("staging", EVIDENCE, "deadbeef", "link", "recovery")
         self.assertTrue(recovery.startswith("two-bot-next RECOVERY synthetic-user-flow:staging"))
@@ -84,14 +88,17 @@ class SyntheticAlertTests(unittest.TestCase):
             {"id": 100, "run_number": 9, "event": "schedule"},
         ]}
         jobs = {"jobs": [{
-            "name": "staging user-flow synthetic",
-            "steps": [{"name": history.PROBE_STEPS["staging"], "conclusion": "failure"}],
+            "name": history.JOB_NAMES["staging"],
+            "steps": [
+                {"name": history.PROBE_STEPS["staging"], "conclusion": "failure"},
+                {"name": history.ALERT_STEPS["staging"], "conclusion": "failure"},
+            ],
         }]}
         with mock.patch.object(history, "_get", side_effect=[runs, jobs]) as get:
             outcomes = history.previous_probe_outcomes(
                 {"GITHUB_TOKEN": "test-token", "GITHUB_REPOSITORY": "owner/repo",
                  "GITHUB_RUN_ID": "101"}, "staging")
-        self.assertEqual(outcomes, ["failure"])
+        self.assertEqual(outcomes, [("failure", "failure")])
         self.assertEqual(get.call_count, 2)
         self.assertIn("event=schedule", get.call_args_list[0].args[0])
         self.assertIn("/runs/100/jobs?", get.call_args_list[1].args[0])
@@ -112,12 +119,35 @@ class SyntheticAlertTests(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, {"PROBE_OUTCOME": "failure"}, clear=True), \
                 redirect_stdout(out), redirect_stderr(err), \
-                mock.patch.object(alert, "previous_probe_outcomes", return_value=["failure"]), \
+                mock.patch.object(alert, "previous_probe_outcomes", return_value=[("failure", "success")]), \
                 mock.patch.object(alert.urllib.request, "urlopen") as opened:
             code = alert.main(["--env", "staging", "--evidence", self.evidence])
         self.assertEqual(code, 1)
         opened.assert_not_called()
         self.assertIn("not set", err.getvalue())
+
+    def test_missing_probe_sample_and_non_transition_do_not_post(self):
+        for outcome, previous in (("skipped", []), ("failure", [])):
+            env = {**self.base_env(), "PROBE_OUTCOME": outcome, "FORCE_FAIL": "false"}
+            with self.subTest(outcome=outcome), mock.patch.dict(os.environ, env, clear=True), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
+                    mock.patch.object(alert, "previous_probe_outcomes", return_value=previous), \
+                    mock.patch.object(alert, "post") as post:
+                code = alert.main(["--env", "staging", "--evidence", self.evidence])
+            self.assertEqual(code, 0)
+            post.assert_not_called()
+
+    def test_history_error_does_not_suppress_failure_alert(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {**self.base_env(), "FORCE_FAIL": "false"}, clear=True), \
+                redirect_stdout(out), redirect_stderr(err), \
+                mock.patch.object(alert, "previous_probe_outcomes",
+                                  side_effect=history.HistoryError("history unavailable")), \
+                mock.patch.object(alert, "post") as post:
+            code = alert.main(["--env", "staging", "--evidence", self.evidence])
+        self.assertEqual(code, 0)
+        post.assert_called_once()
+        self.assertIn("sending failure alert without history", err.getvalue())
 
     def test_delivers_once_with_allowed_mentions_off(self):
         seen = {}

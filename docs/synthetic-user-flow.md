@@ -39,10 +39,10 @@ silent notification path cannot read as delivered.
 ## Operator bindings
 
 - Repository variables `STAGING_WORKER_URL` and `PRODUCTION_WORKER_URL`:
-  the staging and production Worker origins. The latter must match the existing
-  `production` Environment variable because the synthetic runs in the separate
-  `synthetic-alerts` Environment. A missing variable skips that target with a
-  visible warning instead of producing recurring configuration failures.
+  the staging and production Worker origins. `PRODUCTION_WORKER_URL` is the
+  single source for deploy and passive synthetic checks; remove any production
+  Environment override of the same name. A missing variable skips that target
+  with a visible warning instead of producing recurring configuration failures.
 - Environment `synthetic-alerts`, secret `SYNTHETIC_ALERT_WEBHOOK_URL`: the
   Discord webhook. Never paste it into a command, log, or report.
 

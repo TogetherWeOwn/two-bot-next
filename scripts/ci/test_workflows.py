@@ -1,6 +1,7 @@
 """Offline workflow policy fixtures; never dispatch, deploy or probe staging."""
 
 from copy import deepcopy
+import importlib.util
 from pathlib import Path
 import re
 import tomllib
@@ -9,6 +10,13 @@ import unittest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+_HISTORY_SPEC = importlib.util.spec_from_file_location(
+    "synthetic_alert_history", ROOT / "scripts/synthetic_alert_history.py")
+_HISTORY_MODULE = importlib.util.module_from_spec(_HISTORY_SPEC)
+_HISTORY_SPEC.loader.exec_module(_HISTORY_MODULE)
+ALERT_STEPS = _HISTORY_MODULE.ALERT_STEPS
+JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
+PROBE_STEPS = _HISTORY_MODULE.PROBE_STEPS
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
     # The nextest branch adds its required lane; main adds the production schema gate.
@@ -1478,6 +1486,16 @@ def synthetic_user_flow_errors(workflow):
             errors.append(f"{name}:{job_id}: transition step must run with if: always()")
         if "scripts/synthetic_alert.py" not in str(alert_step.get("run", "")):
             errors.append(f"{name}:{job_id}: alert step must call scripts/synthetic_alert.py")
+        environment = "staging" if job_id == "staging" else "prod"
+        job_name = JOB_NAMES[environment]
+        probe_name = PROBE_STEPS[environment]
+        alert_name = ALERT_STEPS[environment]
+        if job.get("name") != job_name:
+            errors.append(f"{name}:{job_id}: job name must match synthetic alert history lookup")
+        if probe_step.get("name") != probe_name:
+            errors.append(f"{name}:{job_id}: probe step name must match synthetic alert history lookup")
+        if alert_step.get("name") != alert_name:
+            errors.append(f"{name}:{job_id}: alert step name must match synthetic alert history lookup")
         alert_env = alert_step.get("env") or {}
         if (alert_env.get("GITHUB_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
                 or alert_env.get("PROBE_OUTCOME") != "${{ steps.probe.outcome }}"

@@ -13,31 +13,57 @@ PROBE_STEPS = {
     "staging": "Run the staging user-flow probe",
     "prod": "Run the passive production probe",
 }
+ALERT_STEPS = {
+    "staging": "Alert the ops channel on incident transition",
+    "prod": "Alert the ops channel on incident transition",
+}
+JOB_NAMES = {
+    "staging": "staging user-flow synthetic",
+    "prod": "prod passive user-flow synthetic",
+}
 
 
 class HistoryError(Exception):
     """A safe-to-report failure reading probe history."""
 
 
-def consecutive_failures(outcomes):
-    count = 0
-    for outcome in outcomes:
-        if outcome != "failure":
-            break
-        count += 1
-    return count
+def incident_state(previous):
+    """Rebuild whether the recent incident was alerted and then recovered."""
+    failures = 0
+    incident = False
+    alert_delivered = False
+    for outcome, delivery in reversed(previous):
+        if outcome == "failure":
+            failures += 1
+            if failures >= 2:
+                incident = True
+                if delivery == "success":
+                    alert_delivered = True
+                elif delivery == "failure":
+                    alert_delivered = False
+        else:
+            failures = 0
+            if incident:
+                if alert_delivered and delivery == "success":
+                    incident = False
+                    alert_delivered = False
+                elif not alert_delivered and delivery == "success":
+                    alert_delivered = True
+    return failures, incident, alert_delivered
 
 
 def transition(current, previous, force_fail=False):
-    """Return alert/recovery only at incident transitions; two failures open."""
+    """Return incident transitions, retrying alerts that did not deliver."""
     if current not in ("success", "failure"):
         return None
-    failures = consecutive_failures(previous)
+    failures, incident, alert_delivered = incident_state(previous)
     if current == "failure":
-        if force_fail or failures == 1:
+        if force_fail or (not incident and failures >= 1) or (incident and not alert_delivered):
             return "alert"
         return None
-    return "recovery" if failures >= 2 else None
+    if incident:
+        return "recovery" if alert_delivered else "alert"
+    return None
 
 
 def _get(path, token):
@@ -72,17 +98,18 @@ def previous_probe_outcomes(env, environment):
         key=lambda run: run.get("run_number", 0), reverse=True,
     )
     outcomes = []
-    target_job = "staging user-flow synthetic" if environment == "staging" else "prod passive user-flow synthetic"
     for run in prior:
         jobs = _get(f"/repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100", token)
-        job = next((item for item in jobs.get("jobs", []) if item.get("name") == target_job), None)
+        job = next((item for item in jobs.get("jobs", [])
+                    if item.get("name") == JOB_NAMES[environment]), None)
         if not job:
             continue
-        probe = next((step for step in job.get("steps", [])
+        steps = job.get("steps", [])
+        probe = next((step for step in steps
                       if step.get("name") == PROBE_STEPS[environment]), None)
+        alert = next((step for step in steps
+                      if step.get("name") == ALERT_STEPS[environment]), None)
         outcome = probe.get("conclusion") if probe else None
         if outcome in ("success", "failure"):
-            outcomes.append(outcome)
-            if len(outcomes) == 2:
-                break
+            outcomes.append((outcome, alert.get("conclusion") if alert else None))
     return outcomes
