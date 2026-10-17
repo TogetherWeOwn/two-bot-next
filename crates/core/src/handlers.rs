@@ -19,8 +19,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    analytics_family::AnalyticsCategory,
     funnel::{idempotency_key, now_iso, EventType, FunnelEvent, MESSAGE_RUNGS},
-    privacy::AnalyticsCategory,
     voice::{resolve_voice_end, VoiceEnd, VoiceSessionTracker},
     Snowflake,
 };

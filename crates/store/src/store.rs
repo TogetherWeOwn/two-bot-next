@@ -23,11 +23,11 @@ use std::collections::HashSet;
 
 use sqlx::{postgres::PgRow, Pool, Postgres, Row};
 use two_bot_core::{
+    analytics_family::AnalyticsCategory,
     membership::{
         advance_observation, is_membership, project, set_observation, valid_observation,
         Membership, MembershipStore,
     },
-    privacy::AnalyticsCategory,
     EventType, FunnelEvent, FunnelStore, RecordOutcome, Snowflake, StoredRow, MESSAGE_RUNGS,
 };
 
@@ -633,7 +633,7 @@ mod privacy_lock_tests {
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use sqlx::{Pool, Postgres};
 
-    use two_bot_core::{privacy::AnalyticsCategory, EventType, FunnelEvent, FunnelStore};
+    use two_bot_core::{analytics_family::AnalyticsCategory, EventType, FunnelEvent, FunnelStore};
 
     use super::PgFunnelStore;
 

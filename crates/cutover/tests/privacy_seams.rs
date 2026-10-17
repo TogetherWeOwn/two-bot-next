@@ -10,6 +10,7 @@
 //! `privacy_opt_out.rs`, which this file never duplicates: every test here
 //! targets a seam that file does not touch.
 
+use two_bot_core::analytics_family::AnalyticsCategory;
 use two_bot_core::community::{Classification, ClassifyInput};
 use two_bot_core::community_store::{
     member_join_fact, member_join_metadata, message_fact, record_fact, voice_ended_fact,
@@ -25,7 +26,6 @@ use two_bot_core::onboarding_store::{
     record_game_selection_in_transaction, record_session_routed,
     record_session_routed_in_transaction,
 };
-use two_bot_core::privacy::AnalyticsCategory;
 use two_bot_core::rsvp::{checkin_classification, AttendanceProof};
 use two_bot_core::rsvp_store::{record_checkin, CheckinWrite};
 use two_bot_core::{EventType, FunnelEvent, InviteState};

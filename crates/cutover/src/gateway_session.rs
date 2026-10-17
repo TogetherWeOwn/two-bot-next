@@ -6,13 +6,12 @@
 use std::collections::HashSet;
 
 use sqlx::{PgConnection, PgPool};
+use two_bot_core::analytics_family::{category_of_event, AnalyticsCategory};
 use two_bot_core::gateway_funnel::{FunnelBatch, SnapshotWrite};
 use two_bot_core::gateway_session::{
     dispatch_action, BootDirective, DispatchAction, GatewaySession,
 };
-use two_bot_core::privacy::{
-    category_of_event, inviter_in_metadata, scrubbed_member_join_metadata, AnalyticsCategory,
-};
+use two_bot_core::privacy::{inviter_in_metadata, scrubbed_member_join_metadata};
 use two_bot_core::{format_iso_millis, idempotency_key, EventType, FunnelEvent};
 
 use crate::db::{project_event, FunnelWrite};

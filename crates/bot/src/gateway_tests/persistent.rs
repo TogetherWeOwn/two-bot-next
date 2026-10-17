@@ -2,7 +2,7 @@
 //! must roll back with a failed checkpoint. Only test-container schemas.
 use super::*;
 use two_bot_core::gateway_funnel::{ActivityTouch, SnapshotWrite};
-use two_bot_core::{privacy::AnalyticsCategory, InviteSnapshotStore, InviteState};
+use two_bot_core::{analytics_family::AnalyticsCategory, InviteSnapshotStore, InviteState};
 use two_bot_discord::MessageEligibility;
 
 fn invite(uses: u64) -> InviteState {

@@ -52,8 +52,9 @@ use twilight_model::{
     util::Timestamp,
 };
 use two_bot_core::{
-    gateway_funnel::InviteSnapshotWrite, privacy::AnalyticsCategory, EventType, FunnelEvent,
-    FunnelStore, InviteState, MemStore, NoopLeveling, RecordOutcome, Snowflake, StoredRow,
+    analytics_family::AnalyticsCategory, gateway_funnel::InviteSnapshotWrite, EventType,
+    FunnelEvent, FunnelStore, InviteState, MemStore, NoopLeveling, RecordOutcome, Snowflake,
+    StoredRow,
 };
 use two_bot_discord::{DeferredCommunityFacts, NoClassification, Pipeline, ScriptedInvites};
 

@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::privacy::AnalyticsCategory;
+use crate::analytics_family::AnalyticsCategory;
 use crate::{
     EventType, FunnelEvent, FunnelStore, InviteSnapshotStore, InviteState, MemStore, RecordOutcome,
     Snowflake,
