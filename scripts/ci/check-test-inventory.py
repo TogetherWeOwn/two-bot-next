@@ -93,7 +93,10 @@ def extract_run_blocks(text):
         marker = value.split("#", 1)[0].strip() if value else ""
         if marker and _BLOCK_SCALAR_RE.match(marker):
             prefix = match.group("prefix")
-            parent_col = prefix.index("-") if "-" in prefix else len(prefix)
+            # YAML requires block-scalar lines to be indented deeper than
+            # the `run` key itself, not the `- ` dash: a later step key
+            # (name:, env:, if:) sits at the key column and ends the script.
+            parent_col = len(prefix)
             body = []
             while index < len(lines):
                 line = lines[index]
