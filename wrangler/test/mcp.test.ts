@@ -638,7 +638,7 @@ test("a Content-Length that understates the body does not lift the cap", async (
   assert.deepEqual(h.forwarded, [], "oversize intake must never reach the container");
 });
 
-test("streamed oversize without Content-Length is cancelled at the cap, tail unread", async () => {
+test("streamed oversize without Content-Length is cancelled at the cap", async () => {
   const marker = "synthetic-intake-streamed-marker";
   const h = harness(() => Response.json({ synthetic: true }));
   const bytes = encoder.encode(paddedRpcBody(INBOUND_CAP_BYTES + 8192, { marker }));
@@ -650,8 +650,12 @@ test("streamed oversize without Content-Length is cancelled at the cap, tail unr
   ]);
   const res = await worker.fetch(rawMcp(stream), h.env, h.ctx);
   await assertIntakeRefusal(res, marker);
+  // Do not pin `state.delivered` here: with the default high-water mark the
+  // runtime prefetches a chunk into the Request buffer during the mandatory
+  // async auth check, so the count measures runtime prefetch, not reads by
+  // the Worker. Cancellation is the implementation-controlled signal: a body
+  // drained to the end closes, and a closed stream never fires cancel.
   assert.equal(state.cancelled, true, "oversize streamed body must be cancelled, not drained");
-  assert.ok(state.delivered < 4, `tail past cap+1 must stay unread (delivered ${state.delivered}/4)`);
   assert.deepEqual(h.names, [], "oversize intake must not resolve the DO");
   assert.deepEqual(h.forwarded, [], "oversize intake must never reach the container");
 });
