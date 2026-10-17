@@ -128,7 +128,7 @@ pub enum DriverError {
 /// These pure parsers hold that surface under hostile input: arbitrary bytes
 /// fail as bounded [`DriverError::Failed`] — never a panic, OOM, or hang.
 /// Every refusal message is a static string well under
-/// [`FB_WEBHOOK_ERROR_MAX`]; secrets and hostile bytes never appear in
+/// [`webhook::FB_WEBHOOK_ERROR_MAX`]; secrets and hostile bytes never appear in
 /// errors. A verified envelope with zero changes is `Ok` with no changes
 /// (acknowledge with 2xx, do nothing). Driver behavior, Discord mirroring,
 /// and notification wiring are out of scope for this slice.
