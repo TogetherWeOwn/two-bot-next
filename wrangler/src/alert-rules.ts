@@ -173,6 +173,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_join_fast_burn", summary: `creator-join error budget burning faster than ${JOIN_FAST_BURN}x over 1 h and 5 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-fast-burn" },
   { id: "voice_join_slow_burn", summary: `creator-join error budget burning faster than ${JOIN_SLOW_BURN}x over 6 h and 30 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-slow-burn", severity: "ticket" },
   { id: "voice_creator_map_stale", summary: `voice creator map has not merged for more than ${CREATOR_MAP_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-voice-creator-map-stale" },
+  { id: "eventsub_reconcile_failed", summary: `EventSub reconcile failed passes increased between samples`, runbook: "runbook.md#alert-eventsub-reconcile-failed", severity: "ticket" },
 ];
 
 /**
@@ -260,6 +261,14 @@ export interface MetricsAlertState {
   dispatchDrops?: Record<string, number>;
   /** Consecutive positive deltas, capped at DISPATCH_DROP_SAMPLES. */
   dispatchDropStreaks?: Record<string, number>;
+  /** Healthy reconcile passes at the last valid baseline; absent in legacy storage. */
+  reconcileHealthy?: number;
+  /** Verification-pending reconcile passes at the last valid baseline; absent in legacy storage. */
+  reconcilePending?: number;
+  /** Failed reconcile passes at the last valid baseline; absent in legacy storage. */
+  reconcileFailed?: number;
+  /** False until a valid sample stores the reconcile baseline: the first sample never fires. */
+  reconcileSeen?: boolean;
   /**
    * Creator-join burn snapshots for the SLO windows, oldest first. Each entry
    * carries the scrape time plus cumulative counters (received joins,
@@ -277,7 +286,7 @@ export interface JoinBurnSnapshot {
   fastMoves: number;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false };
 
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
@@ -786,7 +795,61 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring } };
+  // Failed EventSub reconciliation passes (one ticket per failed pass). The
+  // Rust process records exactly one outcome per completed pass that reaches
+  // Helix (`two_bot_eventsub_reconcile_passes_total{outcome}` with the fixed
+  // `healthy`/`pending`/`failed` outcomes); parked or refused startup passes
+  // never reach Helix and record no sample. Only the pass outcome is an alert
+  // input: the detailed per-site error counters stay exposition-only so one
+  // failed pass raises one ticket however many error sites moved. The first
+  // valid sample only stores a baseline. A later positive failed-pass delta
+  // fires (even beside a healthy delta); healthy-only or pending-only growth
+  // never fires. A flat failed counter never recovers: only a healthy-pass
+  // increase with no failed-pass increase resolves, once. Any backwards
+  // counter means the process restarted: that sample re-baselines and holds a
+  // firing ticket instead of fabricating an ALERT or RESOLVED. Missing or
+  // invalid samples (absent family on older containers, malformed values,
+  // extra labels, duplicates) hold the firing state and keep the previous
+  // baseline; `??` covers DO storage written before this rule existed.
+  const RECONCILE_FAILED_RULE = "eventsub_reconcile_failed";
+  const wasReconcileFiring = prev.firing.includes(RECONCILE_FAILED_RULE);
+  const passSamples = gauge("two_bot_eventsub_reconcile_passes_total");
+  const reconcileHealthyNow = exactSeries(passSamples, { outcome: "healthy" });
+  const reconcilePendingNow = exactSeries(passSamples, { outcome: "pending" });
+  const reconcileFailedNow = exactSeries(passSamples, { outcome: "failed" });
+  let reconcileHealthy = prev.reconcileHealthy ?? 0;
+  let reconcilePending = prev.reconcilePending ?? 0;
+  let reconcileFailed = prev.reconcileFailed ?? 0;
+  let reconcileSeen = prev.reconcileSeen ?? false;
+  if (reconcileHealthyNow === undefined || reconcilePendingNow === undefined || reconcileFailedNow === undefined) {
+    if (wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
+  } else if (!reconcileSeen) {
+    reconcileHealthy = reconcileHealthyNow;
+    reconcilePending = reconcilePendingNow;
+    reconcileFailed = reconcileFailedNow;
+    reconcileSeen = true;
+  } else if (
+    reconcileHealthyNow < reconcileHealthy
+    || reconcilePendingNow < reconcilePending
+    || reconcileFailedNow < reconcileFailed
+  ) {
+    reconcileHealthy = reconcileHealthyNow;
+    reconcilePending = reconcilePendingNow;
+    reconcileFailed = reconcileFailedNow;
+    reconcileSeen = true;
+    if (wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
+  } else {
+    const failedGrew = reconcileFailedNow > reconcileFailed;
+    const healthyGrew = reconcileHealthyNow > reconcileHealthy;
+    reconcileHealthy = reconcileHealthyNow;
+    reconcilePending = reconcilePendingNow;
+    reconcileFailed = reconcileFailedNow;
+    reconcileSeen = true;
+    if (failedGrew) firing.push(RECONCILE_FAILED_RULE);
+    else if (!healthyGrew && wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
+  }
+
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

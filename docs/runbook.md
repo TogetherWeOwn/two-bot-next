@@ -700,6 +700,49 @@ as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
 
+#### Alert: eventsub reconcile failed
+
+`two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rose between two
+keepalive samples. The Rust process records exactly one outcome per completed
+reconcile pass that reaches Helix (`healthy`, `pending` or `failed`); parked or
+refused startup passes never reach Helix and record no sample. A failed pass
+means a reconcile action failed or a healthy subscription is still missing,
+including listing failures — the detailed per-site error counters
+(`two_bot_eventsub_reconcile_errors_total`) add detail only and never multiply
+this alert. This is a **ticket, not a page**.
+
+Trigger: the first valid sample only stores a baseline and never fires. A later
+positive failed-pass delta fires once, however many internal error counters
+moved in the same window; a failed delta beside a healthy delta still fires.
+Healthy-only or pending-only growth never fires. Recovery: a flat failed counter
+never recovers, and a verification-pending pass never recovers — only a later
+healthy-pass increase with no failed-pass increase resolves, once. A backwards
+counter in any of the three outcomes means the process restarted: that sample
+re-baselines and holds a firing ticket instead of fabricating an ALERT or a
+RESOLVED. Missing or invalid samples (absent family on older containers,
+malformed values, extra labels, duplicates) and failed scrapes hold the firing
+state and keep the previous baseline; the next valid failed delta still fires
+and the next valid healthy increase still recovers.
+
+First response: read-only diagnosis only — no Helix request and no
+reconciliation behavior change. Run the read-only reconcile queries in
+[eventsub-subscription-health-queries.md](eventsub-subscription-health-queries.md)
+(Q2 last reconcile outcome plus the dashboard fields it drops: `failed`,
+`missing`, `prior_failed`, `action`, `error`) via the authorized `/ops/metrics`
+scrape and Workers Observability, correlate the window with recent deploys (a
+fresh deploy restarts the process and resets the counters), and confirm the
+firing key is the fixed `eventsub_reconcile_failed` with no broadcaster,
+subscription id, body, token or free-text labels. Forwarding, persistence and
+log context are the existing metrics-alert path above (persist before notify,
+at most once per transition); turning forwarding off retains monitoring.
+
+Do not retry Helix calls, re-list subscriptions, delete/re-create subscriptions
+by hand, or restart the container to "clear" the counter; a replacement resets
+the baseline without healing the subscription. This alert adds neither automatic
+ticket-system integration nor paging escalation: it labels the existing
+transition delivery as `(ticket)` and supplies this runbook. No new webhook,
+production activation or live load test is authorized.
+
 #### Auto-remediation: guarded stall and crash-loop response
 
 Execution-path decision: the Worker cannot restart containers, so remediation
