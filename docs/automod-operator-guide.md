@@ -33,8 +33,10 @@ Order matters for operators reading a verdict:
   neither counted toward the repeat total nor treated as a break in the
   streak.
 - Messages that a *later* filter matches (invite, mention spam, attachment)
-  **are** observed first. Copies 1–2 report the later filter and copy 3
-  reports `repeated_message`, as in legacy
+  **are** observed first. Copies below the configured
+  `TWO_AUTOMOD_REPEAT_COUNT` threshold report the later filter, and the copy
+  that reaches the threshold reports `repeated_message` (copies 1–2, then
+  copy 3, at the default threshold of 3), as in legacy
   `["invite_link","invite_link","repeated_message"]`.
 - Blank content (empty or whitespace-only after normalization) never counts
   and never breaks a streak.
@@ -64,16 +66,16 @@ plan did what it did:
 
 | Outcome | Meaning for the operator |
 | --- | --- |
-| `Ready` | Enforceable plan with effects. The only outcome that sends Discord mutations. |
+| `Ready` | Enforceable plan. Execution attempts the delete and any permitted follow-up sanction. |
 | `DryRun` | Match recorded capture-only; no target fetch, no count, no mutation. |
 | `AlreadyProcessed` | `(guild, message)` already counted; no effects, no second mutation. |
 | `Unavailable` | Enrichment, claim or target facts failed; nothing counted or sent. |
 | `Protected(reason)` | Owner, Owen, bot or staff-role target: counted per legacy, zero mutations. |
-| `SanctionRefused` | Exact delete still happened, but warn/timeout permission or hierarchy refused; no ladder step beyond the delete. |
+| `SanctionRefused` | Warn/timeout permission or hierarchy refused. The plan still includes the delete; execution attempts it, but no ladder step follows it. |
 
 Two refusal shapes look alike but differ: `Protected` means the *target*
 is off-limits (nothing sent at all); `SanctionRefused` means the *bot*
-lacked permission or role height (delete confirmed, ladder stopped). Both
+lacked permission or role height (delete attempted, ladder stopped). Both
 settle normally with a typed receipt; neither needs reconciliation.
 
 ## Repeat windows and expiry: the operational summary
