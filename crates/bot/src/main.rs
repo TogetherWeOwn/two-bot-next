@@ -11,6 +11,9 @@ mod admission_test_support;
 mod audit_gateway;
 mod audit_runtime;
 mod automod_gateway;
+#[cfg(test)]
+mod backfill_error_chain_acceptance_tests;
+mod backfill_retention_chains;
 mod backup_cli;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.
 #[allow(dead_code)]
@@ -80,6 +83,8 @@ mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
 mod restore_drill;
+#[cfg(test)]
+mod retention_error_chain_acceptance_tests;
 mod retention_jobs;
 #[cfg(test)]
 mod retention_runtime_tests;

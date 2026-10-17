@@ -90,24 +90,36 @@ not production authorization or a migration tool.
    completed counter shape (converged or lag) with identity unchanged. Any
    non-passing poll resets the streak. The success evidence records
    `"active_lag": true` on this path. The application listing is read separately
-   from the rollout record and can briefly trail it, so a completed rollout whose
-   target digest the listing does not yet show is not accepted and not failed
-   immediately: `verify` keeps polling (last observation `application_image=stale`)
-   for up to twenty-four polls (about 4.5 minutes) or until the 300s verify deadline,
-   whichever comes first. If the deadline ends while the last known listing is still
-   stale—including when a deadline-bounded control-plane read times out after it—the
-   gate fails closed as `application_image_drift` (the deadline usually ends it first,
+   from the rollout record and can briefly trail it. A target digest in the listing
+   is accepted normally; a stale listing is accepted only when its digest matches the
+   completed rollout's verified previous-image digest, the listing has never shown
+   the target during this verification, a final rollout-list read finds no newer
+   rollout, and the exact Worker passes the runtime probes. On the active-lag counter
+   shape, that listing-lag acceptance still requires two consecutive full passes.
+   Successful stale-listing acceptance records `"application_listing_lag": true`.
+
+   A stale listing that is not verified as the rollout's previous image fails as
+   `application_image_drift`. For a verified previous-image listing that has not
+   yet passed the runtime probes, `verify` keeps polling (last observation
+   `application_image=stale`) up to twenty-four polls or until the 300s verify
+   deadline, whichever comes first. The stale-poll cap does not interrupt an
+   in-progress active-lag confirmation; it can still complete its required second
+   full pass. If the deadline ends while the last known listing is still stale—
+   including when a deadline-bounded control-plane read times out after it—the gate
+   fails closed as `application_image_drift` (the deadline usually ends it first,
    since the polls only count once the rollout completes). A gateway failure named in
    the last observation keeps `rollout_timeout`, because the rollback triggers key on it.
-   That failure (also raised if the listing stops matching on the final re-read) prints
-   a fixed-vocabulary diagnostic: `listing_image=target|baseline|other` (where the
-   listing points, `baseline` being the pre-deploy image), `app_version=behind|equal|ahead`
+   A drift failure (also raised if the listing stops matching on the final re-read)
+   prints a fixed-vocabulary diagnostic: `listing_image=target|baseline|other` (where
+   the listing points, `baseline` being the pre-deploy image), `app_version=behind|equal|ahead`
    when the listing reports a version, and `later_rollouts=<n>` with
    `latest_later=<status>:<target|baseline|other>` when a rollout created after the
    pinned one exists. `listing_image=baseline` with a later `completed:baseline`
    rollout means the control plane reverted the application after the pinned rollout
-   completed; `listing_image=baseline` with `later_rollouts=0` means the listing never
-   moved. Digests, configurations and ids are never printed.
+   completed. A baseline listing is accepted only if the gate never saw the target
+   during this verification and the final rollout-list read found no newer rollout;
+   `later_rollouts=0` alone does not establish that history. Digests, configurations
+   and ids are never printed.
 7. Require the intended Worker version at 100% traffic, `/readyz` **200** with all
    components ready and the exact compiled revision/build ID, and `/health` 200.
    Both responses carry `x-two-worker-version`, overwritten by the outer Worker

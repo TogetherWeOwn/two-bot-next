@@ -73,11 +73,24 @@ After the reviewer approves (or the automated approval passes), the job:
 
 Before step 2, a schema gate runs the read-only `production-migrate plan` on
 the guarded SHA through the no-reviewer `production-migrate-plan` environment
-and refuses a new build whose migrations are ahead of the production ledger.
+and refuses a new build when either the cutover or store migration chain is
+ahead of its production ledger (`pending_before` or `pending_store_before`).
 Apply the named pending versions through the manual `production-migrate`
 apply dispatch (reviewed plan required), then re-dispatch. A rollback and a
 live-SHA takeover redeploy serve no new schema and waive the ledger check
 (recorded in the run, never a silent skip), so recovery never waits on it.
+
+Before step 2, a role gate also runs the read-only `two-bot db roles verify`
+on the same `production-migrate-plan` binding and refuses a new build whose
+grants lag the migrations. Migrations create tables but grant nothing: the
+2026-10-16 deploy applied migrations 0424–0441 without reapplying the role
+plan, the runtime role lacked grants on the new tables (SQLSTATE 42501), and
+the gateway crash-looped while the schema gate stayed green. After every
+`production-migrate` apply, the operator reapplies the full role plan
+(`two-bot db roles plan`) and `verify` must read 0; the gate enforces it.
+Rollback and live-SHA redeploy waive the findings check the same way (they
+serve no new-table grants), so recovery never waits on it either. Applying
+the role plan stays an operator/host action; the gate is read-only.
 
 Operator setup (once): create the non-secret vars
 `TWO_BOT_PRODUCTION_HOST`, `TWO_BOT_PRODUCTION_DATABASE` and

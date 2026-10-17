@@ -254,7 +254,8 @@ fn macro_name_before(source: &str, bang: usize) -> Option<&'static str> {
 
 /// Byte index of the `)` closing the paren opened at `open`, skipping
 /// over string literals, character literals and `//` line comments so
-/// parens inside them do not affect the depth.
+/// parens inside them do not affect the depth. A `'` that opens a lifetime
+/// (`'static`, `'a`) is not a character literal and never swallows the scan.
 fn closing_paren(source: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = open;
@@ -272,7 +273,15 @@ fn closing_paren(source: &[u8], open: usize) -> Option<usize> {
                     }
                 }
             }
-            b'\'' => {
+            // Only `'\..'` (escape) or `'x'` (one byte, then the closing
+            // quote) opens a character literal; any other `'` is a lifetime
+            // and falls through as an ordinary byte. A multi-byte character
+            // literal holds no paren byte, so it is safe to count through.
+            b'\''
+                if i + 1 < source.len()
+                    && (source[i + 1] == b'\\'
+                        || (i + 2 < source.len() && source[i + 2] == b'\'')) =>
+            {
                 i += 1;
                 while i < source.len() {
                     if source[i] == b'\\' {
@@ -506,12 +515,45 @@ const EVENTSUB_RS_EVENTS: [&str; 5] = [
     "delivery ignored",
 ];
 
+/// Test-only emissions inside the receiver file's `#[cfg(test)]` module,
+/// mirroring `TEST_ONLY_EMISSIONS` for the scoped sources: they never run
+/// in production and carry no `event` field, but the disk read sees the
+/// whole file, so they join the known set explicitly instead of failing
+/// the scan.
+const EVENTSUB_TEST_ONLY_EMISSIONS: [&str; 1] = [
+    // Secret-reload log-capture self-check: proves the test recorder
+    // observes events; asserts on the text, ships no behavior.
+    "reload log capture live",
+];
+
 /// The receiver's startup diagnostic in `main.rs` (also in
 /// `MAIN_RS_ADJACENT` for the scanned-source pin above).
 const EVENTSUB_STARTUP_EVENT: &str = "eventsub startup refused";
 
 /// Bounded `event` field value every receiver emission carries.
 const EVENTSUB_EVENT_FIELD: &str = "eventsub_receiver";
+
+/// Bounded `message_type` scalars the receiver's refuse paths log: the three
+/// Twitch types the receiver handles, else `unknown`. Raw header values never
+/// reach a log line, so a failed challenge (`webhook_callback_verification`)
+/// separates from a malformed notification or an edge probe in logs alone.
+const EVENTSUB_MESSAGE_TYPES: [&str; 4] = [
+    "webhook_callback_verification",
+    "notification",
+    "revocation",
+    "unknown",
+];
+
+/// Bounded `reason` scalars the revocation ack logs: Twitch's revocation
+/// `status` vocabulary, unmapped values collapsing to `other`. Revocation
+/// counts by reason are answerable from logs alone.
+const EVENTSUB_REVOCATION_REASONS: [&str; 5] = [
+    "user_removed",
+    "authorization_revoked",
+    "notification_failures_exceeded",
+    "version_removed",
+    "other",
+];
 
 fn eventsub_receiver_source() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/eventsub_http.rs");
@@ -542,21 +584,29 @@ fn observability_catalog_doc() -> String {
 #[test]
 fn eventsub_receiver_emissions_match_the_catalog() {
     let source = eventsub_receiver_source();
+    let traced = traced_messages(&source);
+    let mut known = EVENTSUB_RS_EVENTS.to_vec();
+    known.extend(EVENTSUB_TEST_ONLY_EMISSIONS);
     assert_eq!(
-        sorted_unique(traced_messages(&source)),
-        sorted_unique(EVENTSUB_RS_EVENTS.to_vec()),
+        sorted_unique(traced.clone()),
+        sorted_unique(known),
         "eventsub receiver emitted an uncataloged message or dropped a cataloged one: \
          record it in docs/observability-event-catalog.md and EVENTSUB_RS_EVENTS together"
     );
-    // Every log callsite must carry the bounded field, and it must be the
-    // only `event` value in the file. Count the field literals against the
-    // traced callsites so a callsite that drops the field fails.
-    let traced = traced_messages(&source).len();
+    // Every receiver log callsite must carry the bounded field, and it must
+    // be the only `event` value in the file. Count the field literals
+    // against the receiver callsites (test-only emissions carry no field)
+    // so a callsite that drops the field fails.
+    let receiver_callsites = traced
+        .iter()
+        .copied()
+        .filter(|message| !EVENTSUB_TEST_ONLY_EMISSIONS.contains(message))
+        .count();
     let fielded = source.matches("event = \"eventsub_receiver\"").count();
     assert_eq!(
-        fielded, traced,
+        fielded, receiver_callsites,
         "every eventsub receiver log callsite carries event = \"eventsub_receiver\" \
-         ({fielded} fielded of {traced} callsites)"
+         ({fielded} fielded of {receiver_callsites} receiver callsites)"
     );
 }
 
@@ -575,6 +625,90 @@ fn eventsub_events_are_recorded_in_the_catalog_doc() {
             "eventsub event missing from docs/observability-event-catalog.md: {event}"
         );
     }
+    // The attribution scalars are cataloged as backticked values so the
+    // check is precise: bare `notification` or `unknown` would match prose.
+    for scalar in EVENTSUB_MESSAGE_TYPES
+        .into_iter()
+        .chain(EVENTSUB_REVOCATION_REASONS)
+    {
+        let backticked = format!("`{scalar}`");
+        assert!(
+            catalog.contains(&backticked),
+            "eventsub scalar missing from docs/observability-event-catalog.md: {backticked}"
+        );
+    }
+}
+
+/// Every `refuse` callsite passes one bounded `message_type` scalar and the
+/// `refuse` definition logs it: a new refuse path without attribution fails
+/// here, and a raw header value smuggled into a callsite fails the bounded
+/// vocabulary check above. The single `fn refuse` definition declares the
+/// scalar; everything else matching `refuse(` is a callsite.
+#[test]
+fn eventsub_refuse_callsites_pass_a_bounded_message_type() {
+    let source = eventsub_receiver_source();
+    let bytes = source.as_bytes();
+    let mut search_from = 0;
+    let mut definitions = 0;
+    let mut callsites = 0;
+    while let Some(rel) = source[search_from..].find("refuse(") {
+        let open = search_from + rel + "refuse".len();
+        let Some(close) = closing_paren(bytes, open) else {
+            panic!("unbalanced refuse( call fails closed");
+        };
+        let body = &source[open + 1..close];
+        if body.contains("&'static str") {
+            assert!(
+                body.contains("message_type"),
+                "fn refuse must declare the bounded message_type scalar"
+            );
+            assert!(
+                source[close..].starts_with(") -> Response"),
+                "refuse definition shape changed; re-check this pin"
+            );
+            definitions += 1;
+        } else {
+            assert!(
+                body.contains("bounded_message_type(") || body.contains("\"unknown\""),
+                "refuse callsite without a bounded message_type fails closed; \
+                 pass bounded_message_type(&message_type) or \"unknown\"; \
+                 body starts: {}",
+                body.chars().take(80).collect::<String>()
+            );
+            callsites += 1;
+        }
+        search_from = close + 1;
+    }
+    assert_eq!(
+        definitions, 1,
+        "exactly one fn refuse definition carries the message_type scalar"
+    );
+    assert!(
+        callsites > 0,
+        "no refuse callsites found; the receiver lost its refusal paths"
+    );
+    for bounded in EVENTSUB_MESSAGE_TYPES {
+        assert!(
+            source.contains(&format!("\"{bounded}\"")),
+            "bounded message_type value missing from eventsub_http.rs: {bounded}"
+        );
+    }
+}
+
+/// The revocation ack logs exactly one bounded `reason` scalar and nothing
+/// else identifying the subscription: no id, header, body or secret.
+#[test]
+fn eventsub_revocation_ack_carries_a_bounded_reason() {
+    let source = eventsub_receiver_source();
+    assert!(
+        source.contains("reason = reason.as_str()"),
+        "revocation acknowledged must log reason = reason.as_str()"
+    );
+    assert_eq!(
+        source.matches("reason = ").count(),
+        1,
+        "exactly one reason field on the receiver: the revocation ack"
+    );
 }
 
 /// `crates/bot/src/eventsub_reconcile.rs`: the subscription reconcile log
