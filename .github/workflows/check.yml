@@ -511,9 +511,14 @@ jobs:
           # Disk hygiene for hosted overflow runners (TOG-12134): the package
           # lists stay on the job-container overlay otherwise.
           rm -rf /var/lib/apt/lists/*
+          set -e
+          # /etc/hosts is mounted in the job container; sed -i cannot rename over it.
           # Remove any runner/image mapping first so resolution uses the
           # disposable service's current job-scoped address.
-          sed -i -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts
+          hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"
+          sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > "$hosts_tmp"
+          cat "$hosts_tmp" > /etc/hosts
+          rm -f "$hosts_tmp"
           # Resolve the disposable service and pin its job-scoped address so
           # long database runs do not depend on service-alias DNS staying up.
           service_ip=""
