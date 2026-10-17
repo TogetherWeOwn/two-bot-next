@@ -47,21 +47,16 @@
 //! tests arm it with a *lazy* pool handle (`connect_lazy` performs no I/O
 //! and no connection is ever opened: nothing here drains to a database),
 //! which exercises the exact armed buffering path the gateway uses.
+//! Creating even a lazy pool needs a Tokio context, so the tests run
+//! under `#[tokio::test]`; nothing in them awaits.
 //!
 //! Run: `python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test community_message_length_acceptance`
 #![cfg(feature = "db")]
 
-use std::str::FromStr;
-
+use serde_json::json;
 use twilight_model::{
-    channel::{
-        message::{MessageFlags, MessageType},
-        Message,
-    },
+    channel::Message,
     gateway::{event::Event, payload::incoming::MessageCreate},
-    id::Id,
-    user::User,
-    util::Timestamp,
 };
 use two_bot_core::{ChannelClass, FactsSink, MemStore, MessageFact, NoopLeveling};
 use two_bot_discord::{DeferredCommunityFacts, NoClassification, Pipeline, ScriptedInvites};
@@ -104,8 +99,8 @@ fn metadata_of(write: &two_bot_core::community_store::FactWrite) -> serde_json::
         .expect("fact metadata is JSON")
 }
 
-#[test]
-fn gateway_sink_buffers_a_length_carrying_fact() {
+#[tokio::test]
+async fn gateway_sink_buffers_a_length_carrying_fact() {
     let buffer = armed_buffer();
     buffer.record_message(gateway_message("msg-gateway-1", Some(11)));
 
@@ -125,8 +120,8 @@ fn gateway_sink_buffers_a_length_carrying_fact() {
     );
 }
 
-#[test]
-fn gateway_sink_without_length_buffers_no_length_key() {
+#[tokio::test]
+async fn gateway_sink_without_length_buffers_no_length_key() {
     // No length measured (e.g. the privileged message-content intent is
     // off): the buffered fact is still recorded, but with no
     // `contentLength` key and never a fabricated `0`.
@@ -142,78 +137,28 @@ fn gateway_sink_without_length_buffers_no_length_key() {
     );
 }
 
-fn ts(s: &str) -> Timestamp {
-    Timestamp::from_str(&format!("2026-09-01T{s}.000+00:00")).expect("fixture stamp")
-}
-
-fn user(id: u64) -> User {
-    User {
-        accent_color: None,
-        avatar: None,
-        avatar_decoration: None,
-        avatar_decoration_data: None,
-        banner: None,
-        bot: false,
-        discriminator: 0,
-        email: None,
-        flags: None,
-        global_name: None,
-        id: Id::new(id),
-        locale: None,
-        mfa_enabled: None,
-        name: "member".to_owned(),
-        premium_type: None,
-        primary_guild: None,
-        public_flags: None,
-        system: None,
-        verified: None,
-    }
-}
-
 fn message_event(message_id: u64, at: &str, content: &str) -> Event {
-    Event::MessageCreate(Box::new(MessageCreate(Message {
-        activity: None,
-        application: None,
-        application_id: None,
-        attachments: vec![],
-        author: user(MEMBER),
-        call: None,
-        channel_id: Id::new(CHANNEL),
-        components: vec![],
-        content: content.to_owned(),
-        edited_timestamp: None,
-        embeds: vec![],
-        flags: Some(MessageFlags::empty()),
-        guild_id: Some(Id::new(GUILD)),
-        id: Id::new(message_id),
-        // `interaction` is deprecated in favour of `interaction_metadata`
-        // but still a required literal field on this twilight version.
-        #[allow(deprecated)]
-        interaction: None,
-        interaction_metadata: None,
-        kind: MessageType::Regular,
-        member: None,
-        mention_channels: vec![],
-        mention_everyone: false,
-        mention_roles: vec![],
-        mentions: vec![],
-        message_snapshots: vec![],
-        pinned: false,
-        poll: None,
-        reactions: vec![],
-        reference: None,
-        referenced_message: None,
-        role_subscription_data: None,
-        sticker_items: vec![],
-        timestamp: ts(at),
-        thread: None,
-        tts: false,
-        webhook_id: None,
-    })))
+    // Deserialized like a gateway payload (the same fixture shape as the
+    // automation-admission suite), so no struct literal has to name
+    // twilight's deprecated `interaction` field.
+    let message: Message = serde_json::from_value(json!({
+        "id": message_id.to_string(),
+        "guild_id": GUILD.to_string(),
+        "channel_id": CHANNEL.to_string(),
+        "type": 0,
+        "author": {"id": MEMBER.to_string(), "username": "member", "discriminator": "0", "avatar": null},
+        "content": content,
+        "timestamp": format!("2026-09-01T{at}.000000+00:00"),
+        "edited_timestamp": null,
+        "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
+        "attachments": [], "embeds": [], "pinned": false
+    }))
+    .expect("fixture message deserializes");
+    Event::MessageCreate(Box::new(MessageCreate(message)))
 }
 
-#[test]
-fn pipeline_message_create_records_scalar_count_not_bytes() {
+#[tokio::test]
+async fn pipeline_message_create_records_scalar_count_not_bytes() {
     assert_eq!(
         MULTIBYTE_CONTENT.chars().count(),
         11,
