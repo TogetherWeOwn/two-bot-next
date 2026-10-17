@@ -161,6 +161,46 @@ class SyntheticAlertTests(unittest.TestCase):
         self.assertIn("event=schedule", get.call_args_list[0].args[0])
         self.assertIn("/runs/100/jobs?", get.call_args_list[1].args[0])
 
+    def test_carried_delivery_does_not_leak_across_a_healthy_sample(self):
+        # Newest-first: a sub-threshold delivered failure, a healthy sample,
+        # then a fresh two-failure streak with no delivery. The healthy
+        # sample ends the first streak, so the new incident is undelivered.
+        previous = [("failure", "skipped"), ("failure", "skipped"),
+                    ("success", "skipped"), ("failure", "success")]
+        failures, incident, delivered = history.incident_state(previous)
+        self.assertTrue(incident)
+        self.assertFalse(delivered)
+        self.assertEqual(history.transition("failure", previous), "alert")
+
+    def test_reconstruction_bound_reports_unknown_history(self):
+        # Endless failures whose post step never ran never checkpoint (the
+        # delivered state depends on older history), so the bounded scan
+        # must report unknown history instead of returning a partial suffix.
+        import urllib.parse
+
+        def fake_get(path, _token):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+            if "/actions/workflows/" in path:
+                page = int(query.get("page", ["1"])[0])
+                first = 1000 - (page - 1) * 2
+                return {"total_count": 9999, "workflow_runs": [
+                    {"id": first - offset, "run_number": first - offset,
+                     "event": "schedule"} for offset in range(2)]}
+            return {"jobs": [{
+                "name": history.JOB_NAMES["staging"],
+                "steps": [
+                    {"name": history.PROBE_STEPS["staging"], "conclusion": "failure"},
+                    {"name": history.ALERT_STEPS["staging"], "conclusion": "skipped"},
+                ]}]}
+
+        with mock.patch.object(history, "MAX_HISTORY_RUNS", 5), \
+                mock.patch.object(history, "RUNS_PAGE_SIZE", 2), \
+                mock.patch.object(history, "_get", side_effect=fake_get):
+            with self.assertRaisesRegex(history.HistoryError, "unknown"):
+                history.previous_probe_outcomes(
+                    {"GITHUB_TOKEN": "test-token", "GITHUB_REPOSITORY": "owner/repo",
+                     "GITHUB_RUN_ID": "2000"}, "staging")
+
     def test_non_discord_destination_refuses_before_any_request(self):
         with self.assertRaisesRegex(alert.AlertError, "not a Discord webhook"):
             alert.post("https://example.com/hook", "content")

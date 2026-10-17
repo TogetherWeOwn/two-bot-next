@@ -34,8 +34,29 @@ behavior. A decide step computes the transition and writes `event` to
 implicit `success()`. Only a successful post counts as delivered in
 `scripts/synthetic_alert_history.py`; `skipped` or missing delivery leaves
 the incident open, so a history-read no-op can never drop a recovery or fake
-a delivery. The manual `force_fail: true` staging proof bypasses the
-threshold intentionally:
+a delivery.
+
+Incident state is rebuilt from this workflow's own completed scheduled runs
+on `main` (the only state store; no extra permissions or infrastructure).
+Reconstruction pages the runs list (GitHub caps a page at 100) and reads jobs
+newest-first until the collected samples determine the incident state by
+themselves — replaying them from any prior state converges, confirmed by one
+further sample — or the history runs out. The scan is bounded at 200 prior
+runs (about sixteen hours at the five-minute schedule); it normally stops at
+the current incident's boundary long before that. Delivery evidence on the
+oldest retained failure counts, so an outage that outlives any fixed window
+keeps its once-per-incident contract: one delivered opening alert, no
+duplicate while it stays down, and exactly one recovery on the first healthy
+sample (or the late ALERT above when the opening alert never delivered).
+When reconstruction cannot be completed — the history read fails, or no
+checkpoint is found within the bound — the incident state is unknown rather
+than guessed: the documented fail-open policy applies (alert on a real probe
+failure, send nothing on a healthy sample), and a fail-open alert that
+delivers becomes fresh delivery evidence for later samples. Skipped,
+cancelled and manually dispatched runs are not probe samples and never move
+the state. The manual `force_fail: true` staging proof bypasses the
+threshold intentionally; it applies to staging only, and production stays
+passive as described above:
 
 ```text
 two-bot-next ALERT synthetic-user-flow:<staging|prod>: <failing checks>. Runbook: <runbook URL> | build <revision> <build_id> (git <sha>) | logs <github run URL>
