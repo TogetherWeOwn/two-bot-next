@@ -89,9 +89,13 @@ pub async fn bind_with_delivery(
     delivery: Option<DeliveryDeps>,
 ) -> std::io::Result<BoundEventsubReceiver> {
     let listener = TcpListener::bind(config.listen_addr()).await?;
+    let state = match delivery {
+        Some(deps) => ReceiverState::with_delivery(&config, Some(deps)),
+        None => ReceiverState::new(&config),
+    };
     Ok(BoundEventsubReceiver {
         listener,
-        state: Arc::new(ReceiverState::with_delivery(&config, delivery)),
+        state: Arc::new(state),
     })
 }
 
@@ -282,7 +286,7 @@ async fn handle_notification(
             "unavailable",
             true,
             id,
-            "notification",
+            bounded_message_type("notification"),
         )
     }
 }

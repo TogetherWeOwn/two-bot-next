@@ -13,40 +13,20 @@
 use std::sync::Arc;
 
 use two_bot_core::stream_live::GoLiveOutcome;
-use two_bot_core::stream_live_store::{
-    LiveDeliveryConfig, LiveLedger, LiveSendError, LiveSender, SendFuture,
-};
-use two_bot_discord::ActionExecutor;
+use two_bot_core::stream_live_store::{LiveDeliveryConfig, LiveLedger, LiveSender};
 
 /// Injected delivery dependencies: the durable ledger, the one-shot
 /// sender, and the static allowlist/invite/channel inputs. Held behind
 /// trait objects so receiver tests inject in-memory fakes and no test
 /// touches a database or the Discord wire. The production shape is the
 /// bot's Postgres pool as `ledger` (it implements `LiveLedger`) and the
-/// shared REST executor as `sender` (below); boot constructs that once a
+/// shared REST executor as `sender` (its `LiveSender` impl lives with the
+/// type in `crates/discord/src/executor.rs`); boot constructs that once a
 /// configuration slice provisions `config`.
 pub struct DeliveryDeps {
     pub ledger: Arc<dyn LiveLedger>,
     pub sender: Arc<dyn LiveSender>,
     pub config: LiveDeliveryConfig,
-}
-
-/// The shared executor is the production `LiveSender`: `post_message`
-/// builds the exact no-ping body (`allowed_mentions: { parse: [] }`,
-/// pinned in `crates/discord/src/executor.rs`) and makes a single attempt.
-/// Only an error that proves no effect (explicit rejection, 429, or a
-/// local guard refusal) may release the claim; timeouts and transport
-/// failures are ambiguous and stay fenced.
-impl LiveSender for ActionExecutor {
-    fn send_live<'a>(&'a self, channel_id: &'a str, content: &'a str) -> SendFuture<'a> {
-        Box::pin(async move {
-            match self.post_message(channel_id, content, None).await {
-                Ok(message_id) => Ok(message_id),
-                Err(error) if error.proves_no_effect() => Err(LiveSendError::ProvenNoSend),
-                Err(_) => Err(LiveSendError::Ambiguous),
-            }
-        })
-    }
 }
 
 /// Bounded `eventsub_post` outcome labels for one delivery, as
