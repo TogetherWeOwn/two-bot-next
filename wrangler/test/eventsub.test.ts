@@ -641,6 +641,27 @@ test("logs carry only scalar event/status/error_class/request_id/release/log_url
   }
 });
 
+// Paperclip Review (PR #1116): pin the EventSub edge wiring with an exact SHA.
+// The shape test above accepts `sha|unknown`, so replacing
+// `env.CONTAINER_RELEASE` with `undefined` at this edge call site stays green.
+// This test drives a real 40-hex SHA through `worker.fetch` and asserts the
+// span line carries it verbatim.
+test("edge stamps the deploy CONTAINER_RELEASE on eventsub span lines", async (t) => {
+  const sha = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
+  const h = await harness(t, { ...ENABLED_ENV, CONTAINER_RELEASE: sha });
+  await h.warm();
+  const refused = await h.call(post(BODY, { ...DELIVERY_HEADERS, "content-type": "text/plain" }));
+  assert.equal(refused.status, 415);
+  await refused.arrayBuffer();
+  const span = h.logs.filter((line) => line.includes("eventsub_ingress"));
+  assert.ok(span.length >= 1, "expected a span line");
+  for (const line of span) {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    assert.equal(record["release"], sha, `edge must stamp the deploy SHA: ${line}`);
+    assert.equal(record["log_url"], LOG_QUERY_URL, `bad log url: ${line}`);
+  }
+});
+
 test("minted request id survives EventSub header filtering and upstream refusal", async (t) => {
   resetEventsubIngressLimits();
   t.after(() => resetEventsubIngressLimits());

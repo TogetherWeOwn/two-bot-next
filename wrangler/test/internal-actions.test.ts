@@ -581,6 +581,83 @@ test("logs carry only scalar event, status, error class, request id, release and
   for (const line of h.logs) for (const secret of secrets) assert.ok(!line.includes(secret), secret);
 });
 
+// Paperclip Review (PR #1116): pin the edge wiring with an exact SHA. The
+// shape test above accepts `sha|unknown`, so replacing `env.CONTAINER_RELEASE`
+// with `undefined` at the edge call site stays green. This test drives a real
+// 40-hex SHA through `worker.fetch` and asserts the span line carries it
+// verbatim; a hostile value must bucket to the visible "unknown".
+test("edge stamps the deploy CONTAINER_RELEASE on span lines; hostile values bucket to unknown", async (t) => {
+  const sha = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
+  const withSha = await harness(t, { ...ENABLED_ENV, CONTAINER_RELEASE: sha });
+  await withSha.warm();
+  const refused = await withSha.call(post(BODY, { ...SIGNED_HEADERS, "content-type": "text/plain" }));
+  assert.equal(refused.status, 415);
+  await refused.arrayBuffer();
+  const span = withSha.logs.filter((line) => line.includes("internal_actions_ingress"));
+  assert.ok(span.length >= 1, "expected a span line");
+  for (const line of span) {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    assert.equal(record["release"], sha, `edge must stamp the deploy SHA: ${line}`);
+    assert.equal(record["log_url"], LOG_QUERY_URL, `bad log url: ${line}`);
+  }
+
+  const hostile = await harness(t, {
+    ...ENABLED_ENV,
+    CONTAINER_RELEASE: "postgres://user:hunter2@db.internal/app",
+  });
+  await hostile.warm();
+  const refusedHostile = await hostile.call(post(BODY, { ...SIGNED_HEADERS, "content-type": "text/plain" }));
+  assert.equal(refusedHostile.status, 415);
+  await refusedHostile.arrayBuffer();
+  const hostileSpan = hostile.logs.filter((line) => line.includes("internal_actions_ingress"));
+  assert.ok(hostileSpan.length >= 1, "expected a span line");
+  for (const line of hostileSpan) {
+    assert.equal((JSON.parse(line) as Record<string, unknown>)["release"], "unknown", line);
+  }
+  assert.ok(hostile.logs.every((line) => !line.includes("hunter2")), "hostile release must not echo");
+});
+
+// Paperclip Review (PR #1116): pin the DO wiring with an exact SHA. Warming
+// the keepalive probe with a /readyz `build_revision` SHA sets `lastRelease`;
+// a DO-side refusal (malformed header, before the ownership fence) must carry
+// that SHA verbatim. Passing `null` at any DO call site logs "unknown" and
+// fails this test.
+test("DO stamps the probed build_revision on span lines", async (t) => {
+  const sha = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
+  const h = await harness(t, ENABLED_ENV);
+  await h.warm();
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    if (url.pathname === "/readyz") {
+      return Object.assign(
+        new Response(
+          JSON.stringify({ components: [["process", "ready"]], build_revision: sha, build_id: "123-1" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+        { webSocket: null },
+      );
+    }
+    return Object.assign(Response.json({ ready: true }), { webSocket: null });
+  });
+  await h.bot.onStart();
+  const [pending] = await h.bot.listSchedules<{ startedAt: number }>("keepalive");
+  assert.ok(pending, "keepalive must be armed");
+  await h.bot.keepalive(pending.payload!, pending);
+  const before = h.logs.length;
+  const direct = await h.bot.fetch(new Request(`https://worker.invalid${ACTIONS_PATH}`, {
+    method: "POST",
+    body: BODY,
+    headers: { ...SIGNED_HEADERS, "content-type": "text/plain" },
+  }));
+  assert.equal(direct.status, 415);
+  await direct.arrayBuffer();
+  const span = h.logs.slice(before).filter((line) => line.includes("internal_actions_ingress"));
+  assert.ok(span.length >= 1, "expected a DO-side span line");
+  for (const line of span) {
+    assert.equal((JSON.parse(line) as Record<string, unknown>)["release"], sha, line);
+  }
+});
+
 test("minted request id survives header filtering and an upstream refusal", async (t) => {
   resetIngressLimits();
   t.after(() => resetIngressLimits());
