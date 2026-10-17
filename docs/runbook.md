@@ -349,10 +349,14 @@ First response: check the affected provider's status (PlanetScale for
 production, Neon for staging) before touching the bot; then correlate with
 the `op` label and recent deploys (a new query path or migration can explain
 a fresh error burst). For voice actor load failures, read `voice actor load
-failed; actor respawns on the next guild snapshot` in container stdout.
-Every failure increments the counter, but that warn is throttled
-process-wide to once per 300 s; its absence in a short window does not
-prove the actor loaded. Do not run SQL probes against staging or
+failed; retrying with capped backoff` in container stdout (or `voice actor
+load failed; credential refused, not retrying` when the store refused the
+bot credential). Transient failures retry inside the actor task (30 s
+per-attempt deadline, 1 s backoff doubling to a 60 s cap), so the guild
+recovers on its own once storage heals; a credential refusal never retries
+and needs the credential fixed first. Every failure increments the
+counter, but that warn is throttled process-wide to once per 300 s; its
+absence in a short window does not prove the actor loaded. Do not run SQL probes against staging or
 production, add grants, or restart the container to "clear" the errors;
 a replacement restarts the shard without fixing the failing storage path.
 
