@@ -715,9 +715,10 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // no recorded failure has no step to read. The first valid sample only
   // stores the baseline and never fires; a process restart (gateway pairing
   // counters went backwards, detected above) re-baselines the streak even
-  // when this sample's readiness is invalid, and holds a firing alert rather
-  // than clearing it; any ready sample clears at
-  // once. A failed /metrics scrape never reaches this evaluation: the caller
+  // when this sample's readiness is invalid, and holds a firing non-ready or
+  // invalid alert rather than clearing it; any ready sample clears at once,
+  // even across a restart. A failed /metrics scrape never reaches this
+  // evaluation: the caller
   // preserves the whole state, so the rule also needs consecutive ticks where
   // both the probe parsed and the scrape succeeded.
   const GATEWAY_NOT_READY_RULE = "gateway_not_ready";
@@ -731,19 +732,22 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     gatewayNotReadySeen = true;
     gatewayNotReadyStreak = gatewayReady ? 0 : 1;
     gatewayNotReadyFiring = notReadyWasFiring;
+  } else if (gatewayReady === true) {
+    // A valid ready sample clears at once, even across a restart: a restart
+    // that lands on ready means the new process came up connected.
+    gatewayNotReadyStreak = 0;
+    gatewayNotReadyFiring = false;
   } else if (unpaired.restarted && notReadySeen) {
     // A process restart re-baselines the streak even when this sample's
     // readiness is invalid: the pre-restart streak is stale, so the next valid
     // non-ready sample recounts from 1 instead of firing off it. Firing still
-    // holds (a restart never resolves), matching the sibling unpaired rule.
+    // holds for non-ready or invalid samples (a restart never resolves those),
+    // matching the sibling unpaired rule.
     gatewayNotReadyStreak = gatewayReady === false ? 1 : 0;
     gatewayNotReadyFiring = notReadyWasFiring;
   } else if (gatewayReady === false) {
     gatewayNotReadyStreak = notReadyStreakPrev + 1;
     gatewayNotReadyFiring = gatewayNotReadyStreak >= GATEWAY_NOT_READY_SAMPLES || notReadyWasFiring;
-  } else if (gatewayReady === true) {
-    gatewayNotReadyStreak = 0;
-    gatewayNotReadyFiring = false;
   }
   if (gatewayNotReadyFiring) firing.push(GATEWAY_NOT_READY_RULE);
 

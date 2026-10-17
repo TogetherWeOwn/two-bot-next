@@ -662,10 +662,10 @@ test("gateway not ready restart re-baselines the streak and holds a firing alert
   const again = ev(flat(0, 0), restart.state, false);
   assert.deepEqual(again.firing, [NOT_READY]);
   assert.equal(again.state.gatewayNotReadyStreak, 2);
-  // A restart that lands on ready still holds for that one sample: the
-  // restart re-baselines, it never resolves.
+  // A restart that lands on ready clears at once: the new process came up
+  // connected, so readiness resolves even across the restart re-baseline.
   const restartReady = ev(flat(0, 0), fired.state, true);
-  assert.deepEqual(restartReady.firing, [NOT_READY]);
+  assert.deepEqual(restartReady.firing, []);
   assert.equal(restartReady.state.gatewayNotReadyStreak, 0);
   assert.deepEqual(ev(flat(0, 0), restartReady.state, true).firing, []);
 });

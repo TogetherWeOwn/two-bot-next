@@ -569,10 +569,11 @@ threshold it never fires sooner than the generic
 generic page fires first and this rule attributes the outage to the gateway
 with its own runbook, an order of magnitude inside the 15-minute
 acknowledgement window. (A raised `UNREADY_ALERT_FAILURES` override can invert
-that order; do not rely on generic-first with an override.) Any outage long
-enough to trip this rule already
+that order; do not rely on generic-first with an override.) At the default
+threshold, any outage long enough to trip this rule already
 tripped the generic unready page a sample earlier, so it adds no new
-false-page class for slow boots.
+false-page class for slow boots; with an override it can page first, so a
+slow boot can page here with no prior generic page.
 
 A non-ready component is read from the `components` breakdown of the
 keepalive `/readyz` probe, not from `gateway_failure.failed_step`: the
@@ -584,8 +585,9 @@ holds rather than guessing. The first valid sample only stores the baseline.
 A failed probe, an unparsable body, or a failed `/metrics` scrape changes
 nothing and holds the current state, so the rule needs consecutive ticks
 where both the probe parsed and the scrape succeeded. A counter reset
-(process restart) re-baselines the streak and holds a firing alert rather
-than clearing it. The first sample with the gateway `ready` clears at once.
+(process restart) re-baselines the streak and holds a firing non-ready or
+invalid alert rather than clearing it. A `ready` sample clears at once,
+even across a restart.
 The firing key is the constant `gateway_not_ready`.
 
 A parked gateway (Unconfigured, for example a missing `DISCORD_TOKEN`) pages
