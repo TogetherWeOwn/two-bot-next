@@ -4,10 +4,11 @@
 //! For one validated [`StreamOnline`](crate::stream_funnel::StreamOnline):
 //! check the broadcaster allowlist, render the post, claim the go-live row
 //! ([`ClaimOutcome`](crate::stream_live_store::ClaimOutcome)), and send it to
-//! the announcements channel. The receiver MUST send with
-//! `allowed_mentions: { parse: [] }`; this repository does not yet contain
-//! that sender, so the no-ping guarantee is a receiver contract, not verified
-//! behavior. Only a provably-unsent send failure releases the claim (the
+//! the announcements channel. The sender MUST send with
+//! `allowed_mentions: { parse: [] }`; that is the `LiveSender` contract in
+//! `stream_live_store`, and the bot's executor-backed implementation posts
+//! through the shared executor shape that pins it. Only a provably-unsent
+//! send failure releases the claim (the
 //! store deletes it only for the token-holding owner:
 //! [`release_live`](crate::stream_live_store::release_live) before the
 //! send starts,
@@ -29,10 +30,12 @@
 //! [`disposition`] is the table the receiver executes; every row is pinned
 //! below. The async glue (claim → start → post → stamp-or-release, with
 //! stale takeover of never-started claims inside
-//! [`crate::stream_live_store::claim_live`]) belongs with the
-//! receiver, which is not implemented in this slice. The receiver MUST call
-//! `mark_live_send_started` before the first Discord POST so an ambiguous
-//! send (posted but unstamped) stays fenced as `Duplicate` forever.
+//! [`crate::stream_live_store::claim_live`]) is
+//! [`crate::stream_live_store::deliver_go_live`], which the receiver calls
+//! for a verified notification when delivery dependencies are injected. It
+//! calls `mark_live_send_started` before the first Discord POST so an
+//! ambiguous send (posted but unstamped) stays fenced as `Duplicate`
+//! forever.
 
 /// What one pipeline stage decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
