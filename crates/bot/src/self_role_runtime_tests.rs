@@ -1137,7 +1137,7 @@ async fn terminal_partial_repair_exchange_outcomes(pool: &PgPool) -> TestResult 
         script.push(failure); // only one add attempt, no executor retry
         script.extend(snapshot(&[NEW_ROLE, OTHER])); // later authoritative convergence
         let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
-        let feature = if pending {
+        let feature = if pending || case.starts_with("stalled-") {
             runtime_with_timeout(pool, &clock, &mock, Duration::from_secs(5))
         } else {
             runtime(pool, &clock, &mock)
@@ -3116,7 +3116,11 @@ async fn execution_and_compensation(pool: &PgPool) -> TestResult {
             script.extend(snapshot(&[OLD_ROLE, OTHER])); // settlement revalidation
         }
         let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
-        let runtime = runtime(pool, &clock, &mock);
+        let runtime = if body_fault == "stalled" {
+            runtime_with_timeout(pool, &clock, &mock, Duration::from_secs(5))
+        } else {
+            runtime(pool, &clock, &mock)
+        };
         let mut panel = panel(PanelMode::Select);
         panel.id = format!("execution-{status}-{body_fault}");
         let request = request(
