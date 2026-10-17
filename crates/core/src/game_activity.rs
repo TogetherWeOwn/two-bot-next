@@ -195,12 +195,9 @@ pub fn render_game_activity_report(guild_id: &str, rows: &[GuildGameAggregate]) 
         b.total_play_ms
             .cmp(&a.total_play_ms)
             .then_with(|| b.in_voice_ms.cmp(&a.in_voice_ms))
-            .then_with(|| match (&a.game, &b.game) {
-                (None, None) => std::cmp::Ordering::Equal,
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (Some(left), Some(right)) => left.cmp(right),
-            })
+            // `Option<&str>` order is `None` before any `Some`, then
+            // lexicographic: untitled first among full ties, titles asc.
+            .then_with(|| a.game.as_deref().cmp(&b.game.as_deref()))
             .then_with(|| b.session_count.cmp(&a.session_count))
     });
     let truncated = scoped.len() > GAME_ACTIVITY_REPORT_MAX_ROWS;
