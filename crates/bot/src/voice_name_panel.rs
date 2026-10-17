@@ -657,15 +657,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 ProposeOutcome::Unchanged => "unchanged",
                                 ProposeOutcome::Queued { .. } => "queued",
                             };
-                            tracing::info!(
-                                guild = %self.live.guild_id,
-                                channel = %room_id,
-                                game = %facts.context.game_name,
-                                playing_members = facts.context.members_playing,
-                                activity_detected = facts.context.members_playing > 0,
-                                requested_name = %name,
+                            log_template_name_decision(
+                                self.live.guild_id,
+                                room_id,
+                                &facts.context.game_name,
+                                facts.context.members_playing,
+                                &name,
                                 decision,
-                                "voice room rename decision"
                             );
                             metrics::global().voice_name(match outcome {
                                 ProposeOutcome::Unchanged => "unchanged",
@@ -674,14 +672,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             self.name_signatures.insert(room_id, signature);
                         }
                         None => {
-                            tracing::info!(
-                                guild = %self.live.guild_id,
-                                channel = %room_id,
-                                game = %facts.context.game_name,
-                                playing_members = facts.context.members_playing,
-                                activity_detected = facts.context.members_playing > 0,
-                                decision = "channel_unseen",
-                                "voice room rename decision"
+                            log_template_name_decision(
+                                self.live.guild_id,
+                                room_id,
+                                &facts.context.game_name,
+                                facts.context.members_playing,
+                                "",
+                                "channel_unseen",
                             );
                             metrics::global().voice_name("channel_unseen");
                             self.name_inputs = None;
@@ -689,14 +686,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                 }
                 Err(_) => {
-                    tracing::info!(
-                        guild = %self.live.guild_id,
-                        channel = %room_id,
-                        game = %facts.context.game_name,
-                        playing_members = facts.context.members_playing,
-                        activity_detected = facts.context.members_playing > 0,
-                        decision = "template_blocked",
-                        "voice room rename decision"
+                    log_template_name_decision(
+                        self.live.guild_id,
+                        room_id,
+                        &facts.context.game_name,
+                        facts.context.members_playing,
+                        "",
+                        "template_blocked",
                     );
                     metrics::global().voice_name("blocked");
                     self.name_signatures.insert(room_id, signature);
