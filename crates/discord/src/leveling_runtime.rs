@@ -826,8 +826,8 @@ mod tests {
         assert_eq!(state.config.channel_class(HUMAN), ChannelClass::Human);
     }
 
-    #[test]
-    fn enable_with_config_arms_the_sink_with_the_given_config() {
+    #[tokio::test]
+    async fn enable_with_config_arms_the_sink_with_the_given_config() {
         let buffer = DeferredCommunityFacts::new();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
