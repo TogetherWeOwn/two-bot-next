@@ -28,6 +28,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 
 | Event name | Callsite (stable anchor) | Meaning |
 | --- | --- | --- |
+| `gateway intents resolved` | `crates/bot/src/main.rs` (`run`) | Boot resolved the gateway intents; `voice_presences` states whether `GUILD_PRESENCES` was requested (the enabling flag may be a secret binding, so only the boolean is logged). `false` means voice-room game names can never be detected this boot |
 | `durable gateway initialized; shard connecting` | `crates/bot/src/main.rs` (`run`) | Supervisor built the shard; `resume=true` means a saved checkpoint was offered, `false` means fresh IDENTIFY |
 | `gateway shard loop started` | `crates/bot/src/gateway.rs` (`run_shard`) | Reception task entered the Twilight stream loop |
 | `gateway reconnect failed; Twilight will retry` | `crates/bot/src/gateway.rs` (`run_shard`) | Transport reconnect attempt failed; Twilight owns the retry |
@@ -69,22 +70,22 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `eventsub startup refused` | `crates/bot/src/main.rs` (`run`, two sites) | EventSub receiver config invalid or bind failed; process exits for supervisor restart |
 | `eventsub delivery refused` | `crates/bot/src/eventsub_http.rs` (`refuse`) | Delivery failed verification, admission, shape or classification; `status` and `error_class` name the refusal, bounded `message_type` (`webhook_callback_verification` / `notification` / `revocation` / `unknown`) names the delivery type (`unknown` before headers are established) |
 | `challenge answered` | `crates/bot/src/eventsub_http.rs` (`receive`) | Webhook verification challenge answered with the plaintext challenge; Twitch enables the subscription |
-| `notification acknowledged` | `crates/bot/src/eventsub_http.rs` (`receive`) | Notification verified and acknowledged; durable claim wiring lands in a follow-up slice |
+| `notification acknowledged` | `crates/bot/src/eventsub_http.rs` (`handle_notification`, two sites) | Notification verified and acknowledged; when delivery dependencies are injected, the durable claim → send → settle flow has settled (or deduped) before the ack |
 | `revocation acknowledged` | `crates/bot/src/eventsub_http.rs` (`receive`) | Revocation verified and acknowledged; boot/periodic reconcile owns re-subscription; bounded `reason` (`user_removed` / `authorization_revoked` / `notification_failures_exceeded` / `version_removed` / `other`) answers counts by reason |
 | `delivery ignored` | `crates/bot/src/eventsub_http.rs` (`receive`, two info sites) | Known ignored delivery or deterministic planning error acknowledged with 2xx; unknown/future classification errors are counted as `other` and refused with retryable 503 |
-| `event = "eventsub_receiver"` | `crates/bot/src/eventsub_http.rs` (`refuse`, `receive`) | Bounded `event` field value every receiver emission carries; no header, token or body leaves the process |
+| `event = "eventsub_receiver"` | `crates/bot/src/eventsub_http.rs` (`refuse`, `receive`, `handle_notification`) | Bounded `event` field value every receiver emission carries; no header, token or body leaves the process |
 | `eventsub reconcile parked: TWO_EVENTSUB is not exactly 1` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`, `spawn_if_enabled`) | Info; gate dark, no subscription is listed or mutated (`status = "parked"`, `reason = "flag_dark"`) |
 | `eventsub reconcile refused: callback configuration is invalid` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; `TWO_TWITCH_CALLBACK_URL` missing or not an https callback, no Helix call (`error_class = "reconcile_config_invalid"`) |
 | `eventsub reconcile parked: broadcaster allowlist is empty, no subscriptions mutated` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Warn; `TWO_TWITCH_BROADCASTERS` empty, pass parked without mutation (`error_class = "reconcile_no_broadcasters"`) |
 | `eventsub reconcile refused: Twitch credentials are missing or invalid` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; Operator Twitch client credentials unreadable, no Helix call (`error_class = "reconcile_config_invalid"`) |
 | `eventsub reconcile refused: webhook secret is missing or invalid` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; signing secret unreadable, no Helix call (`error_class = "reconcile_config_invalid"`) |
-| `eventsub reconcile found failed subscriptions on our callback; deleting and re-creating` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`) | Error; failed subscriptions on our callback counted before the pass (`error_class = "reconcile_prior_failed"`), then deleted and re-created |
-| `eventsub subscriptions re-created but not all verified yet` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`) | Warn; pass re-created subscriptions but at least one desired broadcaster is not `enabled` yet (`status = "pending"`, `error_class = "reconcile_pending"`) |
-| `eventsub subscriptions reconciled` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`) | Info; every desired broadcaster holds an `enabled` subscription on our callback (`status = "healthy"`) |
+| `eventsub reconcile found failed subscriptions on our callback; deleting and re-creating` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all_with_metrics`) | Error; failed subscriptions on our callback counted before the pass (`error_class = "reconcile_prior_failed"`), then deleted and re-created |
+| `eventsub subscriptions re-created but not all verified yet` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all_with_metrics`) | Warn; pass re-created subscriptions but at least one desired broadcaster is not `enabled` yet (`status = "pending"`, `error_class = "reconcile_pending"`) |
+| `eventsub subscriptions reconciled` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all_with_metrics`) | Info; every desired broadcaster holds an `enabled` subscription on our callback (`status = "healthy"`) |
 | `eventsub reconcile action failed; continuing with the rest of the plan` | `crates/bot/src/eventsub_reconcile.rs` (`run_plan`) | Error; one delete or create was rejected or failed in transport (`action = "delete"` or `"create"`, `error` names the status, `error_class = "reconcile_action_failed"`); the later actions and the follow-up listing still run |
-| `eventsub reconcile did not converge: an action failed or a healthy subscription is missing` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`) | Error; after the follow-up listing, at least one action failed or a desired broadcaster lacks a healthy subscription; the pass fails loudly with `failed` and `missing` counts (`error_class = "reconcile_unhealthy"`) |
+| `eventsub reconcile did not converge: an action failed or a healthy subscription is missing` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all_with_metrics`) | Error; after the follow-up listing, at least one action failed or a desired broadcaster lacks a healthy subscription; the pass fails loudly with `failed` and `missing` counts (`error_class = "reconcile_unhealthy"`) |
 | `eventsub reconcile failed` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; the pass returned an error after the gate and config checks (`error_class = "reconcile_failed"`) |
-| `event = "eventsub_reconcile"` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`, `run_plan`, `startup_reconcile`, `spawn_if_enabled`) | Bounded `event` field value every reconcile emission carries; scalar counts, statuses and error classes only, never a secret, header, challenge or body |
+| `event = "eventsub_reconcile"` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all_with_metrics`, `run_plan`, `startup_reconcile`, `spawn_if_enabled`) | Bounded `event` field value every reconcile emission carries; scalar counts, statuses and error classes only, never a secret, header, challenge or body |
 
 ## Gateway metric event labels
 
@@ -174,6 +175,9 @@ body, broadcaster, subscription or secret data reaches any label.
 | `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures; requests rejected before body intake are not deliveries |
 | `two_bot_eventsub_classified_total{kind}` | Deliveries by bounded receiver classification; `kind` is `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`; `other` marks unknown/future classification errors returned as retryable 503 |
 | `two_bot_eventsub_posts_total{outcome}` | Go-live post attempts by bounded outcome; `outcome` is `attempted`, `succeeded`, `failed` or `other`; zero until the go-live sender slice is wired |
+| `two_bot_eventsub_reconcile_passes_total{outcome}` | Reconcile passes by bounded outcome; `outcome` is `healthy`, `pending` or `failed`; exactly one sample per pass that reaches Helix, parked or refused startup passes stay log-only |
+| `two_bot_eventsub_reconcile_actions_total{action}` | Successful reconcile mutations by bounded action; `action` is `create` or `delete`; 409 already-exists confirmations fold into the pass outcome |
+| `two_bot_eventsub_reconcile_errors_total{error_class}` | Reconcile failure sites by bounded log `error_class`; `error_class` is `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed` or `other`; no status, body or response bytes in labels |
 
 ## Scheduled job labels
 
@@ -252,6 +256,23 @@ sink attaches to the gateway writer on the cutover path.
 | `voice_event="voice_dead_letter"` | `crates/bot/src/voice_rooms.rs` (`mark_failed_observed`: `voice action dead-lettered`) | Queue write exhausted retries with bounded `action` and attempts |
 | `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs` (`execute_create`: `voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
 | `voice_event="voice_join_received"` | `crates/bot/src/voice_rooms.rs` (`accept_join_received`: `voice creator join accepted` / `voice creator join refused before queueing`) | One creator-channel join delivered to the guild actor, accepted or refused. The refused line carries a bounded `reason` (`halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked`, `other`) plus the refusing `channel` id and creator-map state at join time (`creators_len`, `known`, `halted`, `ready`, `live_generation`, `ticket_generation`; no member/name/token content); every delivery bumps `two_bot_voice_joins_received_total`, so received-vs-handled drift is the stall signal |
+
+Rename-decision lines without a `voice_event` field:
+`voice room rename decision` (`log_rename_decision` and
+`log_template_name_decision` in `crates/bot/src/voice_rooms.rs`): one line
+per voice-room rename decision so a room that keeps its default name is
+diagnosable from logs alone. Fields: `guild`, `channel` and bounded
+`decision` (`queued`, `unchanged`, `channel_unseen`, `template_blocked`,
+`attempted`, `renamed`, `rate_limited`, `permission_denied`,
+`duplicate_name`, `in_flight_deferred`, `outcome_deferred`,
+`outcome_unknown`, `discord_error`, or a `rename_*` skip reason). No
+member-derived text (display names, stream or presence titles, rendered
+room names) is logged. The execution lines also carry `reason` (empty
+when none) and `retry_after_ms` (0 unless Discord asked for a wait);
+failures log at warn. The template lines instead carry `playing_members`
+and `activity_detected`, so "no game was ever seen" is distinguishable
+from "the rename was refused"; the retry-only `channel_unseen` decision
+logs at debug, since the naming pass retries it on every pass.
 
 Adjacent actor message without a `voice_event` field:
 `voice actor load failed; actor respawns on the next guild snapshot`

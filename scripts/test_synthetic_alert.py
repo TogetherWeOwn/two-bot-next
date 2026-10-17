@@ -477,8 +477,10 @@ class SyntheticAlertTests(unittest.TestCase):
         # OSError): it must become HistoryError so fail-open still applies
         # instead of crashing the decide step.
         import http.client
-        with mock.patch.object(history.urllib.request, "urlopen",
-                               side_effect=http.client.IncompleteRead(b"", 10)):
+        opener = mock.Mock()
+        opener.open.side_effect = http.client.IncompleteRead(b"", 10)
+        with mock.patch.object(history.urllib.request, "build_opener",
+                               return_value=opener):
             with self.assertRaisesRegex(history.HistoryError, "IncompleteRead"):
                 history._get("/repos/owner/repo/actions/workflows/x/runs", "t")
 
