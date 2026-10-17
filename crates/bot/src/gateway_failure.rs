@@ -155,10 +155,13 @@ pub fn step_failure(class: FailureClass, step: &'static str, error: sqlx::Error)
 /// failure: the table is missing (`42P01 undefined_table`, an unapplied
 /// migration) or the login lacks the grant (`42501 insufficient_privilege`,
 /// an unapplied ACL plan). Retrying these on every boot is futile — the
-/// schema only changes through the Operator apply path — so gateway-adjacent
-/// auxiliary writes skip them with a warn instead of holding the cursor
-/// (TOG-25067: a missing auxiliary table must never crash-loop the gateway).
-/// Every other error still fails the step: transient faults replay.
+/// schema only changes through the Operator apply path — so callers normally
+/// skip gateway-adjacent auxiliary writes on these errors (TOG-25067: a
+/// missing auxiliary table must not crash-loop the gateway). The retention
+/// lifecycle keeps the cursor held for a `42501` on an available
+/// `GUILD_CREATE`: without the cancel grant, a queued purge could erase a
+/// guild that has rejoined. Every other error still fails the step: transient
+/// faults replay.
 #[must_use]
 pub fn is_schema_gap(error: &sqlx::Error) -> bool {
     match error {

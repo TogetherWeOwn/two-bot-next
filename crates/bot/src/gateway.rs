@@ -610,14 +610,17 @@ fn count_community_facts_drain_failure<T, E>(
 /// after it still repairs on replay.
 ///
 /// Deployment-state schema gaps (missing table `42P01`, missing grant
-/// `42501` — an unapplied migration or ACL plan) never hold the cursor:
-/// retrying them on every boot is futile. A skipped rejoin-cancel is safe (a
-/// missing queue table holds nothing to cancel), but a skipped real removal
-/// drops the guild's only purge-queue write — the removed guild is never seen
-/// again — so it logs at error level with the guild and SQLSTATE for the
-/// Operator replay documented in `docs/privacy.md` instead of warning
-/// (TOG-25067). The replay is conditional: a later rejoin means the guild is
-/// live and the insert must be skipped, per the privacy.md ordering check.
+/// `42501` — an unapplied migration or ACL plan) are normally skipped because
+/// retrying them on every boot is futile. An available `GUILD_CREATE` is the
+/// exception for `42501`: the queue table may contain a pending purge, so the
+/// cursor must remain held until the rejoin-cancel can run. A missing queue
+/// table holds nothing to cancel, so `42P01` on rejoin is safe to skip. A
+/// skipped real removal drops the guild's only purge-queue write — the removed
+/// guild is never seen again — so it logs at error level with the guild and
+/// SQLSTATE for the Operator replay documented in `docs/privacy.md` instead of
+/// warning (TOG-25067). The replay is conditional: a later rejoin means the
+/// guild is live and the insert must be skipped, per the privacy.md ordering
+/// check.
 async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Option<sqlx::Error> {
     let pool = store.pool();
     let write = match event {

@@ -165,7 +165,11 @@ jobs:
                   refuse("allow_unstaged needs a valid production Worker URL")
               try:
                   try:
-                      with urllib.request.urlopen(worker_url + "/readyz", timeout=10) as response:
+                      request = urllib.request.Request(
+                          worker_url + "/readyz",
+                          headers={"User-Agent": "two-bot-next-production-rollout/1.0"},
+                      )
+                      with urllib.request.urlopen(request, timeout=10) as response:
                           status, body = response.status, response.read()
                   except urllib.error.HTTPError as error:
                       if error.code != 503:

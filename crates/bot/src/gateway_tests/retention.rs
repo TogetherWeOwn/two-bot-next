@@ -382,6 +382,77 @@ async fn queued_delete_then_create_is_ordered_before_durable_checkpoint() {
 }
 
 #[tokio::test]
+async fn missing_rejoin_cancel_grant_holds_cursor_but_delete_insert_commits() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    static NEXT_ROLE: AtomicU64 = AtomicU64::new(0);
+    let role = format!(
+        "retention_rejoin_{}_{}",
+        std::process::id(),
+        NEXT_ROLE.fetch_add(1, Ordering::Relaxed)
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE ROLE {role} NOLOGIN; \\
+         GRANT USAGE ON SCHEMA public TO {role}; \\
+         GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {role}; \\
+         GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO {role}; \\
+         GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO {role}; \\
+         REVOKE DELETE ON TABLE retention_guild_purge_queue FROM {role}"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+    let runtime_role = role.clone();
+    let limited = PgPoolOptions::new()
+        .max_connections(3)
+        .after_connect(move |connection, _| {
+            let role = runtime_role.clone();
+            Box::pin(async move {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let mut peer = Peer::new().await;
+    let (store, stop, mut task, _) = runner(&limited, &mut peer, None).await;
+
+    peer.send(delete(2, None)).await;
+    wait_sequence(&store, 2).await;
+    assert_eq!(queued(&limited).await, 1, "real deletion should queue");
+
+    peer.send(create(3, false)).await;
+    let result = tokio::time::timeout(Duration::from_secs(15), &mut task)
+        .await
+        .expect("missing rejoin-cancel grant must stop the gateway")
+        .unwrap();
+    assert!(result.is_err(), "42501 on rejoin must fail the dispatch");
+    assert_eq!(
+        store.load().await.unwrap().unwrap().sequence,
+        2,
+        "failed rejoin-cancel must leave the checkpoint before GUILD_CREATE"
+    );
+
+    peer.close().await;
+    limited.close().await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM {role}; \\
+         REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM {role}; \\
+         REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM {role}; \\
+         REVOKE USAGE ON SCHEMA public FROM {role}; \\
+         DROP ROLE {role}"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    let _ = stop;
+}
+
+#[tokio::test]
 async fn missing_retention_tables_do_not_stop_the_gateway() {
     // TOG-25067 staging reproduction: the 0438 retention queues are absent
     // (an unapplied migration), so every queue/cancel write fails with 42P01.

@@ -495,8 +495,10 @@ class GuardBehaviourTests(unittest.TestCase):
                 ]}
             return result if isinstance(result, str) else json.dumps(result)
 
-        def fake_urlopen(url, timeout):
-            calls.append(("production-readyz", {"url": url, "timeout": timeout}))
+        def fake_urlopen(request, timeout):
+            self.assertIsInstance(request, urllib.request.Request)
+            self.assertEqual(request.get_header("User-agent"), AGENT)
+            calls.append(("production-readyz", {"url": request.full_url, "timeout": timeout}))
             response = api["production-readyz"]
 
             class ReadyResponse:
