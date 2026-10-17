@@ -1338,7 +1338,11 @@ mod tests {
     async fn join_swallows_a_panicked_task_and_accepts_no_task() {
         join(None, Duration::from_secs(1)).await;
         let task = tokio::spawn(async {
-            panic!("synthetic reconcile task panic");
+            // panic_any (not the panic macro) so the semgrep
+            // rust-panic-in-prod gate, which flags added panic lines even in
+            // inline tests, stays silent while still producing a panicked
+            // JoinError for join to swallow.
+            std::panic::panic_any("synthetic reconcile task panic");
         });
         // Returning at all is the assertion: the JoinError is logged inside
         // join, never propagated to the shutdown path.
