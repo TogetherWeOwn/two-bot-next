@@ -491,7 +491,10 @@ flat generation is this alert becoming member-visible.
 
 Escalate when the store cause is not self-clearing, when `unknown_creator`
 refusals dominate, or when the flat generation survives a restart — the fix
-belongs to the on-call engineer, not another redeploy.
+belongs to the on-call engineer, not another redeploy. Guarded remediation
+recommends alongside this alert: the bot's own reload first, then a same-SHA
+takeover card if the alert survives it (see
+[auto-remediation](#auto-remediation-guarded-stall-and-crash-loop-response)).
 
 #### Alert: gateway missed events
 
@@ -561,7 +564,70 @@ the logs show no `gateway ready` after the last disconnect, the gateway is still
 down: escalate to the on-call engineer through the watch escalation path. Do not
 restart the container to clear the alert. A restart re-baselines the counters
 without showing that the gateway came back, so confirm `gateway ready` in the
-new process's logs first.
+new process's logs first. Guarded remediation recommends alongside this alert:
+a same-SHA takeover card, then a CEO page if two takeovers fail (see
+[auto-remediation](#auto-remediation-guarded-stall-and-crash-loop-response)).
+A reload step is skipped here: no in-process reload can fix a gateway that
+never came back.
+
+#### Alert: gateway not ready
+
+The scraped `/readyz` gateway component stayed non-ready (`starting` or
+`down`) for 3 consecutive valid samples. Unlike
+[`gateway_unpaired_disconnect`](#alert-gateway-unpaired-disconnect), this rule
+needs no disconnect edge: it catches a gateway stuck starting (Armed,
+reconnecting but never connecting), parked (Unconfigured, so the shard never
+starts) or draining, where `two_bot_gateway_disconnects_total` never grows
+and the pairing rule stays silent. This is page severity (SEV-1 in the
+[watch escalation path](watch-escalation-path.md)).
+
+The bound is 3 samples. Samples arrive about every 60 s, so the third
+consecutive non-ready sample comes about two to three minutes after the
+gateway stopped being ready. The bound matches the sibling unpaired rule, so
+both gateway pages tell one story, and it never fires sooner than the generic
+`container_unready_alert` (about two minutes of failed `/readyz` probes): the
+generic page fires first and this rule attributes the outage to the gateway
+with its own runbook, an order of magnitude inside the 15-minute
+acknowledgement window. Any outage long enough to trip this rule already
+tripped the generic unready page a sample earlier, so it adds no new
+false-page class for slow boots.
+
+A non-ready component is read from the `components` breakdown of the
+keepalive `/readyz` probe, not from `gateway_failure.failed_step`: the
+failure field is absent until a failure is recorded, so a shard stuck
+starting with no recorded failure has no step to read, while the component
+entry always names the gateway state. Only `ready` (Connected) counts as
+ready; `starting` and `down` both extend the streak, and unknown vocabulary
+holds rather than guessing. The first valid sample only stores the baseline.
+A failed probe, an unparsable body, or a failed `/metrics` scrape changes
+nothing and holds the current state, so the rule needs consecutive ticks
+where both the probe parsed and the scrape succeeded. A counter reset
+(process restart) re-baselines the streak and holds a firing alert rather
+than clearing it. The first sample with the gateway `ready` clears at once.
+The firing key is the constant `gateway_not_ready`. Guarded auto-remediation
+does not trigger on this alert in v1 (see
+[auto-remediation](#auto-remediation-guarded-stall-and-crash-loop-response)).
+
+A parked gateway (Unconfigured, for example a missing `DISCORD_TOKEN`) pages
+here too, exactly as it already trips the generic unready page: confirm the
+expected token configuration before touching the bot. The staging
+rollback-drill injection reports this exact shape on purpose, so a drill that
+holds the injection for three consecutive samples trips this rule by design;
+treat a page inside a known drill window as the drill working — the drill
+gate rolls back on the 503 regardless.
+
+First response: scrape `/ops/metrics` as described above and confirm the
+disconnect and recovery counters are flat (flat counters with this page mean
+the gateway never started or never came back without an edge, not an
+unpaired loss). Then read `/readyz` for the full component breakdown: a
+`database` or `token_invalid` down alongside a ready gateway is not this
+alert's territory. Read the container logs for `gateway reconnect failed;
+Twilight will retry` (still retrying) and `gateway ready; checkpoint
+committed` (a recovery). If the logs show no `gateway ready`, the gateway is
+still down: escalate to the on-call engineer through the watch escalation
+path. Do not restart the container to clear the alert. A restart re-baselines
+the streak without showing that the gateway came back, so confirm `gateway
+ready` in the new process's logs first.
 
 #### Alert: ticker stale
 
@@ -697,6 +763,68 @@ integration nor paging escalation: it labels the existing transition delivery
 as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
+
+#### Auto-remediation: guarded stall and crash-loop response
+
+Execution-path decision: the Worker cannot restart containers, so remediation
+is recommendation plus guard state, evaluated in `wrangler/src/remediation.ts`
+on every keepalive tick. Nothing there mutates the container, the ownership
+record, or any deployment. Execution stays inside the existing machine
+contract: the bot's own in-process reload (no host action), then one Operator
+host-action card per host step for a same-SHA deployment-takeover through the
+existing deploy workflow. No new endpoint, credential, spend, or authority.
+
+Trigger table (a recommendation fires only while its trigger key fires):
+
+| Scope | Trigger firing key | R1 (first) | R2 (escalation) |
+|---|---|---|---|
+| `voice-stall` | `voice_creator_map_stale` | `creator-map-reload`: the bot's maintenance tick retries the merge every 5 minutes; no host action | `same-sha-takeover`: one Operator card for a same-SHA takeover via the existing deploy workflow |
+| `crash-loop` | `gateway_unpaired_disconnect` | skipped: no in-process reload can fix a gateway that never came back | `same-sha-takeover`: one Operator card, same path as above |
+
+Guard state (persisted in DO storage next to the alert state):
+
+- At most one recommendation per 30 minutes across all scopes.
+- A recommendation while a prior one for the same scope did not clear the
+  alert counts as one consecutive failure for that scope.
+- After 2 consecutive failures the scope goes quiet and the Worker pages the
+  CEO card once. No further recommendations until the alert resolves.
+- A resolved trigger resets its scope guard: failure count, phase, and
+  suppression all clear. The alert's own RESOLVED line is the recovery proof.
+
+Operator card shape for `same-sha-takeover`: name the firing key, the build
+revision from the alert line, and the deploy workflow run to dispatch at that
+same SHA. File exactly one card per host step; act only while the alert is
+firing. When the CEO page lands, the on-call pages the CEO card and stops
+filing takeover cards for that scope until the alert resolves.
+
+Known limits of v1: the triggers stay pinned to the two keys in the table
+above. A gateway-not-ready rule is landing on this branch separately; wiring
+it into the crash-loop scope is follow-up work once that rule is merged, not
+part of this slice. Sustained `/readyz` red (`container_unready_alert`) and
+repeated process restarts stay manual.
+
+#### Staging fault injector drill
+
+Positive-path staging proof uses the staging-only fault injector
+(`wrangler/src/staging-fault.ts`), armed solely through the generated
+staging deploy config by a manual `deploy-staging` dispatch with
+`inject_voice_stall` and/or `inject_unpaired_disconnect` (both default
+false; a push can never arm them, and the switches are never committed
+vars). While armed, the keepalive tick holds
+`two_bot_voice_creator_map_generation` at 1 with age 660 s (past the 600 s
+bound, the 2x300 s refresh) and/or advances
+`two_bot_gateway_disconnects_total` with no recovery so the unpaired rule
+holds an outstanding disconnect; the alert rules and the guard above run
+unmodified, so every recommendation still fires only alongside its trigger.
+Expected timeline at the 60 s keepalive: the stall alert fires on the first
+armed tick, the unpaired alert needs one baseline tick plus three
+outstanding ticks (about 4 min). Observe one full 30-minute cooldown window
+for R1-to-R2 escalation (`creator-map-reload`, no host action, then one
+Operator card for `same-sha-takeover` at the same SHA); a further window
+proves the two-failure CEO page and silence. Re-dispatching without the
+flags (or any plain push deploy) disarms the drill: the triggers resolve on
+their own rules and the guards reset. Rollback is disarm-by-redeploy; the
+Worker recommends only, so nothing executes from this path.
 
 ### Event-store capture gaps and lag
 
