@@ -159,10 +159,12 @@ claim them as shipped acceptance:
 - Error-rate detection is installed: `rest_5xx_rate` pages when 5xx exceed 10%
   of Discord REST requests between keepalive samples (minimum 10 requests),
   with the rollback evaluation in [Alert: REST 5xx](runbook.md#alert-rest-5xx).
-  What is not yet wired is a canary-stage error-rate gate that fails a
-  promotion stage automatically: a 5xx burst during promotion pages on-call,
-  and the existing per-stage health gates roll back only on their own probe
-  failures.
+  The canary gate helper `evaluatePromotionGate` (in
+  `wrangler/src/alert-rules.ts`) fails a promotion stage only on that 5xx
+  firing; a 429-only burst passes. What is not yet wired is calling it from
+  a live promotion stage: until a staging/production gate step invokes it and
+  fails the stage, a 5xx burst during promotion pages on-call and the existing
+  per-stage health gates roll back only on their own probe failures.
 - The shared central gradual-promotion action promotes 5-50-100% with
   per-stage health gates and automatic rollback to the recorded pre-promote
   version. This repository has no caller wiring to it yet, so do not treat
