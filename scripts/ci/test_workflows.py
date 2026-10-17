@@ -1527,6 +1527,37 @@ class WorkflowTests(unittest.TestCase):
             "${{ github.event_name == 'push' && 60 || 45 }}",
         )
 
+    def test_rust_test_container_pins_disposable_database_service_address(self):
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        prerequisites = next(
+            step for step in job["steps"]
+            if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
+        )
+        self.assertEqual(prerequisites.get("shell"), "bash")
+        run = prerequisites["run"]
+        resolve = run.index("getent ahostsv4 agent-testdb")
+        remove_stale_pin = run.index("sed -i -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts")
+        pin = run.index("printf '%s agent-testdb\\n' \"$service_ip\" >> /etc/hosts")
+        verify_pin = run.index('getent ahostsv4 agent-testdb | awk \'NR == 1 { print $1; exit }\'')
+        forward = run.index("TCP:agent-testdb:5432")
+        ready = run.index("pg_isready -q -h 127.0.0.1")
+        self.assertIn("for attempt in $(seq 1 30)", run[:resolve])
+        self.assertLess(remove_stale_pin, resolve)
+        self.assertLess(resolve, pin)
+        self.assertLess(pin, verify_pin)
+        mismatch_check = run.index('if [ "$pinned_ip" != "$service_ip" ]; then')
+        mismatch_exit = run.index("exit 1", mismatch_check)
+        self.assertLess(verify_pin, mismatch_check)
+        self.assertLess(mismatch_exit, forward)
+        self.assertLess(verify_pin, forward)
+        self.assertLess(forward, ready)
+        self.assertIn("sleep 1", run)
+        fail_closed = run.index('if [ -z "$service_ip" ]; then')
+        self.assertLess(fail_closed, pin)
+        self.assertLess(run.index("exit 1", fail_closed), pin)
+        self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
+
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
         step = next(
