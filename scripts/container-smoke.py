@@ -32,14 +32,17 @@ IMAGE_MAX_BYTES = 112 * MIB
 # measurement comes from hosted CI on the merged head. 16 MiB restores a
 # working tripwire with headroom; revisit if the binary approaches it.
 # 2026-10-17 recalibration: hosted CI measured ~16.00 MiB, over the 16 MiB
-# ceiling (main tip 89503f71: 16,776,096 bytes; PR merge ref 16,777,376
-# bytes, byte-identical on main HEAD 89c859b and the merge ref). The growth
-# since the 15.32 MiB 2026-10-11 sample comes from landed main slices — the
-# voice rename-decision logs add ~3,160 bytes (merged head 6a9c394e:
-# 16,779,256 bytes) — with no new dependencies and no src/Cargo/Dockerfile
-# changes on this branch; the release profile is already minimal
-# (opt-level=z, lto, strip). 17 MiB restores ~1.00 MiB of headroom while
-# keeping a working tripwire; revisit if the binary approaches it.
+# ceiling (main tip 89503f71: 16,776,096 bytes, 1,120 bytes of headroom; PR
+# merge ref 16,777,376 bytes, byte-identical on main HEAD 89c859b and the
+# merge ref). The growth since the 15.32 MiB 2026-10-11 sample comes from
+# landed main slices — the voice rename-decision logs add ~3,160 bytes
+# (merged head 6a9c394e: 16,779,256 bytes, 2,040 over 16 MiB) — with no new
+# dependencies; the release profile is already minimal (opt-level=z, lto,
+# strip). The go-live receiver-ledger branch independently measured 16801560
+# bytes (16.02 MiB) on CI run 39056648109 job 117470241279, 24344 bytes over
+# the 16 MiB tripwire, after ~450 lines of shipping ledger/receiver code.
+# 17 MiB restores ~1.00 MiB of headroom while keeping a working tripwire;
+# revisit if the binary approaches it.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.

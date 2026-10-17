@@ -306,9 +306,12 @@ and log one scalar warn line (`event="eventsub_receiver"`, `status`,
 404 below, which is plain-text `not found`, and log
 `event="eventsub_ingress"`. Retryable refusals are the container
 timeout/busy rows, the Worker 429 / 504 / 503 rows, and the container's
-unknown/future classification fallback (503 `unavailable`). This slice has no
-send and no durable ledger; ordinary verified deliveries have no side effects
-before acknowledgement.
+unknown/future classification fallback (503 `unavailable`). Boot injects no
+go-live delivery dependencies yet, so ordinary verified deliveries have no
+side effects before acknowledgement; once provisioning injects them, a
+transient ledger/send failure on a verified notification also answers the
+retryable 503 `unavailable`, and the durable claim fences keep that
+redelivery from double-posting.
 Container non-POST answers also carry an `Allow: POST` header.
 Source: `wrangler/src/eventsub.ts:101-125`, `crates/bot/src/eventsub_http.rs`.
 
@@ -342,8 +345,9 @@ direct `containerFetch`, because the Worker answers those shapes first):
 
 Verified deliveries that need no operator action answer `200`:
 
-- `notification` and `revocation`: acknowledged as `200 {"ok": true}`. This
-  slice has no send and no ledger, so the receiver only acks; the
+- `notification` and `revocation`: acknowledged as `200 {"ok": true}`.
+  Until delivery provisioning lands the receiver only acks a notification;
+  afterwards a 200 also covers a posted or deduplicated go-live. The
   reconciler (above) re-creates a revoked subscription on its next
   scheduled pass when the broadcaster is still in the allowlist, so
   re-subscription after a revocation is automatic, not manual and not

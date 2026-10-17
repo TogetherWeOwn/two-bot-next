@@ -50,6 +50,10 @@ on:
         description: STAGING rollback drill only - deployed build reports gateway not-ready so the gate fails and auto-rolls back (run stays red)
         type: boolean
         default: false
+      inject_error_rate_spike:
+        description: STAGING rollback drill only - promotion error-rate gate judges a rehearsal 5xx firing so the gate fails and auto-rolls back (run stays red)
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -81,7 +85,7 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'schema-gate') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -139,7 +143,7 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'roles-gate') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -337,11 +341,44 @@ jobs:
           # Evidence contains only allowlisted version/digest/build IDs + statuses.
           # No raw Wrangler sessions, CF configs, env values or HTTP error bodies.
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/evidence.json")), sort_keys=True))'
-      # A failed verify after a deploy rolls back automatically to the
-      # pre-deploy snapshot (Worker version AND container image, with
-      # takeover). The run still fails red: the rollback restores service,
-      # it never certifies the build. Without a deploy or a snapshot there
-      # is nothing to restore.
+      # REST 5xx error-rate promotion gate: invokes evaluatePromotionGate()
+      # (wrangler/src/alert-rules.ts) through scripts/promotion-error-gate.mjs
+      # so a 5xx burst fails this stage and the auto-rollback step below
+      # restores the recorded pre-promote snapshot. Live mode scrapes staging
+      # /ops/metrics twice with the scrape token; without that token the
+      # script records a skip (the runbook states this limit) and the
+      # dispatch-only inject_error_rate_spike input judges a rehearsal 5xx
+      # firing instead, proving the fail-to-rollback chain with no traffic.
+      - name: Gate promotion on REST 5xx error rate
+        id: error_rate_gate
+        env:
+          STAGING_URL: ${{ vars.STAGING_WORKER_URL }}
+          # Optional until the Operator provisions it: absent means the gate
+          # records a skip, never a failure and never a silent pass.
+          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
+          # Dispatch-only drill switch: a push run has no inputs and this
+          # expression requires workflow_dispatch besides, so it is 'false'
+          # on every push. test_workflows.py pins this exact expression.
+          INJECT_ERROR_RATE_SPIKE: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'true' || 'false' }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          rehearsal=()
+          if [ "$INJECT_ERROR_RATE_SPIKE" = "true" ]; then
+            rehearsal=(--rehearsal-firing '["rest_5xx_rate"]')
+          fi
+          node scripts/promotion-error-gate.mjs \
+            --metrics-url "$STAGING_URL" \
+            --evidence "$ROLLOUT_DIR/error-rate-gate.json" \
+            --sha "$SHA" "${rehearsal[@]}"
+          # Evidence carries the mode, firing list and verdict only.
+          # No tokens, no raw exposition bodies.
+          python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/error-rate-gate.json")), sort_keys=True))'
+      # A failed verify or error-rate gate after a deploy rolls back
+      # automatically to the pre-deploy snapshot (Worker version AND container
+      # image, with takeover). The run still fails red: the rollback restores
+      # service, it never certifies the build. Without a deploy or a snapshot
+      # there is nothing to restore.
       - name: Auto-roll back Worker version and container image
         id: auto_rollback
         if: failure() && steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'
