@@ -242,20 +242,30 @@ messages, which use different wording. Run all three filters below for each
 page: the broad diagnostic filter, the healthy terminal message, and the pending
 terminal message. Read a rolling 90-minute look-back as three adjacent 30-minute
 pages (the reader caps each request at 30 minutes). This spans one hourly
-interval plus 30 minutes for pass duration. If there is no terminal outcome,
-continue paging backward within the dataset's retention period; a pass can take
-longer than an hour. For each page, note timestamps and interpret all matching
-lines together using the table above. In Workers Observability, select dataset
-`containers`, this service id, and filter `event = "eventsub_reconcile"` to see
-the event-level view. Confirm the staging image contains the reconcile
-implementation before using readback to assess cadence; query results describe
-only the deployed image.
+interval plus 30 minutes for pass duration, if a pass completes in that time.
+The `flag_dark` line is logged only once at process start; it is not a per-pass
+outcome and can fall outside a rolling look-back. If a live container has no
+terminal outcome in 90 minutes, distinguish a gated-off task from a dead
+container or a still-running pass: check the deployed `TWO_EVENTSUB` value and
+in Workers Observability inspect `event = "eventsub_reconcile"` over a timeframe
+that includes the container's last boot (use its rollout time). A `flag_dark`
+line in that boot-inclusive view confirms the gate was off; no line plus
+`TWO_EVENTSUB=1` leaves dead vs. mid-pass unresolved. Do not treat paging past
+retention or silence alone as a discriminator. For each page, note timestamps
+and interpret all matching lines together using the table above. Confirm the
+staging image contains the reconcile implementation before using readback to
+assess cadence; query results describe only the deployed image.
 
 Run this in Bash on a host with GNU `date`; it issues all three message filters
-for each of three adjacent pages, newest first. The `jq` keeps only safe
-summary fields and matching message text in the sample output:
+for each of three adjacent pages, newest first. The subshell keeps
+`set -euo pipefail` from changing the calling shell, and `pipefail` makes a
+reader failure or refusal fail the command instead of looking like an empty
+match. Expect nine JSON blocks; fewer means a page read failed. The `jq` keeps
+only safe summary fields and matching message text in the sample output:
 
 ```bash
+(
+set -euo pipefail
 for end in "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
            "$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
            "$(date -u -d '60 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"; do
@@ -268,7 +278,7 @@ for end in "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       | jq '{window,event_count,possibly_truncated,events:[.events[].message]}'
   done
 done
-```
+)
 
 Staging sample (2026-10-16; each of the nine filter/page queries was executed;
 for each page the broad diagnostic filter is followed by healthy then pending):
