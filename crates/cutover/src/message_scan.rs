@@ -16,6 +16,10 @@ use std::collections::HashMap;
 
 use crate::rest::iso_to_millis;
 
+#[cfg(test)]
+#[path = "message_scan_boundary_tests.rs"]
+mod message_scan_boundary_tests;
+
 /// Ladder depth: the AM7 text bar (legacy `LADDER = MESSAGE_RUNGS.length`).
 pub const LADDER: usize = 3;
 
