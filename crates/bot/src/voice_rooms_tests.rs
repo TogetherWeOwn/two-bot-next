@@ -14254,6 +14254,62 @@ async fn watchdog_observe_publishes_nothing_after_retirement() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn metric_guard_drop_sets_the_retired_fence() {
+    // The setter half of the fence: dropping a real metric guard must
+    // mark the shared stall state retired (so a sibling already holding
+    // a strong ref cannot re-publish after the removal) and retire the
+    // contribution. The watchdog test above sets the flag by hand and
+    // only pins the observe side; this test goes through the guard.
+    const GUARD_GUILD: u64 = 9_100_004;
+    let (live, store, http, _) = fixture_for_guild(GUARD_GUILD);
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let generation = next_voice_actor_generation();
+    let stall = Arc::new(StallShared {
+        guild: GUARD_GUILD,
+        generation,
+        retired: AtomicBool::new(false),
+        http: Arc::clone(&worker.http),
+        start: tokio::time::Instant::now(),
+        state: Mutex::new(StallState {
+            last_progress: tokio::time::Instant::now(),
+            urgent: 1,
+            deferred: 0,
+            oldest_age_secs: 7,
+            halted: true,
+            creators_generation: 0,
+            creators_merged_ms: None,
+        }),
+    });
+    let mut last_fire = None;
+    stall.observe(Duration::from_secs(3600), &mut last_fire);
+    assert_eq!(
+        metrics::global().voice_actor_contribution(GUARD_GUILD),
+        Some((generation, true, [1, 0], 7)),
+        "the live sibling publishes before the guard drops"
+    );
+    drop(VoiceActorMetricGuard {
+        actor: GUARD_GUILD,
+        generation,
+        stall: Arc::downgrade(&stall),
+    });
+    assert!(
+        stall.retired.load(std::sync::atomic::Ordering::Relaxed),
+        "the guard's drop sets the retired fence"
+    );
+    assert_eq!(
+        metrics::global().voice_actor_contribution(GUARD_GUILD),
+        None,
+        "the guard's drop retires the contribution"
+    );
+    stall.observe(Duration::from_secs(3600), &mut last_fire);
+    assert_eq!(
+        metrics::global().voice_actor_contribution(GUARD_GUILD),
+        None,
+        "a sibling holding a strong ref cannot resurrect it after the guard dropped"
+    );
+}
+
 #[tokio::test]
 async fn halted_delete_provenance_refusal_requeues_the_delete_after_recovery() {
     // The ordinary-delete provenance read refuses mid-dispatch: the worker
