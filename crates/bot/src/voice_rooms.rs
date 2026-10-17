@@ -7178,7 +7178,8 @@ where
         let name_policy = Arc::clone(&self.name_policy);
         tokio::spawn(async move {
             let mut rx = rx;
-            let Some((worker, buffered)) = load_actor_worker(&make, live, &mut rx).await else {
+            let Some((worker, buffered)) = load_actor_worker(make.as_ref(), live, &mut rx).await
+            else {
                 return;
             };
             let mut worker = worker.with_name_policy(name_policy);
