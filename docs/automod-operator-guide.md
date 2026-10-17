@@ -140,11 +140,13 @@ recorded reconciliation; nothing is retried, leased or resent automatically.
 | `Retained(UncertainTimeout)` | Delete confirmed, timeout uncertain | Same as above; the delete happened, the timeout is unknown. |
 | `Retained(Ledger)`, `Retained(CompletionRefused)` | Store write failed after possible counting | Inspect the claim ledger and DB health; duplicate suppression favors no repeated sanctions. |
 | `Retained(FenceRefused)`, `Retained(PreserveRefused)`, `Retained(PlanUnavailable)` | Mutation fence, pre-count preservation or planning refused | Nothing was sent. Check store role grants (migrations `0220`–`0223` matrix) and the plan outcome; fail-closed is intended. |
-| `Completed` with `SanctionRefused` | Bot role too low or missing `MODERATE_MEMBERS` | Raise the bot's role above the target and grant moderation permission; the delete itself succeeded. |
+| `Completed` with `SanctionRefused`, `deleted: true` | Warn/timeout refused: bot role too low or missing `MODERATE_MEMBERS` | Raise the bot's role above the target and grant moderation permission; the delete succeeded. |
+| `Completed` with `SanctionRefused`, `deleted: false` | Delete rejected before mutation (permission, guard paused/circuit open); no ladder step | Check `MANAGE_MESSAGES` in the channel and executor guard state; the message was not deleted. |
 | Expected message untouched, outcome `Bypassed` | Outside the fence (wrong guild, DM, unapproved identity) | Verify the staging guild scope and activation approval; flags alone never widen scope. |
-| Expected message untouched, clean `Accept` | Exempt channel/role, dry-run mode, or no filter matched | Check `TWO_AUTOMOD_BYPASS_ROLE_IDS`, `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS` and the boot-resolved mode. |
+| Expected message untouched, `Completed` with `DryRun` (matched) | Dry-run mode: matched, captured, nothing counted or sent | Check the boot-resolved `mode`; set `TWO_AUTOMOD_ENFORCE` to exactly `1` through the authorized procedure. |
+| Expected message untouched, clean `Accept` | Exempt channel/role, automod disabled, or no filter matched | Check `TWO_AUTOMOD_BYPASS_ROLE_IDS`, `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS` and the filter knobs. |
 | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` rising | Text automations refused by capture-only verdicts | Expected while automod holds a message capture-only; matched, unavailable, timed-out and uninspected creates all refuse triggers. See the [observability catalog](observability-event-catalog.md). |
-| `automod_expiry` job `failure` / `job_consecutive_failures` | Repeat-history expiry tick failing | Check gateway logs and the 60 s supervisor; expiry failure leaves stale repeat rows, biasing toward over-counting. |
+| `automod_expiry` job `failure` / `job_consecutive_failures` | Repeat-history expiry tick failing | Check gateway logs and the 60 s supervisor. Idle authors keep stale in-memory rows; verdicts are unaffected because every CREATE re-expires and the window check ignores rows outside the cutoff. |
 
 General rules: never infer REST success from a plan; an uncertain response
 is retention, not success. A crash after counting but before sending is a
