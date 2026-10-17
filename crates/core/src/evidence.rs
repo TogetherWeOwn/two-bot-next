@@ -27,6 +27,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::analytics_family::AnalyticsCategory;
 use crate::funnel::{idempotency_key, now_iso, parse_iso_millis};
 use crate::{EventType, FunnelEvent, FunnelStore, RecordOutcome, Snowflake};
 
@@ -733,8 +734,14 @@ impl<S: FunnelStore> FunnelStore for ReceiptingStore<S> {
         outcome
     }
 
-    fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str) {
-        self.inner.touch_activity(guild_id, member_id, at);
+    fn touch_activity(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        at: &str,
+        family: AnalyticsCategory,
+    ) {
+        self.inner.touch_activity(guild_id, member_id, at, family);
     }
 
     fn next_message_rung(

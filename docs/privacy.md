@@ -111,7 +111,8 @@ are outside this implementation's scope.
   presence on, play aggregates still persist while voice-derived `in_voice_ms`
   stays 0 (voice spans drain and drop). The table is not a replay fence and
   holds no fence rows; member erasure and opt-out purges have no row to delete
-  there.
+  there. Operators read these rows through the [game-activity aggregate
+  report](game-activity-report.md).
 
 The authoritative, ordered deletion manifest is
 [`member_erasure_plan.json`](../crates/cutover/src/member_erasure_plan.json).
@@ -282,9 +283,17 @@ never recreates the purged `member_inactive` row). Every gated writer serializes
 with concurrent opt-outs (a shared table lock, so a write that passes the
 gate can never land after the purge), and `member_join` rows strip a
 suppressed inviter's `inviterId` from metadata while keeping the joiner's
-own row. Under a disabled toggle `touch_activity` / `mark_bot` may still
-refresh `last_active_at` for non-suppressed members, which is a known
-residual for a follow-up, not silent per-user analytics. Duplicate
+own row. Gateway activity timestamps carry their originating family
+(message/activity versus voice) through the timestamp buffer, and the
+batch commit applies the matching guild toggle inside the same
+transaction before the monotonic `last_active_at` upsert, so a disabled
+family's touch creates or advances nothing and a newer disabled stamp
+can never replace the allowed family's timestamp; the runtime funnel
+store's `touch_activity` honors the same toggle. The standalone
+`cutover::db::{touch_activity, mark_bot}` helpers and the backfill
+binaries that call them stay suppression-only (they carry no family
+signal), which is the remaining residual for a follow-up, not silent
+per-user analytics. Duplicate
 reconfirmations for suppressed pairs advance nothing: the gate runs before
 the observation-maximum path too.
 

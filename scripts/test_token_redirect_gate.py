@@ -34,13 +34,13 @@ is a READER covered by the allowlist test, so a new token-sending script (or
 a new token path in an old one) trips the gate even before anyone adds it to
 READERS.
 
-Four entries in KNOWN_GAPS are still vulnerable and owned by in-flight
-sibling fixes (the four voice-synthetic token readers). They are allowlisted
-by (file, function) so the gate stays green
-while those fixes land; the gate fails on any violation outside the list AND
-on any stale entry whose function is already clean, so each sibling fix must
-drop its lines and the list shrinks to empty -- the strict end state. Reasons
-stay in plain words: this repo is public and tracker ids never enter code.
+All sibling fixes have landed (alert-history, then the four
+voice-synthetic token readers), so KNOWN_GAPS is empty -- the strict end
+state. The gate fails on any violation anywhere; the allowlist mechanism
+stays so a future token path can be pinned by (file, function) while its fix
+lands, and the gate still fails on any stale entry whose function is already
+clean. Reasons stay in plain words: this repo is public and tracker ids never
+enter code.
 """
 
 import ast
@@ -67,12 +67,8 @@ READERS = (
 # (file, function) pairs whose bare-urlopen-with-token violation is still
 # open under a sibling fix. Remove a line with the fix that cleans it; an
 # entry that no longer matches a live violation fails the gate as stale.
-KNOWN_GAPS = frozenset({
-    ("staging_voice_synthetic.py", "metrics_snapshot"),
-    ("staging_voice_synthetic.py", "rest"),
-    ("staging_voice_synthetic.py", "rest_patch"),
-    ("staging_voice_synthetic.py", "metrics_value"),
-})
+# Empty: every sibling fix has landed. Keep the mechanism for future pins.
+KNOWN_GAPS = frozenset()
 
 REDIRECT_METHODS = frozenset({
     "redirect_request",
@@ -699,7 +695,9 @@ class TokenRedirectGateTests(unittest.TestCase):
                 if name != "synthetic_alert_history.py":
                     (scripts / name).write_text("x = 1\n")
             remaining, stale = check_tree(
-                scripts_dir=scripts, readers=READERS, known_gaps=KNOWN_GAPS)
+                scripts_dir=scripts, readers=READERS, known_gaps=frozenset({
+                    ("staging_voice_synthetic.py", "metrics_snapshot"),
+                }))
         self.assertEqual(remaining, [])
         self.assertIn(("staging_voice_synthetic.py", "metrics_snapshot"), stale)
 
