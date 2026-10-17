@@ -381,10 +381,11 @@ async fn queued_delete_then_create_is_ordered_before_durable_checkpoint() {
     db.close().await.unwrap();
 }
 
-#[tokio::test]
-async fn missing_rejoin_cancel_grant_holds_cursor_but_delete_insert_commits() {
-    let Some(db) = database().await else { return };
-    let pool = db.pool();
+/// A pool whose connections run as a fresh role missing exactly one
+/// privilege (`revoked`, a test-local literal) on the purge queue, plus the
+/// role name so the caller can drop it with [`drop_limited_role`].
+async fn limited_pool(pool: &PgPool, revoked: &str) -> (PgPool, String) {
+    assert!(matches!(revoked, "DELETE" | "INSERT"));
     static NEXT_ROLE: AtomicU64 = AtomicU64::new(0);
     let role = format!(
         "retention_rejoin_{}_{}",
@@ -397,7 +398,7 @@ async fn missing_rejoin_cancel_grant_holds_cursor_but_delete_insert_commits() {
          GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {role};
          GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO {role};
          GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO {role};
-         REVOKE DELETE ON TABLE retention_guild_purge_queue FROM {role}"
+         REVOKE {revoked} ON TABLE retention_guild_purge_queue FROM {role}"
     )))
     .execute(pool)
     .await
@@ -417,6 +418,27 @@ async fn missing_rejoin_cancel_grant_holds_cursor_but_delete_insert_commits() {
         .connect_with(pool.connect_options().as_ref().clone())
         .await
         .unwrap();
+    (limited, role)
+}
+
+async fn drop_limited_role(pool: &PgPool, role: &str) {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM {role};
+         REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM {role};
+         REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM {role};
+         REVOKE USAGE ON SCHEMA public FROM {role};
+         DROP ROLE {role}"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn missing_rejoin_cancel_grant_holds_cursor_but_delete_insert_commits() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    let (limited, role) = limited_pool(pool, "DELETE").await;
     let mut peer = Peer::new().await;
     let (store, stop, mut task, _) = runner(&limited, &mut peer, None).await;
 
@@ -438,18 +460,37 @@ async fn missing_rejoin_cancel_grant_holds_cursor_but_delete_insert_commits() {
 
     peer.close().await;
     limited.close().await;
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM {role};
-         REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM {role};
-         REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM {role};
-         REVOKE USAGE ON SCHEMA public FROM {role};
-         DROP ROLE {role}"
-    )))
-    .execute(pool)
-    .await
-    .unwrap();
+    drop_limited_role(pool, &role).await;
     db.close().await.unwrap();
     let _ = stop;
+}
+
+#[tokio::test]
+async fn missing_queue_insert_grant_skips_real_delete_and_gateway_continues() {
+    // The mirror of the rejoin hold above: a 42501 on a real GUILD_DELETE
+    // (INSERT denied) is still a schema-gap skip — the dispatch checkpoints,
+    // the gateway keeps running, and the Operator replay in docs/privacy.md
+    // owns the dropped queue write. Widening the 42501 hold beyond
+    // GUILD_CREATE would hold the cursor here and fail this test.
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    let (limited, role) = limited_pool(pool, "INSERT").await;
+    let mut peer = Peer::new().await;
+    let (store, stop, task, _) = runner(&limited, &mut peer, None).await;
+
+    peer.send(delete(2, None)).await;
+    wait_sequence(&store, 2).await;
+    assert!(
+        !task.is_finished(),
+        "42501 on a real GUILD_DELETE must skip, not stop the gateway"
+    );
+    assert_eq!(queued(&limited).await, 0, "denied insert queues nothing");
+
+    stop_runner(stop, task).await;
+    peer.close().await;
+    limited.close().await;
+    drop_limited_role(pool, &role).await;
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
