@@ -1421,13 +1421,6 @@ export class TwoBotContainer extends Container<Env> {
       const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);
-      // A complete valid scrape clears only observer-loss state: silently
-      // below the ticket threshold, or with exactly one recovery once firing.
-      // Metric-rule transitions below are evaluated and notified unchanged.
-      const recovering = scrapeLoss.firing;
-      if (scrapeLoss.streak !== 0 || scrapeLoss.firing) {
-        await this.ctx.storage.put(SCRAPE_LOSS_KEY, { ...EMPTY_SCRAPE_LOSS });
-      }
       for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses, context)) {
         console.warn(JSON.stringify({
           event: "metrics_alert",
@@ -1439,6 +1432,15 @@ export class TwoBotContainer extends Container<Env> {
           log_url: LOG_QUERY_URL,
         }));
         await this.postWebhookText(content);
+      }
+      // A complete valid scrape clears only observer-loss state: silently
+      // below the ticket threshold, or with exactly one recovery once firing.
+      // After the metric transitions above, so a transient failure of this
+      // write can only delay the scrape-loss resolve (retried next tick),
+      // never skip an already-persisted metric notification.
+      const recovering = scrapeLoss.firing;
+      if (scrapeLoss.streak !== 0 || scrapeLoss.firing) {
+        await this.ctx.storage.put(SCRAPE_LOSS_KEY, { ...EMPTY_SCRAPE_LOSS });
       }
       if (recovering) {
         const content = scrapeLossResolvedMessage(context);
