@@ -1,0 +1,18 @@
+name: review-rules (shadow)
+# ci-policy: non-required -- advisory signals; existing required gates stay unchanged.
+# Repin to TogetherWeOwn/.github's squash-merge SHA after central PR #26 merges.
+on:
+  pull_request:
+  merge_group:
+permissions: {}
+concurrency:
+  group: review-rules-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  review-rules:
+    permissions:
+      contents: read
+    uses: TogetherWeOwn/.github/.github/workflows/review-rules.yml@87862ee2a4cacc519e80b66495938db396d780e8
+    with:
+      packs: rust,security,python-shell-ci
+      mode: warn
