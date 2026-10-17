@@ -60,7 +60,13 @@ const ACTIVE_OWNER = {
   timestamp: "2026-10-01T00:00:00.000Z", oldEpoch: 0, oldDeploymentId: null,
 };
 const METRICS_KEY = "two-bot:metrics-alerts";
-const WEBHOOK_URL = "https://discord.com/api/webhooks/123456789012345678/synthetic-token-not-a-secret";
+// Webhook id/token stay separate constants so the no-echo assertion below
+// never passes a URL-shaped string to a substring check (CodeQL
+// js/incomplete-url-substring-sanitization). WEBHOOK_URL keeps the exact
+// destination the production code posts to.
+const WEBHOOK_ID = "123456789012345678";
+const WEBHOOK_TOKEN = "synthetic-token-not-a-secret";
+const WEBHOOK_URL = `https://discord.com/api/webhooks/${WEBHOOK_ID}/${WEBHOOK_TOKEN}`;
 const BODY_MARKER = "synthetic-secret-body-marker";
 
 const WORKER_ENV = {
@@ -180,7 +186,8 @@ async function harness(t: TestContext, options: {
     assertNoBodyEcho: () => {
       assert.ok(logs.every((line) => !line.includes(BODY_MARKER)), "scrape bodies never reach logs");
       assert.ok(posts.every((p) => !p.content.includes(BODY_MARKER)), "scrape bodies never reach notifications");
-      assert.ok(logs.every((line) => !line.includes(WEBHOOK_URL)), "webhook destination never reaches logs");
+      assert.ok(logs.every((line) => !line.includes(WEBHOOK_ID)), "webhook id never reaches logs");
+      assert.ok(logs.every((line) => !line.includes(WEBHOOK_TOKEN)), "webhook token never reaches logs");
     },
   };
 }
