@@ -166,9 +166,12 @@ stays dark even on an enabled receiver.
   stamp failure. Started and delivered rows are never
   reclaimed, even when stale, or a retry can double-post a delivery that may
   already have reached Discord.
-- Delivered rows are retained indefinitely as dedup fences. This slice adds no
-  purge; the retained policy is one row per go-live, kept forever, which never
-  weakens the active dedup fence.
+- Delivered rows are kept as dedup fences until they age past
+  `DELIVERED_DEDUP_RETENTION_DAYS` (90 days), then the retention cadence purges
+  them whole (`expire_delivered_live`, full-row deletes, no tombstone). The
+  purge only ever matches `delivered_at IS NOT NULL`, so never-started and
+  started-but-ambiguous rows stay fenced however old, and a retry inside the
+  horizon still dedups instead of double-posting.
 - The sender posts with `allowed_mentions: { parse: [] }`: the production
   `LiveSender` is the shared REST executor's `post_message`, whose body
   pins exactly that shape.
