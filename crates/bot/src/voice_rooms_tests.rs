@@ -13681,6 +13681,8 @@ async fn watchdog_creator_map_age_climbs_from_a_frozen_snapshot() {
     worker.reload_creators(0).await;
     let stall = StallShared {
         guild: worker.live.guild_id,
+        generation: next_voice_actor_generation(),
+        retired: AtomicBool::new(false),
         http: Arc::clone(&worker.http),
         start: tokio::time::Instant::now(),
         state: Mutex::new(StallState {
