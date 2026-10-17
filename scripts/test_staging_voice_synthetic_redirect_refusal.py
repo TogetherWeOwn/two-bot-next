@@ -165,7 +165,7 @@ class RedirectRefusalTests(unittest.TestCase):
             for status in REDIRECT_STATUSES:
                 with self.subTest(reader=name, status=status):
                     transport = self.redirect_transport(status, EVIL)
-                    with self.assertRaises(Exception) as caught:
+                    with self.assertRaises(synth.RedirectRefused) as caught:
                         self.run_with_transport(transport, call)
                     message = str(caught.exception)
                     self.assertIn(str(status), message, name)
@@ -177,7 +177,7 @@ class RedirectRefusalTests(unittest.TestCase):
         # even a same-origin Location must not be contacted.
         same_origin = STAGING_URL + "/ops/metrics?retry=1"
         transport = self.redirect_transport(302, same_origin)
-        with self.assertRaises(Exception) as caught:
+        with self.assertRaises(synth.RedirectRefused) as caught:
             self.run_with_transport(
                 transport, lambda: synth.metrics_snapshot(STAGING_URL, TOKEN_SENTINEL))
         self.assert_no_leak(str(caught.exception), location=same_origin)
@@ -185,7 +185,7 @@ class RedirectRefusalTests(unittest.TestCase):
 
     def test_redirect_error_is_fixed_vocabulary(self):
         transport = self.redirect_transport(302, EVIL)
-        with self.assertRaises(Exception) as caught:
+        with self.assertRaises(synth.RedirectRefused) as caught:
             self.run_with_transport(
                 transport, lambda: synth.rest(TOKEN_SENTINEL, CHANNEL_PATH))
         exc = caught.exception
