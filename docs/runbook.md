@@ -719,20 +719,30 @@ Guard state (persisted in DO storage next to the alert state):
 - After 2 consecutive failures the scope goes quiet and the Worker pages the
   CEO card once, on the same best-effort webhook path as the alerts
   themselves: if forwarding is off or delivery fails, the scope still goes
-  quiet until the alert resolves, so a suppressed scope with no CEO line is a
-  paging gap, not a recovery. No further recommendations until the alert
-  resolves.
-- A resolved trigger resets its scope guard: failure count, phase, and
-  suppression all clear. The alert's own RESOLVED line is the recovery proof.
+  quiet until the alert stays clear for a full cooldown window, so a suppressed
+  scope with no CEO line is a paging gap, not a recovery. No further
+  recommendations until the alert stays clear for one cooldown window.
+- Recovery needs a sustained clear, not one quiet line. A recommended takeover
+  restarts the process, which re-baselines the gateway counters and boots
+  `creator_map_generation` at 0, so the next tick goes quiet even when the
+  fault survives. A quiet tick therefore starts a per-scope hold-down instead
+  of resetting the guard; only a full 30-minute window of silence returns the
+  scope to idle. A refire inside the window keeps the failure count, so a
+  flapping alert still reaches the two-failure stop. A scope that stays silent
+  for the full window with generation pinned at 0 never pages from this guard:
+  the stall rule cannot tell parked from wedged at generation 0, so that case
+  needs its own boot/store-fault signal (follow-up), not another redeploy.
 
 Operator card shape for `same-sha-takeover`: name the firing key, the build
 revision from the alert line, and the deploy workflow run to dispatch at that
-same SHA. File exactly one card per host step; act only while the alert is
-firing. A repeated takeover line for the same still-firing alert is the
-escalation retry, not a second step: file it only after the first card's
-action completed without clearing the alert, never while that action is still
-in flight. When the CEO page lands, the on-call pages the CEO card and stops
-filing takeover cards for that scope until the alert resolves.
+same SHA. File a host-action card only from a `same-sha-takeover` line: the
+first (`creator-map-reload`) line is never card authority. File exactly one
+card per host step; act only while the alert is firing. A repeated takeover
+line for the same still-firing alert is the escalation retry, not a second
+step: file it only after the first card's action completed without clearing
+the alert, never while that action is still in flight. When the CEO page
+lands, the on-call pages the CEO card and stops filing takeover cards for
+that scope until the alert stays clear for one cooldown window.
 
 Known limits of v1: the triggers stay pinned to the two keys in the table
 above. A stuck-gateway rule (non-ready `/readyz` gateway component with no

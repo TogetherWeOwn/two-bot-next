@@ -71,21 +71,73 @@ test("two consecutive failures stop the scope with a CEO page, then silence", ()
   assert.equal(quiet.state.scopes["voice-stall"].suppressed, true);
 });
 
-test("resolution resets the guard, including suppression", () => {
+test("recovery needs a sustained clear: one quiet tick holds the guard", () => {
   let state = EMPTY_REMEDIATION_STATE;
   state = evaluateRemediation(STALE, state, NOW).state;
   state = evaluateRemediation(STALE, state, NOW + REMEDIATION_COOLDOWN_SECONDS).state;
   const paged = evaluateRemediation(STALE, state, NOW + 2 * REMEDIATION_COOLDOWN_SECONDS);
   assert.equal(paged.state.scopes["voice-stall"].suppressed, true);
-  const resolved = evaluateRemediation([], paged.state, NOW + 3 * REMEDIATION_COOLDOWN_SECONDS);
-  assert.deepEqual(resolved.messages, []);
-  assert.deepEqual(resolved.state.scopes["voice-stall"], {
+  // A single quiet tick (e.g. the restart after a recommended takeover
+  // re-baselines counters) starts the hold-down but keeps the failures.
+  const quietOnce = evaluateRemediation([], paged.state, NOW + 2 * REMEDIATION_COOLDOWN_SECONDS + 60);
+  assert.deepEqual(quietOnce.messages, []);
+  assert.equal(quietOnce.state.scopes["voice-stall"].suppressed, true);
+  assert.equal(quietOnce.state.scopes["voice-stall"].consecutiveFailures, 2);
+  // A full cooldown window of silence resets to idle.
+  const quietLong = evaluateRemediation(
+    [],
+    quietOnce.state,
+    NOW + 2 * REMEDIATION_COOLDOWN_SECONDS + 60 + REMEDIATION_COOLDOWN_SECONDS,
+  );
+  assert.deepEqual(quietLong.messages, []);
+  assert.deepEqual(quietLong.state.scopes["voice-stall"], {
     phase: "idle",
     consecutiveFailures: 0,
     suppressed: false,
+    clearSinceSeconds: 0,
   });
-  const refire = evaluateRemediation(STALE, resolved.state, NOW + 3 * REMEDIATION_COOLDOWN_SECONDS);
+  const refire = evaluateRemediation(STALE, quietLong.state, quietLong.state.lastRecommendedAtSeconds + REMEDIATION_COOLDOWN_SECONDS);
   assert.equal(refire.messages[0]!.action, "creator-map-reload");
+});
+
+test("a transient resolve after a takeover does not reset the failure count", () => {
+  let state = EMPTY_REMEDIATION_STATE;
+  state = evaluateRemediation(STALE, state, NOW).state;
+  state = evaluateRemediation(STALE, state, NOW + REMEDIATION_COOLDOWN_SECONDS).state;
+  assert.equal(state.scopes["voice-stall"].consecutiveFailures, 1);
+  // Takeover restarts the process: the next tick goes quiet (generation 0 /
+  // re-baselined counters) even though the fault survives.
+  const quiet = evaluateRemediation([], state, NOW + REMEDIATION_COOLDOWN_SECONDS + 60);
+  assert.deepEqual(quiet.messages, []);
+  assert.equal(quiet.state.scopes["voice-stall"].consecutiveFailures, 1);
+  assert.equal(quiet.state.scopes["voice-stall"].phase, "takeover-recommended");
+  // The alert refires before the hold-down elapses: this still counts toward
+  // the two-failure stop instead of restarting at zero.
+  const refire = evaluateRemediation(
+    STALE,
+    quiet.state,
+    NOW + 2 * REMEDIATION_COOLDOWN_SECONDS,
+  );
+  assert.equal(refire.messages.length, 1);
+  assert.equal(refire.messages[0]!.kind, "ceo-page");
+  assert.equal(refire.state.scopes["voice-stall"].suppressed, true);
+});
+
+test("an alert that flaps between firing and resolved still reaches the CEO page", () => {
+  let state = EMPTY_REMEDIATION_STATE;
+  state = evaluateRemediation(STALE, state, NOW).state;
+  const quiet = evaluateRemediation([], state, NOW + 60);
+  assert.deepEqual(quiet.messages, []);
+  const refire = evaluateRemediation(STALE, quiet.state, NOW + REMEDIATION_COOLDOWN_SECONDS);
+  assert.equal(refire.messages[0]!.action, "same-sha-takeover");
+  const quietAgain = evaluateRemediation([], refire.state, NOW + REMEDIATION_COOLDOWN_SECONDS + 60);
+  assert.deepEqual(quietAgain.messages, []);
+  const paged = evaluateRemediation(
+    STALE,
+    quietAgain.state,
+    NOW + 2 * REMEDIATION_COOLDOWN_SECONDS,
+  );
+  assert.equal(paged.messages[0]!.kind, "ceo-page");
 });
 
 test("cooldown holds recommendations inside 30 minutes but keeps the guard", () => {
@@ -138,8 +190,13 @@ test("scopes guard independently: a stopped stall does not silence a crash loop"
   let state: RemediationState = {
     ...EMPTY_REMEDIATION_STATE,
     scopes: {
-      "voice-stall": { phase: "takeover-recommended", consecutiveFailures: 2, suppressed: true },
-      "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false },
+      "voice-stall": {
+        phase: "takeover-recommended",
+        consecutiveFailures: 2,
+        suppressed: true,
+        clearSinceSeconds: 0,
+      },
+      "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   };
   const { messages } = evaluateRemediation([...STALE, ...UNPAIRED], state, NOW);
@@ -183,13 +240,20 @@ test("a corrupt guard record restarts the guard instead of wedging it", () => {
     { lastRecommendedAtSeconds: NOW, scopes: {} },
     {
       lastRecommendedAtSeconds: NOW,
-      scopes: { "voice-stall": { phase: "idle", consecutiveFailures: 0, suppressed: false } },
+      scopes: {
+        "voice-stall": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      },
     },
     {
       lastRecommendedAtSeconds: NOW,
       scopes: {
-        "voice-stall": { phase: "takeover-recommended", consecutiveFailures: NaN, suppressed: false },
-        "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false },
+        "voice-stall": {
+          phase: "takeover-recommended",
+          consecutiveFailures: NaN,
+          suppressed: false,
+          clearSinceSeconds: 0,
+        },
+        "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       },
     },
     // Counts this code never writes restart the guard: a negative or
@@ -197,8 +261,21 @@ test("a corrupt guard record restarts the guard instead of wedging it", () => {
     ...[-100, 1.5, Number.MAX_SAFE_INTEGER + 1].map((consecutiveFailures) => ({
       lastRecommendedAtSeconds: NOW,
       scopes: {
-        "voice-stall": { phase: "idle", consecutiveFailures, suppressed: false },
-        "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false },
+        "voice-stall": { phase: "idle", consecutiveFailures, suppressed: false, clearSinceSeconds: 0 },
+        "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      },
+    })),
+    // A hold-down timestamp this code never writes also restarts the guard.
+    ...[-1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1].map((clearSinceSeconds) => ({
+      lastRecommendedAtSeconds: NOW,
+      scopes: {
+        "voice-stall": {
+          phase: "takeover-recommended",
+          consecutiveFailures: 1,
+          suppressed: false,
+          clearSinceSeconds,
+        },
+        "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
       },
     })),
   ]) {
@@ -215,8 +292,8 @@ test("a non-finite or far-future guard timestamp restarts the guard", () => {
   const withTimestamp = (lastRecommendedAtSeconds: number): RemediationState => ({
     lastRecommendedAtSeconds,
     scopes: {
-      "voice-stall": { phase: "idle", consecutiveFailures: 0, suppressed: false },
-      "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false },
+      "voice-stall": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
+      "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 },
     },
   });
   for (const bad of [NaN, Infinity, -Infinity, NOW + 301, 1_700_000_000_000]) {
@@ -227,6 +304,16 @@ test("a non-finite or far-future guard timestamp restarts the guard", () => {
     sanitizeRemediationState(withTimestamp(NOW + 60), NOW),
     withTimestamp(NOW + 60),
   );
+});
+
+test("the first recommendation files no host-action card: only a takeover line does", () => {
+  const r1 = operatorInstruction("creator-map-reload");
+  assert.match(r1, /No host action/);
+  assert.doesNotMatch(r1, /File a host-action card only if this alert is still firing past the next tick/);
+  assert.match(r1, /file a host-action card only from that line/);
+  const { messages } = evaluateRemediation(STALE, EMPTY_REMEDIATION_STATE, NOW);
+  assert.match(messages[0]!.text, /No host action/);
+  assert.match(operatorInstruction("same-sha-takeover"), /file one host-action card/);
 });
 
 test("a valid guard record passes sanitizing untouched", () => {

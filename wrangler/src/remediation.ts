@@ -33,6 +33,13 @@ export interface ScopeGuard {
   consecutiveFailures: number;
   /** True after the failure bound: no further recommendations until recovery. */
   suppressed: boolean;
+  /**
+   * Seconds since epoch when the current non-firing streak started, 0 while
+   * the trigger is firing. A single quiet tick after a recommended takeover
+   * is expected (a restart re-baselines counters and boots generation 0), so
+   * it must not reset the guard on its own; see `evaluateRemediation`.
+   */
+  clearSinceSeconds: number;
 }
 
 export interface RemediationState {
@@ -41,7 +48,12 @@ export interface RemediationState {
   scopes: Record<RemediationScope, ScopeGuard>;
 }
 
-const IDLE_GUARD: ScopeGuard = { phase: "idle", consecutiveFailures: 0, suppressed: false };
+const IDLE_GUARD: ScopeGuard = {
+  phase: "idle",
+  consecutiveFailures: 0,
+  suppressed: false,
+  clearSinceSeconds: 0,
+};
 
 export const EMPTY_REMEDIATION_STATE: RemediationState = {
   lastRecommendedAtSeconds: 0,
@@ -65,7 +77,10 @@ function isScopeGuard(value: unknown): value is ScopeGuard {
     typeof guard["consecutiveFailures"] === "number" &&
     Number.isSafeInteger(guard["consecutiveFailures"]) &&
     (guard["consecutiveFailures"] as number) >= 0 &&
-    typeof guard["suppressed"] === "boolean"
+    typeof guard["suppressed"] === "boolean" &&
+    typeof guard["clearSinceSeconds"] === "number" &&
+    Number.isSafeInteger(guard["clearSinceSeconds"]) &&
+    (guard["clearSinceSeconds"] as number) >= 0
   );
 }
 
@@ -142,7 +157,7 @@ export function remediationRunbookUrl(trigger: TriggerDef): string {
 /** Operator instruction carried by each recommendation; no host action for R1. */
 export function operatorInstruction(action: RemediationAction): string {
   return action === "creator-map-reload"
-    ? "No host action: the bot's maintenance tick retries the creator-map merge every 5 minutes. File a host-action card only if this alert is still firing past the next tick."
+    ? "No host action: the bot's maintenance tick retries the creator-map merge every 5 minutes. If this alert is still firing at the next remediation window, a same-sha-takeover line follows; file a host-action card only from that line."
     : "Operator: file one host-action card for a same-SHA deployment-takeover through the existing deploy workflow; one card per host step.";
 }
 
@@ -162,7 +177,7 @@ function recommendText(trigger: TriggerDef, action: RemediationAction): string {
 }
 
 function ceoPageText(trigger: TriggerDef): string {
-  return `two-bot-next REMEDIATION STOPPED ${trigger.scope}: ${REMEDIATION_MAX_CONSECUTIVE_FAILURES} consecutive remediations failed for ${trigger.firingKey}. Paging the CEO card per ${RUNBOOK_BASE_URL}runbook.md#auto-remediation-guarded-stall-and-crash-loop-response. No further recommendations until this alert resolves.`;
+  return `two-bot-next REMEDIATION STOPPED ${trigger.scope}: ${REMEDIATION_MAX_CONSECUTIVE_FAILURES} consecutive remediations failed for ${trigger.firingKey}. Paging the CEO card per ${RUNBOOK_BASE_URL}runbook.md#auto-remediation-guarded-stall-and-crash-loop-response. No further recommendations until this alert stays clear for one cooldown window.`;
 }
 
 export interface RemediationEvaluation {
@@ -178,9 +193,18 @@ export interface RemediationEvaluation {
  * without its alert alongside. Triggers are visited in `REMEDIATION_TRIGGERS`
  * table order and the first eligible one consumes the window, so when both
  * scopes fire at once the table order is the priority: the other scope waits
- * for the next window. A resolved trigger resets its scope guard
- * (recovery clears the failure count and the suppression). Callers must pass
- * stored guard state through `sanitizeRemediationState` first.
+ * for the next window.
+ *
+ * Recovery needs a sustained clear, not one quiet tick: a recommended
+ * same-SHA takeover restarts the process, which re-baselines the gateway
+ * counters and boots `creator_map_generation` at 0, so the very next tick
+ * goes quiet even when the underlying fault survives. A non-firing tick
+ * therefore starts (or continues) a per-scope hold-down instead of resetting
+ * the guard; only a full cooldown window of silence returns the scope to
+ * idle. A refire clears the hold-down and keeps the failure count, so an
+ * alert that flaps between firing and resolved still reaches the two-failure
+ * stop. Callers must pass stored guard state through
+ * `sanitizeRemediationState` first.
  */
 export function evaluateRemediation(
   firing: string[],
@@ -194,12 +218,26 @@ export function evaluateRemediation(
   };
   let lastRecommendedAtSeconds = prev.lastRecommendedAtSeconds;
   for (const trigger of REMEDIATION_TRIGGERS) {
-    const guard = scopes[trigger.scope]!;
+    let guard = scopes[trigger.scope]!;
     if (!firing.includes(trigger.firingKey)) {
-      if (guard.phase !== "idle" || guard.consecutiveFailures !== 0 || guard.suppressed) {
+      const isIdle =
+        guard.phase === "idle" &&
+        guard.consecutiveFailures === 0 &&
+        !guard.suppressed &&
+        guard.clearSinceSeconds === 0;
+      if (isIdle) continue;
+      if (guard.clearSinceSeconds === 0) {
+        scopes[trigger.scope] = { ...guard, clearSinceSeconds: nowSeconds };
+      } else if (nowSeconds - guard.clearSinceSeconds >= REMEDIATION_COOLDOWN_SECONDS) {
         scopes[trigger.scope] = { ...IDLE_GUARD };
+      } else {
+        scopes[trigger.scope] = { ...guard };
       }
       continue;
+    }
+    if (guard.clearSinceSeconds !== 0) {
+      guard = { ...guard, clearSinceSeconds: 0 };
+      scopes[trigger.scope] = guard;
     }
     if (guard.suppressed) continue;
     if (nowSeconds - lastRecommendedAtSeconds < REMEDIATION_COOLDOWN_SECONDS) continue;
@@ -212,6 +250,7 @@ export function evaluateRemediation(
         phase: "takeover-recommended",
         consecutiveFailures,
         suppressed: true,
+        clearSinceSeconds: 0,
       };
       messages.push({
         kind: "ceo-page",
@@ -225,6 +264,7 @@ export function evaluateRemediation(
         phase: action === "creator-map-reload" ? "reload-recommended" : "takeover-recommended",
         consecutiveFailures,
         suppressed: false,
+        clearSinceSeconds: 0,
       };
       messages.push({
         kind: "recommend",
