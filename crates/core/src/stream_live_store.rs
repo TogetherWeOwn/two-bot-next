@@ -37,10 +37,14 @@
 //! as stale recovery or after a stamp failure; [`release_started_live`] is
 //! the separate token-gated path for a started row whose Discord send
 //! provably never landed, and likewise must never be used on an ambiguous
-//! outcome or after a stamp failure. One row per go-live is
-//! retained indefinitely as the dedup fence; this slice adds no purge.
-//! Rows carry no member identity (Twitch broadcaster id plus the
-//! announcements channel), hence no member-erasure entry.
+//! outcome or after a stamp failure. One row per go-live is kept as the
+//! dedup fence while it can still matter: delivered rows expire past
+//! [`DELIVERED_DEDUP_RETENTION_DAYS`] via [`expire_delivered_live`], which
+//! runs on the retention cadence (never on the send path) and deletes only
+//! rows no live claim or send can reference. Started and ambiguous rows
+//! (`delivered_at IS NULL`) never expire. Rows carry no member identity
+//! (Twitch broadcaster id plus the announcements channel), hence no
+//! member-erasure entry.
 
 use sqlx::{Pool, Postgres};
 
@@ -59,6 +63,14 @@ use crate::Secret;
 /// a retry arrives after the lease expires, and this slice has no sweeper
 /// to recover a go-live that is never retried.
 pub const STALE_CLAIM_LEASE_SECS: i64 = 30;
+
+/// How long a delivered go-live row stays a dedup fence, in days. Twitch
+/// retries and redeliveries arrive within minutes of the event; 90 days keeps
+/// the fence far beyond any retry window while bounding table growth to one
+/// small row per go-live. This is the default horizon the retention cadence
+/// passes to [`expire_delivered_live`]; started and ambiguous rows
+/// (`delivered_at IS NULL`) are never eligible, however old.
+pub const DELIVERED_DEDUP_RETENTION_DAYS: i32 = 90;
 
 /// One go-live claim: the `live_dedup_key` plus the rendered post it owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +300,55 @@ pub async fn reclaim_stale_live(
     }
 }
 
+/// Delete delivered go-live rows older than `horizon_days`, returning how
+/// many rows went. Only rows stamped `delivered_at` before the horizon are
+/// eligible: anything a live claim or send could still reference is
+/// `delivered_at IS NULL` (never-started, or started-but-ambiguous after a
+/// stamp failure), so the single-table predicate excludes it atomically with
+/// the delete and no second-table join is needed. The delete removes full
+/// rows with no tombstone, so no broadcaster or channel id survives in the
+/// ledger. Call this from the retention cadence only, never on the send
+/// path: a delivery retried inside the horizon still finds its fence and
+/// answers `Duplicate` instead of double-posting.
+pub async fn expire_delivered_live<'e, E>(
+    executor: E,
+    horizon_days: i32,
+) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    Ok(sqlx::query(
+        "DELETE FROM stream_live_claims
+         WHERE delivered_at IS NOT NULL
+           AND delivered_at < clock_timestamp() - make_interval(days => $1)",
+    )
+    .bind(horizon_days)
+    .execute(executor)
+    .await?
+    .rows_affected())
+}
+
+/// Count the delivered rows [`expire_delivered_live`] would delete, without
+/// deleting anything. The dry-run retention projection reports this so the
+/// live run never surprises.
+pub async fn count_expired_delivered_live<'e, E>(
+    executor: E,
+    horizon_days: i32,
+) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM stream_live_claims
+         WHERE delivered_at IS NOT NULL
+           AND delivered_at < clock_timestamp() - make_interval(days => $1)",
+    )
+    .bind(horizon_days)
+    .fetch_one(executor)
+    .await?;
+    Ok(count as u64)
+}
+
 /// Take over a conflicting row if it is a stale never-started claim, else
 /// classify it. Returns `None` when no row exists (any more), so callers
 /// can loop back to the insert instead of misreading the absence as
@@ -343,6 +404,15 @@ async fn classify_conflict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivered_dedup_horizon_outlives_any_retry_window() {
+        assert!(
+            DELIVERED_DEDUP_RETENTION_DAYS >= 30,
+            "the fence must outlive any Twitch retry window, got {} days",
+            DELIVERED_DEDUP_RETENTION_DAYS
+        );
+    }
 
     #[test]
     fn claimed_token_is_redacted_in_both_debug_forms() {
