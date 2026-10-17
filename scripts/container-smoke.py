@@ -33,8 +33,13 @@ IMAGE_MAX_BYTES = 112 * MIB
 # aggregate-expiry slice (PR 1082) measured 16,782,608 bytes (16.01 MiB) on
 # hosted CI, 5,392 bytes over the 16 MiB budget with no new dependencies:
 # the store expiry plus its per-guild stale listing and the retention-cadence
-# driver. 17 MiB restores a working tripwire with headroom; revisit if the
-# binary approaches it.
+# driver. 2026-10-17 recalibration: main tip 89503f71 measured 16,776,096 bytes
+# (16.00 MiB) in hosted CI, leaving 1,120 bytes of headroom — the tripwire is
+# exhausted even before new code lands; this branch's voice rename-decision
+# logs add 3,160 bytes (merged head 6a9c394e: 16,779,256 bytes, 2,040 over
+# 16 MiB) with no new dependencies; the release profile is already minimal
+# (opt-level=z, lto, strip). 17 MiB restores ~1.00 MiB of headroom while
+# keeping a working tripwire; revisit if the binary approaches it.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.

@@ -653,6 +653,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     // on a later pass.
                     match self.propose_name(room_id, &name, now_ms) {
                         Some(outcome) => {
+                            let decision = match outcome {
+                                ProposeOutcome::Unchanged => "unchanged",
+                                ProposeOutcome::Queued { .. } => "queued",
+                            };
+                            log_template_name_decision(
+                                self.live.guild_id,
+                                room_id,
+                                facts.context.members_playing,
+                                decision,
+                            );
                             metrics::global().voice_name(match outcome {
                                 ProposeOutcome::Unchanged => "unchanged",
                                 ProposeOutcome::Queued { .. } => "proposed",
@@ -660,12 +670,24 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             self.name_signatures.insert(room_id, signature);
                         }
                         None => {
+                            log_template_name_decision(
+                                self.live.guild_id,
+                                room_id,
+                                facts.context.members_playing,
+                                "channel_unseen",
+                            );
                             metrics::global().voice_name("channel_unseen");
                             self.name_inputs = None;
                         }
                     }
                 }
                 Err(_) => {
+                    log_template_name_decision(
+                        self.live.guild_id,
+                        room_id,
+                        facts.context.members_playing,
+                        "template_blocked",
+                    );
                     metrics::global().voice_name("blocked");
                     self.name_signatures.insert(room_id, signature);
                 }

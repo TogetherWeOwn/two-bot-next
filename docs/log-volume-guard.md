@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 628 samples
+## Cardinality budget: 638 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -55,7 +55,10 @@ table and the test are updated together.
 | `two_bot_eventsub_received_total` | 1 | label-free counter: deliveries accepted for verification, including tampered signatures |
 | `two_bot_eventsub_classified_total{kind}` | 6 | `challenge`, `notification`, `revocation`, `tampered`, `ignored`, `other`; unknown kinds collapse to `other` |
 | `two_bot_eventsub_posts_total{outcome}` | 4 | `attempted`, `succeeded`, `failed`, `other`; zero until the go-live sender is wired |
-| `# HELP` / `# TYPE` headers | 124 | 62 families x 2 |
+| `two_bot_eventsub_reconcile_passes_total{outcome}` | 3 | `healthy`, `pending`, `failed`; one sample per pass, unknown outcomes collapse to `failed` |
+| `two_bot_eventsub_reconcile_actions_total{action}` | 2 | `create`, `delete`; 409 already-exists confirmations fold into the pass outcome |
+| `two_bot_eventsub_reconcile_errors_total{error_class}` | 5 | `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed`, `other`; no status, body or response bytes in labels |
+| `# HELP` / `# TYPE` headers | 130 | 65 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 
