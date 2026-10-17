@@ -258,7 +258,7 @@ mod tests {
     struct CaptureFields<'a>(&'a mut String);
 
     impl tracing::field::Visit for CaptureFields<'_> {
-        fn record_debug(&self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             use std::fmt::Write as _;
             write!(self.0, " {}={value:?}", field.name()).unwrap();
         }

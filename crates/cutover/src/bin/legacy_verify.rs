@@ -197,7 +197,7 @@ mod tests {
     struct CaptureFields<'a>(&'a mut String);
 
     impl tracing::field::Visit for CaptureFields<'_> {
-        fn record_debug(&self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             use std::fmt::Write as _;
             write!(self.0, " {}={value:?}", field.name()).unwrap();
         }
@@ -261,7 +261,7 @@ mod tests {
             let mut saved = Vec::new();
             for key in PG_KEYS {
                 saved.push((key.to_owned(), std::env::var_os(key)));
-                unsafe { std::env::remove_var(key) };
+                std::env::remove_var(key);
             }
             saved.push(("HOME".to_owned(), std::env::var_os("HOME")));
             let dir = std::env::temp_dir().join(format!(
@@ -273,7 +273,7 @@ mod tests {
                     .as_nanos()
             ));
             std::fs::create_dir_all(&dir).expect("synthetic HOME");
-            unsafe { std::env::set_var("HOME", &dir) };
+            std::env::set_var("HOME", &dir);
             let home_guard = TempHome { dir };
             (guard, Self(saved), home_guard)
         }
@@ -282,11 +282,9 @@ mod tests {
     impl Drop for SavedEnv {
         fn drop(&mut self) {
             for (key, value) in self.0.drain(..) {
-                unsafe {
-                    match value {
-                        Some(v) => std::env::set_var(key, v),
-                        None => std::env::remove_var(key),
-                    }
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
                 }
             }
         }
@@ -381,7 +379,7 @@ mod tests {
     #[test]
     fn inherited_pgpassfile_is_forbidden() {
         let (_lock, _env, _home) = SavedEnv::clear_pg_and_isolate_home();
-        unsafe { std::env::set_var("PGPASSFILE", "/tmp/synthetic-passfile") };
+        std::env::set_var("PGPASSFILE", "/tmp/synthetic-passfile");
         let error =
             connection_options("postgres://operator:explicit@live.invalid:5432/bot").unwrap_err();
         assert_eq!(
