@@ -140,6 +140,21 @@ body, broadcaster, subscription or secret data reaches any label.
 | `two_bot_eventsub_classified_total{kind}` | Deliveries by bounded receiver classification; `kind` is `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`; `other` marks unknown/future classification errors returned as retryable 503 |
 | `two_bot_eventsub_posts_total{outcome}` | Go-live post attempts by bounded outcome; `outcome` is `attempted`, `succeeded`, `failed` or `other`; zero until the go-live sender slice is wired |
 
+## Moderation enforcement series
+
+Counters emitted by the moderation enforcement render. Unknown verbs and
+outcomes collapse to `other`, and no member ID, reason text or message
+content reaches any label. Verbs are the bounded `ModerationAction`
+command vocabulary (`ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`,
+`slowmode`, `lockdown`, `unlock`); outcomes are `success`, `refused`,
+`discord_error`, `storage_error` and `other`. Each terminal member or
+channel enforcement counts once; retries and rate-limit backoffs are not
+outcomes. See `docs/metrics.md` for the full label table.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_moderation_enforcements_total{verb,outcome}` | Terminal moderation enforcements by bounded verb and outcome |
+
 ## Scheduled job labels
 
 Each label owns independent `two_bot_job_runs_total{job,outcome}`,
