@@ -56,10 +56,12 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
 | `two_bot_voice_joins_received_total` | Creator joins received by the guild actor; compare with create/move/refused outcomes — received persistently above handled means the actor is not processing joins |
 | `two_bot_voice_join_refused_total{reason}` | Actor-received creator joins refused before queueing; `reason` is `halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked` or `other` |
-| `two_bot_voice_worker_halted` | Guild-actor halt latch: 1 while a store CredentialRefused or Discord 401 halted join processing (only store halts auto-recover; 401s need a token fix + restart) |
-| `two_bot_voice_queue_pending{lane}` | Queued (not in-flight) voice actions; `lane` is `urgent` or `deferred` |
-| `two_bot_voice_queue_oldest_age_seconds` | Age of the oldest queued voice action in seconds; 0 when empty |
+| `two_bot_voice_worker_halted` | Guild-actor halt latch: 1 while any guild actor is halted by a store CredentialRefused or Discord 401 (only store halts auto-recover; 401s need a token fix + restart); aggregated over all current guild actors, so a healthy guild cannot hide another guild's halt |
+| `two_bot_voice_queue_pending{lane}` | Queued (not in-flight) voice actions, summed across all current guild actors per lane; `lane` is `urgent` or `deferred` |
+| `two_bot_voice_queue_oldest_age_seconds` | Age of the oldest queued voice action in seconds, the maximum across all current guild actors; 0 when every queue is empty |
 | `two_bot_voice_rest_in_flight_age_seconds` | Age of the oldest in-flight voice REST attempt in seconds; 0 when idle |
+| `two_bot_voice_creator_map_generation` | Last merged creator-map generation; 0 before the first merge — a flat line across reconnects means the map stopped converging |
+| `two_bot_voice_creator_map_age_seconds` | Seconds since the last successful creator-map merge, republished every actor tick; 0 when never merged — climbing past the 5 min refresh interval means merges stopped landing; the `voice_creator_map_stale` rule pages past 600 s once a merge has landed |
 | `two_bot_voice_global_backoff_capped_total` | Global-backoff waits capped (returned RateLimited for tick-driven backoff) instead of parking the actor |
 | `two_bot_voice_dispatch_timeouts_total` | Actor dispatch turns that ran past the observe bound (run to completion; counted after the fact); the queue keeps its retries |
 | `two_bot_voice_watchdog_stucks_total` | Watchdog firings: queued work with no dispatch progress inside the window |
@@ -73,6 +75,9 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert-threshold hook for M2.1: alert when the counter increases across consecutive scrapes; a single failed drain is not paging |
 | `two_bot_audit_delivery_halt` | Audit mirror delivery-halt state for staleness evaluation: `1` while the persistent kill switch is engaged, `0` once cleared. Label-free gauge set once per readable `audit_retry` sweep from the store's `delivery_halt` read; an unreadable halt keeps the last reported state, and a halted sweep still counts as a job `success` (the sweep ran; it claimed nothing by design). Manual check, not an alert input: no alert rule consumes this series and production alert forwarding stays off. No actor ID, timestamp, error text or row content ever reaches exposition |
 | `two_bot_event_store_consumer_lag_seconds` | Event-store consumer lag in seconds (`received_at` minus `event_time` for the newest observed capture row); `0` when unobserved. Label-free gauge; S1 exposes the series and its setter contract (last writer wins; non-finite or negative input clears to `0` so exposition stays a finite non-negative duration). The periodic store-read caller lands with the consumer slice, so until then the series reads `0` (unobserved), not "no lag". Manual check, not an alert input: no alert rule consumes this series. No message, channel, user, dedup-key, content or body label ever reaches exposition |
+| `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures. Requests rejected before body intake are not deliveries; label-free counter |
+| `two_bot_eventsub_classified_total{kind}` | EventSub deliveries classified by fixed `kind`: `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`. `ignored` covers known unrecognized or invalid outcomes, including deterministic 2xx acknowledgments, invalid challenges, and non-signature verification failures; `other` marks unknown/future classification errors, which return retryable 503. Only `BadSignature` is `tampered`. No IDs, tokens, headers, body text or secrets become labels |
+| `two_bot_eventsub_posts_total{outcome}` | Go-live post outcomes: `attempted`, `succeeded`, `failed` or `other`. The current receiver slice does not send go-live posts, so these remain zero until the sender is wired; no IDs, content or errors become labels |
 
 ## REST admission guard
 
@@ -176,6 +181,10 @@ Renaming a metric, label, or allowlisted value breaks scrapers; new values
 are added to these compile-time lists in `crates/core/src/metrics.rs`, never
 as dynamic labels.
 
+- `two_bot_eventsub_classified_total{kind}` — `kind` is one of
+  `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`.
+- `two_bot_eventsub_posts_total{outcome}` — `outcome` is one of `attempted`,
+  `succeeded`, `failed` or `other`.
 - `two_bot_gateway_events_total{event}` — `event` is one of `READY`,
   `RESUMED`, `GUILD_CREATE`, `GUILD_DELETE`, `GUILD_UPDATE`,
   `GUILD_MEMBER_ADD`, `GUILD_MEMBER_REMOVE`, `GUILD_MEMBER_UPDATE`,
@@ -334,16 +343,27 @@ as dynamic labels.
   `voice_event="voice_creator_orphan"`. No channel, member, token, body or
   ID leaves the process in any label or field.
 - Worker log fields (Workers Logs only, never a metric):
-  `event="container_gateway_failure"` with `phase`/`class`, emitted by the
-  Container DO keepalive in `wrangler/src/index.ts` once per tick while the
-  gateway task is failing. `phase` is `durable_gateway`; `class` is one of
+  `event="container_gateway_failure"` with `phase`/`class`/`failed_step`/
+  `error_code`/`build_revision`/`release`/`worker_version`/`log_url`, emitted
+  by the Container DO keepalive in `wrangler/src/index.ts` once per tick while
+  the gateway task is failing. `phase` is `durable_gateway`; `class` is one of
   `store_unavailable`, `gateway_pool_connect_failed`, `checkpoint_load_failed`,
   `onboarding_gates_invalid`, `onboarding_init_failed`,
   `custom_commands_init_failed`, `milestones_load_failed`,
   `automod_config_invalid`, `automod_executor_failed`, `raid_executor_failed`,
   `gateway_runtime_failed` or `gateway_task_panicked` (every `FailureClass`
-  variant in `crates/bot/src/gateway_failure.rs`). Only `[a-z0-9_]{1,32}`
-  tokens are ever logged; anything else is dropped. See
+  variant in `crates/bot/src/gateway_failure.rs`). Only `phase` and `class`
+  use `[a-z0-9_]{1,32}` tokens; anything else is dropped. `failed_step` names
+  the fallible step, `error_code` carries the SQLSTATE (`none` when no database
+  code applies). `release` is the container git SHA from `/readyz`
+  `build_revision` (stamped at deploy time, `"unknown"` when unparseable, never
+  echoed); `build_revision` carries the same SHA under its `/readyz` spelling
+  and `log_url` links the log-query docs; `worker_version` is the platform
+  Worker version id. `metrics_alert` lines carry the same `release` and
+  `worker_version` from that tick's probe. Group gateway failures by `class`;
+  group metrics alerts by the alert rule in `content`. Error-class grouping
+  applies to metrics alerts only when `content` includes a validated last error
+  class, as with `job_consecutive_failures`. See
   [startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gateway_failure).
 - `two_bot_voice_join_to_move_seconds` is a label-free histogram from creator
   join gateway receipt to successful member move. Cancelled/failed joins do not
@@ -493,10 +513,19 @@ Both readiness and metrics share the [Discord-only destination validator and
 non-destructive disable switch](container-readiness.md#threshold-and-notifications).
 No Prometheus server, no new infrastructure.
 
-Background alert scrapes share the streaming 64 KiB body cap and a single
-six-second request/body deadline. Non-OK bodies are cancelled without buffering;
-oversize or stalled bodies are cancelled too, without waiting on a cancellation
-hook. Failed scrapes log only `two-bot metrics scrape failed`: no response body,
+Every DO ops read — the background alert scrape, the summary proxy, the
+read-only ops proxies (metrics, gateway, backfill and the signed
+backfill-progress read) and the keepalive `/readyz` probe — shares the
+streaming 64 KiB body cap and a single end-to-end six-second deadline across
+the container fetch and the body read. The deadline does not rely on the SDK
+or the response stream honoring abort: a fetch or body that ignores
+cancellation still settles the caller at six seconds, a response that only
+arrives after the deadline is released and discarded (never proxied, never
+recorded as readiness), and body cancellation is best-effort — a cancel hook
+that stalls or never resolves cannot extend the caller's critical section.
+Non-OK bodies are cancelled without buffering; oversize or stalled bodies are
+cancelled too, without waiting on a cancellation hook. Failed scrapes log
+only `two-bot metrics scrape failed`: no response body,
 exception detail, token or URL. Empty/non-exposition, malformed or interrupted
 bodies, timeouts, and missing/duplicate/invalid alert inputs keep the previous
 firing set, counter baselines and streaks, and emit no `RESOLVED` — except the
@@ -530,10 +559,11 @@ exposition proxy, and ownership and bearer controls are unchanged.
   `404`. Unauthenticated requests never reach the container. `/metrics`
   itself stays `404`. The ownership control path (`/internal/ownership`)
   keeps its own gate and shares neither this bucket nor its budget.
-  The DO container fetch aborts after 6 s (`504`, generic body — the SDK
-  resolves aborts as a 500 Response, which is mapped to 504 without
-  proxying its text) and the upstream body is capped at 64 KiB
-  (larger → `502`, generic body).
+  The DO container fetch and its body read share one end-to-end 6 s
+  deadline (`504` at the deadline, generic body — the SDK resolves aborts
+  as a 500 Response, which is mapped to 504 without proxying its text, and
+  a fetch or stream that ignores abort still settles at the deadline) and
+  the upstream body is capped at 64 KiB (larger → `502`, generic body).
 - Rules live in `wrangler/src/alert-rules.ts`; each links to a
   [runbook](runbook.md#metrics-alerts) section (a test enforces the anchors):
 
@@ -542,6 +572,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `job_stale:<job>` | last success older than 2 x the job cadence (never-succeeded is ignored) | [job stale](runbook.md#alert-job-stale) |
 | `job_consecutive_failures:<job>` | `two_bot_job_consecutive_failures` >= 3 | [job failures](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s > 10% of REST requests between samples, >= 10 requests | [REST 429](runbook.md#alert-rest-429) |
+| `rest_5xx_rate` | 5xx responses > 10% of REST requests between samples, >= 10 requests | [REST 5xx](runbook.md#alert-rest-5xx) |
 | `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
 | `db_errors` | 3+ storage failures between samples (restarts skip the window) | [DB errors](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
@@ -553,6 +584,9 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `dispatch_drops:<lane>` | **ticket**, not page: `two_bot_dispatch_drops_total{lane}` grows in 3 consecutive completed sample windows per bounded lane; first sample is baseline, flat/reset clears, missing/invalid retains active alerts | [dispatch drops](runbook.md#alert-dispatch-drops) |
 | `job_unknown_stale:<job>` | **ticket**, not page: job without a cadence entry with no success for more than 2 hours (never-succeeded is ignored) | [job unknown stale](runbook.md#alert-job-unknown-stale) |
 | `gateway_checkpoint_failures` | any increase of `two_bot_gateway_checkpoint_failures_total` summed over every `stage` between samples (first sample is baseline-only; the 75 s runtime linger leaves ~3 s margin over a 60 s tick plus two 6 s probes for a pre-exit scrape, the post-restart reset resolves) | [checkpoint failures](runbook.md#alert-checkpoint-failures) |
+| `voice_join_fast_burn` | creator-join budget (99.5% moved within 5 s) burning faster than 14.4x in both the 1 h and 5 min windows; each window requires at least 10 genuine joins and two bad moves; receive counts lag one scrape and incomplete post-restart windows stay inactive | [voice join fast burn](runbook.md#alert-voice-join-fast-burn) |
+| `voice_join_slow_burn` | **ticket**, not page: same budget burning faster than 6x in both the 6 h and 30 min windows, with the same per-window volume and bad-move floors (sustained grind the fast rule never catches) | [voice join slow burn](runbook.md#alert-voice-join-slow-burn) |
+| `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` > 600 (two missed 5 min refreshes) with `two_bot_voice_creator_map_generation` > 0; generation 0 (never merged) never fires, missing gauges on older containers hold the previous state | [voice creator-map stale](runbook.md#alert-voice-creator-map-stale) |
 
 `dispatch_drops` covers `messages`, `interactions`, `registry`, `privileged`,
 `busy` and `reactions` independently (the Worker allowlist is pinned to Rust).

@@ -77,5 +77,5 @@ pub use internal_events::{event_status_name, scheduled_event_body, EventActionEr
 pub use pipeline::{
     build_cache, AuditEntryObserver, AuditLogObservation, ChannelClassifier, InviteSource,
     JoinObservation, JoinObserver, MemPipeline, MessageEligibility, NoClassification, NoInvites,
-    Pipeline, PipelineSnapshots, ScriptedInvites,
+    Pipeline, PipelineSnapshots, ScriptedInvites, SettingsChannelClassifier,
 };

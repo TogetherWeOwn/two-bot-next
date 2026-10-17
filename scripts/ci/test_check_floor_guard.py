@@ -41,6 +41,8 @@ SUPPORT_EXCEPTION = ("crates/*/tests/support/*.rs", "allow(dead_code)", date(202
 SUPPORT_PATH = "crates/core/tests/support/tracing_capture.rs"
 
 PATCH_ROW = "| Patch coverage | Changed lines >= 80% covered | llvm-cov | every Rust PR |\n"
+REAL_PATCH_ROW = "| Patch coverage | Changed lines >= 80% covered | `cargo llvm-cov` + `scripts/ci/check-patch-coverage.py`, `check` lane | every Rust PR |\n"
+MOVED_PATCH_ROW = "| Patch coverage | Changed lines >= 80% covered | `cargo llvm-cov --workspace --lib --bins --tests --features two-bot-core/db -- --include-ignored` + `scripts/ci/check-patch-coverage.py`, `rust-tests` lane with disposable Postgres | every Rust PR |\n"
 LINT_ROW = "| Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets -- -D warnings` | every Rust PR |\n"
 REAL_LINT_ROW = "| Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `check` lane | every Rust PR |\n"
 REAL_DEPENDENCIES_ROW = "| Dependencies | Nothing at high or above; advisories fail | `cargo-deny check all`, `check` lane | every PR |\n"
@@ -602,7 +604,38 @@ class ThresholdTests(unittest.TestCase):
         errors = gate.threshold_violations(base, head)
         self.assertTrue(any("Checked-by scope narrowed" in e for e in errors), errors)
 
-    def test_checked_by_real_row_rejects_dropped_check_lane(self):
+    def test_checked_by_patch_coverage_allows_moving_to_another_lane(self):
+        base = ENFORCED_BASE.replace(PATCH_ROW, REAL_PATCH_ROW)
+        head = base.replace(REAL_PATCH_ROW, MOVED_PATCH_ROW)
+        self.assertEqual(gate.threshold_violations(base, head), [])
+
+    def test_checked_by_patch_coverage_rejects_move_to_unapproved_lane(self):
+        base = ENFORCED_BASE.replace(PATCH_ROW, REAL_PATCH_ROW)
+        head = base.replace(
+            REAL_PATCH_ROW,
+            REAL_PATCH_ROW.replace("`check` lane", "`worker` lane"),
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Checked-by scope narrowed" in e for e in errors), errors)
+
+    def test_checked_by_patch_coverage_rejects_move_from_unapproved_lane(self):
+        worker_row = REAL_PATCH_ROW.replace("`check` lane", "`worker` lane")
+        base = ENFORCED_BASE.replace(PATCH_ROW, worker_row)
+        head = base.replace(
+            worker_row,
+            worker_row.replace("`worker` lane", "`rust-tests` lane"),
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Checked-by scope narrowed" in e for e in errors), errors)
+
+    def test_checked_by_real_row_rejects_unapproved_lane_migration(self):
+        base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW) + REAL_DEPENDENCIES_ROW
+        head = base.replace("`cargo-deny check all`, `check` lane",
+                            "`cargo-deny check all`, `rust-tests` lane")
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Checked-by scope narrowed" in e for e in errors), errors)
+
+    def test_checked_by_real_row_rejects_dropped_lane(self):
         base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW) + REAL_DEPENDENCIES_ROW
         head = base.replace(
             "`cargo-deny check all`, `check` lane",

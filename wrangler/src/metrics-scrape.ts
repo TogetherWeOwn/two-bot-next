@@ -17,6 +17,9 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
   two_bot_voice_operations_total: { op: ["create", "move", "delete"], outcome: ["success", "category_full", "discord", "persistence", "refused", "cancelled"] },
   two_bot_voice_dead_letters_total: { action: ["create", "move", "delete", "companion", "ownership", "kick", "rename", "limit", "other"] },
   two_bot_voice_orphans_total: {},
+  two_bot_voice_joins_received_total: {},
+  two_bot_voice_join_refused_total: { reason: ["halted", "access", "unknown_creator", "stale_ticket", "duplicate", "name_blocked", "other"] },
+  two_bot_voice_join_to_move_seconds_bucket: { le: ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf"] },
   two_bot_gateway_missed_events_total: {},
   two_bot_gateway_disconnects_total: {},
   two_bot_gateway_resumes_total: {},
@@ -33,10 +36,15 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
  * Optional inputs validated when present but never required. The job error-class
  * gauge postdates older containers: requiring it would turn a valid older
  * exposition into a failed scrape (no page at all) instead of the documented
- * classless page. The evaluator already tolerates its absence.
+ * classless page. The creator-map generation/age gauges are optional for the
+ * same reason: a rollback container without them must still scrape, with the
+ * staleness rule held rather than every rule silenced. The evaluator already
+ * tolerates their absence.
  */
 export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
   two_bot_job_last_error_class: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"], class: ["database", "rest", "configuration", "timeout", "panic", "feed", "recovery_required"] },
+  two_bot_voice_creator_map_generation: {},
+  two_bot_voice_creator_map_age_seconds: {},
 };
 
 /** Every series the validator checks: required plus optional-when-present. */

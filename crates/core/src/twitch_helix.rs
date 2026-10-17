@@ -12,8 +12,9 @@
 //!   refresh-before-expiry ([`TOKEN_REFRESH_SKEW_MS`]) and
 //!   [`parse_token_response`].
 //! - [`plan_boot_actions`]: the accumulated subscription list plus desired
-//!   broadcasters in, deletes-before-creates plan out. Pure: runs at boot and
-//!   after a `revocation`, never on a timer.
+//!   broadcasters in, deletes-before-creates plan out. Pure: holds no timers;
+//!   the bot runtime (`eventsub_reconcile`) runs it at startup and on a
+//!   bounded interval.
 //! - [`HelixClient`]: executes the plan over a [`HelixTransport`]. Tests
 //!   inject a scripted transport; production uses [`HyperHelixTransport`]
 //!   (hyper 1.x over rustls, one fresh client per request, fixed hosts only).
@@ -40,10 +41,10 @@ use hyper_util::rt::TokioExecutor;
 use thiserror::Error;
 use url::form_urlencoded;
 
+pub use crate::twitch_eventsub::HELIX_SUBSCRIPTIONS_URL;
 use crate::twitch_eventsub::{
     create_subscription_body, delete_subscription_url, parse_subscriptions, reconcile, CallbackUrl,
     EventSubError, ExistingSubscription, SubscriptionAction, WebhookSecret,
-    HELIX_SUBSCRIPTIONS_URL,
 };
 use crate::Secret;
 
@@ -554,6 +555,25 @@ impl<T: HelixTransport> HelixClient<T> {
                 .await?;
             let document: serde_json::Value = serde_json::from_slice(&response.body)
                 .map_err(|_| HelixError::BadResponse("subscription listing is not JSON"))?;
+            // A successful answer is only listing evidence when it is an
+            // object carrying a `data` array. `parse_subscriptions` is
+            // deliberately lenient per entry (other types, versions,
+            // transports and malformed entries are skipped), but a missing
+            // or non-array `data` envelope must not read as "no
+            // subscriptions": reconciliation would plan creates from
+            // invalid evidence, and a malformed later page would truncate
+            // the accumulated pages into partial success. Fail the whole
+            // listing instead; the message is static and carries no bytes
+            // from the response.
+            if document
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .is_none()
+            {
+                return Err(HelixError::BadResponse(
+                    "subscription listing has no data array",
+                ));
+            }
             subscriptions.extend(parse_subscriptions(&document));
 
             let next_cursor = match document.get("pagination") {

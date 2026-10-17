@@ -511,6 +511,8 @@ mod tests {
         let shared = state_with(GatewayState::Armed, None);
         shared.failure.record(GatewayFailure::durable_gateway(
             FailureClass::GatewayRuntimeFailed,
+            "gateway_run",
+            "none",
         ));
         let (status, json) = get(
             crate::server::router_with_guard(

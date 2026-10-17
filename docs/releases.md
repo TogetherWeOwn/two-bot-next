@@ -46,6 +46,11 @@ review to land.
 - Promoting a commit that already has a tag reuses that tag and only repairs a
   missing GitHub Release. Promoting a commit older than the newest release
   creates no tag.
+- Only the highest `vX.Y.Z` version is marked "Latest". A new cut and a repair
+  of the newest tag pass `--latest`; repairing an older tag passes an explicit
+  `--latest=false`, so the repair never moves "Latest" backward (omitting the
+  flag would let GitHub's automatic default pick the fresh repair). An older
+  tag whose release already exists stays an idempotent no-op.
 - Notes use only commit subjects (plus `BREAKING CHANGE:` footers), so a PR body
   can no longer drop a note. The `pr-lint` commit-parse guard
   (`.github/scripts/commit-parse-guard.cjs`, `.github/release-parse-exceptions.txt`)
@@ -70,7 +75,13 @@ gh workflow run release.yml --ref main -f dry_run=true
 `scripts/test-release-on-promote.cjs` (worker CI) pins the parsing, the bump
 rules and the note rendering. It also dry-runs the script on a throwaway git
 repository: the version, the rollback guard, `release-as`, the off-main refusal and an
-invalid SHA. `scripts/ci/test_workflows.py` and `scripts/test-deploy-production.py` pin
+invalid SHA. Its one non-dry-run case runs a fresh cut — an untagged commit
+above the highest tag — against a mocked `gh` and pins the single
+`release create` call's target and its `--latest` flag, the main promote path
+the dry runs never reach. `scripts/test-release-on-promote-latest-repair.cjs` (worker CI,
+`node --test`) pins "Latest" selection during repair against a mocked `gh`:
+an older repair keeps the newer Latest, the newest repair stays
+latest-eligible, and the no-op, untagged-rollback and dry-run guards hold. `scripts/ci/test_workflows.py` and `scripts/test-deploy-production.py` pin
 the workflow shapes and the `contents: write` grant on the release jobs.
 
 The root `src/lib.rs` release-metadata library was added for release-please's

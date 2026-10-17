@@ -18,6 +18,7 @@ import textwrap
 import threading
 import tomllib
 import unittest
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -198,10 +199,17 @@ class StaticGuardTests(unittest.TestCase):
     def test_wrangler_and_secrets_only_run_in_the_production_environment(self):
         production = children(JOBS["production"][1:], 4)
         self.assertEqual(value(production["environment"]), "production")
-        # Drift must block the deploy: the production job waits for the guard
-        # and the prod schema gate. A rollback serves no new schema and waives
-        # the ledger check inside the reviewed gate script, never here.
-        self.assertEqual(value(production["needs"]), "[guard, schema-gate]")
+        # Drift must block the deploy: the production job waits for the guard,
+        # the prod schema gate and the prod roles gate. A rollback serves no
+        # new schema and waives the ledger check inside the reviewed gate
+        # script, never here.
+        self.assertEqual(value(production["needs"]), "[guard, schema-gate, roles-gate]")
+        for gate in ("schema-gate", "roles-gate"):
+            condition = value(children(JOBS[gate][1:], 4)["if"])
+            self.assertEqual(condition, "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'")
+        production_if = value(children(JOBS["production"][1:], 4)["if"])
+        self.assertIn("needs.guard.outputs.mode == 'rollback'", production_if)
+        self.assertIn("needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'", production_if)
         guard = children(JOBS["guard"][1:], 4)
         self.assertNotIn("environment", guard)
         self.assertNotIn("secrets.", "\n".join(JOBS["guard"]))
@@ -220,7 +228,7 @@ class StaticGuardTests(unittest.TestCase):
 
     def test_every_job_uses_the_shared_runner_routing(self):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
-        self.assertEqual(list(JOBS), ["guard", "schema-gate", "production", "release"])
+        self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "production", "release"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
@@ -421,7 +429,8 @@ class GuardBehaviourTests(unittest.TestCase):
               ref="refs/heads/main", auto="", **responses):
         if image is None:
             image = IMAGE if rollback else ""
-        api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]}, **responses}
+        api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
+               "production-readyz": {"status": 200, "build_revision": SHA}, **responses}
         calls = []
         resolved = sha.strip().lower() or (SHA if not rollback else "")
 
@@ -486,17 +495,39 @@ class GuardBehaviourTests(unittest.TestCase):
                 ]}
             return result if isinstance(result, str) else json.dumps(result)
 
+        def fake_urlopen(request, timeout):
+            self.assertIsInstance(request, urllib.request.Request)
+            self.assertEqual(request.get_header("User-agent"), AGENT)
+            calls.append(("production-readyz", {"url": request.full_url, "timeout": timeout}))
+            response = api["production-readyz"]
+
+            class ReadyResponse:
+                status = response.get("status", 200)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_):
+                    return False
+
+                def read(self):
+                    return json.dumps(response).encode()
+
+            return ReadyResponse()
+
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             output, summary = Path(tmp) / "output", Path(tmp) / "summary"
             env = {
                 "GITHUB_REPOSITORY": REPO, "GITHUB_REF": ref, "SHA": sha, "ROLLBACK": rollback,
                 "IMAGE": image, "TAKEOVER": takeover, "ALLOW_UNSTAGED": allow_unstaged,
+                "PRODUCTION_WORKER_URL": "https://production.example.test",
                 "AUTO_APPROVE": auto,
                 "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
             }
             stdout, code = io.StringIO(), 0
             with patch.dict(os.environ, env, clear=True), \
                     patch("subprocess.check_output", side_effect=fake_check_output), \
+                    patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                     contextlib.redirect_stdout(stdout):
                 try:
                     exec(GUARD, {})
@@ -607,6 +638,13 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("never blocks recovery", summary)
         self.assertFalse(any("deploy-staging" in path for path, _ in calls))
 
+    def test_live_sha_waiver_requires_live_readyz_revision(self):
+        result = self.guard(
+            takeover="true", allow_unstaged="true",
+            **{"production-readyz": {"build_revision": "f" * 40}},
+        )
+        self.assertRefused(result, "live production build revision does not match requested SHA")
+
     def test_live_sha_takeover_redeploy_waives_staging_history(self):
         # The owner's first-response cure for a stale bot: re-serve the live
         # SHA with takeover when staging history aged out.
@@ -617,7 +655,22 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
                                    "takeover": "true", "allow_unstaged": "true"})
         self.assertIn("operator confirms the SHA is live", summary)
+        self.assertIn(("production-readyz", {"url": "https://production.example.test/readyz", "timeout": 10}), calls)
         self.assertFalse(any("deploy-staging" in path for path, _ in calls))
+
+    def test_live_sha_waiver_accepts_parked_readyz_only_with_matching_revision(self):
+        result = self.guard(
+            takeover="true", allow_unstaged="true",
+            **{"production-readyz": {"status": 503, "build_revision": SHA}},
+        )
+        self.assertEqual(result[0], 0)
+
+    def test_live_sha_waiver_refuses_unexpected_readyz_status(self):
+        result = self.guard(
+            takeover="true", allow_unstaged="true",
+            **{"production-readyz": {"status": 500, "build_revision": SHA}},
+        )
+        self.assertRefused(result, "unexpected status 500")
 
     def test_allow_unstaged_needs_takeover_and_deploy_mode(self):
         result = self.guard(allow_unstaged="true")
@@ -930,6 +983,10 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("../tooling/wrangler/scripts/production-ownership-control.mjs", production)
         self.assertIn("tooling/scripts/ci/production_schema_gate.py",
                       "\n".join(JOBS["schema-gate"]))
+        roles_gate = "\n".join(JOBS["roles-gate"])
+        self.assertIn("path: tooling", roles_gate)
+        self.assertIn("ref: ${{ github.sha }}", roles_gate)
+        self.assertIn("tooling/scripts/ci/roles_gate.py", roles_gate)
 
     def test_api_failures_fail_closed(self):
         for key in ("compare", "ci-runs", "ci-run", "ci-jobs", "ci-ok", "worker check", "staging", "branches"):
@@ -1296,7 +1353,7 @@ class ShellStepTests(unittest.TestCase):
                                                        ["database", "ready"], ["token_invalid", "ready"]],
                                        "jobs": {}, "build_revision": "unknown", "build_id": "unknown"})
         pre_stamp = report(revision="unknown", build_id="unknown")
-        for status, body in (("503", pre_stamp), ("200", parked_pre_stamp), ("503", parked_pre_stamp)):
+        for status, body in ((503, pre_stamp), (200, parked_pre_stamp), (503, parked_pre_stamp)):
             with self.subTest(status=status):
                 code, summary, _ = self.gate({"/health": [(200, "{}")], "/readyz": [(status, body)]},
                                              mode="rollback")

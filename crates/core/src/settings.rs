@@ -129,6 +129,8 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     // --- a web form must never enable the ingress or see the secret. ---
     ("TWO_EVENTSUB", SettingClass::EnvOnly),
     ("TWO_EVENTSUB_BIND", SettingClass::EnvOnly),
+    ("TWO_TWITCH_BROADCASTERS", SettingClass::EnvOnly),
+    ("TWO_TWITCH_CALLBACK_URL", SettingClass::EnvOnly),
     ("TWO_TWITCH_CLIENT_ID", SettingClass::EnvOnly),
     ("TWO_TWITCH_CLIENT_SECRET", SettingClass::EnvOnly),
     ("TWO_TWITCH_WEBHOOK_SECRET", SettingClass::EnvOnly),
@@ -263,6 +265,8 @@ pub const HOT_WIRED: &[&str] = &[
     "TWO_AUTOMOD_REPEAT_WINDOW_SECONDS",
     "TWO_AUTOMOD_SANCTIONS",
     "TWO_FEED_POLL_SECONDS",
+    "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
+    "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
 ];
 
 /// The catalogue class for `key`, or `None` for a name this file has never
@@ -974,6 +978,8 @@ mod tests {
         "TWO_STAGING_RESTART_CONTAINMENT",
         "TWO_STAGING_RESTART_SYNTHETIC_ACTORS",
         "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
+        "TWO_TWITCH_BROADCASTERS",
+        "TWO_TWITCH_CALLBACK_URL",
         "TWO_TWITCH_CLIENT_ID",
         "TWO_TWITCH_CLIENT_SECRET",
         "TWO_TWITCH_WEBHOOK_SECRET",
@@ -991,7 +997,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 128, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 130, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,
@@ -1033,7 +1039,7 @@ mod tests {
 
     #[test]
     fn hot_wired_is_a_hot_subset() {
-        assert_eq!(HOT_WIRED.len(), 22);
+        assert_eq!(HOT_WIRED.len(), 24);
         for key in HOT_WIRED {
             assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
         }

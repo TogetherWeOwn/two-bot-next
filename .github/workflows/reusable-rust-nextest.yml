@@ -1,10 +1,11 @@
 name: reusable rust nextest
 
-# Shared Rust nextest lane (SDLC 2.3 CI speed pilot). Org-level home is
-# TogetherWeOwn/.github (.github/workflows/rust-nextest.yml), called via
-# `uses:` with a pinned SHA like the test-guard precedent; this file is the
-# same content with a local path so the pilot runs before the central move.
-# Advisory only: no required check calls it, and it never reports ci-ok.
+# Shared Rust nextest lane (SDLC 2.3 CI speed pilot, promoted to required).
+# Org-level home is TogetherWeOwn/.github (.github/workflows/rust-nextest.yml),
+# called via `uses:` with a pinned SHA like the test-guard precedent; this
+# file is the same content with a local path so the pilot runs before the
+# central move. Required: check.yml calls it as the `nextest` job, gated by
+# the rust selector and aggregated by `ci-ok`.
 
 on:
   workflow_call:
@@ -12,6 +13,11 @@ on:
       ref:
         description: Full head SHA the caller checked out for selection
         required: true
+        type: string
+      quarantine:
+        description: Whitespace-separated nextest filters to skip (red-group ejection without a revert; empty runs everything)
+        required: false
+        default: ''
         type: string
     secrets:
       SCCACHE_BUCKET:
@@ -36,7 +42,7 @@ permissions: {}
 
 jobs:
   nextest:
-    name: rust nextest (advisory)
+    name: rust nextest
     permissions:
       contents: read
     # Runner routing (TOG-12339): public repo -> GitHub-hosted, private ->
@@ -103,21 +109,42 @@ jobs:
           exit 1
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
 
-      # PR isolation first: on pull_request events sccache stays on local disk
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
+
+      # PR and merge-queue isolation first: sccache stays on local disk
       # only and no shared-backend credential is written anywhere. R2 write
-      # credentials must never reach PR-built code (this lane compiles and
-      # executes build scripts and tests at the PR head, and a shared R2
-      # bucket has no per-PR scope, so a PR could poison objects a later
-      # main build links). The GitHub-cache backend stays off PRs too: its
-      # entries share the repo Actions cache quota with the warm `check`
-      # entry the required lanes restore, so an advisory lane must not grow
-      # it. Off-PR runs (push to main, workflow_dispatch) use R2 when the
-      # caller passed all the pins, else the GitHub-cache backend. Values
-      # travel via the environment file, never the log: secrets stay masked.
+      # credentials must never reach PR- or merge-queue-built code (this lane
+      # compiles and executes build scripts and tests at a head that is not
+      # on `main` yet, and a shared R2 bucket has no per-PR scope, so a PR
+      # could poison objects a later main build links). The GitHub-cache
+      # backend stays off PRs and the merge queue too: its entries share the
+      # repo Actions cache quota with the warm `check` entry the required
+      # lanes restore, so a non-main lane must not grow it. Push-to-main and
+      # workflow_dispatch runs use R2 when the caller passed all the pins,
+      # else the GitHub-cache backend. Values travel via the environment
+      # file, never the log: secrets stay masked.
       - name: Select sccache backend (R2 when pinned, GitHub cache otherwise)
         env:
           R2_BUCKET: ${{ secrets.SCCACHE_BUCKET }}
@@ -129,20 +156,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$NEXTEST_EVENT" = "pull_request" ]; then
-            echo "sccache backend: local disk only (no shared writes on PRs)"
-          elif [ -n "$R2_BUCKET" ] && [ -n "$R2_ENDPOINT" ] && [ -n "$R2_KEY" ] && [ -n "$R2_SECRET" ]; then
-            {
-              echo "SCCACHE_BUCKET=$R2_BUCKET"
-              echo "SCCACHE_ENDPOINT=$R2_ENDPOINT"
-              echo "SCCACHE_REGION=${R2_REGION:-auto}"
-              echo "AWS_ACCESS_KEY_ID=$R2_KEY"
-              echo "AWS_SECRET_ACCESS_KEY=$R2_SECRET"
-            } >> "$GITHUB_ENV"
-            echo "sccache backend: R2"
+          if [ "$NEXTEST_EVENT" = "push" ] || [ "$NEXTEST_EVENT" = "workflow_dispatch" ]; then
+            if [ -n "$R2_BUCKET" ] && [ -n "$R2_ENDPOINT" ] && [ -n "$R2_KEY" ] && [ -n "$R2_SECRET" ]; then
+              {
+                echo "SCCACHE_BUCKET=$R2_BUCKET"
+                echo "SCCACHE_ENDPOINT=$R2_ENDPOINT"
+                echo "SCCACHE_REGION=${R2_REGION:-auto}"
+                echo "AWS_ACCESS_KEY_ID=$R2_KEY"
+                echo "AWS_SECRET_ACCESS_KEY=$R2_SECRET"
+              } >> "$GITHUB_ENV"
+              echo "sccache backend: R2"
+            else
+              echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+              echo "sccache backend: GitHub cache"
+            fi
           else
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-            echo "sccache backend: GitHub cache"
+            echo "sccache backend: local disk only (no shared writes on PRs, the merge queue, or other events)"
           fi
 
       - name: Start sccache
@@ -150,8 +179,8 @@ jobs:
 
       # Restore-only: the warm `check` entry in check.yml owns the registry
       # write, so this step never saves. sccache is the only shared-cache
-      # writer left, and only off-PR (R2 or GitHub cache on push to main;
-      # local disk on pull_request per the backend step above).
+      # writer left, and only on push to main or workflow_dispatch (R2 or
+      # GitHub cache; local disk everywhere else per the backend step above).
       - name: Restore cargo registry cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -171,9 +200,15 @@ jobs:
           createdb -h agent-testdb -U agent_test two_next_backup_publication_ci
           printf 'PAPERCLIP_RUN_SCRATCH_DIR=%s/two-bot-check-scratch\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
-      # Advisory pilot scope: workspace lib/bins via nextest (retries=1 and
+      # Required scope: workspace lib/bins via nextest (retries=1 and
       # JUnit come from .config/nextest.toml profile `ci`). A fail-then-pass
       # retry is reported flaky, not red; the ledger step still runs.
+      # `inputs.quarantine` ejects a red group without a revert: each
+      # whitespace-separated filter becomes one `--skip` (test-name
+      # substrings, no spaces), so the rest of the suite still gates. The
+      # skips travel AFTER the `--` separator: pinned cargo-nextest 0.9.99
+      # only accepts `--skip` as an emulated libtest argument there, and a
+      # `--skip` before `--` fails the whole lane with a usage error.
       # JUnit `path = "junit.xml"` in .config/nextest.toml is profile-store
       # relative (target/nextest/ci/junit.xml), not workspace-root. Resolve it
       # and copy to the workspace root so the parse/upload steps below see one
@@ -182,10 +217,21 @@ jobs:
       - name: cargo nextest (unit and binary, retries=1, JUnit)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          QUARANTINE: ${{ inputs.quarantine }}
         shell: bash
         run: |
           status=0
-          cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci || status=$?
+          skip_args=()
+          # Word splitting is the mechanism: filters are test-name
+          # substrings and never contain spaces.
+          for filter in $QUARANTINE; do
+            skip_args+=(--skip "$filter")
+          done
+          # One command line for both quarantine states so a flag cannot
+          # drift in only one branch: the expansion appends `--` plus the
+          # skips when the array is non-empty and nothing when it is empty
+          # (behaviorally pinned in scripts/ci/test_workflows.py).
+          cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci ${skip_args[@]:+-- "${skip_args[@]}"} || status=$?
           for candidate in target/nextest/ci/junit.xml junit.xml; do
             if [ -f "$candidate" ]; then
               cp "$candidate" junit.xml

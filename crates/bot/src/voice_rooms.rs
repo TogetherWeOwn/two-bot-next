@@ -16,7 +16,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex, RwLock, Weak,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -2503,8 +2503,13 @@ pub struct GuildRoomWorker<S, H> {
     /// re-read; the maintenance tick merges it, debounced. Set by
     /// `ActorCommand::RefreshCreators`, cleared by `reload_creators`.
     creators_refresh_due: bool,
-    /// Actor clock of the last creator-view merge (periodic refresh).
+    /// Actor clock of the last creator refresh *attempt* (success or
+    /// failure); paces the interval/debounce retries.
     creators_read_ms: Option<u64>,
+    /// Actor clock of the last *successful* creator-view merge. The age
+    /// gauge counts from this field only, so it keeps climbing through a
+    /// store outage instead of resetting on every failed attempt.
+    creators_merged_ms: Option<u64>,
     /// Live generation the creator view was last merged at. A gateway
     /// reconnect (GuildCreate/Resumed) bumps the generation but sends no
     /// channel event, so with no RefreshCreators flag the merge would wait
@@ -2897,6 +2902,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             creators,
             creators_refresh_due: false,
             creators_read_ms: None,
+            creators_merged_ms: None,
             creators_generation,
             creator_misses: HashSet::new(),
             creator_revalidate_cooldown_until: None,
@@ -3278,6 +3284,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         match self.store.creators(self.live.guild_id).await {
             Ok(rows) => {
                 self.creators_generation = generation;
+                self.creators_merged_ms = Some(now_ms);
                 self.creator_misses.clear();
                 self.creator_revalidate_cooldown_until = None;
                 let mut added = 0u64;
@@ -6818,6 +6825,42 @@ struct PendingImport {
     expires_at: Instant,
 }
 
+/// Reply for a command whose required guild-role facts have not loaded
+/// yet: retryable, never a permanent permission denial.
+const WARMING_UP_REPLY: &str =
+    "Voice commands are warming up while I load this server's permissions. Please try again shortly.";
+
+/// Whether guild-role authority could be established for an interaction.
+/// `WarmingUp` covers absent, unready, disconnected or incomplete
+/// guild-role facts; `MissingMember` covers an interaction without the
+/// member/user facts needed to evaluate authority at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuildAuthority {
+    Ready(Permissions),
+    WarmingUp,
+    MissingMember,
+}
+
+/// Commands gated on guild-role authority (`may_create`, the admin flag,
+/// or `may_manage_server`). Only these get the warming-up reply when cold;
+/// commands that do not depend on that authority keep their behaviour.
+fn requires_guild_authority(command: &VoiceCommand) -> bool {
+    matches!(
+        command,
+        VoiceCommand::Create { .. }
+            | VoiceCommand::TextChannels { .. }
+            | VoiceCommand::Position { .. }
+            | VoiceCommand::Group { .. }
+            | VoiceCommand::InheritPermissions { .. }
+            | VoiceCommand::DefaultLimit { .. }
+            | VoiceCommand::AlwaysPrivate { .. }
+            | VoiceCommand::Access(_)
+            | VoiceCommand::Logging(_)
+            | VoiceCommand::Export
+            | VoiceCommand::Import { .. }
+    )
+}
+
 pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,
@@ -6955,23 +6998,53 @@ where
         interaction: &Interaction,
         now_micros: i128,
     ) -> Option<Permissions> {
-        let guild = interaction_guild(interaction)?;
-        let member = interaction.member.as_ref()?;
-        let member_id = member.user.as_ref()?.id.get();
-        let actor = self.live_actor(guild)?;
+        match self.guild_authority_at(interaction, now_micros) {
+            GuildAuthority::Ready(permissions) => Some(permissions),
+            GuildAuthority::WarmingUp | GuildAuthority::MissingMember => None,
+        }
+    }
+
+    fn guild_authority(&self, interaction: &Interaction) -> GuildAuthority {
+        self.guild_authority_at(
+            interaction,
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000,
+        )
+    }
+
+    /// Tri-state behind [`Self::guild_permissions_at`]: a generic `None`
+    /// cannot tell a cold snapshot (retryable) from a missing member
+    /// (malformed, never relabelled as warm-up). Missing/disconnected or
+    /// incomplete guild-role facts are `WarmingUp` and stay fail-closed.
+    fn guild_authority_at(&self, interaction: &Interaction, now_micros: i128) -> GuildAuthority {
+        let Some(guild) = interaction_guild(interaction) else {
+            return GuildAuthority::MissingMember;
+        };
+        let Some(member) = interaction.member.as_ref() else {
+            return GuildAuthority::MissingMember;
+        };
+        let Some(member_id) = member.user.as_ref().map(|user| user.id.get()) else {
+            return GuildAuthority::MissingMember;
+        };
+        let Some(actor) = self.live_actor(guild) else {
+            return GuildAuthority::WarmingUp;
+        };
         let live = actor.live.read_state();
         if !live.ready {
-            return None;
+            return GuildAuthority::WarmingUp;
         }
-        let bot = live.bot.as_ref()?;
-        let mut permissions = effective_permissions(
+        let Some(bot) = live.bot.as_ref() else {
+            return GuildAuthority::WarmingUp;
+        };
+        let Some(mut permissions) = effective_permissions(
             guild,
             bot.guild_owner_id,
             member_id,
             &member.roles,
             &bot.roles,
             &[],
-        )?;
+        ) else {
+            return GuildAuthority::WarmingUp;
+        };
         // Discord exempts the guild owner and Administrator, both of which
         // effective_permissions resolves to all bits. Other timed-out members
         // retain only their existing View Channel and Read Message History bits.
@@ -6983,7 +7056,7 @@ where
         {
             permissions &= Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY;
         }
-        Some(permissions)
+        GuildAuthority::Ready(permissions)
     }
 
     fn ensure_actor(&self, guild: Snowflake) -> Option<GuildActor> {
@@ -7770,10 +7843,62 @@ fn watchdog_due(
     queue_nonempty && now.saturating_duration_since(last_progress) >= stuck_after
 }
 
+/// Creator-map staleness on the actor-uptime clock: seconds since the last
+/// successful merge; 0 when never merged. Pure, unit-tested: the gauge must
+/// keep climbing between merges instead of freezing at the merge-time zero.
+fn creator_map_age_secs(creators_merged_ms: Option<u64>, now_ms: u64) -> u64 {
+    creators_merged_ms.map_or(0, |last| now_ms.saturating_sub(last) / 1000)
+}
+
+/// Process-wide guild-actor incarnation counter for the per-actor stall
+/// gauges. Each actor loop start takes the next generation, so a
+/// replacement actor's first publish retires the old incarnation's
+/// contribution and late publishes from the old incarnation (e.g. its
+/// watchdog sibling outliving it by a tick) are fenced out.
+static VOICE_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn next_voice_actor_generation() -> u64 {
+    VOICE_ACTOR_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1)
+}
+
+/// Retires one actor incarnation's stall-gauge contribution when the
+/// actor loop ends — including a panic unwind, which skips the loop's
+/// own shutdown steps. Retirement fences the watchdog sibling first:
+/// setting `retired` under the snapshot lock (the lock the sibling
+/// publishes under) means an in-flight sibling publish either completes
+/// before the removal or never happens, so it cannot resurrect the
+/// contribution after removal. A dead weak means no sibling can publish
+/// again, which fences it the same way.
+struct VoiceActorMetricGuard<H> {
+    actor: Snowflake,
+    generation: u64,
+    stall: Weak<StallShared<H>>,
+}
+
+impl<H> Drop for VoiceActorMetricGuard<H> {
+    fn drop(&mut self) {
+        if let Some(stall) = self.stall.upgrade() {
+            let _state = stall
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            stall.retired.store(true, Ordering::Relaxed);
+        }
+        metrics::global().remove_voice_actor(self.actor, self.generation);
+    }
+}
+
 /// Publish the per-tick stall gauges: halt latch plus per-lane queue depth
-/// and oldest-pending age. Cheap atomics; called every actor tick so
-/// `/ops/metrics` always shows the worker's stall posture.
-fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWorker<S, H>) {
+/// and oldest-pending age, as this guild actor incarnation's contribution
+/// to the process-wide aggregates. Cheap atomics; called every actor tick
+/// so `/ops/metrics` always shows the worker's stall posture.
+fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(
+    worker: &GuildRoomWorker<S, H>,
+    generation: u64,
+    now_ms: u64,
+) {
     let guild = worker.live.guild_id;
     let (urgent, deferred) = worker.queue.pending_counts(guild);
     let oldest_age_secs = worker
@@ -7781,12 +7906,18 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWor
         .oldest_pending_age(guild)
         .map_or(0, |age| age.as_secs());
     let gauges = metrics::global();
-    gauges.set_voice_halted(worker.halted());
+    gauges.set_voice_actor_halted(guild, generation, worker.halted());
+    gauges.set_voice_creator_map(
+        worker.creators_generation,
+        creator_map_age_secs(worker.creators_merged_ms, now_ms),
+    );
     // Recompute the in-flight REST age from attempts still live, so the
     // gauge shows a currently-stalled request instead of the begin/drop
     // snapshots (0 at begin, already removed at drop).
     worker.http.republish_rest_age();
-    gauges.set_voice_queue(
+    gauges.set_voice_actor_queue(
+        guild,
+        generation,
         u64::try_from(urgent).unwrap_or(u64::MAX),
         u64::try_from(deferred).unwrap_or(u64::MAX),
         oldest_age_secs,
@@ -7802,7 +7933,18 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWor
 /// main task recovers once the write returns.
 struct StallShared<H> {
     guild: Snowflake,
+    /// Actor incarnation generation for the per-actor stall gauges; the
+    /// sibling publishes under the same generation as the main task.
+    generation: u64,
+    /// Set by the metric guard under the `state` lock when the actor loop
+    /// ends; `observe` checks it under the same lock before publishing,
+    /// so no sibling publish can follow the contribution's removal.
+    retired: AtomicBool,
     http: Arc<H>,
+    /// Actor start instant: the sibling computes the creator-map age from
+    /// the stored merge stamp on this clock, so the age keeps climbing
+    /// while the main task (and its snapshots) are hung in a dispatch.
+    start: tokio::time::Instant,
     state: Mutex<StallState>,
 }
 
@@ -7813,6 +7955,8 @@ struct StallState {
     deferred: usize,
     oldest_age_secs: u64,
     halted: bool,
+    creators_generation: u64,
+    creators_merged_ms: Option<u64>,
 }
 
 impl<H: RoomWrites> StallShared<H> {
@@ -7833,24 +7977,49 @@ impl<H: RoomWrites> StallShared<H> {
             deferred,
             oldest_age_secs,
             halted: worker.halted(),
+            creators_generation: worker.creators_generation,
+            creators_merged_ms: worker.creators_merged_ms,
         };
+    }
+
+    /// Creator-map age for a snapshot, computed on the sibling's own clock:
+    /// a frozen snapshot (hung dispatch) still yields a climbing age.
+    fn snapshot_creator_map_age_secs(&self, snap: &StallState) -> u64 {
+        let now_ms = self.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        creator_map_age_secs(snap.creators_merged_ms, now_ms)
     }
 
     /// Watchdog + gauge publish from the shared snapshot. Reads only: safe
     /// to run on the sibling task while the main task is hung in dispatch.
     fn observe(&self, stuck_after: Duration, last_fire: &mut Option<tokio::time::Instant>) {
-        let snap = *self.state.lock().expect("stall snapshot lock");
-        // Recompute the in-flight REST age from attempts still live, so the
-        // gauge shows a currently-stalled request instead of the begin/drop
-        // snapshots (0 at begin, already removed at drop).
-        self.http.republish_rest_age();
-        let gauges = metrics::global();
-        gauges.set_voice_halted(snap.halted);
-        gauges.set_voice_queue(
-            u64::try_from(snap.urgent).unwrap_or(u64::MAX),
-            u64::try_from(snap.deferred).unwrap_or(u64::MAX),
-            snap.oldest_age_secs,
-        );
+        // Publish under the snapshot lock: the metric guard sets `retired`
+        // under the same lock before removing this actor's contribution,
+        // so a publish either lands before that removal or not at all.
+        let snap = {
+            let state = self.state.lock().expect("stall snapshot lock");
+            if self.retired.load(Ordering::Relaxed) {
+                return;
+            }
+            let snap = *state;
+            // Recompute the in-flight REST age from attempts still live, so
+            // the gauge shows a currently-stalled request instead of the
+            // begin/drop snapshots (0 at begin, already removed at drop).
+            self.http.republish_rest_age();
+            let gauges = metrics::global();
+            gauges.set_voice_actor_halted(self.guild, self.generation, snap.halted);
+            gauges.set_voice_actor_queue(
+                self.guild,
+                self.generation,
+                u64::try_from(snap.urgent).unwrap_or(u64::MAX),
+                u64::try_from(snap.deferred).unwrap_or(u64::MAX),
+                snap.oldest_age_secs,
+            );
+            gauges.set_voice_creator_map(
+                snap.creators_generation,
+                self.snapshot_creator_map_age_secs(&snap),
+            );
+            snap
+        };
         // Stuck-worker watchdog: queued work with no completed turn for the
         // full window. Log + metric only; the queue keeps its retries so a
         // transient outage still drains on recovery.
@@ -7885,6 +8054,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     tick: Duration,
     limits: ActorLimits,
 ) {
+    let generation = next_voice_actor_generation();
     let start = tokio::time::Instant::now();
     let mut timer = tokio::time::interval(tick);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -7899,16 +8069,29 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     // gauges. The sibling never touches `worker`.
     let stall = Arc::new(StallShared {
         guild: worker.live.guild_id,
+        generation,
+        retired: AtomicBool::new(false),
         http: Arc::clone(&worker.http),
+        start,
         state: Mutex::new(StallState {
             last_progress,
             urgent: 0,
             deferred: 0,
             oldest_age_secs: 0,
             halted: false,
+            creators_generation: 0,
+            creators_merged_ms: None,
         }),
     });
     stall.snapshot(worker, last_progress);
+    // Retires this incarnation's stall contribution on every exit path
+    // (inbox close or panic unwind). Declared after `stall`, so it drops
+    // while the strong ref is still alive and its retire fence can engage.
+    let _metric_guard = VoiceActorMetricGuard {
+        actor: worker.live.guild_id,
+        generation,
+        stall: Arc::downgrade(&stall),
+    };
     let stop_watchdog = Arc::new(AtomicBool::new(false));
     let watchdog = {
         // Weak, not a clone: the actor task owns the only strong ref. If a
@@ -7984,7 +8167,8 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 dispatch_budget = dispatch_budget.saturating_sub(1);
             }
             _ = timer.tick() => {
-                publish_voice_gauges(worker);
+                let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                publish_voice_gauges(worker, generation, now_ms);
                 // The stuck-worker watchdog lives on the sibling task now, so
                 // it fires while a dispatch is hung: see `StallShared`. The
                 // tick arm keeps the fresh gauge publish plus recovery below.
@@ -8057,6 +8241,9 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 maintenance_ready = false;
                 let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 worker.reload_creators(now_ms).await;
+                // Republish the merge stamp now, not next tick: until then
+                // the watchdog sibling would keep ageing the pre-merge stamp.
+                stall.snapshot(worker, last_progress);
                 worker.reload_name_settings(now_ms).await;
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
@@ -10739,6 +10926,15 @@ where
     let Some(command) = runtime.parse_voice_command(interaction) else {
         return false;
     };
+    // Cold guild-role facts are not a permanent denial: a command that
+    // needs that authority gets the retryable warming-up reply and fails
+    // closed before any gate read or protected effect. Missing-member
+    // interactions keep their existing handling.
+    let authority = runtime.guild_authority(interaction);
+    if matches!(authority, GuildAuthority::WarmingUp) && requires_guild_authority(&command) {
+        reply(ephemeral_response(WARMING_UP_REPLY)).await;
+        return true;
+    }
     // Guild-level role gate first. Settings that cannot be read fail closed for
     // members: only an admin proceeds without them.
     let member = access_member(interaction, runtime.guild_permissions(interaction));
@@ -11466,6 +11662,13 @@ where
     }
     let permissions = runtime.guild_permissions(interaction);
     if !may_manage_server(permissions) {
+        if matches!(
+            runtime.guild_authority(interaction),
+            GuildAuthority::WarmingUp
+        ) {
+            reply(ephemeral_response(WARMING_UP_REPLY)).await;
+            return true;
+        }
         reply(ephemeral_response(
             "You need Manage Server to confirm an import.",
         ))

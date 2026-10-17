@@ -146,10 +146,10 @@ Look for these literal messages:
 - `gateway shard loop started` / `gateway reconnect failed; Twilight will retry`.
 - `durable gateway failed; checkpoint unchanged, readiness unavailable` — fatal
   initialization failure; underlying SQL error deliberately not logged. Its
-  `error_class` is also on `/readyz` as `gateway_failure` for 15 s before exit
-  (startup failures linger 15 s; only a running-gateway failure lingers 75 s)
-  and in Workers Logs as `container_gateway_failure` (see
-  [startup-diagnostics.md](startup-diagnostics.md)).
+  `error_class` plus the failing step and SQLSTATE code are also on `/readyz`
+  as `gateway_failure` for 15 s before exit (startup failures linger 15 s;
+  only a running-gateway failure lingers 75 s) and in Workers Logs as
+  `container_gateway_failure` (see [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
 - Worker: `two-bot container started|stopped`, `two-bot /readyz unhealthy`,
   `two-bot keepalive probe failed`, `two-bot container error`.
@@ -276,6 +276,39 @@ Unknown, wrong-method and overlong shapes collapse to `other` with no new
 series. Source: [`metrics.rs`](../crates/core/src/metrics.rs),
 [`executor_metrics.rs`](../crates/discord/src/executor_metrics.rs).
 
+#### Alert: REST 5xx
+
+More than 10% of Discord REST requests between two keepalive samples (minimum
+10 requests in the window) returned 5xx. Unlike 429s, a 5xx burst is never
+healthy backpressure: it is Discord-side failure or a broken request shape
+from a fresh deploy. A counter reset (process restart) skips the window rather
+than firing. `transport` failures (timeouts and cancellations before response
+headers) are not counted here; they surface through job timeout classes.
+
+First response: read the hot route from the `route` label on
+`two_bot_rest_requests_total{route,result="5xx"}` via the authorized
+`/ops/metrics` scrape; confirm whether a deploy or promotion is in progress
+(check the staging workflow result and recent merges — a fresh deploy can
+explain a new hot route). Do not replay uncertain writes: a 5xx leaves the
+effect unknown, so reconcile through the recorded disposition before retrying
+anything the burst may have executed twice.
+
+Evaluate rollback when the burst starts with the deployed revision: compare the
+alert's first-firing window with the staging-rollout evidence (or the gated
+production run) for that SHA. A 5xx share introduced by a promotion stage
+requires a manual rollback decision unless a promotion stage invokes the
+`evaluatePromotionGate` helper (`wrangler/src/alert-rules.ts`, 5xx-only) and
+fails on its verdict. When that configured gate fails, the existing per-stage
+auto-rollback (staging verify, production gate, or the shared
+gradual-promotion action once wired) restores the recorded pre-promote
+version; a manual rollback names the recorded Worker version and container
+image from the failed run's snapshot. A burst on an unchanged revision is a
+Discord incident or a dependency regression, not a rollback.
+
+Escalate when the 5xx share stays above threshold across several windows after
+containment, or when 5xx coincide with 429/transport failures suggesting a
+wider Discord or network incident.
+
 #### Alert: DB pool
 
 The SQLx pool sat at its maximum with zero idle connections for three
@@ -384,6 +417,66 @@ Escalate when failures persist across windows after the suspect deploy is
 identified, when a dead-letter or orphan names a stranded member, or when
 failures coincide with 429, DB-error or pool alerts — the fix then belongs
 to the on-call engineer, not another redeploy.
+
+#### Alert: voice join fast burn
+
+Creator joins are burning the 99.5%-moved-within-5 s error budget faster than
+14.4x in both the last hour and the last 5 minutes
+(`two_bot_voice_joins_received_total` minus benign `duplicate` refusals in
+`two_bot_voice_join_refused_total`, against
+`two_bot_voice_join_to_move_seconds_bucket{le="5"}`). Every non-duplicate
+refusal, failed move and slow (>5 s) move is burn. Each window needs at least
+10 genuine joins and two bad moves; one event alone cannot page or ticket.
+Receive counters lag one scrape so an in-flight move can complete. After startup
+or restart, a window stays inactive until its full history is available; a
+counter reset rebuilds the ring instead of firing.
+
+First response: confirm the spike is joins, not moves, via the authorized
+`/ops/metrics` scrape — compare `joins_received` growth against
+`voice_join_refused` by `reason` and `voice_operations{op="move"}` outcomes.
+`halted` means the actor is parked (check `two_bot_voice_worker_halted`);
+`unknown_creator`/`stale_ticket` point at creator-map or ticket generation
+drift; `discord`/`persistence` move outcomes point at REST or storage. Then
+read the container logs for `voice_event="voice_join_received"` refusal lines
+and `voice_event="voice_join"` terminal lines with their stage durations.
+
+Escalate when the burn persists across hours (the slow-burn ticket below will
+already be open), when `halted` refusals dominate, or when the stall matches a
+deploy — the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: voice join slow burn
+
+The same creator-join budget is burning faster than 6x in both the last 6
+hours and the last 30 minutes. This is the ticket-severity companion to the
+fast-burn page above: a moderate but sustained degradation — a slow leak of
+refusals or p95 creep past 5 s — that never spikes hard enough to page.
+Same signals, same first response, same escalation, lower urgency. Do not
+close it as "fast burn resolved": the fast window can clear while the slow
+grind continues.
+
+#### Alert: voice creator-map stale
+
+The voice actor re-merges the creator map from the store every 5 minutes;
+`two_bot_voice_creator_map_age_seconds` counts from the last *successful*
+merge (a failed read never resets it, and the stall watchdog keeps it
+climbing while the actor is hung). This alert fires when the age passes two
+refresh intervals (600 s) with `two_bot_voice_creator_map_generation` above
+0, meaning merges stopped landing and creator joins are served from a stale
+map: new or changed creators are invisible (`unknown_creator` refusals) and
+removed creators keep working. Generation 0 (no merge yet: boot, or voice
+parked) never fires, and a container old enough to lack the gauges holds the
+previous state instead of resolving it.
+
+First response: confirm via the authorized `/ops/metrics` scrape that the
+generation is flat while the age climbs, then look for the cause one layer
+down — store read failures (`db_errors`, pool saturation) or a halted actor
+(`two_bot_voice_worker_halted`). Read the container logs for
+`voice_join_received` refusal lines: a rising `unknown_creator` share with a
+flat generation is this alert becoming member-visible.
+
+Escalate when the store cause is not self-clearing, when `unknown_creator`
+refusals dominate, or when the flat generation survives a restart — the fix
+belongs to the on-call engineer, not another redeploy.
 
 #### Alert: gateway missed events
 
@@ -530,14 +623,16 @@ First response: if the failing process is still up (within the linger), read
 the `stage` label on `two_bot_gateway_checkpoint_failures_total` via the
 authorized `/ops/metrics` scrape — `pre_commit` means the commit was skipped
 after a funnel, leveling or acknowledgement failure, while `commit` means the
-durable store write itself failed. Once the process has restarted, the stage
-is not recoverable: the counter resets to zero and the Worker log line
-(`{"event":"container_gateway_failure","phase":…,"class":…}`) carries only
-`phase` and `class` — both stages map to `gateway_runtime_failed` — never
-the `stage`. Do not wait for the stage then; check the `gateway` component on
-`/readyz` and the Neon status for the staging branch instead: a `commit`
-failure next to DB-error or pool alerts points at the database, not the
-gateway. Do not restart manually: the process exits on its own after
+durable store write itself failed. The Worker log line
+(`container_gateway_failure`) and `/readyz` `gateway_failure` carry the phase,
+class, failing step and SQLSTATE code plus the `release`/`worker_version` tags
+— both checkpoint stages map to `gateway_runtime_failed` — but never the
+checkpoint `stage`. Once the process has restarted, the stage is not
+recoverable: the counter resets to zero. Do not wait for the stage then; check
+the `gateway` component on `/readyz` and the Neon status for the staging branch
+instead: a `commit` failure next to DB-error or pool alerts points at the
+database, not the gateway. Do not restart manually: the process exits on its own
+after
 the linger and the supervisor restarts from the committed checkpoint — verify
 the replacement is healthy per the
 [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
@@ -716,10 +811,14 @@ previously healthy version from your deployment record; never silently choose
 
 `.github/workflows/staging-migrate.yml` (manual, staging-only, no production
 path) runs `staging-migrate --plan|--apply` from `crates/cutover/src/bin/staging_migrate.rs`.
-It embeds this crate's migrations through the SQLx **0.9.0 library** (no
-`sqlx-cli`; the pin is asserted against `Cargo.lock`), keeps the ledger in
-`public._sqlx_migrations`, and runs `SET ROLE` in SQLx's per-connection
-`after_connect`, verifying `current_user` on every connection. The two modes
+It embeds two migration chains through the SQLx **0.9.0 library** (no
+`sqlx-cli`; the pin is asserted against `Cargo.lock`): this crate's
+migrations (ledger `public._sqlx_migrations`) and the store migrations from
+`two-bot-store` (ledger `public._two_bot_migrations`, the chain the DML-only
+gateway needs at boot). Each chain is planned, applied and verified
+separately with its own pending list and plan-binding hash. The runner runs
+`SET ROLE` in SQLx's per-connection `after_connect`, verifying `current_user`
+on every connection. The two modes
 use two credentials and two groups, so the plan is physically read-only:
 `--plan` reads only `TWO_BOT_STAGING_PLAN_DATABASE_URL` (a login holding only
 `two_bot_migrator_ro`, the `staging-migrate-plan` environment secret) and runs
@@ -735,9 +834,15 @@ staging-migrate --target staging --plan --source-sha <40hex> --staging-host <hos
   --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
 staging-migrate --target staging --apply <same flags> --expected-pending <list> \
-  --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
+  --expected-store-pending <store list> \
+  --plan-manifest-sha256 <64hex> --store-plan-manifest-sha256 <64hex> \
+  --plan-run-id <run id> \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
+
+Both chains (cutover and store) are planned, applied and verified in one
+run, each with its own pending list, manifest hash and ledger; `--apply`
+refuses unless both lists and both hashes match the reviewed plan.
 
 `--staging-branch-id` pins the PlanetScale branch id (non-secret). It is
 required when `--staging-host` ends in `.psdb.cloud` (PlanetScale routes
@@ -770,7 +875,8 @@ A passing apply records `"plan_provenance_verified": true` in its manifest.
 `--plan` also fills an `audit` block (`null` for apply) from one explicit
 `READ ONLY` transaction on the same read-only login: the ledger owner
 (`ledger_owner`), `ledger_counts` (successful rows, max successful version,
-failed rows), one `memberships` entry per migrator login (`two_bot_migrator`,
+failed rows), the store ledger's `store_ledger_owner` / `store_ledger_counts`,
+one `memberships` entry per migrator login (`two_bot_migrator`,
 `two_bot_migrator_ro`, `two_bot_migrator_ro_plan`, `two_bot_migrator_apply`):
 an `exists` flag (so a missing login reads `false` instead of vanishing), the
 aggregated direct `member_of` list, and the transitive `member_of_migrator` /
@@ -792,10 +898,11 @@ a `*.psdb.cloud` pin has no `--staging-branch-id`, the pin is malformed, or the
 binding username's branch suffix does not match the pinned branch, the login
 cannot assume `two_bot_migrator` (apply) or `two_bot_migrator_ro` (plan), the
 plan login also holds `two_bot_migrator`, a reference is missing, `--apply` has no
-`--expected-pending` or it mismatches, `--apply` has no `plan_manifest_sha256`/
-`plan_run_id` or the hash does not match the recomputed manifest, `--apply`
-has no producing-run manifest or that manifest does not carry the bound hash,
-or the ledger has a failed/incomplete
+`--expected-pending` / `--expected-store-pending` or either mismatches,
+`--apply` has no `plan_manifest_sha256` / `store_plan_manifest_sha256` /
+`plan_run_id` or either hash does not match the recomputed manifest, `--apply`
+has no producing-run manifest or that manifest does not carry the bound hashes,
+or either ledger has a failed/incomplete
 row, a SHA-384 mismatch or a version unknown to the source. The database name needs no `staging`
 substring (the verified shared-Neon staging database is `two_bot`); the pinned
 host plus the binding-match check is the staging identity. It never resets,
@@ -876,12 +983,18 @@ Pooler hosts/ports and production-like or empty pins refuse with fixed,
 secret-free messages. When the three variables are unset the gate fails
 closed, so set and verify them in the environment before relying on deploys.
 
-Outcomes: `pending_before` empty prints `schema gate clean` and the deploy
-proceeds; non-empty pending exits 1 with `schema drift: staging database is
-behind source <sha>: pending versions [...]` — fix it with the manual
-`staging-migrate` apply dispatch for that source (reviewed plan, exact
-`expected_pending`), then re-run `deploy-staging`. The gate never fixes drift
-itself. The plan manifest is written to `staging-schema-gate-manifest.json`
+Outcomes: `pending_before` and `pending_store_before` both empty prints
+`schema gate clean` and the deploy proceeds; either non-empty exits 1 with
+`schema drift: staging database is behind source <sha>: pending versions [...]`
+— fix it with the manual `staging-migrate` apply dispatch for that source
+(reviewed plan, exact `expected_pending` plus `expected_store_pending` when
+the store chain is behind). When applying the store chain, the apply creates a
+new ledger whose default privileges do not automatically grant the plan login
+read access: reapply the full reviewed role plan (`two-bot db roles plan`), run
+`verify` and require 0 findings, then re-run `deploy-staging`. The drift output
+prints this sequence. For cutover-only apply, re-run `deploy-staging` after
+apply. The gate never fixes drift itself. The plan manifest is written to
+`staging-schema-gate-manifest.json`
 in the job workspace; its `audit.connection_usage` (sessions summed from
 `pg_stat_database.numbackends`, readable in full by the plan login) warns —
 never fails — when usage is strictly above 80% of the non-superuser ceiling
@@ -908,7 +1021,9 @@ staging-migrate --target production --plan --source-sha <40hex> \
   --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
 staging-migrate --target production --apply <same flags> --expected-pending <list> \
-  --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
+  --expected-store-pending <store list> \
+  --plan-manifest-sha256 <64hex> --store-plan-manifest-sha256 <64hex> \
+  --plan-run-id <run id> \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
 
@@ -1352,6 +1467,9 @@ staging container. [Tabletop evidence](incident-tabletop-2026-10-01.md) separate
 local source rehearsal, actual staging observations and unfinished acceptance.
 The [October-6 staging record](incident-tabletop-2026-10-06.md) is the Discord and
 Neon dry run against the live staging baseline, with its open evidence gaps.
+The [October-15 production postmortem](production-incident-2026-10-15-postmortem.md)
+records the production gateway crash-loop, its provisional schema-gap cause, and
+the rollback receipts; read it before any production gateway recovery.
 A denied observation or successful offline test is not a completed staging drill.
 
 ### Discord gateway or API outage
@@ -1758,7 +1876,7 @@ into this Rust binary without an implemented dispatch path.
 | Attribution/scorecard/plan/onboarding/automation reports | Legacy read-only reporting CLIs intentionally dropped by parity decision; core calculations/store presence does not add operator commands. |
 | Staging provision/verify/reset and Discord e2e harness | Legacy tooling intentionally dropped; next uses local fixtures/agent-testdb and its own soak evidence. Never reset live/staging databases for tests. |
 | Preflight/exact-grant acceptance, Wave 0 exports, Wick whitelist, redesign/role cleanup | No equivalent next operator preflight/export/grant CLI identified. Core permission contracts are not live-grant proof; redesign and third-party dashboard verification are outside routine operations. |
-| Cutover import/backfill/capture/dedupe, dual-running, command registration, live identity/bot removal | Cutover tools are separate ports, **not dropped**. Execution is out of scope and has separate gates. This runbook cannot authorize activation, backfill, or legacy-bot removal. |
+| Cutover import/backfill/capture/dedupe, dual-running, command registration, live identity/bot removal | Cutover tools are separate ports, **not dropped**. Execution is out of scope and has separate gates. This runbook cannot authorize activation, backfill, or legacy-bot removal. Rate limits, cursors/resume, dry-run counts and failure anchors for backfills live in [backfill-runbook.md](backfill-runbook.md). |
 | Host bootstrap/systemd, 48-hour backups, logrotate/housekeeping | Deployment topology differs; timers remain templates. Host execution is broker/operator-owned, not an agent shell task or Container installation recipe. |
 | Secret storage/rotation and legacy credential filenames | Names/custody guidance retained, runtime spellings separated. No rotation commands: credential changes require separate approval and exact consumer wiring. |
 | Staging acceptance fixtures, hierarchy/grants, bot startup mapping and evidence | Replaced by next test-container/local-fixture coverage and the explicit staging soak. Legacy reset/provisioning evidence and contradictory historical status are not current next-runtime proof. |

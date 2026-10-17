@@ -167,7 +167,7 @@ jobs:
       # Serial execution prevents the ignored stores' shared tables/locks from
       # racing. Sticky/onboarding tests are disposable-DB tests, not Discord calls.
       # Channel moderation, the discord channel-moderation executor, feeds_store,
-      # legacy_verify_db, raid_list_db, reengagement_list_db, staging_migrate_db
+      # legacy_verify_db, raid_list_db, reengagement_list_db, game_activity_report_db, staging_migrate_db
       # and internal_events require agent_test, not the two_bot_test_* bootstrap
       # used by TestDatabase suites. Skip only those tests here, then run ALL of
       # those suites below with their accepted URL.
@@ -252,19 +252,26 @@ jobs:
           --skip rejected_lockdown_removes_only_new_seed_and_allows_same_key_retry
           --skip permission_actor_and_guild_refusals_never_mutate
           --skip feed_crud_audit_scope_and_timestamp_roundtrip
-          --skip claim_is_owned_once_then_duplicate
+          --skip claim_is_owned_once_then_in_flight
           --skip failed_send_releases_the_claim_for_the_retry
-          --skip delivered_rows_are_never_released
+          --skip delivered_rows_are_never_reclaimed
+          --skip fresh_claim_cannot_be_reclaimed
+          --skip stale_unposted_claim_is_taken_over_atomically
+          --skip started_claim_is_never_reclaimed_even_when_stale
+          --skip started_send_that_provably_failed_releases_for_the_retry
+          --skip reclaiming_a_missing_key_claims_it_fresh
           --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
           --skip mock_delivery_crash_reconciliation_restart_and_overflow
           --skip parity_mismatch_cursor_and_read_only_acceptance
           --skip dump_inspect_restore_round_trip
           --skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected
           --skip list_is_guild_scoped_selector_shaped_and_read_only
+          --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
           --skip real_sqlx_runner_cases
           --skip post_failure_unreadable_ledger_is_unknown_not_empty
           --skip post_failure_readable_ledger_keeps_array_output
           --skip post_apply_unreadable_ledger_is_unknown_not_empty
+          --skip store_failure_keeps_committed_cutover_evidence
           --skip connection_count_sees_other_roles_from_plan_login
           --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
           --skip a_restarted_worker_rediscovers_a_channel_whose_rollback_failed
@@ -375,6 +382,13 @@ jobs:
         run: >-
           cargo test -p two-bot-cutover --all-features --test reengagement_list_db --locked
           -- --include-ignored --test-threads=1
+      - name: Game-activity report tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-cutover --all-features --test game_activity_report_db --locked
+          -- --test-threads=1
       - name: Staging migration runner ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:

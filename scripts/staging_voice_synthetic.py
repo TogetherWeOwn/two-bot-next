@@ -25,19 +25,24 @@ What it proves on the deployed staging bot (stdlib only, no third-party code):
              read-back after each write (FAIL on HTTP 403: the owner grant was
              lost after creation; SKIP on HTTP 429; the same Discord
              field `/limit` and `/unlimit` manage)
-  privacy    the room's @everyone Connect overwrite toggles and restores with a
-             read-back after each write (SKIP while the test bot may not edit
-             overwrites: its staging role needs Manage Roles once; SKIP on
-             HTTP 429; the same Discord entry `/private` and `/public` rewrite)
+  privacy    the room's @everyone overwrite does not deny Connect (the
+             public baseline: a Connect deny is the `/private` marker), the
+             staging product bot has effective View Channel and Manage Roles
+             on the room (the `/private` overwrite precondition), and no
+             member overwrite grants Manage Roles (read-only)
   name_panel the room's name after the rename cycle renders from its template
              (not the "<display>'s room" fallback): what the `/name` panel's
              Current-name line would show
 
-The limit/privacy/name_panel checks exercise the Discord channel fields the
-owner commands manage through the same REST paths the bot writes; they do not
-invoke the slash commands themselves (Discord only creates interactions for
-real users, so a bot token cannot). A PASS means the room the staging bot made
-is fully owner-manageable; a FAIL names the field that did not round-trip.
+The limit check exercises the channel field `/limit` and `/unlimit` write;
+privacy reads the public @everyone baseline (no Connect deny) and the
+staging product bot's
+computed View Channel and Manage Roles permission (the `/private`
+precondition, mirroring `can_edit_overwrites`), and name_panel
+reads the template-rendered name. These checks do not invoke slash commands
+(Discord only creates interactions for real users, so a bot token cannot). A
+PASS means the room the staging bot made has the expected owner permissions and
+privacy baseline; a FAIL names the fact that did not hold.
 
 Identity and fences (fail-closed, before any request):
   - TWO_VOICE_SYNTHETIC_BOT_TOKEN: a dedicated test bot (never the bot under
@@ -79,7 +84,9 @@ API = "https://discord.com/api/v10"
 GATEWAY = "gateway.discord.gg"
 INTENTS = 1 | (1 << 7)  # GUILDS | GUILD_VOICE_STATES (no privileged intents)
 VIEW, CONNECT, MANAGE = 1 << 10, 1 << 20, 1 << 4
+MANAGE_ROLES, ADMINISTRATOR = 1 << 28, 1 << 3
 OWNER_BITS = VIEW | CONNECT | MANAGE
+STAGING_PRODUCT_BOT_ID = "1469137636663758888"
 VOICE_TYPES = (2, 13)
 FALLBACK = re.compile(r"^.+['’]s room$")
 # Marker appended to the staging creator's name for the rename case. The run
@@ -120,6 +127,85 @@ def voice_order(channels, parent_id):
     return sorted(rows, key=lambda c: (c.get("position", 0), int(c["id"])))
 
 
+def effective_permissions(guild_id, member_id, member_role_ids, roles, overwrites,
+                          guild_owner_id=None):
+    """Compute Discord guild and channel permissions for one member."""
+    if member_id == guild_owner_id:
+        return (1 << 64) - 1
+    role_ids = {str(role_id) for role_id in member_role_ids}
+    role_by_id = {str(role.get("id")): role for role in roles}
+    everyone = role_by_id.get(str(guild_id), {})
+    permissions = int(everyone.get("permissions") or 0)
+    for role_id in role_ids:
+        permissions |= int(role_by_id.get(role_id, {}).get("permissions") or 0)
+    if permissions & ADMINISTRATOR:
+        return (1 << 64) - 1
+
+    everyone_overwrite = next((o for o in overwrites
+                               if int(o.get("type", -1)) == 0
+                               and str(o.get("id")) == str(guild_id)), None)
+    if everyone_overwrite:
+        permissions &= ~int(everyone_overwrite.get("deny") or 0)
+        permissions |= int(everyone_overwrite.get("allow") or 0)
+
+    role_denies = role_allows = 0
+    for overwrite in overwrites:
+        if int(overwrite.get("type", -1)) == 0 and str(overwrite.get("id")) in role_ids:
+            role_denies |= int(overwrite.get("deny") or 0)
+            role_allows |= int(overwrite.get("allow") or 0)
+    permissions &= ~role_denies
+    permissions |= role_allows
+
+    member_overwrite = next((o for o in overwrites
+                             if int(o.get("type", -1)) == 1
+                             and str(o.get("id")) == str(member_id)), None)
+    if member_overwrite:
+        permissions &= ~int(member_overwrite.get("deny") or 0)
+        permissions |= int(member_overwrite.get("allow") or 0)
+    return permissions
+
+
+def privacy_facts(channel, roles, member, guild_id, product_bot_id, guild_owner_id=None):
+    """Return the three read-only privacy assertions for the newly created room."""
+    overwrites = channel.get("permission_overwrites", []) or []
+    everyone = [o for o in overwrites
+                if int(o.get("type", -1)) == 0 and str(o.get("id")) == str(guild_id)]
+    everyone_allow = int(everyone[0].get("allow") or 0) if len(everyone) == 1 else 0
+    everyone_deny = int(everyone[0].get("deny") or 0) if len(everyone) == 1 else 0
+    # Public is the absence of the private marker: `/private` denies Connect
+    # to @everyone and `/public` only removes that deny
+    # (everyone_connect_overwrite in
+    # crates/bot/src/voice_rooms/private_runtime.rs), while a new room
+    # inherits its source channel's overwrites, which commonly allow
+    # Connect explicitly. An allow therefore stays public; only a deny
+    # (or a malformed duplicate @everyone entry) breaks the baseline.
+    public_baseline = len(everyone) <= 1 and not (everyone_deny & CONNECT)
+    no_member_grant = not any(
+        int(o.get("type", -1)) == 1 and int(o.get("allow") or 0) & MANAGE_ROLES
+        for o in overwrites)
+    product_member_roles = [str(role_id) for role_id in member.get("roles", [])]
+    product_permissions = effective_permissions(
+        guild_id, product_bot_id, product_member_roles, roles, overwrites,
+        guild_owner_id=guild_owner_id)
+    # Mirrors can_edit_overwrites in
+    # crates/bot/src/voice_rooms/private_runtime.rs: rewriting the @everyone
+    # overwrite needs VIEW_CHANNEL|MANAGE_ROLES, not Manage Roles alone.
+    product_can_edit = (product_permissions & (VIEW | MANAGE_ROLES)) == (VIEW | MANAGE_ROLES)
+    role_by_id = {str(role.get("id")): role for role in roles}
+    product_role_names = [role_by_id[role_id].get("name", role_id)
+                          for role_id in product_member_roles if role_id in role_by_id]
+    product_role = ", ".join(product_role_names) or "no assigned staging role"
+    return {
+        "privacy_public_baseline": public_baseline,
+        "privacy_everyone_allow": everyone_allow,
+        "privacy_everyone_deny": everyone_deny,
+        "privacy_everyone_count": len(everyone),
+        "privacy_product_bot_manage_roles": bool(product_can_edit),
+        "privacy_no_member_manage_roles": no_member_grant,
+        "privacy_product_bot_role": product_role,
+    }
+
+
 def creator_block(channels_before, creator):
     """The creator's existing rooms before the join, mirroring plan_placement:
     a creator that already has rooms groups the new one at the end of that
@@ -156,11 +242,11 @@ def evaluate(obs):
     limit_initial/limit_probed (user_limit before/probed), limit_set_ok and
     limit_restored (each write verified by read-back), limit_forbidden (FAIL
     reason: the owner Manage Channels grant was lost after creation) and
-    limit_rate_limited (SKIP reason), limit_note, privacy_initial_denies
-    (@everyone Connect deny before the toggle), privacy_toggled and
-    privacy_restored (each write verified by read-back), privacy_forbidden
-    and privacy_rate_limited (SKIP reasons), privacy_note, panel_name (the
-    room's name read after the rename cycle) and panel_note.
+    limit_rate_limited (SKIP reason), limit_note, privacy_public_baseline,
+    privacy_everyone_allow/deny/count (the raw @everyone facts behind the
+    baseline), privacy_product_bot_manage_roles, privacy_no_member_manage_roles,
+    privacy_product_bot_role (read-only privacy facts), privacy_note, panel_name
+    (the room's name read after the rename cycle) and panel_note.
     """
     out = []
     creator, room_id = obs["creator"], obs.get("room_id")
@@ -244,33 +330,23 @@ def evaluate(obs):
     else:
         out.append(check("limit", False, limit_note or "room user_limit was not round-tripped"))
     privacy_note = obs.get("privacy_note")
-    if obs.get("privacy_forbidden"):
-        out.append(check("privacy", False,
-                         "test bot may not rewrite the room's @everyone overwrite "
-                         "(HTTP 403): grant its staging role Manage Roles once, "
-                         "then the private/public toggle gates",
-                         skip=True))
-    elif obs.get("privacy_rate_limited"):
-        out.append(check("privacy", False,
-                         "room overwrite PUT hit Discord's rate limit (HTTP 429): "
-                         "a retry or dispatch collided; privacy skipped",
-                         skip=True))
-    elif obs.get("privacy_toggled") and obs.get("privacy_restored"):
-        out.append(check("privacy", True,
-                         "@everyone Connect deny "
-                         f"{'on' if obs.get('privacy_initial_denies') else 'off'} -> "
-                         f"{'off' if obs.get('privacy_initial_denies') else 'on'} -> "
-                         f"{'on' if obs.get('privacy_initial_denies') else 'off'} "
-                         "(each write verified by read-back)"))
-    elif privacy_note and not obs.get("privacy_toggled"):
+    public_baseline = obs.get("privacy_public_baseline", False)
+    product_manage_roles = obs.get("privacy_product_bot_manage_roles", False)
+    no_member_grant = obs.get("privacy_no_member_manage_roles", False)
+    product_role = obs.get("privacy_product_bot_role") or "no assigned staging role"
+    privacy_detail = (
+        f"@everyone public Connect baseline={'PASS' if public_baseline else 'FAIL'} "
+        f"(allow={obs.get('privacy_everyone_allow')} deny={obs.get('privacy_everyone_deny')} "
+        f"entries={obs.get('privacy_everyone_count')}); "
+        f"product bot staging role {product_role!r} effective View Channel|Manage Roles="
+        f"{'PASS' if product_manage_roles else 'FAIL'}; "
+        f"member overwrites grant Manage Roles={'no' if no_member_grant else 'yes'}"
+    )
+    if privacy_note:
         out.append(check("privacy", False, privacy_note))
-    elif obs.get("privacy_toggled") and not obs.get("privacy_restored"):
-        out.append(check("privacy", False,
-                         "room @everyone Connect deny was toggled but NOT restored; "
-                         "restore it manually"))
     else:
-        out.append(check("privacy", False,
-                         privacy_note or "room @everyone Connect deny was not round-tripped"))
+        out.append(check("privacy", public_baseline and product_manage_roles and no_member_grant,
+                         privacy_detail))
     panel = obs.get("panel_name") or ""
     if panel and not FALLBACK.match(panel):
         out.append(check("name_panel", True,
@@ -512,34 +588,6 @@ def rest_patch(token, path, payload, timeout=20):
     return status, json.loads(raw)
 
 
-def rest_put_overwrite(token, channel_id, overwrite_id, allow, deny, ow_type, timeout=20):
-    """PUT one channel permission overwrite under the same body cap.
-
-    `allow`/`deny` are ints sent as Discord's string bitfields; `ow_type` is 0
-    for a role (@everyone) or 1 for a member. Returns the HTTP status (a 403
-    means the test bot may not edit overwrites; 429 is Discord's rate limit);
-    only an over-cap body raises BodyTooLarge, like the GET/PATCH paths.
-    """
-    data = json.dumps({"allow": str(allow), "deny": str(deny), "type": ow_type}).encode()
-    req = urllib.request.Request(f"{API}/channels/{channel_id}/permissions/{overwrite_id}",
-                                 data=data, headers={
-                                     "Authorization": f"Bot {token}",
-                                     "User-Agent": "two-bot-voice-synthetic (staging)",
-                                     "Content-Type": "application/json"}, method="PUT")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read(MAX_BODY_BYTES + 1)
-            status = resp.status
-    except urllib.error.HTTPError as exc:
-        raw = exc.read(MAX_BODY_BYTES + 1)
-        if len(raw) > MAX_BODY_BYTES:
-            raise BodyTooLarge("Discord REST read answered over the body cap") from None
-        return exc.code
-    if len(raw) > MAX_BODY_BYTES:
-        raise BodyTooLarge("Discord REST read answered over the body cap")
-    return status
-
-
 def metrics_value(staging_url, token):
     if not (staging_url and token):
         return None
@@ -694,16 +742,15 @@ def run_live(args, token):
             obs["channels"] = rest(token, f"/guilds/{args.guild}/channels")
             obs["statuses"] = [e["d"].get("status") for e in s.events
                                if e["t"] == "VOICE_CHANNEL_STATUS_UPDATE" and e["d"].get("id") == room_id]
-            # Owner-command round-trips on the room we own: the same Discord
-            # fields /limit, /private//public and /name manage, driven through
-            # the same REST paths the bot writes (Discord creates interactions
-            # only for real users, so a bot token cannot invoke the slash
-            # commands themselves). Each write is verified by a read-back and
-            # restored, so a green run leaves the room as the bot made it. A
-            # failed step records a note (its check FAILs). A limit 403 FAILs
-            # (the owner Manage Channels grant was lost after creation); a
-            # limit/privacy 429 and a privacy 403 (its one-time Manage Roles
-            # grant is still pending) record SKIP reasons instead.
+            # The limit owner-command round-trip exercises the user_limit
+            # field /limit and /unlimit manage, through the same REST PATCH
+            # path the bot writes. The privacy check is read-only; the
+            # name-panel check reads the rendered room name. Discord creates
+            # interactions only for real users, so a bot token cannot invoke
+            # the slash commands themselves. Each limit write is verified by
+            # a read-back and restored. A failed step records a note (its
+            # check FAILs). A limit 403 FAILs (the owner Manage Channels grant
+            # was lost after creation); a limit 429 is allowed to SKIP.
             obs["limit_forbidden"] = obs["limit_rate_limited"] = False
             obs["limit_set_ok"] = obs["limit_restored"] = False
             try:
@@ -731,58 +778,22 @@ def run_live(args, token):
                     obs["limit_note"] = f"room user_limit PATCH answered {status}; limit skipped"
             except Exception as exc:
                 obs["limit_note"] = f"{type(exc).__name__} during the limit round-trip"
-            obs["privacy_forbidden"] = obs["privacy_rate_limited"] = False
-            obs["privacy_toggled"] = obs["privacy_restored"] = False
             try:
-                seen = rest(token, f"/channels/{room_id}")
-                current = [o for o in seen.get("permission_overwrites", []) or []
-                           if o.get("type") == 0 and str(o.get("id")) == str(args.guild)]
-                allow = int(current[0].get("allow") or 0) if current else 0
-                deny = int(current[0].get("deny") or 0) if current else 0
-                initial_denies = bool(deny & CONNECT)
-                obs["privacy_initial_denies"] = initial_denies
-                if initial_denies:
-                    planned_allow, planned_deny = allow, deny & ~CONNECT
-                else:
-                    planned_allow, planned_deny = allow & ~CONNECT, deny | CONNECT
-                status = rest_put_overwrite(token, room_id, args.guild,
-                                            planned_allow, planned_deny, 0)
-                if status == 403:
-                    obs["privacy_forbidden"] = True
-                elif status == 429:
-                    obs["privacy_rate_limited"] = True
-                    obs["privacy_note"] = ("room overwrite PUT answered 429 "
-                                           "(rate limit); privacy skipped")
-                elif status is not None and 200 <= status < 300:
-                    now = rest(token, f"/channels/{room_id}")
-                    entries = [o for o in now.get("permission_overwrites", []) or []
-                               if o.get("type") == 0 and str(o.get("id")) == str(args.guild)]
-                    denies = (bool(int(entries[0].get("deny") or 0) & CONNECT)
-                              if entries else False)
-                    if denies == (not initial_denies):
-                        obs["privacy_toggled"] = True
-                        back = rest_put_overwrite(token, room_id, args.guild, allow, deny, 0)
-                        if back is not None and 200 <= back < 300:
-                            fin = rest(token, f"/channels/{room_id}")
-                            fentries = [o for o in fin.get("permission_overwrites", []) or []
-                                        if o.get("type") == 0
-                                        and str(o.get("id")) == str(args.guild)]
-                            fdenies = (bool(int(fentries[0].get("deny") or 0) & CONNECT)
-                                       if fentries else False)
-                            if fdenies == initial_denies:
-                                obs["privacy_restored"] = True
-                    else:
-                        obs["privacy_note"] = ("room overwrite PUT answered "
-                                               f"{status} but @everyone Connect reads back "
-                                               f"{'denied' if denies else 'allowed'}")
-                else:
-                    obs["privacy_note"] = f"room overwrite PUT answered {status}; privacy skipped"
+                room = rest(token, f"/channels/{room_id}")
+                roles = rest(token, f"/guilds/{args.guild}/roles")
+                product_member = rest(
+                    token, f"/guilds/{args.guild}/members/{STAGING_PRODUCT_BOT_ID}")
+                guild = rest(token, f"/guilds/{args.guild}")
+                obs.update(privacy_facts(room, roles, product_member, args.guild,
+                                         STAGING_PRODUCT_BOT_ID, guild.get("owner_id")))
             except Exception as exc:
-                obs["privacy_note"] = f"{type(exc).__name__} during the privacy round-trip"
-            # Name-panel render: read the room's name after the rename cycle
-            # (the limit/privacy writes may have triggered a bot re-render, so
-            # read last). No write: the /name panel's Current-name line shows
-            # whatever this GET returns.
+                obs["privacy_note"] = (
+                    f"{type(exc).__name__} reading room privacy facts; could not verify "
+                    f"the product bot's staging role ({STAGING_PRODUCT_BOT_ID}) "
+                    "effective Manage Roles")
+            # Name-panel render: read the room's name after the rename and
+            # limit round-trips. No write: the /name panel's Current-name line
+            # shows whatever this GET returns.
             try:
                 obs["panel_name"] = rest(token, f"/channels/{room_id}").get("name")
             except Exception as exc:

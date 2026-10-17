@@ -138,6 +138,18 @@ function git(...args) {
 	return execFileSync("git", args, { encoding: "utf8" }).trim();
 }
 
+// Highest vX.Y.Z tag in the repository, or null when there is none. Numeric
+// semver order (0.10.0 > 0.9.0); non-semver tags are ignored, as elsewhere.
+function highestTagVersion() {
+	return (
+		git("tag", "--list", "v*")
+			.split("\n")
+			.map(parseTag)
+			.filter(Boolean)
+			.sort((a, b) => compareVersions(b, a))[0] || null
+	);
+}
+
 function releaseExists(tag) {
 	try {
 		execFileSync("gh", ["release", "view", tag, "--json", "tagName"], {
@@ -204,11 +216,7 @@ function main() {
 		version = tagsAt.map(parseTag).sort((a, b) => compareVersions(b, a))[0];
 	} else {
 		const prev = parseTag(prevTag);
-		const highest = git("tag", "--list", "v*")
-			.split("\n")
-			.map(parseTag)
-			.filter(Boolean)
-			.sort((a, b) => compareVersions(b, a))[0];
+		const highest = highestTagVersion();
 		if (compareVersions(prev, highest) < 0) {
 			// The newest release is not reachable from this commit, so it is older
 			// than that release (a rollback or a redeploy of a prior commit). It is
@@ -242,6 +250,12 @@ function main() {
 		const notesFile = `${process.env.RUNNER_TEMP || "/tmp"}/release-notes-${tag}.md`;
 		fs.writeFileSync(notesFile, notes);
 		// Creates the tag on the promoted commit when it does not exist yet.
+		// Only the highest version may become "Latest": repairing a missing
+		// release for an older tag must not move Latest backward. Say so
+		// explicitly with --latest=false; merely omitting the flag would let
+		// GitHub's automatic date/version default pick the fresh repair.
+		const highest = highestTagVersion();
+		const isLatest = !highest || compareVersions(version, highest) >= 0;
 		execFileSync(
 			"gh",
 			[
@@ -254,7 +268,7 @@ function main() {
 				tag,
 				"--notes-file",
 				notesFile,
-				"--latest",
+				isLatest ? "--latest" : "--latest=false",
 			],
 			{ stdio: "inherit" },
 		);

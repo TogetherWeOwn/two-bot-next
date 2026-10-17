@@ -93,6 +93,19 @@ const JOB_ERROR_CLASS_SET: ReadonlySet<string> = new Set(JOB_ERROR_CLASSES);
 export const REST_429_RATIO = 0.1;
 /** ...and the window must hold at least this many requests. */
 export const REST_429_MIN_REQUESTS = 10;
+/** 5xxs must exceed this share of REST requests between two samples... */
+export const REST_5XX_RATIO = 0.1;
+/** ...and the window must hold at least this many requests. */
+export const REST_5XX_MIN_REQUESTS = 10;
+/**
+ * Promotion canary gate: firing keys that fail a promotion stage so the
+ * existing per-stage auto-rollback restores the pre-promote version. 5xx
+ * only: a 5xx burst is never healthy backpressure (Discord-side failure or
+ * a broken request shape from the fresh build), while 429s are rate-limit
+ * backpressure and `transport` failures already surface through job timeout
+ * classes. See docs/runbook.md#alert-rest-5xx.
+ */
+export const PROMOTION_ERROR_GATE_RULES: readonly string[] = ["rest_5xx_rate"];
 /** Pool at max with zero idle for this many consecutive samples. */
 export const POOL_SATURATED_SAMPLES = 3;
 /** DB errors must reach this many between two samples... */
@@ -111,11 +124,41 @@ export const VOICE_FAILURE_MIN_OPS = 10;
 export const DISPATCH_DROP_SAMPLES = 3;
 /** Mirrors the fixed DISPATCH_LANES allowlist in crates/core/src/metrics.rs. */
 export const DISPATCH_LANES: readonly string[] = ["messages", "interactions", "registry", "privileged", "busy", "reactions"];
+/** Creator-join SLO: this share of genuine joins must move within 5 s (99.5%). */
+export const JOIN_SLO_BUDGET = 0.005;
+/** Fast burn: alert when both the 1 h and 5 min windows burn faster than this. */
+export const JOIN_FAST_BURN = 14.4;
+/** Long window for the fast-burn rule, seconds. */
+export const JOIN_FAST_LONG_SECONDS = 3600;
+/** Short confirmation window for the fast-burn rule, seconds. */
+export const JOIN_FAST_SHORT_SECONDS = 300;
+/** Slow burn: ticket when both the 6 h and 30 min windows burn faster than this. */
+export const JOIN_SLOW_BURN = 6;
+/** Long window for the slow-burn rule, seconds. */
+export const JOIN_SLOW_LONG_SECONDS = 21600;
+/** Short confirmation window for the slow-burn rule, seconds. */
+export const JOIN_SLOW_SHORT_SECONDS = 1800;
+/** A burn window with fewer genuine joins than this never fires (quiet guilds stay silent). */
+export const JOIN_BURN_MIN_JOINS = 10;
+/** One bad join alone never pages or tickets, even at the volume floor. */
+export const JOIN_BURN_MIN_BAD = 2;
+/** Burn snapshots older than the slow window plus this margin are pruned. */
+export const JOIN_BURN_HISTORY_MARGIN_SECONDS = 600;
+/** Creator-map refresh cadence in seconds (`CREATORS_REFRESH_INTERVAL_MS` in `crates/bot/src/voice_rooms.rs`). */
+export const CREATOR_MAP_REFRESH_SECONDS = 300;
+/**
+ * Creator-map staleness bound: two missed refresh intervals. The age gauge
+ * counts from the last *successful* merge, so one failed refresh only reaches
+ * the bound as the next attempt also fails; scheduling jitter inside one
+ * interval never fires. Mirrors the `STALE_INTERVALS` two-interval rule.
+ */
+export const CREATOR_MAP_STALE_SECONDS = 2 * CREATOR_MAP_REFRESH_SECONDS;
 
 export const RULES: readonly RuleDef[] = [
   { id: "job_stale", summary: `scheduled job has no success for more than ${STALE_INTERVALS} intervals`, runbook: "runbook.md#alert-job-stale" },
   { id: "job_consecutive_failures", summary: `scheduled job failed ${FAILURE_THRESHOLD}+ times in a row`, runbook: "runbook.md#alert-job-failures" },
   { id: "rest_429_rate", summary: `Discord REST 429s exceed ${REST_429_RATIO * 100}% of requests`, runbook: "runbook.md#alert-rest-429" },
+  { id: "rest_5xx_rate", summary: `Discord REST 5xx responses exceed ${REST_5XX_RATIO * 100}% of requests`, runbook: "runbook.md#alert-rest-5xx" },
   { id: "db_pool_saturated", summary: `database pool exhausted for ${POOL_SATURATED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-db-pool" },
   { id: "db_errors", summary: `database errors reached ${DB_ERROR_MIN_ERRORS}+ between samples`, runbook: "runbook.md#alert-db-errors" },
   { id: "send_admission_blocked", summary: `Discord sends refused admission for ${SEND_BLOCKED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-send-admission-blocked" },
@@ -127,6 +170,9 @@ export const RULES: readonly RuleDef[] = [
   { id: "dispatch_drops", summary: `dispatch-lane drops grew for ${DISPATCH_DROP_SAMPLES} consecutive sample windows (reactions include fairness refusals; not proof of gateway packet loss)`, runbook: "runbook.md#alert-dispatch-drops", severity: "ticket" },
   { id: "job_unknown_stale", summary: `job without a cadence entry has no success for more than ${UNKNOWN_JOB_STALE_SECONDS / 3600} hours`, runbook: "runbook.md#alert-job-unknown-stale", severity: "ticket" },
   { id: "gateway_checkpoint_failures", summary: `gateway checkpoint commit failures increased between samples`, runbook: "runbook.md#alert-checkpoint-failures" },
+  { id: "voice_join_fast_burn", summary: `creator-join error budget burning faster than ${JOIN_FAST_BURN}x over 1 h and 5 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-fast-burn" },
+  { id: "voice_join_slow_burn", summary: `creator-join error budget burning faster than ${JOIN_SLOW_BURN}x over 6 h and 30 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-slow-burn", severity: "ticket" },
+  { id: "voice_creator_map_stale", summary: `voice creator map has not merged for more than ${CREATOR_MAP_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-voice-creator-map-stale" },
 ];
 
 /**
@@ -141,12 +187,44 @@ export function runbookUrl(rule: RuleDef): string {
   return `${RUNBOOK_BASE_URL}${rule.runbook}`;
 }
 
+/**
+ * Public docs link for the Worker/Container log query backing every alert.
+ * A stable docs URL (not an account-scoped dashboard link) so webhook
+ * messages stay public-safe: the operator opens the environment's Workers
+ * Observability logs from there.
+ */
+export const LOG_QUERY_URL = "https://developers.cloudflare.com/workers/observability/logs/workers-logs/";
+
+/** Build/SHA context appended to every alert message and alert log line. */
+export interface AlertContext {
+  /** Container Git SHA from `/readyz` (`unknown` when the probe failed). */
+  buildRevision?: string | undefined;
+  /** Failing gateway step from `/readyz` (`gateway_failure.failed_step`). */
+  failedStep?: string | undefined;
+  /** SQLSTATE class from `/readyz` (`gateway_failure.error_code`). */
+  errorCode?: string | undefined;
+}
+
+/** Shared suffix carrying build, failure detail and the log-query link. */
+export function alertContextSuffix(context?: AlertContext): string {
+  const build = context?.buildRevision?.trim() ? context.buildRevision.trim() : "unknown";
+  let suffix = ` Build: ${build}. Logs: ${LOG_QUERY_URL}`;
+  const step = context?.failedStep?.trim();
+  const code = context?.errorCode?.trim();
+  if (step || code) {
+    suffix += ` Failure: ${step || "unknown"}/${code || "none"}.`;
+  }
+  return suffix;
+}
+
 export interface MetricsAlertState {
   /** Rule ids (with subject) currently firing, e.g. `job_stale:rank`. */
   firing: string[];
   /** Latest fixed failure class by job; absent on state stored by older Worker versions. */
   jobErrorClasses?: Record<string, JobErrorClass>;
   rest429: number;
+  /** Missing on state stored before REST 5xx tracking was introduced. */
+  rest5xx?: number;
   restTotal: number;
   poolStreak: number;
   dbErrors: number;
@@ -182,9 +260,24 @@ export interface MetricsAlertState {
   dispatchDrops?: Record<string, number>;
   /** Consecutive positive deltas, capped at DISPATCH_DROP_SAMPLES. */
   dispatchDropStreaks?: Record<string, number>;
+  /**
+   * Creator-join burn snapshots for the SLO windows, oldest first. Each entry
+   * carries the scrape time plus cumulative counters (received joins,
+   * benign duplicate refusals, moves within 5 s). Absent on state stored by
+   * older Worker versions; the first valid sample only stores a baseline.
+   */
+  joinBurn?: JoinBurnSnapshot[];
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
+/** One cumulative creator-join SLI snapshot feeding the burn-rate windows. */
+export interface JoinBurnSnapshot {
+  t: number;
+  received: number;
+  duplicate: number;
+  fastMoves: number;
+}
+
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
 
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
@@ -297,6 +390,94 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
   };
 }
 
+/**
+ * One series (counter or gauge) with exactly these labels, or undefined when
+ * absent, duplicated, mislabeled or not a safe nonnegative integer. Keeps a
+ * Rust rename or malformed value from silently holding its rules off.
+ */
+function exactSeries(matches: Sample[], labels: Record<string, string>): number | undefined {
+  const rows = matches.filter((s) =>
+    Object.keys(s.labels).length === Object.keys(labels).length
+    && Object.entries(labels).every(([key, value]) => s.labels[key] === value));
+  if (rows.length !== 1) return undefined;
+  const value = rows[0]!.value;
+  return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+interface JoinBurnResult {
+  fast: boolean;
+  slow: boolean;
+  /** Inputs were missing or malformed: the caller retains the previous firing state. */
+  held: boolean;
+  ring: JoinBurnSnapshot[];
+}
+
+/**
+ * Multiwindow burn rate over the creator-join SLI ring. `held` is true when
+ * the join series are unusable and the ring is carried unchanged; a backwards
+ * counter (process restart) rebuilds the ring from this sample and fires
+ * nothing. Otherwise the sample is appended, entries older than the slow
+ * window plus margin are pruned, and each fully covered window burns as
+ * bad / (genuine x budget) against its threshold. Each window also needs the
+ * minimum join volume and at least two bad moves to fire.
+ */
+function joinBurnEvaluation(samples: Sample[], ring: JoinBurnSnapshot[], nowSeconds: number): JoinBurnResult {
+  const gauge = (name: string) => samples.filter((s) => s.name === name);
+  const received = exactSeries(gauge("two_bot_voice_joins_received_total"), {});
+  const duplicate = exactSeries(gauge("two_bot_voice_join_refused_total"), { reason: "duplicate" });
+  const fastMoves = exactSeries(gauge("two_bot_voice_join_to_move_seconds_bucket"), { le: "5" });
+  if (received === undefined || duplicate === undefined || fastMoves === undefined) {
+    return { fast: false, slow: false, held: true, ring };
+  }
+  const snapshot: JoinBurnSnapshot = { t: nowSeconds, received, duplicate, fastMoves };
+  const last = ring[ring.length - 1];
+  if (last !== undefined && (received < last.received || duplicate < last.duplicate || fastMoves < last.fastMoves)) {
+    return { fast: false, slow: false, held: false, ring: [snapshot] };
+  }
+  const cutoff = nowSeconds - JOIN_SLOW_LONG_SECONDS - JOIN_BURN_HISTORY_MARGIN_SECONDS;
+  const next = [...ring.filter((s) => s.t > cutoff && s.t <= nowSeconds), snapshot];
+  // Receive/duplicate counters lag one scrape so joins can finish moving before
+  // they enter the denominator. The denominator ends at the prior scrape while
+  // moves end at the current histogram; compute bad moves from both the shifted
+  // move-window baseline and the common denominator baseline, keeping the lower
+  // estimate so an oldest-edge burst cannot masquerade as failed moves.
+  const end = ring[ring.length - 1] ?? snapshot;
+  const baselineAtOrBefore = (time: number, ceiling: number): JoinBurnSnapshot | undefined => {
+    const eligible = next.filter((s) => s.t <= time && s.t <= ceiling);
+    return eligible[eligible.length - 1];
+  };
+  const burn = (windowSeconds: number): number | undefined => {
+    const receivedBase = baselineAtOrBefore(end.t - windowSeconds, end.t);
+    const moveBase = baselineAtOrBefore(nowSeconds - windowSeconds, nowSeconds);
+    // No sample at or before either boundary means the ring does not yet cover
+    // this full window, so wait for history rather than treating it as complete.
+    if (receivedBase === undefined || moveBase === undefined) return undefined;
+    const genuine = (end.received - end.duplicate) - (receivedBase.received - receivedBase.duplicate);
+    if (genuine < JOIN_BURN_MIN_JOINS) return undefined;
+    const good = fastMoves - moveBase.fastMoves;
+    const commonGenuine = (snapshot.received - snapshot.duplicate) - (moveBase.received - moveBase.duplicate);
+    if (commonGenuine < JOIN_BURN_MIN_JOINS) return undefined;
+    // Window-boundary skew can briefly move more joins than arrived: never
+    // report negative burn, just no burn. Compare the offset-window burn with
+    // an estimate whose arrival and move counters share the move baseline; the
+    // latter excludes an oldest-edge arrival with no matching completion.
+    const offsetBad = Math.max(0, genuine - good);
+    const commonBad = Math.max(0, commonGenuine - good);
+    if (offsetBad < JOIN_BURN_MIN_BAD || commonBad < JOIN_BURN_MIN_BAD) return undefined;
+    return Math.min(offsetBad / (genuine * JOIN_SLO_BUDGET), commonBad / (commonGenuine * JOIN_SLO_BUDGET));
+  };
+  const fastLong = burn(JOIN_FAST_LONG_SECONDS);
+  const fastShort = burn(JOIN_FAST_SHORT_SECONDS);
+  const slowLong = burn(JOIN_SLOW_LONG_SECONDS);
+  const slowShort = burn(JOIN_SLOW_SHORT_SECONDS);
+  return {
+    fast: fastLong !== undefined && fastShort !== undefined && fastLong > JOIN_FAST_BURN && fastShort > JOIN_FAST_BURN,
+    slow: slowLong !== undefined && slowShort !== undefined && slowLong > JOIN_SLOW_BURN && slowShort > JOIN_SLOW_BURN,
+    held: false,
+    ring: next,
+  };
+}
+
 export interface Evaluation {
   /** Firing keys `ruleId` or `ruleId:subject`. */
   firing: string[];
@@ -362,16 +543,29 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   }
 
   let rest429 = 0;
+  let rest5xx = 0;
   let restTotal = 0;
   for (const s of gauge("two_bot_rest_requests_total")) {
     restTotal += s.value;
     if (s.labels["result"] === "429") rest429 += s.value;
+    if (s.labels["result"] === "5xx") rest5xx += s.value;
   }
   // A counter that went backwards means the process restarted: no window.
   const reset = rest429 < prev.rest429 || restTotal < prev.restTotal;
   const dTotal = restTotal - prev.restTotal;
   const d429 = rest429 - prev.rest429;
   if (!reset && dTotal >= REST_429_MIN_REQUESTS && d429 / dTotal > REST_429_RATIO) firing.push("rest_429_rate");
+
+  // Error-rate sibling of the 429 rule: a 5xx burst (Discord-side failures or
+  // a broken request shape from a fresh deploy) pages like a hot 429 route.
+  // `transport` (failures before response headers) stays out: timeouts and
+  // cancellations already surface through job timeout classes. Missing 5xx
+  // state from older DO storage establishes a baseline without firing.
+  const hasRest5xxBaseline = prev.rest5xx !== undefined;
+  const prevRest5xx = prev.rest5xx ?? 0;
+  const reset5xx = rest5xx < prevRest5xx || restTotal < prev.restTotal;
+  const d5xx = rest5xx - prevRest5xx;
+  if (hasRest5xxBaseline && !reset5xx && dTotal >= REST_5XX_MIN_REQUESTS && d5xx / dTotal > REST_5XX_RATIO) firing.push("rest_5xx_rate");
 
   const configured = gauge("two_bot_db_pool_configured")[0]?.value === 1;
   const size = gauge("two_bot_db_pool_connections")[0]?.value;
@@ -437,6 +631,43 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const dVoiceOrphans = voiceOrphans - prevVoiceOrphans;
   if (!voiceReset && ((dVoiceOps >= VOICE_FAILURE_MIN_OPS && dVoiceFailures / dVoiceOps > VOICE_FAILURE_RATIO) || dVoiceDead >= 1 || dVoiceOrphans >= 1)) {
     firing.push("voice_failures");
+  }
+
+  // Creator-join SLO burn rate (Google SRE workbook multiwindow): 99.5% of
+  // genuine creator joins must move within 5 s. Good events are the
+  // `two_bot_voice_join_to_move_seconds_bucket{le="5"}` cumulative count;
+  // genuine joins are `two_bot_voice_joins_received_total` minus the benign
+  // post-move `duplicate` refusals (`two_bot_voice_join_refused_total`).
+  // Every other refusal, failed move and slow (>5 s) move is budget burn.
+  // The fast rule pages when both the 1 h and 5 min windows burn faster
+  // than 14.4x; the slow rule tickets when both the 6 h and 30 min windows
+  // burn faster than 6x. A window with fewer genuine joins than
+  // JOIN_BURN_MIN_JOINS never fires, so quiet guilds stay silent. A counter
+  // that went backwards means the process restarted: the ring is rebuilt
+  // from this sample and nothing fires. Missing or malformed join series
+  // hold the previous firing state without appending a snapshot.
+  const joinBurn = joinBurnEvaluation(samples, prev.joinBurn ?? [], nowSeconds);
+  if (joinBurn.fast) firing.push("voice_join_fast_burn");
+  else if (prev.firing.includes("voice_join_fast_burn") && joinBurn.held) firing.push("voice_join_fast_burn");
+  if (joinBurn.slow) firing.push("voice_join_slow_burn");
+  else if (prev.firing.includes("voice_join_slow_burn") && joinBurn.held) firing.push("voice_join_slow_burn");
+
+  // Creator-map staleness: the voice actor re-merges the creator map from
+  // the store every 5 minutes; `two_bot_voice_creator_map_age_seconds`
+  // counts from the last successful merge (a failed read never resets it,
+  // and the stall watchdog keeps it climbing while the actor is hung), so
+  // an age past two intervals means merges stopped landing and joins are
+  // served from a stale map. Generation 0 means no merge has landed yet —
+  // boot, or voice parked — where the age is defined as 0 and this rule
+  // cannot tell parked from wedged, so it stays silent. The gauges postdate
+  // older containers and are optional scrape inputs: missing or malformed
+  // series hold the previous firing state instead of resolving it.
+  const creatorMapGeneration = exactSeries(gauge("two_bot_voice_creator_map_generation"), {});
+  const creatorMapAge = exactSeries(gauge("two_bot_voice_creator_map_age_seconds"), {});
+  if (creatorMapGeneration !== undefined && creatorMapAge !== undefined) {
+    if (creatorMapGeneration > 0 && creatorMapAge > CREATOR_MAP_STALE_SECONDS) firing.push("voice_creator_map_stale");
+  } else if (prev.firing.includes("voice_creator_map_stale")) {
+    firing.push("voice_creator_map_stale");
   }
 
   // Gateway missed events (sequence gaps inside one session): any increase
@@ -555,12 +786,33 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks } };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
   const id = key.split(":")[0];
   return RULES.find((r) => r.id === id);
+}
+
+/** Promotion-stage verdict: `fail` true means the stage must fail so auto-rollback runs. */
+export interface PromotionGateVerdict {
+  fail: boolean;
+  /** Gate rule ids present in the firing list, in gate order. */
+  reasons: string[];
+}
+
+/**
+ * Canary error-rate gate over an `evaluateMetrics` firing list. Fails when
+ * any `PROMOTION_ERROR_GATE_RULES` entry fires (exact match: this gate's
+ * rules carry no `:subject` suffix). A 429-only burst passes: backpressure
+ * is not a rollback trigger. Callers wire the failure into their per-stage
+ * health gate (staging verify, production gate, or the shared
+ * gradual-promotion smoke wrapper) so the existing auto-rollback restores
+ * the recorded pre-promote version.
+ */
+export function evaluatePromotionGate(firing: string[]): PromotionGateVerdict {
+  const reasons = PROMOTION_ERROR_GATE_RULES.filter((rule) => firing.includes(rule));
+  return { fail: reasons.length > 0, reasons };
 }
 
 /**
@@ -594,20 +846,22 @@ export function transitionMessages(
   after: string[],
   beforeJobErrorClasses?: Record<string, JobErrorClass>,
   afterJobErrorClasses?: Record<string, JobErrorClass>,
+  context?: AlertContext,
 ): string[] {
   const out: string[] = [];
+  const suffix = alertContextSuffix(context);
   for (const key of after.filter((k) => !before.includes(k))) {
     const rule = ruleFor(key);
     const runbook = rule ? runbookUrl(rule) : `${RUNBOOK_BASE_URL}runbook.md`;
     const errorClass = jobErrorClassForAlert(key, afterJobErrorClasses);
     const classSuffix = errorClass ? ` (last error class: ${errorClass})` : "";
     const severity = rule?.severity ? ` (${rule.severity})` : "";
-    out.push(`two-bot-next ALERT ${key}${classSuffix}${severity}: ${rule?.summary ?? key}. Runbook: ${runbook}`);
+    out.push(`two-bot-next ALERT ${key}${classSuffix}${severity}: ${rule?.summary ?? key}. Runbook: ${runbook}.${suffix}`);
   }
   for (const key of before.filter((k) => !after.includes(k))) {
     const errorClass = jobErrorClassForAlert(key, beforeJobErrorClasses);
     const classSuffix = errorClass ? ` (last error class: ${errorClass})` : "";
-    out.push(`two-bot-next RESOLVED ${key}${classSuffix}.`);
+    out.push(`two-bot-next RESOLVED ${key}${classSuffix}.${suffix}`);
   }
   return out;
 }

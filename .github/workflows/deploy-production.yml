@@ -12,7 +12,10 @@ name: deploy-production
 # the operator confirms the SHA is live. A pre-deploy schema gate then runs
 # the read-only production-migrate plan on the guarded SHA and refuses a new
 # build whose migrations are ahead of the production ledger (rollback and
-# live-SHA redeploy waive it: they serve no new schema). The guard also refuses
+# live-SHA redeploy waive it: they serve no new schema), and a pre-deploy
+# role gate runs the read-only `two-bot db roles verify` on the same binding
+# and refuses a new build whose grants lag the migrations (same waivers: a
+# rollback re-serves grants its build already held). The guard also refuses
 # when the `production` Environment is missing or unprotected: a job that
 # names a missing Environment makes GitHub create it with no reviewers, which
 # would remove the human gate. A failed gate after a takeover auto-rolls back
@@ -81,12 +84,13 @@ jobs:
           IMAGE: ${{ inputs.image }}
           ALLOW_UNSTAGED: ${{ inputs.allow_unstaged }}
           TAKEOVER: ${{ inputs.takeover }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
           # Exactly "true" replaces the human Environment reviewer with
           # automated evidence (latest deploy-staging run on the SHA is green).
           AUTO_APPROVE: ${{ vars.PRODUCTION_AUTO_APPROVE }}
         shell: python3 {0}
         run: |
-          import json, os, re, subprocess, sys
+          import json, os, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
 
           repo = os.environ["GITHUB_REPOSITORY"]
           sha = os.environ.get("SHA", "").strip().lower()
@@ -155,6 +159,29 @@ jobs:
                   refuse("allow_unstaged applies to a deploy, never a rollback")
               if takeover != "true":
                   refuse("allow_unstaged needs takeover true: it re-serves the live build")
+              worker_url = os.environ.get("PRODUCTION_WORKER_URL", "").strip().rstrip("/")
+              parsed_url = urllib.parse.urlsplit(worker_url)
+              if parsed_url.scheme != "https" or not parsed_url.netloc or parsed_url.username:
+                  refuse("allow_unstaged needs a valid production Worker URL")
+              try:
+                  try:
+                      request = urllib.request.Request(
+                          worker_url + "/readyz",
+                          headers={"User-Agent": "two-bot-next-production-rollout/1.0"},
+                      )
+                      with urllib.request.urlopen(request, timeout=10) as response:
+                          status, body = response.status, response.read()
+                  except urllib.error.HTTPError as error:
+                      if error.code != 503:
+                          raise
+                      status, body = error.code, error.read()
+                  if status not in (200, 503):
+                      refuse(f"production /readyz returned unexpected status {status}")
+                  live_report = json.loads(body)
+              except (OSError, ValueError, urllib.error.URLError):
+                  refuse("could not read live production build revision; failing closed")
+              if not isinstance(live_report, dict) or live_report.get("build_revision") != sha:
+                  refuse("live production build revision does not match requested SHA")
           if os.environ.get("GITHUB_REF") != "refs/heads/main":
               refuse("dispatch this workflow from main only")
 
@@ -334,12 +361,13 @@ jobs:
   # (never derived from it), so a wrong-target binding refuses instead of
   # reading the wrong database. Drift is fixed by the manual
   # production-migrate apply dispatch named in the failure, never by this
-  # workflow. A rollback and a live-SHA takeover redeploy serve no new schema
-  # and waive the ledger check inside the reviewed script (recorded, never a
-  # silent skip), so recovery never waits on this gate.
+  # workflow. Rollback and live-SHA takeover jobs skip this gate because they
+  # serve no new schema; production's condition accepts only those guard-validated
+  # modes, while ordinary deploys require this gate to succeed.
   schema-gate:
     name: prod schema drift gate (production-migrate plan)
     needs: guard
+    if: needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'
     permissions:
       contents: read
     environment: production-migrate-plan
@@ -399,9 +427,89 @@ jobs:
             --binary ./target/debug/staging-migrate --source-sha "$SOURCE_SHA" \
             --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"
 
+  # Pre-deploy role-drift gate: a production database whose grants lag the
+  # migrations fails this job (and, through `needs`, the deploy below)
+  # instead of crash-looping the new build at gateway startup with SQLSTATE
+  # 42501 (the 2026-10-16 incident: migrations 0424-0441 applied, role plan
+  # never reapplied, schema gate green). Read-only `two-bot db roles verify`
+  # through the no-reviewer `production-migrate-plan` environment binding (a
+  # login holding only the read-only plan group); the expected
+  # host/database/branch pins are non-secret `vars.*` compared against that
+  # binding (never derived from it), so a wrong-target binding refuses
+  # instead of reading the wrong database. Drift is fixed by the operator
+  # reapplying the full role plan (`two-bot db roles plan`) until `verify`
+  # reads 0, never by this workflow. Rollback and live-SHA takeover jobs skip
+  # this gate because they serve no new-table grants; production's condition
+  # accepts only those guard-validated modes, while ordinary deploys require
+  # this gate to succeed.
+  roles-gate:
+    name: prod role drift gate (two-bot db roles verify)
+    needs: guard
+    if: needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'
+    permissions:
+      contents: read
+    environment: production-migrate-plan
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'roles-gate') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 30
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Gate exactly the guarded SHA, not a newer main head.
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Reviewed tooling runs from the workflow's own commit: a rollback
+          # (or live-SHA redeploy) targets an older SHA that predates these
+          # scripts, so the guarded checkout above may not contain them.
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Deploy SHA must be exact
+        env:
+          SOURCE_SHA: ${{ needs.guard.outputs.sha }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Build runner
+        run: cargo build -p two-bot --bin two-bot --locked
+      - name: Fail closed on role drift
+        env:
+          # Must already exist as a production-migrate-plan environment secret; absent means refusal.
+          # Read-only login: the gate never applies and never reads the migrator binding.
+          TWO_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_PLAN_DATABASE_URL }}
+          # Non-secret expected production identity (repo vars, Operator-owned;
+          # unset pins refuse): the gate refuses unless the secret binding
+          # matches these pins. Vars: TWO_BOT_PRODUCTION_HOST,
+          # TWO_BOT_PRODUCTION_DATABASE and TWO_BOT_PRODUCTION_BRANCH_ID
+          # (see docs/production-deploy.md).
+          TWO_BOT_PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
+          TWO_BOT_PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
+          TWO_BOT_PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
+          MODE: ${{ needs.guard.outputs.mode }}
+          ALLOW_UNSTAGED: ${{ needs.guard.outputs.allow_unstaged }}
+        # `shell: bash` runs with `-eo pipefail`. The container's default `sh`
+        # has no pipefail, so a gate refusal piped anywhere would read green.
+        # `set -o pipefail` is belt-and-braces for the same guarantee if the
+        # shell key is ever re-targeted; the workflow-policy test pins both.
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 tooling/scripts/ci/roles_gate.py \
+            --binary ./target/debug/two-bot --target production \
+            --expected-host "$TWO_BOT_PRODUCTION_HOST" --expected-database "$TWO_BOT_PRODUCTION_DATABASE" \
+            --expected-branch-id "$TWO_BOT_PRODUCTION_BRANCH_ID" \
+            --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"
+
   production:
     name: wrangler ${{ needs.guard.outputs.mode }} + readyz gate
-    needs: [guard, schema-gate]
+    needs: [guard, schema-gate, roles-gate]
+    if: always() && needs.guard.result == 'success' && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'production') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     # Sized for the worst case: a ~442 s deploy, a failing gate (~15 min of

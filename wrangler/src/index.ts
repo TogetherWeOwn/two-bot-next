@@ -99,13 +99,18 @@ import {
 } from "./ops-control.ts";
 import {
   EMPTY_STATE,
+  LOG_QUERY_URL,
+  alertContextSuffix,
   evaluateMetrics,
   interruptDispatchDrops,
   transitionMessages,
+  type AlertContext,
   type MetricsAlertState,
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
+import { parseRelease, releaseTag, workerVersionTag } from "./error-events.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
+import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
 import { handleMcp } from "./mcp.ts";
 import {
   OPS_DASHBOARD_PATH,
@@ -142,7 +147,7 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
-  /** Consecutive failed probes; default covers ~10 minutes of keepalive ticks. */
+  /** Consecutive failed probes; default covers ~2 minutes of keepalive ticks. */
   UNREADY_ALERT_FAILURES?: string;
   /** Optional Worker secret; never forwarded to the container or logged. */
   OPS_ALERT_WEBHOOK_URL?: string;
@@ -183,6 +188,20 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_EVENTSUB?: string;
   /** Operator-set Worker secret carrying the Twitch signing secret. Never flag-forwarded. */
   TWO_TWITCH_WEBHOOK_SECRET?: string;
+  /** Operator-set reconcile callback URL. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
+  TWO_TWITCH_CALLBACK_URL?: string;
+  /** Operator-set reconcile broadcaster allowlist. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
+  TWO_TWITCH_BROADCASTERS?: string;
+  /** Operator-set Helix client id. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
+  TWO_TWITCH_CLIENT_ID?: string;
+  /** Operator-set Helix client secret. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
+  TWO_TWITCH_CLIENT_SECRET?: string;
+  /** Staging rollback-drill switch (docs/staging-rollout-gate.md). Set only
+   * in the generated staging deploy config by a manual deploy-staging
+   * dispatch, never a committed var (check-env-bindings.py). Reaches the
+   * Container on an explicit fenced line below, never flag-forwarded. The
+   * TWO_DEPLOY_ENV marker it is fenced by rides FORWARDED_FLAGS. */
+  TWO_GATEWAY_READINESS_FAIL_INJECTION?: string;
   /** Operator-set Worker secrets for the private receiver. Never flag-forwarded. */
   TWO_INTERNAL_ACTIONS?: string;
   TWO_INTERNAL_CALLERS?: string;
@@ -312,7 +331,7 @@ type ReadinessEvent = "container_unready_alert" | "container_unready_recovery";
 
 const SINGLETON_NAME = "two-bot";
 const DEFAULT_KEEPALIVE_SECONDS = 60;
-const DEFAULT_UNREADY_SECONDS = 600;
+const DEFAULT_UNREADY_SECONDS = 120;
 const READINESS_KEY = "two-bot:readiness";
 const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
 const OPS_METRICS_PATH = "/ops/metrics";
@@ -446,11 +465,14 @@ function isBotProbeResponse(response: Response): boolean {
   return response.status === 503 && mediaType === "application/json";
 }
 
-// TOG-13044: while the gateway task is failing, the bot serves its fixed
-// phase/class on /readyz for a bounded linger. Container stdout is not in
-// Workers Logs, so the keepalive re-emits those two tokens as a structured
-// warn. Strict tokens only: nothing else from the probe body is ever logged.
+// While the gateway task is failing, the bot serves its fixed phase/class
+// plus the failing step and SQLSTATE code on /readyz for a bounded linger.
+// Container stdout is not in Workers Logs, so the keepalive re-emits those
+// tokens as a structured warn alongside the container build revision.
+// Strict tokens only: nothing else from the probe body is ever logged.
 const FAILURE_TOKEN = /^[a-z0-9_]{1,32}$/;
+const SQLSTATE_TOKEN = /^(none|[0-9A-Z]{5})$/;
+const BUILD_TOKEN = /^[A-Za-z0-9._-]{1,64}$/;
 const MAX_PROBE_BODY_BYTES = 64 * 1024;
 
 /** Bound awaits even when the SDK/response stream does not observe abort. */
@@ -466,6 +488,24 @@ async function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   } finally {
     signal.removeEventListener("abort", onAbort);
   }
+}
+
+/** Release a body best-effort: a stalling cancel hook must not hold the caller. */
+function releaseBody(response: Response): void {
+  void response.body?.cancel().catch(() => {});
+}
+
+/**
+ * Settle a container fetch at `signal`'s deadline even when the SDK ignores
+ * abort. A response that arrives after the deadline is released best-effort
+ * and never delivered to the caller.
+ */
+async function deadlineFetch(work: Promise<Response>, signal: AbortSignal): Promise<Response> {
+  const request = work.then((res) => {
+    if (signal.aborted) releaseBody(res);
+    return res;
+  });
+  return abortable(request, signal);
 }
 
 /** Read at most `limit` bytes; cancel oversize/failed bodies without buffering. */
@@ -495,21 +535,51 @@ async function readBoundedText(response: Response, limit: number, signal?: Abort
   }
 }
 
-function gatewayFailure(body: string): { phase: string; class: string } | null {
-  if (new TextEncoder().encode(body).byteLength > MAX_PROBE_BODY_BYTES) return null;
+export interface ProbeDetail {
+  failure: { phase: string; class: string; failedStep?: string; errorCode?: string } | null;
+  buildRevision?: string;
+  buildId?: string;
+}
+
+function probeDetail(body: string): ProbeDetail {
+  if (new TextEncoder().encode(body).byteLength > MAX_PROBE_BODY_BYTES) return { failure: null };
   try {
-    const report: unknown = JSON.parse(body);
-    const field = (report as { gateway_failure?: unknown } | null)?.gateway_failure;
-    if (typeof field !== "object" || field === null) return null;
-    const { phase, class: errorClass } = field as Record<string, unknown>;
-    if (typeof phase === "string" && typeof errorClass === "string"
-      && FAILURE_TOKEN.test(phase) && FAILURE_TOKEN.test(errorClass)) {
-      return { phase, class: errorClass };
+    const report = JSON.parse(body) as {
+      gateway_failure?: unknown;
+      build_revision?: unknown;
+      build_id?: unknown;
+    } | null;
+    let failure: ProbeDetail["failure"] = null;
+    const field = report?.gateway_failure;
+    if (typeof field === "object" && field !== null) {
+      const { phase, class: errorClass, failed_step, error_code } = field as Record<string, unknown>;
+      if (typeof phase === "string" && typeof errorClass === "string"
+        && FAILURE_TOKEN.test(phase) && FAILURE_TOKEN.test(errorClass)) {
+        failure = { phase, class: errorClass };
+        if (typeof failed_step === "string" && FAILURE_TOKEN.test(failed_step)) {
+          failure.failedStep = failed_step;
+        }
+        if (typeof error_code === "string" && SQLSTATE_TOKEN.test(error_code)) {
+          failure.errorCode = error_code;
+        }
+      }
     }
+    const detail: ProbeDetail = { failure };
+    if (typeof report?.build_revision === "string" && BUILD_TOKEN.test(report.build_revision)) {
+      detail.buildRevision = report.build_revision;
+    }
+    if (typeof report?.build_id === "string" && BUILD_TOKEN.test(report.build_id)) {
+      detail.buildId = report.build_id;
+    }
+    return detail;
   } catch {
     // Not the bot's JSON: nothing to report.
+    return { failure: null };
   }
-  return null;
+}
+
+function gatewayFailure(body: string): { phase: string; class: string } | null {
+  return probeDetail(body).failure;
 }
 
 function containerPort(raw: string | undefined): number {
@@ -564,6 +634,14 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   if (typeof applicationId === "string" && isSnowflake(applicationId)) {
     vars[APPLICATION_ID_KEY] = applicationId;
   }
+  // Staging rollback drill (docs/staging-rollout-gate.md): the readiness
+  // failure switch reaches the Container only under the staging deploy-env
+  // marker with the exact "1" value; the Rust fence repeats both checks, so
+  // a stray binding on any other Worker forwards and activates nothing.
+  // Not flag-forwarded (NOT_FORWARDED in container-env.ts).
+  if (env.TWO_DEPLOY_ENV === "staging" && env.TWO_GATEWAY_READINESS_FAIL_INJECTION === "1") {
+    vars["TWO_GATEWAY_READINESS_FAIL_INJECTION"] = "1";
+  }
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   // Private internal-actions receiver (TOG-12980, bind TOG-16851). Dark unless
   // the Operator sets TWO_INTERNAL_ACTIONS to exactly "1"; any other value
@@ -583,8 +661,11 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   // exactly "1" with the signing secret present; any other state forwards
   // nothing, so a typo or a missing secret cannot crash-loop the gateway
   // (the receiver boots all-or-nothing). The bind and the container marker
-  // are the Worker's constants, never Operator-set values. The signing secret
-  // travels on its own explicit line and is never logged.
+  // are the Worker's constants, never Operator-set values. The signing secret,
+  // reconcile inputs and Helix credentials each travel on their own explicit
+  // line and are never logged. Absent stays absent so a half-provisioned
+  // enable fails loudly in the Container (reconcile_config_invalid) instead
+  // of silently running dark.
   if (eventsubReceiverForwarded(env)) {
     if (port === EVENTSUB_RECEIVER_PORT) throw new Error("BOT_PORT must differ from the EventSub receiver port");
     if (port === RECEIVER_PORT) throw new Error("BOT_PORT must differ from the internal-actions receiver port");
@@ -592,6 +673,10 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     vars["TWO_EVENTSUB_BIND"] = EVENTSUB_RECEIVER_BIND;
     vars[CONTAINER_MARKER] = CONTAINER_MARKER_VALUE;
     vars["TWO_TWITCH_WEBHOOK_SECRET"] = env.TWO_TWITCH_WEBHOOK_SECRET as string;
+    if (env.TWO_TWITCH_CALLBACK_URL) vars["TWO_TWITCH_CALLBACK_URL"] = env.TWO_TWITCH_CALLBACK_URL;
+    if (env.TWO_TWITCH_BROADCASTERS) vars["TWO_TWITCH_BROADCASTERS"] = env.TWO_TWITCH_BROADCASTERS;
+    if (env.TWO_TWITCH_CLIENT_ID) vars["TWO_TWITCH_CLIENT_ID"] = env.TWO_TWITCH_CLIENT_ID;
+    if (env.TWO_TWITCH_CLIENT_SECRET) vars["TWO_TWITCH_CLIENT_SECRET"] = env.TWO_TWITCH_CLIENT_SECRET;
   }
   return vars;
 }
@@ -610,6 +695,10 @@ export class TwoBotContainer extends Container<Env> {
   private readonly ownership = new OwnershipFence(this.ctx.storage);
   private readonly initialization: Promise<void>;
   private recoveryFailed = false;
+  // Last container git SHA seen on /readyz this tick. Tags the keepalive
+  // error events (gateway failures by class; metrics alerts by rule/content);
+  // a failed probe leaves "unknown" rather than a stale release from a replaced image.
+  private lastRelease: string | null = null;
   private static readonly KEEPALIVE_KEY = "two-bot:keepalive:v1";
 
   constructor(ctx: DurableObjectState<{}>, env: Env) {
@@ -703,20 +792,23 @@ export class TwoBotContainer extends Container<Env> {
             });
           let upstream: Response;
           try {
-            upstream = await this.containerFetch(`http://c${OPS_SUMMARY_PATH}`, {
+            upstream = await deadlineFetch(this.containerFetch(`http://c${OPS_SUMMARY_PATH}`, {
               signal: fetchSignal,
-            });
+            }), fetchSignal);
           } catch {
             return summaryUnavailable(504);
           }
           if (fetchSignal.aborted || !isBotProbeResponse(upstream)) {
-            await upstream.body?.cancel().catch(() => {});
+            releaseBody(upstream);
             return summaryUnavailable(504);
           }
           let body: string | null;
           try {
-            body = await readBoundedText(upstream, MAX_SUMMARY_BODY_BYTES);
+            body = await readBoundedText(upstream, MAX_SUMMARY_BODY_BYTES, fetchSignal);
           } catch {
+            return summaryUnavailable(504);
+          }
+          if (fetchSignal.aborted) {
             return summaryUnavailable(504);
           }
           if (body === null) {
@@ -802,21 +894,21 @@ export class TwoBotContainer extends Container<Env> {
     let upstream: Response;
     try {
       upstream = headers
-        ? await this.containerFetch(new Request(containerUrl, { headers, signal: fetchSignal }))
-        : await this.containerFetch(containerUrl, {
+        ? await deadlineFetch(this.containerFetch(new Request(containerUrl, { headers, signal: fetchSignal })), fetchSignal)
+        : await deadlineFetch(this.containerFetch(containerUrl, {
           signal: fetchSignal,
-        });
+        }), fetchSignal);
     } catch {
       return unavailable(504);
     }
     if (fetchSignal.aborted) {
-      await upstream.body?.cancel().catch(() => {});
+      releaseBody(upstream);
       return unavailable(504);
     }
     if (headers && upstream.status === 401) {
       // Signed-read auth failure, not an outage: fixed 401 with the same body
       // the Worker pre-check uses, so container error text cannot leak.
-      await upstream.body?.cancel().catch(() => {});
+      releaseBody(upstream);
       return new Response("unauthorized", {
         status: 401,
         headers: withSecurityHeaders({ "content-type": "text/plain", "cache-control": "no-store" }),
@@ -825,13 +917,16 @@ export class TwoBotContainer extends Container<Env> {
     if (!upstream.ok) {
       // Cancel without reading: a huge non-2xx body must not bypass
       // the 64 KiB cap by being drained here.
-      await upstream.body?.cancel().catch(() => {});
+      releaseBody(upstream);
       return unavailable(504);
     }
     let body: string | null;
     try {
-      body = await readBoundedText(upstream, MAX_METRICS_BODY_BYTES);
+      body = await readBoundedText(upstream, MAX_METRICS_BODY_BYTES, fetchSignal);
     } catch {
+      return unavailable(504);
+    }
+    if (fetchSignal.aborted) {
       return unavailable(504);
     }
     if (body === null) {
@@ -851,9 +946,13 @@ export class TwoBotContainer extends Container<Env> {
    */
   private async internalActions(request: Request): Promise<Response> {
     if (!ingressEnabled(this.env) || !isActionsRequest(request)) return notFound();
-    const checked = allowlistedHeaders(request.headers);
+    // The Worker's stamped id (or a fresh one): the forward already carries
+    // it via the allowlisted headers, and these envelopes echo it so a 503
+    // still joins the flow's Worker and container logs.
+    const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
+    const checked = allowlistedHeaders(request.headers, requestId);
     if ("refusal" in checked) return checked.refusal;
-    const body = await readBody(request);
+    const body = await readBody(request, requestId);
     if ("refusal" in body) return body.refusal;
     const forward = forwardRequest(
       `http://c${ACTIONS_PATH}`,
@@ -864,17 +963,17 @@ export class TwoBotContainer extends Container<Env> {
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
-        if (!this.ctx.container?.running) return envelope(503, "unavailable", true);
+        if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
         try {
-          return await relayReceiverResponse(await this.containerFetch(forward, RECEIVER_PORT));
+          return await relayReceiverResponse(await this.containerFetch(forward, RECEIVER_PORT), requestId);
         } catch {
-          return envelope(503, "unavailable", true);
+          return envelope(503, "unavailable", true, {}, requestId);
         }
       });
     } catch (error) {
       // Logs the closed ownership reason; the caller only sees the envelope.
       refused(error);
-      return envelope(503, "unavailable", true);
+      return envelope(503, "unavailable", true, {}, requestId);
     }
   }
 
@@ -889,9 +988,12 @@ export class TwoBotContainer extends Container<Env> {
    */
   private async internalEventsub(request: Request): Promise<Response> {
     if (!eventsubIngressEnabled(this.env) || !isEventsubRequest(request)) return notFound();
-    const checked = eventsubAllowlistedHeaders(request.headers);
+    // Same join as the actions path above: the forward carries the stamped
+    // id, and these envelopes echo it so a 503 still joins the flow's logs.
+    const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
+    const checked = eventsubAllowlistedHeaders(request.headers, requestId);
     if ("refusal" in checked) return checked.refusal;
-    const body = await readEventsubBody(request);
+    const body = await readEventsubBody(request, requestId);
     if ("refusal" in body) return body.refusal;
     const forward = forwardRequest(
       `http://c${EVENTSUB_PATH}`,
@@ -902,17 +1004,17 @@ export class TwoBotContainer extends Container<Env> {
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
-        if (!this.ctx.container?.running) return envelope(503, "unavailable", true);
+        if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
         try {
-          return await relayEventsubResponse(await this.containerFetch(forward, EVENTSUB_RECEIVER_PORT));
+          return await relayEventsubResponse(await this.containerFetch(forward, EVENTSUB_RECEIVER_PORT), requestId);
         } catch {
-          return envelope(503, "unavailable", true);
+          return envelope(503, "unavailable", true, {}, requestId);
         }
       });
     } catch (error) {
       // Logs the closed ownership reason; the caller only sees the envelope.
       refused(error);
-      return envelope(503, "unavailable", true);
+      return envelope(503, "unavailable", true, {}, requestId);
     }
   }
 
@@ -1117,23 +1219,45 @@ export class TwoBotContainer extends Container<Env> {
         let admitted = true;
         try {
           let status: number | null = null;
+          let probe: ProbeDetail = { failure: null };
           try {
-            const res = await this.containerFetch("http://c/readyz", { signal: AbortSignal.timeout(6000) });
+            const probeSignal = AbortSignal.timeout(6000);
+            const res = await deadlineFetch(
+              this.containerFetch("http://c/readyz", { signal: probeSignal }), probeSignal);
             status = res.status;
             if (!res.ok) console.warn(`two-bot /readyz unhealthy: ${status}`);
             // Cap the keepalive /readyz read like the metrics scrape: a
             // compromised container controls this body, so an oversized answer
             // is a failed probe, never a buffered parse. Small bodies still
             // drain fully, so the SDK 0.3.7 proxy pipe settles cleanly.
-            const body = await readBoundedText(res, MAX_PROBE_BODY_BYTES);
-            if (body === null) {
+            const body = await readBoundedText(res, MAX_PROBE_BODY_BYTES, probeSignal);
+            // Refresh the release tag before any error event below: a failed
+            // probe must not reuse a previous image's SHA.
+            this.lastRelease = null;
+            if (probeSignal.aborted) {
+              // A probe that only completed past its deadline is no evidence
+              // of readiness: record it as failed, never as recovery.
+              status = null;
+              console.warn("two-bot keepalive probe failed");
+            } else if (body === null) {
               status = null;
               console.warn("two-bot keepalive probe failed");
             } else {
-              const failure = isBotProbeResponse(res) ? gatewayFailure(body) : null;
+              const botBody = isBotProbeResponse(res);
+              probe = botBody ? probeDetail(body) : { failure: null };
+              this.lastRelease = botBody ? parseRelease(body) : null;
+              const failure = probe.failure;
               if (failure) {
                 console.warn(JSON.stringify({
-                  event: "container_gateway_failure", phase: failure.phase, class: failure.class,
+                  event: "container_gateway_failure",
+                  phase: failure.phase,
+                  class: failure.class,
+                  failed_step: failure.failedStep ?? "unknown",
+                  error_code: failure.errorCode ?? "none",
+                  build_revision: probe.buildRevision ?? "unknown",
+                  release: releaseTag(this.lastRelease),
+                  worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+                  log_url: LOG_QUERY_URL,
                 }));
               }
             }
@@ -1143,10 +1267,16 @@ export class TwoBotContainer extends Container<Env> {
               throw error;
             }
             status = null;
+            this.lastRelease = null;
             console.warn("two-bot keepalive probe failed");
           }
-          await this.recordReadiness(status);
-          await this.evaluateMetricsAlerts();
+          const context: AlertContext = {
+            buildRevision: probe.buildRevision ?? "unknown",
+            failedStep: probe.failure?.failedStep,
+            errorCode: probe.failure?.errorCode,
+          };
+          await this.recordReadiness(status, context);
+          await this.evaluateMetricsAlerts(context);
         } finally {
           // Collapse duplicate chains, preserving unrelated SDK schedules.
           // No takeover can interleave with this owned callback's I/O.
@@ -1174,7 +1304,7 @@ export class TwoBotContainer extends Container<Env> {
     return Math.max(1, Math.ceil(DEFAULT_UNREADY_SECONDS / this.keepaliveSeconds()));
   }
 
-  private async recordReadiness(status: number | null): Promise<void> {
+  private async recordReadiness(status: number | null, context?: AlertContext): Promise<void> {
     const now = Date.now();
     const ready = status !== null && status >= 200 && status < 300;
     const threshold = this.unreadyAlertFailures();
@@ -1210,12 +1340,18 @@ export class TwoBotContainer extends Container<Env> {
       status,
       first_failure_at: ready ? previous!.firstFailureAt : state.firstFailureAt,
       observed_at: now,
+      build_revision: context?.buildRevision ?? "unknown",
+      release: releaseTag(this.lastRelease),
+      worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+      failed_step: context?.failedStep ?? "unknown",
+      error_code: context?.errorCode ?? "none",
+      log_url: LOG_QUERY_URL,
     }));
-    await this.postReadinessWebhook(event);
+    await this.postReadinessWebhook(event, context);
   }
 
   /** Pull /metrics, evaluate rules, notify on transitions. Never throws. */
-  private async evaluateMetricsAlerts(): Promise<void> {
+  private async evaluateMetricsAlerts(context?: AlertContext): Promise<void> {
     try {
       const previous = (await this.ctx.storage.get<MetricsAlertState>(METRICS_ALERT_KEY)) ?? EMPTY_STATE;
       let samples;
@@ -1249,8 +1385,16 @@ export class TwoBotContainer extends Container<Env> {
       const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);
-      for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses)) {
-        console.warn(JSON.stringify({ event: "metrics_alert", service: "two-bot-next", content }));
+      for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses, context)) {
+        console.warn(JSON.stringify({
+          event: "metrics_alert",
+          service: "two-bot-next",
+          content,
+          build_revision: context?.buildRevision ?? "unknown",
+          release: releaseTag(this.lastRelease),
+          worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+          log_url: LOG_QUERY_URL,
+        }));
         await this.postWebhookText(content);
       }
     } catch {
@@ -1278,12 +1422,13 @@ export class TwoBotContainer extends Container<Env> {
     }
   }
 
-  private async postReadinessWebhook(event: ReadinessEvent): Promise<void> {
+  private async postReadinessWebhook(event: ReadinessEvent, context?: AlertContext): Promise<void> {
     if (this.env.OPS_ALERT_FORWARDING !== "on") return;
     const binding = this.env.OPS_ALERT_WEBHOOK_URL;
     if (!binding) return;
     try {
       const url = opsAlertWebhookUrl(binding);
+      const suffix = alertContextSuffix(context);
       const response = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1291,8 +1436,8 @@ export class TwoBotContainer extends Container<Env> {
         signal: AbortSignal.timeout(6000),
         body: JSON.stringify({
           content: event === "container_unready_alert"
-            ? "two-bot-next: Container /readyz has repeatedly failed. Check the gateway connection and Worker logs."
-            : "two-bot-next: Container /readyz is ready again. The unready incident has recovered.",
+            ? `two-bot-next: Container /readyz has repeatedly failed. Check the gateway connection and Worker logs.${suffix}`
+            : `two-bot-next: Container /readyz is ready again. The unready incident has recovered.${suffix}`,
           // https://docs.discord.com/developers/resources/webhook#execute-webhook
           allowed_mentions: { parse: [], replied_user: false },
         }),
@@ -1468,8 +1613,9 @@ export default {
         });
       }
       // Sanitize the forwarded probe: keep the origin (Host) the Container
-      // expects, but drop the query, caller headers and body. The only header
-      // the DO sees is the Worker-stamped deployment id the fence requires.
+      // expects, but drop the query, caller headers and body. The DO sees the
+      // Worker-stamped deployment id the fence requires, plus the validated
+      // `x-request-id` so the container's request span joins this probe.
       const clean = new URL(request.url);
       clean.search = "";
       clean.hash = "";
@@ -1479,11 +1625,12 @@ export default {
       try {
         deployment = deploymentId(env.CF_VERSION_METADATA?.id);
       } catch (error) { return refused(error); }
+      const probeId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
       let response: Response;
       try {
         const sanitized = new Request(clean.toString(), {
           method: request.method,
-          headers: { [DEPLOYMENT_HEADER]: deployment },
+          headers: { [DEPLOYMENT_HEADER]: deployment, [REQUEST_ID_HEADER]: probeId },
         });
         const upstream = await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         // SDK startup failures arrive as responses rather than rejections.
