@@ -52,8 +52,8 @@ use twilight_model::{
     util::Timestamp,
 };
 use two_bot_core::{
-    gateway_funnel::InviteSnapshotWrite, EventType, FunnelEvent, FunnelStore, InviteState,
-    MemStore, NoopLeveling, RecordOutcome, Snowflake, StoredRow,
+    gateway_funnel::InviteSnapshotWrite, privacy::AnalyticsCategory, EventType, FunnelEvent,
+    FunnelStore, InviteState, MemStore, NoopLeveling, RecordOutcome, Snowflake, StoredRow,
 };
 use two_bot_discord::{DeferredCommunityFacts, NoClassification, Pipeline, ScriptedInvites};
 
@@ -188,8 +188,14 @@ impl FunnelStore for RecordingStore {
         self.inner.record(event)
     }
 
-    fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str) {
-        self.inner.touch_activity(guild_id, member_id, at);
+    fn touch_activity(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        at: &str,
+        family: AnalyticsCategory,
+    ) {
+        self.inner.touch_activity(guild_id, member_id, at, family);
     }
 
     fn next_message_rung(

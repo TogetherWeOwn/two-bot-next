@@ -16,7 +16,7 @@ use two_bot_core::community_store::{
     MessageFactInput,
 };
 use two_bot_core::database_tls::TlsPolicy;
-use two_bot_core::gateway_funnel::{FunnelBatch, InviteSnapshotWrite};
+use two_bot_core::gateway_funnel::{ActivityTouch, FunnelBatch, InviteSnapshotWrite};
 use two_bot_core::gateway_session::{DispatchAction, GatewaySession};
 use two_bot_core::inactivity_store::run_sweep;
 use two_bot_core::onboarding::{build_session_picks, plan_game_selection, plan_session};
@@ -25,6 +25,7 @@ use two_bot_core::onboarding_store::{
     record_game_selection_in_transaction, record_session_routed,
     record_session_routed_in_transaction,
 };
+use two_bot_core::privacy::AnalyticsCategory;
 use two_bot_core::rsvp::{checkin_classification, AttendanceProof};
 use two_bot_core::rsvp_store::{record_checkin, CheckinWrite};
 use two_bot_core::{EventType, FunnelEvent, InviteState};
@@ -431,9 +432,22 @@ async fn gateway_batch_commit_gates_suppression_toggles_and_inviters() {
             ),
             join_by_c,
         ],
+        // Message-origin touches: the suppressed member drops on
+        // suppression, the allowed member persists on the enabled
+        // activity family (voice is disabled in this fixture).
         activity: vec![
-            (guild_u64(), member_u64(MEMBER_A), at.clone()),
-            (guild_u64(), member_u64(MEMBER_B), at.clone()),
+            ActivityTouch {
+                guild_id: guild_u64(),
+                member_id: member_u64(MEMBER_A),
+                at: at.clone(),
+                family: AnalyticsCategory::Activity,
+            },
+            ActivityTouch {
+                guild_id: guild_u64(),
+                member_id: member_u64(MEMBER_B),
+                at: at.clone(),
+                family: AnalyticsCategory::Activity,
+            },
         ],
         bots: vec![
             (guild_u64(), member_u64(MEMBER_A)),

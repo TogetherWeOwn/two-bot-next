@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     funnel::{idempotency_key, now_iso, EventType, FunnelEvent, MESSAGE_RUNGS},
+    privacy::AnalyticsCategory,
     voice::{resolve_voice_end, VoiceEnd, VoiceSessionTracker},
     Snowflake,
 };
@@ -69,8 +70,16 @@ pub trait FunnelStore: Send + Sync {
     fn mark_bot(&self, guild_id: Snowflake, member_id: Snowflake);
     /// Insert-or-ignore by idempotency key.
     fn record(&self, event: FunnelEvent) -> RecordOutcome;
-    /// Monotonic recency bump (never moves backwards).
-    fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str);
+    /// Monotonic recency bump (never moves backwards). The `family` is the
+    /// analytics family of the touch that staged it, so the commit gate can
+    /// apply the matching guild toggle before touching `last_active_at`.
+    fn touch_activity(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        at: &str,
+        family: AnalyticsCategory,
+    );
     /// Lowest empty message rung for a message arriving at `at`, or `None`
     /// when the ladder is full — including the redelivery guard (a rung is
     /// filled only strictly after the rung below).
@@ -134,7 +143,15 @@ impl FunnelStore for MemStore {
         crate::membership::MembershipStore::record_observed(self, event, None)
     }
 
-    fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str) {
+    fn touch_activity(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        at: &str,
+        _family: AnalyticsCategory,
+    ) {
+        // In-memory replay double: no guild settings row exists here, so the
+        // family gate lives at the durable commit, not in this map.
         let mut inner = self.inner.lock().expect("store lock");
         let entry = inner.activity.entry((guild_id, member_id)).or_default();
         if entry.is_empty() || entry.as_str() < at {
@@ -649,7 +666,8 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
         if i.is_bot || i.webhook_id.is_some() || i.is_staff_automation || i.capture_only {
             return HandlerOutcome::none();
         }
-        self.store.touch_activity(i.guild_id, i.member_id, &at);
+        self.store
+            .touch_activity(i.guild_id, i.member_id, &at, AnalyticsCategory::Activity);
         let mut leveled_up_to = None;
         if let Some(leveling) = &self.leveling {
             let award = leveling.award_message(i.guild_id, i.member_id, &at, i.channel_id);
@@ -710,7 +728,8 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
         if i.is_bot {
             return HandlerOutcome::none();
         }
-        self.store.touch_activity(i.guild_id, i.member_id, &at);
+        self.store
+            .touch_activity(i.guild_id, i.member_id, &at, AnalyticsCategory::Voice);
         self.store.record(FunnelEvent {
             guild_id: i.guild_id,
             member_id: Some(i.member_id),
@@ -813,8 +832,12 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
         }
         // Leaving at T proves presence up to T: recency moves to the stamped
         // time, never raw garbage (which would throw on timestamptz).
-        self.store
-            .touch_activity(i.guild_id, i.member_id, &end.end_at);
+        self.store.touch_activity(
+            i.guild_id,
+            i.member_id,
+            &end.end_at,
+            AnalyticsCategory::Voice,
+        );
         HandlerOutcome {
             event: Some(event),
             leveled_up_to,
