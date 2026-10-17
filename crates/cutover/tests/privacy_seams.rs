@@ -13,6 +13,7 @@
 use two_bot_core::community::{Classification, ClassifyInput};
 use two_bot_core::community_store::{
     member_join_fact, member_join_metadata, message_fact, record_fact, voice_ended_fact,
+    MessageFactInput,
 };
 use two_bot_core::database_tls::TlsPolicy;
 use two_bot_core::gateway_funnel::{FunnelBatch, InviteSnapshotWrite};
@@ -126,15 +127,16 @@ async fn community_facts_gate_suppression_and_family_toggles() {
     let pool = db.pool();
 
     // Defaults: everything persists.
-    let message = message_fact(
-        GUILD,
-        "msg-1",
-        "chan-1",
-        "human",
-        &actor(MEMBER_B),
-        "2026-10-13T00:00:00.000Z",
-        verdict(),
-    );
+    let message = message_fact(MessageFactInput {
+        guild_id: GUILD,
+        message_id: "msg-1",
+        channel_id: "chan-1",
+        channel_class: "human",
+        actor: &actor(MEMBER_B),
+        occurred_at: "2026-10-13T00:00:00.000Z",
+        content_length: None,
+        classification: verdict(),
+    });
     assert!(
         record_fact(pool, &message).await.unwrap(),
         "default settings persist message facts"
@@ -144,15 +146,16 @@ async fn community_facts_gate_suppression_and_family_toggles() {
     set_analytics_settings(&db, GUILD, true, false, true)
         .await
         .unwrap();
-    let message2 = message_fact(
-        GUILD,
-        "msg-2",
-        "chan-1",
-        "human",
-        &actor(MEMBER_B),
-        "2026-10-13T00:01:00.000Z",
-        verdict(),
-    );
+    let message2 = message_fact(MessageFactInput {
+        guild_id: GUILD,
+        message_id: "msg-2",
+        channel_id: "chan-1",
+        channel_class: "human",
+        actor: &actor(MEMBER_B),
+        occurred_at: "2026-10-13T00:01:00.000Z",
+        content_length: None,
+        classification: verdict(),
+    });
     assert!(
         !record_fact(pool, &message2).await.unwrap(),
         "disabled activity drops message facts"
@@ -177,15 +180,16 @@ async fn community_facts_gate_suppression_and_family_toggles() {
     for (label, fact) in [
         (
             "message",
-            message_fact(
-                GUILD,
-                "msg-3",
-                "chan-1",
-                "human",
-                &actor(MEMBER_A),
-                "2026-10-13T00:02:00.000Z",
-                verdict(),
-            ),
+            message_fact(MessageFactInput {
+                guild_id: GUILD,
+                message_id: "msg-3",
+                channel_id: "chan-1",
+                channel_class: "human",
+                actor: &actor(MEMBER_A),
+                occurred_at: "2026-10-13T00:02:00.000Z",
+                content_length: None,
+                classification: verdict(),
+            }),
         ),
         (
             "voice",
@@ -218,15 +222,16 @@ async fn community_facts_gate_suppression_and_family_toggles() {
             "suppressed pair drops {label} facts"
         );
     }
-    let other = message_fact(
-        GUILD,
-        "msg-4",
-        "chan-1",
-        "human",
-        &actor(MEMBER_B),
-        "2026-10-13T00:04:00.000Z",
-        verdict(),
-    );
+    let other = message_fact(MessageFactInput {
+        guild_id: GUILD,
+        message_id: "msg-4",
+        channel_id: "chan-1",
+        channel_class: "human",
+        actor: &actor(MEMBER_B),
+        occurred_at: "2026-10-13T00:04:00.000Z",
+        content_length: None,
+        classification: verdict(),
+    });
     // Activity is still disabled, so B's message drops on the toggle, not on
     // suppression; the voice fact below proves B still persists.
     assert!(!record_fact(pool, &other).await.unwrap());
@@ -258,15 +263,16 @@ async fn opt_out_purges_community_facts_for_the_pair_only() {
     let pool = db.pool();
 
     for (who, stamp) in [(MEMBER_A, "00:00:00"), (MEMBER_B, "00:01:00")] {
-        let message = message_fact(
-            GUILD,
-            &format!("purge-{who}"),
-            "chan-1",
-            "human",
-            &actor(who),
-            &format!("2026-10-13T{stamp}.000Z"),
-            verdict(),
-        );
+        let message = message_fact(MessageFactInput {
+            guild_id: GUILD,
+            message_id: &format!("purge-{who}"),
+            channel_id: "chan-1",
+            channel_class: "human",
+            actor: &actor(who),
+            occurred_at: &format!("2026-10-13T{stamp}.000Z"),
+            content_length: None,
+            classification: verdict(),
+        });
         assert!(record_fact(pool, &message).await.unwrap());
     }
     let join = member_join_fact(
@@ -680,12 +686,12 @@ async fn concurrent_fact_write_during_opt_out_never_persists() {
     let pool = db.pool().clone();
     let writer = tokio::spawn(async move {
         for i in 0..30 {
-            let fact = message_fact(
-                GUILD,
-                &format!("race-{i}"),
-                "chan-1",
-                "human",
-                &ClassifyInput {
+            let fact = message_fact(MessageFactInput {
+                guild_id: GUILD,
+                message_id: &format!("race-{i}"),
+                channel_id: "chan-1",
+                channel_class: "human",
+                actor: &ClassifyInput {
                     guild_id: GUILD.to_owned(),
                     actor_id: MEMBER_A.to_owned(),
                     is_bot: false,
@@ -695,13 +701,14 @@ async fn concurrent_fact_write_during_opt_out_never_persists() {
                     is_staging: false,
                     is_test: false,
                 },
-                &format!("2026-10-13T00:{i:02}:00.000Z"),
-                Classification {
+                occurred_at: &format!("2026-10-13T00:{i:02}:00.000Z"),
+                content_length: None,
+                classification: Classification {
                     classification: "eligible_human".to_owned(),
                     classifier_version: "privacy-seams-v1".to_owned(),
                     matched_rule: "fixture".to_owned(),
                 },
-            );
+            });
             // Suppression drops return `Ok(false)`; a purge racing the
             // insert surfaces as a serialization/deadlock error on rare
             // timing — either way the pair must not survive below.
@@ -1370,12 +1377,12 @@ async fn fact_deterministic_race_never_persists() {
     let opt_tx = hold_opt_out_open(db.pool(), GUILD, MEMBER_A).await;
     let pool = db.pool().clone();
     let writer = tokio::spawn(async move {
-        let fact = message_fact(
-            GUILD,
-            "race-single",
-            "chan-1",
-            "human",
-            &ClassifyInput {
+        let fact = message_fact(MessageFactInput {
+            guild_id: GUILD,
+            message_id: "race-single",
+            channel_id: "chan-1",
+            channel_class: "human",
+            actor: &ClassifyInput {
                 guild_id: GUILD.to_owned(),
                 actor_id: MEMBER_A.to_owned(),
                 is_bot: false,
@@ -1385,13 +1392,14 @@ async fn fact_deterministic_race_never_persists() {
                 is_staging: false,
                 is_test: false,
             },
-            "2026-10-13T00:00:00.000Z",
-            Classification {
+            occurred_at: "2026-10-13T00:00:00.000Z",
+            content_length: None,
+            classification: Classification {
                 classification: "eligible_human".to_owned(),
                 classifier_version: "privacy-seams-v1".to_owned(),
                 matched_rule: "fixture".to_owned(),
             },
-        );
+        });
         let _ = record_fact(&pool, &fact).await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;

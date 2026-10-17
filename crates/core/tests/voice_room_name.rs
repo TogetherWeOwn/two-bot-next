@@ -2,7 +2,7 @@
 
 use two_bot_core::automod::{AutomodFilter, AutomodPolicy};
 use two_bot_core::voice_conditions::ConditionFacts;
-use two_bot_core::voice_name_filter::NameFilterContext;
+use two_bot_core::voice_name_filter::{NameFilterContext, MAX_CHANNEL_NAME_CHARS};
 use two_bot_core::voice_naming::RoomContext;
 use two_bot_core::voice_room_name::{
     decide_custom_name, decide_template_name, is_literal_name, NameChecks, NameRefusal,
@@ -272,4 +272,92 @@ fn refusal_text_is_actionable_and_never_echoes_the_name() {
     }
     .to_string()
     .contains("bad words"));
+}
+
+fn assert_decided_name(name: &str) {
+    assert!(!name.is_empty(), "decided names are never empty");
+    assert!(
+        name.chars().count() <= MAX_CHANNEL_NAME_CHARS,
+        "decided names fit the channel bound"
+    );
+    assert!(
+        !name
+            .chars()
+            .any(|c| matches!(c, '\u{0}'..='\u{1F}' | '\u{7F}')),
+        "no C0 control or DEL leaks into decided names"
+    );
+    assert!(!name.contains('@'), "the sanitizer strips @");
+    assert!(!name.contains('`'), "the sanitizer strips backticks");
+}
+
+fn assert_refusal_text(refusal: &NameRefusal) {
+    let text = refusal.to_string();
+    assert!(!text.is_empty(), "refusals explain what to do");
+    assert!(text.chars().count() < 300, "{text}");
+}
+
+#[test]
+fn hostile_names_keep_the_fuzz_oracle_invariants() {
+    // Mirrors the `voice_room_name` fuzz target's oracle over fixed hostile
+    // inputs so `cargo test` pins what the fuzzer explores.
+    let overlong = "a".repeat(MAX_CUSTOM_NAME_CHARS + 1);
+    let overlong_wide = "é".repeat(MAX_CUSTOM_NAME_CHARS + 1);
+    let hostile: Vec<&str> = vec![
+        "",
+        "   ",
+        "@@",
+        "`",
+        "\u{0}\u{1}\u{7F}@`",
+        "@@owner@@",
+        "@@owner@@'s ## (@@num@@/@@limit@@)",
+        "{{LIVE ??blorp//fine}}",
+        "[[a/b]]",
+        "discord.gg/abc",
+        "blorp den",
+        overlong.as_str(),
+        overlong_wide.as_str(),
+        "👾 Ｌｏｕｎｇｅ",
+        "Lounge",
+        "  lounge  ",
+    ];
+    let plain = Fixture::new();
+    let mut strict = Fixture::new();
+    strict.policy = words(&["blorp"]);
+    strict.unique = true;
+    strict.others = vec![
+        "Lounge".to_owned(),
+        "Ava".to_owned(),
+        "Ava's room".to_owned(),
+    ];
+    for raw in hostile {
+        for fixture in [&plain, &strict] {
+            match fixture.custom(raw) {
+                Ok((stored, channel_name)) => {
+                    assert_eq!(stored, raw.trim());
+                    assert!(stored.chars().count() <= MAX_CUSTOM_NAME_CHARS);
+                    assert_decided_name(&channel_name);
+                }
+                Err(refusal) => {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        assert_eq!(refusal, NameRefusal::Empty, "{raw:?}");
+                    }
+                    if trimmed.chars().count() > MAX_CUSTOM_NAME_CHARS {
+                        assert_eq!(refusal, NameRefusal::TooLong, "{raw:?}");
+                    }
+                    if refusal == NameRefusal::Taken {
+                        assert!(is_literal_name(trimmed), "{raw:?}");
+                    }
+                    assert_refusal_text(&refusal);
+                }
+            }
+            match fixture.template(raw) {
+                Ok(name) => assert_decided_name(&name),
+                Err(refusal) => {
+                    assert_eq!(refusal, NameRefusal::TemplateBlocked, "{raw:?}");
+                    assert_refusal_text(&refusal);
+                }
+            }
+        }
+    }
 }
