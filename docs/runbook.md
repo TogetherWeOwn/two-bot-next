@@ -297,14 +297,23 @@ anything the burst may have executed twice.
 Evaluate rollback when the burst starts with the deployed revision: compare the
 alert's first-firing window with the staging-rollout evidence (or the gated
 production run) for that SHA. A 5xx share introduced by a promotion stage
-requires a manual rollback decision unless a promotion stage invokes the
-`evaluatePromotionGate` helper (`wrangler/src/alert-rules.ts`, 5xx-only) and
-fails on its verdict. When that configured gate fails, the existing per-stage
-auto-rollback (staging verify, production gate, or the shared
-gradual-promotion action once wired) restores the recorded pre-promote
-version; a manual rollback names the recorded Worker version and container
-image from the failed run's snapshot. A burst on an unchanged revision is a
-Discord incident or a dependency regression, not a rollback.
+requires a manual rollback decision unless the staging `error_rate_gate`
+step invokes the `evaluatePromotionGate` helper
+(`wrangler/src/alert-rules.ts`, 5xx-only, via
+`wrangler/scripts/promotion-error-gate.mjs`) and fails on its verdict. When
+that gate fails, the existing staging auto-rollback restores the recorded
+pre-promote Worker version and container image; a manual rollback names the
+recorded Worker version and container image from the failed run's snapshot.
+The gate enforces live traffic only once the `STAGING_METRICS_SCRAPE_TOKEN`
+secret is provisioned — without it the step records a skip, and the
+dispatch-only `inject_error_rate_spike` input judges a rehearsal firing to
+prove the rollback chain (see `docs/runbook-observability.md` for the exact
+coverage limits). A live window with fewer than 10 REST requests records
+`insufficient_data`, never a pass, so only a `pass` with `rest_requests >= 10`
+counts as enforcement proof. Production has no error-rate gate: a burst on the
+production revision still needs a manual rollback decision. A burst on an
+unchanged revision is a Discord incident or a dependency regression, not a
+rollback.
 
 Escalate when the 5xx share stays above threshold across several windows after
 containment, or when 5xx coincide with 429/transport failures suggesting a
