@@ -5679,6 +5679,7 @@ async fn privacy_command_purges_suppresses_receipts_and_reenables_through_dispat
 
     let events_for = |member: &str| {
         let pool = db.pool().clone();
+        let member = member.to_owned();
         async move {
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM events WHERE guild_id = $1 AND member_id = $2",
@@ -5692,6 +5693,7 @@ async fn privacy_command_purges_suppresses_receipts_and_reenables_through_dispat
     };
     let suppressed = |member: &str| {
         let pool = db.pool().clone();
+        let member = member.to_owned();
         async move {
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",

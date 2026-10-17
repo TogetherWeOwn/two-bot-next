@@ -163,8 +163,11 @@ pub(crate) async fn privacy_command(
             }
         },
         PrivacyAction::Status => {
-            let suppressed = is_opted_out(&db, &guild_id, &member).await;
-            let switches = analytics_settings(&db, &guild_id).await;
+            // Both reads are independent, so run them concurrently.
+            let (suppressed, switches) = tokio::join!(
+                is_opted_out(&db, &guild_id, &member),
+                analytics_settings(&db, &guild_id)
+            );
             match (suppressed, switches) {
                 (Ok(suppressed), Ok((presence, activity, voice))) => {
                     finish(

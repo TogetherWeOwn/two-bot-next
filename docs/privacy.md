@@ -148,7 +148,7 @@ When your opt-out runs, the bot:
    invite keeps the joiner's row but with your inviter field blanked.
    Anonymous aggregate counters keep counting throughout.
 3. Writes exactly one audit receipt: the guild/member scope plus the
-   operator actor label and the database timestamp.
+   actor label and the database timestamp.
 
 Moderation, audit, XP/level, ticket, voice-room and settings rows are not
 part of an opt-out: they serve safety, delivery and accountability, not

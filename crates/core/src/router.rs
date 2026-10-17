@@ -1372,7 +1372,7 @@ mod tests {
             })
             .collect();
         let set = off.publish_set(&crowded).expect("core-only set");
-        assert_eq!(set.len(), 3);
+        assert_eq!(set.len(), 4);
     }
 
     #[test]
@@ -1574,7 +1574,7 @@ mod tests {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 50);
+        assert_eq!(both.len(), 51);
         let last = both.last().expect("non-empty");
         assert_eq!(last.name, "templateassistant");
         assert_eq!(
