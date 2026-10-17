@@ -3228,6 +3228,7 @@ async fn website_purge_forbidden_actor_records_one_refused_sample() {
     let body = serde_json::json!({
         "actor_id": RESOLVE_ACTOR_ID,
         "channel_id": "222222222222222222",
+        "count": 10,
         "reason": "cleanup",
     });
     let request =
@@ -3358,6 +3359,7 @@ async fn website_channel_executor_disabled_records_one_refused_sample() {
     let body = serde_json::json!({
         "actor_id": RESOLVE_ACTOR_ID,
         "channel_id": "222222222222222222",
+        "count": 10,
         "reason": "cleanup",
     });
     let request =
