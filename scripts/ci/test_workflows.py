@@ -967,11 +967,16 @@ def production_errors(workflow):
             or any(marker in guard_text for marker in guard_markers)):
         errors.append(f"{name}:guard: deployment/probe alternative outside the production job")
     guard_script = "\n".join(step.get("run", "") for step in guard.get("steps", []))
-    for required in ('urllib.request.urlopen(worker_url + "/readyz", timeout=10)',
+    for required in ('urllib.request.Request(',
+                     'worker_url + "/readyz"',
+                     '"User-Agent": "two-bot-next-production-rollout/1.0"',
+                     'urllib.request.urlopen(request, timeout=10)',
                      'live_report.get("build_revision") != sha'):
         if required not in guard_script:
             errors.append(f"{name}:guard: missing live-SHA check {required}")
     if guard_script.count("urllib.request.urlopen(") != 1:
+        errors.append(f"{name}:guard: unexpected live production probe")
+    if guard_script.count("urllib.request.Request(") != 1:
         errors.append(f"{name}:guard: unexpected live production probe")
     # Lexical regression pins on the guard script. deploy-staging runs
     # execute (TOG-12856), so every production SHA needs a staging deploy
@@ -1835,7 +1840,9 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(mutated(lambda w, s=step: w["jobs"]["guard"]["steps"].append(s)))
         with self.subTest(guard="environment"):
             self.assertTrue(mutated(lambda w: w["jobs"]["guard"].update({"environment": "production"})))
-        for pin in ('status="success"', "deploy-staging.yml/runs", '"required_reviewers"'):
+        for pin in ('status="success"', "deploy-staging.yml/runs", '"required_reviewers"',
+                      '"User-Agent": "two-bot-next-production-rollout/1.0"',
+                      "urllib.request.Request("):
             with self.subTest(dropped=pin):
                 def drop(w, pin=pin):
                     for step in w["jobs"]["guard"]["steps"]:
