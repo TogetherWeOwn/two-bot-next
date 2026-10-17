@@ -150,6 +150,15 @@ impl InternalMemberResult {
     }
 }
 
+/// Bundled per-call context for `execute_inner` so the private helper stays
+/// under the `too_many_arguments` limit without a waiver.
+struct MemberExecuteContext<'a> {
+    bot_highest_role_position: i64,
+    request_id: &'a str,
+    idempotency_key: &'a str,
+    now_ms: i64,
+}
+
 impl<S> InternalMemberExecutor<S>
 where
     S: MemberModerationStore + Clone,
@@ -195,17 +204,13 @@ where
         idempotency_key: &str,
         now_ms: i64,
     ) -> Result<InternalMemberResult, ActionError> {
-        let result = self
-            .execute_inner(
-                request,
-                actor,
-                target,
-                bot_highest_role_position,
-                request_id,
-                idempotency_key,
-                now_ms,
-            )
-            .await;
+        let ctx = MemberExecuteContext {
+            bot_highest_role_position,
+            request_id,
+            idempotency_key,
+            now_ms,
+        };
+        let result = self.execute_inner(request, actor, target, &ctx).await;
         let outcome = match &result {
             Ok(_) => "success",
             Err(err) => err.enforcement_outcome(),
@@ -215,18 +220,14 @@ where
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn execute_inner(
         &self,
         request: &InternalMemberRequest,
         actor: &ModerationActor,
         target: &ModerationTarget,
-        bot_highest_role_position: i64,
-        request_id: &str,
-        idempotency_key: &str,
-        now_ms: i64,
+        ctx: &MemberExecuteContext<'_>,
     ) -> Result<InternalMemberResult, ActionError> {
-        validate_idempotency_key(Some(idempotency_key), request.action.action_name())?;
+        validate_idempotency_key(Some(ctx.idempotency_key), request.action.action_name())?;
         if !self.config.enabled
             || actor.user_id != request.actor_id
             || target.user_id != request.target_id
@@ -240,11 +241,12 @@ where
         let signing = SigningDiscord {
             inner: &self.discord,
             guild_id: self.config.guild_id.clone(),
-            idempotency_key: idempotency_key.to_owned(),
+            idempotency_key: ctx.idempotency_key.to_owned(),
             action: action_name,
             actor_id: actor.user_id.clone(),
             secret: self.config.audit_secret.clone(),
         };
+        let now_ms = ctx.now_ms;
         let service = MemberModerationService::new(
             signing,
             self.store.clone(),
@@ -256,11 +258,11 @@ where
             guild_id: self.config.guild_id.clone(),
             actor: actor.clone(),
             target: Some(target.clone()),
-            bot_highest_role_position,
+            bot_highest_role_position: ctx.bot_highest_role_position,
             reason: request.reason.clone(),
             duration_seconds: request.duration_seconds,
-            request_id: request_id.to_owned(),
-            idempotency_key: idempotency_key.to_owned(),
+            request_id: ctx.request_id.to_owned(),
+            idempotency_key: ctx.idempotency_key.to_owned(),
         };
         let result = service.execute(&execution).await.map_err(member_error)?;
         Ok(InternalMemberResult {
