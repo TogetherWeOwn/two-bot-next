@@ -30,6 +30,16 @@ pub const MAX_COMMAND_NAME_CHARS: usize = 32;
 /// Text-trigger bound, characters including the leading `!` (legacy
 /// `TRIGGER_PATTERN` `^![a-z0-9_-]{1,32}$`: one `!` plus a command name).
 pub const MAX_TEXT_TRIGGER_CHARS: usize = MAX_COMMAND_NAME_CHARS + 1;
+/// Placeholder-extraction bound: `placeholders_in` returns at most this many
+/// distinct keys in first-seen order, then stops scanning. Only four keys are
+/// ever known, so any five distinct keys already contain an unknown one —
+/// capping at 64 preserves `validate_template`'s unknown-placeholder refusal
+/// exactly while keeping hostile inputs total-bounded in time and memory.
+pub const MAX_PLACEHOLDERS: usize = 64;
+/// Initial render allocation cap, bytes. A successful render holds at most
+/// `MAX_RENDERED_CHARS` UTF-16 units (at most ~6000 UTF-8 bytes), so a larger
+/// `template.len()` reservation would only serve a path that refuses anyway.
+const MAX_RENDER_CAPACITY_BYTES: usize = 8192;
 
 /// Said to anybody who reaches a custom command while automations are off
 /// (legacy `AUTOMATIONS_DISABLED_REPLY`; one constant shared with the router).
@@ -83,13 +93,17 @@ fn placeholder_end(bytes: &[u8], i: usize) -> Option<usize> {
 }
 
 /// Every placeholder the template references, deduplicated in first-seen
-/// order (legacy `placeholdersIn`).
+/// order (legacy `placeholdersIn`), capped at [`MAX_PLACEHOLDERS`] distinct
+/// keys so hostile inputs stay total-bounded.
 #[must_use]
 pub fn placeholders_in(template: &str) -> Vec<String> {
     let bytes = template.as_bytes();
     let mut found = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
+        if found.len() >= MAX_PLACEHOLDERS {
+            break;
+        }
         if bytes[i] == b'{' {
             if let Some(end) = placeholder_end(bytes, i) {
                 let key = template[i + 1..end - 1].to_owned();
@@ -125,10 +139,44 @@ pub fn validate_template(template: &str) -> Result<(), TemplateError> {
 /// Render a validated template against `ctx` (legacy `renderTemplate`).
 /// Unknown-but-pattern-matching keys render literally (unreachable after
 /// validation, kept so render never invents text); output past Discord's
-/// ceiling is refused.
+/// ceiling is refused. The rendered length is measured first without building
+/// the string, so hostile placeholder/context expansion fails as a bounded
+/// `RenderTooLong` instead of materialising a huge allocation.
 pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, TemplateError> {
     let bytes = template.as_bytes();
-    let mut out = String::with_capacity(template.len());
+    let user_units = ctx.user.encode_utf16().count();
+    let username_units = ctx.username.encode_utf16().count();
+    let server_units = ctx.server.encode_utf16().count();
+    let channel_units = ctx.channel.encode_utf16().count();
+    let mut total_units = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(end) = placeholder_end(bytes, i) {
+                let key = &template[i + 1..end - 1];
+                let units = match key {
+                    "user" => user_units,
+                    "username" => username_units,
+                    "server" => server_units,
+                    "channel" => channel_units,
+                    _ => template[i..end].encode_utf16().count(),
+                };
+                total_units = total_units.saturating_add(units);
+                i = end;
+                continue;
+            }
+        }
+        // Advance one char (templates are validated UTF-8 by construction).
+        // `i` stays on a char boundary: it starts there and each step moves
+        // past ASCII braces or one full `char`, so this never panics.
+        let ch = template[i..].chars().next().expect("char boundary");
+        total_units = total_units.saturating_add(ch.len_utf16());
+        i += ch.len_utf8();
+    }
+    if total_units > MAX_RENDERED_CHARS {
+        return Err(TemplateError::RenderTooLong(total_units));
+    }
+    let mut out = String::with_capacity(template.len().min(MAX_RENDER_CAPACITY_BYTES));
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
@@ -150,10 +198,7 @@ pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, 
         out.push(ch);
         i += ch.len_utf8();
     }
-    let len = out.encode_utf16().count();
-    if len > MAX_RENDERED_CHARS {
-        return Err(TemplateError::RenderTooLong(len));
-    }
+    debug_assert_eq!(out.encode_utf16().count(), total_units);
     Ok(out)
 }
 
@@ -685,6 +730,54 @@ mod tests {
             placeholders_in("{user} and {user} and {server}"),
             ["user".to_owned(), "server".to_owned()]
         );
+    }
+
+    #[test]
+    fn template_placeholders_in_is_total_bounded_on_hostile_input() {
+        // 200 distinct lowercase keys: unbounded extraction would return all
+        // 200; the hold caps distinct placeholders so fuzz-sized inputs stay
+        // bounded in time and memory.
+        fn alpha_key(mut n: usize) -> String {
+            let mut key = Vec::new();
+            loop {
+                key.push((b'a' + (n % 26) as u8) as char);
+                n /= 26;
+                if n == 0 {
+                    break;
+                }
+                n -= 1;
+            }
+            key.into_iter().rev().collect()
+        }
+        let hostile: String = (0..200).map(|i| format!("{{{}}}", alpha_key(i))).collect();
+        let found = placeholders_in(&hostile);
+        assert!(
+            found.len() <= 64,
+            "placeholders_in must stay total-bounded, got {}",
+            found.len()
+        );
+        // First-seen order preserved for the capped prefix.
+        assert_eq!(found[0], alpha_key(0));
+        assert_eq!(found[1], alpha_key(1));
+    }
+
+    #[test]
+    fn template_render_hostile_expansion_refused_without_panic() {
+        // Degenerate expansion: many placeholders over a large context must
+        // fail as a bounded RenderTooLong, never panic or hang.
+        let ctx = TemplateContext {
+            user: "y".repeat(10_000),
+            username: String::new(),
+            server: String::new(),
+            channel: String::new(),
+        };
+        let template = "{user}".repeat(500);
+        match render_template(&template, &ctx) {
+            Err(TemplateError::RenderTooLong(len)) => {
+                assert_eq!(len, 500 * 10_000);
+            }
+            other => panic!("expected bounded RenderTooLong, got {other:?}"),
+        }
     }
 
     #[test]
