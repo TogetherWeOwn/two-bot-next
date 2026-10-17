@@ -1478,9 +1478,12 @@ def synthetic_user_flow_errors(workflow):
             errors.append(f"{name}:{job_id}: transition step must run with if: always()")
         if "scripts/synthetic_alert.py" not in str(alert_step.get("run", "")):
             errors.append(f"{name}:{job_id}: alert step must call scripts/synthetic_alert.py")
-        if (alert_step.get("env", {}).get("GITHUB_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
-                or alert_step.get("env", {}).get("PROBE_OUTCOME") != "${{ steps.probe.outcome }}"):
-            errors.append(f"{name}:{job_id}: transition step must pass the run token and probe outcome via env")
+        alert_env = alert_step.get("env") or {}
+        if (alert_env.get("GITHUB_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
+                or alert_env.get("PROBE_OUTCOME") != "${{ steps.probe.outcome }}"
+                or "SYNTHETIC_ALERT_WEBHOOK_URL" not in alert_env
+                or "secrets." in str(alert_step.get("run", ""))):
+            errors.append(f"{name}:{job_id}: transition step must pass token, outcome and webhook via env only")
         for step in steps:
             if step is not alert_step and "secrets." in str(step):
                 errors.append(f"{name}:{job_id}: only the alert step may hold a secret")
