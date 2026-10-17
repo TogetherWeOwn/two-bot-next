@@ -133,6 +133,7 @@ async fn community_facts_gate_suppression_and_family_toggles() {
         "human",
         &actor(MEMBER_B),
         "2026-10-13T00:00:00.000Z",
+        None,
         verdict(),
     );
     assert!(
@@ -151,6 +152,7 @@ async fn community_facts_gate_suppression_and_family_toggles() {
         "human",
         &actor(MEMBER_B),
         "2026-10-13T00:01:00.000Z",
+        None,
         verdict(),
     );
     assert!(
@@ -184,6 +186,7 @@ async fn community_facts_gate_suppression_and_family_toggles() {
                 "human",
                 &actor(MEMBER_A),
                 "2026-10-13T00:02:00.000Z",
+                None,
                 verdict(),
             ),
         ),
@@ -225,6 +228,7 @@ async fn community_facts_gate_suppression_and_family_toggles() {
         "human",
         &actor(MEMBER_B),
         "2026-10-13T00:04:00.000Z",
+        None,
         verdict(),
     );
     // Activity is still disabled, so B's message drops on the toggle, not on
@@ -265,6 +269,7 @@ async fn opt_out_purges_community_facts_for_the_pair_only() {
             "human",
             &actor(who),
             &format!("2026-10-13T{stamp}.000Z"),
+            None,
             verdict(),
         );
         assert!(record_fact(pool, &message).await.unwrap());
@@ -696,6 +701,7 @@ async fn concurrent_fact_write_during_opt_out_never_persists() {
                     is_test: false,
                 },
                 &format!("2026-10-13T00:{i:02}:00.000Z"),
+                None,
                 Classification {
                     classification: "eligible_human".to_owned(),
                     classifier_version: "privacy-seams-v1".to_owned(),
@@ -1386,6 +1392,7 @@ async fn fact_deterministic_race_never_persists() {
                 is_test: false,
             },
             "2026-10-13T00:00:00.000Z",
+            None,
             Classification {
                 classification: "eligible_human".to_owned(),
                 classifier_version: "privacy-seams-v1".to_owned(),

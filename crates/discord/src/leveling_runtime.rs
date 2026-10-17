@@ -208,6 +208,13 @@ impl DeferredCommunityFacts {
         std::mem::take(&mut self.0.lock().expect("community facts lock").joins)
     }
 
+    /// Take every buffered fact write (`message_created`,
+    /// `voice_session_started` / `voice_session_ended`), leaving that
+    /// buffer empty. Order is arrival order.
+    pub fn take_pending(&self) -> Vec<FactWrite> {
+        std::mem::take(&mut self.0.lock().expect("community facts lock").pending)
+    }
+
     /// Buffered gate-clearing count (tests, health). Rules only.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -382,6 +389,7 @@ impl FactsSink for DeferredCommunityFacts {
             fact.channel_class.as_str(),
             &input,
             fact.occurred_at,
+            fact.content,
             verdict,
         ));
     }
@@ -858,6 +866,7 @@ mod tests {
             channel_id: 10,
             channel_class: two_bot_core::ChannelClass::Human,
             occurred_at: "2026-09-20T12:01:00.000Z",
+            content: None,
         });
         assert_eq!(
             buffer.record_voice_started(VoiceStartedFact {

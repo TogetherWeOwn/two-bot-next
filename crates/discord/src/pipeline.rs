@@ -708,6 +708,7 @@ impl<
                     channel_class: self.classifier.classify(channel_id),
                     capture_only: eligibility.capture_only,
                     occurred_at: Some(legacy_stamp(msg.timestamp)),
+                    content: Some(msg.content.clone()),
                 };
                 self.cache.update(event);
                 if deliver {

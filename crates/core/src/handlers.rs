@@ -355,6 +355,7 @@ pub struct MessageFact<'a> {
     pub channel_id: Snowflake,
     pub channel_class: ChannelClass,
     pub occurred_at: &'a str,
+    pub content: Option<&'a str>,
 }
 
 /// Voice-start fact (legacy `recordVoiceStarted`).
@@ -446,6 +447,7 @@ pub struct MessageInput {
     pub channel_class: ChannelClass,
     pub capture_only: bool,
     pub occurred_at: Option<String>,
+    pub content: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -638,6 +640,7 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
                     channel_id: i.channel_id,
                     channel_class: i.channel_class,
                     occurred_at: &at,
+                    content: i.content.as_deref(),
                 });
             }
         }
@@ -1036,6 +1039,7 @@ mod tests {
             channel_class: ChannelClass::Human,
             capture_only: false,
             occurred_at: Some(at.to_owned()),
+            content: None,
         };
         let kinds: Vec<Option<EventType>> = [
             "2026-09-20T12:00:00.000Z",
@@ -1093,6 +1097,7 @@ mod tests {
             channel_class: ChannelClass::Other,
             capture_only: false,
             occurred_at: Some(at.to_owned()),
+            content: None,
         });
         assert_eq!(
             first.event.map(|e| e.event_type),
@@ -1110,6 +1115,7 @@ mod tests {
             channel_class: ChannelClass::Other,
             capture_only: false,
             occurred_at: Some(at.to_owned()),
+            content: None,
         });
         assert!(dup.event.is_none());
     }

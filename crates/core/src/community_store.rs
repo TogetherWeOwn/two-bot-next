@@ -131,8 +131,13 @@ pub fn message_fact(
     channel_class: &str,
     actor: &ClassifyInput,
     occurred_at: &str,
+    content: Option<&str>,
     classification: Classification,
 ) -> FactWrite {
+    let length_part = match content {
+        Some(c) if !c.is_empty() => format!(",\"contentLength\":{}", c.chars().count()),
+        _ => String::new(),
+    };
     FactWrite {
         guild_id: guild_id.to_owned(),
         event_type: "message_created".to_owned(),
@@ -142,9 +147,10 @@ pub fn message_fact(
         source: format!("channel:{channel_id}"),
         classification,
         metadata: Some(format!(
-            "{{\"channelId\":\"{channel_id}\",\"channelClass\":\"{channel_class}\",\"webhookId\":{},\"discordBot\":{}}}",
+            "{{\"channelId\":\"{channel_id}\",\"channelClass\":\"{channel_class}\",\"webhookId\":{},\"discordBot\":{}{}}}",
             actor.webhook_id.as_deref().map_or("null".to_owned(), |w| format!("\"{w}\"")),
-            actor.is_bot
+            actor.is_bot,
+            length_part
         )),
         idempotency_key: format!("discord-message:{message_id}"),
     }
@@ -164,6 +170,7 @@ pub async fn record_message_fact(
     channel_class: &str,
     actor: &ClassifyInput,
     occurred_at: &str,
+    content: Option<&str>,
     classification: Classification,
 ) -> Result<bool, CommunityStoreError> {
     let write = message_fact(
@@ -173,6 +180,7 @@ pub async fn record_message_fact(
         channel_class,
         actor,
         occurred_at,
+        content,
         classification,
     );
     record_fact(pool, &write).await
@@ -792,7 +800,16 @@ mod tests {
                 "2026-09-01T11:00:00.000Z"
             };
             let input = actor(who);
-            let write = message_fact(GUILD, id, "general", "human", &input, at, verdict(class));
+            let write = message_fact(
+                GUILD,
+                id,
+                "general",
+                "human",
+                &input,
+                at,
+                None,
+                verdict(class),
+            );
             record_fact(pool, &write).await.expect("seed message");
         }
         for (id, who, at, class) in [
@@ -1067,6 +1084,7 @@ mod tests {
             "human",
             &input,
             "2026-09-02T10:00:00.000Z",
+            None,
             verdict("eligible_human"),
         );
         assert_eq!(write.event_type, "message_created");
@@ -1081,7 +1099,7 @@ mod tests {
             "channel class travels: {metadata}"
         );
         assert!(
-            !metadata.contains("hello") && !metadata.contains("content"),
+            !metadata.contains("hello") && !metadata.contains("contentLength"),
             "no message content stored: {metadata}"
         );
     }
@@ -1207,6 +1225,7 @@ mod tests {
             "human",
             &input,
             at,
+            None,
             verdict("eligible_human"),
         )
         .await
@@ -1220,6 +1239,7 @@ mod tests {
             "human",
             &input,
             at,
+            None,
             verdict("eligible_human"),
         )
         .await

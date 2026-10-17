@@ -1115,6 +1115,7 @@ mod tests {
             channel_class: ChannelClass::Human,
             capture_only: false,
             occurred_at: Some(T_MSG.to_owned()),
+            content: None,
         });
         let voice_start_out = handlers.on_voice_join(VoiceInput {
             guild_id: G,
