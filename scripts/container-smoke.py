@@ -31,13 +31,15 @@ IMAGE_MAX_BYTES = 112 * MIB
 # (15.04 MiB) before the event-executor merge; the combined-head
 # measurement comes from hosted CI on the merged head. 16 MiB restores a
 # working tripwire with headroom; revisit if the binary approaches it.
-# Rebumped 2026-10-17: main measured 16,777,376 bytes (16.00 MiB) — 160
-# bytes over the 16 MiB ceiling — and this head measured 16,778,152 bytes
-# (16.00 MiB), 936 bytes over, both in hosted CI with no new dependencies
-# and the same minimal release profile (opt-level=z, lto, strip). The
-# landed slices since the 16 MiB bump consumed its headroom, so the ceiling
-# itself trips on main (main-red). 17 MiB restores a working tripwire with
-# ~1 MiB of headroom; revisit if the binary approaches it.
+# Rebumped 2026-10-17: the 16 MiB ceiling trips on main itself (main-red)
+# with no new dependencies and the same minimal release profile
+# (opt-level=z, lto, strip). Main measured 16,777,376 bytes (160 over) at
+# one calibration and 16,776,096 bytes at 89503f71 (1,120 bytes of
+# headroom) in hosted CI; this head measured 16,778,152 bytes (936 over).
+# The voice rename-decision logs add ~3,160 bytes (merged head 6a9c394e:
+# 16,779,256 bytes). The landed slices since the 16 MiB bump consumed its
+# headroom, so 17 MiB restores a working tripwire with ~1 MiB of headroom;
+# revisit if the binary approaches it.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.

@@ -61,6 +61,9 @@ claim. Staging deploys from `main`; production deploys through the manual
   `containment_runtime.rs:186`, `join_risk_runtime.rs:198`) and onboarding's
   per-event refresh (`onboarding.rs:167`), if at all (see the reference;
   re-checked at `bce86a791`).
+- [Feed supervisor](docs/feed-supervisor.md): running feed delivery —
+  source configuration, fetch cadence as-coded, failure signals and triage,
+  read-only guarantees, and worked examples.
 - [Gateway recovery runbook](docs/gateway-recovery.md): readiness, durable RESUME,
   failure handling and rollback.
 - [Staging soak acceptance](docs/staging-soak.md): the evidence required before
@@ -74,6 +77,8 @@ claim. Staging deploys from `main`; production deploys through the manual
   generation fencing, atomic audit and preserved lockdown recovery.
 - [Command registry drift](docs/command-publish.md): dry-run-first
   `two-bot commands diff|publish` and opt-in boot publication for cutover.
+- [Automod operator guide](docs/automod-operator-guide.md): filter/effect
+  semantics, repeat expiry, corpus management, failure signals and triage.
 
 ### Stream delivery (Twitch EventSub)
 

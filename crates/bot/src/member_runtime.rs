@@ -546,6 +546,7 @@ pub(crate) fn sweep_job(member: Arc<MemberRuntime>, rest: ActionExecutor) -> Job
     Job {
         name: NAMES[0],
         cadence,
+        cadence_source: None,
         startup_jitter: jobs::startup_jitter(cadence, rand::random()),
         timeout: SWEEP_TIMEOUT,
         action: Arc::new(move || {
