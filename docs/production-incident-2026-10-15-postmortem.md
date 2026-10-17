@@ -11,16 +11,24 @@ production crash-loop on record (2026-10-16 role drift, SQLSTATE `42501`,
 see the role gate in [production-deploy.md](production-deploy.md)) quotes
 no `failed_step` line either — and its mechanism (missing grant, cursor
 held on rejoin) is distinct from this hypothesis (missing table `42P01`).
-A #978+ build cannot confirm this hypothesis via `gateway_failed`:
-`retention_lifecycle` classifies `42P01` as a schema gap
+The retention write cannot confirm this hypothesis via `gateway_failed` on a
+#978+ build: `retention_lifecycle` classifies `42P01` as a schema gap
 (`crates/bot/src/gateway.rs:655`, `is_schema_gap` at
 `crates/bot/src/gateway_failure.rs:198`), logs `retention lifecycle
 skipped; schema gap, nothing to cancel` with `error_code=42P01`, and returns
-`None` — so no `gateway_run` step failure (`crates/bot/src/gateway.rs:877-887`,
-`crates/bot/src/main.rs:700`) and no `gateway_failed` line
-(`publish_gateway_failure` at `crates/bot/src/main.rs:861`) occur. The
-observable #978-era signal would be that schema-gap skip line with
-`error_code=42P01`; a `gateway_failed` confirmation would need a pre-#978
+`None` — so that path emits no `gateway_run` step failure
+(`crates/bot/src/gateway.rs:877-887`, `crates/bot/src/main.rs:700`) and no
+`gateway_failed` line (`publish_gateway_failure` at
+`crates/bot/src/main.rs:861`). The observable #978-era signal for the
+retention trigger is that schema-gap skip line with `error_code=42P01`. The
+section's second trigger (XP awards inserting into `member_season_xp` via the
+leveling drain) can still log `gateway_failed` on #978+: a failed drain maps
+to `leveling_dispatch_failure()` (`crates/bot/src/gateway.rs:905-915`,
+`InvalidArgument` at `:344`), surfaces as a `gateway_run` step failure
+(`crates/bot/src/main.rs:700`), and `publish_gateway_failure`
+(`crates/bot/src/main.rs:861`) logs it with `failed_step=gateway_run` and
+`error_code=none` — narrowing the step but not the SQLSTATE. A
+`gateway_failed` confirmation of the retention trigger would need a pre-#978
 build or a staging restore. Update this section when such a line is captured;
 do not treat the hypothesis as proven before then.
 
