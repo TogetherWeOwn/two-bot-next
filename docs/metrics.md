@@ -143,13 +143,13 @@ scheduled-message, feed, self-role recovery, unban-sweep and automod-expiry
 names against that allowlist.
 
 No scheduler or registration gate changes are implied by these labels. Feed
-supervisor cadence is the boot-configured interval (default 300 s, range
-60–86,400 s); live interval changes gate polling inside those fixed opportunities.
-A skipped inner poll returns success and resets the `feeds` consecutive-failure
-streak, so `job_consecutive_failures:feeds` is reliable only while the live
-interval is at most the boot cadence; with a live interval at least twice the boot
-cadence each failed real poll is followed by a skipped tick that zeroes the streak
-before it can reach 3. Self-role recovery runs every 30 s with 0–5 s startup jitter
+supervisor cadence follows the live interval (boot default 300 s, range
+60–86,400 s): a stored change reschedules the next tick to last-run + new
+interval and the per-tick schedule gate mirrors that slot, so ticks normally
+land only when a poll is due. A skipped inner poll (a gate refusal on an
+overlapping or not-yet-due tick) still returns success and resets the `feeds`
+consecutive-failure streak, so a streak can under-report while such refusals
+interleave with failures. Self-role recovery runs every 30 s with 0–5 s startup jitter
 and a 25 s timeout; a successful sweep need not settle every pending repair.
 The member unban sweep runs every 30 s (`UNBAN_SWEEP_INTERVAL_SECONDS`) with
 startup jitter and a 180 s attempt timeout; one attempt may outlive its cadence,
@@ -627,10 +627,9 @@ records success, so only a truly wedged sweep tickets — check
 sweep is intentional before treating flat audit deliveries as a wedged job.
 `feeds` is covered by
 the coarse fallback, not a precise cadence, because its cadence is
-boot-configured (60–86400 s) with a live-configurable inner polling gate and
-successful gated ticks are not polling freshness; its failure alerting is
-reliable only while the live interval is at most the boot cadence, since
-skipped gated ticks return success and reset the streak. `self_role_recovery`
+live-configurable (60–86400 s) with an inner polling gate and
+successful gated ticks are not polling freshness; skipped gated ticks return
+success and reset the streak. `self_role_recovery`
 keeps failure-only alerting: twice its 30 s cadence is too close to the ~60 s
 scrape interval for safe `job_stale` paging, and this label-isolation change
 adds no ticker-staleness policy. `member_unban_sweep` keeps failure-only
@@ -640,7 +639,7 @@ failure-only alerting with the coarse 2-hour fallback: its 60 s tick is a
 no-op success until the gateway builds the activation, and it only does real
 expiry work when `TWO_AUTOMOD=1`. `self_role_recovery`, `member_unban_sweep`
 and `automod_expiry` each trigger `job_consecutive_failures` independently at
-three completed failures; `feeds` does the same within its live-interval limit
+three completed failures; `feeds` does the same subject to the skipped-tick caveat
 above. A sweep with no completions is covered only by the coarse 2-hour
 fallback, not a precise cadence.
 `wrangler/test/alert-job-catalog.test.ts` checks website/community cadence

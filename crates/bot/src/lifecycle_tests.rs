@@ -468,6 +468,7 @@ async fn stalled_http_drain_does_not_bypass_website_job_join() {
     let job = crate::jobs::Job {
         name: "pending",
         cadence: Duration::from_secs(1),
+        cadence_source: None,
         startup_jitter: Duration::ZERO,
         timeout: Duration::from_secs(300),
         action: Arc::new({
@@ -554,6 +555,7 @@ async fn gateway_failure_joins_pending_website_job_before_returning() {
     let job = crate::jobs::Job {
         name: "pending",
         cadence: Duration::from_secs(1),
+        cadence_source: None,
         startup_jitter: Duration::ZERO,
         timeout: Duration::from_secs(300),
         action: Arc::new({
