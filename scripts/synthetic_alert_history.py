@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Decide synthetic alert transitions from this workflow's recent probe runs."""
 
+import http.client
 import json
 import os
 import urllib.error
@@ -22,9 +23,14 @@ ALERT_STEPS = {
 # undelivered, skipped/None means no-op and must not move incident state.
 # The decide step's own conclusion is the known-history record: a healthy
 # run whose history read failed fails its decide step (see
-# synthetic_alert.main), so decide=success with a skipped post on a healthy
-# probe is an explicit known-closed checkpoint, while decide!=success
-# leaves that healthy sample ambiguous and state must not move.
+# synthetic_alert.main), so decide=success with a skipped post is an
+# explicit decided-none record — a known-closed checkpoint on a healthy
+# probe, a known-open one on a failed probe (see _run_outcome) — while
+# decide!=success leaves that sample ambiguous and state must not move.
+# Both records also require a normally finished job (its conclusion matches
+# the probe outcome): a cancelled or timed-out job concludes neither way,
+# and its post step is skipped by the !cancelled() gate even when an event
+# was due, so it can fake neither record.
 DECIDE_STEPS = {
     "staging": "Decide the synthetic alert event",
     "prod": "Decide the synthetic alert event",
@@ -33,16 +39,23 @@ JOB_NAMES = {
     "staging": "staging user-flow synthetic",
     "prod": "prod passive user-flow synthetic",
 }
-# Bounded reconstruction: page the workflow-runs list (GitHub caps per_page
-# at 100) and read jobs newest-first until the collected suffix determines
-# the incident state on its own (a checkpoint: replaying it from any prior
-# state converges), the history is exhausted, or the scan bound below is
-# hit. Hitting the bound means the incident state is unknown, which is a
-# HistoryError so the caller keeps the documented fail-open policy instead
-# of acting on a partial guess. 200 prior runs at the five-minute schedule
-# is roughly sixteen hours of history.
-RUNS_PAGE_SIZE = 100
+# Bounded reconstruction: page the workflow-runs list and read jobs
+# newest-first until the collected suffix determines the incident state on
+# its own (a checkpoint: replaying it from any prior state converges), the
+# history is exhausted, or the scan bound below is hit. Hitting the bound
+# means the incident state is unknown, which is a HistoryError so the
+# caller keeps the documented fail-open policy instead of acting on a
+# partial guess. 200 prior runs at the five-minute schedule is roughly
+# sixteen hours of history.
+#
+# The page size is sized to the response cap in _get, not to GitHub's
+# per_page maximum of 100: a workflow-run object embeds head_commit plus
+# two full repository objects and measures 15-40 KB, so a 100-run page is
+# about 2 MB and would exceed the cap on every read. Fifteen runs stay
+# under 1 MiB even at the largest observed run object (~38 KB).
+RUNS_PAGE_SIZE = 15
 MAX_HISTORY_RUNS = 200
+MAX_RESPONSE_BYTES = 1 << 20
 
 
 class HistoryError(Exception):
@@ -62,6 +75,15 @@ def _advance(state, outcome, delivery):
             alert_delivered = True
         elif delivery == "failure":
             alert_delivered = False
+        elif delivery == "open" and failures >= 2:
+            # Decided-none record on a failed probe (see _run_outcome): at
+            # incident size it can only mean the opening alert had already
+            # delivered, because an undelivered incident re-alerts instead.
+            # Two "open" samples in a row therefore replay to open-and-
+            # delivered from every prior state, which is what lets
+            # _checkpoint stop a mid-outage scan after a few jobs reads
+            # instead of re-reading the whole outage on every decision.
+            alert_delivered = True
         if failures >= 2:
             incident = True
     else:
@@ -118,10 +140,10 @@ def incident_state(previous):
     Only a post-step conclusion of "success" counts as delivered; "failure"
     means undelivered. Any other conclusion ("skipped", None, cancelled)
     is a no-op and leaves incident state unchanged, so a history-read
-    no-op can never close an open incident or fake a delivery. The one
-    synthetic exception is "closed", produced only by _run_outcome for a
-    healthy run with a successful decide step and a skipped post step: an
-    explicit known-closed checkpoint that resets the state.
+    no-op can never close an open incident or fake a delivery. The two
+    synthetic exceptions come only from _run_outcome's decided-none
+    records: "closed", a known-closed checkpoint that resets the state,
+    and "open", a failed probe that decided no event with known history.
     """
     return _replay(reversed(previous))
 
@@ -150,8 +172,21 @@ def _get(path, token):
     )
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            return json.loads(response.read(1 << 20))
-    except (OSError, ValueError, urllib.error.HTTPError) as error:
+            body = response.read(MAX_RESPONSE_BYTES + 1)
+    except (OSError, urllib.error.HTTPError, http.client.HTTPException) as error:
+        # HTTPException covers a mid-read truncation (IncompleteRead),
+        # which is not an OSError: it is unknown history, not a crash, so
+        # the fail-open policy still applies.
+        raise HistoryError("could not read recent synthetic workflow history ("
+                           + error.__class__.__name__ + ")") from None
+    if len(body) > MAX_RESPONSE_BYTES:
+        # Never parse a silently truncated body: oversize is unknown
+        # history, so the caller's fail-open policy applies.
+        raise HistoryError("could not read recent synthetic workflow history "
+                           "(response exceeds the size cap)")
+    try:
+        return json.loads(body)
+    except ValueError as error:
         raise HistoryError("could not read recent synthetic workflow history ("
                            + error.__class__.__name__ + ")") from None
 
@@ -172,15 +207,30 @@ def _run_outcome(repo, run, environment, token):
     outcome = probe.get("conclusion") if probe else None
     if outcome in ("success", "failure"):
         delivery = alert.get("conclusion") if alert else None
-        if (outcome == "success" and delivery == "skipped"
-                and decide is not None and decide.get("conclusion") == "success"):
-            # Known-closed checkpoint, not a mere skipped post: the decide
-            # step succeeded, which it only does when that run's history was
-            # known, and with an open incident a healthy run would have
-            # decided recovery/alert so the post step would have run. A raw
-            # ("success", "skipped") sample (no such decide record) stays
-            # ambiguous below.
+        # A decided-none record — the decide step succeeded (which it only
+        # does when that run's history was known) and no event was due, so
+        # the post step skipped — only counts from a job that finished
+        # normally: its conclusion equals the probe outcome (the probe step
+        # has no continue-on-error, so a failed probe fails its job). A
+        # cancelled or timed-out job concludes neither way and its post
+        # step is skipped by the !cancelled() gate even when an event was
+        # decided, so it records nothing; a raw sample with no such record
+        # stays ambiguous below, as does a missing job conclusion.
+        decided_none = (delivery == "skipped" and decide is not None
+                        and decide.get("conclusion") == "success"
+                        and job.get("conclusion") == outcome)
+        if decided_none and outcome == "success":
+            # Known-closed checkpoint, not a mere skipped post: with an
+            # open incident a healthy run would have decided recovery or
+            # the late alert, so the post step would have run.
             delivery = "closed"
+        elif decided_none:
+            # Known-open record: with unknown history a failed probe would
+            # have fail-open alerted and with an undelivered incident it
+            # would have re-alerted, so deciding none means either a first
+            # failure or an already-delivered incident; replaying two in a
+            # row rules the first failure out (see _advance).
+            delivery = "open"
         return outcome, delivery
     return None
 
@@ -191,9 +241,11 @@ def previous_probe_outcomes(env, environment):
     Pages are read lazily and jobs newest-first; the scan stops early once
     the collected suffix is a confirmed checkpoint (its incident state no
     longer depends on older history, confirmed by one further sample). A
-    known-closed healthy sample is such a checkpoint on its own, so the
-    healthy steady state stops after a couple of jobs reads instead of
-    scanning back to the last incident. If MAX_HISTORY_RUNS prior runs are
+    known-closed healthy sample is such a checkpoint on its own, and two
+    known-open samples are one together, so both the healthy steady state
+    and a long delivered outage stop after a couple of jobs reads instead
+    of scanning back to the incident boundary on every decision. If
+    MAX_HISTORY_RUNS prior runs are
     scanned with no checkpoint and more history may exist, the state is
     unknown: raise HistoryError rather than return a partial suffix that
     would silently invent one — unless every collected sample is healthy

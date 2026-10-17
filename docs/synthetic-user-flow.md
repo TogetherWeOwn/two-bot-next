@@ -38,20 +38,37 @@ a delivery.
 
 Incident state is rebuilt from this workflow's own completed scheduled runs
 on `main` (the only state store; no extra permissions or infrastructure).
-Reconstruction pages the runs list (GitHub caps a page at 100) and reads jobs
-newest-first until the collected samples determine the incident state by
-themselves — replaying them from any prior state converges, confirmed by one
-further sample — or the history runs out. A healthy sample whose decide step
-succeeded and whose post step was skipped is an explicit known-closed
-checkpoint: with an open incident a healthy sample always decides recovery or
-the late alert, so the post step would have run. To keep that record honest,
-a healthy run whose history read failed fails its decide step after writing
-the empty event (its job shows red even though the probe passed); later
-reconstruction treats such a sample as ambiguous, never as closed. In the
-healthy steady state the newest sample is such a checkpoint, so a decision
-costs one runs-list read plus a couple of jobs reads; during an outage the
-scan reaches back to the delivered opening alert and costs about the
-outage's length, capped by the bound. The scan is bounded at 200 prior runs
+Reconstruction pages the runs list 15 runs at a time — a page is sized to
+the 1 MiB cap on history responses, since one Actions run object measures
+15–40 KB and a maximal 100-run page would exceed the cap; an oversized
+response reports unknown history instead of being parsed truncated — and
+reads jobs newest-first until the collected samples determine the incident
+state by themselves — replaying them from any prior state converges,
+confirmed by one further sample — or the history runs out. A sample whose
+decide step succeeded with no event due (post step skipped) in a normally
+finished job is an explicit decided-none record: on a healthy probe a
+known-closed checkpoint, because with an open incident a healthy sample
+always decides recovery or the late alert so the post step would have run;
+on a failed probe a known-open record, because with unknown history it
+would have fail-open alerted and with an undelivered incident it would have
+re-alerted, so two such records in a row prove the incident is open and
+delivered. A cancelled or timed-out job finishes neither way and its post
+step is skipped by the `!cancelled()` gate even when an event was due, so
+it records neither checkpoint. To keep the record honest, a healthy run
+whose history read failed fails its decide step after writing the empty
+event (its job shows red even though the probe passed); later
+reconstruction treats such a sample as ambiguous, never as closed. (Runs
+recorded before that decide-step record existed, during their own failed
+history read, are indistinguishable from known-closed ones; that only
+matters for an incident open across the change, and the window closes as
+those runs age past the bound.) In the healthy steady state the newest
+sample is a known-closed checkpoint and mid-outage the two newest samples
+are known-open, so either way a decision costs one runs-list read plus a
+couple of jobs reads — well inside the `GITHUB_TOKEN` hourly request
+budget at the five-minute schedule for both environments; only histories
+without decided-none records (for example jobs recorded before the decide
+step existed) scan back toward the incident boundary, capped by the bound.
+The scan is bounded at 200 prior runs
 (about sixteen hours at the five-minute schedule). Delivery evidence on the
 oldest retained failure counts, so an outage that outlives any fixed window
 keeps its once-per-incident contract: one delivered opening alert, no

@@ -7,9 +7,13 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
+
+# Captured before any test patches urlopen, for the real-_get fixtures.
+_REAL_URLOPEN = urllib.request.urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 alert = importlib.import_module("synthetic_alert")
@@ -201,8 +205,13 @@ class SyntheticAlertTests(unittest.TestCase):
                     {"GITHUB_TOKEN": "test-token", "GITHUB_REPOSITORY": "owner/repo",
                      "GITHUB_RUN_ID": "2000"}, "staging")
 
-    def fake_history(self, samples, decide="success"):
-        """Paginated fake for previous_probe_outcomes over chronological samples."""
+    def fake_history(self, samples, decide="success", job_conclusions=None):
+        """Paginated fake for previous_probe_outcomes over chronological samples.
+
+        Each job carries the conclusion a normally finished job would have
+        ("failure" when the probe or decide step failed, else "success")
+        unless `job_conclusions` overrides it per chronological index.
+        """
         import re
         import urllib.parse
 
@@ -234,7 +243,12 @@ class SyntheticAlertTests(unittest.TestCase):
                                   "conclusion": decide})
                 steps.append({"name": history.ALERT_STEPS["staging"],
                               "conclusion": delivery})
-                return {"jobs": [{"name": history.JOB_NAMES["staging"], "steps": steps}]}
+                conclusion = (job_conclusions or {}).get(
+                    index,
+                    "failure" if probe == "failure" or decide == "failure"
+                    else "success")
+                return {"jobs": [{"name": history.JOB_NAMES["staging"],
+                                  "conclusion": conclusion, "steps": steps}]}
 
             def env(self, current):
                 return {"GITHUB_TOKEN": "test-token", "GITHUB_REPOSITORY": "owner/repo",
@@ -332,6 +346,141 @@ class SyntheticAlertTests(unittest.TestCase):
                     self.assertEqual(Path(output_path).read_text(), expected_line)
                 finally:
                     Path(output_path).unlink(missing_ok=True)
+
+    def test_long_outage_stops_at_decided_none_checkpoint_with_few_jobs_reads(self):
+        # A 130-failure delivered outage: after the opening alert every
+        # failed run decided no event (decide step succeeded, post step
+        # skipped, job finished normally). Two such records in a row prove
+        # the incident is open and delivered, so reconstruction stops after
+        # a few jobs reads instead of re-reading the whole outage (which at
+        # the five-minute schedule would exhaust the GITHUB_TOKEN budget).
+        samples = [("success", "skipped"), ("failure", "skipped"),
+                   ("failure", "success")] + [("failure", "skipped")] * 128
+        fake = self.fake_history(samples)
+        with mock.patch.object(history, "_get", side_effect=fake):
+            self.assertIsNone(alert.decide_event(fake.env("failure"), "staging"))
+        self.assertLess(fake.jobs_calls, 10,
+                        f"one decision re-read {fake.jobs_calls} jobs mid-outage")
+        fake.jobs_calls = 0
+        with mock.patch.object(history, "_get", side_effect=fake):
+            self.assertEqual(alert.decide_event(fake.env("success"), "staging"),
+                             "recovery")
+        self.assertLess(fake.jobs_calls, 10,
+                        f"one decision re-read {fake.jobs_calls} jobs mid-outage")
+
+    def test_cancelled_job_cannot_record_a_closed_checkpoint(self):
+        # The healthy run after a delivered outage decided recovery, then
+        # its job was cancelled before the post step ran (!cancelled gate):
+        # the same probe/decide/post conclusions as a known-closed sample,
+        # but the job did not finish normally. The recovery stays owed.
+        samples = [("failure", "skipped"), ("failure", "success"),
+                   ("failure", "skipped"), ("success", "skipped")]
+        fake = self.fake_history(samples, job_conclusions={3: "cancelled"})
+        with mock.patch.object(history, "_get", side_effect=fake):
+            outcomes = history.previous_probe_outcomes(fake.env("success"), "staging")
+        self.assertNotIn(("success", "closed"), outcomes)
+        with mock.patch.object(history, "_get", side_effect=fake):
+            self.assertEqual(alert.decide_event(fake.env("success"), "staging"),
+                             "recovery")
+
+    def test_cancelled_job_cannot_record_a_decided_none_checkpoint(self):
+        # Failed runs whose jobs were cancelled after the decide step leave
+        # a skipped post step that must not prove the alert was delivered:
+        # an outage nobody was told about keeps alerting.
+        samples = [("failure", "skipped")] * 6
+        fake = self.fake_history(samples,
+                                  job_conclusions={i: "cancelled" for i in range(6)})
+        with mock.patch.object(history, "_get", side_effect=fake):
+            self.assertEqual(alert.decide_event(fake.env("failure"), "staging"),
+                             "alert")
+
+    def serve_history(self, runs_body, jobs_body):
+        """Serve runs/jobs JSON over loopback HTTP for the real _get."""
+        import http.server
+        import threading
+        import urllib.parse
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                parsed = urllib.parse.urlparse(self.path)
+                body = jobs_body if "/jobs" in parsed.path else runs_body(
+                    urllib.parse.parse_qs(parsed.query))
+                payload = body if isinstance(body, bytes) else json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop():
+            server.shutdown()
+            server.server_close()
+
+        self.addCleanup(stop)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def test_runs_pages_stay_under_response_cap_through_real_get(self):
+        # Real Actions run objects are 15-40 KB (head_commit plus two
+        # repository objects), so a 100-run page is ~2 MB and would be
+        # truncated by the 1 MiB response cap in _get. Serve realistic-size
+        # pages through the real _get and require the scan to complete.
+        pad = "x" * 20_000
+        runs = [{"id": 10000 + i, "run_number": i + 1, "event": "schedule",
+                 "head_commit": {"message": pad}} for i in range(100)]
+        runs.append({"id": 99999, "run_number": 101, "event": "schedule",
+                     "head_commit": {"message": pad}})
+
+        def runs_body(query):
+            page = int(query.get("page", ["1"])[0])
+            per_page = min(int(query.get("per_page", ["30"])[0]), 100)
+            newest = sorted(runs, key=lambda run: run["run_number"], reverse=True)
+            start = (page - 1) * per_page
+            return {"total_count": len(newest),
+                    "workflow_runs": newest[start:start + per_page]}
+
+        jobs_body = {"jobs": [{
+            "name": history.JOB_NAMES["staging"], "conclusion": "success",
+            "steps": [
+                {"name": history.PROBE_STEPS["staging"], "conclusion": "success"},
+                {"name": history.DECIDE_STEPS["staging"], "conclusion": "success"},
+                {"name": history.ALERT_STEPS["staging"], "conclusion": "skipped"},
+            ]}]}
+        base = self.serve_history(runs_body, jobs_body)
+        env = {"GITHUB_TOKEN": "test-token", "GITHUB_REPOSITORY": "owner/repo",
+               "GITHUB_RUN_ID": "99999"}
+        with mock.patch.object(history, "API", base), \
+                mock.patch.object(urllib.request, "urlopen", _REAL_URLOPEN):
+            outcomes = history.previous_probe_outcomes(env, "staging")
+        self.assertTrue(outcomes)
+        self.assertTrue(all(sample == ("success", "closed") for sample in outcomes))
+
+    def test_oversized_history_response_reports_cap_not_truncated_parse(self):
+        # A body over the cap must fail as "exceeds the cap", never be
+        # parsed after silent truncation.
+        oversized = json.dumps({"pad": "x" * ((1 << 20) + 100)}).encode()
+        base = self.serve_history(lambda _query: oversized, oversized)
+        with mock.patch.object(history, "API", base), \
+                mock.patch.object(urllib.request, "urlopen", _REAL_URLOPEN):
+            with self.assertRaises(history.HistoryError) as raised:
+                history._get("/repos/owner/repo/actions/workflows/x/runs", "t")
+        self.assertIn("exceeds", str(raised.exception))
+
+    def test_truncated_history_read_reports_history_error(self):
+        # A mid-read truncation raises http.client.IncompleteRead (not an
+        # OSError): it must become HistoryError so fail-open still applies
+        # instead of crashing the decide step.
+        import http.client
+        with mock.patch.object(history.urllib.request, "urlopen",
+                               side_effect=http.client.IncompleteRead(b"", 10)):
+            with self.assertRaisesRegex(history.HistoryError, "IncompleteRead"):
+                history._get("/repos/owner/repo/actions/workflows/x/runs", "t")
 
     def test_non_discord_destination_refuses_before_any_request(self):
         with self.assertRaisesRegex(alert.AlertError, "not a Discord webhook"):
