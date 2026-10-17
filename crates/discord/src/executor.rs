@@ -593,7 +593,7 @@ impl HyperTransport {
         // Learn per-route bucket state from this response's `X-RateLimit-*`
         // headers before the body is read: the next admission gates on it.
         self.guard
-            .observe_bucket(request.path(), response.headers());
+            .observe_bucket(&bucket_route_key(request), response.headers());
         attempt.finish(Some(status));
         // The 429 wait honors `retry-after` first, then the bucket
         // `reset-after` hint: on a 429 both name the same pause, and the reset
@@ -787,6 +787,18 @@ impl Drop for PendingHeaders<'_> {
 
 fn is_interaction_callback(request: &Request) -> bool {
     request.path().starts_with("interactions/") && request.path().ends_with("/callback")
+}
+
+/// Bucket identity for one request: HTTP method plus path, without the
+/// query string. Paginated reads change `after`/`before`/`limit` on every
+/// page, so keying learned bucket state on the full path would orphan the
+/// deadline a response teaches before the next page admits; Discord can
+/// also bucket different methods on one path separately. Admission and
+/// `observe_bucket` share this key so a response's deadline gates the
+/// next page of the same route.
+fn bucket_route_key(request: &Request) -> String {
+    let path = request.path().split('?').next().unwrap_or(request.path());
+    format!("{} {path}", request.method().name())
 }
 
 fn is_interaction_token_request(request: &Request) -> bool {
@@ -1067,8 +1079,26 @@ impl ActionExecutor {
     }
 
     async fn admit(&self, request: &Request, lane: Option<bool>) -> Result<(), GuardError> {
+        self.admit_essential(request, lane, is_interaction_callback(request))
+            .await
+    }
+
+    /// 429 sleep-then-retry admission: essential, so a breaker this read's
+    /// own 429 tally just opened cannot refuse its retry — and only that.
+    /// The guard still enforces `token_invalid`, pending/global pauses, the
+    /// learned bucket deadline and shared pacing, so no retry leaves during
+    /// a pause another request installed while this one slept.
+    async fn admit_retry(&self, request: &Request, lane: Option<bool>) -> Result<(), GuardError> {
+        self.admit_essential(request, lane, true).await
+    }
+
+    async fn admit_essential(
+        &self,
+        request: &Request,
+        lane: Option<bool>,
+        essential: bool,
+    ) -> Result<(), GuardError> {
         let guard = &self.inner.transport.guard;
-        let essential = is_interaction_callback(request);
         // Route-aware admission on the paced lanes: the guard paces all
         // executors sharing it and holds same-bucket reads until the header
         // reset (see admit_route). Lane-less sends keep plain admission.
@@ -1083,7 +1113,8 @@ impl ActionExecutor {
         // Keep the lane reservation through cooldown and pacing. Timestamp only
         // the actual dispatch, not each queued caller's pre-cooldown admission.
         let mut last = lock.lock().await;
-        guard.admit_route(request.path(), essential).await?;
+        let route_key = bucket_route_key(request);
+        guard.admit_route(&route_key, essential).await?;
         let earliest = *last + interval;
         if earliest > tokio::time::Instant::now() {
             tokio::time::sleep_until(earliest).await;
@@ -1091,7 +1122,7 @@ impl ActionExecutor {
         // A global response/breaker may arrive during the lane sleep. The
         // re-check reserves no second pacing slot: this admission already
         // holds the one from the first call.
-        guard.admit_route_recheck(request.path(), essential).await?;
+        guard.admit_route_recheck(&route_key, essential).await?;
         self.stamp_paced_lane(&mut last, kick_lane);
         Ok(())
     }
@@ -1801,14 +1832,19 @@ impl ActionExecutor {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
         // A 429 proves the attempt reached Discord, so its sleep-then-retry
-        // reuses this read's admission instead of re-admitting: a breaker the
-        // tally just opened must not refuse the in-flight read's own retry.
-        // New reads still admit (and refuse) as usual.
+        // re-admits as essential: a breaker the tally just opened must not
+        // refuse the in-flight read's own retry, while every other guard
+        // gate (token, pauses, bucket, pacing) still applies. New reads
+        // admit (and refuse) as usual.
         let mut admitted_retry = false;
         loop {
             let request = Request::from_route(&route);
             // Guard refusals are terminal; pacing completes before the stamp.
-            if !admitted_retry {
+            if admitted_retry {
+                self.admit_retry(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            } else {
                 self.admit(&request, Some(false))
                     .await
                     .map_err(|error| error.to_string())?;
@@ -1844,8 +1880,8 @@ impl ActionExecutor {
                     // Every 429 spends one read attempt, like 5xx/transport:
                     // a steady 429 stream exhausts the budget instead of
                     // parking the read until a separate guard refuses it. The
-                    // retry re-sends under this read's admission (see
-                    // `admitted_retry`): no request leaves during the wait.
+                    // retry re-admits as essential (see `admitted_retry`):
+                    // no request leaves during the wait or a shared pause.
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return Ok(None);
                     }
@@ -1919,13 +1955,17 @@ impl ActionExecutor {
     ) -> Result<Option<serde_json::Value>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
-        // Same reuse as the observed read: a 429 retries under the covering
-        // admission instead of re-admitting past a just-opened breaker.
+        // Same essential re-admission as the observed read: a 429 retry
+        // bypasses only a just-opened breaker, never the other guard gates.
         let mut admitted_retry = false;
         loop {
             let request = Request::from_route(&route);
             // Guard refusals are terminal; pacing completes before the send.
-            if !admitted_retry {
+            if admitted_retry {
+                self.admit_retry(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            } else {
                 self.admit(&request, Some(false))
                     .await
                     .map_err(|error| error.to_string())?;
@@ -1958,8 +1998,8 @@ impl ActionExecutor {
                     // spends one attempt, so persistent rate limiting ends in
                     // the fixed transient-exhaustion error for checked reads
                     // (absence for unchecked ones), never an open-ended park.
-                    // The retry re-sends under the covering admission after
-                    // sleeping out the wait (plus any shared pause).
+                    // The retry re-admits as essential after sleeping out
+                    // the wait (plus any shared pause).
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return if checked {
                             Err("Discord evidence unavailable".to_owned())

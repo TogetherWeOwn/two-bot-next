@@ -214,7 +214,9 @@ impl RateLimitGuard {
     /// `X-RateLimit-*` response headers (see [`Self::observe_bucket`]) and the
     /// shared [`GLOBAL_MIN_INTERVAL`] pacing floor. Routes without learned
     /// state admit exactly like [`Self::admit`]. This is the interface every
-    /// backfill endpoint slice reuses.
+    /// backfill endpoint slice reuses. `route` is the shared bucket key the
+    /// executor derives (HTTP method plus path, without the query string);
+    /// admission and observation must use the same key for one request.
     pub async fn admit_route(&self, route: &str, essential: bool) -> Result<(), GuardError> {
         self.admit_inner(Some(route), essential, true).await
     }
@@ -237,13 +239,14 @@ impl RateLimitGuard {
         essential: bool,
         pace: bool,
     ) -> Result<(), GuardError> {
-        // Reserve the shared pacing slot once for this admission. Re-reserving
-        // on every loop pass would push the slot out on each spurious wake and
-        // never converge; a fixed slot only ever gets closer.
-        let pace_slot = pace.then(|| {
-            let mut state = self.state.lock().expect("Discord guard state");
-            Self::reserve_pace_slot(&mut state)
-        });
+        // Reserve the shared pacing slot once for this admission, and only
+        // on the first pass where every other gate is clear (below):
+        // reserving up front would let refused admissions consume slots and
+        // would stale-date every waiter's slot during a long pause, so the
+        // pause would end in a simultaneous burst. Once reserved, the slot
+        // is kept across later passes — re-reserving on every wake would
+        // push it out each time and never converge.
+        let mut pace_slot: Option<Instant> = None;
         enum Step {
             WaitPending,
             Sleep { until: Option<Instant> },
@@ -274,8 +277,13 @@ impl RateLimitGuard {
                             .chain(self.bucket_deadline(&state, route, now))
                             .max();
                     }
-                    // The reserved pacing slot is just another deadline on
-                    // the same runtime clock as every other guard wait.
+                    // Every other gate is clear on this pass, so reserve
+                    // the pacing slot now (once). The reserved slot is just
+                    // another deadline on the same runtime clock as every
+                    // other guard wait.
+                    if pace && pace_slot.is_none() && until.is_none() {
+                        pace_slot = Some(Self::reserve_pace_slot(&mut state));
+                    }
                     until = until
                         .into_iter()
                         .chain(pace_slot.filter(|slot| *slot > now))
