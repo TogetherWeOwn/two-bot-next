@@ -270,17 +270,24 @@ fn build_json(facts: Vec<FactRow>) -> serde_json::Value {
 #[test]
 fn writer_to_builder_round_trip_flags_copy_paste() {
     // Five messages from one member in one channel inside an hour, each 12
-    // scalar values long but with *different* UTF-8 byte lengths. Only a
-    // scalar-count length makes them identical-length for the detector, so
-    // a byte-length implementation cannot pass this test. (The detector's
+    // scalar values long but with UTF-8 byte lengths of 12, 12, 24, 24, 21.
+    // Only a scalar-count length makes them identical-length for the
+    // detector: under byte lengths no five fall inside the detector's
+    // length window (the largest same-window byte group is three), so a
+    // byte-length implementation cannot pass this test. (The detector's
     // threshold is five same-channel messages within ±2 chars in an hour.)
     let contents = [
-        "hello world!",               // 12 scalars, 12 bytes
-        "caf\u{00E9} \u{2615} tests", // 12 scalars, 15 bytes
-        "na\u{00EF}ve fa\u{00E7}ade", // 12 scalars, 14 bytes
-        "\u{00FC}nicode r\u{00F6}ck", // 12 scalars, 14 bytes
-        "plain text!!",               // 12 scalars, 12 bytes
+        "hello world!", // 12 scalars, 12 bytes
+        "plain text!!", // 12 scalars, 12 bytes
+        "\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}", // 12 scalars, 24 bytes
+        "\u{2615}\u{2615}\u{2615}\u{2615}\u{2615}\u{2615}abcdef", // 12 scalars, 24 bytes
+        "\u{1F600}\u{1F600}\u{1F600}abcdefghi", // 12 scalars, 21 bytes
     ];
+    assert_eq!(
+        contents.iter().map(|c| c.len()).collect::<Vec<_>>(),
+        vec![12, 12, 24, 24, 21],
+        "fixture byte lengths stay split under byte counting"
+    );
     for content in contents {
         assert_eq!(content.chars().count(), 12, "fixture: {content}");
     }
