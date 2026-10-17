@@ -169,16 +169,27 @@ mod tests {
             .split_once("bind_with_delivery")
             .expect("delivery bind site moved")
             .0;
+        // Strip `//` comments before scanning: the fence-region comment names
+        // the helper, so a bare `contains("go_live_delivery_permitted")`
+        // passes on comments alone (and an inline `//` could smuggle the
+        // exact statement past the pin while the code hardcodes `true`).
+        let fence_code: String = fence
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            fence.contains("go_live_delivery_permitted"),
-            "the delivery fence must delegate to go_live_delivery_permitted"
+            fence_code
+                .contains("let announcements_permitted = activation.go_live_delivery_permitted();"),
+            "the delivery fence must be exactly `let announcements_permitted = \
+             activation.go_live_delivery_permitted();` so `= true` or `|| true` fails"
         );
         assert!(
-            !fence.contains("LiveCapability::"),
+            !fence_code.contains("LiveCapability::"),
             "the delivery fence must not name a LiveCapability directly; keep the choice in go_live_delivery_permitted"
         );
         assert!(
-            !fence.contains("activation.permitted"),
+            !fence_code.contains("activation.permitted"),
             "the delivery fence must not call the generic fence directly; delegate to go_live_delivery_permitted"
         );
         let activation = include_str!("activation.rs");
