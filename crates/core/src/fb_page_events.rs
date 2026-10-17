@@ -138,9 +138,12 @@ pub mod webhook {
     /// Re-exported so the fuzz harness names the refusal type at its own path.
     pub use super::DriverError;
 
-    /// Largest POST body the receiver may buffer. Genuine page-events bodies
-    /// are a few KiB; the cap bounds memory before JSON parsing and the HMAC.
-    pub const FB_WEBHOOK_MAX_BODY_BYTES: usize = 64 * 1024;
+    /// Largest POST body the receiver may buffer (1 MiB). Typical
+    /// page-events bodies are a few KiB, but a full Meta batch of 1000
+    /// realistic feed changes is ~255 KiB, so the cap holds a complete
+    /// 1000-update batch with ~4x headroom while still bounding memory
+    /// before JSON parsing and the HMAC.
+    pub const FB_WEBHOOK_MAX_BODY_BYTES: usize = 1024 * 1024;
     /// Longest `hub.challenge` the verifier echoes back.
     pub const FB_WEBHOOK_CHALLENGE_MAX: usize = 256;
     /// Longest page id accepted per entry.
@@ -148,11 +151,13 @@ pub mod webhook {
     /// Longest change `field` accepted per change.
     pub const FB_WEBHOOK_FIELD_MAX: usize = 64;
     /// Most entries accepted per envelope: sized to Meta's documented batch
-    /// of up to 1000 updates, so authenticated deliveries are never refused
-    /// for their size; the body cap still bounds memory.
+    /// of up to 1000 updates, so an authenticated delivery within the 1 MiB
+    /// body cap is never refused for its entry count; bodies beyond the cap
+    /// are still refused as too large.
     pub const FB_WEBHOOK_MAX_ENTRIES: usize = 1000;
     /// Most changes accepted per envelope, across all entries: sized to
-    /// Meta's documented batch of up to 1000 updates.
+    /// Meta's documented batch of up to 1000 updates, within the same 1 MiB
+    /// body cap.
     pub const FB_WEBHOOK_MAX_CHANGES: usize = 1000;
     /// Upper bound every [`DriverError::Failed`] message from this module
     /// stays under, so hostile input can never inflate an error.
@@ -257,7 +262,10 @@ pub mod webhook {
     /// [`FB_WEBHOOK_MAX_ENTRIES`] / [`FB_WEBHOOK_MAX_CHANGES`] are refused
     /// rather than truncated so a flood can never silently shrink. The caps
     /// match Meta's documented batch of up to 1000 updates, so a correctly
-    /// signed delivery is never refused for its size.
+    /// signed delivery within [`FB_WEBHOOK_MAX_BODY_BYTES`] is never refused
+    /// for its entry/change count; bodies beyond the 1 MiB cap are refused
+    /// as too large (the receiver should acknowledge with 2xx plus an alert
+    /// rather than a redelivered non-2xx).
     #[must_use = "handle the parsed changes or the refusal, never drop it"]
     pub fn parse_envelope(body: &[u8]) -> Result<FbPageEnvelope, DriverError> {
         if body.len() > FB_WEBHOOK_MAX_BODY_BYTES {
@@ -2490,7 +2498,10 @@ mod tests {
 
     #[test]
     fn fb_envelope_rejects_hostile_shapes() {
-        use webhook::{parse_envelope, FB_WEBHOOK_MAX_CHANGES, FB_WEBHOOK_MAX_ENTRIES};
+        use webhook::{
+            parse_envelope, FB_WEBHOOK_MAX_BODY_BYTES, FB_WEBHOOK_MAX_CHANGES,
+            FB_WEBHOOK_MAX_ENTRIES,
+        };
 
         let overlong_field = "f".repeat(65);
         let overlong_id = "1".repeat(129);
@@ -2575,6 +2586,41 @@ mod tests {
             "entry": [{"id": "1", "changes": full_changes}]})
         .to_string();
         let parsed = parse_envelope(full.as_bytes()).expect("1000-change batch parses");
+        assert_eq!(parsed.changes.len(), FB_WEBHOOK_MAX_CHANGES);
+        // A full 1000-update batch of realistic Page feed changes (~260 B
+        // each, ~255 KiB per 1000) parses well under the 1 MiB body cap. It
+        // would have been refused by the old 64 KiB cap, which held only
+        // ~250 such changes; this pins the sizing the review asked for.
+        let realistic_changes: Vec<_> = (0..FB_WEBHOOK_MAX_CHANGES)
+            .map(|i| {
+                serde_json::json!({
+                    "field": "feed",
+                    "value": {
+                        "from": {"id": "1234567890", "name": "Test Page"},
+                        "item": "post",
+                        "post_id": format!("1234567890_{i:010}"),
+                        "verb": "add",
+                        "created_time": 1_760_000_000,
+                        "message": "Hello world, this is a test post with enough content to reach a realistic delivery size.",
+                    },
+                })
+            })
+            .collect();
+        let realistic = serde_json::json!({"object": "page",
+            "entry": [{"id": "1234567890", "time": 1_760_000_000, "changes": realistic_changes}]})
+        .to_string();
+        assert!(
+            realistic.as_bytes().len() > 64 * 1024,
+            "realistic batch must exceed the old 64 KiB cap: {} bytes",
+            realistic.as_bytes().len()
+        );
+        assert!(
+            realistic.as_bytes().len() < FB_WEBHOOK_MAX_BODY_BYTES,
+            "realistic batch must fit the 1 MiB cap: {} bytes",
+            realistic.as_bytes().len()
+        );
+        let parsed = parse_envelope(realistic.as_bytes())
+            .expect("realistic 1000-change batch parses");
         assert_eq!(parsed.changes.len(), FB_WEBHOOK_MAX_CHANGES);
         // Invalid UTF-8 never panics the JSON parser.
         assert!(parse_envelope(&[0xff, 0xfe, 0x00]).is_err());
