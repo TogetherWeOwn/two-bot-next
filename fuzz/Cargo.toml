@@ -135,3 +135,10 @@ path = "fuzz_targets/helix_token.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "automation_transfer_import"
+path = "fuzz_targets/automation_transfer_import.rs"
+test = false
+doc = false
+bench = false
