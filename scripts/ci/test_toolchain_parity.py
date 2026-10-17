@@ -84,8 +84,18 @@ def workflow_toolchain_errors(root):
     return errors
 
 
+def _rust_stages(text):
+    """Every `FROM rust:<tag>[@sha256:<digest>]` stage, in file order.
+
+    Tag and digest are read from the SAME line in one pass, so a later rust
+    stage can never supply the digest for an earlier stage's tag (or vice
+    versa) once this file grows a second rust stage.
+    """
+    return re.findall(r"(?m)^FROM\s+rust:([^\s@]+)(?:@sha256:([0-9a-f]{64}))?", text)
+
+
 def dockerfile_parity_errors(root):
-    """The Dockerfile builds FROM rust:<major>.<minor>-trixie on the channel."""
+    """Every rust stage in the Dockerfile builds FROM rust:<major>.<minor>-trixie."""
     errors = []
     try:
         channel = read_channel(root)
@@ -101,22 +111,27 @@ def dockerfile_parity_errors(root):
         except Exception as exc:
             errors.append(f"{name} unreadable: {exc}")
             continue
-        match = re.search(r"(?m)^FROM\s+rust:([^\s@]+)", text)
-        if not match:
+        stages = _rust_stages(text)
+        if not stages:
             errors.append(f"{name}: no FROM rust:<tag> builder found")
-        elif match.group(1) != expected:
-            errors.append(f"{name}: expected rust:{expected}, got rust:{match.group(1)}")
+        for index, (tag, _digest) in enumerate(stages):
+            if tag != expected:
+                errors.append(f"{name}: stage {index} expected rust:{expected}, got rust:{tag}")
     return errors
 
 
 def dockerfile_builder_digest(root, name):
-    """Builder digest from a Dockerfile's FROM rust:<tag>@sha256:<digest> line."""
+    """Builder digest from the Dockerfile's first rust stage.
+
+    Read from the same single parse as the tag check above, so tag and digest
+    always describe the same FROM line.
+    """
     try:
         text = (root / name).read_text()
     except Exception:
         return None
-    match = re.search(r"(?m)^FROM\s+rust:[^\s@]+@sha256:([0-9a-f]{64})", text)
-    return match.group(1) if match else None
+    stages = _rust_stages(text)
+    return (stages[0][1] or None) if stages else None
 
 
 def container_image_errors(root):
@@ -132,11 +147,19 @@ def container_image_errors(root):
         return [f"rust-toolchain.toml unreadable: {exc}"]
     builder_digests = {}
     for name in DOCKERFILES:
-        digest = dockerfile_builder_digest(root, name)
-        if digest is None:
+        try:
+            stages = _rust_stages((root / name).read_text())
+        except Exception:
+            stages = []
+        if not stages or not stages[0][1]:
             errors.append(f"{name}: no pinned rust builder digest found")
-        else:
-            builder_digests[name] = digest
+            continue
+        stage_digests = {digest for _, digest in stages if digest}
+        if len(stage_digests) > 1:
+            detail = ", ".join(sorted(f"sha256:{d[:12]}" for d in stage_digests))
+            errors.append(f"{name}: rust stages disagree on builder digest: {detail}")
+            continue
+        builder_digests[name] = stages[0][1]
     if len(set(builder_digests.values())) > 1:
         detail = ", ".join(f"{n}@sha256:{d[:12]}" for n, d in sorted(builder_digests.items()))
         errors.append(f"builder digests disagree: {detail}")
@@ -272,6 +295,44 @@ class ToolchainParityTests(unittest.TestCase):
             errors = container_image_errors(root)
             self.assertEqual(len(errors), sum(map(len, CONTAINER_WORKFLOWS.values())))
             self.assertTrue(all("digest" in error for error in errors))
+
+    def test_multistage_second_rust_tag_drift_fails(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch)
+            (root / "Dockerfile").write_text(
+                PINNED_DOCKERFILE.format(tag="1.98-trixie", digest=PINNED_DIGEST)
+                + f"FROM rust:1.99-trixie@sha256:{PINNED_DIGEST} AS extra\n"
+            )
+            errors = dockerfile_parity_errors(root)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("1.99-trixie", errors[0])
+            wired = toolchain_parity_errors(root)
+            self.assertTrue(wired, "second-stage tag drift must fail through the CI entry point")
+            self.assertTrue(any("1.99-trixie" in error for error in wired))
+
+    def test_multistage_second_rust_digest_drift_fails(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch)
+            (root / "Dockerfile").write_text(
+                PINNED_DOCKERFILE.format(tag="1.98-trixie", digest=PINNED_DIGEST)
+                + f"FROM rust:1.98-trixie@sha256:{'b' * 64} AS extra\n"
+            )
+            errors = container_image_errors(root)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("disagree", errors[0])
+            wired = toolchain_parity_errors(root)
+            self.assertTrue(wired, "second-stage digest drift must fail through the CI entry point")
+
+    def test_multistage_later_digest_does_not_satisfy_builder(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch)
+            (root / "Dockerfile").write_text(
+                "FROM rust:1.98-trixie AS builder\n"
+                + f"FROM rust:1.98-trixie@sha256:{PINNED_DIGEST} AS extra\n"
+            )
+            errors = container_image_errors(root)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("no pinned rust builder digest", errors[0])
 
     def test_each_container_image_is_covered(self):
         for name, job_ids in CONTAINER_WORKFLOWS.items():
