@@ -267,6 +267,31 @@ class DatabaseTargetTests(unittest.TestCase):
                 reader.database_target(env)
             self.assertNotIn("pw@", str(caught.exception), "a refusal must not echo the login")
 
+    def test_unknown_query_key_is_a_fixed_refusal_that_never_echoes_the_key(self):
+        good = f"postgresql://two_bot_events_ro:pw@{STAGING_HOST}/two_bot"
+        cases = {
+            "secret-like key": "?SENTINELKEY=1",
+            "encoded CRLF key": "?evil%0d%0aSENTINEL=1",
+            "plus-encoded key": "?evil+SENTINEL+key=1",
+            "url-like key": "?https%3A%2F%2FSENTINEL.example%2Fx=1",
+        }
+        for label, suffix in cases.items():
+            with self.subTest(case=label), self.assertRaises(reader.Refused) as caught:
+                self.target(good + suffix)
+            message = str(caught.exception)
+            self.assertEqual(message, "refusing: the database login may not set that query parameter")
+            self.assertNotIn("SENTINEL", message)
+            self.assertNotIn("\r", message)
+            self.assertNotIn("\n", message)
+
+    def test_known_query_controls_keep_their_validation(self):
+        good = f"postgresql://two_bot_events_ro:pw@{STAGING_HOST}/two_bot"
+        pg = self.target(good + "?sslmode=require&channel_binding=require&connect_timeout=5")
+        self.assertEqual(pg["PGCHANNELBINDING"], "require")
+        self.assertEqual(pg["PGCONNECT_TIMEOUT"], "5")
+        with self.assertRaises(reader.Refused):
+            self.target(good + "?sslmode=disable")
+
 
 class ReadTests(unittest.TestCase):
     def test_missing_or_mismatched_host_pin_refuses_before_connection(self):
@@ -481,6 +506,16 @@ class FenceTests(unittest.TestCase):
         fixture = Fixture(self, rows=rows_csv(1))
         code, _, err = fixture.run(env={reader.URL_ENV: URL.replace("/two_bot?", "/two_bot_prod?")})
         self.assert_refused(fixture, code, err, "production-like")
+
+    def test_an_unknown_query_key_refuses_before_any_connection_without_echo(self):
+        fixture = Fixture(self, rows=rows_csv(1))
+        url = (f"postgresql://two_bot_events_ro:{PASSWORD}@{STAGING_HOST}/two_bot"
+               "?sslmode=require&evil%0d%0aSENTINEL=1")
+        code, out, err = fixture.run(env={reader.URL_ENV: url})
+        self.assert_refused(fixture, code, err, "may not set that query parameter")
+        self.assertNotIn("SENTINEL", out + err)
+        self.assertNotIn("\r", err)
+        self.assertEqual(err.count("\n"), 1, "the refusal must stay one line")
 
     def test_the_live_guild_refuses_before_any_connection(self):
         fixture = Fixture(self, rows=rows_csv(1))

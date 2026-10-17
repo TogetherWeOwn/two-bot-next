@@ -311,6 +311,7 @@ impl SelfRoleService {
         Job {
             name: RECOVERY_JOB_NAME,
             cadence,
+            cadence_source: None,
             startup_jitter: jobs::startup_jitter(cadence, rand::random()),
             timeout: Duration::from_secs(25),
             action: Arc::new(move || {

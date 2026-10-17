@@ -1307,6 +1307,46 @@ fn fixture() -> (LiveGuild, Store, Http, Trace) {
     )
 }
 
+/// `snapshot` re-keyed to `guild`: channel guild ids and the @everyone
+/// role id follow the guild, so `LiveGuild::publish` accepts it.
+fn snapshot_for_guild(guild: u64, extra: &[u64], members: Vec<VoiceMember>) -> GuildSnapshot {
+    let mut snap = snapshot(extra, members);
+    for channel in &mut snap.channels {
+        channel.guild_id = Some(Id::new(guild));
+    }
+    snap.bot.roles = vec![role_with(guild, permissions())];
+    snap
+}
+
+/// `fixture` on a caller-chosen guild id. Tests that read one actor's
+/// process-global stall contribution use a unique guild per test, so
+/// parallel test threads running actors on `GUILD` cannot create,
+/// overwrite or retire the entry under test.
+fn fixture_for_guild(guild: u64) -> (LiveGuild, Store, Http, Trace) {
+    let trace = Trace::default();
+    let live = LiveGuild::new(guild);
+    live.publish(snapshot_for_guild(guild, &[], vec![]));
+    (
+        live,
+        Store::new(trace.clone()),
+        Http::new(trace.clone()),
+        trace,
+    )
+}
+
+fn room_for_guild(guild: u64, channel_id: u64) -> VoiceRoom {
+    VoiceRoom::from_spec(
+        NewRoomSpec {
+            guild_id: guild,
+            creator_channel_id: CREATOR,
+            owner_id: MEMBER,
+            seed: 7,
+            created_at: NOW.to_owned(),
+        },
+        channel_id,
+    )
+}
+
 fn join(worker: &mut GuildRoomWorker<Store, Http>, member: u64) -> JoinTicket {
     let ticket = worker
         .live
@@ -2374,6 +2414,33 @@ fn owned_room() -> (LiveGuild, Store, Http, Trace) {
     let (live, store, http, trace) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
     live.publish(snapshot(
+        &[500],
+        vec![
+            VoiceMember {
+                member_id: MEMBER,
+                channel_id: 500,
+                bot: Some(false),
+            },
+            VoiceMember {
+                member_id: 301,
+                channel_id: 500,
+                bot: Some(false),
+            },
+        ],
+    ));
+    (live, store, http, trace)
+}
+
+/// `owned_room` on a caller-chosen guild id (see `fixture_for_guild`).
+fn owned_room_for_guild(guild: u64) -> (LiveGuild, Store, Http, Trace) {
+    let (live, store, http, trace) = fixture_for_guild(guild);
+    store
+        .rooms
+        .lock()
+        .unwrap()
+        .insert(500, room_for_guild(guild, 500));
+    live.publish(snapshot_for_guild(
+        guild,
         &[500],
         vec![
             VoiceMember {
@@ -13937,6 +14004,8 @@ async fn watchdog_creator_map_age_climbs_from_a_frozen_snapshot() {
     worker.reload_creators(0).await;
     let stall = StallShared {
         guild: worker.live.guild_id,
+        generation: next_voice_actor_generation(),
+        retired: AtomicBool::new(false),
         http: Arc::clone(&worker.http),
         start: tokio::time::Instant::now(),
         state: Mutex::new(StallState {
@@ -14282,6 +14351,219 @@ async fn watchdog_sibling_exits_when_its_actor_dies() {
         "no stuck alarm on the second window either"
     );
     drop(tx);
+}
+
+#[tokio::test(start_paused = true)]
+async fn actor_exit_on_inbox_close_retires_its_stall_contribution() {
+    // A halted actor publishes its stall contribution under its guild
+    // key; when the inbox closes the actor loop ends and the metric
+    // guard must retire that contribution, or the process-wide halt
+    // gauge stays stuck at 1 for a guild that no longer runs. Unique
+    // guild: the contribution map is process-global.
+    const RETIRE_GUILD: u64 = 9_100_001;
+    let (live, store, http, _) = fixture_for_guild(RETIRE_GUILD);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.halted = true;
+    assert_eq!(
+        metrics::global().voice_actor_contribution(RETIRE_GUILD),
+        None,
+        "no contribution before the actor starts"
+    );
+    let (tx, rx) = mpsc::unbounded_channel();
+    let limits = ActorLimits {
+        watchdog_stuck_after: Duration::from_secs(3600),
+        halt_reprobe_interval: Duration::from_secs(3600),
+        ..ActorLimits::default()
+    };
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+    });
+    // Drive ticks until the running actor's halted contribution lands.
+    let mut contribution = None;
+    for _ in 0..200 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        contribution = metrics::global().voice_actor_contribution(RETIRE_GUILD);
+        if contribution.is_some() {
+            break;
+        }
+    }
+    let (generation, halted, _, _) =
+        contribution.expect("the running actor publishes its stall contribution");
+    assert!(generation > 0, "the actor runs under a real generation");
+    assert!(halted, "the halted latch is the published contribution");
+    drop(tx);
+    handle.await.unwrap();
+    assert_eq!(
+        metrics::global().voice_actor_contribution(RETIRE_GUILD),
+        None,
+        "inbox close retires the contribution, so the halt signal cannot stick"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn actor_panic_unwind_retires_its_stall_contribution() {
+    // Same retirement on the panic path: the unwind skips the loop's
+    // shutdown steps, so only the metric guard's drop can retire the
+    // contribution. The panicking write records the contribution it
+    // sees first, proving the entry existed when the actor died.
+    const PANIC_GUILD: u64 = 9_100_002;
+    let (live, store, mut http, _) = owned_room_for_guild(PANIC_GUILD);
+    let seen_at_panic = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&seen_at_panic);
+    http.before_limit = Some(Arc::new(move || {
+        *seen.lock().unwrap() = metrics::global().voice_actor_contribution(PANIC_GUILD);
+        panic!("probe panic: actor dies");
+    }));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let super::limit::LimitReply::Queued { .. } =
+        worker.apply_limit(MEMBER, false, LimitCommand::Limit(LimitArg::Value(3)))
+    else {
+        panic!("the limit must queue");
+    };
+    worker.queue.enqueue(
+        PANIC_GUILD,
+        RoomAction::RenameRoom {
+            channel_id: 500,
+            name: "den".to_owned(),
+        },
+    );
+    let (tx, rx) = mpsc::unbounded_channel();
+    let limits = ActorLimits {
+        watchdog_stuck_after: Duration::from_secs(3600),
+        halt_reprobe_interval: Duration::from_secs(3600),
+        ..ActorLimits::default()
+    };
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+    });
+    let mut ticks = 0;
+    while !tx.is_closed() {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        ticks += 1;
+        assert!(ticks < 200, "the actor never reached the panicking write");
+    }
+    handle
+        .await
+        .expect_err("the actor task must die on the panic");
+    let (generation, _, queue, _) = seen_at_panic
+        .lock()
+        .unwrap()
+        .expect("a tick published the contribution before the panicking dispatch");
+    assert!(generation > 0, "the actor runs under a real generation");
+    assert!(
+        queue.iter().sum::<u64>() > 0,
+        "the queued work is in the published contribution: {queue:?}"
+    );
+    assert_eq!(
+        metrics::global().voice_actor_contribution(PANIC_GUILD),
+        None,
+        "the panic unwind retires the contribution"
+    );
+    drop(tx);
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_observe_publishes_nothing_after_retirement() {
+    // The retire fence: once the actor's contribution is removed, a
+    // late watchdog-sibling observe must not resurrect it. Positive
+    // control first: the same observe publishes the frozen snapshot
+    // under the incarnation's own generation while it is live.
+    const FENCE_GUILD: u64 = 9_100_003;
+    let (live, store, http, _) = fixture_for_guild(FENCE_GUILD);
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let generation = next_voice_actor_generation();
+    let stall = StallShared {
+        guild: FENCE_GUILD,
+        generation,
+        retired: AtomicBool::new(false),
+        http: Arc::clone(&worker.http),
+        start: tokio::time::Instant::now(),
+        state: Mutex::new(StallState {
+            last_progress: tokio::time::Instant::now(),
+            urgent: 2,
+            deferred: 3,
+            oldest_age_secs: 44,
+            halted: true,
+            creators_generation: 0,
+            creators_merged_ms: None,
+        }),
+    };
+    let mut last_fire = None;
+    stall.observe(Duration::from_secs(3600), &mut last_fire);
+    assert_eq!(
+        metrics::global().voice_actor_contribution(FENCE_GUILD),
+        Some((generation, true, [2, 3], 44)),
+        "the live sibling publishes under the shared generation"
+    );
+    // Retire exactly as the metric guard does, then observe again.
+    stall
+        .retired
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    metrics::global().remove_voice_actor(FENCE_GUILD, generation);
+    stall.observe(Duration::from_secs(3600), &mut last_fire);
+    assert_eq!(
+        metrics::global().voice_actor_contribution(FENCE_GUILD),
+        None,
+        "a retired sibling cannot resurrect the removed contribution"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn metric_guard_drop_sets_the_retired_fence() {
+    // The setter half of the fence: dropping a real metric guard must
+    // mark the shared stall state retired (so a sibling already holding
+    // a strong ref cannot re-publish after the removal) and retire the
+    // contribution. The watchdog test above sets the flag by hand and
+    // only pins the observe side; this test goes through the guard.
+    const GUARD_GUILD: u64 = 9_100_004;
+    let (live, store, http, _) = fixture_for_guild(GUARD_GUILD);
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let generation = next_voice_actor_generation();
+    let stall = Arc::new(StallShared {
+        guild: GUARD_GUILD,
+        generation,
+        retired: AtomicBool::new(false),
+        http: Arc::clone(&worker.http),
+        start: tokio::time::Instant::now(),
+        state: Mutex::new(StallState {
+            last_progress: tokio::time::Instant::now(),
+            urgent: 1,
+            deferred: 0,
+            oldest_age_secs: 7,
+            halted: true,
+            creators_generation: 0,
+            creators_merged_ms: None,
+        }),
+    });
+    let mut last_fire = None;
+    stall.observe(Duration::from_secs(3600), &mut last_fire);
+    assert_eq!(
+        metrics::global().voice_actor_contribution(GUARD_GUILD),
+        Some((generation, true, [1, 0], 7)),
+        "the live sibling publishes before the guard drops"
+    );
+    drop(VoiceActorMetricGuard {
+        actor: GUARD_GUILD,
+        generation,
+        stall: Arc::downgrade(&stall),
+    });
+    assert!(
+        stall.retired.load(std::sync::atomic::Ordering::Relaxed),
+        "the guard's drop sets the retired fence"
+    );
+    assert_eq!(
+        metrics::global().voice_actor_contribution(GUARD_GUILD),
+        None,
+        "the guard's drop retires the contribution"
+    );
+    stall.observe(Duration::from_secs(3600), &mut last_fire);
+    assert_eq!(
+        metrics::global().voice_actor_contribution(GUARD_GUILD),
+        None,
+        "a sibling holding a strong ref cannot resurrect it after the guard dropped"
+    );
 }
 
 #[tokio::test]

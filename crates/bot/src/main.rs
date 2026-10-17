@@ -668,6 +668,13 @@ async fn run(cli_args: &[String]) {
                             intents.contains(twilight_model::gateway::Intents::GUILD_PRESENCES),
                         "gateway intents resolved"
                     );
+                    // One intents value drives both the shard subscription
+                    // and the pipeline's length measurement: without
+                    // MESSAGE_CONTENT, Discord delivers content only for
+                    // bot mentions, so the pipeline must not measure it.
+                    pipeline.set_message_content_delivered(
+                        intents.contains(twilight_gateway::Intents::MESSAGE_CONTENT),
+                    );
                     let shard = build_shard(token, intents, saved.as_ref(), gateway_url.as_deref());
                     info!(
                         msg = "gateway_connecting",
