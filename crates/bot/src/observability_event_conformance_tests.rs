@@ -725,7 +725,7 @@ const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 11] = [
     "eventsub reconcile found failed subscriptions on our callback; deleting and re-creating",
     "eventsub reconcile action failed; continuing with the rest of the plan",
     "eventsub reconcile did not converge: an action failed or a healthy subscription is missing",
-    "eventsub subscriptions re-created but none verified yet",
+    "eventsub subscriptions re-created but not all verified yet",
     "eventsub subscriptions reconciled",
     "eventsub reconcile failed",
 ];
