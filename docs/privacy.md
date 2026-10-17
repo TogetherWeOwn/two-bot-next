@@ -188,7 +188,8 @@ Long-term aggregates (counts,
 streaks) are never time-purged, with one exception: game-activity guild
 aggregates (`game_activity_guild_aggregates`) expire by `updated_at` age on
 the retention cadence (default 90 days, `TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`
-override clamped to 1..=36,500, only when `TWO_RETENTION_MODE` is exactly
+accepts 1..=36,500 days and any missing, malformed, or out-of-range value
+falls back to 90 days, only when `TWO_RETENTION_MODE` is exactly
 `execute`; dry runs count and log the same rows without deleting). After
 expiry a returning game's totals restart from zero with no marker. Apart
 from that window, a departed guild's rows go only through
