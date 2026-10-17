@@ -461,8 +461,8 @@ checked-in slow-burn verdict over its cached ring and reconciles the
 `slow-burn` label: no open card means file one, an open card stays untouched
 (a refresh comment lands at most every six hours, so a refire never
 duplicates the card), and a cleared burn resolves and closes it. An unknown
-verdict — a failed scrape or evaluation — never closes the card, and a lost
-ring rebuilds instead of firing. The five-minute cadence is load-bearing for
+verdict — a failed scrape or evaluation, or unusable join series — never
+closes the card, and a lost ring rebuilds instead of firing. The five-minute cadence is load-bearing for
 the six-hour baseline. The tracker needs the `slow-burn-tracker` environment
 bearer for `/ops/metrics`; without it the run warns and stays green. Prove
 the path by dispatching the workflow with the fire and clear fixtures: they

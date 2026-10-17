@@ -5,8 +5,8 @@ The `voice_join_slow_burn` Worker rule only alerts: this scheduled tracker
 turns the first firing into one GitHub tracking issue and closes it when the
 burn clears. While the burn keeps firing the open issue is left alone (a
 refresh comment lands at most every six hours), so a refire never duplicates
-the card. An unknown verdict (failed scrape, failed evaluation) never closes
-an open card: silence is not recovery.
+the card. An unknown verdict (failed scrape, failed evaluation, or unusable
+join series) never closes an open card: silence is not recovery.
 
 The firing verdict comes from the checked-in evaluator
 (`wrangler/src/alert-rules.ts`) through `wrangler/scripts/slow-burn-decide.mjs`;
@@ -129,6 +129,7 @@ def run_driver(node, driver, exposition_path, ring_path, now):
     except ValueError:
         raise TrackError("burn evaluation failed: driver answer is not JSON")
     if (not isinstance(verdict, dict) or not isinstance(verdict.get("slow"), bool)
+            or not isinstance(verdict.get("held"), bool)
             or not isinstance(verdict.get("ring"), list)):
         raise TrackError("burn evaluation failed: driver answer has no verdict")
     return verdict
@@ -385,6 +386,15 @@ def main(argv=None, env=None):
         return 1
     next_ring = verdict["ring"]
     evidence["ring_size"] = len(next_ring)
+    if verdict["held"]:
+        # The join series were unusable: the previous firing state holds, so
+        # this run decides nothing. It must not file, refresh, resolve, close
+        # or rewrite the ring; silence here is not recovery.
+        evidence["verdict"] = "held"
+        Path(args.evidence_out).write_text(json.dumps(evidence, indent=2) + "\n",
+                                           encoding="utf-8")
+        print(f"slow-burn tracker: verdict=held action=none ring={len(next_ring)}")
+        return 0
     evidence["verdict"] = "slow-fire" if verdict["slow"] else "clear"
     if args.fixture == "live":
         Path(args.ring).write_text(json.dumps(next_ring) + "\n", encoding="utf-8")

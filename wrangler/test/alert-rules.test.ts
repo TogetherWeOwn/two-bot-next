@@ -356,6 +356,21 @@ test("voice join slow burn tickets on a sustained 6 h grind that never trips fas
   assert.ok(!grinding.firing.includes("voice_join_fast_burn"));
 });
 
+test("voice join burn holds the previous firing state when the join series go missing", () => {
+  // A firing ticket survives an exposition without the join series: the
+  // tracker reads joinHeld to decide nothing instead of resolving the card.
+  let state = EMPTY_STATE;
+  for (let i = 0; i <= 360; i++) {
+    state = evAt(joinLines(i * 100, 0, i * 96), state, i * 60).state;
+  }
+  const firing = evAt(joinLines(361 * 100, 0, 361 * 96), state, 361 * 60);
+  assert.deepEqual(firing.firing, ["voice_join_slow_burn"]);
+  assert.equal(firing.joinHeld, false);
+  const held = evAt([], firing.state, 362 * 60);
+  assert.deepEqual(held.firing, ["voice_join_slow_burn"]);
+  assert.equal(held.joinHeld, true);
+});
+
 test("voice join burn stays silent on healthy traffic, quiet windows and benign duplicates", () => {
   // Healthy at a fifth of the budget: 1,000 genuine, 1 slow (0.2x burn).
   let state = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0).state;

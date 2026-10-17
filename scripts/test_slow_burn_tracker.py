@@ -187,6 +187,21 @@ class TrackerUnitTests(unittest.TestCase):
         writes = [call for call in fake.calls if call[2] != "list"]
         self.assertEqual(writes, [])
 
+    def test_held_verdict_decides_nothing(self):
+        evidence = str(self.dir / "evidence.json")
+        held = {"slow": False, "fast": False, "held": True, "ring": []}
+        with mock.patch.object(tracker, "run_driver", return_value=held):
+            with mock.patch("subprocess.run",
+                             side_effect=AssertionError("gh must not run")):
+                code = tracker.main(
+                    ["--fixture", "fire", "--evidence-out", evidence,
+                     "--exposition-out", str(self.dir / "expo.prom")],
+                    base_env())
+        self.assertEqual(code, 0)
+        stored = json.loads(Path(evidence).read_text())
+        self.assertEqual(stored["verdict"], "held")
+        self.assertEqual(stored["action"], "none")
+
     def test_dry_run_writes_nothing(self):
         fake = FakeGh()
         with mock.patch("subprocess.run", fake):
@@ -226,6 +241,18 @@ class TrackerDriverTests(unittest.TestCase):
         verdict = self.run_fixture("clear")
         self.assertFalse(verdict["slow"])
         self.assertFalse(verdict.get("fast"))
+
+    def test_missing_join_series_holds_instead_of_clearing(self):
+        now = int(time.time())
+        _, ring = tracker.fixture_inputs("fire", now)
+        expo = self.dir / "expo.prom"
+        expo.write_text('two_bot_voice_operations_total{op="create",outcome="success"} 42\n',
+                        encoding="utf-8")
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(json.dumps(ring), encoding="utf-8")
+        verdict = tracker.run_driver(NODE, str(DRIVER), expo, ring_path, now)
+        self.assertTrue(verdict["held"])
+        self.assertFalse(verdict["slow"])
 
     def test_malformed_ring_rebuilds_silently(self):
         now = int(time.time())
