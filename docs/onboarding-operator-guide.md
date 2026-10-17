@@ -150,11 +150,11 @@ line per pick; otherwise `Done. Here is where to go:` plus one
 - Otherwise roles are matched to the menu exactly (unticked held game roles
   are removed), the reply is ephemeral (only the clicker sees it),
   `record_selected` is true and `record_routed` is true only when
-  destinations exist. The reply and plan are provisional until
-  `finalize_after_grant` re-resolves visibility after successful role
-  writes — a just-added role can itself reveal the channel to link — so
-  the executor must call it after role writes and before replying or
-  recording. On role failure the executor replies `I could not set those
+  destinations exist. The reply and plan are provisional until the
+  executor re-resolves visibility after successful role writes — a
+  just-added role can itself reveal the channel to link — so after role
+  writes it reloads `MemberAccess`, recomputes visible channels, and calls
+  `plan_game_selection` before replying or recording. On role failure the executor replies `I could not set those
   roles - my own permissions are wrong. Staff have been notified in the
   logs.` and records nothing.
 
