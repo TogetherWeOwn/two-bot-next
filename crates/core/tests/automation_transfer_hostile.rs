@@ -191,7 +191,7 @@ fn entry_problems_are_counted_never_fatal() {
             [1, 2],
             "str",
             null,
-            {"name": "", "template": ""},
+            {"name": "", "template": null},
             {"name": "fine", "template": "kept", "text_trigger": null},
         ]}),
         max,

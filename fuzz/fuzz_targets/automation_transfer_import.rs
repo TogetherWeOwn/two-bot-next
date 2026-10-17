@@ -15,6 +15,7 @@ fn raw_entry_count(body: &serde_json::Value) -> Option<usize> {
             .get("commands")
             .and_then(serde_json::Value::as_array)
             .map(Vec::len),
+        _ => None,
     }
 }
 
