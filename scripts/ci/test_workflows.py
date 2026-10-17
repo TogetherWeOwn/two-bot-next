@@ -61,6 +61,8 @@ JOB_INVENTORY = {
     # SDLC separation gate (org test-guard reusable, warn mode): one
     # reusable call, least-privilege grant pinned below.
     "test-guard.yml": {"test-guard"},
+    # Advisory changed-file review rules; no deploy route or new required gate.
+    "review-rules.yml": {"review-rules"},
     # TOG-21027: manual, bounded vote_kick libFuzzer smoke on a GitHub-hosted
     # runner. Read-only, no secrets, no deploy route: the generic
     # deployment/probe scan already passes, so only the inventory pin is needed.
@@ -87,6 +89,8 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
                    ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
+                   # Read-only shadow engine. Repin with its caller after central merge.
+                   ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@c0b2e33692266088af0d7caf9f448dde2f723d75",
                    # SDLC 2.3 CI speed pilot, promoted: required check.yml
                    # caller to the shared nextest lane (local path until
                    # the central move).
@@ -2759,6 +2763,17 @@ class WorkflowTests(unittest.TestCase):
     def test_duplicate_keys_cannot_hide_an_enabled_job(self):
         with self.assertRaises(ValueError):
             yaml.load("jobs:\n  deploy:\n    if: '${{ false }}'\n    if: true\n", Loader=UniqueKeyLoader)
+
+    def test_review_rules_stays_read_only_and_shadow(self):
+        workflow = self.workflows["review-rules.yml"]
+        self.assertEqual(set(workflow["on"]), {"pull_request", "merge_group"})
+        self.assertEqual(workflow["permissions"], {})
+        job = workflow["jobs"]["review-rules"]
+        self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertEqual(job["with"], {"packs": "rust,security,python-shell-ci", "mode": "warn"})
+        self.assertNotIn("secrets", job)
+        self.assertNotIn("environment", job)
+        self.assertEqual(job["uses"], REUSABLE_CALLS[("review-rules.yml", "review-rules")])
 
     def test_private_runner_and_service_isolation(self):
         for name, workflow in self.workflows.items():
