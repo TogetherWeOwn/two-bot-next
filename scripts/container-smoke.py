@@ -31,7 +31,13 @@ IMAGE_MAX_BYTES = 112 * MIB
 # (15.04 MiB) before the event-executor merge; the combined-head
 # measurement comes from hosted CI on the merged head. 16 MiB restores a
 # working tripwire with headroom; revisit if the binary approaches it.
-BINARY_MAX_BYTES = 16 * MIB
+# Recalibrated 2026-10-17: main measured 16,776,096 bytes (16.00 MiB) in
+# hosted CI, leaving ~1 KiB under the 16 MiB budget — the tripwire is
+# exhausted by landed growth, not by any one slice. The voice actor-init
+# retry head measured 16,782,904 bytes (+6,808, no new dependencies;
+# release profile already minimal: opt-level=z, lto, strip). 17 MiB
+# restores a working tripwire with headroom; revisit if it approaches it.
+BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"

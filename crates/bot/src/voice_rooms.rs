@@ -8168,6 +8168,7 @@ impl<H: RoomWrites> StallShared<H> {
     }
 }
 
+#[cfg(test)]
 async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
     inbox: mpsc::UnboundedReceiver<ActorCommand>,
