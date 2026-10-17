@@ -183,6 +183,7 @@ pub(crate) fn scheduled_job(seconds: u64, action: JobAction) -> Result<Job, Erro
     Ok(Job {
         name: NAME,
         cadence: Duration::from_secs(seconds),
+        cadence_source: None,
         startup_jitter: Duration::ZERO,
         timeout: JOB_TIMEOUT,
         action: Arc::new(move || {
@@ -235,37 +236,55 @@ pub(crate) fn live_poll_seconds(guild: &str, fallback: u64) -> u64 {
     live_poll_seconds_with(guild, fallback, crate::settings_jobs::live().as_ref())
 }
 
-/// Live-aware job: the supervisor still wakes on the boot value, while the
-/// non-overlapping schedule gate re-reads the live interval before every
-/// tick. A stored change takes effect no earlier than the previously
-/// scheduled slot, and the effective interval is the stored value rounded up
-/// to a multiple of the boot cadence; only a restart re-baselines the
-/// supervisor cadence (dynamic-cadence follow-up).
+/// Live-aware job: the supervisor's own cadence follows the live interval,
+/// and the non-overlapping schedule gate re-reads the same interval before
+/// every tick. A stored change reschedules the next run to last-run + new
+/// interval on both layers (see `jobs::Job::cadence_source` and
+/// `FeedPollSchedule::set_interval_seconds`), so a decrease below the boot
+/// cadence no longer waits for the pending boot-cadence slot and the
+/// effective interval is the stored value, never rounded to a boot multiple.
 pub(crate) fn scheduled_job_live(
     seconds: u64,
     action: JobAction,
     guild: String,
 ) -> Result<Job, ErrorClass> {
+    let interval: Arc<dyn Fn() -> u64 + Send + Sync> =
+        Arc::new(move || live_poll_seconds(&guild, seconds));
+    scheduled_job_dynamic(seconds, action, interval)
+}
+
+/// [`scheduled_job_live`] over an injectable interval reader, for tests.
+/// `seconds` is the boot value: it validates the job and seeds the cadence
+/// until the reader's first value is taken at construction.
+pub(crate) fn scheduled_job_dynamic(
+    seconds: u64,
+    action: JobAction,
+    interval: Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> Result<Job, ErrorClass> {
+    // Validate the boot value even when a live value is already published:
+    // a misconfigured boot interval must refuse registration like before.
+    FeedPollSchedule::new(seconds).map_err(|_| ErrorClass::Configuration)?;
+    let initial = interval();
     let schedule = Arc::new(Mutex::new(
-        FeedPollSchedule::new(live_poll_seconds(&guild, seconds))
-            .map_err(|_| ErrorClass::Configuration)?,
+        FeedPollSchedule::new(initial).map_err(|_| ErrorClass::Configuration)?,
     ));
     let origin = tokio::time::Instant::now();
+    let gate_interval = interval.clone();
     Ok(Job {
         name: NAME,
-        cadence: Duration::from_secs(seconds),
+        cadence: Duration::from_secs(initial),
+        cadence_source: Some(Arc::new(move || Duration::from_secs(interval()))),
         startup_jitter: Duration::ZERO,
         timeout: JOB_TIMEOUT,
         action: Arc::new(move || {
             let action = action.clone();
             let schedule = schedule.clone();
-            let guild = guild.clone();
+            let interval = gate_interval.clone();
             let now = origin.elapsed().as_millis().min(i64::MAX as u128) as i64;
             Box::pin(async move {
                 {
                     let mut schedule = schedule.lock().expect("feed schedule");
-                    let live_seconds = live_poll_seconds(&guild, seconds);
-                    schedule.set_interval_seconds(live_seconds);
+                    schedule.set_interval_seconds(interval());
                     if !schedule.begin(now) {
                         return Ok(());
                     }
@@ -279,9 +298,9 @@ pub(crate) fn scheduled_job_live(
 
 /// The feed poller, or `None` while `TWO_ANNOUNCEMENTS` is off or the boot
 /// identity does not permit announcements (the live-identity fence, TOG-15758).
-/// The poll interval reads the live settings snapshot (TOG-19027): the boot
-/// value sets the supervisor cadence, the per-tick schedule gate re-reads the
-/// stored value so a changed interval applies without a restart.
+/// The poll interval reads the live settings snapshot (TOG-19027): the
+/// supervisor cadence and the per-tick schedule gate both follow the stored
+/// value, so a changed interval reschedules the next run without a restart.
 pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Option<Job> {
     let gates = match FeatureGates::from_env() {
         Ok(gates) => gates,

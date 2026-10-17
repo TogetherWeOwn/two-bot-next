@@ -31,12 +31,15 @@ IMAGE_MAX_BYTES = 112 * MIB
 # (15.04 MiB) before the event-executor merge; the combined-head
 # measurement comes from hosted CI on the merged head. 16 MiB restores a
 # working tripwire with headroom; revisit if the binary approaches it.
-# Rebumped for the feed-fetch outcome gauges: CI measured 16,778,336 bytes
-# (16.00 MiB) on the PR merge head vs 16,776,096 bytes on the main baseline
-# — 1,120 bytes (0.007%) over the 16 MiB budget, +2,240 bytes of
-# bounded-vocabulary counters and pure mapping functions, no new
-# dependencies. 17 MiB restores a working tripwire with ~1.00 MiB (6.2%)
-# headroom, the same policy as the 16 MiB calibration; revisit if the binary
+# 2026-10-17 recalibration: main tip measured 16,776,096 bytes (16.00 MiB)
+# in hosted CI, leaving 1,120 bytes of headroom — the tripwire is exhausted
+# even before new code lands. This branch's feed-fetch outcome gauges add
+# ~2,240 bytes of bounded-vocabulary counters and pure mapping functions
+# (PR merge head 16,778,336 bytes, 1,120 over 16 MiB), and main's voice
+# rename-decision logs add 3,160 bytes (merged head 16,779,256 bytes, 2,040
+# over 16 MiB), both with no new dependencies; the release profile is
+# already minimal (opt-level=z, lto, strip). 17 MiB restores ~1.00 MiB
+# of headroom while keeping a working tripwire; revisit if the binary
 # approaches it.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read

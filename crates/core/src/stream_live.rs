@@ -21,8 +21,10 @@
 //! treating the go-live as delivered. `claim_live` classifies a
 //! conflicting row itself, so that answer needs no follow-up call.
 //! Never-started claims expire on a bounded lease
-//! (`STALE_CLAIM_LEASE_SECS`, 30 s) via atomic stale takeover; started and
-//! delivered rows never expire and are never reclaimed. Twitch documents
+//! (`STALE_CLAIM_LEASE_SECS`, 30 s) via atomic stale takeover; started rows
+//! never expire and are never reclaimed, while delivered rows expire past
+//! the dedup horizon on the retention cadence (see
+//! [`crate::stream_live_store::expire_delivered_live`]). Twitch documents
 //! no retry schedule, so recovery depends on a retry arriving after the
 //! lease; there is no sweeper in this slice.
 //!
