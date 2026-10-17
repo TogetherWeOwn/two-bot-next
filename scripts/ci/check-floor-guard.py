@@ -217,27 +217,41 @@ def _scope_cells(line):
     return cells[2], cells[3]
 
 
-def _checked_by_narrowed(base_cell, head_cell):
+def _checked_by_narrowed(base_cell, head_cell, *, allow_coverage_lane_move=False):
     """Whether a Checked-by edit removes a command, subcommand, flag or lane.
 
     Every token of each base command must appear as a whole token in one
     head command, so added flags pass while a swapped subcommand (``clippy``
     to ``check``, ``check all`` to ``check advisories``, ``doc`` to
     ``check``) fails. Tokens are compared whole: a substring never
-    satisfies. The bare ```check``` span names the required ``check`` lane,
-    not a command, so it is checked separately and kept out of the token
-    comparison. An interpreter swap around a script path (``python3
-    scripts/...`` to ``uv run scripts/...``) keeps its identity through
-    the script path.
+    satisfies. A backticked name followed by ``lane`` is a CI lane, not a
+    command. The only approved lane move is Patch coverage from ``check`` to
+    ``rust-tests``; every gate must otherwise keep its named lane. An
+    interpreter swap around a script path (``python3 scripts/...`` to
+    ``uv run scripts/...``) keeps its identity through the script path.
     """
     commands = re.findall(r"`([^`]+)`", base_cell)
     head_commands = re.findall(r"`([^`]+)`", head_cell)
-    base_spans = [command.strip() for command in commands]
-    head_spans = [command.strip() for command in head_commands]
-    if "check" in base_spans and "check" not in head_spans:
-        return True
-    commands = [command for command in commands if command.strip() != "check"]
-    head_commands = [command for command in head_commands if command.strip() != "check"]
+    base_lanes = {
+        command.strip() for command in commands
+        if re.search(rf"`{re.escape(command.strip())}`\s+lane\b", base_cell)
+    }
+    head_lanes = {
+        command.strip() for command in head_commands
+        if re.search(rf"`{re.escape(command.strip())}`\s+lane\b", head_cell)
+    }
+    if base_lanes:
+        if not head_lanes:
+            return True
+        approved_coverage_move = (
+            allow_coverage_lane_move
+            and base_lanes == {"check"}
+            and head_lanes == {"rust-tests"}
+        )
+        if base_lanes != head_lanes and not approved_coverage_move:
+            return True
+    commands = [command for command in commands if command.strip() not in base_lanes]
+    head_commands = [command for command in head_commands if command.strip() not in head_lanes]
     head_token_sets = []
     for candidate in head_commands:
         try:
@@ -370,7 +384,11 @@ def threshold_violations(base_text, head_text):
                             "Runs-at scope narrowed: "
                             f"{old.strip()[:80]} -> {head_line.strip()[:80]}"
                         )
-                    elif _checked_by_narrowed(old_checked, head_checked):
+                    elif _checked_by_narrowed(
+                        old_checked,
+                        head_checked,
+                        allow_coverage_lane_move=key == "Patch coverage",
+                    ):
                         errors.append(
                             "threshold-lowered: CONSTRAINTS.md Enforced row "
                             "Checked-by scope narrowed: "

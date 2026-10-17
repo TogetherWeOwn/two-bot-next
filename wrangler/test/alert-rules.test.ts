@@ -30,6 +30,30 @@ test("job stale fires only past two intervals and ignores never-succeeded", () =
   assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="rank"} 0`]).firing, []);
 });
 
+test("creator-map staleness fires past two refresh intervals once a merge landed", () => {
+  const map = (generation: number, age: number) => [
+    `two_bot_voice_creator_map_generation ${generation}`,
+    `two_bot_voice_creator_map_age_seconds ${age}`,
+  ];
+  // At the bound is not past it; one failed refresh alone cannot fire.
+  assert.deepEqual(ev(map(3, 600)).firing, []);
+  const stale = ev(map(3, 601));
+  assert.deepEqual(stale.firing, ["voice_creator_map_stale"]);
+  // Generation 0 is never-merged (boot or voice parked): the age is defined
+  // as 0 there, so even a synthetic large age must not fire.
+  assert.deepEqual(ev(map(0, 99999)).firing, []);
+  // A landed merge resets the age and resolves the alert.
+  assert.deepEqual(ev(map(4, 0), stale.state).firing, []);
+  // Older containers lack the optional gauges: absence holds a firing alert
+  // instead of resolving it, and never fires on its own.
+  assert.deepEqual(ev([], stale.state).firing, ["voice_creator_map_stale"]);
+  assert.deepEqual(ev([]).firing, []);
+  // Duplicated or labeled rows are malformed for a label-free gauge: held,
+  // not resolved and not newly fired.
+  assert.deepEqual(ev([...map(3, 601), "two_bot_voice_creator_map_age_seconds 601"], stale.state).firing, ["voice_creator_map_stale"]);
+  assert.deepEqual(ev([`two_bot_voice_creator_map_generation 3`, `two_bot_voice_creator_map_age_seconds{guild="1"} 601`]).firing, []);
+});
+
 test("consecutive failures fire at 3 and retain classless messages for older exposition", () => {
   assert.deepEqual(ev([`two_bot_job_consecutive_failures{job="counter"} 2`]).firing, []);
   const failed = ev([`two_bot_job_consecutive_failures{job="counter"} 3`]);
@@ -147,6 +171,7 @@ test("5xx rate uses the delta, baselines legacy state, and ignores resets and ti
     `two_bot_rest_requests_total{route="other",result="5xx"} 50`,
   ], legacy);
   assert.deepEqual(baseline.firing, []);
+  assert.equal(baseline.state.rest5xx, 50);
   const later = ev([
     `two_bot_rest_requests_total{route="other",result="2xx"} 1018`,
     `two_bot_rest_requests_total{route="other",result="5xx"} 62`,
@@ -156,6 +181,20 @@ test("5xx rate uses the delta, baselines legacy state, and ignores resets and ti
   // A 429 burst is not a 5xx burst: the two rates track independently.
   const other = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 180`, `two_bot_rest_requests_total{route="other",result="429"} 20`], first.state);
   assert.deepEqual(other.firing, ["rest_429_rate"]);
+});
+
+test("alert messages carry build revision, failure detail and the log-query link", () => {
+  const firing = transitionMessages([], ["rest_5xx_rate"], {}, {}, {
+    buildRevision: "abc123",
+    failedStep: "gateway_run",
+    errorCode: "42501",
+  })[0]!;
+  assert.match(firing, /Build: abc123/);
+  assert.match(firing, /Failure: gateway_run\/42501/);
+  assert.match(firing, /Logs: https:\/\/developers\.cloudflare\.com/);
+  const fallback = transitionMessages([], ["rest_5xx_rate"])[0]!;
+  assert.match(fallback, /Build: unknown/);
+  assert.doesNotMatch(fallback, /Failure:/);
 });
 
 test("promotion error gate fails a stage only on a 5xx burst", () => {
@@ -759,6 +798,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "gateway_checkpoint_failures",
     "voice_join_fast_burn",
     "voice_join_slow_burn",
+    "voice_creator_map_stale",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -777,6 +817,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("gateway_checkpoint_failures", window), `evidence-gateway_checkpoint_failures-${window}.json`);
   assert.equal(packetFilename("voice_join_fast_burn", window), `evidence-voice_join_fast_burn-${window}.json`);
   assert.equal(packetFilename("voice_join_slow_burn", window), `evidence-voice_join_slow_burn-${window}.json`);
+  assert.equal(packetFilename("voice_creator_map_stale", window), `evidence-voice_creator_map_stale-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -789,6 +830,13 @@ test("every rule links to an existing runbook heading", () => {
     const anchor = rule.runbook.split("#")[1]!;
     assert.ok(slugs.has(anchor), `${rule.id}: missing runbook heading for #${anchor}`);
   }
+});
+
+test("runbook heading slugs are unique", () => {
+  const headings = [...readFileSync(new URL("../../docs/runbook.md", import.meta.url), "utf8").matchAll(/^#+ (.+)$/gm)];
+  const slugs = headings.map((m) =>
+    m[1]!.toLowerCase().replace(/[^a-z0-9 _-]/g, "").replace(/ /g, "-"));
+  assert.equal(new Set(slugs).size, slugs.length, "duplicate runbook heading slug");
 });
 
 test("heading anchors keep literal underscores from inline-code headings", () => {
@@ -883,6 +931,7 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   burn = evaluateMetrics(parseExposition(body(joinLines(900, 9, 720))), burn.state, burnBase + 3300);
   burn = evaluateMetrics(parseExposition(body(joinLines(1000, 10, 800))), burn.state, burnBase + 3600);
   firing.push(...burn.firing);
+  firing.push(...ev(["two_bot_voice_creator_map_generation 3", "two_bot_voice_creator_map_age_seconds 601"]).firing);
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);
@@ -890,11 +939,13 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
     const packet = packets.find((p) => p.includes(`: ${rule.summary}. Runbook: `));
     assert.ok(packet, `${rule.id}: no fired packet carries its summary`);
     assert.ok(packet!.includes(runbookUrl(rule)), `${rule.id}: packet lacks full deep link ${runbookUrl(rule)}`);
-    const url = packet!.slice(packet!.indexOf("Runbook: ") + "Runbook: ".length);
+    const afterRunbook = packet!.slice(packet!.indexOf("Runbook: ") + "Runbook: ".length);
+    const url = afterRunbook.split(". Build:")[0]!;
     assert.ok(url.startsWith(RUNBOOK_BASE_URL), `${rule.id}: runbook is not a full docs URL: ${url}`);
     const anchor = url.slice(`${RUNBOOK_BASE_URL}runbook.md#`.length);
     assert.ok(slugs.has(anchor), `${rule.id}: packet URL anchor #${anchor} missing from docs/runbook.md`);
     assert.equal(ruleFor(firing.find((k) => k.startsWith(rule.id))!)?.id, rule.id);
+    assert.match(packet!, /Build: unknown\. Logs: https:\/\//, `${rule.id}: packet lacks build/log context`);
   }
 });
 

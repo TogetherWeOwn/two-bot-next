@@ -1,6 +1,7 @@
 """Offline workflow policy fixtures; never dispatch, deploy or probe staging."""
 
 from copy import deepcopy
+import importlib.util
 from pathlib import Path
 import re
 import tomllib
@@ -9,6 +10,14 @@ import unittest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+_HISTORY_SPEC = importlib.util.spec_from_file_location(
+    "synthetic_alert_history", ROOT / "scripts/synthetic_alert_history.py")
+_HISTORY_MODULE = importlib.util.module_from_spec(_HISTORY_SPEC)
+_HISTORY_SPEC.loader.exec_module(_HISTORY_MODULE)
+ALERT_STEPS = _HISTORY_MODULE.ALERT_STEPS
+DECIDE_STEPS = _HISTORY_MODULE.DECIDE_STEPS
+JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
+PROBE_STEPS = _HISTORY_MODULE.PROBE_STEPS
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
     # The nextest branch adds its required lane; main adds the production schema gate.
@@ -46,9 +55,14 @@ JOB_INVENTORY = {
     "sbom.yml": {"image", "verify"},
     # Live staging voice synthetic (docs/voice-synthetic.md); pinned shape below.
     "voice-synthetic.yml": {"synthetic"},
+    # Five-minute user-flow synthetic (docs/synthetic-user-flow.md): staging
+    # health-contract plus passive production probes; pinned shape below.
+    "synthetic-user-flow.yml": {"staging", "prod-passive"},
     # SDLC separation gate (org test-guard reusable, warn mode): one
     # reusable call, least-privilege grant pinned below.
     "test-guard.yml": {"test-guard"},
+    # Advisory changed-file review rules; no deploy route or new required gate.
+    "review-rules.yml": {"review-rules"},
     # TOG-21027: manual, bounded vote_kick libFuzzer smoke on a GitHub-hosted
     # runner. Read-only, no secrets, no deploy route: the generic
     # deployment/probe scan already passes, so only the inventory pin is needed.
@@ -75,6 +89,8 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
                    ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
+                   # Read-only shadow engine, pinned to the published central merge commit.
+                   ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@63699075b492914c137281acffd4c89e51cc1c4c",
                    # SDLC 2.3 CI speed pilot, promoted: required check.yml
                    # caller to the shared nextest lane (local path until
                    # the central move).
@@ -190,11 +206,14 @@ def staging_push_filter_errors(name, push):
 
 
 def staging_dispatch_errors(workflow):
-    """The active staging workflow keeps exactly one fenced dispatch input.
+    """The active staging workflow keeps exactly two fenced dispatch inputs.
 
     `release_fence` exists on main (TOG-11143) so post-handoff release of an
     uninitialized/parked singleton is explicit and auditable; it defaults to
-    false and the deploy job itself runs unconditionally (TOG-12856). Anything
+    false and the deploy job itself runs unconditionally (TOG-12856).
+    `inject_gateway_failure` is the staging rollback-drill switch: also an
+    opt-in boolean defaulting to false, readable only through the pinned
+    dispatch-only expression in staging_gateway_injection_errors. Anything
     else in the dispatch block (an arming switch, a deploy flag, a default of
     true) is an unreviewed deploy route outside the pinned shape.
     """
@@ -205,12 +224,61 @@ def staging_dispatch_errors(workflow):
         errors.append(f"{name}: triggers changed")
     errors.extend(staging_push_filter_errors(name, on.get("push")))
     dispatch = on.get("workflow_dispatch") or {}
-    if set(dispatch) != {"inputs"} or set(dispatch.get("inputs") or {}) != {"release_fence"}:
-        errors.append(f"{name}: workflow_dispatch must carry only the release_fence input")
+    expected = {"release_fence", "inject_gateway_failure"}
+    if set(dispatch) != {"inputs"} or set(dispatch.get("inputs") or {}) != expected:
+        errors.append(f"{name}: workflow_dispatch must carry only the release_fence and inject_gateway_failure inputs")
     else:
-        fence = dispatch["inputs"]["release_fence"] or {}
-        if fence.get("type") != "boolean" or fence.get("default") not in (False, "false"):
-            errors.append(f"{name}: release_fence must be an opt-in boolean defaulting to false")
+        for input_name in expected:
+            spec = dispatch["inputs"][input_name] or {}
+            if spec.get("type") != "boolean" or spec.get("default") not in (False, "false"):
+                errors.append(f"{name}: {input_name} must be an opt-in boolean defaulting to false")
+    return errors
+
+
+INJECTION_EXPRESSION = "${{ github.event_name == 'workflow_dispatch' && inputs.inject_gateway_failure && 'true' || 'false' }}"
+INJECTION_MARKERS = (
+    "inject_gateway_failure", "INJECT_GATEWAY_FAILURE",
+    "TWO_GATEWAY_READINESS_FAIL_INJECTION", "--inject-gateway-failure",
+)
+
+
+def staging_gateway_injection_errors(workflows):
+    """The drill injection is dispatch-only, staging-only plumbing.
+
+    Exactly one expression in exactly one staging step may read the input,
+    it must also require `workflow_dispatch` (a push never carries inputs,
+    and the guard makes that structural rather than implied), and the step
+    may only hand the prepare flag to the generated staging deploy config.
+    Every other workflow — deploy-production above all — must not mention
+    the switch at all, so no route can forward it to production.
+    """
+    errors = []
+    for name, workflow in workflows.items():
+        if name == "deploy-staging.yml":
+            continue
+        text = str(workflow)
+        for marker in INJECTION_MARKERS:
+            if marker in text:
+                errors.append(f"{name}: gateway-failure injection marker {marker} outside deploy-staging")
+    staging = workflows.get("deploy-staging.yml") or {}
+    text = str(staging)
+    if text.count("inputs.inject_gateway_failure") != 1:
+        errors.append("deploy-staging.yml: inject_gateway_failure must be read exactly once")
+    steps = ((staging.get("jobs") or {}).get("deploy") or {}).get("steps") or []
+    armed = [step for step in steps
+             if isinstance(step, dict) and "INJECT_GATEWAY_FAILURE" in str(step)]
+    if len(armed) != 1:
+        errors.append("deploy-staging.yml: exactly one deploy step may carry the injection switch")
+        return errors
+    step = armed[0]
+    env = step.get("env") or {}
+    if env.get("INJECT_GATEWAY_FAILURE") != INJECTION_EXPRESSION:
+        errors.append("deploy-staging.yml: injection must use the pinned dispatch-only expression")
+    run = str(step.get("run") or "")
+    for needle in ("staging_rollout.py prepare", "--inject-gateway-failure",
+                   '[ "$INJECT_GATEWAY_FAILURE" = "true" ]'):
+        if run.count(needle) != 1:
+            errors.append(f"deploy-staging.yml: injection step must contain exactly one {needle}")
     return errors
 
 
@@ -948,13 +1016,36 @@ def production_errors(workflow):
     production, guard = jobs.get("production", {}), jobs.get("guard", {})
     needs = production.get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
+    expected_production_if = (
+        "always() && needs.guard.result == 'success' && "
+        "(needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || "
+        "(needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))"
+    )
     if production.get("environment") != "production" or set(needs) != {"guard", "schema-gate", "roles-gate"}:
         errors.append(f"{name}:production: must wait for the guard, the schema gate, the roles gate and the protected Environment")
-    if "if" in production:
-        errors.append(f"{name}:production: a job condition could bypass the guard outputs")
-    if ("environment" in guard or "uses" in guard
-            or any(marker in str(guard).lower() for marker in DEPLOY_MARKERS)):
+    if production.get("if") != expected_production_if:
+        errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates")
+    expected_gate_if = "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
+    for gate_name in ("schema-gate", "roles-gate"):
+        if jobs.get(gate_name, {}).get("if") != expected_gate_if:
+            errors.append(f"{name}:{gate_name}: must run only for ordinary deploys")
+    guard_text = str(guard).lower()
+    guard_markers = tuple(marker for marker in DEPLOY_MARKERS if marker not in ("production_worker_url", "/readyz"))
+    if ("environment" in guard or "uses" in guard or "curl " in guard_text
+            or any(marker in guard_text for marker in guard_markers)):
         errors.append(f"{name}:guard: deployment/probe alternative outside the production job")
+    guard_script = "\n".join(step.get("run", "") for step in guard.get("steps", []))
+    for required in ('urllib.request.Request(',
+                     'worker_url + "/readyz"',
+                     '"User-Agent": "two-bot-next-production-rollout/1.0"',
+                     'urllib.request.urlopen(request, timeout=10)',
+                     'live_report.get("build_revision") != sha'):
+        if required not in guard_script:
+            errors.append(f"{name}:guard: missing live-SHA check {required}")
+    if guard_script.count("urllib.request.urlopen(") != 1:
+        errors.append(f"{name}:guard: unexpected live production probe")
+    if guard_script.count("urllib.request.Request(") != 1:
+        errors.append(f"{name}:guard: unexpected live production probe")
     # Lexical regression pins on the guard script. deploy-staging runs
     # execute (TOG-12856), so every production SHA needs a staging deploy
     # run on that SHA that concluded `success` (a `skipped` run does not
@@ -1020,7 +1111,7 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:schema-gate: must keep contents:read only")
     if "if" in gate:
-        errors.append(f"{name}:schema-gate: a job condition would let drift deploy silently")
+        errors.append(f"{name}:schema-gate: a job condition would bypass the stage gate")
     if "needs" in gate:
         errors.append(f"{name}:schema-gate: must wait for nothing (it is the wait)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
@@ -1073,17 +1164,15 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
 def production_schema_gate_errors(workflow, name="deploy-production.yml"):
     """Pre-deploy production schema-drift gate: read-only plan, fail closed.
 
-    One job runs on every deploy-production dispatch after the guard (it
-    needs the guarded SHA: a dispatch SHA is an input, not github.sha),
-    through the no-reviewer `production-migrate-plan` environment, builds the
-    reviewed `staging-migrate` binary and fails the run with a `schema drift`
-    error when the guarded source is ahead of the production ledger. The
-    production job must `needs` both the guard and the gate, so drift can
-    never deploy silently. Plan-only: no migrator binding, no `--apply`, no
-    role/grant route, no wrangler, no secret indexing. Rollback and live-SHA
-    takeover redeploys serve no new schema and waive the ledger check inside
-    the reviewed script (recorded, never a job-level skip: the job carries
-    no `if:`).
+    Ordinary deploys run one post-guard job (it needs the guarded SHA: a
+    dispatch SHA is an input, not github.sha) through the no-reviewer
+    `production-migrate-plan` environment. The job builds the reviewed
+    `staging-migrate` binary and fails with `schema drift` when the guarded
+    source is ahead of the production ledger. Rollback and live-SHA takeover
+    modes explicitly skip it; the production job accepts those guard-validated
+    waivers but otherwise requires this gate to succeed. Plan-only: no
+    migrator binding, no `--apply`, no role/grant route, no wrangler, no
+    secret indexing.
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -1092,8 +1181,8 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:schema-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:schema-gate: must keep contents:read only")
-    if "if" in gate:
-        errors.append(f"{name}:schema-gate: a job condition would let drift deploy silently")
+    if gate.get("if") != "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'":
+        errors.append(f"{name}:gate: must run only for ordinary deploys")
     if gate.get("needs") != "guard":
         errors.append(f"{name}:schema-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
@@ -1242,16 +1331,14 @@ python3 scripts/ci/roles_gate.py \\
 def production_roles_gate_errors(workflow, name="deploy-production.yml"):
     """Pre-deploy production role-drift gate: read-only verify, fail closed.
 
-    One job runs on every deploy-production dispatch after the guard (it
-    needs the guarded SHA: a dispatch SHA is an input, not github.sha),
-    through the no-reviewer `production-migrate-plan` environment, builds the
-    reviewed `two-bot` binary and fails the run when `db roles verify` reports
-    any finding on a new build. The production job must `needs` the guard and
-    both gates, so drift can never deploy silently. Verify-only: no migrator
-    write binding, no `--apply`, no `roles plan` subcommand, no wrangler, no
-    secret indexing. Rollback and live-SHA takeover redeploys serve no
-    new-table grants and waive the findings check inside the reviewed script
-    (recorded, never a job-level skip: the job carries no `if:`).
+    Ordinary deploys run one post-guard job (it needs the guarded SHA: a
+    dispatch SHA is an input, not github.sha) through the no-reviewer
+    `production-migrate-plan` environment. It builds the reviewed `two-bot`
+    binary and fails when `db roles verify` reports any finding. Rollback and
+    live-SHA takeover modes explicitly skip it; the production job accepts
+    those guard-validated waivers but otherwise requires this gate to succeed.
+    Verify-only: no migrator write binding, no `--apply`, no `roles plan`
+    subcommand, no wrangler, no secret indexing.
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -1260,8 +1347,8 @@ def production_roles_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:roles-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:roles-gate: must keep contents:read only")
-    if "if" in gate:
-        errors.append(f"{name}:roles-gate: a job condition would let drift deploy silently")
+    if gate.get("if") != "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'":
+        errors.append(f"{name}:roles-gate: must run only for ordinary deploys")
     if gate.get("needs") != "guard":
         errors.append(f"{name}:roles-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("roles-gate", gate.get("runs-on")):
@@ -1397,8 +1484,146 @@ def voice_synthetic_errors(workflow):
     return errors
 
 
+def synthetic_user_flow_errors(workflow):
+    """Five-minute user-flow synthetic (docs/synthetic-user-flow.md).
+
+    Runs on a 5-minute schedule and manual dispatch, only from main, through
+    the `synthetic-alerts` environment. Two jobs: `staging` runs the reviewed
+    staging health-contract probe, `prod-passive` runs the reviewed passive
+    production probe (observe and alert only, never a deploy gate). Each job
+    has an optional target probe, a notice when its binding is absent, an
+    always() evidence upload, an always() decide step, and a gated post step.
+    The decide step reads recent run history with actions:read, alerts after
+    two failures, and writes the event to GITHUB_OUTPUT; the post step runs
+    only when an event is due so a no-op is skipped (never success), and only
+    a successful post counts as delivered. No wrangler, no deploy route, no
+    `set -x`.
+    """
+    name = "synthetic-user-flow.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent")
+    on = workflow.get("on") or {}
+    if set(on) != {"schedule", "workflow_dispatch"}:
+        errors.append(f"{name}: triggers must be exactly schedule and workflow_dispatch")
+    else:
+        schedules = on.get("schedule") or []
+        if schedules != [{"cron": "*/5 * * * *"}]:
+            errors.append(f"{name}: schedule must stay every 5 minutes")
+        dispatch = on.get("workflow_dispatch") or {}
+        inputs = (dispatch.get("inputs") or {}) if isinstance(dispatch, dict) else {}
+        if set(dispatch) != {"inputs"} or set(inputs) != {"force_fail"}:
+            errors.append(f"{name}: workflow_dispatch must carry only the force_fail input")
+        else:
+            field = inputs["force_fail"] or {}
+            if field.get("type") != "boolean" or field.get("default") not in (False, "false"):
+                errors.append(f"{name}: force_fail must be an opt-in boolean defaulting to false")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "synthetic-user-flow", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own synthetic-user-flow group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"staging", "prod-passive"}:
+        errors.append(f"{name}: jobs must be exactly staging and prod-passive")
+        return errors
+    expected_script = {"staging": "scripts/staging_health_contract_probe.py",
+                       "prod-passive": "scripts/prod_passive_probe.py"}
+    for job_id in ("staging", "prod-passive"):
+        job = jobs[job_id]
+        if job.get("environment") != "synthetic-alerts":
+            errors.append(f"{name}:{job_id}: must read only the synthetic-alerts Environment")
+        if job.get("if") != "github.ref == 'refs/heads/main'":
+            errors.append(f"{name}:{job_id}: must run only from main")
+        if job.get("permissions") != {"actions": "read", "contents": "read"}:
+            errors.append(f"{name}:{job_id}: must keep actions:read plus contents:read only")
+        if job.get("timeout-minutes") != "10":
+            errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
+        if not runner_allowed(job_id, job.get("runs-on")):
+            errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
+        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+            if key in job:
+                errors.append(f"{name}:{job_id}: must not set {key}")
+        steps = job.get("steps") or []
+        if len(steps) != 6:
+            errors.append(f"{name}:{job_id}: must run checkout, probe, notice, upload, decide and alert")
+            continue
+        checkout, probe_step, notice, upload, decide_step, alert_step = steps
+        if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+                or (checkout.get("with") or {}).get("persist-credentials") != "false":
+            errors.append(f"{name}:{job_id}: checkout must be pinned and must not persist credentials")
+        if expected_script[job_id] not in str(probe_step.get("run", "")) or "uses" in probe_step:
+            errors.append(f"{name}:{job_id}: probe step must call {expected_script[job_id]}")
+        expected_target = "STAGING_WORKER_URL" if job_id == "staging" else "PRODUCTION_WORKER_URL"
+        if probe_step.get("id") != "probe" or expected_target not in str(probe_step.get("if", "")):
+            errors.append(f"{name}:{job_id}: probe must be skipped when {expected_target} is unset")
+        expected_notice = expected_target + " is unset"
+        if expected_notice not in str(notice.get("run", "")) or "::warning::" not in str(notice.get("run", "")):
+            errors.append(f"{name}:{job_id}: missing-binding skip must emit a notice")
+        if upload.get("if") != "always()":
+            errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
+        if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
+            errors.append(f"{name}:{job_id}: must upload the run evidence artifact")
+        if decide_step.get("if") != "always()":
+            errors.append(f"{name}:{job_id}: decide step must run with if: always()")
+        if "scripts/synthetic_alert.py" not in str(decide_step.get("run", "")) \
+                or "--decide-only" not in str(decide_step.get("run", "")):
+            errors.append(f"{name}:{job_id}: decide step must call scripts/synthetic_alert.py --decide-only")
+        if decide_step.get("id") != "decide":
+            errors.append(f"{name}:{job_id}: decide step must expose id decide for the post gate")
+        if alert_step.get("if") != "${{ !cancelled() && steps.decide.outputs.event != '' }}":
+            errors.append(f"{name}:{job_id}: post step must run only when steps.decide.outputs.event != ''")
+        # Without a status function GitHub adds an implicit success() &&, so
+        # a failed probe would skip the post step and no ALERT would go out
+        # during an outage. Keep this check even if the exact pin above moves.
+        if not any(func in str(alert_step.get("if", ""))
+                   for func in ("!cancelled()", "always()", "failure()", "success()")):
+            errors.append(f"{name}:{job_id}: post step gate must carry a status function so GitHub does not add implicit success()")
+        if "scripts/synthetic_alert.py" not in str(alert_step.get("run", "")) \
+                or "--post-only" not in str(alert_step.get("run", "")):
+            errors.append(f"{name}:{job_id}: alert step must call scripts/synthetic_alert.py --post-only")
+        environment = "staging" if job_id == "staging" else "prod"
+        job_name = JOB_NAMES[environment]
+        probe_name = PROBE_STEPS[environment]
+        alert_name = ALERT_STEPS[environment]
+        decide_name = DECIDE_STEPS[environment]
+        if job.get("name") != job_name:
+            errors.append(f"{name}:{job_id}: job name must match synthetic alert history lookup")
+        if probe_step.get("name") != probe_name:
+            errors.append(f"{name}:{job_id}: probe step name must match synthetic alert history lookup")
+        if decide_step.get("name") != decide_name:
+            errors.append(f"{name}:{job_id}: decide step name must match synthetic alert history lookup")
+        if alert_step.get("name") != alert_name:
+            errors.append(f"{name}:{job_id}: alert step name must match synthetic alert history lookup")
+        decide_env = decide_step.get("env") or {}
+        if (decide_env.get("GITHUB_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
+                or decide_env.get("PROBE_OUTCOME") != "${{ steps.probe.outcome }}"
+                or "SYNTHETIC_ALERT_WEBHOOK_URL" in decide_env
+                or "secrets." in str(decide_step.get("run", ""))):
+            errors.append(f"{name}:{job_id}: decide step must pass token and outcome via env only")
+        alert_env = alert_step.get("env") or {}
+        if (alert_env.get("SYNTHETIC_ALERT_WEBHOOK_URL") != "${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}"
+                or alert_env.get("ALERT_EVENT") != "${{ steps.decide.outputs.event }}"
+                or "GITHUB_TOKEN" in alert_env
+                or "PROBE_OUTCOME" in alert_env
+                or "secrets." in str(alert_step.get("run", ""))):
+            errors.append(f"{name}:{job_id}: post step must pass webhook and decided event via env only")
+        for step in steps:
+            if step not in (decide_step, alert_step) and "secrets." in str(step):
+                errors.append(f"{name}:{job_id}: only the decide and alert steps may hold a secret")
+    text = str(jobs).lower().replace(" ", "")
+    for marker in ("wrangler", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                   "cloudflare_api_token", "ownership_control"):
+        if marker in text:
+            errors.append(f"{name}: must not contain {marker!r}")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"synthetic_alert_webhook_url", "github_token"}:
+        errors.append(f"{name}: must read only the webhook secret and read-only GitHub token")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
+    errors.extend(staging_gateway_injection_errors(workflows))
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
     if set(workflows) != set(JOB_INVENTORY):
@@ -1421,6 +1646,11 @@ def workflow_policy_errors(workflows):
             # Pinned shape above; the generic environment scan below would
             # flag its voice-synthetic Environment binding.
             errors.extend(voice_synthetic_errors(workflow))
+            continue
+        if name == "synthetic-user-flow.yml":
+            # Pinned shape above; the generic environment/marker scan below
+            # would flag its synthetic-alerts binding and probe paths.
+            errors.extend(synthetic_user_flow_errors(workflow))
             continue
         if name == "staging-rollback-drill.yml":
             # Manual drill (TOG-14008): pinned shape above; the generic
@@ -1509,7 +1739,6 @@ class WorkflowTests(unittest.TestCase):
         expected_head = "${{ github.sha }}"
         for name in (
             "Floor guard (HARD, CONSTRAINTS.md floor)",
-            "Patch coverage (WARN, 80% of added lines)",
             "Unwrap in request paths (HARD)",
             "Semgrep Rust rules (HARD)",
         ):
@@ -1519,6 +1748,248 @@ class WorkflowTests(unittest.TestCase):
                 head_key = "FLOOR_HEAD" if name.startswith("Floor guard") else "QUALITY_HEAD"
                 self.assertEqual(step["env"][base_key], expected_base)
                 self.assertEqual(step["env"][head_key], expected_head)
+
+    def test_rust_tests_timeout_leaves_headroom_for_coverage_measurement(self):
+        # The HARD patch-coverage step re-runs the suite under llvm-cov
+        # (measured 30 min of a 42m16s job; four earlier runs of this design
+        # took 36-42 min), so every event keeps 60 minutes: a slow runner
+        # reports a coverage verdict, not a job timeout.
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        # BaseLoader keeps scalars as strings; "60" is the 60-minute limit.
+        self.assertEqual(job["timeout-minutes"], "60")
+
+    def test_rust_test_container_pins_disposable_database_service_address(self):
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        prerequisites = next(
+            step for step in job["steps"]
+            if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
+        )
+        self.assertEqual(prerequisites.get("shell"), "bash")
+        run = prerequisites["run"]
+        self.assertIn("set -e", run)
+        hosts_tmp = run.index('hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"')
+        resolve = run.index("getent ahostsv4 agent-testdb")
+        remove_stale_pin = run.index("sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > \"$hosts_tmp\"")
+        self.assertNotIn("sed -i -E", run)
+        self.assertLess(hosts_tmp, remove_stale_pin)
+        copy_hosts = run.index('cat "$hosts_tmp" > /etc/hosts')
+        cleanup_hosts = run.index('rm -f "$hosts_tmp"')
+        self.assertLess(remove_stale_pin, copy_hosts)
+        self.assertLess(copy_hosts, cleanup_hosts)
+        pin = run.index("printf '%s agent-testdb\\n' \"$service_ip\" >> /etc/hosts")
+        verify_pin = run.index('getent ahostsv4 agent-testdb | awk \'NR == 1 { print $1; exit }\'')
+        forward = run.index("TCP:agent-testdb:5432")
+        ready = run.index("pg_isready -q -h 127.0.0.1")
+        self.assertIn("for attempt in $(seq 1 30)", run[:resolve])
+        self.assertLess(remove_stale_pin, resolve)
+        self.assertLess(resolve, pin)
+        self.assertLess(pin, verify_pin)
+        mismatch_check = run.index('if [ "$pinned_ip" != "$service_ip" ]; then')
+        mismatch_exit = run.index("exit 1", mismatch_check)
+        self.assertLess(verify_pin, mismatch_check)
+        self.assertLess(mismatch_exit, forward)
+        self.assertLess(verify_pin, forward)
+        self.assertLess(forward, ready)
+        self.assertIn("sleep 1", run)
+        fail_closed = run.index('if [ -z "$service_ip" ]; then')
+        self.assertLess(fail_closed, pin)
+        self.assertLess(run.index("exit 1", fail_closed), pin)
+        self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
+
+    def test_rust_test_postgres_wal_budget_is_bounded(self):
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        prepare = next(
+            step for step in job["steps"]
+            if step.get("name") == "Prepare isolated test databases"
+        )
+        verify = next(
+            step for step in job["steps"]
+            if step.get("name") == "Verify disposable Postgres defaults"
+        )
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+        self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assertIn("'min_wal_size': '64MB'", verify["run"])
+
+    def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+        )
+        expected_base = "${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}"
+        self.assertEqual(step["env"]["QUALITY_BASE"], expected_base)
+        self.assertEqual(step["env"]["QUALITY_HEAD"], "${{ github.sha }}")
+        self.assertIn("--ignore-run-fail", step["run"])
+        self.assertIn("--features two-bot-core/db", step["run"])
+        self.assertIn("--lib --bins --tests", step["run"])
+        self.assertIn(
+            "--no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs",
+            step["run"],
+        )
+        self.assertIn(
+            "--locked -- channel_moderation --include-ignored --test-threads=1",
+            step["run"],
+        )
+        self.assertIn('report_path="$GITHUB_WORKSPACE/lcov.info"', step["run"])
+        self.assertIn('[ ! -s "$report_path" ]', step["run"])
+        self.assertIn(
+            'llvm-cov report --workspace --lcov --output-path "$report_path"',
+            step["run"],
+        )
+        self.assertIn('retrying via stdout', step["run"])
+        self.assertIn(
+            'llvm-cov report --workspace --lcov > "$report_path"', step["run"]
+        )
+        self.assertNotIn("/dev/stdout", step["run"])
+        # `report` without --workspace scopes to the current (root) package
+        # only and excludes every crates/* member directory from the export;
+        # the root library is a single const with no coverable lines, so the
+        # merged report comes out empty. Every report invocation must carry
+        # --workspace; the bare form must never reappear.
+        self.assertNotIn("llvm-cov report --lcov", step["run"])
+        # Guarded suites are measured per suite with their accepted URL and
+        # merged: --no-report per run, one final report. Selected ignored runs
+        # are serial and never execute the reference-docs regen.
+        self.assertIn("--no-report", step["run"])
+        self.assertIn("llvm-cov report --workspace --lcov", step["run"])
+        # Non-ignored tests stay parallel; only the ignored sweep is serial.
+        self.assertIn("-- --ignored --test-threads=1", step["run"])
+        self.assertIn("--test-threads=1", step["run"])
+        self.assertIn("--skip regenerate_reference_docs", step["run"])
+        self.assertIn(
+            "TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test",
+            step["run"],
+        )
+        self.assertIn(
+            "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test",
+            step["run"],
+        )
+        self.assertIn("MEMBER_TESTDB=agent-testdb", step["run"])
+        for target in (
+            "channel_moderation_runtime",
+            "internal_channel_moderation",
+            "feeds_store",
+            "legacy_verify_db",
+            "staging_migrate_db",
+            "internal_events",
+            "raid_list_db",
+            "reengagement_list_db",
+            "member_moderation_db",
+        ):
+            with self.subTest(target=target):
+                self.assertIn(target, step["run"])
+        # Per-invocation pins: whole-script substring checks let one surviving
+        # occurrence mask a flag dropped from another invocation (e.g.
+        # --ignore-run-fail removed from either sweep). Join line
+        # continuations, then assert flags on each cov_run separately.
+        logical_lines = []
+        pending = ""
+        for raw_line in step["run"].splitlines():
+            stripped = raw_line.strip()
+            pending = f"{pending} {stripped}".strip() if pending else stripped
+            if stripped.endswith("\\"):
+                pending = pending[:-1].strip()
+                continue
+            logical_lines.append(pending)
+            pending = ""
+        if pending:
+            logical_lines.append(pending)
+        cov_runs = [line for line in logical_lines if line.startswith("cov_run ")]
+        # cov_run's failure annotation must go to stderr: the stdout report
+        # retry redirects cov_run's stdout into the lcov file.
+        self.assertIn(
+            'echo "::error::patch coverage measurement failed to build or report" >&2',
+            step["run"],
+        )
+        sweeps = [run for run in cov_runs if "--workspace --lib --bins --tests" in run]
+        self.assertEqual(len(sweeps), 2)
+        for sweep in sweeps:
+            with self.subTest(sweep=sweep):
+                # A failing test must never suppress coverage collection.
+                self.assertIn("--ignore-run-fail", sweep)
+                self.assertIn("--no-report", sweep)
+                self.assertIn("--features two-bot-core/db", sweep)
+                self.assertIn("--locked", sweep)
+        ignored_sweeps = [run for run in sweeps if "-- --ignored" in run]
+        self.assertEqual(len(ignored_sweeps), 1)
+        self.assertIn("--test-threads=1", ignored_sweeps[0])
+        self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
+        guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
+        self.assertEqual(len(guarded), 11)
+        for run in guarded:
+            with self.subTest(guarded=run):
+                self.assertIn("--test-threads=1", run)
+                self.assertIn("--skip regenerate_reference_docs", run)
+                self.assertIn("--locked", run)
+                # Deliberate: a guard panic in a guarded suite fails the step.
+                self.assertNotIn("--ignore-run-fail", run)
+        # needle -> carries `--features db` (core/discord suites need the db
+        # feature to build their guarded targets; cutover suites do not).
+        guarded_needles = {
+            "-- channel_moderation --include-ignored": True,
+            "--test channel_moderation_runtime": True,
+            "--test internal_channel_moderation": True,
+            "--test feeds_store": True,
+            "--test legacy_verify_db": False,
+            "--test staging_migrate_db": False,
+            "--test internal_events": True,
+            "--test raid_list_db": False,
+            "--test reengagement_list_db": False,
+            "--test game_activity_report_db": False,
+            "--test member_moderation_db": True,
+        }
+        for needle, wants_db_feature in guarded_needles.items():
+            with self.subTest(needle=needle):
+                matches = [run for run in guarded if needle in run]
+                self.assertEqual(len(matches), 1)
+                self.assertIn("--test-threads=1", matches[0])
+                if wants_db_feature:
+                    self.assertIn("--features db", matches[0])
+                else:
+                    self.assertNotIn("--features db", matches[0])
+        env_wrapped = [
+            run for run in cov_runs
+            if run.startswith('cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV"')
+        ]
+        self.assertEqual(len(env_wrapped), 1)
+        self.assertIn("--test channel_moderation_runtime", env_wrapped[0])
+        reports = [run for run in cov_runs if "llvm-cov report" in run]
+        self.assertEqual(len(reports), 2)
+        for report in reports:
+            with self.subTest(report=report):
+                self.assertIn("llvm-cov report --workspace --lcov", report)
+        self.assertEqual(
+            step["env"]["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        self.assertIn("agent-testdb", job["services"])
+        self.assertEqual(
+            step["if"],
+            "always() && !cancelled() && steps.prepare_test_databases.outcome == 'success' "
+            "&& steps.verify_disposable_postgres.outcome == 'success'",
+        )
+        test_steps = [
+            index for index, candidate in enumerate(job["steps"])
+            if "cargo test" in str(candidate.get("run", ""))
+        ]
+        self.assertTrue(test_steps)
+        self.assertGreater(job["steps"].index(step), max(test_steps))
+        self.assertEqual(
+            next(candidate for candidate in job["steps"]
+                 if candidate.get("name") == "Prepare isolated test databases")["id"],
+            "prepare_test_databases",
+        )
+        self.assertEqual(
+            next(candidate for candidate in job["steps"]
+                 if candidate.get("name") == "Verify disposable Postgres defaults")["id"],
+            "verify_disposable_postgres",
+        )
+        checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"]["fetch-depth"], "0")
 
     def test_voice_synthetic_shape_is_pinned_and_mutations_fail(self):
         import copy
@@ -1720,6 +2191,48 @@ class WorkflowTests(unittest.TestCase):
                 workflows["deploy-staging.yml"]["on"]["workflow_dispatch"] = dispatch
                 self.assertTrue(workflow_policy_errors(workflows))
 
+    def test_gateway_failure_injection_is_dispatch_only_and_never_forwarded(self):
+        workflows = self.workflows
+        self.assertEqual(staging_gateway_injection_errors(workflows), [])
+        self.assertEqual(staging_dispatch_errors(workflows["deploy-staging.yml"]), [])
+        steps = workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        armed = [s for s in steps if "INJECT_GATEWAY_FAILURE" in str(s)]
+        self.assertEqual(len(armed), 1)
+        index = steps.index(armed[0])
+        mutations = {
+            # Push could read it / default armed.
+            "expression without dispatch guard": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
+                .__setitem__("INJECT_GATEWAY_FAILURE", "${{ inputs.inject_gateway_failure }}"),
+            "expression constant true": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
+                .__setitem__("INJECT_GATEWAY_FAILURE", "true"),
+            "prepare flag unconditional": lambda w: w["jobs"]["deploy"]["steps"][index]
+                .__setitem__("run", "python3 ../scripts/staging_rollout.py prepare --inject-gateway-failure"),
+            "input defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["inject_gateway_failure"]
+                .__setitem__("default", True),
+            "input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("inject_gateway_failure"),
+            "second reader step": lambda w: w["jobs"]["deploy"]["steps"][0]
+                .setdefault("env", {}).__setitem__("INJECT_GATEWAY_FAILURE", "true"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(
+                    staging_gateway_injection_errors(changed)
+                    or staging_dispatch_errors(changed["deploy-staging.yml"]),
+                    label,
+                )
+                self.assertTrue(workflow_policy_errors(changed), label)
+        # Production (or any other workflow) mentioning the switch at all
+        # is a forwarding route, whatever the surrounding shape.
+        for name in ("deploy-production.yml", "check.yml"):
+            with self.subTest(forwarded=name):
+                changed = deepcopy(workflows)
+                job = next(iter(changed[name]["jobs"].values()))
+                job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_gateway_failure }}"
+                self.assertTrue(staging_gateway_injection_errors(changed))
+                self.assertTrue(workflow_policy_errors(changed))
+
     def test_docs_only_push_skips_staging_but_runtime_paths_deploy(self):
         # A docs-only merge to main must start no run (the soak needs a stable
         # gateway), while every runtime path still deploys. Pinned against
@@ -1821,7 +2334,9 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(mutated(lambda w, s=step: w["jobs"]["guard"]["steps"].append(s)))
         with self.subTest(guard="environment"):
             self.assertTrue(mutated(lambda w: w["jobs"]["guard"].update({"environment": "production"})))
-        for pin in ('status="success"', "deploy-staging.yml/runs", '"required_reviewers"'):
+        for pin in ('status="success"', "deploy-staging.yml/runs", '"required_reviewers"',
+                      '"User-Agent": "two-bot-next-production-rollout/1.0"',
+                      "urllib.request.Request("):
             with self.subTest(dropped=pin):
                 def drop(w, pin=pin):
                     for step in w["jobs"]["guard"]["steps"]:
@@ -1860,7 +2375,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(production["jobs"]["schema-gate"].get("needs"), "guard")
         self.assertEqual(production["jobs"]["schema-gate"].get("environment"),
                          "production-migrate-plan")
-        self.assertNotIn("if", production["jobs"]["schema-gate"])
+        self.assertEqual(production["jobs"]["schema-gate"].get("if"),
+                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'")
 
     def test_production_roles_gate_shape_is_pinned_and_mutations_fail(self):
         import copy
@@ -1903,7 +2419,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(production["jobs"]["roles-gate"].get("needs"), "guard")
         self.assertEqual(production["jobs"]["roles-gate"].get("environment"),
                          "production-migrate-plan")
-        self.assertNotIn("if", production["jobs"]["roles-gate"])
+        self.assertEqual(production["jobs"]["roles-gate"].get("if"),
+                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'")
 
     def test_staging_migrate_runner_shape_is_pinned(self):
         # TOG-11572: the slice's own workflow must satisfy its carve-out, and
@@ -2606,6 +3123,17 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             yaml.load("jobs:\n  deploy:\n    if: '${{ false }}'\n    if: true\n", Loader=UniqueKeyLoader)
 
+    def test_review_rules_stays_read_only_and_shadow(self):
+        workflow = self.workflows["review-rules.yml"]
+        self.assertEqual(set(workflow["on"]), {"pull_request", "merge_group"})
+        self.assertEqual(workflow["permissions"], {})
+        job = workflow["jobs"]["review-rules"]
+        self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertEqual(job["with"], {"packs": "rust,security,python-shell-ci", "mode": "warn"})
+        self.assertNotIn("secrets", job)
+        self.assertNotIn("environment", job)
+        self.assertEqual(job["uses"], REUSABLE_CALLS[("review-rules.yml", "review-rules")])
+
     def test_private_runner_and_service_isolation(self):
         for name, workflow in self.workflows.items():
             for job_id, job in workflow["jobs"].items():
@@ -2953,7 +3481,11 @@ class WorkflowTests(unittest.TestCase):
             for job_id, job in workflow["jobs"].items():
                 with self.subTest(workflow=name, job=job_id):
                     expected = {"contents": "read"}
-                    if (name, job_id) == ("supply-chain.yml", "pr-lint"):
+                    if (name, job_id) in (("synthetic-user-flow.yml", "staging"),
+                                          ("synthetic-user-flow.yml", "prod-passive")):
+                        # Read workflow/job history to debounce alerts and detect recovery.
+                        expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
                         # Marker-label actor audit via the issue-events API.

@@ -25,16 +25,18 @@ What it proves on the deployed staging bot (stdlib only, no third-party code):
              read-back after each write (FAIL on HTTP 403: the owner grant was
              lost after creation; SKIP on HTTP 429; the same Discord
              field `/limit` and `/unlimit` manage)
-  privacy    the room's @everyone overwrite matches the public Connect
-             baseline, the staging product bot has effective View Channel and
-             Manage Roles on the room (the `/private` overwrite precondition),
-             and no member overwrite grants Manage Roles (read-only)
+  privacy    the room's @everyone overwrite does not deny Connect (the
+             public baseline: a Connect deny is the `/private` marker), the
+             staging product bot has effective View Channel and Manage Roles
+             on the room (the `/private` overwrite precondition), and no
+             member overwrite grants Manage Roles (read-only)
   name_panel the room's name after the rename cycle renders from its template
              (not the "<display>'s room" fallback): what the `/name` panel's
              Current-name line would show
 
 The limit check exercises the channel field `/limit` and `/unlimit` write;
-privacy reads the public @everyone baseline and the staging product bot's
+privacy reads the public @everyone baseline (no Connect deny) and the
+staging product bot's
 computed View Channel and Manage Roles permission (the `/private`
 precondition, mirroring `can_edit_overwrites`), and name_panel
 reads the template-rendered name. These checks do not invoke slash commands
@@ -170,9 +172,14 @@ def privacy_facts(channel, roles, member, guild_id, product_bot_id, guild_owner_
                 if int(o.get("type", -1)) == 0 and str(o.get("id")) == str(guild_id)]
     everyone_allow = int(everyone[0].get("allow") or 0) if len(everyone) == 1 else 0
     everyone_deny = int(everyone[0].get("deny") or 0) if len(everyone) == 1 else 0
-    public_baseline = (len(everyone) <= 1
-                       and not (everyone_allow & CONNECT)
-                       and not (everyone_deny & CONNECT))
+    # Public is the absence of the private marker: `/private` denies Connect
+    # to @everyone and `/public` only removes that deny
+    # (everyone_connect_overwrite in
+    # crates/bot/src/voice_rooms/private_runtime.rs), while a new room
+    # inherits its source channel's overwrites, which commonly allow
+    # Connect explicitly. An allow therefore stays public; only a deny
+    # (or a malformed duplicate @everyone entry) breaks the baseline.
+    public_baseline = len(everyone) <= 1 and not (everyone_deny & CONNECT)
     no_member_grant = not any(
         int(o.get("type", -1)) == 1 and int(o.get("allow") or 0) & MANAGE_ROLES
         for o in overwrites)
@@ -190,6 +197,9 @@ def privacy_facts(channel, roles, member, guild_id, product_bot_id, guild_owner_
     product_role = ", ".join(product_role_names) or "no assigned staging role"
     return {
         "privacy_public_baseline": public_baseline,
+        "privacy_everyone_allow": everyone_allow,
+        "privacy_everyone_deny": everyone_deny,
+        "privacy_everyone_count": len(everyone),
         "privacy_product_bot_manage_roles": bool(product_can_edit),
         "privacy_no_member_manage_roles": no_member_grant,
         "privacy_product_bot_role": product_role,
@@ -233,7 +243,8 @@ def evaluate(obs):
     limit_restored (each write verified by read-back), limit_forbidden (FAIL
     reason: the owner Manage Channels grant was lost after creation) and
     limit_rate_limited (SKIP reason), limit_note, privacy_public_baseline,
-    privacy_product_bot_manage_roles, privacy_no_member_manage_roles,
+    privacy_everyone_allow/deny/count (the raw @everyone facts behind the
+    baseline), privacy_product_bot_manage_roles, privacy_no_member_manage_roles,
     privacy_product_bot_role (read-only privacy facts), privacy_note, panel_name
     (the room's name read after the rename cycle) and panel_note.
     """
@@ -324,7 +335,9 @@ def evaluate(obs):
     no_member_grant = obs.get("privacy_no_member_manage_roles", False)
     product_role = obs.get("privacy_product_bot_role") or "no assigned staging role"
     privacy_detail = (
-        f"@everyone public Connect baseline={'PASS' if public_baseline else 'FAIL'}; "
+        f"@everyone public Connect baseline={'PASS' if public_baseline else 'FAIL'} "
+        f"(allow={obs.get('privacy_everyone_allow')} deny={obs.get('privacy_everyone_deny')} "
+        f"entries={obs.get('privacy_everyone_count')}); "
         f"product bot staging role {product_role!r} effective View Channel|Manage Roles="
         f"{'PASS' if product_manage_roles else 'FAIL'}; "
         f"member overwrites grant Manage Roles={'no' if no_member_grant else 'yes'}"

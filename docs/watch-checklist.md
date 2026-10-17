@@ -22,7 +22,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 
 | Alert | Fires when | Reads from | Runbook |
 |---|---|---|---|
-| `container_unready_alert` | keepalive `/readyz` probes fail 10 consecutive samples (≈10 min at default 60 s cadence) | Worker logs (structured JSON event) | [container-readiness.md](container-readiness.md#responding-to-an-alert) |
+| `container_unready_alert` | keepalive `/readyz` probes fail 2 consecutive samples (≈2 min at default 60 s cadence) | Worker logs (structured JSON event) | [container-readiness.md](container-readiness.md#responding-to-an-alert) |
 | `container_unready_recovery` | first ready sample after an alert | Worker logs | same as above |
 | `container_keepalive_arm_failed` | keepalive schedule lookup/insert fails (monitoring outage, not a readiness sample) | Worker logs | [container-readiness.md](container-readiness.md) |
 | `container_unready_webhook_failed` | alert/recovery webhook POST failed or timed out (type + HTTP status only) | Worker logs | [container-readiness.md](container-readiness.md) |
@@ -43,6 +43,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `gateway_checkpoint_failures` | any increase of `two_bot_gateway_checkpoint_failures_total` summed over every `stage` between samples (first sample is baseline-only; the 75 s runtime linger leaves ~3 s margin over a 60 s tick plus two 6 s probes for a pre-exit scrape) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-checkpoint-failures) |
 | `voice_join_fast_burn` | **page**: genuine creator joins burn the 99.5% move-within-5s budget faster than 14.4x in both the 1 h and 5 min windows (each needs at least 10 joins and two bad moves; incomplete startup/restart windows stay inactive) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-join-fast-burn) |
 | `voice_join_slow_burn` | **ticket**: genuine creator joins burn the 99.5% move-within-5s budget faster than 6x in both the 6 h and 30 min windows (each uses the same volume and bad-move floors) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-join-slow-burn) |
+| `voice_creator_map_stale` | creator-map age past 600 s (two missed 5 min refreshes) after at least one merge; generation 0 never fires, older containers without the gauges hold state | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-creator-map-stale) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via
@@ -125,7 +126,7 @@ provisioner and records the receipt on the execution card:
   `wrangler.toml`, a PR or a log); forwarding must also be on.
 - [ ] Scrape token provisioned as the production Worker secret backing
   `GET /ops/metrics`; an off-container scrape returns exposition.
-- [ ] Readiness threshold confirmed: default (≈10 min) or the
+- [ ] Readiness threshold confirmed: default (≈2 min) or the
   per-environment override value.
 - [ ] No `container_keepalive_arm_failed` in recent Worker logs
   (the loop is actually armed).

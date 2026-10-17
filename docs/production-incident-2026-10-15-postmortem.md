@@ -112,8 +112,9 @@ prior good SHA has no production drill record").
 
 Pre-dispatch step: before any rollback dispatch, derive `sha` from the
 target Worker version's recorded build SHA (the version Summary/metadata,
-not the incident commit), and confirm a successful `deploy-staging` run
-exists on it. Do not re-dispatch with a guessed or incident-commit SHA.
+not the incident commit), and derive `image` from the pre-deploy rollback
+snapshot in the failed run's summary. The current guard waives staging history
+for rollback; do not re-dispatch with a guessed SHA or image.
 
 ## Rollback receipts (quoted, not re-executed)
 
@@ -133,12 +134,13 @@ That dispatch is the single sanctioned production rollback method
 version's recorded build SHA first (pre-dispatch step above), then dispatch
 `deploy-production` with `sha` set to the commit the previous version was
 built from, `rollback` set to the previous Worker version ID from the failed
-run's summary, and `takeover: true`. Inside the workflow that becomes
-`wrangler rollback <version-id> --message <sha> --yes`, which fails unless
-the target version serves 100% of traffic, followed by the same
-`/health` 200 + build-identity `/readyz` gate. When the Rust image itself is
-the fault, dispatch in deploy mode with `takeover: true` and the prior good
-SHA instead.
+run's summary, `image` set to the previous container image digest from the
+rollback snapshot, and `takeover: true`. The reviewed
+`worker_container_rollback.py rollback` step restores both the Worker version
+and container image, then runs the `/health` 200 + build-identity `/readyz`
+stability gate; the workflow does not use `wrangler rollback`. When the Rust
+image itself is the fault, dispatch in deploy mode with `takeover: true` and
+the prior good SHA instead.
 
 Successful host rollback (Cloudflare API, outside the workflow): Worker
 version `952618ab` + container image `sha256:bfe1038e`

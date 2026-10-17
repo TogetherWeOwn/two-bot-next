@@ -20,7 +20,8 @@ No Gatus or third-party monitor is used.
 - **Readiness:** `/health` indicates the HTTP process responds;
   `/readyz` reports process, gateway, database, token-invalid state and build
   identity. A 503 includes the bounded readiness breakdown. `gateway_failure`
-  is a fixed-vocabulary phase/class, not an SQL error message or SQLSTATE.
+  carries the fixed-vocabulary phase/class plus the failing step and the
+  SQLSTATE code (`failed_step`/`error_code`), never an SQL error message.
 - **Metrics and alerts:** the Container exposes `/metrics` internally. The DO
   scrapes it on keepalive ticks, evaluates the rules in
   [`wrangler/src/alert-rules.ts`](../wrangler/src/alert-rules.ts), persists
@@ -70,24 +71,30 @@ No Gatus or third-party monitor is used.
 
 `gateway_checkpoint_failures` fires on an increase in the checkpoint-failure
 counter between metric samples. `gateway_unpaired_disconnect` detects a
-sustained disconnect without RESUMED or fresh READY. Read the class and failed
-step from the Container's structured `gateway_failed` log line, which carries
-`failed_step` and the sanitized `error_code`. The Worker separately writes a
-`container_gateway_failure` event with the phase, class, `release`, and
-`worker_version`. The `/readyz`
-`gateway_failure` field also exposes phase and class only. SQL errors are never
-emitted verbatim. A PostgreSQL SQLSTATE code appears only when the producer
-explicitly extracts it; do not infer one from a generic `database` class. A
-missing grant (`42501`) or missing table (`42P01`) is a deployment/schema/ACL
-issue for the authorized Operator,
+sustained disconnect without RESUMED or fresh READY. `rest_5xx_rate` fires when
+Discord 5xx responses exceed 10% of REST requests in a window. Read the class
+and failed step from the Container's structured `gateway_failed` log line,
+which carries `failed_step` and the sanitized `error_code`. The Worker re-emits
+the same phase, class, failed step and SQLSTATE code in its
+`container_gateway_failure` event plus the `release`/`worker_version` tags, and
+`/readyz` serves the step plus the code in
+`gateway_failure.failed_step`/`error_code` alongside the phase/class. SQL
+errors are never emitted verbatim. A PostgreSQL SQLSTATE code appears only when
+the producer explicitly extracts it; do not infer one from a generic
+`database` class. A missing grant (`42501`) or missing table (`42P01`) is a
+deployment/schema/ACL issue for the authorized Operator,
 not something to repair with a production query or restart.
 
+Every alert message and alert log line carries the container build revision and
+a log-query link; a crash-loop or unhandled exception surfaces as a sustained
+`/readyz` red, which alerts after the readiness threshold below.
+
 If `/readyz` remains red, the Worker/DO readiness transition alerts after its
-configured consecutive-failure threshold (default approximately ten minutes
-at the 60-second keepalive cadence). This is not a two-minute guarantee. A
-missing/invalid metrics scrape preserves existing firing state and does not
-count as recovery. See the detailed rule definitions and their alert-response
-sections in [the operations runbook](runbook.md#metrics-alerts) and
+configured consecutive-failure threshold (default approximately two minutes
+at the 60-second keepalive cadence). A missing/invalid metrics scrape preserves
+existing firing state and does not count as recovery. See the detailed rule
+definitions and their alert-response sections in
+[the operations runbook](runbook.md#metrics-alerts) and
 [metrics reference](metrics.md#off-container-scrape-and-alert-rules).
 
 ## Request-id correlation
@@ -148,14 +155,20 @@ claim them as shipped acceptance:
   Worker/DO activity via the procedure above.
 - Release-tagged error grouping is provided by Workers Logs, not an external
   error-tracking service. Every `container_gateway_failure` and `metrics_alert`
-  line carries `release` (the container git SHA) and `worker_version`. Filter a
-  deploy window by `release`; group gateway failures by `class` and metrics
-  alerts by the alert rule in `content`. A last error class is available only
-  when metrics-alert `content` includes a validated one. Traces remain disabled
-  to avoid recording credential-bearing URLs.
-- This repository's synthetic workflow is staging-oriented. Do not describe it
-  as a passive five-minute production user-flow check unless the production
-  schedule and alert delivery have been independently verified.
+  line carries `release` (the container git SHA) and `worker_version` plus the
+  `failed_step`/`error_code`/`build_revision`/`log_url` detail. Filter a deploy
+  window by `release`; group gateway failures by `class` and metrics alerts by
+  the alert rule in `content`. A last error class is available only when
+  metrics-alert `content` includes a validated one. Production Workers Logs are
+  enabled unsampled; traces remain disabled to avoid recording
+  credential-bearing URLs.
+- The five-minute user-flow synthetic (`synthetic-user-flow` workflow, see
+  [synthetic-user-flow](synthetic-user-flow.md)) defines staging and passive
+  production probes, with one alert after two consecutive failures and one
+  recovery message per incident. Production remains read-only and never blocks
+  a deploy. The workflow's `force_fail` input exercises staging only; do not
+  claim live schedule or alert delivery until the operator bindings and matching
+  run/artifact evidence have been independently verified.
 - Error-rate detection is installed: `rest_5xx_rate` pages when 5xx exceed 10%
   of Discord REST requests between keepalive samples (minimum 10 requests),
   with the rollback evaluation in [Alert: REST 5xx](runbook.md#alert-rest-5xx).

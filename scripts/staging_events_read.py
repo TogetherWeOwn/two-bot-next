@@ -219,7 +219,7 @@ def database_target(env):
         raise Refused("refusing: the database login query is malformed")
     for key, value in params:
         if key not in URL_PARAMS:
-            raise Refused(f"refusing: the database login may not set {key}")
+            raise Refused("refusing: the database login may not set that query parameter")
         allowed = URL_PARAMS[key]
         if (allowed is not None and value not in allowed) or (allowed is None and not value.isdigit()):
             raise Refused(f"refusing: the database login has a bad {key}")

@@ -20,15 +20,17 @@ test("alert input dimensions match the Rust always-emitted scrape contract", () 
   assert.ok(parseAlertScrape(valid));
 });
 
+const isOptionalLine = (line: string) => Object.hasOwn(ALERT_OPTIONAL_INPUT_LABELS, line.split(/[{ ]/)[0]!);
+
 test("every current required label combination is required, not merely one row per family", () => {
-  const lines = metricsLines().filter((line) => !line.startsWith("two_bot_job_last_error_class"));
+  const lines = metricsLines().filter((line) => !isOptionalLine(line));
   for (let i = 0; i < lines.length; i++) {
     assert.equal(parseAlertScrape(lines.filter((_, j) => j !== i).join("\n")), null, lines[i]);
   }
 });
 
-test("older exposition without the optional error-class gauge still parses", () => {
-  const older = metricsBody(3).split("\n").filter((line) => !line.startsWith("two_bot_job_last_error_class")).join("\n");
+test("older exposition without the optional gauges still parses", () => {
+  const older = metricsBody(3).split("\n").filter((line) => !isOptionalLine(line)).join("\n");
   const samples = parseAlertScrape(older);
   assert.ok(samples);
   assert.equal(samples.find((s) => s.name === "two_bot_job_consecutive_failures" && s.labels.job === "rank")?.value, 3);

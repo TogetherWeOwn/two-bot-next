@@ -17,8 +17,13 @@ since Environment settings can drift.
    reviewers, only a branch policy. Add a required reviewer before any
    rollback or live-SHA cure: the guard refuses staging-history waivers
    without human reviewers even with `PRODUCTION_AUTO_APPROVE=true`.
-2. The `PRODUCTION_WORKER_URL` variable holds the production Worker's
-   `https://` URL. It must differ from `STAGING_WORKER_URL`. The deploy job
+2. The repository-level `PRODUCTION_WORKER_URL` variable holds the production
+   Worker's `https://` URL. It must differ from `STAGING_WORKER_URL`. Keep this
+   as the single source for both deploy and passive synthetic checks: remove any
+   production-Environment override of the same name. Repository scope is
+   required: the `sha guard` job reads it for the live-SHA probe and names no
+   Environment, so an Environment-scoped value alone is invisible to the guard
+   and every `allow_unstaged` dispatch refuses before probing. The deploy job
    refuses when it is unset, not an `https://` URL, or equal to staging.
 3. Optionally add production-scoped `CLOUDFLARE_API_TOKEN` /
    `CLOUDFLARE_ACCOUNT_ID` secrets. Environment secrets override the
@@ -149,11 +154,13 @@ production drill record.
 
 A deploy stamps its image the way `deploy-staging` does. The rendered Wrangler
 config sets `image_vars` on the production container: `BOT_BUILD_REVISION` is
-the guarded 40-hex SHA, and `BOT_BUILD_ID` is `<run id>-<run attempt>`. Wrangler
-passes both to `docker build` as build arguments, the Rust binary compiles them
-in, and `/readyz` reports them as `build_revision` and `build_id`. Neither value
-is secret. The SHA comes from the guard, not `GITHUB_SHA`: a dispatch runs on
-the head of `main`, which can be newer than the commit being deployed.
+the guarded 40-character lowercase hexadecimal SHA, and `BOT_BUILD_ID` is
+`<run id>-<run attempt>`: exactly two non-empty decimal components, each at most
+20 digits and 64 characters total. Wrangler passes both to `docker build` as
+build arguments, the Rust binary compiles them in, and `/readyz` reports them as
+`build_revision` and `build_id`. Neither value is secret. The SHA comes from the
+guard, not `GITHUB_SHA`: a dispatch runs on the head of `main`, which can be
+newer than the commit being deployed.
 
 Production renders its own config instead of calling `staging_rollout.py
 prepare`. That path also snapshots the staging Cloudflare application and
@@ -273,9 +280,11 @@ signal.
 new secret surface. `PRODUCTION_OWNERSHIP_CONTROL_TOKEN` (Environment
 secret, ≥32 chars; provisioning/rotation is a separate governed step, never
 part of takeover) is read only inside the `production`-gated job and never
-forwarded into the container. `PRODUCTION_WORKER_URL` (Environment variable,
-non-secret) must be `https://` and differ from `STAGING_WORKER_URL`; the job
-and the client both refuse otherwise, and the client never follows redirects.
+forwarded into the container. `PRODUCTION_WORKER_URL` (repository-level
+non-secret variable — see item 2 above for why the guard needs it at
+repository scope) must be `https://` and differ from `STAGING_WORKER_URL`; the
+job and the client both refuse otherwise, and the client never follows
+redirects.
 Receipts, logs and cards name only bindings, version IDs and fixed refusal
 words — never secret values.
 

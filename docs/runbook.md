@@ -146,10 +146,10 @@ Look for these literal messages:
 - `gateway shard loop started` / `gateway reconnect failed; Twilight will retry`.
 - `durable gateway failed; checkpoint unchanged, readiness unavailable` — fatal
   initialization failure; underlying SQL error deliberately not logged. Its
-  `error_class` is also on `/readyz` as `gateway_failure` for 15 s before exit
-  (startup failures linger 15 s; only a running-gateway failure lingers 75 s)
-  and in Workers Logs as `container_gateway_failure` (see
-  [startup-diagnostics.md](startup-diagnostics.md)).
+  `error_class` plus the failing step and SQLSTATE code are also on `/readyz`
+  as `gateway_failure` for 15 s before exit (startup failures linger 15 s;
+  only a running-gateway failure lingers 75 s) and in Workers Logs as
+  `container_gateway_failure` (see [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
 - Worker: `two-bot container started|stopped`, `two-bot /readyz unhealthy`,
   `two-bot keepalive probe failed`, `two-bot container error`.
@@ -454,6 +454,30 @@ Same signals, same first response, same escalation, lower urgency. Do not
 close it as "fast burn resolved": the fast window can clear while the slow
 grind continues.
 
+#### Alert: voice creator-map stale
+
+The voice actor re-merges the creator map from the store every 5 minutes;
+`two_bot_voice_creator_map_age_seconds` counts from the last *successful*
+merge (a failed read never resets it, and the stall watchdog keeps it
+climbing while the actor is hung). This alert fires when the age passes two
+refresh intervals (600 s) with `two_bot_voice_creator_map_generation` above
+0, meaning merges stopped landing and creator joins are served from a stale
+map: new or changed creators are invisible (`unknown_creator` refusals) and
+removed creators keep working. Generation 0 (no merge yet: boot, or voice
+parked) never fires, and a container old enough to lack the gauges holds the
+previous state instead of resolving it.
+
+First response: confirm via the authorized `/ops/metrics` scrape that the
+generation is flat while the age climbs, then look for the cause one layer
+down — store read failures (`db_errors`, pool saturation) or a halted actor
+(`two_bot_voice_worker_halted`). Read the container logs for
+`voice_join_received` refusal lines: a rising `unknown_creator` share with a
+flat generation is this alert becoming member-visible.
+
+Escalate when the store cause is not self-clearing, when `unknown_creator`
+refusals dominate, or when the flat generation survives a restart — the fix
+belongs to the on-call engineer, not another redeploy.
+
 #### Alert: gateway missed events
 
 `two_bot_gateway_missed_events_total` increased between two keepalive
@@ -599,14 +623,16 @@ First response: if the failing process is still up (within the linger), read
 the `stage` label on `two_bot_gateway_checkpoint_failures_total` via the
 authorized `/ops/metrics` scrape — `pre_commit` means the commit was skipped
 after a funnel, leveling or acknowledgement failure, while `commit` means the
-durable store write itself failed. Once the process has restarted, the stage
-is not recoverable: the counter resets to zero and the Worker log line
-(`{"event":"container_gateway_failure","phase":…,"class":…,"release":…,"worker_version":…}`)
-carries `phase` and `class` plus the `release`/`worker_version` tags — both
-stages map to `gateway_runtime_failed` — never the `stage`. Do not wait for the stage then; check the `gateway` component on
-`/readyz` and the Neon status for the staging branch instead: a `commit`
-failure next to DB-error or pool alerts points at the database, not the
-gateway. Do not restart manually: the process exits on its own after
+durable store write itself failed. The Worker log line
+(`container_gateway_failure`) and `/readyz` `gateway_failure` carry the phase,
+class, failing step and SQLSTATE code plus the `release`/`worker_version` tags
+— both checkpoint stages map to `gateway_runtime_failed` — but never the
+checkpoint `stage`. Once the process has restarted, the stage is not
+recoverable: the counter resets to zero. Do not wait for the stage then; check
+the `gateway` component on `/readyz` and the Neon status for the staging branch
+instead: a `commit` failure next to DB-error or pool alerts points at the
+database, not the gateway. Do not restart manually: the process exits on its own
+after
 the linger and the supervisor restarts from the committed checkpoint — verify
 the replacement is healthy per the
 [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).

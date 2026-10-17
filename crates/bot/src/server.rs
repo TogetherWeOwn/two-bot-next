@@ -17,6 +17,31 @@ use two_bot_core::{ComponentStatus, HealthReport};
 use crate::gateway::GatewayState;
 use crate::gateway_failure::{FailureSlot, GatewayFailure};
 
+/// Staging rollback-drill injection (docs/staging-rollout-gate.md): when
+/// active, readiness reports the gateway `down` through the real `/readyz`
+/// computation so the deploy gate fails and auto-rolls back. It activates
+/// only under both exact values below — the deployment-environment marker
+/// the Worker carries only in its staging vars, and the injection switch
+/// that reaches the container only from a generated staging deploy config.
+/// Every other combination (unset, `production`, a typo, a truthy spelling
+/// other than `1`) is off, so production refuses it by construction.
+pub const DEPLOY_ENV_VAR: &str = "TWO_DEPLOY_ENV";
+pub const GATEWAY_FAIL_INJECTION_VAR: &str = "TWO_GATEWAY_READINESS_FAIL_INJECTION";
+
+/// Pure fence: staging marker exactly `staging` AND injection exactly `1`.
+#[must_use]
+pub fn gateway_failure_injection_active(deploy_env: Option<&str>, injection: Option<&str>) -> bool {
+    deploy_env == Some("staging") && injection == Some("1")
+}
+
+/// The fence read once from the process environment at boot.
+#[must_use]
+pub fn gateway_failure_injection_from_env() -> bool {
+    let deploy_env = std::env::var(DEPLOY_ENV_VAR).ok();
+    let injection = std::env::var(GATEWAY_FAIL_INJECTION_VAR).ok();
+    gateway_failure_injection_active(deploy_env.as_deref(), injection.as_deref())
+}
+
 /// Readiness reflects the live database, not only successful boot.
 #[derive(Clone)]
 pub struct SharedState {
@@ -31,6 +56,11 @@ pub struct SharedState {
     /// layer — so the handler stays a `State + Request` pair like the
     /// receiver's `handle`.
     pub backfill_ring: crate::ops_backfill::SharedRing,
+    /// Resolved staging-drill injection (see
+    /// [`gateway_failure_injection_active`]); false unless production wiring
+    /// attaches the fenced env read. The gateway itself keeps running —
+    /// only readiness reports it down, which is what the deploy gate reads.
+    pub gateway_fail_injected: bool,
 }
 
 impl SharedState {
@@ -40,12 +70,21 @@ impl SharedState {
             database,
             failure: FailureSlot::default(),
             backfill_ring: crate::ops_backfill::SharedRing::empty(),
+            gateway_fail_injected: false,
         }
     }
 
     /// Attach the backfill verifier without disturbing the other fields.
     pub fn with_backfill_ring(mut self, ring: crate::ops_backfill::SharedRing) -> Self {
         self.backfill_ring = ring;
+        self
+    }
+
+    /// Attach the resolved drill-injection fence without disturbing the
+    /// other fields. Callers pass [`gateway_failure_injection_from_env`],
+    /// never a raw env value, so the staging marker cannot be skipped.
+    pub fn with_gateway_fail_injection(mut self, active: bool) -> Self {
+        self.gateway_fail_injected = active;
         self
     }
 }
@@ -186,8 +225,9 @@ pub(crate) struct ReadinessReport {
     pub(crate) health: HealthReport,
     // Informational component: not included in HealthReport::ready().
     pub(crate) jobs: std::collections::BTreeMap<String, crate::jobs::JobStatus>,
-    /// Fixed-vocabulary phase/class of the last gateway task failure; absent
-    /// while none has happened. Never carries error text.
+    /// Fixed-vocabulary phase/class plus the failing step and SQLSTATE code of
+    /// the last gateway task failure; absent while none has happened. Never
+    /// carries error text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) gateway_failure: Option<GatewayFailure>,
     pub(crate) build_revision: &'static str,
@@ -215,6 +255,7 @@ pub(crate) async fn readiness(
         }
     })
     .await;
+    let (code, health) = with_injected_gateway_failure(code, health, state.gateway_fail_injected);
     let (code, health) = with_token_state(code, health, token_invalid);
     (
         code,
@@ -237,6 +278,27 @@ async fn readyz(
 ) -> (StatusCode, Json<ReadinessReport>) {
     let (code, report) = readiness(&state, &jobs, guard.snapshot().token_invalid).await;
     (code, Json(report))
+}
+
+/// The staging drill injection reports the real `gateway` component down:
+/// same component name and status vocabulary as a parked shard, so the
+/// deploy gate sees exactly the not-ready shape it already rolls back on.
+/// Off (the default everywhere but a fenced staging drill deploy) the
+/// report is returned untouched.
+fn with_injected_gateway_failure(
+    code: StatusCode,
+    mut health: HealthReport,
+    injected: bool,
+) -> (StatusCode, HealthReport) {
+    if !injected {
+        return (code, health);
+    }
+    for (name, status) in &mut health.components {
+        if name == "gateway" {
+            *status = ComponentStatus::Down;
+        }
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, health)
 }
 
 /// A rejected bot token is fatal: surface it as its own readiness component.
@@ -811,13 +873,15 @@ mod tests {
         };
         assert!(fetch(shared.clone()).await.get("gateway_failure").is_none());
         for class in FailureClass::ALL {
-            shared
-                .failure
-                .record(GatewayFailure::durable_gateway(class));
+            shared.failure.record(GatewayFailure::durable_gateway(
+                class,
+                "checkpoint_load",
+                "42P01",
+            ));
             let json = fetch(shared.clone()).await;
             assert_eq!(
                 json["gateway_failure"],
-                serde_json::json!({"phase": "durable_gateway", "class": class.as_str()})
+                serde_json::json!({"phase": "durable_gateway", "class": class.as_str(), "failed_step": "checkpoint_load", "error_code": "42P01"})
             );
             // The component breakdown is untouched by the new field.
             assert_eq!(
@@ -849,6 +913,77 @@ mod tests {
             assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
             assert!(!report.0.ready());
         }
+    }
+
+    #[test]
+    fn gateway_failure_injection_fence_needs_staging_marker_and_exact_one() {
+        // Off by default and on every production-shaped combination; the
+        // only active row is the staging marker with the exact switch.
+        for (deploy_env, injection, active) in [
+            (None, None, false),
+            (Some("staging"), None, false),
+            (None, Some("1"), false),
+            (Some("production"), Some("1"), false),
+            (Some("Staging"), Some("1"), false),
+            (Some("staging "), Some("1"), false),
+            (Some(""), Some("1"), false),
+            (Some("staging"), Some("0"), false),
+            (Some("staging"), Some("true"), false),
+            (Some("staging"), Some(""), false),
+            (Some("staging"), Some("1 "), false),
+            (Some("staging"), Some("1"), true),
+        ] {
+            assert_eq!(
+                gateway_failure_injection_active(deploy_env, injection),
+                active,
+                "deploy_env={deploy_env:?} injection={injection:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_gateway_failure_reports_gateway_down_through_readyz() {
+        let fetch = |shared: SharedState| async move {
+            let response = router(shared)
+                .oneshot(
+                    Request::builder()
+                        .uri("/readyz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let bytes = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        // Connected + no injection (the default `new`): gateway ready. The
+        // offline fixture has no database, so both fetches stay 503; only
+        // the gateway component may move.
+        let plain = fetch(state(GatewayState::Connected)).await;
+        assert_eq!(
+            plain["components"][1],
+            serde_json::json!(["gateway", "ready"])
+        );
+        let injected =
+            fetch(state(GatewayState::Connected).with_gateway_fail_injection(true)).await;
+        assert_eq!(
+            injected["components"][1],
+            serde_json::json!(["gateway", "down"])
+        );
+        // Liveness is not readiness: /health stays 200 while injected.
+        let response = router(state(GatewayState::Connected).with_gateway_fail_injection(true))
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -70,6 +70,26 @@ class PinsFromUrlTests(unittest.TestCase):
                 with self.assertRaises(Refused):
                     pins_from_url(bad)
 
+    def test_malformed_port_is_a_fixed_refusal_that_never_echoes_input(self):
+        for port in ("notaportSENTINEL", "99999", "-1"):
+            url = f"postgresql://two_bot_migrator_ro:pwSENTINEL@{PROD_HOST}:{port}/{PROD_DB}"
+            with self.subTest(port=port):
+                with self.assertRaises(Refused) as caught:
+                    pins_from_url(url)
+                message = str(caught.exception)
+                self.assertEqual(message, "plan database binding is not a valid database URL")
+                self.assertNotIn("SENTINEL", message)
+                self.assertNotIn(port, message)
+                self.assertNotIn("\n", message)
+
+    def test_absent_and_direct_ports_keep_parsing(self):
+        for suffix in ("", ":5432"):
+            with self.subTest(suffix=suffix):
+                host, database, branch = pins_from_url(
+                    f"postgresql://two_bot_migrator_ro:pw@{PROD_HOST}{suffix}/{PROD_DB}"
+                )
+                self.assertEqual((host, database, branch), (PROD_HOST, PROD_DB, ""))
+
 
 class VerifyBindingTests(unittest.TestCase):
     """The binding is compared with independently pinned vars, never itself."""
@@ -184,6 +204,14 @@ class RunGateArgvTests(unittest.TestCase):
         argv = self.capture_argv(PROD_URL, PROD_HOST, PROD_DB, "")
         self.assertEqual(self.flag_value(argv, "--production-branch-id"), "")
 
+    def test_malformed_port_refuses_before_the_plan_subprocess(self):
+        bad = f"postgresql://two_bot_migrator_ro:pwSENTINEL@{PROD_HOST}:notaportSENTINEL/{PROD_DB}"
+        with mock.patch.object(production_schema_gate.subprocess, "run") as run_spy:
+            with self.assertRaises(Refused) as caught:
+                run_gate("bin", SHA, bad, PROD_HOST, PROD_DB, "")
+        run_spy.assert_not_called()
+        self.assertNotIn("SENTINEL", str(caught.exception))
+
 
 class WaiveReasonTests(unittest.TestCase):
     def test_rollback_waives(self):
@@ -290,6 +318,20 @@ class MainTests(unittest.TestCase):
             with self.assertRaises(Refused):
                 self.run_main(["--binary", "bin", "--source-sha", SHA,
                                "--mode", "deploy"], refuse, out)
+
+    def test_malformed_port_writes_no_manifest(self):
+        bad = f"postgresql://two_bot_migrator_ro:pwSENTINEL@{PROD_HOST}:99999/{PROD_DB}"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "manifest.json"
+            with mock.patch.object(production_schema_gate.subprocess, "run") as run_spy:
+                with self.assertRaises(Refused) as caught:
+                    main(["--binary", "bin", "--source-sha", SHA,
+                          "--mode", "deploy", "--manifest-out", str(out)],
+                         env=env(url=bad))
+            run_spy.assert_not_called()
+            self.assertFalse(out.exists())
+            self.assertNotIn("SENTINEL", str(caught.exception))
+            self.assertNotIn("99999", str(caught.exception))
 
     def test_short_sha_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

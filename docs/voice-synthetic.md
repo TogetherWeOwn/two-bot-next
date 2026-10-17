@@ -21,7 +21,7 @@ creator) and asserts:
 | delete | after the test bot leaves, every room it was moved into (the first room and the rejoin room) is deleted within the empty grace |
 | rename | the creator is renamed before the join and restored after; the post-rename join must still move the test bot into a new room (SKIP while the test bot may not rename — see below) |
 | limit | the room's `user_limit` PATCHes to a probed value and back, each write verified by read-back (FAIL on 403, SKIP on 429) |
-| privacy | read-only checks confirm the room's @everyone Connect overwrite matches the public baseline, the staging product bot has effective View Channel and Manage Roles (the `/private` overwrite precondition), and no member overwrite grants Manage Roles (FAIL on any mismatch or read error) |
+| privacy | read-only checks confirm the room's @everyone overwrite does not deny Connect (the public baseline: a Connect deny is the `/private` marker; an inherited Connect allow stays public), the staging product bot has effective View Channel and Manage Roles (the `/private` overwrite precondition), and no member overwrite grants Manage Roles (FAIL on any mismatch or read error) |
 | name_panel | the room's name after the rename cycle still renders from its template, not the fallback (what the `/name` panel's Current-name line shows) |
 | metrics | optional: `two_bot_voice_names_total{outcome="created_with_template"}` grows (SKIP without a metrics token) |
 
