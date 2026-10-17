@@ -168,6 +168,11 @@ async fn run_job(
     let mut last_run_tick: Option<Instant> = None;
     let mut active: Option<JoinHandle<Result<(), ErrorClass>>> = None;
     let mut completed_at = None;
+    // A live-cadence decrease that becomes due while an action runs cannot
+    // fire immediately (no overlap): remember one pending prompt run and
+    // re-arm it when the action completes, instead of deferring by a full
+    // new cadence. A single flag is enough because Skip collapses bursts.
+    let mut pending_live_run = false;
     loop {
         tokio::select! {
             biased;
@@ -175,6 +180,10 @@ async fn run_job(
             result = async { active.as_mut().expect("guarded active task").await }, if active.is_some() => {
                 active = None;
                 completed_at = Some(Instant::now());
+                if pending_live_run {
+                    pending_live_run = false;
+                    interval = cadence_interval(Instant::now(), cadence);
+                }
                 record_completion(job.name, &status, metrics, result.unwrap_or(Err(ErrorClass::Panic))).await;
             }
             deadline = interval.tick() => {
@@ -230,11 +239,14 @@ async fn run_job(
                 // their last actual run would still refuse); Skip collapses
                 // any further missed slots, so the job never bursts.
                 if let Some(next) = refreshed_cadence(&job.cadence_source, &mut cadence) {
-                    let first = last_run_tick.map_or(first_deadline, |tick| {
+                    let now = Instant::now();
+                    let (first, prompt) = last_run_tick.map_or((first_deadline, false), |tick| {
                         let due = tick + next;
-                        let now = Instant::now();
-                        if due <= now { now } else { due }
+                        if due <= now { (now, true) } else { (due, false) }
                     });
+                    // An idle prompt fires through the reset interval itself;
+                    // only an active slot needs a remembered run for later.
+                    pending_live_run = prompt && active.is_some();
                     interval = cadence_interval(first, next);
                 }
             }

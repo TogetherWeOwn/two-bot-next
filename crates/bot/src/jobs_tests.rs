@@ -604,6 +604,69 @@ async fn dynamic_cadence_decrease_past_due_runs_once_promptly() {
     task.await.unwrap();
 }
 
+/// A decrease that becomes due while the action still runs is remembered and
+/// fires promptly when the action completes, instead of waiting a full new
+/// cadence. No overlap: the prompt run starts only after completion, and no
+/// burst follows.
+#[tokio::test(start_paused = true)]
+async fn dynamic_cadence_prompt_during_active_runs_after_completion() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let cadence_secs = Arc::new(AtomicU64::new(3600));
+    let status = statuses(&["dynamic"], false);
+    let (stop, rx) = watch::channel(false);
+    // NOTE: the dynamic fixture times out actions at 30 s, so the long action
+    // must stay under that (25 s) to remain active across the change.
+    let task = tokio::spawn(supervise(
+        vec![dynamic_job(
+            "dynamic",
+            counting(&count, Duration::from_secs(25)),
+            &cadence_secs,
+        )],
+        status,
+        rx,
+    ));
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 1, "first run at t=0");
+
+    // The 25 s action still holds the slot at t=15; dropping to 10 s makes
+    // last-run (t=0) + 10 s already past, so the recheck creates a prompt
+    // tick that must not be lost to the active-action guard.
+    tokio::time::advance(Duration::from_secs(15)).await;
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 1, "action still running");
+    cadence_secs.store(10, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    settle().await;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "prompt tick waits for the active action, no overlap"
+    );
+
+    // At t=25 the action completes; the remembered prompt runs immediately
+    // instead of deferring to the discarded tick's next slot (t=30).
+    tokio::time::advance(Duration::from_secs(5)).await;
+    settle().await;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        2,
+        "prompt run fires on completion"
+    );
+    // Skip still collapses bursts: nothing else fires in this window. The
+    // prompt run itself holds the slot for 25 s, so the next 10 s tick lands
+    // at t=55 (first slot after the prompt action completes).
+    tokio::time::advance(Duration::from_secs(5)).await;
+    settle().await;
+    assert_eq!(count.load(Ordering::SeqCst), 2, "no catch-up burst");
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_secs(5)).await;
+        settle().await;
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 3, "next slot after prompt");
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn already_stopped_or_closed_signal_never_starts_a_job() {
     for initially_stopped in [false, true] {
