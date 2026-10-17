@@ -179,27 +179,28 @@ async fn expire_stale_game_aggregates(pool: &PgPool) -> Result<(), ErrorClass> {
     );
     let guilds = game_activity_store::list_aggregate_guilds(pool)
         .await
-        .map_err(|_| {
-            tracing::warn!("game_activity_aggregate_expiry_failed");
-            ErrorClass::Database
-        })?;
+        .map_err(|_| aggregate_expiry_failed())?;
     let mut expired = 0u64;
     for guild_id in &guilds {
-        match game_activity_store::expire_stale_guild_aggregates(pool, guild_id, horizon).await {
-            Ok(rows) => expired += rows,
-            Err(_) => {
-                tracing::warn!("game_activity_aggregate_expiry_failed");
-                return Err(ErrorClass::Database);
-            }
-        }
+        expired += game_activity_store::expire_stale_guild_aggregates(pool, guild_id, horizon)
+            .await
+            .map_err(|_| aggregate_expiry_failed())?;
     }
     if expired > 0 {
         tracing::info!(
             message = "game_activity_aggregate_expiry",
             expired_rows = expired,
             horizon_days = horizon,
-            "retention cadence expired stale per-guild game-activity aggregates",
+            "expired stale aggregates",
         );
     }
     Ok(())
+}
+
+/// Single log site for aggregate-expiry store failures: one guild's failure
+/// aborts the tick as [`ErrorClass::Database`] so the supervisor retries on
+/// the next bounded opportunity.
+fn aggregate_expiry_failed() -> ErrorClass {
+    tracing::warn!("game_activity_aggregate_expiry_failed");
+    ErrorClass::Database
 }

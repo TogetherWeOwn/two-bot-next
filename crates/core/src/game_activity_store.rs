@@ -174,7 +174,7 @@ pub async fn expire_stale_guild_aggregates(
 ) -> Result<u64, GameActivityStoreError> {
     if !(1..=MAX_AGGREGATE_RETENTION_DAYS).contains(&retention_days) {
         return Err(GameActivityStoreError::Db(sqlx::Error::InvalidArgument(
-            "game-activity aggregate retention horizon must be one day to a century".into(),
+            "bad aggregate retention horizon".into(),
         )));
     }
     Ok(sqlx::query(
