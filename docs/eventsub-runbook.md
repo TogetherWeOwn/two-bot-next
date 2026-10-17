@@ -104,15 +104,17 @@ DELETE, `delete_subscription_url`) and recreate it with the new secret
 while they differ, every delivery fails closed with `401 unauthorized` (see
 the matrix below). Confirm agreement by watching for `notification
 acknowledged` or `challenge answered` lines after the recreate, not by
-printing either value. Never use a test fixture as a runtime credential. No
-runtime reconciler is wired yet: nothing calls `reconcile()` /
-`plan_boot_actions()` at boot or after a revocation, so the
-delete-and-recreate step is manual.
+printing either value. Never use a test fixture as a runtime credential. The
+runtime reconciler runs once at startup plus a bounded hourly interval while
+`TWO_EVENTSUB` is exactly `1` (dark parks otherwise), so a revocation is
+healed by the next pass; it keeps any healthy subscription on our callback
+without comparing secrets, so the delete-and-recreate step for secret rotation
+stays manual.
 Source: `crates/core/src/twitch_eventsub.rs:526-529` (duplicate create answers
 `409`), `:543-547` (healthy subscriptions on our callback are kept without
 comparing secrets), `:467-472` (`ExistingSubscription` carries no secret),
 `wrangler/src/index.ts:535-537,594`, `crates/core/src/twitch_helix.rs:365,591`,
-`crates/bot/src/main.rs` (wires only `eventsub_http`).
+`crates/bot/src/main.rs` (`eventsub_reconcile::spawn_if_enabled`).
 
 ## Challenge verification
 

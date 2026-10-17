@@ -3908,8 +3908,9 @@ pub fn pace_delay_ms(last_at_ms: u64, interval_ms: u64, now_ms: u64) -> u64 {
 /// `post_message` builds the exact no-ping body
 /// (`allowed_mentions: { parse: [] }`, pinned above) and makes a single
 /// attempt. Only an error that proves no effect (explicit rejection, 429,
-/// or a local guard refusal) may release the durable claim; timeouts and
-/// transport failures are ambiguous and stay fenced. The impl lives here,
+/// a local guard refusal, or the shared admission-lane refusal before any
+/// wire attempt) may release the durable claim; timeouts and transport
+/// failures are ambiguous and stay fenced. The impl lives here,
 /// with the type, because the trait is defined in `two-bot-core`.
 #[cfg(feature = "db")]
 impl two_bot_core::stream_live_store::LiveSender for ActionExecutor {
@@ -3922,7 +3923,9 @@ impl two_bot_core::stream_live_store::LiveSender for ActionExecutor {
         Box::pin(async move {
             match self.post_message(channel_id, content, None).await {
                 Ok(message_id) => Ok(message_id),
-                Err(error) if error.proves_no_effect() => Err(LiveSendError::ProvenNoSend),
+                Err(error) if error.is_admission_blocked() || error.proves_no_effect() => {
+                    Err(LiveSendError::ProvenNoSend)
+                }
                 Err(_) => Err(LiveSendError::Ambiguous),
             }
         })
