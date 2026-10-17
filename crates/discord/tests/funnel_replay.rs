@@ -409,7 +409,7 @@ fn handlers_replay_matches_legacy_oracle() {
         channel_class: ChannelClass::Welcome,
         capture_only: false,
         occurred_at: Some(stamp("12:36:00")),
-        content: None,
+        content_length: None,
     });
     h.on_voice_leave(VoiceInput {
         guild_id: GUILD,
