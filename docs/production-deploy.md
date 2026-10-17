@@ -114,9 +114,20 @@ Dispatch again with `rollback` set to the previous version ID
 from the failed run's summary, `image` set to the previous container image
 digest from the same summary's rollback-snapshot line, and `takeover: true`.
 Set `sha` to the commit that version was built
-from. It is recorded as the rollback message, and the `/readyz` gate after the
+from: take all three from that summary line, which the pre-deploy snapshot
+(the provenance receipt) fills in. The three inputs are validated as one
+receipt before anything is restored: the rollback script refuses unless the
+Worker version's stamped deploy message (`wrangler deploy --message <sha>`)
+equals `sha`, the version appears in the 100%-serving deployment history,
+and the image comes from a completed rollout. A merely CI-green SHA paired
+with the wrong version therefore refuses before traffic moves instead of
+failing the gate after the restore; do not widen the guard to admit one.
+The `/readyz` gate after the
 rollback must report that revision, or a pre-stamp version on 200 with
-gateway ready (see below). The
+gateway ready (see below). A pre-stamp version carries no stamped SHA, so
+it cannot form a receipt and a manual rollback to it refuses; the in-run
+auto-rollback to a pre-stamp snapshot keeps its legacy version-header
+identity and records `provenance: legacy-no-sha` in its evidence. The
 rollback passes the same guard and the same Environment approval, except the
 guard never needs deploy-staging history for a rollback: aged-out staging
 runs must not block recovery. It still needs a human Environment reviewer:
