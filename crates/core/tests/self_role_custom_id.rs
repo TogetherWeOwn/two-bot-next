@@ -159,26 +159,10 @@ fn hostile_battery_never_panics_and_only_valid_parses() {
         "two:self-role:UPPER:lower",
     ];
     for input in hostile {
-        let parsed = parse_self_role_custom_id(input);
-        // The only acceptances are one or two valid keys; everything else
-        // is `None`. The call itself is the no-panic proof.
-        if let Some(found) = parsed {
-            assert!(
-                !found.panel_id.is_empty() && found.panel_id.len() <= 60,
-                "{input:?} -> {found:?}"
-            );
-            assert!(
-                found.panel_id.bytes().enumerate().all(|(i, b)| if i == 0 {
-                    b.is_ascii_lowercase() || b.is_ascii_digit()
-                } else {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
-                }),
-                "{input:?} -> {found:?}"
-            );
-            if let Some(key) = &found.option_key {
-                assert!(!key.is_empty() && key.len() <= 60, "{input:?} -> {found:?}");
-            }
-        }
+        // Every hostile fixture is outside the panel namespace or violates
+        // `valid_key`: rejection (`None`) is the only acceptable outcome.
+        // The call itself is the no-panic proof.
+        assert_eq!(parse_self_role_custom_id(input), None, "{input:?}");
     }
     // Determinism: hostile inputs parse the same way twice.
     for input in [
