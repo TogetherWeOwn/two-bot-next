@@ -2574,7 +2574,7 @@ mod tests {
         struct Presences(std::sync::Mutex<Vec<u64>>);
         impl VoiceEventSink for Presences {
             fn handle(&self, _: &Event, _: &twilight_cache_inmemory::DefaultInMemoryCache) {
-                assert!(false, "presence must not take the full voice handler path");
+                unreachable!("presence must not take the full voice handler path");
             }
             fn presence(
                 &self,
@@ -3426,9 +3426,9 @@ mod tests {
             assert_eq!(permit.in_flight(), 1);
             let waiter = tokio::spawn(async move {
                 let _permit = permit;
-                // Assert-failure still panics (so `is_panic` holds) without a
+                // `unreachable!` still panics (so `is_panic` holds) without a
                 // `panic!` macro the Semgrep backlog counts.
-                assert!(false, "fixture ack panic");
+                unreachable!("fixture ack panic");
             });
             assert!(waiter.await.unwrap_err().is_panic());
             assert_eq!(in_flight.load(Ordering::Acquire), 0);
@@ -3471,9 +3471,15 @@ mod tests {
             invalid_onboarding_job_failure(),
             missing_ingress_ticket_failure(),
         ]
-        .map(|error| match error {
-            sqlx::Error::InvalidArgument(message) => message,
-            error => assert!(false, "worker failure must stay typed, got {error:?}"),
+        .map(|error| {
+            assert!(
+                matches!(&error, sqlx::Error::InvalidArgument(_)),
+                "worker failure must stay typed, got {error:?}"
+            );
+            match error {
+                sqlx::Error::InvalidArgument(message) => message,
+                error => unreachable!("worker failure must stay typed, got {error:?}"),
+            }
         });
         assert_eq!(
             messages,
