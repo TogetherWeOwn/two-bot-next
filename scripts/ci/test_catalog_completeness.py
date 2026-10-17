@@ -57,8 +57,6 @@ _ALERT_INPUT_REASON = (
     "alert input documented in the docs/metrics.md rule table; "
     "no catalog row yet"
 )
-_EMITTED_REASON = "emitted series documented in docs/metrics.md; no catalog row yet"
-
 # Every emitted family absent from the catalog, with why it stays out.
 # A name here that gains a catalog row fails until its exemption is removed.
 EXEMPT_SERIES = {
@@ -94,7 +92,6 @@ EXEMPT_SERIES = {
         _ALERT_INPUT_REASON + " (gateway_checkpoint_failures)"
     ),
     "two_bot_internal_actions_total": _ALERT_INPUT_REASON + " (receiver_refusals)",
-    "two_bot_community_facts_drain_failures_total": _EMITTED_REASON,
     "two_bot_send_admissions_total": _ALERT_INPUT_REASON + " (send_admission_blocked)",
     # Label-free halt gauge: a manual check, not an alert input. Its catalog
     # row lands with the change that introduces the gauge.
