@@ -480,7 +480,7 @@ pub fn schedule_list_page(lines: &[String], page: i64) -> String {
 /// Greedily pack row lines into page buckets whose joined (`\n`) UTF-16
 /// length fits `rows_budget`. A single row always fits on its own page (rows
 /// are bounded far below the message ceiling); rows are never split.
-fn pack_schedule_rows<'a>(lines: &'a [String], rows_budget: usize) -> Vec<Vec<&'a String>> {
+fn pack_schedule_rows(lines: &[String], rows_budget: usize) -> Vec<Vec<&String>> {
     let mut pages: Vec<Vec<&String>> = vec![Vec::new()];
     let mut current_len: usize = 0;
     for line in lines {
