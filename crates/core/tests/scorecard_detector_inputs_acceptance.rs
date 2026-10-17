@@ -221,8 +221,8 @@ fn partial_input_week_reports_exact_detector_inputs() {
     assert_eq!(json["abuse_candidates"], json!([]));
     assert_eq!(
         json["abuse_data_quality"],
-        json!([]),
-        "2 usable lengths: no insufficient_data note for copy_paste"
+        json!(["copy_paste:insufficient_data"]),
+        "2 of 7 usable lengths is sparse: fail-closed note, no verdict"
     );
 }
 
@@ -342,5 +342,9 @@ fn flag_week_still_reports_detector_inputs() {
         "spread lengths must not flag copy_paste: {flags:?}"
     );
     assert_eq!(json["abuse_candidates"], json!(["SPAM_TO_EARN_WATCH"]));
-    assert_eq!(json["abuse_data_quality"], json!([]));
+    assert_eq!(
+        json["abuse_data_quality"],
+        json!(["copy_paste:insufficient_data"]),
+        "5 of 31 usable lengths is sparse: copy_paste stays fail-closed while burst still fires"
+    );
 }
