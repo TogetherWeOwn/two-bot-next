@@ -98,13 +98,18 @@ without comparing secrets, so a new secret alone orphans the old
 subscription. Generate a fresh value meeting the constraint above, set the
 Worker secret `TWO_TWITCH_WEBHOOK_SECRET`, redeploy that Worker version and
 transfer ownership per the enable order above, then restart the container.
-The delete step stays manual, the recreate does not: delete each
-`stream.online` v1 subscription on our callback (Helix DELETE,
-`delete_subscription_url`), then let the reconciler (next section) create
-the missing subscriptions with the new secret on its next pass — restart
-the container to run the startup pass promptly instead of waiting for the
-hourly tick. Do not hand-create a duplicate first: Twitch answers `409`,
-and the plan already orders deletes before creates. The two sides must
+Restarting first is deliberate: the running container must already carry
+the new secret before any subscription is deleted, so no scheduled pass
+can re-create a deleted subscription with the old secret. The cost is a
+401 window (below) for not-yet-deleted subscriptions signed with the old
+secret, so delete promptly after the restart. The delete step stays
+manual, the recreate does not: delete each `stream.online` v1
+subscription on our callback (Helix DELETE, `delete_subscription_url`),
+then let the reconciler (next section) create the missing subscriptions
+with the new secret on its next pass — restart the container again to run
+the startup pass promptly instead of waiting for the next scheduled pass.
+Do not hand-create a duplicate first: Twitch answers `409`, and the plan
+already orders deletes before creates. The two sides must
 agree: while they differ, every delivery fails closed with `401
 unauthorized` (see the matrix below). Confirm agreement by watching for
 `notification acknowledged` or `challenge answered` lines after the
@@ -121,10 +126,12 @@ subscription on our callback).
 ## Subscription reconciler
 
 The reconciler is wired into bot startup. While `TWO_EVENTSUB` is exactly
-`"1"` it runs one pass at startup and then one pass per hour
-(`RECONCILE_INTERVAL_SECS = 3_600`) until shutdown; a failed pass is logged
-and the loop still runs the next tick, so a reconcile failure never exits
-the process (unlike an enabled-but-invalid receiver bind, above). Dark
+`"1"` it runs one pass at startup, then sleeps
+`RECONCILE_INTERVAL_SECS = 3_600` after each pass completes before the
+next one, until shutdown — so the gap between passes is the pass duration
+plus one hour, and no one-hour recovery bound is promised. A failed pass
+is logged and the loop still runs the next tick, so a reconcile failure
+never exits the process (unlike an enabled-but-invalid receiver bind, above). Dark
 spawns no task and logs one parked line (below).
 Source: `crates/bot/src/main.rs:399-403`,
 `crates/bot/src/eventsub_reconcile.rs:40-42,390-444`.
@@ -149,9 +156,10 @@ Each pass, from the process environment:
 3. List existing subscriptions, plan with `plan_boot_actions` /
    `reconcile()` (deletes before creates, **our callback only**: unwanted,
    duplicate, and non-healthy subscriptions on our callback are deleted;
-   healthy wanted ones are kept), then run the plan one action at a time so
-   one rejected action cannot starve the rest, and confirm with a follow-up
-   listing that every desired broadcaster holds a healthy (`enabled` or
+   healthy wanted ones are kept), then — once the plan is built — run it
+   one action at a time so one rejected action cannot starve the rest, and
+   confirm with a follow-up listing that every desired broadcaster holds
+   a healthy (`enabled` or
    `webhook_callback_verification_pending`) subscription on our callback.
    Source: `crates/bot/src/eventsub_reconcile.rs:201-315`,
    `crates/core/src/twitch_eventsub.rs:542-581`,
@@ -167,9 +175,22 @@ Health signal is the container log, scalar fields only
   yet` (warn, `reconcile_pending`): every desired subscription exists but
   none is `enabled` yet; the callback has not completed verification.
 - `error_class="reconcile_unhealthy"` then the wrapping
-  `error_class="reconcile_failed"` (error): an action failed or a desired
-  broadcaster still lacks a healthy subscription (`failed` / `missing`
-  counts). The pair is one failed pass, not two.
+  `error_class="reconcile_failed"` (error): the plan ran but an action
+  failed or a desired broadcaster still lacks a healthy subscription
+  (`failed` / `missing` counts). The pair is one failed pass, not two.
+- `error_class="reconcile_failed"` on its own (error, `error` field): the
+  pass errored at the first listing, at the plan, or at the follow-up
+  listing, so no `reconcile_unhealthy` or `reconcile_action_failed` line
+  follows. At the listing or plan stage nothing was mutated; at the
+  follow-up listing the plan may already have run but convergence is
+  unconfirmed. Read the remediation off the `error` field: an invalid
+  broadcaster id (not 1-32 digits) or more than 100 allowlist entries
+  fails the plan before any action and blocks **every** broadcaster on
+  every pass until the allowlist format is fixed; a token-endpoint
+  rejection points at the client id/secret provisioning.
+  Source: `crates/bot/src/eventsub_reconcile.rs:253,264,266,378-386`,
+  `crates/core/src/twitch_eventsub.rs:551-556`,
+  `crates/core/src/stream_funnel.rs:76-77`.
 - `error_class="reconcile_config_invalid"` or
   `error_class="reconcile_no_broadcasters"`: refused or parked before any
   mutation, per steps 1-2.
@@ -192,8 +213,9 @@ Operator verification and remediation (staging only; never run a test
 against production Twitch, and never print a secret value to check one):
 
 - Verify a pass by its terminal log line, not by calling Helix by hand.
-  No terminal line within one interval plus the startup window means check,
-  in order: the flag (parked?), the refusal lines (config invalid or empty
+  No terminal line for the startup pass, or none for well over one
+  interval (plus pass time) after the previous one, means check, in order:
+  the flag (parked?), the refusal lines (config invalid or empty
   allowlist?), and only then container liveness.
 - `reconcile_config_invalid`: compare binding and flag **names** — callback
   shape, client id/secret, webhook secret — fix the provisioning, redeploy
@@ -208,14 +230,25 @@ against production Twitch, and never print a secret value to check one):
   re-creates failed subscriptions every pass; manually looping deletes
   adds nothing.
 - `reconcile_action_failed` / `reconcile_unhealthy`: read the `action` and
-  `error` fields (dashboard; the log-read script drops them). A typo'd
-  broadcaster id (400) is fixed in the allowlist, not at Twitch; transient
-  429/5xx answers are retried by the next hourly pass, and later
-  broadcasters in the same pass were not starved.
+  `error` fields (dashboard; the log-read script drops them). A
+  well-formed numeric broadcaster id that Twitch rejects with 400 during a
+  create is fixed in the allowlist, not at Twitch; transient 429/5xx
+  answers are retried by the next pass, and later broadcasters in the same
+  pass were not starved. That no-starvation note covers rejected actions
+  only — a malformed allowlist entry never reaches an action (see the lone
+  `reconcile_failed` above).
+- Lone `reconcile_failed`: read its `error` field first. An invalid
+  broadcaster id or a more-than-100-entry allowlist means fix the
+  `TWO_TWITCH_BROADCASTERS` format and redeploy/restart — no broadcaster
+  is reconciled until then. A token-endpoint or listing rejection means
+  check the client id/secret provisioning (names, never values); do not
+  substitute another credential.
 - A `revocation` delivery is acknowledged by the receiver and healed by
-  the next pass (the revoked entry is absent or `authorization_revoked`),
-  not by an immediate revocation-triggered pass — allow up to one hour, or
-  restart the container to run the startup pass sooner.
+  the next scheduled pass (the revoked entry is absent or
+  `authorization_revoked`), not by an immediate revocation-triggered
+  pass. Because the interval is counted from the previous pass's
+  completion, the wait can exceed one hour — restart the container to run
+  the startup pass sooner.
   Source: `crates/bot/src/eventsub_reconcile.rs:400-425`,
   `docs/stream-funnel.md:106-108`.
 
@@ -307,10 +340,10 @@ Verified deliveries that need no operator action answer `200`:
 
 - `notification` and `revocation`: acknowledged as `200 {"ok": true}`. This
   slice has no send and no ledger, so the receiver only acks; the
-  reconciler (above) re-creates a revoked subscription on its next pass
-  when the broadcaster is still in the allowlist, so re-subscription after
-  a revocation is automatic within one interval, not manual and not
-  immediate.
+  reconciler (above) re-creates a revoked subscription on its next
+  scheduled pass when the broadcaster is still in the allowlist, so
+  re-subscription after a revocation is automatic, not manual and not
+  immediate — and not bounded by one hour (see above).
 - Unknown message types, and known deterministic classification errors on
   non-verification messages (`WrongSubscription`, `InvalidBody`):
   acknowledged with 2xx so Twitch does not retry what will never succeed.
