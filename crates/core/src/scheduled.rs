@@ -435,7 +435,11 @@ pub fn schedule_list_pages(lines: &[String]) -> Vec<String> {
         let packed = pack_schedule_rows(lines, rows_budget);
         if packed.len() == total_guess {
             if packed.len() == 1 {
-                return vec![packed[0].join("\n")];
+                return vec![packed[0]
+                    .iter()
+                    .map(|s| (*s).as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")];
             }
             let total = packed.len() as i64;
             return packed
@@ -445,7 +449,10 @@ pub fn schedule_list_pages(lines: &[String]) -> Vec<String> {
                     let current = index as i64 + 1;
                     format!(
                         "{}\n{}",
-                        rows.join("\n"),
+                        rows.iter()
+                            .map(|s| (*s).as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
                         schedule_list_page_indicator(current, total)
                     )
                 })
