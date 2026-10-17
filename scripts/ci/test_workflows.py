@@ -78,7 +78,7 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
                    ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
                    # Read-only shadow engine. Repin with its caller after central merge.
-                   ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@87862ee2a4cacc519e80b66495938db396d780e8",
+                   ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@c0b2e33692266088af0d7caf9f448dde2f723d75",
                    # SDLC 2.3 CI speed pilot, promoted: required check.yml
                    # caller to the shared nextest lane (local path until
                    # the central move).
