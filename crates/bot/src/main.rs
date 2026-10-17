@@ -399,8 +399,9 @@ async fn run(cli_args: &[String]) {
     // M3.3 reconcile: once at startup plus a bounded interval while
     // `TWO_EVENTSUB` is exactly `1`. Dark parks with an info log;
     // enabled-but-invalid configuration logs with an error class and never
-    // mutates.
-    eventsub_reconcile::spawn_if_enabled(shutdown.subscribe());
+    // mutates. The handle is retained and joined after the supervisor
+    // drains below, never detached.
+    let reconcile_task = eventsub_reconcile::spawn_if_enabled(shutdown.subscribe());
 
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
@@ -738,6 +739,12 @@ async fn run(cli_args: &[String]) {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
         None => http.await,
     };
+    // Both branches latch the shutdown watch before returning (the gateway
+    // supervisor sends it before its drain; the HTTP/job serve path sends
+    // it before joining its supervisor), so the reconcile task has been
+    // draining concurrently. Join it within its bounded drain rather than
+    // exiting over a possibly in-flight subscription mutation.
+    eventsub_reconcile::join(reconcile_task, eventsub_reconcile::SHUTDOWN_DRAIN).await;
     if result.is_err() {
         tracing::error!(
             msg = "shutdown_failed",
