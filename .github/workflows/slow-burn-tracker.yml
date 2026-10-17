@@ -78,14 +78,16 @@ jobs:
           METRICS_SCRAPE_TOKEN: ${{ secrets.METRICS_SCRAPE_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RING_PATH: slow-burn-ring.json
+          TRACKER_FIXTURE: ${{ github.event.inputs.fixture || 'live' }}
+          TRACKER_DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           set -euo pipefail
-          fixture="${{ github.event.inputs.fixture || 'live' }}"
+          fixture="$TRACKER_FIXTURE"
           args=(--ring "$RING_PATH" --evidence-out slow-burn-tracker-evidence.json --exposition-out slow-burn-exposition.prom)
           if [ "$fixture" != "live" ]; then
             args+=(--fixture "$fixture" --label slow-burn-test --title-prefix '[slow-burn-test]')
           fi
-          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+          if [ "$TRACKER_DRY_RUN" = "true" ]; then
             args+=(--dry-run)
           fi
           python3 scripts/slow_burn_tracker.py "${args[@]}"
