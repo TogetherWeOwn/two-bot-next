@@ -207,11 +207,17 @@ async fn run_job(
             }
             _ = recheck.tick(), if job.cadence_source.is_some() => {
                 // Between ticks: a changed cadence reschedules the pending
-                // tick to last-run + new cadence. A past instant ticks once
-                // promptly; Skip collapses any further missed slots, so the
-                // job never bursts to catch up.
+                // tick to last-run + new cadence. If that instant is already
+                // past, the run fires once promptly and the phase re-anchors
+                // at it (not at the stale grid, which consumers gating on
+                // their last actual run would still refuse); Skip collapses
+                // any further missed slots, so the job never bursts.
                 if let Some(next) = refreshed_cadence(&job.cadence_source, &mut cadence) {
-                    let first = last_run_tick.map_or(first_deadline, |tick| tick + next);
+                    let first = last_run_tick.map_or(first_deadline, |tick| {
+                        let due = tick + next;
+                        let now = Instant::now();
+                        if due <= now { now } else { due }
+                    });
                     interval = cadence_interval(first, next);
                 }
             }
