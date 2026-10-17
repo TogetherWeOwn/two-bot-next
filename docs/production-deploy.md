@@ -196,6 +196,14 @@ only, because the serving version was built by an older run.
 | JSON repeats an object key, nests past the depth bound, or `build_revision`/`build_id` has an unexpected shape | Keep polling; fail at the end with a fixed single-line reason that echoes no remote value |
 | Any other status, including `000` (no answer) | Keep polling; fail at the end |
 
+A single 503 (gateway `starting`) poll never passes the gate — the 10-15
+deploy passed on one such poll ~10 s after rollout while already
+crash-looping (see the detection gap in
+[production-incident-2026-10-15-postmortem.md](production-incident-2026-10-15-postmortem.md)).
+Green requires the follow-up ready observation in the first table row: the
+200-ready answer held for 18 consecutive polls (~3 min). Every other answer
+keeps polling, then fails and auto-rolls back.
+
 A failed gate after a takeover rolls back automatically
 (`scripts/worker_container_rollback.py`): the job restores the pre-deploy
 snapshot's Worker version AND container image with takeover, requires the

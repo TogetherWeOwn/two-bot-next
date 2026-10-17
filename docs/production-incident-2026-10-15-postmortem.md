@@ -1,12 +1,23 @@
 # Postmortem — 2026-10-15 production gateway crash-loop
 
-**Status: root cause PROVISIONAL.** The cause below is the leading hypothesis
-from the incident investigation (production 19 migrations behind staging).
-The RCA fix PR (#978: `failed_step` + error-code logging, schema-gap survival)
-merged on 2026-10-15 at 21:35Z. The hypothesis stays provisional until a
-production log line from a build that includes #978 names the failing step.
-Update this section when that line is captured; do not treat the hypothesis
-as proven before then.
+**Status: root cause PROVISIONAL — non-reproduction recorded 2026-10-17.**
+The cause below is the leading hypothesis from the incident investigation
+(production 19 migrations behind staging). The RCA fix PR (#978:
+`failed_step` + error-code logging, schema-gap survival) merged on
+2026-10-15 at 21:35Z. As of this revision no production `gateway_failed`
+log line from a #978 build naming the failing step is quoted anywhere in
+this repo: the 10-15 logs carry no cause chain, and the only post-#978
+production crash-loop on record (2026-10-16 role drift, SQLSTATE `42501`,
+see the role gate in [production-deploy.md](production-deploy.md)) quotes
+no `failed_step` line either — and its mechanism (missing grant, cursor
+held on rejoin) is distinct from this hypothesis (missing table `42P01`).
+A reproduction on a #978 build would log `failed_step="gateway_run"` with
+`error_code="42P01"` (the retention write holds the cursor in
+`crates/bot/src/gateway.rs:877-887`, surfacing as a `gateway_run` step
+failure in `crates/bot/src/main.rs:700` and logged in
+`publish_gateway_failure` at `crates/bot/src/main.rs:861`). Update this
+section when that line is captured; do not treat the hypothesis as proven
+before then.
 
 ## Timeline (all UTC, 2026-10-15)
 
@@ -232,12 +243,16 @@ prompts.
 
 ## Follow-ups (not this doc's scope)
 
-- Prod schema gate: `deploy-production` must refuse a build whose migrations
-  are ahead of the production ledger (staging has the drift gate; production
-  does not).
-- Strict ready gate: a 503-`starting` answer must not pass a deploy on a
-  single early poll; require a 200 (or a bounded parked-with-evidence rule)
-  before green.
+- Prod schema gate: DONE. `deploy-production` refuses a build whose
+  migrations are ahead of the production ledger (schema gate, #979) and
+  whose grants lag the migrations (role gate: `roles verify` must read 0,
+  #1019). Rollback and live-SHA redeploy waive both checks inside the
+  reviewed script (recorded, never a skip) so recovery never waits on them.
+- Strict ready gate: DONE (#979). A 503-`starting` answer never passes a
+  deploy on a single early poll: green requires 200 with gateway `ready`
+  held for 18 consecutive polls (~3 min), and any parked answer keeps
+  polling, then fails and auto-rolls back. See the gate table in
+  [production-deploy.md](production-deploy.md#build-identity-and-the-readyz-gate).
 - Rollback inputs: record a pinned known-good Worker version + Git SHA +
   image after every production deploy (version discovery above), and make the
   rollback dispatch derive `sha` from that record. Do not widen the guard to
