@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 628 samples
+## Cardinality budget: 673 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -48,6 +48,7 @@ table and the test are updated together.
 | `two_bot_voice_names_total{outcome}` | 15 | 1 create + 5 template-render outcomes + 8 dispatch outcomes + `other` |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | 2 | `pre_commit`, `commit` |
 | `two_bot_internal_actions_total{family,outcome}` | 72 | 6 families x 12 outcomes (`announcement`, `event`, `settings`, `moderation`, `membership`, `other` x `executed` + 11 refusal classes) |
+| `two_bot_moderation_enforcements_total{verb,outcome}` | 45 | 9 verbs (`ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`, `slowmode`, `lockdown`, `unlock`) x 5 outcomes (`success`, `refused`, `discord_error`, `storage_error`, `other`) |
 | `two_bot_community_facts_drain_failures_total{reason}` | 3 | `error`, `timeout`, `other` |
 | `two_bot_presence_capture_total{outcome}` | 3 | `inserted`, `duplicate`, `rejected` |
 | `two_bot_audit_delivery_halt` | 1 | label-free gauge: 1 engaged, 0 cleared |
@@ -55,7 +56,7 @@ table and the test are updated together.
 | `two_bot_eventsub_received_total` | 1 | label-free counter: deliveries accepted for verification, including tampered signatures |
 | `two_bot_eventsub_classified_total{kind}` | 6 | `challenge`, `notification`, `revocation`, `tampered`, `ignored`, `other`; unknown kinds collapse to `other` |
 | `two_bot_eventsub_posts_total{outcome}` | 4 | `attempted`, `succeeded`, `failed`, `other`; zero until the go-live sender is wired |
-| `# HELP` / `# TYPE` headers | 124 | 62 families x 2 |
+| `# HELP` / `# TYPE` headers | 126 | 63 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 

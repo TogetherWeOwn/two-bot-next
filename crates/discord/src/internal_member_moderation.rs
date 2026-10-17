@@ -222,7 +222,18 @@ where
             request_id: request_id.to_owned(),
             idempotency_key: idempotency_key.to_owned(),
         };
-        let result = service.execute(&execution).await.map_err(member_error)?;
+        let result = match service.execute(&execution).await {
+            Ok(result) => result,
+            Err(err) => {
+                two_bot_core::metrics::global().moderation_enforcement(
+                    request.action.command_name(),
+                    err.enforcement_outcome(),
+                );
+                return Err(member_error(err));
+            }
+        };
+        two_bot_core::metrics::global()
+            .moderation_enforcement(request.action.command_name(), "success");
         Ok(InternalMemberResult {
             outcome: result.outcome.as_str().to_owned(),
             replayed: result.replayed,

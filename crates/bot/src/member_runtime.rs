@@ -479,7 +479,18 @@ async fn execute(
         // stored outcome instead of moderating twice.
         idempotency_key: interaction.id.get().to_string(),
     };
-    service.execute(&execution).await.map_err(error_text)
+    match service.execute(&execution).await {
+        Ok(result) => {
+            two_bot_core::metrics::global()
+                .moderation_enforcement(action.command_name(), "success");
+            Ok(result)
+        }
+        Err(err) => {
+            two_bot_core::metrics::global()
+                .moderation_enforcement(action.command_name(), err.enforcement_outcome());
+            Err(error_text(err))
+        }
+    }
 }
 
 fn with_everyone(mut roles: Vec<String>, guild_id: &str) -> Vec<String> {
