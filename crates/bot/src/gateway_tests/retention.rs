@@ -392,11 +392,11 @@ async fn missing_rejoin_cancel_grant_holds_cursor_but_delete_insert_commits() {
         NEXT_ROLE.fetch_add(1, Ordering::Relaxed)
     );
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "CREATE ROLE {role} NOLOGIN; \\
-         GRANT USAGE ON SCHEMA public TO {role}; \\
-         GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {role}; \\
-         GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO {role}; \\
-         GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO {role}; \\
+        "CREATE ROLE {role} NOLOGIN;
+         GRANT USAGE ON SCHEMA public TO {role};
+         GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {role};
+         GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO {role};
+         GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO {role};
          REVOKE DELETE ON TABLE retention_guild_purge_queue FROM {role}"
     )))
     .execute(pool)
@@ -439,10 +439,10 @@ async fn missing_rejoin_cancel_grant_holds_cursor_but_delete_insert_commits() {
     peer.close().await;
     limited.close().await;
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM {role}; \\
-         REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM {role}; \\
-         REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM {role}; \\
-         REVOKE USAGE ON SCHEMA public FROM {role}; \\
+        "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM {role};
+         REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM {role};
+         REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM {role};
+         REVOKE USAGE ON SCHEMA public FROM {role};
          DROP ROLE {role}"
     )))
     .execute(pool)
