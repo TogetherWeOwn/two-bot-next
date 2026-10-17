@@ -135,3 +135,10 @@ path = "fuzz_targets/helix_token.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "feeds_http"
+path = "fuzz_targets/feeds_http.rs"
+test = false
+doc = false
+bench = false
