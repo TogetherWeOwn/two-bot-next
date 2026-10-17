@@ -279,6 +279,7 @@ for end in "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   done
 done
 )
+```
 
 Staging sample (2026-10-16; each of the nine filter/page queries was executed;
 for each page the broad diagnostic filter is followed by healthy then pending):
