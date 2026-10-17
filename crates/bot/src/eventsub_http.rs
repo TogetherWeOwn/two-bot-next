@@ -1,9 +1,9 @@
 //! Private Twitch EventSub receiver (`POST /hooks/twitch`). Never merge this
 //! router into the health socket. Verification (`twitch_eventsub::verify_delivery`)
-//! precedes any JSON parsing; classification errors after verification are
-//! deterministic and are acknowledged with 2xx so Twitch does not retry them.
-//! Only transient failures (none in this slice: no send, no ledger) would be
-//! 5xx. No Helix client and no durable ledger here (separate slices).
+//! precedes any JSON parsing; known deterministic classification errors are
+//! acknowledged with 2xx so Twitch does not retry them. Unknown/future errors
+//! fail closed with retryable 503. No Helix client and no durable ledger here
+//! (separate slices).
 //!
 //! Logging carries only scalar `event`/`status`/`error_class` plus the bounded
 //! `message_type` (refusals) and `reason` (revocation ack) scalars: no header
@@ -27,6 +27,7 @@ use axum::{
 };
 use serde_json::json;
 use tokio::{net::TcpListener, sync::Semaphore};
+use tracing::Instrument;
 use two_bot_core::{
     eventsub_receiver_config::EventsubReceiverConfig,
     twitch_eventsub::{classify, verify_delivery, Delivery, DeliveryHeaders, EventSubError},
@@ -52,11 +53,6 @@ impl ReceiverState {
             secret: RwLock::new(config.secret().clone()),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
         }
-    }
-
-    #[cfg(test)]
-    fn reload_secret(&self, config: &EventsubReceiverConfig) {
-        *self.secret.write().expect("EventSub secret lock poisoned") = config.secret().clone();
     }
 }
 
@@ -93,10 +89,6 @@ fn router(state: Arc<ReceiverState>) -> Router {
         .route(EVENTSUB_PATH, any(handle))
         .fallback(not_found)
         .with_state(state)
-}
-
-fn request_id() -> String {
-    two_bot_core::internal_actions::new_request_id(now_ms_u64(), &rand::random())
 }
 
 fn now_ms_u64() -> u64 {
@@ -156,31 +148,43 @@ fn ack(id: &str) -> Response {
     (StatusCode::OK, Json(json!({"ok": true, "request_id": id}))).into_response()
 }
 
-async fn not_found(State(state): State<Arc<ReceiverState>>) -> Response {
-    // Fallback for any non-callback path or method: no header is trusted.
-    refuse(
-        &state,
-        StatusCode::NOT_FOUND,
-        "not_found",
-        false,
-        &request_id(),
-        "unknown",
-    )
+async fn not_found(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
+    // Honor the Worker's `x-request-id` when it has a generated shape, so one
+    // id joins the Worker, Durable Object and container logs.
+    let id = crate::logging::incoming_request_id(request.headers());
+    let span = crate::logging::request_span(&id);
+    async move {
+        refuse(
+            &state,
+            StatusCode::NOT_FOUND,
+            "not_found",
+            false,
+            &id,
+            "unknown",
+        )
+    }
+    .instrument(span)
+    .await
 }
 
 async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
-    let id = request_id();
-    let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
-        return refuse(
-            &state,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "busy",
-            true,
-            &id,
-            "unknown",
-        );
-    };
-    receive_with_timeout(&state, &id, receive(&state, request, &id)).await
+    let id = crate::logging::incoming_request_id(request.headers());
+    let span = crate::logging::request_span(&id);
+    async move {
+        let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
+            return refuse(
+                &state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "busy",
+                true,
+                &id,
+                "unknown",
+            );
+        };
+        receive_with_timeout(&state, &id, receive(&state, request, &id)).await
+    }
+    .instrument(span)
+    .await
 }
 
 async fn receive_with_timeout(
@@ -200,6 +204,14 @@ async fn receive_with_timeout(
             id,
             "unknown",
         ),
+    }
+}
+
+fn record_verification_failure(metrics: &two_bot_core::metrics::Metrics, error: &EventSubError) {
+    if *error == EventSubError::BadSignature {
+        metrics.eventsub_classified("tampered");
+    } else {
+        metrics.eventsub_classified("ignored");
     }
 }
 
@@ -318,14 +330,18 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         );
     }
 
+    two_bot_core::metrics::global().eventsub_received();
     let secret = state
         .secret
         .read()
         .expect("EventSub secret lock poisoned")
         .clone();
     if let Err(error) = verify_delivery(&secret, &headers, &raw, now_ms_i64()) {
-        // `BodyTooLarge` cannot arrive here (`to_bytes` caps first), but map
-        // it explicitly rather than collapsing every variant into one arm.
+        // Timestamp failures happen only after a valid HMAC. Only a signature
+        // mismatch is evidence of a tampered delivery. `BodyTooLarge` cannot
+        // arrive here (`to_bytes` caps first), but map it explicitly rather
+        // than collapsing every variant into one arm.
+        record_verification_failure(two_bot_core::metrics::global(), &error);
         if error == EventSubError::BodyTooLarge {
             return refuse(
                 state,
@@ -348,6 +364,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
 
     match classify(&message_type, &raw) {
         Ok(Delivery::Challenge(challenge)) => {
+            two_bot_core::metrics::global().eventsub_classified("challenge");
             tracing::info!(
                 event = "eventsub_receiver",
                 status = 200,
@@ -364,6 +381,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             response
         }
         Ok(Delivery::Notification(_)) => {
+            two_bot_core::metrics::global().eventsub_classified("notification");
             // No send and no ledger in this slice: acknowledge so Twitch does
             // not retry; the follow-up wires the durable claim plus post.
             tracing::info!(
@@ -374,6 +392,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         Ok(Delivery::Revocation { reason, .. }) => {
+            two_bot_core::metrics::global().eventsub_classified("revocation");
             // The bounded reconcile pass re-subscribes; here only acknowledge
             // so Twitch does not retry. The bounded `reason` scalar (never the
             // subscription id) answers revocation counts by reason from logs alone.
@@ -386,6 +405,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         Ok(Delivery::Ignored) => {
+            two_bot_core::metrics::global().eventsub_classified("ignored");
             tracing::info!(
                 event = "eventsub_receiver",
                 status = 200,
@@ -394,9 +414,10 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         // Deterministic planning errors: acknowledge with 2xx so Twitch does
-        // not retry what will never succeed. Only transient send/ledger
-        // failures (not in this slice) are 5xx.
+        // not retry what will never succeed. Unknown/future classification
+        // errors remain retryable through the fallback below.
         Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody) => {
+            two_bot_core::metrics::global().eventsub_classified("ignored");
             tracing::info!(
                 event = "eventsub_receiver",
                 status = 200,
@@ -405,6 +426,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         Err(EventSubError::InvalidChallenge) => {
+            two_bot_core::metrics::global().eventsub_classified("ignored");
             // Same `malformed` error class as a bad notification body, but
             // `message_type = "webhook_callback_verification"` separates
             // failed challenges in logs alone.
@@ -418,17 +440,18 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             )
         }
         Err(e) => {
-            // Unreachable today: post-verification `classify` only yields
-            // WrongSubscription, InvalidBody or InvalidChallenge (all handled
-            // above). Warn loudly so a future classify variant shows up in
-            // logs instead of silently acking.
-            tracing::warn!(
-                event = "eventsub_receiver",
-                status = 200,
-                error_class = %e,
-                "delivery ignored"
-            );
-            ack(id)
+            let _ = e;
+            two_bot_core::metrics::global().eventsub_classified("other");
+            // A future classify error may be transient. Keep it retryable
+            // rather than acknowledging it as a permanent delivery outcome.
+            refuse(
+                state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                true,
+                id,
+                bounded_message_type(&message_type),
+            )
         }
     }
 }
@@ -444,6 +467,12 @@ mod tests {
         Mutex, OnceLock,
     };
     use tower::ServiceExt as _;
+
+    impl ReceiverState {
+        fn reload_secret(&self, config: &EventsubReceiverConfig) {
+            *self.secret.write().expect("EventSub secret lock poisoned") = config.secret().clone();
+        }
+    }
 
     static NEXT_TEST_SECRET: AtomicU64 = AtomicU64::new(1);
 
@@ -913,6 +942,101 @@ mod tests {
         assert!(!logs.contains("https://example.com/hooks/twitch"));
     }
 
+    /// Child: the real redaction probe, alone in its own process (see the
+    /// parent below). Scoped JSON captures lose events when sibling tests
+    /// share the binary (tracing-core resolves a callsite's first
+    /// registration against the registering thread's dispatcher), so the log
+    /// assertions run here and the parent only relays the exit status.
+    ///
+    /// Redaction proof for the receiver path: secrets riding the query
+    /// string, authorization/cookie headers or the body never reach the JSON
+    /// logs (which carry only scalar event/status/error_class plus the
+    /// correlation id), while the honored `x-request-id` is both logged and
+    /// echoed in the envelope — the join a staging curl can verify per hop.
+    #[tokio::test]
+    async fn refusal_logs_carry_request_id_child() {
+        if std::env::var_os("EVENTSUB_REDACTION_PROBE").is_none() {
+            return;
+        }
+        use tracing::instrument::WithSubscriber;
+
+        let sent = two_bot_core::internal_actions::new_request_id(1_720_000_000_000, &[9u8; 16]);
+        let capture = crate::logging::Capture::default();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/hooks/twitch?token=synthetic-query-secret")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer synthetic-auth-secret")
+            .header("cookie", "session=synthetic-cookie-secret")
+            .header("x-request-id", &sent)
+            .header("twitch-eventsub-message-id", "synthetic-delivery-9001")
+            .header("twitch-eventsub-message-timestamp", fresh_timestamp())
+            .header(
+                "twitch-eventsub-message-signature",
+                "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .header("twitch-eventsub-message-type", "notification")
+            .body(Body::from(challenge_body()))
+            .unwrap();
+        let response = app()
+            .oneshot(request)
+            .with_subscriber(crate::logging::capture_subscriber(capture.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["request_id"], sent);
+        let text = capture.text();
+        assert!(
+            text.contains(sent.as_str()),
+            "honored id missing from logs: {text}"
+        );
+        for secret in [
+            "synthetic-query-secret",
+            "synthetic-auth-secret",
+            "synthetic-cookie-secret",
+            "synthetic-challenge-0001",
+        ] {
+            assert!(!text.contains(secret), "sensitive value reached logs");
+        }
+    }
+
+    /// Parent: re-run only the probe above in an env-cleared child. A
+    /// separate process avoids process-global tracing-callsite races with
+    /// the parallel suite.
+    #[test]
+    fn refusal_logs_carry_request_id_without_secrets() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .args([
+                "eventsub_http::tests::refusal_logs_carry_request_id_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("EVENTSUB_REDACTION_PROBE", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "isolated redaction probe failed: {stderr}"
+        );
+        assert!(stdout.contains("running 1 test"));
+        assert!(stdout.contains("refusal_logs_carry_request_id_child ... ok"));
+        for marker in [
+            "synthetic-query-secret",
+            "synthetic-auth-secret",
+            "synthetic-cookie-secret",
+            "synthetic-challenge-0001",
+        ] {
+            assert!(!stdout.contains(marker) && !stderr.contains(marker));
+        }
+    }
+
     #[tokio::test]
     async fn busy_returns_503_with_retryable() {
         let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
@@ -984,6 +1108,125 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["error"]["code"], "request_timeout");
         assert_eq!(value["error"]["retryable"], true);
+    }
+
+    #[test]
+    fn eventsub_verification_failures_only_mark_bad_signatures_tampered() {
+        let metrics = two_bot_core::metrics::Metrics::default();
+        record_verification_failure(&metrics, &EventSubError::BadSignature);
+        for error in [
+            EventSubError::InvalidTimestamp,
+            EventSubError::StaleTimestamp,
+            EventSubError::BodyTooLarge,
+        ] {
+            record_verification_failure(&metrics, &error);
+        }
+
+        let exposition = metrics.render(None);
+        assert!(exposition.contains("two_bot_eventsub_classified_total{kind=\"tampered\"} 1\n"));
+        assert!(exposition.contains("two_bot_eventsub_classified_total{kind=\"ignored\"} 3\n"));
+    }
+
+    #[test]
+    fn eventsub_received_is_counted_once_before_verification() {
+        // `two_bot_eventsub_received_total` includes tampered deliveries only
+        // because `eventsub_received()` runs after the empty-body gate and
+        // before `verify_delivery`. A behavioral delta test would race on the
+        // process-global registry under parallel test threads, so pin the
+        // position in source instead.
+        let source = include_str!("eventsub_http.rs");
+        let non_test = source.split_once("#[cfg(test)]").expect("test module").0;
+        assert_eq!(
+            non_test.matches("eventsub_received()").count(),
+            1,
+            "receiver must count each accepted delivery exactly once via eventsub_received()"
+        );
+        let empty_pos = non_test.find("if raw.is_empty()").expect("empty-body gate");
+        let received_pos = non_test.find("eventsub_received()").expect("receipt call");
+        let verify_pos = non_test
+            .find("if let Err(error) = verify_delivery")
+            .expect("verification branch");
+        assert!(
+            empty_pos < received_pos && received_pos < verify_pos,
+            "eventsub_received() must run after the empty-body gate and before verify_delivery so tampered deliveries still count toward received_total"
+        );
+        assert!(
+            non_test[empty_pos..verify_pos].contains("eventsub_received()"),
+            "receipt call must sit in the slice between the empty-body gate and verify_delivery"
+        );
+    }
+
+    #[test]
+    fn eventsub_classification_literals_stay_with_their_delivery_arms() {
+        let source = include_str!("eventsub_http.rs");
+        let verify_failure = source
+            .split_once("if let Err(error) = verify_delivery")
+            .expect("verify failure branch")
+            .1
+            .split_once("match classify(")
+            .expect("classification match")
+            .0;
+        assert!(verify_failure
+            .contains("record_verification_failure(two_bot_core::metrics::global(), &error)"));
+
+        let arm = |start: &str, end: &str| {
+            let body = source.split_once(start).expect("delivery arm start").1;
+            body.split_once(end).expect("next delivery arm").0
+        };
+        let assert_classification = |body: &str, expected: &str| {
+            let calls = body.matches("eventsub_classified(").count();
+            let expected_call = format!("eventsub_classified(\"{expected}\")");
+            assert_eq!(
+                calls, 1,
+                "delivery arm must emit exactly one classification, found {calls}"
+            );
+            assert!(
+                body.contains(&expected_call),
+                "delivery arm must classify as {expected}"
+            );
+        };
+
+        let catch_all = arm("Err(e) => {", "\n    }\n}\n\n#[cfg(test)]");
+        assert!(catch_all.contains("StatusCode::SERVICE_UNAVAILABLE"));
+        assert!(!catch_all.contains("ack("));
+        assert!(catch_all.contains("\"unavailable\""));
+        assert!(catch_all.contains("                true,"));
+
+        for (start, end, kind) in [
+            (
+                "Ok(Delivery::Challenge(",
+                "Ok(Delivery::Notification(",
+                "challenge",
+            ),
+            (
+                "Ok(Delivery::Notification(",
+                "Ok(Delivery::Revocation",
+                "notification",
+            ),
+            (
+                "Ok(Delivery::Revocation",
+                "Ok(Delivery::Ignored)",
+                "revocation",
+            ),
+            (
+                "Ok(Delivery::Ignored)",
+                "Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody)",
+                "ignored",
+            ),
+            (
+                "Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody)",
+                "Err(EventSubError::InvalidChallenge)",
+                "ignored",
+            ),
+            (
+                "Err(EventSubError::InvalidChallenge)",
+                "Err(e) => {",
+                "ignored",
+            ),
+            ("Err(e) => {", "\n    }\n}\n\n#[cfg(test)]", "other"),
+        ] {
+            assert_classification(arm(start, end), kind);
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -416,6 +416,42 @@ identified, when a dead-letter or orphan names a stranded member, or when
 failures coincide with 429, DB-error or pool alerts — the fix then belongs
 to the on-call engineer, not another redeploy.
 
+#### Alert: voice join fast burn
+
+Creator joins are burning the 99.5%-moved-within-5 s error budget faster than
+14.4x in both the last hour and the last 5 minutes
+(`two_bot_voice_joins_received_total` minus benign `duplicate` refusals in
+`two_bot_voice_join_refused_total`, against
+`two_bot_voice_join_to_move_seconds_bucket{le="5"}`). Every non-duplicate
+refusal, failed move and slow (>5 s) move is burn. Each window needs at least
+10 genuine joins and two bad moves; one event alone cannot page or ticket.
+Receive counters lag one scrape so an in-flight move can complete. After startup
+or restart, a window stays inactive until its full history is available; a
+counter reset rebuilds the ring instead of firing.
+
+First response: confirm the spike is joins, not moves, via the authorized
+`/ops/metrics` scrape — compare `joins_received` growth against
+`voice_join_refused` by `reason` and `voice_operations{op="move"}` outcomes.
+`halted` means the actor is parked (check `two_bot_voice_worker_halted`);
+`unknown_creator`/`stale_ticket` point at creator-map or ticket generation
+drift; `discord`/`persistence` move outcomes point at REST or storage. Then
+read the container logs for `voice_event="voice_join_received"` refusal lines
+and `voice_event="voice_join"` terminal lines with their stage durations.
+
+Escalate when the burn persists across hours (the slow-burn ticket below will
+already be open), when `halted` refusals dominate, or when the stall matches a
+deploy — the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: voice join slow burn
+
+The same creator-join budget is burning faster than 6x in both the last 6
+hours and the last 30 minutes. This is the ticket-severity companion to the
+fast-burn page above: a moderate but sustained degradation — a slow leak of
+refusals or p95 creep past 5 s — that never spikes hard enough to page.
+Same signals, same first response, same escalation, lower urgency. Do not
+close it as "fast burn resolved": the fast window can clear while the slow
+grind continues.
+
 #### Alert: gateway missed events
 
 `two_bot_gateway_missed_events_total` increased between two keepalive
@@ -563,9 +599,9 @@ authorized `/ops/metrics` scrape — `pre_commit` means the commit was skipped
 after a funnel, leveling or acknowledgement failure, while `commit` means the
 durable store write itself failed. Once the process has restarted, the stage
 is not recoverable: the counter resets to zero and the Worker log line
-(`{"event":"container_gateway_failure","phase":…,"class":…}`) carries only
-`phase` and `class` — both stages map to `gateway_runtime_failed` — never
-the `stage`. Do not wait for the stage then; check the `gateway` component on
+(`{"event":"container_gateway_failure","phase":…,"class":…,"release":…,"worker_version":…}`)
+carries `phase` and `class` plus the `release`/`worker_version` tags — both
+stages map to `gateway_runtime_failed` — never the `stage`. Do not wait for the stage then; check the `gateway` component on
 `/readyz` and the Neon status for the staging branch instead: a `commit`
 failure next to DB-error or pool alerts points at the database, not the
 gateway. Do not restart manually: the process exits on its own after
@@ -1812,7 +1848,7 @@ into this Rust binary without an implemented dispatch path.
 | Attribution/scorecard/plan/onboarding/automation reports | Legacy read-only reporting CLIs intentionally dropped by parity decision; core calculations/store presence does not add operator commands. |
 | Staging provision/verify/reset and Discord e2e harness | Legacy tooling intentionally dropped; next uses local fixtures/agent-testdb and its own soak evidence. Never reset live/staging databases for tests. |
 | Preflight/exact-grant acceptance, Wave 0 exports, Wick whitelist, redesign/role cleanup | No equivalent next operator preflight/export/grant CLI identified. Core permission contracts are not live-grant proof; redesign and third-party dashboard verification are outside routine operations. |
-| Cutover import/backfill/capture/dedupe, dual-running, command registration, live identity/bot removal | Cutover tools are separate ports, **not dropped**. Execution is out of scope and has separate gates. This runbook cannot authorize activation, backfill, or legacy-bot removal. |
+| Cutover import/backfill/capture/dedupe, dual-running, command registration, live identity/bot removal | Cutover tools are separate ports, **not dropped**. Execution is out of scope and has separate gates. This runbook cannot authorize activation, backfill, or legacy-bot removal. Rate limits, cursors/resume, dry-run counts and failure anchors for backfills live in [backfill-runbook.md](backfill-runbook.md). |
 | Host bootstrap/systemd, 48-hour backups, logrotate/housekeeping | Deployment topology differs; timers remain templates. Host execution is broker/operator-owned, not an agent shell task or Container installation recipe. |
 | Secret storage/rotation and legacy credential filenames | Names/custody guidance retained, runtime spellings separated. No rotation commands: credential changes require separate approval and exact consumer wiring. |
 | Staging acceptance fixtures, hierarchy/grants, bot startup mapping and evidence | Replaced by next test-container/local-fixture coverage and the explicit staging soak. Legacy reset/provisioning evidence and contradictory historical status are not current next-runtime proof. |

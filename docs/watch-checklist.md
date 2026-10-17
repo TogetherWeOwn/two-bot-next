@@ -41,6 +41,8 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `dispatch_drops:<lane>` | **ticket**, not page: drops grow in 3 consecutive completed sample windows per bounded lane after a baseline; reactions include fairness refusals, not proof of gateway packet loss | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-dispatch-drops) |
 | `job_unknown_stale:<job>` | **ticket**, not page: job without a cadence entry with no success for more than 2 hours (never-succeeded is ignored; `session_checkpoint` is event-driven and excluded) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-unknown-stale) |
 | `gateway_checkpoint_failures` | any increase of `two_bot_gateway_checkpoint_failures_total` summed over every `stage` between samples (first sample is baseline-only; the 75 s runtime linger leaves ~3 s margin over a 60 s tick plus two 6 s probes for a pre-exit scrape) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-checkpoint-failures) |
+| `voice_join_fast_burn` | **page**: genuine creator joins burn the 99.5% move-within-5s budget faster than 14.4x in both the 1 h and 5 min windows (each needs at least 10 joins and two bad moves; incomplete startup/restart windows stay inactive) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-join-fast-burn) |
+| `voice_join_slow_burn` | **ticket**: genuine creator joins burn the 99.5% move-within-5s budget faster than 6x in both the 6 h and 30 min windows (each uses the same volume and bad-move floors) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-join-slow-burn) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via

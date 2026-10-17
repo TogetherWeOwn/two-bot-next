@@ -228,10 +228,11 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     },
     TableSpec { table: "self_role_panel_claims", measure: TableMeasure::Columns(&["processing_expires_at"]) },
     TableSpec { table: "sticky_messages", measure: TableMeasure::Columns(&["updated_at"]) },
-    // Claim/stamp transitions rewrite delivered_at without touching
-    // claimed_at, so the maximum across both is the row's last write (same
-    // shape as tickets). Migration 0440.
-    TableSpec { table: "stream_live_claims", measure: TableMeasure::Columns(&["claimed_at", "delivered_at"]) },
+    // Claim/start/stamp/takeover transitions rewrite claimed_at,
+    // send_started_at and delivered_at without touching the others, so the
+    // maximum across all three is the row's last write (same shape as
+    // tickets). Migrations 0440/0443.
+    TableSpec { table: "stream_live_claims", measure: TableMeasure::Columns(&["claimed_at", "send_started_at", "delivered_at"]) },
     TableSpec { table: "ticket_transcripts", measure: TableMeasure::Columns(&["created_at"]) },
     // Status/close transitions rewrite these columns without touching
     // created_at, so the maximum across all three is the row's last write.

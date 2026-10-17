@@ -254,10 +254,10 @@ fn valid_subscription_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Classify a **verified** delivery. Call [`verify_delivery`] first. For a
-/// verified notification, classification errors are deterministic; the receiver
-/// must acknowledge them with 2xx rather than invite Twitch retries. Reserve
-/// non-2xx responses for transient send or durable-ledger failures.
+/// Classify a **verified** delivery. Call [`verify_delivery`] first. The
+/// receiver acknowledges known deterministic notification errors with 2xx rather
+/// than inviting Twitch retries. Unknown/future classification errors remain
+/// retryable; transient send or durable-ledger failures are also non-2xx.
 pub fn classify(message_type: &str, body: &[u8]) -> Result<Delivery, EventSubError> {
     if !matches!(
         message_type,

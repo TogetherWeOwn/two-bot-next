@@ -105,7 +105,9 @@ import {
   type MetricsAlertState,
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
+import { parseRelease, releaseTag, workerVersionTag } from "./error-events.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
+import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
 import { handleMcp } from "./mcp.ts";
 import {
   OPS_DASHBOARD_PATH,
@@ -625,6 +627,10 @@ export class TwoBotContainer extends Container<Env> {
   private readonly ownership = new OwnershipFence(this.ctx.storage);
   private readonly initialization: Promise<void>;
   private recoveryFailed = false;
+  // Last container git SHA seen on /readyz this tick. Tags the keepalive
+  // error events (gateway failures by class; metrics alerts by rule/content);
+  // a failed probe leaves "unknown" rather than a stale release from a replaced image.
+  private lastRelease: string | null = null;
   private static readonly KEEPALIVE_KEY = "two-bot:keepalive:v1";
 
   constructor(ctx: DurableObjectState<{}>, env: Env) {
@@ -866,9 +872,13 @@ export class TwoBotContainer extends Container<Env> {
    */
   private async internalActions(request: Request): Promise<Response> {
     if (!ingressEnabled(this.env) || !isActionsRequest(request)) return notFound();
-    const checked = allowlistedHeaders(request.headers);
+    // The Worker's stamped id (or a fresh one): the forward already carries
+    // it via the allowlisted headers, and these envelopes echo it so a 503
+    // still joins the flow's Worker and container logs.
+    const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
+    const checked = allowlistedHeaders(request.headers, requestId);
     if ("refusal" in checked) return checked.refusal;
-    const body = await readBody(request);
+    const body = await readBody(request, requestId);
     if ("refusal" in body) return body.refusal;
     const forward = forwardRequest(
       `http://c${ACTIONS_PATH}`,
@@ -879,17 +889,17 @@ export class TwoBotContainer extends Container<Env> {
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
-        if (!this.ctx.container?.running) return envelope(503, "unavailable", true);
+        if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
         try {
-          return await relayReceiverResponse(await this.containerFetch(forward, RECEIVER_PORT));
+          return await relayReceiverResponse(await this.containerFetch(forward, RECEIVER_PORT), requestId);
         } catch {
-          return envelope(503, "unavailable", true);
+          return envelope(503, "unavailable", true, {}, requestId);
         }
       });
     } catch (error) {
       // Logs the closed ownership reason; the caller only sees the envelope.
       refused(error);
-      return envelope(503, "unavailable", true);
+      return envelope(503, "unavailable", true, {}, requestId);
     }
   }
 
@@ -904,9 +914,12 @@ export class TwoBotContainer extends Container<Env> {
    */
   private async internalEventsub(request: Request): Promise<Response> {
     if (!eventsubIngressEnabled(this.env) || !isEventsubRequest(request)) return notFound();
-    const checked = eventsubAllowlistedHeaders(request.headers);
+    // Same join as the actions path above: the forward carries the stamped
+    // id, and these envelopes echo it so a 503 still joins the flow's logs.
+    const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
+    const checked = eventsubAllowlistedHeaders(request.headers, requestId);
     if ("refusal" in checked) return checked.refusal;
-    const body = await readEventsubBody(request);
+    const body = await readEventsubBody(request, requestId);
     if ("refusal" in body) return body.refusal;
     const forward = forwardRequest(
       `http://c${EVENTSUB_PATH}`,
@@ -917,17 +930,17 @@ export class TwoBotContainer extends Container<Env> {
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
-        if (!this.ctx.container?.running) return envelope(503, "unavailable", true);
+        if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
         try {
-          return await relayEventsubResponse(await this.containerFetch(forward, EVENTSUB_RECEIVER_PORT));
+          return await relayEventsubResponse(await this.containerFetch(forward, EVENTSUB_RECEIVER_PORT), requestId);
         } catch {
-          return envelope(503, "unavailable", true);
+          return envelope(503, "unavailable", true, {}, requestId);
         }
       });
     } catch (error) {
       // Logs the closed ownership reason; the caller only sees the envelope.
       refused(error);
-      return envelope(503, "unavailable", true);
+      return envelope(503, "unavailable", true, {}, requestId);
     }
   }
 
@@ -1141,14 +1154,21 @@ export class TwoBotContainer extends Container<Env> {
             // is a failed probe, never a buffered parse. Small bodies still
             // drain fully, so the SDK 0.3.7 proxy pipe settles cleanly.
             const body = await readBoundedText(res, MAX_PROBE_BODY_BYTES);
+            // Refresh the release tag before any error event below: a failed
+            // probe must not reuse a previous image's SHA.
+            this.lastRelease = null;
             if (body === null) {
               status = null;
               console.warn("two-bot keepalive probe failed");
             } else {
-              const failure = isBotProbeResponse(res) ? gatewayFailure(body) : null;
+              const botBody = isBotProbeResponse(res);
+              const failure = botBody ? gatewayFailure(body) : null;
+              this.lastRelease = botBody ? parseRelease(body) : null;
               if (failure) {
                 console.warn(JSON.stringify({
                   event: "container_gateway_failure", phase: failure.phase, class: failure.class,
+                  release: releaseTag(this.lastRelease),
+                  worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
                 }));
               }
             }
@@ -1158,6 +1178,7 @@ export class TwoBotContainer extends Container<Env> {
               throw error;
             }
             status = null;
+            this.lastRelease = null;
             console.warn("two-bot keepalive probe failed");
           }
           await this.recordReadiness(status);
@@ -1265,7 +1286,11 @@ export class TwoBotContainer extends Container<Env> {
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);
       for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses)) {
-        console.warn(JSON.stringify({ event: "metrics_alert", service: "two-bot-next", content }));
+        console.warn(JSON.stringify({
+          event: "metrics_alert", service: "two-bot-next", content,
+          release: releaseTag(this.lastRelease),
+          worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+        }));
         await this.postWebhookText(content);
       }
     } catch {
@@ -1483,8 +1508,9 @@ export default {
         });
       }
       // Sanitize the forwarded probe: keep the origin (Host) the Container
-      // expects, but drop the query, caller headers and body. The only header
-      // the DO sees is the Worker-stamped deployment id the fence requires.
+      // expects, but drop the query, caller headers and body. The DO sees the
+      // Worker-stamped deployment id the fence requires, plus the validated
+      // `x-request-id` so the container's request span joins this probe.
       const clean = new URL(request.url);
       clean.search = "";
       clean.hash = "";
@@ -1494,11 +1520,12 @@ export default {
       try {
         deployment = deploymentId(env.CF_VERSION_METADATA?.id);
       } catch (error) { return refused(error); }
+      const probeId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
       let response: Response;
       try {
         const sanitized = new Request(clean.toString(), {
           method: request.method,
-          headers: { [DEPLOYMENT_HEADER]: deployment },
+          headers: { [DEPLOYMENT_HEADER]: deployment, [REQUEST_ID_HEADER]: probeId },
         });
         const upstream = await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         // SDK startup failures arrive as responses rather than rejections.
