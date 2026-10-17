@@ -497,7 +497,9 @@ is burning faster than 12x in both the last 15 minutes and the last 2 minutes
 spend). Each window needs at least 10 eligible requests and two budget errors;
 one bad minute alone never pages. After startup or restart, a window stays
 inactive until its full history is available; a counter reset rebuilds the
-window history instead of firing. Window edges land on whole keepalive scrapes,
+window history instead of firing. A scrape gap never resolves a firing page by
+itself: a window without coverage holds the existing state, and only full
+coverage below threshold resolves. Window edges land on whole keepalive scrapes,
 so a burn sustained exactly at the policy rate reads up to ~1% low and the
 comparison carries that allowance instead of flapping.
 

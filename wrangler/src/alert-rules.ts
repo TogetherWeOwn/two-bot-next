@@ -163,6 +163,14 @@ export const ERROR_BUDGET_FAST_LONG_SECONDS = 900;
 export const ERROR_BUDGET_FAST_SHORT_SECONDS = 120;
 /** Burn snapshots older than the long window plus this margin are pruned. */
 export const ERROR_BUDGET_FAST_HISTORY_MARGIN_SECONDS = 120;
+/**
+ * A window baseline older than its boundary plus this tolerance is stale, not
+ * covering: keepalive scrapes land about every 60 s (slower when a probe is
+ * slow), so a baseline up to two nominal intervals past the boundary is still
+ * ordinary scrape alignment, while an older one means a boundary scrape was
+ * missed and the window would sweep errors from outside the claimed span.
+ */
+export const ERROR_BUDGET_FAST_BASELINE_TOLERANCE_SECONDS = 120;
 /** A burn window with fewer eligible REST requests than this never fires. */
 export const ERROR_BUDGET_FAST_MIN_EVENTS = 10;
 /** A burn window with fewer budget errors than this never fires. */
@@ -334,11 +342,15 @@ interface ErrorBudgetBurnResult {
  * series are absent or malformed and the ring is carried unchanged; a
  * backwards counter (process restart) rebuilds the ring from this sample
  * and fires nothing. Otherwise the sample is appended, entries older than
- * the long window plus margin are pruned, and each window burns as
+ * the long window plus margin are pruned but the newest pre-cutoff snapshot
+ * is always kept as the long-window anchor, and each window burns as
  * errors / (requests x budget) against the threshold. A window fires only
- * with full history coverage (a sample at or before its start), enough
- * eligible requests, and at least two budget errors, so fresh rings,
- * quiet traffic and one bad minute stay silent.
+ * with full history coverage (a sample at or before its start and no older
+ * than the boundary plus the baseline tolerance), enough eligible requests,
+ * and at least two budget errors, so fresh rings, quiet traffic and one bad
+ * minute stay silent. A window without coverage is unknown rather than
+ * quiet: the caller holds an existing firing state instead of resolving a
+ * page on missing history, and only full coverage below threshold resolves.
  */
 function errorBudgetBurnEvaluation(
   samples: Sample[],
@@ -369,27 +381,49 @@ function errorBudgetBurnEvaluation(
     return { fast: false, held: false, ring: [snapshot] };
   }
   const cutoff = nowSeconds - ERROR_BUDGET_FAST_LONG_SECONDS - ERROR_BUDGET_FAST_HISTORY_MARGIN_SECONDS;
-  const next = [...ring.filter((s) => s.t > cutoff && s.t <= nowSeconds), snapshot];
-  const burn = (windowSeconds: number): number | undefined => {
+  const keep = ring.filter((s) => s.t > cutoff && s.t <= nowSeconds);
+  // Anchor: always retain the newest pre-cutoff snapshot. A failed scrape
+  // never evaluates, so after a scrape gap the first samples past the gap
+  // have no baseline at or before the long-window start; without the anchor
+  // a still-firing burn reads as uncovered and spuriously resolves, then
+  // re-pages on the next scrape. Counters are cumulative, so the anchored
+  // delta still measures exactly the errors and requests since the anchor.
+  const anchor = [...ring].reverse().find((s) => s.t <= cutoff);
+  const next = [...(anchor ? [anchor] : []), ...keep, snapshot];
+  // A window is a measured rate, an unknown coverage gap, or a covered quiet
+  // window. Unknown holds an existing page; only a covered window below the
+  // volume floors or the threshold resolves one.
+  const burn = (windowSeconds: number): { rate: number } | { unknown: true } | { quiet: true } => {
     let base: ErrorBudgetBurnSnapshot | undefined;
     for (const s of next) {
       if (s.t <= nowSeconds - windowSeconds) base = s;
     }
     // No sample at or before the window start means the ring does not yet
     // cover this full window, so wait for history rather than firing.
-    if (base === undefined) return undefined;
+    if (base === undefined) return { unknown: true };
+    // A baseline older than the boundary plus the scrape-alignment tolerance
+    // means a boundary scrape was missed: the window would sweep errors from
+    // outside the claimed span, so treat it as unknown rather than paging on
+    // stale errors.
+    if (nowSeconds - windowSeconds - base.t > ERROR_BUDGET_FAST_BASELINE_TOLERANCE_SECONDS) {
+      return { unknown: true };
+    }
     const windowTotal = total - base.total;
     const windowErrors = errors - base.errors;
-    if (windowTotal < ERROR_BUDGET_FAST_MIN_EVENTS) return undefined;
-    if (windowErrors < ERROR_BUDGET_FAST_MIN_ERRORS) return undefined;
-    return windowErrors / (windowTotal * ERROR_BUDGET_RATIO);
+    if (windowTotal < ERROR_BUDGET_FAST_MIN_EVENTS) return { quiet: true };
+    if (windowErrors < ERROR_BUDGET_FAST_MIN_ERRORS) return { quiet: true };
+    return { rate: windowErrors / (windowTotal * ERROR_BUDGET_RATIO) };
   };
   const threshold = ERROR_BUDGET_FAST_BURN * (1 - ERROR_BUDGET_FAST_TOLERANCE);
   const longBurn = burn(ERROR_BUDGET_FAST_LONG_SECONDS);
   const shortBurn = burn(ERROR_BUDGET_FAST_SHORT_SECONDS);
   return {
-    fast: longBurn !== undefined && shortBurn !== undefined && longBurn >= threshold && shortBurn >= threshold,
-    held: false,
+    fast:
+      "rate" in longBurn &&
+      "rate" in shortBurn &&
+      longBurn.rate >= threshold &&
+      shortBurn.rate >= threshold,
+    held: "unknown" in longBurn || "unknown" in shortBurn,
     ring: next,
   };
 }

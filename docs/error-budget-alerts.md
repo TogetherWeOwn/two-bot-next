@@ -55,9 +55,10 @@ Assumed rate ~2.8 events/s. 48h gives 480,000 eligible events, so the
 watch budget is 480 errors. Allowed errors per window = burn x 0.001 x
 window events:
 
-- Fast burn calls for a manual page at 30 errors in 15 minutes
-  (12 x 0.001 x 2,500), confirmed by 4 errors in 2 minutes
-  (12 x 0.001 x ~333, rounded up).
+- Fast burn triggers the automatic `error_budget_fast_burn` page at 30 errors
+  in 15 minutes (12 x 0.001 x 2,500), confirmed by 4 errors in 2 minutes
+  (12 x 0.001 x ~333, rounded up). Manual evaluation is only the checkpoint
+  fallback below, not the routine fast-burn path.
 - Slow burn calls for a manually opened ticket at 60 errors in 2 hours
   (3 x 0.001 x 20,000), confirmed by 8 errors in 15 minutes
   (3 x 0.001 x 2,500, rounded up).
