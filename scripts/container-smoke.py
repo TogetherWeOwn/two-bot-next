@@ -31,7 +31,15 @@ IMAGE_MAX_BYTES = 112 * MIB
 # (15.04 MiB) before the event-executor merge; the combined-head
 # measurement comes from hosted CI on the merged head. 16 MiB restores a
 # working tripwire with headroom; revisit if the binary approaches it.
-BINARY_MAX_BYTES = 16 * MIB
+# 2026-10-17 recalibration: main at 89c859b measured 16,777,376 bytes
+# (16.00 MiB + 160 bytes) in the container smoke job (run 39061354880,
+# job 117479846522), and the PR-1093 merge_group against the same base
+# measured the identical 16,777,376 bytes (run 39061090833). The stream
+# retention-expiry slice (ac8fd66, fence-preserving expiry of delivered
+# go-live dedup rows) tipped the full 16 MiB budget with no new
+# dependencies and no release-profile change. 17 MiB restores the tripwire
+# with 1,048,416 bytes (1.00 MiB, 5.9%) headroom; revisit if approached.
+BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"

@@ -132,8 +132,8 @@ unpacked snapshots and is logged separately, not compared to that ceiling.
 See [Docker's store documentation](https://docs.docker.com/engine/storage/containerd/)
 and [Moby's layer-history implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_history.go).
 The 112 MiB image ceiling is unchanged. The binary budget was 15 MiB at the
-2026-10-01 calibration and is now 16 MiB; the 2026-10-10 measurements below
-explain the tighter tripwire.
+2026-10-01 calibration, 16 MiB after the 2026-10-10 measurements below, and
+is now 17 MiB (2026-10-17 recalibration at the end of this section).
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
 at source `307b50708ec42e8fc4744c1b804216a22a17625e`. The 2026-09-30
@@ -160,6 +160,18 @@ The 16 MiB working tripwire leaves 1,006,288 bytes (0.96 MiB, 6.4%) above the
 event-executors measurement. No new dependencies or release-profile changes;
 revisit if the binary approaches the limit. The 112 MiB image ceiling is
 unchanged.
+
+On 2026-10-17, main at `89c859b` measured 16,777,376 bytes (16.00 MiB +
+160 bytes) in the [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39061354880/job/117479846522),
+and the PR-1093 merge_group against the same base measured the identical
+16,777,376 bytes in [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39061090833).
+The stream retention-expiry slice (`ac8fd66`, fence-preserving expiry of
+delivered go-live dedup rows) tipped the full 16 MiB budget with no new
+dependencies and no release-profile change. The x1.4 rule would yield
+23 MiB, but the budget is set to 17 MiB instead to retain a useful
+tripwire: 1,048,416 bytes (1.00 MiB, 5.9%) of headroom above the measured
+16,777,376 bytes. The 112 MiB image ceiling is unchanged; the
+release-binary ceiling is now 17 MiB.
 
 This branch's automation-only head separately measured 15,769,872 bytes
 (15.04 MiB) before the event-executor merge. This PR keeps the current-main
@@ -202,7 +214,7 @@ The unused streamed-archive helper and its archive-specific builders/tests
 have been removed in favor of main's history metric; the smoke/runtime
 contract fixtures remain.
 
-The 112 MiB image ceiling is unchanged; the release-binary ceiling is 16 MiB
+The 112 MiB image ceiling is unchanged; the release-binary ceiling is 17 MiB
 (see the current calibration above). CI on this PR's exact head must still
 record the corrected image size and pass the runtime contract and both
 one-byte-budget negative checks; fixture success alone cannot establish
