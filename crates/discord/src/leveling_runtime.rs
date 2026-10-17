@@ -34,8 +34,8 @@ use two_bot_core::{
 use two_bot_core::automod_runtime::FunnelDisposition;
 
 use crate::{
-    pipeline::MessageEligibility, ActionExecutor, DiscordError, InviteSource, NoClassification,
-    NoInvites, Pipeline, PipelineSnapshots,
+    pipeline::MessageEligibility, ActionExecutor, DiscordError, InviteSource, NoInvites, Pipeline,
+    PipelineSnapshots, SettingsChannelClassifier,
 };
 
 /// Failures propagate to the gateway supervisor; Display never includes SQL
@@ -190,9 +190,26 @@ impl DeferredCommunityFacts {
     /// the process environment. Called once at boot when
     /// `TWO_COMMUNITY_SCORECARD=1`; tests call it with their fixture pool.
     pub fn enable(&self, pool: PgPool) {
+        self.enable_with_config(pool, ClassifierConfig::from_env());
+    }
+
+    /// Arm Postgres capture with an explicit classifier config, so the
+    /// caller can seed the channel classifier from the same config and
+    /// the two never disagree.
+    pub fn enable_with_config(&self, pool: PgPool, config: ClassifierConfig) {
         let mut state = self.0.lock().expect("community facts lock");
         state.pool = Some(pool);
-        state.config = ClassifierConfig::from_env();
+        state.config = config;
+    }
+
+    /// Replace the classifier config used at record/drain time. Paired
+    /// with the channel classifier refresh in
+    /// [`OrderedLevelingPipeline::refresh_classifier_config`].
+    pub fn refresh_config(&self, config: ClassifierConfig) {
+        let mut state = self.0.lock().expect("community facts lock");
+        if state.config != config {
+            state.config = config;
+        }
     }
 
     /// Take every buffered gate-clearing, leaving that buffer empty. Order is
@@ -588,7 +605,9 @@ impl LevelingRuntime {
 /// persistent gateway runner seeds both from the store, while unit and
 /// database tests keep the in-memory defaults.
 pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots> {
-    pipeline: Pipeline<S, DeferredLeveling, DeferredCommunityFacts, I, NoClassification, P>,
+    pipeline:
+        Pipeline<S, DeferredLeveling, DeferredCommunityFacts, I, SettingsChannelClassifier, P>,
+    classifier: SettingsChannelClassifier,
     pending: DeferredLeveling,
     facts: DeferredCommunityFacts,
     dispatch: tokio::sync::Mutex<()>,
@@ -599,14 +618,16 @@ impl<S: FunnelStore> OrderedLevelingPipeline<S> {
     pub fn new(store: S, runtime: Option<LevelingRuntime>) -> Self {
         let pending = DeferredLeveling::default();
         let facts = DeferredCommunityFacts::default();
+        let classifier = SettingsChannelClassifier::new(ClassifierConfig::from_env());
         Self {
             pipeline: Pipeline::new(
                 store,
                 Some(pending.clone()),
                 Some(facts.clone()),
                 NoInvites,
-                NoClassification,
+                classifier.clone(),
             ),
+            classifier,
             pending,
             facts,
             dispatch: tokio::sync::Mutex::new(()),
@@ -624,15 +645,17 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
     ) -> Self {
         let pending = DeferredLeveling::default();
         let facts = DeferredCommunityFacts::default();
+        let classifier = SettingsChannelClassifier::new(ClassifierConfig::from_env());
         Self {
             pipeline: Pipeline::with_snapshots(
                 store,
                 Some(pending.clone()),
                 Some(facts.clone()),
                 invite_source,
-                NoClassification,
+                classifier.clone(),
                 snapshots,
             ),
+            classifier,
             pending,
             facts,
             dispatch: tokio::sync::Mutex::new(()),
@@ -647,7 +670,20 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
     /// Arm Postgres community-facts capture for all live streams. Called once at boot when `TWO_COMMUNITY_SCORECARD=1`; without
     /// it the sink drops every fact, exactly like the previous no-op seam.
     pub fn enable_community_facts(&self, pool: PgPool) {
-        self.facts.enable(pool);
+        // One config load seeds both the facts sink and the channel
+        // classifier, so classification at record time and the stamped
+        // channel class always read the same sets.
+        let config = ClassifierConfig::from_env();
+        self.facts.enable_with_config(pool, config.clone());
+        self.classifier.refresh(config);
+    }
+
+    /// Refresh the classifier config live (settings poll): the channel
+    /// classifier and the facts sink swap together, so a stored channel
+    /// set reclassifies without a restart and the two never disagree.
+    pub fn refresh_classifier_config(&self, config: ClassifierConfig) {
+        self.facts.refresh_config(config.clone());
+        self.classifier.refresh(config);
     }
 
     /// Persist buffered community facts without holding the async
@@ -762,6 +798,50 @@ mod tests {
             source_event_id: format!("100:{member_id}:rules"),
             source,
         }
+    }
+
+    #[test]
+    fn refresh_classifier_config_swaps_classifier_and_sink_together() {
+        use crate::ChannelClassifier as _;
+        use two_bot_core::ChannelClass;
+
+        const HUMAN: u64 = 200_000_000_000_000_001;
+        let pipeline = OrderedLevelingPipeline::new(two_bot_core::MemStore::new(), None);
+        assert_eq!(pipeline.classifier.classify(HUMAN), ChannelClass::Other);
+
+        let config = ClassifierConfig::from_map(
+            &[
+                ("TWO_COMMUNITY_CLASSIFIER_VERSION", "community-v9"),
+                ("TWO_COMMUNITY_HUMAN_CHANNEL_IDS", "200000000000000001"),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+        );
+        pipeline.refresh_classifier_config(config);
+
+        assert_eq!(pipeline.classifier.classify(HUMAN), ChannelClass::Human);
+        let state = pipeline.facts.0.lock().expect("community facts lock");
+        assert_eq!(state.config.version, "community-v9");
+        assert_eq!(state.config.channel_class(HUMAN), ChannelClass::Human);
+    }
+
+    #[tokio::test]
+    async fn enable_with_config_arms_the_sink_with_the_given_config() {
+        let buffer = DeferredCommunityFacts::new();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let config = ClassifierConfig::from_map(
+            &[("TWO_COMMUNITY_CLASSIFIER_VERSION", "community-v7")]
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        );
+        buffer.enable_with_config(pool, config);
+        let state = buffer.0.lock().expect("community facts lock");
+        assert!(state.pool.is_some());
+        assert_eq!(state.config.version, "community-v7");
     }
 
     #[test]

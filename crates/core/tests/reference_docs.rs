@@ -58,7 +58,7 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   Keys in\n\
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\
-The thirty-two keys in `STORE_READ_KEYS`\n\
+The thirty-four keys in `STORE_READ_KEYS`\n\
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and\n\
@@ -82,7 +82,11 @@ sweep (`crates/bot/src/audit_runtime.rs`), where blanking all three parks the\n\
 mirror live and a malformed row keeps the last good destinations; ticket operations apply\n\
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and\n\
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery\n\
-and purge (`crates/bot/src/ticket_runtime.rs`). Three boot-only edges\n\
+and purge (`crates/bot/src/ticket_runtime.rs`); the gateway funnel applies\n\
+`TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`\n\
+from the snapshot on every guild message, refreshing the channel classifier\n\
+and the community-facts sink together before the message's channel class is\n\
+stamped (`crates/bot/src/gateway.rs`, `crates/discord/src/leveling_runtime.rs`). Three boot-only edges\n\
 remain: the feed supervisor still wakes on the boot cadence, so a stored\n\
 interval change takes effect no earlier than the previously scheduled slot\n\
 and runs at the stored value rounded up to a multiple of the boot cadence\n\
@@ -109,8 +113,11 @@ When voice is enabled, `build_production_runtime` also reads\n\
 `TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely\n\
 for delete protection, not creator provisioning. Its empty grace is fixed at\n\
 60 seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600) sets it.\n\
-Onboarding, automod, scorecard and classifier typed loaders exist but are not\n\
-called during boot; their defaults below come from empty-map calls. The separate\n\
+Onboarding, automod and scorecard typed loaders exist but are not\n\
+called during boot; their defaults below come from empty-map calls. The\n\
+classifier loader runs when the ordered pipeline is built and again when\n\
+community-facts capture is armed, then refreshes live per guild message as\n\
+above. The separate\n\
 `preflight` operator CLI validates further catalog keys from the environment\n\
 (channel references, panels, onboarding mode) as a read-only pre-deploy check;\n\
 it applies nothing to the running gateway.\n\n\
@@ -209,6 +216,8 @@ const STORE_READ_KEYS: &[&str] = &[
     "DISCORD_TICKET_PANEL_CHANNEL_ID",
     "DISCORD_TICKET_STAFF_ROLE_ID",
     "DISCORD_VOICE_LOG_CHANNEL_ID",
+    "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
+    "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
 ];
 
 fn repository_root() -> PathBuf {
@@ -383,6 +392,8 @@ fn setting_defaults() -> BTreeMap<&'static str, Value> {
         ("TWO_COMMUNITY_STAGING_GUILD_IDS", json!(classifier.staging_guild_ids)),
         ("TWO_COMMUNITY_STAGING_ACTOR_IDS", json!(classifier.staging_actor_ids)),
         ("TWO_COMMUNITY_TEST_ACTOR_IDS", json!(classifier.test_actor_ids)),
+        ("TWO_COMMUNITY_HUMAN_CHANNEL_IDS", json!(classifier.human_channel_ids)),
+        ("TWO_COMMUNITY_WELCOME_CHANNEL_IDS", json!(classifier.welcome_channel_ids)),
     ])
 }
 
