@@ -17,9 +17,11 @@ since Environment settings can drift.
    reviewers, only a branch policy. Add a required reviewer before any
    rollback or live-SHA cure: the guard refuses staging-history waivers
    without human reviewers even with `PRODUCTION_AUTO_APPROVE=true`.
-2. The `PRODUCTION_WORKER_URL` variable holds the production Worker's
-   `https://` URL. It must differ from `STAGING_WORKER_URL`. The deploy job
-   refuses when it is unset, not an `https://` URL, or equal to staging.
+2. The repository-level `PRODUCTION_WORKER_URL` variable holds the production
+   Worker's `https://` URL. It must differ from `STAGING_WORKER_URL`. Keep this
+   as the single source for both deploy and passive synthetic checks: remove any
+   production-Environment override of the same name. The deploy job refuses
+   when it is unset, not an `https://` URL, or equal to staging.
 3. Optionally add production-scoped `CLOUDFLARE_API_TOKEN` /
    `CLOUDFLARE_ACCOUNT_ID` secrets. Environment secrets override the
    repository secrets that staging uses.
@@ -273,8 +275,8 @@ signal.
 new secret surface. `PRODUCTION_OWNERSHIP_CONTROL_TOKEN` (Environment
 secret, ≥32 chars; provisioning/rotation is a separate governed step, never
 part of takeover) is read only inside the `production`-gated job and never
-forwarded into the container. `PRODUCTION_WORKER_URL` (Environment variable,
-non-secret) must be `https://` and differ from `STAGING_WORKER_URL`; the job
+forwarded into the container. `PRODUCTION_WORKER_URL` (repository-level
+non-secret variable) must be `https://` and differ from `STAGING_WORKER_URL`; the job
 and the client both refuse otherwise, and the client never follows redirects.
 Receipts, logs and cards name only bindings, version IDs and fixed refusal
 words — never secret values.
