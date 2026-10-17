@@ -2610,17 +2610,17 @@ mod tests {
             "entry": [{"id": "1234567890", "time": 1_760_000_000, "changes": realistic_changes}]})
         .to_string();
         assert!(
-            realistic.as_bytes().len() > 64 * 1024,
+            realistic.len() > 64 * 1024,
             "realistic batch must exceed the old 64 KiB cap: {} bytes",
-            realistic.as_bytes().len()
+            realistic.len()
         );
         assert!(
-            realistic.as_bytes().len() < FB_WEBHOOK_MAX_BODY_BYTES,
+            realistic.len() < FB_WEBHOOK_MAX_BODY_BYTES,
             "realistic batch must fit the 1 MiB cap: {} bytes",
-            realistic.as_bytes().len()
+            realistic.len()
         );
-        let parsed = parse_envelope(realistic.as_bytes())
-            .expect("realistic 1000-change batch parses");
+        let parsed =
+            parse_envelope(realistic.as_bytes()).expect("realistic 1000-change batch parses");
         assert_eq!(parsed.changes.len(), FB_WEBHOOK_MAX_CHANGES);
         // Invalid UTF-8 never panics the JSON parser.
         assert!(parse_envelope(&[0xff, 0xfe, 0x00]).is_err());
