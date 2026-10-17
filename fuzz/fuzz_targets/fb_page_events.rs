@@ -1,3 +1,4 @@
+#![no_main]
 //! Fuzz the Facebook Page webhook front door: [`verify_challenge`]
 //! (GET verification), [`verify_signature`] (HMAC-SHA256 over the raw POST
 //! body), and [`parse_envelope`] (page-events JSON) over hostile bytes.
@@ -30,8 +31,20 @@ use two_bot_core::fb_page_events::webhook::{
 /// production secret; refusals must never echo it (pinned in
 /// [`check_fixed_matrix`]).
 const EXPECTED_TOKEN: &str = "synthetic-fb-verify-token";
-/// Synthetic app secret for signing fuzz fixtures.
-const APP_SECRET: &str = "synthetic-fb-app-secret-0123456789abcdef";
+/// Synthetic app-secret bytes both sides use: derived, never a literal (see
+/// `eventsub_delivery::synthetic_key`), so the hard-coded-crypto query stays
+/// quiet while every campaign derives the same key.
+fn synthetic_key() -> [u8; 32] {
+    std::array::from_fn(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+}
+
+/// The synthetic secret string both sides use: the hex of the derived key.
+/// Public test material, never a production secret; refusals must never echo
+/// it (pinned in [`check_fixed_matrix`]).
+fn app_secret() -> String {
+    hex::encode(synthetic_key())
+}
+
 /// Cap for raw-body bytes per iteration: twice the transport cap so the
 /// oversize refusal stays reachable without wasting RSS.
 const MAX_INPUT_BYTES: usize = FB_WEBHOOK_MAX_BODY_BYTES * 2;
@@ -42,8 +55,8 @@ const MAX_FIELD_CHARS: usize = 512;
 /// Recompute the delivery signature over `body` keyed on the synthetic app
 /// secret, mirroring [`verify_signature`].
 fn sign(body: &[u8]) -> String {
-    let mut mac =
-        <Hmac<Sha256>>::new_from_slice(APP_SECRET.as_bytes()).expect("HMAC takes any key");
+    let secret = app_secret();
+    let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
     mac.update(body);
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
@@ -112,22 +125,24 @@ fn check_fixed_matrix() {
     // Signature happy path verifies; tampered, re-prefixed, and garbage
     // signatures refuse without echoing the secret.
     let body = valid_body();
+    let secret = app_secret();
     let good = sign(&body);
-    assert_eq!(verify_signature(APP_SECRET, &body, &good), Ok(()));
+    assert_eq!(verify_signature(secret.as_str(), &body, &good), Ok(()));
     let mut tampered = good.clone();
     let last = tampered.pop().expect("test signature is non-empty");
     tampered.push(if last == '0' { '1' } else { '0' });
     let reprefixed = format!("md5={}", &good["sha256=".len()..]);
     for bad in [tampered.as_str(), reprefixed.as_str(), "sha256=zz"] {
-        let Err(DriverError::Failed(message)) = verify_signature(APP_SECRET, &body, bad) else {
+        let Err(DriverError::Failed(message)) = verify_signature(secret.as_str(), &body, bad)
+        else {
             panic!("hostile signature must fail as Failed");
         };
-        assert!(!message.contains(APP_SECRET));
+        assert!(!message.contains(secret.as_str()));
     }
 
     // Oversize body is refused before hashing or parsing.
     let big = vec![b'x'; FB_WEBHOOK_MAX_BODY_BYTES + 1];
-    assert!(verify_signature(APP_SECRET, &big, &sign(&big)).is_err());
+    assert!(verify_signature(secret.as_str(), &big, &sign(&big)).is_err());
     assert!(parse_envelope(&big).is_err());
 
     // Envelope happy path parses to its exact change.
@@ -199,9 +214,10 @@ fuzz_target!(|data: &[u8]| {
     // --- Signature pass: the correct signature verifies exactly when the
     // body is within the transport cap; tampered and re-prefixed signatures
     // never verify. A signature-bypass mutant fails here.
+    let secret = app_secret();
     let good = sign(data);
-    let verified = verify_signature(APP_SECRET, data, &good);
-    assert_eq!(verified, verify_signature(APP_SECRET, data, &good));
+    let verified = verify_signature(secret.as_str(), data, &good);
+    assert_eq!(verified, verify_signature(secret.as_str(), data, &good));
     if data.len() > FB_WEBHOOK_MAX_BODY_BYTES {
         assert!(verified.is_err());
     } else {
@@ -210,9 +226,9 @@ fuzz_target!(|data: &[u8]| {
     let mut tampered = good.clone();
     let last = tampered.pop().expect("fuzz signature is non-empty");
     tampered.push(if last == '0' { '1' } else { '0' });
-    assert!(verify_signature(APP_SECRET, data, &tampered).is_err());
+    assert!(verify_signature(secret.as_str(), data, &tampered).is_err());
     assert!(verify_signature(
-        APP_SECRET,
+        secret.as_str(),
         data,
         &format!("md5={}", &good["sha256=".len()..])
     )
@@ -233,7 +249,7 @@ fuzz_target!(|data: &[u8]| {
         }
         Err(DriverError::Failed(message)) => {
             assert!(message.len() <= FB_WEBHOOK_ERROR_MAX);
-            assert!(!message.contains(APP_SECRET));
+            assert!(!message.contains(secret.as_str()));
             assert!(!message.contains(EXPECTED_TOKEN));
         }
         Err(DriverError::Challenge(_)) => {

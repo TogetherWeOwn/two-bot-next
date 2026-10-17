@@ -2077,7 +2077,7 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Builds all sixteen libFuzzer targets. No campaign or generated corpus
+      # Builds all seventeen libFuzzer targets. No campaign or generated corpus
       # output; the existing weekly run replays only the bounded eventsub_delivery
       # seeds below. Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
