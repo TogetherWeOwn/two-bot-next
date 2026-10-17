@@ -6903,22 +6903,42 @@ impl ActorCommand {
 /// a long outage sheds the oldest instead of growing without bound.
 const VOICE_ACTOR_INIT_BUFFER_CAP: usize = 512;
 
-/// Buffer one command that arrived while initialization is pending.
-/// Reply-bearing commands are dropped (see [`ActorCommand::is_bufferable`]);
-/// the rest apply in arrival order once the worker loads.
-fn buffer_init_command(buffered: &mut VecDeque<ActorCommand>, command: ActorCommand) {
-    if !command.is_bufferable() {
-        return;
-    }
+/// Buffer one command that arrived during a load attempt. Everything waits
+/// (capped, oldest shed): when the attempt succeeds the worker answers the
+/// reply-bearing commands in arrival order, so a status or vote-kick sent
+/// right after the snapshot still resolves. Shedding the oldest at the cap
+/// drops its one-shot sender, so an overflowed caller fails fast with `None`.
+fn buffer_attempt_command(buffered: &mut VecDeque<ActorCommand>, command: ActorCommand) {
     if buffered.len() >= VOICE_ACTOR_INIT_BUFFER_CAP {
         let _ = buffered.pop_front();
     }
     buffered.push_back(command);
 }
 
+/// Buffer one command that arrived while backing off between attempts.
+/// Reply-bearing commands are dropped (see [`ActorCommand::is_bufferable`]);
+/// the rest apply in arrival order once the worker loads.
+fn buffer_init_command(buffered: &mut VecDeque<ActorCommand>, command: ActorCommand) {
+    if !command.is_bufferable() {
+        return;
+    }
+    buffer_attempt_command(buffered, command);
+}
+
+/// Drop buffered reply-bearing commands after a failed attempt. Their
+/// one-shot senders are dropped with them, so each waiting caller resolves
+/// to `None` (the existing "syncing" fallback) instead of hanging across
+/// an unbounded backoff window. Fire-and-forget state stays queued.
+fn purge_unanswerable_buffered(buffered: &mut VecDeque<ActorCommand>) {
+    buffered.retain(|command| command.is_bufferable());
+}
+
 #[cfg(test)]
 mod voice_actor_init_buffer_tests {
-    use super::{buffer_init_command, ActorCommand, VecDeque, VOICE_ACTOR_INIT_BUFFER_CAP};
+    use super::{
+        buffer_attempt_command, buffer_init_command, purge_unanswerable_buffered, ActorCommand,
+        VecDeque, VOICE_ACTOR_INIT_BUFFER_CAP,
+    };
     use tokio::sync::oneshot;
 
     #[test]
@@ -6926,7 +6946,7 @@ mod voice_actor_init_buffer_tests {
         let mut buffered = VecDeque::new();
         buffer_init_command(&mut buffered, ActorCommand::Reconcile);
         buffer_init_command(&mut buffered, ActorCommand::RefreshCreators);
-        let (status_tx, _) = oneshot::channel();
+        let (status_tx, mut status_rx) = oneshot::channel();
         buffer_init_command(&mut buffered, ActorCommand::Status(status_tx));
         let (kick_tx, _) = oneshot::channel();
         buffer_init_command(
@@ -6936,9 +6956,35 @@ mod voice_actor_init_buffer_tests {
                 reply: kick_tx,
             },
         );
-        assert_eq!(buffered.len(), 2, "replies must not hang the init buffer");
+        assert_eq!(
+            buffered.len(),
+            2,
+            "replies must not hang the backoff buffer"
+        );
         assert!(matches!(buffered[0], ActorCommand::Reconcile));
         assert!(matches!(buffered[1], ActorCommand::RefreshCreators));
+        // The dropped status sender resolves the waiter to `None` (syncing
+        // fallback) instead of hanging until recovery.
+        assert!(matches!(
+            status_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn attempt_buffers_replies_then_failure_purges_them() {
+        let mut buffered = VecDeque::new();
+        buffer_attempt_command(&mut buffered, ActorCommand::Reconcile);
+        let (status_tx, mut status_rx) = oneshot::channel();
+        buffer_attempt_command(&mut buffered, ActorCommand::Status(status_tx));
+        assert_eq!(buffered.len(), 2, "attempt must wait for replies");
+        purge_unanswerable_buffered(&mut buffered);
+        assert_eq!(buffered.len(), 1, "failure fails fast, keeps state");
+        assert!(matches!(buffered[0], ActorCommand::Reconcile));
+        assert!(matches!(
+            status_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
     }
 
     #[test]
@@ -7958,14 +8004,15 @@ where
 /// [`voice_actor_load_backoff`] between attempts, and the same single
 /// spawned task owns every attempt — retries never spawn a second actor.
 ///
-/// While initialization is pending, fire-and-forget inbox commands are
-/// buffered in order (capped, oldest shed) and handed to
-/// `run_actor_with_initial`, so a snapshot or voice frame that arrived
-/// during the outage is applied after recovery under the usual live-state
-/// and ticket guards. Reply-bearing commands are dropped while no worker
-/// exists (see [`ActorCommand::is_bufferable`]), so status and room-command
-/// callers get the existing "syncing" fallback instead of hanging until
-/// recovery. Cancellation is the inbox closing (every sender dropped):
+/// While a load attempt is in flight, every inbox command waits in order
+/// (capped, oldest shed) and is handed to `run_actor_with_initial` on
+/// success, so a status sent right after the snapshot still resolves once
+/// the worker exists. When the attempt fails or times out, buffered
+/// reply-bearing commands are purged (see [`ActorCommand::is_bufferable`])
+/// so their callers get the existing "syncing" fallback instead of hanging
+/// across the backoff window; commands arriving during the backoff itself
+/// are dropped unless fire-and-forget. Cancellation is the inbox closing
+/// (every sender dropped):
 /// `remove_guild` and runtime drop both end the retry loop, and a load
 /// that finishes after removal is discarded instead of resurrecting the
 /// guild. A [`StoreError::CredentialRefused`] attempt is never retried:
@@ -7997,7 +8044,7 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
                     break;
                 }
                 command = inbox.recv() => match command {
-                    Some(command) => buffer_init_command(&mut buffered, command),
+                    Some(command) => buffer_attempt_command(&mut buffered, command),
                     None => return None,
                 },
             }
@@ -8011,7 +8058,7 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
                 // (guild removed) is discarded, never published.
                 loop {
                     match inbox.try_recv() {
-                        Ok(command) => buffered.push_back(command),
+                        Ok(command) => buffer_attempt_command(&mut buffered, command),
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => return None,
                     }
@@ -8029,6 +8076,9 @@ async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
                 observe_voice_actor_load_timeout(guild_id);
             }
         }
+        // The attempt failed: waiting reply-bearing callers resolve now
+        // instead of hanging across the backoff window. State stays queued.
+        purge_unanswerable_buffered(&mut buffered);
         failed_attempts = failed_attempts.saturating_add(1);
         let wait = tokio::time::sleep(voice_actor_load_backoff(failed_attempts));
         tokio::pin!(wait);
