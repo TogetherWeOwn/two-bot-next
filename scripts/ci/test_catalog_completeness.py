@@ -110,7 +110,8 @@ EXEMPT_SERIES = {
         "rule; catalog row lands with the halt-gauge change"
     ),
     # Voice stall-observability families (lobby-stall follow-up): refusal
-    # labels, backoff cap, halt gauge, and the per-tick stall gauges. All rows
+    # labels, backoff cap, halt gauge, and the per-tick stall gauges,
+    # including the creator-map generation/age freshness pair. All rows
     # live in docs/metrics.md; the catalog covers voice_event log fields.
     # (joins_received, dispatch_timeouts, watchdog_stucks, halt_recoveries are
     # cataloged, so they carry no exemption.)
@@ -119,6 +120,8 @@ EXEMPT_SERIES = {
     "two_bot_voice_queue_pending": _VOICE_SERIES_REASON,
     "two_bot_voice_queue_oldest_age_seconds": _VOICE_SERIES_REASON,
     "two_bot_voice_rest_in_flight_age_seconds": _VOICE_SERIES_REASON,
+    "two_bot_voice_creator_map_generation": _VOICE_SERIES_REASON,
+    "two_bot_voice_creator_map_age_seconds": _VOICE_SERIES_REASON,
     # Histogram `_bucket` child consumed as an alert input: the gate
     # normalizes catalog families (stripping `_bucket`) but compares raw
     # alert-input names, so only an exemption covers this spelling. The base
