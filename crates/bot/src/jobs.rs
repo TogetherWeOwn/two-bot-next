@@ -179,6 +179,29 @@ async fn run_job(
             }
             deadline = interval.tick() => {
                 if active.is_some() || completed_at.is_some_and(|end| deadline < end) { continue; }
+                let now = Instant::now();
+                let mut run_tick = deadline;
+                if let Some(next) = refreshed_cadence(&job.cadence_source, &mut cadence) {
+                    if let Some(last_run) = last_run_tick {
+                        let due = last_run + next;
+                        if due > now {
+                            // This is an obsolete tick from the old cadence.
+                            // Do not run early just because the old interval
+                            // became ready before the cadence recheck.
+                            interval = cadence_interval(due, next);
+                            continue;
+                        }
+                        // The new interval was already due. Run once now and
+                        // anchor the next tick to this prompt run, not the
+                        // stale timer deadline.
+                        run_tick = now;
+                        interval = cadence_interval(now + next, next);
+                    } else {
+                        // Keep the first run immediate; use the new value for
+                        // the cadence after it.
+                        interval = cadence_interval(deadline + next, next);
+                    }
+                }
                 let mut statuses = tokio::select! {
                     biased;
                     _ = stopped(&mut shutdown) => break,
@@ -190,13 +213,7 @@ async fn run_job(
                 current.last_start = Some(timestamp());
                 current.running = true;
                 drop(statuses);
-                last_run_tick = Some(deadline);
-                // A cadence change first observed at this tick reschedules
-                // the next one deadline + new cadence, discarding the old
-                // period's already-queued slot.
-                if let Some(next) = refreshed_cadence(&job.cadence_source, &mut cadence) {
-                    interval = cadence_interval(deadline + next, next);
-                }
+                last_run_tick = Some(run_tick);
                 let action = Arc::clone(&job.action);
                 let timeout = job.timeout;
                 active = Some(tokio::spawn(async move {
