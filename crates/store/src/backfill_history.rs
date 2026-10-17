@@ -98,7 +98,6 @@ impl From<sqlx::Error> for BackfillHistoryError {
 /// [`BackfillHistoryError::Invalid`], mirroring the acceptance helper so a
 /// misuse surfaces as a typed error the caller can handle rather than
 /// paging the wrong window live.
-#[must_use]
 pub fn history_messages_path(
     channel_id: &str,
     limit: u8,
