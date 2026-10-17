@@ -36,7 +36,10 @@ IMAGE_MAX_BYTES = 112 * MIB
 # is exhausted even before new code lands. This branch's voice
 # rename-decision logs add 3,160 bytes (merged head 6a9c394e: 16,779,256
 # bytes, 2,040 over 16 MiB) with no new dependencies; the release profile
-# is already minimal (opt-level=z, lto, strip). 17 MiB restores ~1.00 MiB
+# is already minimal (opt-level=z, lto, strip). The go-live receiver-ledger
+# branch independently measured 16801560 bytes (16.02 MiB) on CI run
+# 39056648109 job 117470241279, 24344 bytes over the 16 MiB tripwire, after
+# ~450 lines of shipping ledger/receiver code. 17 MiB restores ~1.00 MiB
 # of headroom while keeping a working tripwire; revisit if the binary
 # approaches it.
 BINARY_MAX_BYTES = 17 * MIB

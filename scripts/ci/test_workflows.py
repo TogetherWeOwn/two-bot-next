@@ -206,15 +206,18 @@ def staging_push_filter_errors(name, push):
 
 
 def staging_dispatch_errors(workflow):
-    """The active staging workflow keeps exactly two fenced dispatch inputs.
+    """The active staging workflow keeps exactly three fenced dispatch inputs.
 
     `release_fence` exists on main (TOG-11143) so post-handoff release of an
     uninitialized/parked singleton is explicit and auditable; it defaults to
     false and the deploy job itself runs unconditionally (TOG-12856).
     `inject_gateway_failure` is the staging rollback-drill switch: also an
     opt-in boolean defaulting to false, readable only through the pinned
-    dispatch-only expression in staging_gateway_injection_errors. Anything
-    else in the dispatch block (an arming switch, a deploy flag, a default of
+    dispatch-only expression in staging_gateway_injection_errors.
+    `inject_error_rate_spike` is the error-rate rollback-drill switch with
+    the same shape, readable only through the pinned dispatch-only
+    expression in staging_error_rate_gate_errors. Anything else in the
+    dispatch block (an arming switch, a deploy flag, a default of
     true) is an unreviewed deploy route outside the pinned shape.
     """
     name = "deploy-staging.yml"
@@ -224,9 +227,9 @@ def staging_dispatch_errors(workflow):
         errors.append(f"{name}: triggers changed")
     errors.extend(staging_push_filter_errors(name, on.get("push")))
     dispatch = on.get("workflow_dispatch") or {}
-    expected = {"release_fence", "inject_gateway_failure"}
+    expected = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike"}
     if set(dispatch) != {"inputs"} or set(dispatch.get("inputs") or {}) != expected:
-        errors.append(f"{name}: workflow_dispatch must carry only the release_fence and inject_gateway_failure inputs")
+        errors.append(f"{name}: workflow_dispatch must carry only the release_fence, inject_gateway_failure and inject_error_rate_spike inputs")
     else:
         for input_name in expected:
             spec = dispatch["inputs"][input_name] or {}
@@ -279,6 +282,65 @@ def staging_gateway_injection_errors(workflows):
                    '[ "$INJECT_GATEWAY_FAILURE" = "true" ]'):
         if run.count(needle) != 1:
             errors.append(f"deploy-staging.yml: injection step must contain exactly one {needle}")
+    return errors
+
+
+ERROR_RATE_EXPRESSION = "${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'true' || 'false' }}"
+ERROR_RATE_MARKERS = (
+    "inject_error_rate_spike", "INJECT_ERROR_RATE_SPIKE",
+    "promotion-error-gate.mjs", "error-rate-gate.json",
+)
+
+
+def staging_error_rate_gate_errors(workflows):
+    """The error-rate promotion gate is dispatch-gated rehearsal plus live plumbing.
+
+    Exactly one expression in exactly one staging step may read the rehearsal
+    input, it must also require `workflow_dispatch` (a push never carries
+    inputs), and that step must be the error-rate gate step: it judges the
+    rehearsal firing when armed and scrapes live staging /ops/metrics
+    otherwise, failing the stage so auto-rollback runs. The scrape token is
+    optional (absent means a recorded skip, pinned in the gate script's
+    tests); the rehearsal path needs no secret. Every other workflow —
+    deploy-production above all — must not mention the switch at all, so no
+    route can forward it to production.
+    """
+    errors = []
+    for name, workflow in workflows.items():
+        if name == "deploy-staging.yml":
+            continue
+        text = str(workflow)
+        for marker in ERROR_RATE_MARKERS:
+            if marker in text:
+                errors.append(f"{name}: error-rate gate marker {marker} outside deploy-staging")
+    staging = workflows.get("deploy-staging.yml") or {}
+    text = str(staging)
+    if text.count("inputs.inject_error_rate_spike") != 1:
+        errors.append("deploy-staging.yml: inject_error_rate_spike must be read exactly once")
+    steps = ((staging.get("jobs") or {}).get("deploy") or {}).get("steps") or []
+    armed = [step for step in steps
+             if isinstance(step, dict) and "INJECT_ERROR_RATE_SPIKE" in str(step)]
+    if len(armed) != 1:
+        errors.append("deploy-staging.yml: exactly one deploy step may carry the error-rate drill switch")
+        return errors
+    step = armed[0]
+    if step.get("id") != "error_rate_gate":
+        errors.append("deploy-staging.yml: the error-rate drill switch must live on the error_rate_gate step")
+    env = step.get("env") or {}
+    if env.get("INJECT_ERROR_RATE_SPIKE") != ERROR_RATE_EXPRESSION:
+        errors.append("deploy-staging.yml: error-rate rehearsal must use the pinned dispatch-only expression")
+    if "METRICS_SCRAPE_TOKEN" not in env:
+        errors.append("deploy-staging.yml: error_rate_gate must bind the optional scrape token by name")
+    run = str(step.get("run") or "")
+    for needle in ("scripts/promotion-error-gate.mjs", "--metrics-url", "--evidence",
+                   "--rehearsal-firing",
+                   '[ "$INJECT_ERROR_RATE_SPIKE" = "true" ]'):
+        if run.count(needle) != 1:
+            errors.append(f"deploy-staging.yml: error_rate_gate step must contain exactly one {needle}")
+    # The evidence filename appears exactly twice: the --evidence write path
+    # and the read-back print, which must name the same file.
+    if run.count("error-rate-gate.json") != 2:
+        errors.append("deploy-staging.yml: error_rate_gate must write and read back the same error-rate-gate.json")
     return errors
 
 
@@ -1087,10 +1149,10 @@ def staging_active_errors(workflow):
     return errors
 
 
-# Pinned build image shared with the staging-migrate plan job (same runner
-# binary, same toolchain). A digest bump must move both together.
-SCHEMA_GATE_IMAGE = ("rust:bookworm@sha256:"
-                     "93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e")
+# Pinned build image shared with the migration plan jobs (same runner
+# binary, same toolchain). A digest bump must move all consumers together.
+SCHEMA_GATE_IMAGE = ("rust:1.98-trixie@sha256:"
+                     "a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546")
 
 
 def schema_gate_errors(workflow, name="deploy-staging.yml"):
@@ -1624,6 +1686,7 @@ def synthetic_user_flow_errors(workflow):
 def workflow_policy_errors(workflows):
     errors = []
     errors.extend(staging_gateway_injection_errors(workflows))
+    errors.extend(staging_error_rate_gate_errors(workflows))
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
     if set(workflows) != set(JOB_INVENTORY):
@@ -2231,6 +2294,51 @@ class WorkflowTests(unittest.TestCase):
                 job = next(iter(changed[name]["jobs"].values()))
                 job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_gateway_failure }}"
                 self.assertTrue(staging_gateway_injection_errors(changed))
+                self.assertTrue(workflow_policy_errors(changed))
+
+    def test_error_rate_gate_is_dispatch_gated_and_never_forwarded(self):
+        workflows = self.workflows
+        self.assertEqual(staging_error_rate_gate_errors(workflows), [])
+        self.assertEqual(staging_dispatch_errors(workflows["deploy-staging.yml"]), [])
+        steps = workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        armed = [s for s in steps if "INJECT_ERROR_RATE_SPIKE" in str(s)]
+        self.assertEqual(len(armed), 1)
+        self.assertEqual(armed[0].get("id"), "error_rate_gate")
+        index = steps.index(armed[0])
+        mutations = {
+            # Push could read it / default armed.
+            "expression without dispatch guard": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
+                .__setitem__("INJECT_ERROR_RATE_SPIKE", "${{ inputs.inject_error_rate_spike }}"),
+            "expression constant true": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
+                .__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
+            "rehearsal flag unconditional": lambda w: w["jobs"]["deploy"]["steps"][index]
+                .__setitem__("run", "node scripts/promotion-error-gate.mjs --rehearsal-firing '[\"rest_5xx_rate\"]'"),
+            "input defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["inject_error_rate_spike"]
+                .__setitem__("default", True),
+            "input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("inject_error_rate_spike"),
+            "second reader step": lambda w: w["jobs"]["deploy"]["steps"][0]
+                .setdefault("env", {}).__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
+            "switch off the gate step": lambda w: w["jobs"]["deploy"]["steps"][index]
+                .__setitem__("id", "unrelated"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(
+                    staging_error_rate_gate_errors(changed)
+                    or staging_dispatch_errors(changed["deploy-staging.yml"]),
+                    label,
+                )
+                self.assertTrue(workflow_policy_errors(changed), label)
+        # Production (or any other workflow) mentioning the gate at all
+        # is a forwarding route, whatever the surrounding shape.
+        for name in ("deploy-production.yml", "check.yml"):
+            with self.subTest(forwarded=name):
+                changed = deepcopy(workflows)
+                job = next(iter(changed[name]["jobs"].values()))
+                job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_error_rate_spike }}"
+                self.assertTrue(staging_error_rate_gate_errors(changed))
                 self.assertTrue(workflow_policy_errors(changed))
 
     def test_docs_only_push_skips_staging_but_runtime_paths_deploy(self):

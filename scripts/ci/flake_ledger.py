@@ -35,6 +35,7 @@ JUnit file is missing or not well-formed XML.
 
 import argparse
 import json
+import math
 import sys
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
@@ -42,11 +43,20 @@ from pathlib import Path
 
 
 def parse_time_ms(raw):
-    """JUnit `time` is seconds as a float; truncate to whole milliseconds."""
+    """JUnit `time` is seconds as a float; truncate to whole milliseconds.
+
+    Unparsable, non-finite, or overflowing values contribute 0 ms instead
+    of aborting the ledger: float() accepts inf/nan spellings, and finite
+    seconds can still overflow to inf when scaled to milliseconds, both
+    of which int() rejects (OverflowError/ValueError).
+    """
     try:
-        return int(float(raw or 0) * 1000)
-    except (TypeError, ValueError):
+        milliseconds = float(raw or 0) * 1000
+    except (TypeError, ValueError, OverflowError):
         return 0
+    if not math.isfinite(milliseconds):
+        return 0
+    return int(milliseconds)
 
 
 # Child tags cargo-nextest 0.9.99 uses for failed attempts. flaky* means a
