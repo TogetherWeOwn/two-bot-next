@@ -130,22 +130,25 @@ fn count_prior_failed(existing: &[ExistingSubscription], callback: &CallbackUrl)
         .count()
 }
 
-/// True when the follow-up listing holds a healthy subscription for every
-/// desired broadcaster but none is `enabled` yet (all
-/// `webhook_callback_verification_pending`): the callback has not verified,
-/// so the pass must log `pending`, never `healthy`. Call only after the
-/// missing check passes, so every desired broadcaster is healthy here.
-fn pending_only(
+/// True only when every desired broadcaster holds an `enabled` subscription
+/// on our callback in the follow-up listing: the only state the pass may log
+/// as `healthy`. A desired broadcaster served only by a
+/// `webhook_callback_verification_pending` subscription keeps the pass at
+/// `pending`, even when other desired broadcasters are already `enabled`.
+/// An empty desired set is vacuously satisfied (the startup path parks that
+/// case before this check runs). Foreign-callback subscriptions never count.
+fn all_desired_enabled(
     desired: &[String],
     callback: &CallbackUrl,
     confirmed: &[ExistingSubscription],
 ) -> bool {
-    !desired.is_empty()
-        && !confirmed.iter().any(|sub| {
-            sub.callback == callback.as_str()
+    desired.iter().all(|id| {
+        confirmed.iter().any(|sub| {
+            &sub.broadcaster_user_id == id
+                && sub.callback == callback.as_str()
                 && sub.status == "enabled"
-                && desired.contains(&sub.broadcaster_user_id)
         })
+    })
 }
 
 /// Desired broadcasters without a healthy subscription on our callback in the
@@ -352,10 +355,10 @@ pub async fn reconcile_all_with_metrics<T: HelixTransport>(
     let mut summary = summarize(&run.outcomes);
     record_actions(metrics, &run.outcomes);
     summary.prior_failed = prior_failed;
-    let status = if pending_only(desired, callback, &confirmed) {
-        "pending"
-    } else {
+    let status = if all_desired_enabled(desired, callback, &confirmed) {
         "healthy"
+    } else {
+        "pending"
     };
     summary.status = Some(status);
     if status == "pending" {
@@ -369,7 +372,7 @@ pub async fn reconcile_all_with_metrics<T: HelixTransport>(
             created = summary.created,
             already_exists = summary.already_exists,
             prior_failed = summary.prior_failed,
-            "eventsub subscriptions re-created but none verified yet"
+            "eventsub subscriptions re-created but not all verified yet"
         );
         return Ok(summary);
     }
@@ -729,26 +732,66 @@ mod tests {
             },
         ];
         assert_eq!(count_prior_failed(&existing, &callback()), 1);
-        assert!(pending_only(
-            &["444".to_owned()],
+    }
+
+    #[test]
+    fn all_desired_enabled_requires_every_desired_broadcaster_enabled() {
+        fn sub(
+            id: &str,
+            status: &str,
+            broadcaster: &str,
+            callback: &CallbackUrl,
+        ) -> ExistingSubscription {
+            ExistingSubscription {
+                id: id.to_owned(),
+                status: status.to_owned(),
+                broadcaster_user_id: broadcaster.to_owned(),
+                callback: callback.as_str().to_owned(),
+            }
+        }
+        let desired = vec!["222".to_owned(), "444".to_owned()];
+        let enabled_222 = sub("id-222", "enabled", "222", &callback());
+        let enabled_444 = sub("id-444", "enabled", "444", &callback());
+        let pending_444 = sub(
+            "id-444-pending",
+            "webhook_callback_verification_pending",
+            "444",
             &callback(),
-            &[ExistingSubscription {
-                id: "fresh-id".to_owned(),
-                status: "webhook_callback_verification_pending".to_owned(),
-                broadcaster_user_id: "444".to_owned(),
-                callback: callback().as_str().to_owned(),
-            }]
-        ));
-        assert!(!pending_only(
-            &["444".to_owned()],
+        );
+        let failed_444 = sub(
+            "id-444-failed",
+            "webhook_callback_verification_failed",
+            "444",
             &callback(),
-            &[ExistingSubscription {
-                id: "live-id".to_owned(),
-                status: "enabled".to_owned(),
-                broadcaster_user_id: "444".to_owned(),
-                callback: callback().as_str().to_owned(),
-            }]
-        ));
+        );
+        let other = CallbackUrl::new("https://other.example.com/twitch")
+            .expect("fixture callback must parse");
+        let foreign_enabled_444 = sub("id-444-foreign", "enabled", "444", &other);
+
+        assert!(
+            all_desired_enabled(&desired, &callback(), &[enabled_222.clone(), enabled_444]),
+            "all desired broadcasters enabled is healthy"
+        );
+        assert!(
+            !all_desired_enabled(&desired, &callback(), &[enabled_222.clone(), pending_444]),
+            "a mixed enabled/pending desired set is not healthy"
+        );
+        assert!(
+            !all_desired_enabled(&desired, &callback(), &[enabled_222.clone(), failed_444]),
+            "a failed desired subscription is not healthy"
+        );
+        assert!(
+            !all_desired_enabled(&desired, &callback(), std::slice::from_ref(&enabled_222)),
+            "a missing desired subscription is not healthy"
+        );
+        assert!(
+            !all_desired_enabled(&desired, &callback(), &[enabled_222, foreign_enabled_444]),
+            "an enabled subscription on a foreign callback does not count"
+        );
+        assert!(
+            all_desired_enabled(&[], &callback(), &[]),
+            "an empty desired set is vacuously satisfied"
+        );
     }
 
     #[test]
@@ -844,6 +887,85 @@ mod tests {
         );
         assert_eq!(seen[2].method, Method::DELETE);
         assert_eq!(seen[3].method, Method::POST);
+    }
+
+    #[tokio::test]
+    async fn reconcile_reports_pending_when_only_some_desired_are_enabled() {
+        let listing = json!({"data": [], "pagination": {}});
+        let confirmed = json!({
+            "data": [
+                subscription_entry("id-111", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("id-222", "webhook_callback_verification_pending", "222", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let log = CallLog::default();
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            log.clone(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let summary = reconcile_all(
+            &mut client,
+            &callback(),
+            &["111".to_owned(), "222".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect("a mixed enabled/pending follow-up must still succeed");
+        assert_eq!(
+            summary.status,
+            Some("pending"),
+            "one enabled desired broadcaster must not mask a pending one"
+        );
+        assert_eq!(summary.created, 2);
+        let seen = log.requests();
+        assert_eq!(
+            seen.len(),
+            5,
+            "token, listing, two creates, follow-up listing"
+        );
+        assert_eq!(seen[2].method, Method::POST);
+        assert_eq!(seen[3].method, Method::POST);
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_when_followup_desired_subscription_is_failed() {
+        let listing = json!({"data": [], "pagination": {}});
+        let confirmed = json!({
+            "data": [
+                subscription_entry("id-444", "webhook_callback_verification_failed", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let error = reconcile_all(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect_err("a failed desired subscription in the follow-up must fail the pass");
+        assert!(
+            matches!(error, HelixError::BadResponse(_)),
+            "a failed follow-up subscription must surface, not count as done: {error}"
+        );
     }
 
     #[tokio::test]

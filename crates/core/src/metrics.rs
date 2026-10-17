@@ -408,7 +408,7 @@ pub const EVENTSUB_POST_OUTCOMES: [&str; 4] = ["attempted", "succeeded", "failed
 /// Outcomes of one EventSub reconcile pass for
 /// `two_bot_eventsub_reconcile_passes_total{outcome}`: `healthy` when every
 /// desired broadcaster holds a healthy subscription afterwards, `pending` when
-/// re-created but none verified yet, `failed` when an action failed or a
+/// re-created but not all verified yet, `failed` when an action failed or a
 /// healthy subscription is missing (including listing failures). Exactly these
 /// three series exist; an unrecognised outcome collapses to the trailing
 /// `failed` (fail-closed) rather than growing the series vocabulary.

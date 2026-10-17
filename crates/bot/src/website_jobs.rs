@@ -232,6 +232,7 @@ pub async fn serve(
                     registered.push(Job {
                         name,
                         cadence,
+                        cadence_source: None,
                         startup_jitter: jobs::startup_jitter(cadence, rand::random()),
                         timeout: Duration::from_secs(if matches!(kind, Kind::Counter) {
                             45
