@@ -43,7 +43,8 @@ Stamp with the live `/readyz` `build_revision` of that environment: a plain
 `wrangler secret put` publishes an unstamped version that can never form a rollback
 receipt (see `docs/production-deploy.md`). Precheck first: `versions secret put`
 builds on the newest-created version, not necessarily the serving one — confirm the
-newest entry of `wrangler versions list --env <name>` is the serving version (same id
+last block of `wrangler versions list --env <name>` (the list prints oldest first,
+so the last block is the newest version) is the serving version (same id
 as `wrangler deployments status --env <name>`), and if they differ redeploy the intended
 SHA through the workflow first (full rule in `docs/production-deploy.md`).
 

@@ -244,7 +244,7 @@ def run_drill(world, raw_pin=None, attestation=COVERING_ATTESTATION, logs=None):
     (wrangler_dir / "wrangler.toml").write_text(WRANGLER_TOML)
     deploy_path = str(Path(directory) / "staging-container-deploy.json")
 
-    def deploy(config_path):
+    def deploy(config_path, message_sha):
         config = json.loads(Path(config_path).read_text())
         image = config["env"]["staging"]["containers"][0]["image"]
         world.tick(2)
@@ -740,10 +740,11 @@ class WranglerEnvTests(unittest.TestCase):
                                                  job_env)
         with patch.object(container_drill.subprocess, "run",
                           return_value=MagicMock(returncode=0)) as run:
-            self.assertEqual(deploy("staging-deploy.json"), 0)
+            self.assertEqual(deploy("staging-deploy.json", "f" * 40), 0)
         args, kwargs = run.call_args
         self.assertEqual(args[0], ["node_modules/.bin/wrangler", "deploy", "--config",
-                                   "staging-deploy.json", "--env", "staging"])
+                                   "staging-deploy.json", "--env", "staging",
+                                   "--message", "f" * 40])
         self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "HOME": "/home/runner",
                                          "CLOUDFLARE_API_TOKEN": "c" * 40,
                                          "CLOUDFLARE_ACCOUNT_ID": ACCOUNT})
@@ -830,7 +831,7 @@ class MainTests(unittest.TestCase):
             env = {**env, "GITHUB_STEP_SUMMARY": str(summary)}
 
             def deploy_factory(wrangler_bin, directory, environ):
-                def deploy(config_path):
+                def deploy(config_path, message_sha):
                     config = json.loads(Path(config_path).read_text())
                     world.deploys.append(
                         config["env"]["staging"]["containers"][0]["image"])

@@ -7,11 +7,12 @@
 # (docs/production-deploy.md); a plain `wrangler secret put` publishes an
 # unstamped version that manual rollback refuses. Precheck first: `versions
 # secret put` builds on the newest-created version, not the serving one —
-# confirm `wrangler versions list` newest equals `wrangler deployments status`
-# serving, else redeploy the intended SHA through the workflow first:
-#   wrangler versions secret put DISCORD_TOKEN --message <sha>
-#   wrangler versions secret put DATABASE_URL --message <sha>
-#   wrangler versions deploy
+# confirm the last `wrangler versions list` block (oldest first) equals
+# `wrangler deployments status` serving, else redeploy the intended SHA
+# through the workflow first:
+#   wrangler versions secret put --env <env> DISCORD_TOKEN --message <sha>
+#   wrangler versions secret put --env <env> DATABASE_URL --message <sha>
+#   wrangler versions deploy --env <env>
 
 name = "two-bot-next"
 main = "src/index.ts"
@@ -88,8 +89,9 @@ KEEPALIVE_SECONDS = "60"
 # stamped with the serving SHA, then deploy that version, so every serving
 # version keeps its provenance receipt (docs/production-deploy.md). Precheck
 # first: `versions secret put` builds on the newest-created version, not the
-# serving one — confirm `wrangler versions list --env <env>` newest equals
-# `wrangler deployments status --env <env>` serving, else redeploy the intended
+# serving one — confirm the last `wrangler versions list --env <env>` block
+# (oldest first) equals `wrangler deployments status --env <env>` serving,
+# else redeploy the intended
 # SHA through the workflow first:
 #   wrangler versions secret put --env staging DISCORD_TOKEN --message <sha>      # staging bot token
 #   wrangler versions secret put --env staging GUILD_ID --message <sha>           # TWO Staging guild

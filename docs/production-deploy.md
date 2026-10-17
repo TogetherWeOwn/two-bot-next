@@ -139,10 +139,11 @@ version too, so stage secrets with `wrangler versions secret put <KEY>
 not the pre-deploy snapshot's `serving_sha` (that snapshot describes the
 version being replaced, so stamping with it would label the new version with
 the previous build's SHA and trip the post-restore gate) — then deploy that
-staged version with `wrangler versions deploy`, on staging
+staged version with `wrangler versions deploy --env <env>`, on staging
 and production alike. Precheck first: `versions secret put` builds on the
 newest-created version (`PATCH .../versions/latest`), not necessarily the
-serving one. Confirm the newest entry of `wrangler versions list --env <env>`
+serving one. Confirm the last block of `wrangler versions list --env <env>`
+(the list prints oldest first, so the last block is the newest version)
 is the serving version (same id as `wrangler deployments status --env <env>`);
 the stamp is the SHA that serving version was built from (its
 `workers/message`, or the live `/readyz` `build_revision`). If they differ

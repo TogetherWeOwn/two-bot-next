@@ -132,8 +132,9 @@ unpacked snapshots and is logged separately, not compared to that ceiling.
 See [Docker's store documentation](https://docs.docker.com/engine/storage/containerd/)
 and [Moby's layer-history implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_history.go).
 The 112 MiB image ceiling is unchanged. The binary budget was 15 MiB at the
-2026-10-01 calibration and is now 16 MiB; the 2026-10-10 measurements below
-explain the tighter tripwire.
+2026-10-01 calibration and 16 MiB after the 2026-10-10 calibration below
+(superseded by the 17 MiB recalibration at the end of this section); the
+2026-10-10 measurements below explain that tripwire.
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
 at source `307b50708ec42e8fc4744c1b804216a22a17625e`. The 2026-09-30
@@ -156,14 +157,15 @@ tripwire without wedging ordinary code changes. A later event-executors head
 measured 15,770,928 bytes (15.04 MiB) in the [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38062362788/job/114254309361),
 42,288 bytes above the former ceiling. The internal-actions families (event
 executors plus channel-moderation union) measured 15,741,344 bytes (15.01 MiB).
-The 16 MiB working tripwire leaves 1,006,288 bytes (0.96 MiB, 6.4%) above the
+The then-current 16 MiB working tripwire left 1,006,288 bytes (0.96 MiB, 6.4%) above the
 event-executors measurement. No new dependencies or release-profile changes;
 revisit if the binary approaches the limit. The 112 MiB image ceiling is
 unchanged.
 
 This branch's automation-only head separately measured 15,769,872 bytes
-(15.04 MiB) before the event-executor merge. This PR keeps the current-main
-16 MiB binary ceiling; the combined exact-head CI measurement is still
+(15.04 MiB) before the event-executor merge. That paragraph predates the
+17 MiB recalibration at the end of this section, which supersedes its
+16 MiB ceiling; the combined exact-head CI measurement is still
 required.
 
 ### Docker history image measurement and immutable-ID pinning
