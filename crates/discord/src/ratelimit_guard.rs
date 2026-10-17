@@ -146,11 +146,6 @@ pub struct RateLimitGuard {
     config: GuardConfig,
     state: Mutex<State>,
     changed: tokio::sync::Notify,
-    /// Serializes pacing turns: each holder waits out only its own spacing
-    /// from the previous release (never a pre-reserved slot chain), so a
-    /// stale or foreign-clock timestamp can delay one admission by at most
-    /// one [`GLOBAL_MIN_INTERVAL`] instead of parking it.
-    pace_gate: tokio::sync::Mutex<()>,
 }
 
 impl RateLimitGuard {
@@ -162,7 +157,6 @@ impl RateLimitGuard {
             config,
             state: Mutex::new(State::default()),
             changed: tokio::sync::Notify::new(),
-            pace_gate: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -318,38 +312,43 @@ impl RateLimitGuard {
         }
     }
 
-    /// One shared pacing turn: wait until at least
-    /// [`GLOBAL_MIN_INTERVAL`] after the previous turn's release on this
-    /// guard, then stamp this release. The gate serializes turns, so a
-    /// burst of admitters spaces itself one interval at a time instead of
-    /// reserving a chain of future slots. A previous release minted on
-    /// another runtime's clock (the process guard is shared across test
-    /// runtimes, whose paused clocks advance independently) or sitting in
-    /// this clock's future names no real spacing here and is ignored: the
-    /// wait it could otherwise impose is unbounded, while a same-runtime
-    /// release is always in the past and bounds the wait to one interval.
+    /// One shared pacing turn: reserve the next [`GLOBAL_MIN_INTERVAL`]
+    /// slot after the previous turn's release on this guard, wait it out,
+    /// and leave the reservation for the next turn. The reservation is
+    /// taken under the bookkeeping lock and the sleep holds no lock, so a
+    /// burst of admitters spaces itself one interval at a time without
+    /// ever parking on a shared async gate: parallel paused-clock tests
+    /// share the process guard, and parking one runtime on another's turn
+    /// advances the parked runtime to its outer timeout while it makes no
+    /// progress. A previous release minted on another runtime's clock
+    /// (foreign Instants name nothing on this clock) starts a fresh chain
+    /// here instead of waiting. Same-runtime reservations chain behind
+    /// each other, bounded by the live concurrency times one interval.
     async fn pace_once(&self) {
         let runtime = tokio::runtime::Handle::try_current()
             .ok()
             .map(|handle| handle.id());
-        let _gate = self.pace_gate.lock().await;
         let wait = {
-            let state = self.state.lock().expect("Discord guard state");
+            let mut state = self.state.lock().expect("Discord guard state");
             let now = Instant::now();
-            match state.last_pace_release {
-                Some((id, last)) if Some(id) == runtime && last <= now => last
-                    .checked_add(GLOBAL_MIN_INTERVAL)
-                    .map_or(Duration::ZERO, |earliest| {
-                        earliest.saturating_duration_since(now)
-                    }),
-                _ => Duration::ZERO,
+            match (state.last_pace_release, runtime) {
+                (Some((id, last)), Some(mine)) if id == mine => {
+                    let earliest = last.checked_add(GLOBAL_MIN_INTERVAL).unwrap_or(now);
+                    let wait = earliest.saturating_duration_since(now);
+                    state.last_pace_release = Some((mine, earliest.max(now)));
+                    wait
+                }
+                _ => {
+                    if let Some(mine) = runtime {
+                        state.last_pace_release = Some((mine, now));
+                    }
+                    Duration::ZERO
+                }
             }
         };
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
         }
-        let mut state = self.state.lock().expect("Discord guard state");
-        state.last_pace_release = runtime.map(|id| (id, Instant::now()));
     }
 
     /// Deadline for one request route from learned bucket state, if any.
