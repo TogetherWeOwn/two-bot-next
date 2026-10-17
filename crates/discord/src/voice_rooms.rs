@@ -638,7 +638,10 @@ impl RoomHttp {
     /// is refused. A deadline expiry, an oversized body, a non-2xx status
     /// (redirects are classified, never followed) and transport failures
     /// all surface as errors with no partial bytes. Failures never echo the
-    /// signed attachment URL.
+    /// signed attachment URL. The request is marked `connection: close`:
+    /// a non-2xx body is deliberately never read, and this one-shot
+    /// download must not return a connection carrying that unread (and
+    /// possibly stalled) body to the shared pool for a later request.
     pub async fn download_attachment(
         &self,
         url: &str,
@@ -663,6 +666,7 @@ impl RoomHttp {
         let request = Request::builder()
             .method("GET")
             .uri(transport_uri)
+            .header(http::header::CONNECTION, "close")
             .body(Full::new(Bytes::new()))
             .map_err(|_| RoomHttpError::InvalidRequest)?;
         let download = async {
