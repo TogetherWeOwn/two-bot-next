@@ -37,9 +37,12 @@ IMAGE_MAX_BYTES = 112 * MIB
 # one calibration and 16,776,096 bytes at 89503f71 (1,120 bytes of
 # headroom) in hosted CI; this head measured 16,778,152 bytes (936 over).
 # The voice rename-decision logs add ~3,160 bytes (merged head 6a9c394e:
-# 16,779,256 bytes). The landed slices since the 16 MiB bump consumed its
-# headroom, so 17 MiB restores a working tripwire with ~1 MiB of headroom;
-# revisit if the binary approaches it.
+# 16,779,256 bytes). The go-live receiver-ledger slice independently
+# measured 16,801,560 bytes (16.02 MiB, 24,344 over) on CI run 39056648109
+# job 117470241279 after ~450 lines of ledger/receiver code. The landed
+# slices since the 16 MiB bump consumed its headroom, so 17 MiB restores a
+# working tripwire with ~1 MiB of headroom; revisit if the binary
+# approaches it.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.

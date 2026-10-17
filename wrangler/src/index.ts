@@ -108,6 +108,11 @@ import {
   type MetricsAlertState,
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
+import {
+  evaluateRemediation,
+  sanitizeRemediationState,
+  type RemediationState,
+} from "./remediation.ts";
 import { parseRelease, releaseTag, workerVersionTag } from "./error-events.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
 import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
@@ -334,6 +339,7 @@ const DEFAULT_KEEPALIVE_SECONDS = 60;
 const DEFAULT_UNREADY_SECONDS = 120;
 const READINESS_KEY = "two-bot:readiness";
 const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
+const REMEDIATION_KEY = "two-bot:remediation";
 const OPS_METRICS_PATH = "/ops/metrics";
 // Read-only operator roll-ups (TOG-22860), served by the container as JSON.
 // Gateway/backfill stay on the scrape bearer like /ops/metrics; the summary
@@ -1396,6 +1402,30 @@ export class TwoBotContainer extends Container<Env> {
           log_url: LOG_QUERY_URL,
         }));
         await this.postWebhookText(content);
+      }
+      // Guarded remediation recommendations ride the same alert path: one
+      // line per recommendation, only while its trigger key fires. A corrupt
+      // guard record restarts the guard rather than blocking alerts.
+      try {
+        const stored = await this.ctx.storage.get<RemediationState>(REMEDIATION_KEY);
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const remediation = evaluateRemediation(firing, sanitizeRemediationState(stored, nowSeconds), nowSeconds);
+        await this.ctx.storage.put(REMEDIATION_KEY, remediation.state);
+        for (const message of remediation.messages) {
+          const content = `${message.text}.${alertContextSuffix(context)}`;
+          console.warn(JSON.stringify({
+            event: "remediation_recommendation",
+            service: "two-bot-next",
+            content,
+            build_revision: context?.buildRevision ?? "unknown",
+            release: releaseTag(this.lastRelease),
+            worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+            log_url: LOG_QUERY_URL,
+          }));
+          await this.postWebhookText(content);
+        }
+      } catch {
+        console.warn("two-bot remediation guard failed; alerts already delivered");
       }
     } catch {
       console.warn("two-bot metrics scrape failed");
