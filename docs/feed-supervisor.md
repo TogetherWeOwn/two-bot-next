@@ -5,14 +5,9 @@ managed poller). This is the operator view. The port record
 (`docs/feeds-port.md`) remains the domain/store contract; this guide does not
 restate it.
 
-Out of scope: cadence hot-reload follow-up
-([#1075](https://github.com/TogetherWeOwn/two-bot-next/pull/1075),
-"refresh supervisor cadence when interval hot-reloads", open at time of
-writing). The supervisor still wakes on the boot cadence while the per-tick
-schedule gate re-reads the stored interval (see
-[Fetch cadence](#fetch-cadence)). Only a restart re-baselines the supervisor
-cadence until that PR lands. Also out of scope: code changes and dashboard
-queries.
+Out of scope: code changes and dashboard queries. Cadence hot-reload is
+shipped behavior (see [Fetch cadence](#fetch-cadence)): a stored interval
+change reschedules the next run without a restart.
 
 ## Source configuration
 
@@ -67,12 +62,33 @@ As coded (`crates/bot/src/feed_jobs.rs:33-41,227-267`):
 
 - The `feeds` job registers in the website/community job supervisor and runs
   inline — no detached tasks, no second dispatcher.
-- Supervisor cadence is the **boot** `TWO_FEED_POLL_SECONDS` value. The
-  per-tick `FeedPollSchedule` gate re-reads the live settings snapshot
-  before every tick, so a stored change takes effect no earlier than the
-  previously scheduled slot, rounded up to a multiple of the boot cadence.
-  Only a restart re-baselines the supervisor cadence (dynamic-cadence
-  follow-up, [#1075](https://github.com/TogetherWeOwn/two-bot-next/pull/1075)).
+- Supervisor cadence is seeded from the boot `TWO_FEED_POLL_SECONDS` value
+  (or the already-published stored value at construction) and then follows
+  the stored live interval through `Job::cadence_source`
+  (`crates/bot/src/feed_jobs.rs:235-265`, `crates/bot/src/jobs.rs:193-252`).
+  The per-tick `FeedPollSchedule` gate re-reads the same stored interval
+  before every tick (`crates/bot/src/feed_jobs.rs:274-280`,
+  `crates/core/src/feeds.rs:1188-1201`). A stored change reschedules the
+  pending run to last-run + new interval in both directions: a decrease
+  below the boot cadence fires at last-run + new interval without waiting
+  for the pending boot-cadence slot, and an increase pushes the pending
+  tick out a full new interval. The effective interval is the stored value,
+  never rounded to a boot multiple. An unchanged stored value leaves the
+  pending slot untouched (no-op); an out-of-range stored value is refused
+  and keeps the current schedule. Overlapping passes stay suppressed: the
+  gate refuses a tick while a pass is running, and the supervisor skips a
+  tick while the previous pass is still active.
+- Stored live values are not boot configuration. An absent, unparsable, or
+  out-of-range stored value falls back to the boot interval, and a deleted
+  stored row hands the interval back to the boot value
+  (`crates/bot/src/feed_jobs.rs:201-226`). An invalid boot
+  `TWO_FEED_POLL_SECONDS` still refuses registration (`configuration`) and
+  parks the poller even when a live value is already published
+  (`crates/bot/src/feed_jobs.rs:253-259`). Hot-reload regressions:
+  `live_poll_seconds_prefers_the_stored_value`,
+  `schedule_gate_observes_a_stored_increase_without_restart`, and
+  `supervisor_applies_a_hot_reloaded_feed_interval_without_restart`
+  (`crates/bot/src/feed_jobs_tests.rs:269-437`).
 - Immediate first pass, overlapping passes suppressed, no startup jitter
   (`startup_jitter: Duration::ZERO` for this job).
 - Pass budget 100 s under the supervisor's 120 s job timeout. Each relay
