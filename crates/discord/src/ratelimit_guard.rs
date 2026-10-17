@@ -1053,4 +1053,176 @@ mod tests {
             INVALID_REQUEST_WINDOW
         );
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_and_route_debug_renders_counts_only() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        guard.observe_bucket(
+            "GET /guilds/1/roles",
+            &http::HeaderMap::from_iter([
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-bucket"),
+                    http::HeaderValue::from_static("bucket-fixture"),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-remaining"),
+                    http::HeaderValue::from_static("0"),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-reset-after"),
+                    http::HeaderValue::from_static("200"),
+                ),
+            ]),
+        );
+        let rendered = format!("{guard:?}");
+        assert!(
+            rendered.contains("BucketTable"),
+            "guard debug must name the bucket table: {rendered}"
+        );
+        assert!(
+            rendered.contains("RouteTable"),
+            "guard debug must name the route table: {rendered}"
+        );
+        assert!(
+            !rendered.contains("bucket-fixture"),
+            "debug must not leak bucket ids: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/guilds/1/roles"),
+            "debug must not leak routes: {rendered}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remaining_budget_clears_a_live_bucket_deadline_and_prunes_orphans() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let bucketed = |remaining: &str| {
+            http::HeaderMap::from_iter([
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-bucket"),
+                    http::HeaderValue::from_static("bucket-live"),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-remaining"),
+                    http::HeaderValue::from_str(remaining).unwrap(),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-reset-after"),
+                    http::HeaderValue::from_static("200"),
+                ),
+            ])
+        };
+        guard.observe_bucket("GET /guilds/1/roles", &bucketed("0"));
+        assert!(
+            guard.check_route_now("GET /guilds/1/roles", false).is_err(),
+            "an exhausted bucket must gate its route"
+        );
+        guard.observe_bucket("GET /guilds/1/roles", &bucketed("5"));
+        assert!(
+            guard.check_route_now("GET /guilds/1/roles", false).is_ok(),
+            "remaining budget must clear the learned deadline"
+        );
+        // A second route learns the same bucket, then outlives it: the next
+        // admission prunes the expired bucket and its orphaned mapping, so a
+        // later response relearns the route instead of riding stale state.
+        guard.observe_bucket("GET /guilds/2/roles", &bucketed("0"));
+        tokio::time::advance(Duration::from_secs(300)).await;
+        guard
+            .admit_route("GET /guilds/2/roles", false)
+            .await
+            .unwrap();
+        guard.observe_bucket("GET /guilds/2/roles", &bucketed("0"));
+        assert!(
+            guard.check_route_now("GET /guilds/2/roles", false).is_err(),
+            "a repruned route must gate again after relearning"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absolute_reset_epoch_installs_a_bucket_deadline() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let epoch = std::time::SystemTime::now() + Duration::from_secs(100);
+        let reset = epoch
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            .to_string();
+        guard.observe_bucket(
+            "GET /guilds/3/roles",
+            &http::HeaderMap::from_iter([
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-bucket"),
+                    http::HeaderValue::from_static("bucket-epoch"),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-remaining"),
+                    http::HeaderValue::from_static("0"),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-reset"),
+                    http::HeaderValue::from_str(&reset).unwrap(),
+                ),
+            ]),
+        );
+        assert!(
+            guard.check_route_now("GET /guilds/3/roles", false).is_err(),
+            "an absolute reset must gate its route"
+        );
+        tokio::time::advance(Duration::from_secs(101)).await;
+        assert!(
+            guard.check_route_now("GET /guilds/3/roles", false).is_ok(),
+            "an expired absolute reset must release its route"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_shared_scope_retracts_the_header_tally() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let mut accounting = ResponseAccounting::new(&guard, 429, &http::HeaderMap::new(), true);
+        assert_eq!(
+            guard.snapshot().invalid_requests_total,
+            1,
+            "a header tally without scope spends budget"
+        );
+        let shared = accounting.finish(&crate::executor::RawResponse {
+            status: 429,
+            retry_after_header: None,
+            body: br#"{"scope":"shared"}"#.to_vec(),
+            completion: None,
+        });
+        assert!(!shared, "a shared scope is not a global pause");
+        assert_eq!(
+            guard.snapshot().invalid_requests_total,
+            0,
+            "a body-shared scope must retract the tally"
+        );
+        assert_eq!(
+            guard.snapshot().invalid_requests_in_window,
+            0,
+            "a body-shared scope must leave the window"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_global_scope_installs_a_pause_from_body_timing() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let mut accounting = ResponseAccounting::new(&guard, 429, &http::HeaderMap::new(), true);
+        let global = accounting.finish(&crate::executor::RawResponse {
+            status: 429,
+            retry_after_header: None,
+            body: br#"{"global":true,"retry_after":0.5}"#.to_vec(),
+            completion: None,
+        });
+        assert!(global, "a body global flag must govern the retry");
+        assert_eq!(
+            guard.snapshot().global_pause_remaining,
+            Duration::from_millis(750),
+            "body timing plus the 250 ms pad"
+        );
+        assert_eq!(
+            guard.snapshot().global_pauses_total,
+            1,
+            "one body-learned pause"
+        );
+    }
 }
