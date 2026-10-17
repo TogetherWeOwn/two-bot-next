@@ -362,6 +362,17 @@ test("voice join burn stays silent when healthy bursts land on window edges", ()
   assert.ok(!settled.firing.includes("voice_join_slow_burn"), "healthy bursts must not ticket");
 });
 
+test("voice join burn remains silent across the reviewed healthy edge-burst scenario", () => {
+  let state = EMPTY_STATE;
+  let received = 0;
+  for (let tick = -360; tick <= 360; tick++) {
+    const arrivals = tick > 0 && tick < 360 ? 3 + (tick === 300 ? 30 : 0) + (tick === 355 ? 3 : 0) : 0;
+    received += arrivals;
+    state = evAt(joinLines(received, 0, received), state, tick * 60).state;
+  }
+  assert.deepEqual(state.firing, []);
+});
+
 test("voice join burn requires more than one bad move per window", () => {
   let state = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0).state;
   // A quiet hour gives the fast windows complete history without any burn.
