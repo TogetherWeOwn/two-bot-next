@@ -135,3 +135,10 @@ path = "fuzz_targets/helix_token.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "database_url"
+path = "fuzz_targets/database_url.rs"
+test = false
+doc = false
+bench = false
