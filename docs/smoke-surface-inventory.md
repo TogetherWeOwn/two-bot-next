@@ -37,7 +37,10 @@ Each row links the exact expected reply in
 | 5 | `/ban` | moderation (gated) | BanMembers | Expected-response table, `/ban` routing + refusal copy; run-record row 5 |
 
 Denied-path probes for the gated three (gate off, permission missing) are
-rows 6–8 of the run-record sheet, using the shared denied copy.
+rows 6–8 of the run-record sheet, using the shared denied copy. Done: they
+are pinned offline by `crates/discord/tests/denied_path_probes.rs` (one test
+per row; each probe asserts a read-only `Refuse` with the immediate ephemeral
+type-4 reply on an isolated gate-safe router).
 
 ## Deferred: 23 commands with reasons
 

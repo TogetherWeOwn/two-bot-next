@@ -691,6 +691,11 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         12,
         "feed-fetch error-class family changed the budget"
     );
+    assert_eq!(
+        metrics::AUTOMOD_DECISION_OUTCOMES.len(),
+        8,
+        "automod-decision family changed the budget"
+    );
     let text = metrics::Metrics::default().render(None);
     let help_headers = text
         .lines()
@@ -700,13 +705,13 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         .lines()
         .filter(|line| line.starts_with("# TYPE "))
         .count();
-    assert_eq!(help_headers, 67, "rendered HELP family count changed");
-    assert_eq!(type_headers, 67, "rendered TYPE family count changed");
+    assert_eq!(help_headers, 68, "rendered HELP family count changed");
+    assert_eq!(type_headers, 68, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 654,
-        "exposition grew past the 654-sample budget (21 events + 4 scalars + 1 latency \
-         + 22 histograms + 180 rest + 11 REST guard + 64 jobs + 112 job-last-error-class + 53 voice + 8 join-occupancy + 26 vote-kick + 15 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 3 presence-capture + 4 pool + 1 audit-halt + 1 event-store-lag + 1 eventsub-received + 6 eventsub-classified + 4 eventsub-posts + 3 reconcile-passes + 2 reconcile-actions + 5 reconcile-errors + 4 feed-fetches + 12 feed-fetch-errors); \
+        series, 662,
+        "exposition grew past the 662-sample budget (21 events + 4 scalars + 1 latency \
+         + 22 histograms + 180 rest + 11 REST guard + 64 jobs + 112 job-last-error-class + 53 voice + 8 join-occupancy + 26 vote-kick + 15 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 3 presence-capture + 8 automod-decisions + 4 pool + 1 audit-halt + 1 event-store-lag + 1 eventsub-received + 6 eventsub-classified + 4 eventsub-posts + 3 reconcile-passes + 2 reconcile-actions + 5 reconcile-errors + 4 feed-fetches + 12 feed-fetch-errors); \
          update docs/log-volume-guard.md with the new series"
     );
 }
