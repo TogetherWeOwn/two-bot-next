@@ -53,6 +53,23 @@ impl DeliveryDeps {
     }
 }
 
+/// Build the production delivery dependencies from already-validated boot
+/// inputs: the bot pool, the Discord bot token, the optional API override
+/// and the validated delivery config. Pure construction (no I/O, no sends);
+/// `Err` carries the catalogued `error_class` boot refuses startup with.
+pub fn build_delivery_deps(
+    pool: sqlx::PgPool,
+    token: &str,
+    proxy: Option<String>,
+    config: &two_bot_core::eventsub_delivery_config::EventsubDeliveryConfig,
+) -> Result<DeliveryDeps, &'static str> {
+    let admission = two_bot_core::send_admission::PgSendAdmission::new(pool.clone(), token)
+        .map_err(|_| "receiver_prerequisites_invalid")?;
+    let executor = ActionExecutor::with_admission(token.to_owned(), proxy, Arc::new(admission))
+        .map_err(|_| "receiver_prerequisites_invalid")?;
+    Ok(DeliveryDeps::production(pool, executor, config))
+}
+
 /// Bounded `eventsub_post` outcome labels for one delivery, as
 /// `(attempted, succeeded, failed)` increments. Only deliveries that
 /// reached the sender count as attempted; a stamp failure after a landed
@@ -72,6 +89,89 @@ pub fn post_metric_counts(outcome: &GoLiveOutcome) -> (bool, bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn delivery_vars() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([
+            ("TWO_EVENTSUB_DELIVERY".to_owned(), "1".to_owned()),
+            ("TWO_TWITCH_BROADCASTERS".to_owned(), "222,111".to_owned()),
+            (
+                "TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID".to_owned(),
+                "777".to_owned(),
+            ),
+            (
+                "TWO_EVENTSUB_INVITE_URL".to_owned(),
+                "https://discord.gg/example".to_owned(),
+            ),
+        ])
+    }
+
+    fn delivery_config() -> two_bot_core::eventsub_delivery_config::EventsubDeliveryConfig {
+        two_bot_core::eventsub_delivery_config::EventsubDeliveryConfig::from_map(&delivery_vars())
+            .expect("valid snapshot")
+            .expect("enabled")
+    }
+
+    fn lazy_pool() -> sqlx::PgPool {
+        // Never connects: pool construction performs no I/O.
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://agent_test@agent-testdb/agent_test")
+            .expect("lazy pool never connects")
+    }
+
+    fn governed_executor(pool: &sqlx::PgPool, token: &str) -> ActionExecutor {
+        crate::gateway::ensure_crypto_provider();
+        // Pure key derivation over a synthetic token; no I/O, no live request.
+        let admission = Arc::new(
+            two_bot_core::send_admission::PgSendAdmission::new(pool.clone(), token)
+                .expect("synthetic token derives a key"),
+        );
+        ActionExecutor::with_admission(token.to_owned(), None, admission)
+            .expect("governed admission builds for the real origin")
+    }
+
+    #[tokio::test]
+    async fn production_maps_validated_inputs_to_store_config() {
+        let pool = lazy_pool();
+        let executor = governed_executor(&pool, "synthetic-delivery-token");
+        let deps = DeliveryDeps::production(pool, executor, &delivery_config());
+        assert_eq!(deps.config.broadcasters, ["111", "222"]);
+        assert_eq!(deps.config.invite_url, "https://discord.gg/example");
+        assert_eq!(deps.config.channel_id, "777");
+    }
+
+    #[tokio::test]
+    async fn build_delivery_deps_wires_pool_ledger_and_governed_sender() {
+        crate::gateway::ensure_crypto_provider();
+        let deps =
+            build_delivery_deps(lazy_pool(), "synthetic-delivery-token", None, &delivery_config())
+                .expect("synthetic inputs build");
+        assert_eq!(deps.config.broadcasters, ["111", "222"]);
+        assert_eq!(deps.config.invite_url, "https://discord.gg/example");
+        assert_eq!(deps.config.channel_id, "777");
+    }
+
+    #[tokio::test]
+    async fn build_delivery_deps_refuses_credentials_the_admission_rejects() {
+        assert!(matches!(
+            build_delivery_deps(lazy_pool(), "has space", None, &delivery_config()),
+            Err("receiver_prerequisites_invalid")
+        ));
+    }
+
+    #[tokio::test]
+    async fn build_delivery_deps_refuses_an_unusable_api_override() {
+        crate::gateway::ensure_crypto_provider();
+        assert!(matches!(
+            build_delivery_deps(
+                lazy_pool(),
+                "synthetic-delivery-token",
+                Some("http://exa mple.com".to_owned()),
+                &delivery_config(),
+            ),
+            Err("receiver_prerequisites_invalid")
+        ));
+    }
 
     #[test]
     fn post_metric_counts_only_sender_reaching_outcomes() {

@@ -267,6 +267,16 @@ mod tests {
     }
 
     #[test]
+    fn from_map_accepts_a_valid_snapshot() {
+        let config = EventsubDeliveryConfig::from_map(&vars())
+            .unwrap()
+            .expect("enabled");
+        assert_eq!(config.broadcasters(), ["111", "222"]);
+        assert_eq!(config.invite_url(), "https://discord.gg/example");
+        assert_eq!(config.channel_id(), "777");
+    }
+
+    #[test]
     fn enabled_exposes_the_validated_inputs() {
         let config = load(&vars()).unwrap().expect("enabled");
         assert_eq!(config.broadcasters(), ["111", "222"]);

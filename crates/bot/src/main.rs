@@ -398,19 +398,11 @@ async fn run(cli_args: &[String]) {
                 else {
                     refuse("receiver_prerequisites_invalid")
                 };
-                let admission =
-                    two_bot_core::send_admission::PgSendAdmission::new(pool.clone(), token)
-                        .unwrap_or_else(|_| refuse("receiver_prerequisites_invalid"));
                 let proxy = std::env::var("DISCORD_API_BASE")
                     .ok()
                     .filter(|value| !value.is_empty());
-                let executor = two_bot_discord::ActionExecutor::with_admission(
-                    token.to_owned(),
-                    proxy,
-                    Arc::new(admission),
-                )
-                .unwrap_or_else(|_| refuse("receiver_prerequisites_invalid"));
-                eventsub_delivery::DeliveryDeps::production(pool, executor, &delivery_config)
+                eventsub_delivery::build_delivery_deps(pool, token, proxy, &delivery_config)
+                    .unwrap_or_else(|error_class| refuse(error_class))
             });
             Some(
                 eventsub_http::bind_with_delivery(eventsub_config, delivery)
