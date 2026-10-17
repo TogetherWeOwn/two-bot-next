@@ -206,11 +206,14 @@ def staging_push_filter_errors(name, push):
 
 
 def staging_dispatch_errors(workflow):
-    """The active staging workflow keeps exactly one fenced dispatch input.
+    """The active staging workflow keeps exactly two fenced dispatch inputs.
 
     `release_fence` exists on main (TOG-11143) so post-handoff release of an
     uninitialized/parked singleton is explicit and auditable; it defaults to
-    false and the deploy job itself runs unconditionally (TOG-12856). Anything
+    false and the deploy job itself runs unconditionally (TOG-12856).
+    `inject_gateway_failure` is the staging rollback-drill switch: also an
+    opt-in boolean defaulting to false, readable only through the pinned
+    dispatch-only expression in staging_gateway_injection_errors. Anything
     else in the dispatch block (an arming switch, a deploy flag, a default of
     true) is an unreviewed deploy route outside the pinned shape.
     """
@@ -221,12 +224,61 @@ def staging_dispatch_errors(workflow):
         errors.append(f"{name}: triggers changed")
     errors.extend(staging_push_filter_errors(name, on.get("push")))
     dispatch = on.get("workflow_dispatch") or {}
-    if set(dispatch) != {"inputs"} or set(dispatch.get("inputs") or {}) != {"release_fence"}:
-        errors.append(f"{name}: workflow_dispatch must carry only the release_fence input")
+    expected = {"release_fence", "inject_gateway_failure"}
+    if set(dispatch) != {"inputs"} or set(dispatch.get("inputs") or {}) != expected:
+        errors.append(f"{name}: workflow_dispatch must carry only the release_fence and inject_gateway_failure inputs")
     else:
-        fence = dispatch["inputs"]["release_fence"] or {}
-        if fence.get("type") != "boolean" or fence.get("default") not in (False, "false"):
-            errors.append(f"{name}: release_fence must be an opt-in boolean defaulting to false")
+        for input_name in expected:
+            spec = dispatch["inputs"][input_name] or {}
+            if spec.get("type") != "boolean" or spec.get("default") not in (False, "false"):
+                errors.append(f"{name}: {input_name} must be an opt-in boolean defaulting to false")
+    return errors
+
+
+INJECTION_EXPRESSION = "${{ github.event_name == 'workflow_dispatch' && inputs.inject_gateway_failure && 'true' || 'false' }}"
+INJECTION_MARKERS = (
+    "inject_gateway_failure", "INJECT_GATEWAY_FAILURE",
+    "TWO_GATEWAY_READINESS_FAIL_INJECTION", "--inject-gateway-failure",
+)
+
+
+def staging_gateway_injection_errors(workflows):
+    """The drill injection is dispatch-only, staging-only plumbing.
+
+    Exactly one expression in exactly one staging step may read the input,
+    it must also require `workflow_dispatch` (a push never carries inputs,
+    and the guard makes that structural rather than implied), and the step
+    may only hand the prepare flag to the generated staging deploy config.
+    Every other workflow — deploy-production above all — must not mention
+    the switch at all, so no route can forward it to production.
+    """
+    errors = []
+    for name, workflow in workflows.items():
+        if name == "deploy-staging.yml":
+            continue
+        text = str(workflow)
+        for marker in INJECTION_MARKERS:
+            if marker in text:
+                errors.append(f"{name}: gateway-failure injection marker {marker} outside deploy-staging")
+    staging = workflows.get("deploy-staging.yml") or {}
+    text = str(staging)
+    if text.count("inputs.inject_gateway_failure") != 1:
+        errors.append("deploy-staging.yml: inject_gateway_failure must be read exactly once")
+    steps = ((staging.get("jobs") or {}).get("deploy") or {}).get("steps") or []
+    armed = [step for step in steps
+             if isinstance(step, dict) and "INJECT_GATEWAY_FAILURE" in str(step)]
+    if len(armed) != 1:
+        errors.append("deploy-staging.yml: exactly one deploy step may carry the injection switch")
+        return errors
+    step = armed[0]
+    env = step.get("env") or {}
+    if env.get("INJECT_GATEWAY_FAILURE") != INJECTION_EXPRESSION:
+        errors.append("deploy-staging.yml: injection must use the pinned dispatch-only expression")
+    run = str(step.get("run") or "")
+    for needle in ("staging_rollout.py prepare", "--inject-gateway-failure",
+                   '[ "$INJECT_GATEWAY_FAILURE" = "true" ]'):
+        if run.count(needle) != 1:
+            errors.append(f"deploy-staging.yml: injection step must contain exactly one {needle}")
     return errors
 
 
@@ -1571,6 +1623,7 @@ def synthetic_user_flow_errors(workflow):
 
 def workflow_policy_errors(workflows):
     errors = []
+    errors.extend(staging_gateway_injection_errors(workflows))
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
     if set(workflows) != set(JOB_INVENTORY):
@@ -1896,6 +1949,48 @@ class WorkflowTests(unittest.TestCase):
                 workflows = deepcopy(self.workflows)
                 workflows["deploy-staging.yml"]["on"]["workflow_dispatch"] = dispatch
                 self.assertTrue(workflow_policy_errors(workflows))
+
+    def test_gateway_failure_injection_is_dispatch_only_and_never_forwarded(self):
+        workflows = self.workflows
+        self.assertEqual(staging_gateway_injection_errors(workflows), [])
+        self.assertEqual(staging_dispatch_errors(workflows["deploy-staging.yml"]), [])
+        steps = workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        armed = [s for s in steps if "INJECT_GATEWAY_FAILURE" in str(s)]
+        self.assertEqual(len(armed), 1)
+        index = steps.index(armed[0])
+        mutations = {
+            # Push could read it / default armed.
+            "expression without dispatch guard": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
+                .__setitem__("INJECT_GATEWAY_FAILURE", "${{ inputs.inject_gateway_failure }}"),
+            "expression constant true": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
+                .__setitem__("INJECT_GATEWAY_FAILURE", "true"),
+            "prepare flag unconditional": lambda w: w["jobs"]["deploy"]["steps"][index]
+                .__setitem__("run", "python3 ../scripts/staging_rollout.py prepare --inject-gateway-failure"),
+            "input defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["inject_gateway_failure"]
+                .__setitem__("default", True),
+            "input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("inject_gateway_failure"),
+            "second reader step": lambda w: w["jobs"]["deploy"]["steps"][0]
+                .setdefault("env", {}).__setitem__("INJECT_GATEWAY_FAILURE", "true"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(
+                    staging_gateway_injection_errors(changed)
+                    or staging_dispatch_errors(changed["deploy-staging.yml"]),
+                    label,
+                )
+                self.assertTrue(workflow_policy_errors(changed), label)
+        # Production (or any other workflow) mentioning the switch at all
+        # is a forwarding route, whatever the surrounding shape.
+        for name in ("deploy-production.yml", "check.yml"):
+            with self.subTest(forwarded=name):
+                changed = deepcopy(workflows)
+                job = next(iter(changed[name]["jobs"].values()))
+                job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_gateway_failure }}"
+                self.assertTrue(staging_gateway_injection_errors(changed))
+                self.assertTrue(workflow_policy_errors(changed))
 
     def test_docs_only_push_skips_staging_but_runtime_paths_deploy(self):
         # A docs-only merge to main must start no run (the soak needs a stable

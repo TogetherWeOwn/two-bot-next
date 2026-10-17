@@ -1091,6 +1091,68 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(generated["env"]["production"]["vars"], {"PRESERVED": "production-fixture"})
         self.assertEqual(self.config.read_text(), CONFIG)
 
+    def test_prepare_without_drill_flag_never_injects(self):
+        self.config.write_text(CONFIG + '[env.staging.vars]\nTWO_DEPLOY_ENV = "staging"\n')
+        self.prepare_baseline()
+        generated = json.loads(Path(self.args.deploy_config).read_text())
+        self.assertEqual(generated["env"]["staging"]["vars"], {"TWO_DEPLOY_ENV": "staging"})
+        self.assertNotIn(rollout.GATEWAY_FAIL_INJECTION_VAR, json.dumps(generated))
+        self.assertEqual(json.loads(Path(self.args.receipt).read_text()), baseline())
+
+    def test_prepare_with_drill_flag_injects_only_generated_staging_vars(self):
+        config = CONFIG + '[env.staging.vars]\nTWO_DEPLOY_ENV = "staging"\n'
+        self.config.write_text(config)
+        self.args.inject_gateway_failure = True
+        self.prepare_baseline()
+        generated = json.loads(Path(self.args.deploy_config).read_text())
+        self.assertEqual(
+            generated["env"]["staging"]["vars"],
+            {"TWO_DEPLOY_ENV": "staging", rollout.GATEWAY_FAIL_INJECTION_VAR: "1"},
+        )
+        # Production, top level and the checked-in source stay untouched.
+        self.assertEqual(generated["env"]["production"]["vars"], {"PRESERVED": "production-fixture"})
+        self.assertNotIn("vars", {k: v for k, v in generated.items() if k == "vars"})
+        self.assertEqual(self.config.read_text(), config)
+        self.assertEqual(json.loads(Path(self.args.receipt).read_text()), baseline())
+
+    def test_gateway_fail_injection_helper_fence(self):
+        def cfg(staging_vars=None, production_vars=None, top_vars=None):
+            config = {"env": {"staging": {}, "production": {}}}
+            if top_vars is not None:
+                config["vars"] = top_vars
+            if staging_vars is not None:
+                config["env"]["staging"]["vars"] = staging_vars
+            if production_vars is not None:
+                config["env"]["production"]["vars"] = production_vars
+            return config
+
+        # Disabled is a strict no-op on a clean config.
+        clean = cfg(staging_vars={"TWO_DEPLOY_ENV": "staging"})
+        rollout.apply_gateway_fail_injection(clean, False)
+        self.assertEqual(clean["env"]["staging"]["vars"], {"TWO_DEPLOY_ENV": "staging"})
+        # Enabled without the exact staging marker refuses (production shape).
+        for staging_vars in (None, {}, {"TWO_DEPLOY_ENV": "production"}, {"TWO_DEPLOY_ENV": "staging "}):
+            with self.subTest(staging_vars=staging_vars):
+                with self.assertRaises(rollout.GateError) as caught:
+                    rollout.apply_gateway_fail_injection(cfg(staging_vars=staging_vars), True)
+                self.assertEqual(str(caught.exception), "gateway_fail_injection_fence_missing")
+        # A source config already carrying the switch refuses even disabled,
+        # wherever it hides; the marker outside staging refuses too.
+        for kwargs, code in [
+            ({"staging_vars": {rollout.GATEWAY_FAIL_INJECTION_VAR: "1"}},
+             "gateway_fail_injection_in_source_config"),
+            ({"production_vars": {rollout.GATEWAY_FAIL_INJECTION_VAR: "1"}},
+             "gateway_fail_injection_in_source_config"),
+            ({"top_vars": {rollout.GATEWAY_FAIL_INJECTION_VAR: "1"}},
+             "gateway_fail_injection_in_source_config"),
+            ({"production_vars": {"TWO_DEPLOY_ENV": "staging"}}, "deploy_env_outside_staging"),
+            ({"top_vars": {"TWO_DEPLOY_ENV": "staging"}}, "deploy_env_outside_staging"),
+        ]:
+            with self.subTest(code=code, kwargs=kwargs):
+                with self.assertRaises(rollout.GateError) as caught:
+                    rollout.apply_gateway_fail_injection(cfg(**kwargs), False)
+                self.assertEqual(str(caught.exception), code)
+
     def test_main_prepare_uses_default_fixture_config_and_generated_paths(self):
         # argparse's first/default config and output paths, not the repository's config.
         default_config = self.root / "wrangler.toml"

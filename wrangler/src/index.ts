@@ -196,6 +196,12 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_TWITCH_CLIENT_ID?: string;
   /** Operator-set Helix client secret. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
   TWO_TWITCH_CLIENT_SECRET?: string;
+  /** Staging rollback-drill switch (docs/staging-rollout-gate.md). Set only
+   * in the generated staging deploy config by a manual deploy-staging
+   * dispatch, never a committed var (check-env-bindings.py). Reaches the
+   * Container on an explicit fenced line below, never flag-forwarded. The
+   * TWO_DEPLOY_ENV marker it is fenced by rides FORWARDED_FLAGS. */
+  TWO_GATEWAY_READINESS_FAIL_INJECTION?: string;
   /** Operator-set Worker secrets for the private receiver. Never flag-forwarded. */
   TWO_INTERNAL_ACTIONS?: string;
   TWO_INTERNAL_CALLERS?: string;
@@ -609,6 +615,14 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   const applicationId = env[APPLICATION_ID_KEY];
   if (typeof applicationId === "string" && isSnowflake(applicationId)) {
     vars[APPLICATION_ID_KEY] = applicationId;
+  }
+  // Staging rollback drill (docs/staging-rollout-gate.md): the readiness
+  // failure switch reaches the Container only under the staging deploy-env
+  // marker with the exact "1" value; the Rust fence repeats both checks, so
+  // a stray binding on any other Worker forwards and activates nothing.
+  // Not flag-forwarded (NOT_FORWARDED in container-env.ts).
+  if (env.TWO_DEPLOY_ENV === "staging" && env.TWO_GATEWAY_READINESS_FAIL_INJECTION === "1") {
+    vars["TWO_GATEWAY_READINESS_FAIL_INJECTION"] = "1";
   }
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   // Private internal-actions receiver (TOG-12980, bind TOG-16851). Dark unless

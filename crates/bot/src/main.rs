@@ -278,7 +278,16 @@ async fn run(cli_args: &[String]) {
     let state = SharedState::new(
         Arc::clone(&gateway),
         store.as_ref().map(|s| s.pool().clone()),
-    );
+    )
+    .with_gateway_fail_injection(server::gateway_failure_injection_from_env());
+    if state.gateway_fail_injected {
+        // Staging rollback drill only (the fence refuses everywhere else):
+        // loud once at boot so the drill is unmistakable in the deploy logs.
+        tracing::warn!(
+            msg = "gateway_readiness_failure_injection_active",
+            "gateway readiness failure injection active; /readyz reports gateway down for the staging rollback drill"
+        );
+    }
 
     // Disable guard: refuse to boot with moderation/automation disabled
     // while releases are still owed (pending tempban unbans, active
