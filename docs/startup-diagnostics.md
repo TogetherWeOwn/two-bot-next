@@ -58,8 +58,10 @@ running-gateway failure (`shutdown::RUNTIME_FAILURE_LINGER`) before the drain
 and exit-1 restart. A shutdown signal ends the linger at once. Readers:
 
 - Worker keepalive: one `console.warn` JSON line
-  `{"event":"container_gateway_failure","phase":…,"class":…}` per tick, only when
-  both values are `[a-z0-9_]{1,32}` tokens, so it reaches Workers Logs.
+  `{"event":"container_gateway_failure","phase":…,"class":…,"release":…,"worker_version":…}`
+  per tick, only when both values are `[a-z0-9_]{1,32}` tokens, so it reaches
+  Workers Logs. `release` is the container git SHA (`"unknown"` when the probe
+  answer has none); `worker_version` is the platform Worker version id.
 - `scripts/staging_rollout.py`: the rollout gate's `last observation before
   timeout` line ends with `gateway_failure=<phase>:<class>`. The gate also
   probes `/readyz` while this build's rollout exists but has not converged,

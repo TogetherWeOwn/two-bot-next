@@ -1,6 +1,7 @@
 """Offline workflow policy fixtures; never dispatch, deploy or probe staging."""
 
 from copy import deepcopy
+import importlib.util
 from pathlib import Path
 import re
 import tomllib
@@ -9,6 +10,14 @@ import unittest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+_HISTORY_SPEC = importlib.util.spec_from_file_location(
+    "synthetic_alert_history", ROOT / "scripts/synthetic_alert_history.py")
+_HISTORY_MODULE = importlib.util.module_from_spec(_HISTORY_SPEC)
+_HISTORY_SPEC.loader.exec_module(_HISTORY_MODULE)
+ALERT_STEPS = _HISTORY_MODULE.ALERT_STEPS
+DECIDE_STEPS = _HISTORY_MODULE.DECIDE_STEPS
+JOB_NAMES = _HISTORY_MODULE.JOB_NAMES
+PROBE_STEPS = _HISTORY_MODULE.PROBE_STEPS
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
     # The nextest branch adds its required lane; main adds the production schema gate.
@@ -46,9 +55,14 @@ JOB_INVENTORY = {
     "sbom.yml": {"image", "verify"},
     # Live staging voice synthetic (docs/voice-synthetic.md); pinned shape below.
     "voice-synthetic.yml": {"synthetic"},
+    # Five-minute user-flow synthetic (docs/synthetic-user-flow.md): staging
+    # health-contract plus passive production probes; pinned shape below.
+    "synthetic-user-flow.yml": {"staging", "prod-passive"},
     # SDLC separation gate (org test-guard reusable, warn mode): one
     # reusable call, least-privilege grant pinned below.
     "test-guard.yml": {"test-guard"},
+    # Advisory changed-file review rules; no deploy route or new required gate.
+    "review-rules.yml": {"review-rules"},
     # TOG-21027: manual, bounded vote_kick libFuzzer smoke on a GitHub-hosted
     # runner. Read-only, no secrets, no deploy route: the generic
     # deployment/probe scan already passes, so only the inventory pin is needed.
@@ -75,6 +89,8 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
                    ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
+                   # Read-only shadow engine. Repin with its caller after central merge.
+                   ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@c0b2e33692266088af0d7caf9f448dde2f723d75",
                    # SDLC 2.3 CI speed pilot, promoted: required check.yml
                    # caller to the shared nextest lane (local path until
                    # the central move).
@@ -1416,6 +1432,143 @@ def voice_synthetic_errors(workflow):
     return errors
 
 
+def synthetic_user_flow_errors(workflow):
+    """Five-minute user-flow synthetic (docs/synthetic-user-flow.md).
+
+    Runs on a 5-minute schedule and manual dispatch, only from main, through
+    the `synthetic-alerts` environment. Two jobs: `staging` runs the reviewed
+    staging health-contract probe, `prod-passive` runs the reviewed passive
+    production probe (observe and alert only, never a deploy gate). Each job
+    has an optional target probe, a notice when its binding is absent, an
+    always() evidence upload, an always() decide step, and a gated post step.
+    The decide step reads recent run history with actions:read, alerts after
+    two failures, and writes the event to GITHUB_OUTPUT; the post step runs
+    only when an event is due so a no-op is skipped (never success), and only
+    a successful post counts as delivered. No wrangler, no deploy route, no
+    `set -x`.
+    """
+    name = "synthetic-user-flow.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent")
+    on = workflow.get("on") or {}
+    if set(on) != {"schedule", "workflow_dispatch"}:
+        errors.append(f"{name}: triggers must be exactly schedule and workflow_dispatch")
+    else:
+        schedules = on.get("schedule") or []
+        if schedules != [{"cron": "*/5 * * * *"}]:
+            errors.append(f"{name}: schedule must stay every 5 minutes")
+        dispatch = on.get("workflow_dispatch") or {}
+        inputs = (dispatch.get("inputs") or {}) if isinstance(dispatch, dict) else {}
+        if set(dispatch) != {"inputs"} or set(inputs) != {"force_fail"}:
+            errors.append(f"{name}: workflow_dispatch must carry only the force_fail input")
+        else:
+            field = inputs["force_fail"] or {}
+            if field.get("type") != "boolean" or field.get("default") not in (False, "false"):
+                errors.append(f"{name}: force_fail must be an opt-in boolean defaulting to false")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "synthetic-user-flow", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own synthetic-user-flow group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"staging", "prod-passive"}:
+        errors.append(f"{name}: jobs must be exactly staging and prod-passive")
+        return errors
+    expected_script = {"staging": "scripts/staging_health_contract_probe.py",
+                       "prod-passive": "scripts/prod_passive_probe.py"}
+    for job_id in ("staging", "prod-passive"):
+        job = jobs[job_id]
+        if job.get("environment") != "synthetic-alerts":
+            errors.append(f"{name}:{job_id}: must read only the synthetic-alerts Environment")
+        if job.get("if") != "github.ref == 'refs/heads/main'":
+            errors.append(f"{name}:{job_id}: must run only from main")
+        if job.get("permissions") != {"actions": "read", "contents": "read"}:
+            errors.append(f"{name}:{job_id}: must keep actions:read plus contents:read only")
+        if job.get("timeout-minutes") != "10":
+            errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
+        if not runner_allowed(job_id, job.get("runs-on")):
+            errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
+        for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+            if key in job:
+                errors.append(f"{name}:{job_id}: must not set {key}")
+        steps = job.get("steps") or []
+        if len(steps) != 6:
+            errors.append(f"{name}:{job_id}: must run checkout, probe, notice, upload, decide and alert")
+            continue
+        checkout, probe_step, notice, upload, decide_step, alert_step = steps
+        if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+                or (checkout.get("with") or {}).get("persist-credentials") != "false":
+            errors.append(f"{name}:{job_id}: checkout must be pinned and must not persist credentials")
+        if expected_script[job_id] not in str(probe_step.get("run", "")) or "uses" in probe_step:
+            errors.append(f"{name}:{job_id}: probe step must call {expected_script[job_id]}")
+        expected_target = "STAGING_WORKER_URL" if job_id == "staging" else "PRODUCTION_WORKER_URL"
+        if probe_step.get("id") != "probe" or expected_target not in str(probe_step.get("if", "")):
+            errors.append(f"{name}:{job_id}: probe must be skipped when {expected_target} is unset")
+        expected_notice = expected_target + " is unset"
+        if expected_notice not in str(notice.get("run", "")) or "::warning::" not in str(notice.get("run", "")):
+            errors.append(f"{name}:{job_id}: missing-binding skip must emit a notice")
+        if upload.get("if") != "always()":
+            errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
+        if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
+            errors.append(f"{name}:{job_id}: must upload the run evidence artifact")
+        if decide_step.get("if") != "always()":
+            errors.append(f"{name}:{job_id}: decide step must run with if: always()")
+        if "scripts/synthetic_alert.py" not in str(decide_step.get("run", "")) \
+                or "--decide-only" not in str(decide_step.get("run", "")):
+            errors.append(f"{name}:{job_id}: decide step must call scripts/synthetic_alert.py --decide-only")
+        if decide_step.get("id") != "decide":
+            errors.append(f"{name}:{job_id}: decide step must expose id decide for the post gate")
+        if alert_step.get("if") != "${{ !cancelled() && steps.decide.outputs.event != '' }}":
+            errors.append(f"{name}:{job_id}: post step must run only when steps.decide.outputs.event != ''")
+        # Without a status function GitHub adds an implicit success() &&, so
+        # a failed probe would skip the post step and no ALERT would go out
+        # during an outage. Keep this check even if the exact pin above moves.
+        if not any(func in str(alert_step.get("if", ""))
+                   for func in ("!cancelled()", "always()", "failure()", "success()")):
+            errors.append(f"{name}:{job_id}: post step gate must carry a status function so GitHub does not add implicit success()")
+        if "scripts/synthetic_alert.py" not in str(alert_step.get("run", "")) \
+                or "--post-only" not in str(alert_step.get("run", "")):
+            errors.append(f"{name}:{job_id}: alert step must call scripts/synthetic_alert.py --post-only")
+        environment = "staging" if job_id == "staging" else "prod"
+        job_name = JOB_NAMES[environment]
+        probe_name = PROBE_STEPS[environment]
+        alert_name = ALERT_STEPS[environment]
+        decide_name = DECIDE_STEPS[environment]
+        if job.get("name") != job_name:
+            errors.append(f"{name}:{job_id}: job name must match synthetic alert history lookup")
+        if probe_step.get("name") != probe_name:
+            errors.append(f"{name}:{job_id}: probe step name must match synthetic alert history lookup")
+        if decide_step.get("name") != decide_name:
+            errors.append(f"{name}:{job_id}: decide step name must match synthetic alert history lookup")
+        if alert_step.get("name") != alert_name:
+            errors.append(f"{name}:{job_id}: alert step name must match synthetic alert history lookup")
+        decide_env = decide_step.get("env") or {}
+        if (decide_env.get("GITHUB_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
+                or decide_env.get("PROBE_OUTCOME") != "${{ steps.probe.outcome }}"
+                or "SYNTHETIC_ALERT_WEBHOOK_URL" in decide_env
+                or "secrets." in str(decide_step.get("run", ""))):
+            errors.append(f"{name}:{job_id}: decide step must pass token and outcome via env only")
+        alert_env = alert_step.get("env") or {}
+        if (alert_env.get("SYNTHETIC_ALERT_WEBHOOK_URL") != "${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}"
+                or alert_env.get("ALERT_EVENT") != "${{ steps.decide.outputs.event }}"
+                or "GITHUB_TOKEN" in alert_env
+                or "PROBE_OUTCOME" in alert_env
+                or "secrets." in str(alert_step.get("run", ""))):
+            errors.append(f"{name}:{job_id}: post step must pass webhook and decided event via env only")
+        for step in steps:
+            if step not in (decide_step, alert_step) and "secrets." in str(step):
+                errors.append(f"{name}:{job_id}: only the decide and alert steps may hold a secret")
+    text = str(jobs).lower().replace(" ", "")
+    for marker in ("wrangler", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                   "cloudflare_api_token", "ownership_control"):
+        if marker in text:
+            errors.append(f"{name}: must not contain {marker!r}")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"synthetic_alert_webhook_url", "github_token"}:
+        errors.append(f"{name}: must read only the webhook secret and read-only GitHub token")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
@@ -1440,6 +1593,11 @@ def workflow_policy_errors(workflows):
             # Pinned shape above; the generic environment scan below would
             # flag its voice-synthetic Environment binding.
             errors.extend(voice_synthetic_errors(workflow))
+            continue
+        if name == "synthetic-user-flow.yml":
+            # Pinned shape above; the generic environment/marker scan below
+            # would flag its synthetic-alerts binding and probe paths.
+            errors.extend(synthetic_user_flow_errors(workflow))
             continue
         if name == "staging-rollback-drill.yml":
             # Manual drill (TOG-14008): pinned shape above; the generic
@@ -2629,6 +2787,17 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             yaml.load("jobs:\n  deploy:\n    if: '${{ false }}'\n    if: true\n", Loader=UniqueKeyLoader)
 
+    def test_review_rules_stays_read_only_and_shadow(self):
+        workflow = self.workflows["review-rules.yml"]
+        self.assertEqual(set(workflow["on"]), {"pull_request", "merge_group"})
+        self.assertEqual(workflow["permissions"], {})
+        job = workflow["jobs"]["review-rules"]
+        self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertEqual(job["with"], {"packs": "rust,security,python-shell-ci", "mode": "warn"})
+        self.assertNotIn("secrets", job)
+        self.assertNotIn("environment", job)
+        self.assertEqual(job["uses"], REUSABLE_CALLS[("review-rules.yml", "review-rules")])
+
     def test_private_runner_and_service_isolation(self):
         for name, workflow in self.workflows.items():
             for job_id, job in workflow["jobs"].items():
@@ -2976,7 +3145,11 @@ class WorkflowTests(unittest.TestCase):
             for job_id, job in workflow["jobs"].items():
                 with self.subTest(workflow=name, job=job_id):
                     expected = {"contents": "read"}
-                    if (name, job_id) == ("supply-chain.yml", "pr-lint"):
+                    if (name, job_id) in (("synthetic-user-flow.yml", "staging"),
+                                          ("synthetic-user-flow.yml", "prod-passive")):
+                        # Read workflow/job history to debounce alerts and detect recovery.
+                        expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
                         # Marker-label actor audit via the issue-events API.

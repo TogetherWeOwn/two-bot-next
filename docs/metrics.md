@@ -60,6 +60,8 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_queue_pending{lane}` | Queued (not in-flight) voice actions; `lane` is `urgent` or `deferred` |
 | `two_bot_voice_queue_oldest_age_seconds` | Age of the oldest queued voice action in seconds; 0 when empty |
 | `two_bot_voice_rest_in_flight_age_seconds` | Age of the oldest in-flight voice REST attempt in seconds; 0 when idle |
+| `two_bot_voice_creator_map_generation` | Last merged creator-map generation; 0 before the first merge — a flat line across reconnects means the map stopped converging |
+| `two_bot_voice_creator_map_age_seconds` | Seconds since the last successful creator-map merge, republished every actor tick; 0 when never merged — climbing past the 5 min refresh interval means merges stopped landing |
 | `two_bot_voice_global_backoff_capped_total` | Global-backoff waits capped (returned RateLimited for tick-driven backoff) instead of parking the actor |
 | `two_bot_voice_dispatch_timeouts_total` | Actor dispatch turns that ran past the observe bound (run to completion; counted after the fact); the queue keeps its retries |
 | `two_bot_voice_watchdog_stucks_total` | Watchdog firings: queued work with no dispatch progress inside the window |
@@ -341,16 +343,27 @@ as dynamic labels.
   `voice_event="voice_creator_orphan"`. No channel, member, token, body or
   ID leaves the process in any label or field.
 - Worker log fields (Workers Logs only, never a metric):
-  `event="container_gateway_failure"` with `phase`/`class`, emitted by the
-  Container DO keepalive in `wrangler/src/index.ts` once per tick while the
-  gateway task is failing. `phase` is `durable_gateway`; `class` is one of
+  `event="container_gateway_failure"` with `phase`/`class`/`failed_step`/
+  `error_code`/`build_revision`/`release`/`worker_version`/`log_url`, emitted
+  by the Container DO keepalive in `wrangler/src/index.ts` once per tick while
+  the gateway task is failing. `phase` is `durable_gateway`; `class` is one of
   `store_unavailable`, `gateway_pool_connect_failed`, `checkpoint_load_failed`,
   `onboarding_gates_invalid`, `onboarding_init_failed`,
   `custom_commands_init_failed`, `milestones_load_failed`,
   `automod_config_invalid`, `automod_executor_failed`, `raid_executor_failed`,
   `gateway_runtime_failed` or `gateway_task_panicked` (every `FailureClass`
-  variant in `crates/bot/src/gateway_failure.rs`). Only `[a-z0-9_]{1,32}`
-  tokens are ever logged; anything else is dropped. See
+  variant in `crates/bot/src/gateway_failure.rs`). Only `phase` and `class`
+  use `[a-z0-9_]{1,32}` tokens; anything else is dropped. `failed_step` names
+  the fallible step, `error_code` carries the SQLSTATE (`none` when no database
+  code applies). `release` is the container git SHA from `/readyz`
+  `build_revision` (stamped at deploy time, `"unknown"` when unparseable, never
+  echoed); `build_revision` carries the same SHA under its `/readyz` spelling
+  and `log_url` links the log-query docs; `worker_version` is the platform
+  Worker version id. `metrics_alert` lines carry the same `release` and
+  `worker_version` from that tick's probe. Group gateway failures by `class`;
+  group metrics alerts by the alert rule in `content`. Error-class grouping
+  applies to metrics alerts only when `content` includes a validated last error
+  class, as with `job_consecutive_failures`. See
   [startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gateway_failure).
 - `two_bot_voice_join_to_move_seconds` is a label-free histogram from creator
   join gateway receipt to successful member move. Cancelled/failed joins do not
@@ -549,7 +562,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `job_stale:<job>` | last success older than 2 x the job cadence (never-succeeded is ignored) | [job stale](runbook.md#alert-job-stale) |
 | `job_consecutive_failures:<job>` | `two_bot_job_consecutive_failures` >= 3 | [job failures](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s > 10% of REST requests between samples, >= 10 requests | [REST 429](runbook.md#alert-rest-429) |
-| `rest_5xx_rate` | 5xx > 10% of REST requests between samples, >= 10 requests | [REST 5xx](runbook.md#alert-rest-5xx) |
+| `rest_5xx_rate` | 5xx responses > 10% of REST requests between samples, >= 10 requests | [REST 5xx](runbook.md#alert-rest-5xx) |
 | `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
 | `db_errors` | 3+ storage failures between samples (restarts skip the window) | [DB errors](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
@@ -561,6 +574,8 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `dispatch_drops:<lane>` | **ticket**, not page: `two_bot_dispatch_drops_total{lane}` grows in 3 consecutive completed sample windows per bounded lane; first sample is baseline, flat/reset clears, missing/invalid retains active alerts | [dispatch drops](runbook.md#alert-dispatch-drops) |
 | `job_unknown_stale:<job>` | **ticket**, not page: job without a cadence entry with no success for more than 2 hours (never-succeeded is ignored) | [job unknown stale](runbook.md#alert-job-unknown-stale) |
 | `gateway_checkpoint_failures` | any increase of `two_bot_gateway_checkpoint_failures_total` summed over every `stage` between samples (first sample is baseline-only; the 75 s runtime linger leaves ~3 s margin over a 60 s tick plus two 6 s probes for a pre-exit scrape, the post-restart reset resolves) | [checkpoint failures](runbook.md#alert-checkpoint-failures) |
+| `voice_join_fast_burn` | creator-join budget (99.5% moved within 5 s) burning faster than 14.4x in both the 1 h and 5 min windows; each window requires at least 10 genuine joins and two bad moves; receive counts lag one scrape and incomplete post-restart windows stay inactive | [voice join fast burn](runbook.md#alert-voice-join-fast-burn) |
+| `voice_join_slow_burn` | **ticket**, not page: same budget burning faster than 6x in both the 6 h and 30 min windows, with the same per-window volume and bad-move floors (sustained grind the fast rule never catches) | [voice join slow burn](runbook.md#alert-voice-join-slow-burn) |
 
 `dispatch_drops` covers `messages`, `interactions`, `registry`, `privileged`,
 `busy` and `reactions` independently (the Worker allowlist is pinned to Rust).
