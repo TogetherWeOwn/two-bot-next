@@ -58,7 +58,10 @@ existing disposable Postgres service, rather than the lint-only `check` lane.
   macro token trees such as `vec![x.expect("")]`, which the base pattern
   cannot see); the gate reports the macro hit on the call end line and drops
   it when the base rule already covers the line, so there are no double
-  reports. There are no such hits in the tree today.
+  reports. Because the macro rule scans source text, it ignores `//` and
+  `///` comment hits via `pattern-not-regex`; `/* */` block comments and
+  raw strings can still match, which is the accepted tradeoff of covering
+  macro token trees. There are no such hits in the tree today.
 - Squawk migration lint (HARD; `dropping-object` WARN):
   `scripts/ci/check-squawk-migrations.py` flags risky statements in changed
   migration files only. `adding-required-field`, `creating-index`,

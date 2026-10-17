@@ -1,12 +1,13 @@
 """Offline tests for the Semgrep HARD gate.
 
 The gate must fail on new findings, stay silent when the diff adds none,
-and fail closed when it is blind. The vendored rule set is pinned: four
+and fail closed when it is blind. The vendored rule set is pinned: five
 rules, local config only, no registry access.
 """
 
 import io
 import json
+import re
 import stat
 import subprocess
 import tempfile
@@ -495,6 +496,20 @@ class ConfigTests(unittest.TestCase):
             text = json.dumps(rule)
             self.assertNotIn("registry", text)
             self.assertNotIn("p/rust", text)
+
+    def test_macro_rule_excludes_line_comments(self):
+        config = yaml.safe_load((ROOT / ".semgrep/rust-warn.yml").read_text())
+        rule = next(r for r in config["rules"]
+                    if r["id"] == "rust-empty-expect-in-macros")
+        patterns = rule.get("patterns", [])
+        regexes = [p["pattern-regex"] for p in patterns if "pattern-regex" in p]
+        self.assertTrue(regexes, "macro rule must keep its text regex")
+        self.assertTrue(any(re.search(rx, 'x.expect("")') for rx in regexes))
+        not_regexes = [p["pattern-not-regex"] for p in patterns
+                       if "pattern-not-regex" in p]
+        self.assertTrue(not_regexes, "macro rule must exclude // comments")
+        self.assertTrue(any(
+            re.search(rx, "/// Never write .expect(\"\")") for rx in not_regexes))
 
     def test_test_files_are_out_of_scope(self):
         config = yaml.safe_load((ROOT / ".semgrep/rust-warn.yml").read_text())
