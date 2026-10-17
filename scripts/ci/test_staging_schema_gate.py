@@ -1,9 +1,12 @@
 """Offline gate-contract tests; no database, no Actions dispatch, no secrets."""
 
 import json
+from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
+import staging_schema_gate
 from staging_schema_gate import (
     main,
     Refused,
@@ -44,6 +47,26 @@ class MainTests(unittest.TestCase):
             )
             self.assertEqual(result, 0)
 
+    def test_malformed_port_refuses_before_subprocess_and_writes_no_manifest(self):
+        env = {
+            staging_schema_gate.PLAN_URL_ENV: (
+                "postgresql://two_bot_migrator_ro:pwSENTINEL"
+                "@ep-staging-123.aws.neon.tech:notaportSENTINEL/two_bot"
+            ),
+            staging_schema_gate.EXPECTED_HOST_ENV: "ep-staging-123.aws.neon.tech",
+            staging_schema_gate.EXPECTED_DATABASE_ENV: "two_bot",
+            staging_schema_gate.EXPECTED_BRANCH_ENV: "",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_out = Path(directory) / "manifest.json"
+            with mock.patch.object(staging_schema_gate.subprocess, "run") as run_spy:
+                with self.assertRaises(Refused) as caught:
+                    main(["--binary", "staging-migrate", "--source-sha", "a" * 40,
+                          "--manifest-out", str(manifest_out)], env=env)
+            run_spy.assert_not_called()
+            self.assertFalse(manifest_out.exists())
+            self.assertNotIn("SENTINEL", str(caught.exception))
+
 
 class PinsFromUrlTests(unittest.TestCase):
     def test_neon_url_yields_lowercase_host_database_and_empty_branch(self):
@@ -71,6 +94,28 @@ class PinsFromUrlTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(Refused):
                     pins_from_url(bad)
+
+    def test_malformed_port_is_a_fixed_refusal_that_never_echoes_input(self):
+        for port in ("notaportSENTINEL", "99999", "-1"):
+            url = (f"postgresql://two_bot_migrator_ro:pwSENTINEL"
+                   f"@ep-staging-123.aws.neon.tech:{port}/two_bot")
+            with self.subTest(port=port):
+                with self.assertRaises(Refused) as caught:
+                    pins_from_url(url)
+                message = str(caught.exception)
+                self.assertEqual(message, "plan database binding is not a valid database URL")
+                self.assertNotIn("SENTINEL", message)
+                self.assertNotIn(port, message)
+                self.assertNotIn("\n", message)
+
+    def test_absent_and_direct_ports_keep_parsing(self):
+        for suffix in ("", ":5432"):
+            with self.subTest(suffix=suffix):
+                host, database, branch = pins_from_url(
+                    f"postgresql://two_bot_migrator_ro:pw@ep-staging-123.aws.neon.tech{suffix}/two_bot"
+                )
+                self.assertEqual((host, database, branch),
+                                 ("ep-staging-123.aws.neon.tech", "two_bot", ""))
 
 
 class VerifyBindingTests(unittest.TestCase):
