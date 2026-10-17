@@ -31,7 +31,14 @@ IMAGE_MAX_BYTES = 112 * MIB
 # (15.04 MiB) before the event-executor merge; the combined-head
 # measurement comes from hosted CI on the merged head. 16 MiB restores a
 # working tripwire with headroom; revisit if the binary approaches it.
-BINARY_MAX_BYTES = 16 * MIB
+# Rebumped for the feed-fetch outcome gauges: CI measured 16,778,336 bytes
+# (16.00 MiB) on the PR merge head vs 16,776,096 bytes on the main baseline
+# — 1,120 bytes (0.007%) over the 16 MiB budget, +2,240 bytes of
+# bounded-vocabulary counters and pure mapping functions, no new
+# dependencies. 17 MiB restores a working tripwire with ~1.00 MiB (6.2%)
+# headroom, the same policy as the 16 MiB calibration; revisit if the binary
+# approaches it.
+BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"
