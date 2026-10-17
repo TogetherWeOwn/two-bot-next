@@ -41,6 +41,9 @@ IMAGE_MAX_BYTES = 112 * MIB
 # 16,776,096 bytes (16.00 MiB, 1,120 bytes of headroom) and the voice
 # rename-decision logs (#1064) added 3,160 bytes (merged head 6a9c394e:
 # 16,779,256 bytes, 2,040 over 16 MiB), likewise with no new dependencies.
+# The go-live receiver-ledger branch independently measured 16801560 bytes
+# (16.02 MiB) on CI run 39056648109 job 117470241279, 24344 bytes over the
+# 16 MiB tripwire, after ~450 lines of shipping ledger/receiver code.
 # 17 MiB restores the tripwire with ~1.00 MiB headroom; revisit if approached.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
