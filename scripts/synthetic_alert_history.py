@@ -62,6 +62,13 @@ class HistoryError(Exception):
     """A safe-to-report failure reading probe history."""
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Turn every redirect into an HTTPError without contacting its target."""
+
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
 def _advance(state, outcome, delivery):
     """One chronological sample applied to (failures, incident, delivered)."""
     failures, incident, alert_delivered = state
@@ -170,10 +177,27 @@ def _get(path, token):
                  "X-GitHub-Api-Version": "2022-11-28",
                  "User-Agent": "two-bot-next-synthetic-alert/1"},
     )
+    # urllib follows redirects by default, which would resend the GitHub
+    # Bearer token to the redirect target. Reject redirects at the opener
+    # so only the api.github.com URL is ever contacted (same policy as the
+    # alert POST in synthetic_alert.py).
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPSHandler(),
+        urllib.request.HTTPErrorProcessor(),
+        _NoRedirectHandler(),
+    )
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with opener.open(request, timeout=10) as response:
             body = response.read(MAX_RESPONSE_BYTES + 1)
-    except (OSError, urllib.error.HTTPError, http.client.HTTPException) as error:
+    except urllib.error.HTTPError as error:
+        if error.code in (301, 302, 303, 307, 308):
+            raise HistoryError(
+                "could not read recent synthetic workflow history "
+                f"(redirect refused with status {error.code})") from None
+        raise HistoryError("could not read recent synthetic workflow history ("
+                           + error.__class__.__name__ + ")") from None
+    except (OSError, http.client.HTTPException) as error:
         # HTTPException covers a mid-read truncation (IncompleteRead),
         # which is not an OSError: it is unknown history, not a crash, so
         # the fail-open policy still applies.
