@@ -174,10 +174,16 @@ claim them as shipped acceptance:
   with the rollback evaluation in [Alert: REST 5xx](runbook.md#alert-rest-5xx).
   The canary gate helper `evaluatePromotionGate` (in
   `wrangler/src/alert-rules.ts`) fails a promotion stage only on that 5xx
-  firing; a 429-only burst passes. What is not yet wired is calling it from
-  a live promotion stage: until a staging/production gate step invokes it and
-  fails the stage, a 5xx burst during promotion pages on-call and the existing
-  per-stage health gates roll back only on their own probe failures.
+  firing; a 429-only burst passes. The staging `deploy` job invokes it in the
+  `error_rate_gate` step (`wrangler/scripts/promotion-error-gate.mjs`), and a
+  fail verdict fails the stage so the existing auto-rollback restores the
+  recorded pre-promote snapshot. Coverage limits, stated plainly: live
+  enforcement needs the `STAGING_METRICS_SCRAPE_TOKEN` secret, which is not
+  provisioned yet — without it the step records a skip (never a silent pass).
+  Until then, the `inject_error_rate_spike` dispatch input judges a rehearsal
+  5xx firing to prove the fail-to-rollback chain with no traffic. Do not claim
+  live 5xx enforcement on staging until a run shows a `live` verdict in
+  `error-rate-gate.json`. Production has no error-rate gate yet.
 - The shared central gradual-promotion action promotes 5-50-100% with
   per-stage health gates and automatic rollback to the recorded pre-promote
   version. This repository has no caller wiring to it yet, so do not treat
