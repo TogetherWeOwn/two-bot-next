@@ -104,13 +104,6 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                     );
                     ErrorClass::Database
                 })?;
-                // Stale per-guild game-activity aggregates expire on this same
-                // cadence, never on the hourly flush/send path: quiet guilds
-                // stop accumulating rows while active guilds keep every fresh
-                // row. Execute only; the dry run deletes nothing by contract.
-                if mode == RetentionMode::Execute {
-                    expire_stale_game_aggregates(&pool).await?;
-                }
                 let partial = report.guild_purges_failed > 0
                     || report.guild_purges_deferred > 0
                     || report.deletions_deferred > 0
@@ -154,6 +147,15 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                         "retention run completed",
                     );
                 }
+                // Stale per-guild game-activity aggregates expire on this same
+                // cadence, never on the hourly flush/send path: quiet guilds
+                // stop accumulating rows while active guilds keep every fresh
+                // row. Execute only; the dry run deletes nothing by contract.
+                // Runs after the report above so an expiry failure never
+                // discards the retention report unlogged.
+                if mode == RetentionMode::Execute {
+                    expire_stale_game_aggregates(&pool).await?;
+                }
                 Ok(())
             })
         }),
@@ -165,9 +167,10 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
 /// statement, so one guild's store failure never rolls back another guild's
 /// expiry; any failure returns [`ErrorClass::Database`] so the supervisor
 /// retries on the next bounded opportunity. Expiry is idempotent (deleted
-/// rows stay deleted), and the horizon parser never yields a sub-day value,
-/// so a misconfigured setting falls back to the safe default instead of
-/// widening into a wipe.
+/// rows stay deleted), and the horizon parser only yields values inside
+/// `1..=MAX_AGGREGATE_RETENTION_DAYS`, so a misconfigured setting falls back
+/// to the safe default instead of widening into a wipe or overflowing the
+/// interval arithmetic.
 async fn expire_stale_game_aggregates(pool: &PgPool) -> Result<(), ErrorClass> {
     let horizon = game_activity_store::aggregate_retention_days_from_setting(
         std::env::var(game_activity_store::AGGREGATE_RETENTION_DAYS_SETTING)

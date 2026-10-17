@@ -127,14 +127,21 @@ pub const GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS: i32 = 90;
 /// never on the flush/send path.
 pub const AGGREGATE_RETENTION_DAYS_SETTING: &str = "TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS";
 
-/// Parse the [`AGGREGATE_RETENTION_DAYS_SETTING`] value. Missing or malformed
-/// values fall back to [`GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`], never to a
-/// wider horizon: an unreadable setting must not widen into a full-table wipe
-/// (non-positive values refuse below in [`expire_stale_guild_aggregates`]).
+/// Widest horizon the parser accepts: a century, far beyond any sane retention
+/// window yet safely inside the `timestamptz` range, so an absurd operator
+/// value can never push `now() - make_interval(days => $2)` out of range and
+/// fail every retention tick.
+pub const MAX_AGGREGATE_RETENTION_DAYS: i32 = 36_500;
+
+/// Parse the [`AGGREGATE_RETENTION_DAYS_SETTING`] value. Missing, malformed,
+/// non-positive, or unrepresentably large values fall back to
+/// [`GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`], never to a wider horizon: an
+/// unreadable setting must not widen into a full-table wipe (out-of-range
+/// values refuse below in [`expire_stale_guild_aggregates`]).
 #[must_use]
 pub fn aggregate_retention_days_from_setting(value: Option<&str>) -> i32 {
     match value.and_then(|raw| raw.trim().parse::<i32>().ok()) {
-        Some(days) if days >= 1 => days,
+        Some(days) if (1..=MAX_AGGREGATE_RETENTION_DAYS).contains(&days) => days,
         _ => GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS,
     }
 }
@@ -157,16 +164,17 @@ pub async fn list_aggregate_guilds(
 /// every other guild untouched. Only deletes: opt-out filtering stays at the
 /// write-time gate ([`aggregate_filtered`]/[`upsert_guild_aggregates`]), so
 /// expiry can neither persist an opted-out member's data nor resurrect it.
-/// Non-positive horizons are refused (fail-closed) instead of widening into a
-/// full-guild wipe.
+/// Horizons outside `1..=MAX_AGGREGATE_RETENTION_DAYS` are refused
+/// (fail-closed): a sub-day value must not widen into a full-guild wipe, and
+/// an unrepresentable one must not push the interval arithmetic out of range.
 pub async fn expire_stale_guild_aggregates(
     pool: &Pool<Postgres>,
     guild_id: &str,
     retention_days: i32,
 ) -> Result<u64, GameActivityStoreError> {
-    if retention_days < 1 {
+    if !(1..=MAX_AGGREGATE_RETENTION_DAYS).contains(&retention_days) {
         return Err(GameActivityStoreError::Db(sqlx::Error::InvalidArgument(
-            "game-activity aggregate retention horizon must be at least one day".into(),
+            "game-activity aggregate retention horizon must be one day to a century".into(),
         )));
     }
     Ok(sqlx::query(
@@ -596,10 +604,18 @@ mod tests {
         );
         assert_eq!(aggregate_retention_days_from_setting(Some("30")), 30);
         assert_eq!(aggregate_retention_days_from_setting(Some(" 45 ")), 45);
-        // Malformed or non-positive input falls back to the safe default;
-        // nothing parses into a wider-than-default horizon here, and the
-        // wider-or-equal explicit values stay exact.
-        for fallback in [None, Some(""), Some("soon"), Some("0"), Some("-7")] {
+        // Malformed, non-positive, or unrepresentably large input falls back
+        // to the safe default; nothing parses into a wider-than-default
+        // horizon here, and sane explicit values stay exact.
+        for fallback in [
+            None,
+            Some(""),
+            Some("soon"),
+            Some("0"),
+            Some("-7"),
+            Some("36501"),
+            Some("2147483647"),
+        ] {
             assert_eq!(
                 aggregate_retention_days_from_setting(fallback),
                 GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS,
@@ -607,6 +623,10 @@ mod tests {
             );
         }
         assert_eq!(aggregate_retention_days_from_setting(Some("365")), 365);
+        assert_eq!(
+            aggregate_retention_days_from_setting(Some("36500")),
+            MAX_AGGREGATE_RETENTION_DAYS
+        );
     }
 
     #[tokio::test]
@@ -647,13 +667,16 @@ mod tests {
             list_aggregate_guilds(&pool).await.expect("guild listing"),
             vec!["guild-a".to_owned(), "guild-b".to_owned()],
         );
-        // A non-positive horizon refuses instead of wiping the guild.
-        assert!(
-            expire_stale_guild_aggregates(&pool, "guild-a", 0)
-                .await
-                .is_err(),
-            "zero-day horizon must fail closed"
-        );
+        // Out-of-range horizons refuse instead of wiping the guild or
+        // pushing interval arithmetic out of range.
+        for bad in [0, -7, MAX_AGGREGATE_RETENTION_DAYS + 1, i32::MAX] {
+            assert!(
+                expire_stale_guild_aggregates(&pool, "guild-a", bad)
+                    .await
+                    .is_err(),
+                "{bad}-day horizon must fail closed"
+            );
+        }
         // Expiring guild-a deletes only its stale row: the fresh row stays,
         // and guild-b's equally stale row is untouched (per-guild isolation).
         assert_eq!(
