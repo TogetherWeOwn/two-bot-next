@@ -9,6 +9,8 @@ name: synthetic-user-flow
 # after a delivered alert. A decide step writes the event to GITHUB_OUTPUT
 # and the post step runs only when an event is due, so a no-op is skipped
 # (never success): only a successful post counts as delivered in history.
+# A healthy run whose history read failed fails its decide step instead, so
+# its skipped post never reads as a known-closed checkpoint later.
 # The post gate carries !cancelled(): without a status function GitHub adds
 # an implicit success() &&, which would skip the post after a failed probe —
 # exactly when an ALERT is due.

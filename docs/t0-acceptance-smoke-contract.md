@@ -28,7 +28,7 @@ expectation cites the code that produces it.
   `[["process","ready"],["gateway","ready"],["database","ready"],["token_invalid","ready"]]`,
   no `gateway_failure` field, `jobs` map informational only, plus
   `build_revision`/`build_id` compiled in (`crates/bot/src/server.rs:86-140`;
-  `JobStatus` shape `crates/bot/src/jobs.rs:31-39`).
+  `JobStatus` shape `crates/bot/src/jobs.rs:23-31`).
 - T0 must compare `build_revision`/`build_id` to the deployed SHA
   (`crates/bot/src/server.rs:110-116`).
 

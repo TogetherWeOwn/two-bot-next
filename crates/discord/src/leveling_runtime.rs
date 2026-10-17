@@ -20,7 +20,7 @@ use two_bot_core::{
     classify,
     community_store::{
         member_join_fact, member_join_metadata, message_fact, record_fact, rules_accepted_fact,
-        voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite,
+        voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite, MessageFactInput,
     },
     leveling::{
         leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
@@ -225,6 +225,13 @@ impl DeferredCommunityFacts {
         std::mem::take(&mut self.0.lock().expect("community facts lock").joins)
     }
 
+    /// Take every buffered fact write (`message_created`,
+    /// `voice_session_started` / `voice_session_ended`), leaving that
+    /// buffer empty. Order is arrival order.
+    pub fn take_pending(&self) -> Vec<FactWrite> {
+        std::mem::take(&mut self.0.lock().expect("community facts lock").pending)
+    }
+
     /// Buffered gate-clearing count (tests, health). Rules only.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -377,7 +384,8 @@ impl FactsSink for DeferredCommunityFacts {
             return;
         }
         // Content-minimized by construction: IDs plus the classifier verdict
-        // plus the channel class only, never message content. Bots, webhooks
+        // plus the channel class plus the measured content-length integer
+        // only, never message content. Bots, webhooks
         // and staff automation are classified and captured here; the funnel
         // gate in `on_message` already keeps them out of the XP/activity
         // counts, so this sink never filters.
@@ -392,15 +400,16 @@ impl FactsSink for DeferredCommunityFacts {
             is_test: false,
         };
         let verdict = classify(&state.config, &input);
-        state.pending.push(message_fact(
-            &input.guild_id,
-            fact.message_id,
-            &fact.channel_id.to_string(),
-            fact.channel_class.as_str(),
-            &input,
-            fact.occurred_at,
-            verdict,
-        ));
+        state.pending.push(message_fact(MessageFactInput {
+            guild_id: &input.guild_id,
+            message_id: fact.message_id,
+            channel_id: &fact.channel_id.to_string(),
+            channel_class: fact.channel_class.as_str(),
+            actor: &input,
+            occurred_at: fact.occurred_at,
+            content_length: fact.content_length,
+            classification: verdict,
+        }));
     }
 
     fn record_voice_started(&self, fact: VoiceStartedFact<'_>) -> Option<String> {
@@ -619,14 +628,18 @@ impl<S: FunnelStore> OrderedLevelingPipeline<S> {
         let pending = DeferredLeveling::default();
         let facts = DeferredCommunityFacts::default();
         let classifier = SettingsChannelClassifier::new(ClassifierConfig::from_env());
+        let pipeline = Pipeline::new(
+            store,
+            Some(pending.clone()),
+            Some(facts.clone()),
+            NoInvites,
+            classifier.clone(),
+        );
+        // The live wrapper fails closed: no lengths are measured until the
+        // gateway runtime declares its `MESSAGE_CONTENT` subscription.
+        pipeline.set_message_content_delivered(false);
         Self {
-            pipeline: Pipeline::new(
-                store,
-                Some(pending.clone()),
-                Some(facts.clone()),
-                NoInvites,
-                classifier.clone(),
-            ),
+            pipeline,
             classifier,
             pending,
             facts,
@@ -646,15 +659,19 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         let pending = DeferredLeveling::default();
         let facts = DeferredCommunityFacts::default();
         let classifier = SettingsChannelClassifier::new(ClassifierConfig::from_env());
+        let pipeline = Pipeline::with_snapshots(
+            store,
+            Some(pending.clone()),
+            Some(facts.clone()),
+            invite_source,
+            classifier.clone(),
+            snapshots,
+        );
+        // Fail closed like `new`: the gateway runtime declares the real
+        // `MESSAGE_CONTENT` subscription before its shard runs.
+        pipeline.set_message_content_delivered(false);
         Self {
-            pipeline: Pipeline::with_snapshots(
-                store,
-                Some(pending.clone()),
-                Some(facts.clone()),
-                invite_source,
-                classifier.clone(),
-                snapshots,
-            ),
+            pipeline,
             classifier,
             pending,
             facts,
@@ -665,6 +682,12 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
 
     pub fn handlers(&self) -> &FunnelHandlers<S, DeferredLeveling, DeferredCommunityFacts> {
         self.pipeline.handlers()
+    }
+
+    /// Declare whether the shard feeding this pipeline subscribed
+    /// `MESSAGE_CONTENT`; message lengths are measured only when it did.
+    pub fn set_message_content_delivered(&self, delivered: bool) {
+        self.pipeline.set_message_content_delivered(delivered);
     }
 
     /// Arm Postgres community-facts capture for all live streams. Called once at boot when `TWO_COMMUNITY_SCORECARD=1`; without
@@ -938,6 +961,7 @@ mod tests {
             channel_id: 10,
             channel_class: two_bot_core::ChannelClass::Human,
             occurred_at: "2026-09-20T12:01:00.000Z",
+            content_length: None,
         });
         assert_eq!(
             buffer.record_voice_started(VoiceStartedFact {

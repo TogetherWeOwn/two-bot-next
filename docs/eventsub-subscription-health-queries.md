@@ -228,7 +228,7 @@ dashboard for them.
 | `eventsub reconcile parked: broadcaster allowlist is empty, no subscriptions mutated`, `error_class="reconcile_no_broadcasters"` (warn) | allowlist empty, nothing mutated |
 | `eventsub reconcile parked: TWO_EVENTSUB is not exactly 1`, `reason="flag_dark"` (`status="parked"` in the dashboard) | feature gate is off; reconcile is not running |
 | `eventsub reconcile refused …`, `error_class="reconcile_config_invalid"` (error) | callback, credentials or secret invalid; needs the Operator |
-| `eventsub subscriptions re-created but none verified yet`, `error_class="reconcile_pending"`, `status="pending"` | no desired subscription is enabled yet; callback verification has not completed |
+| `eventsub subscriptions re-created but not all verified yet`, `error_class="reconcile_pending"`, `status="pending"` | at least one desired subscription is not enabled yet; callback verification has not completed for every desired broadcaster |
 
 One pass can emit multiple lines. Read the final line together with the
 earlier diagnostic lines: an unhealthy convergence emits `reconcile_unhealthy`
@@ -276,7 +276,7 @@ for end in "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
            "$(date -u -d '60 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"; do
   for message in "eventsub reconcile" \
                  "eventsub subscriptions reconciled" \
-                 "subscriptions re-created but none verified yet"; do
+                 "subscriptions re-created but not all verified yet"; do
     python3 scripts/container_stdout_read.py \
       --service a038b0ad-a1f9-4966-bfb7-f992c602d938 \
       --minutes 30 --end "$end" --contains "$message" \
