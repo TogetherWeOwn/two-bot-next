@@ -19,7 +19,7 @@ The Container registers a `guild_settings` poll job
 automod refreshes its lists, thresholds and enforce flag from that snapshot
 on every delivery (`automod_gateway.rs:211-222`, `:292`); the feed poller
 re-reads its interval from the snapshot before every tick
-(`feed_jobs.rs:232-259`). Other stored reads happen through per-runtime
+(`feed_jobs.rs:235-287`). Other stored reads happen through per-runtime
 store refreshes (`raid_runtime.rs:136`,
 `containment_runtime.rs:186`, `join_risk_runtime.rs:198`) and onboarding's
 per-event refresh (`onboarding.rs:167`). Gateway feature gates still come
@@ -45,8 +45,10 @@ instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECON
 event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`); message-path automod
 applies its ten live lists, thresholds and the enforce flag from the snapshot
 on every delivery (`crates/bot/src/automod_gateway.rs:211-222`, `:292`);
-the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot before
-every tick (`crates/bot/src/feed_jobs.rs:232-259`); the audit mirror applies
+the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot to the
+supervisor cadence and its per-tick schedule gate, so a changed interval
+reschedules the next run to last-run + new interval without a restart
+(`crates/bot/src/feed_jobs.rs:235-287`); the audit mirror applies
 `DISCORD_AUDIT_LOG_CHANNEL_ID`, `DISCORD_VOICE_LOG_CHANNEL_ID` and
 `DISCORD_MODERATION_LOG_CHANNEL_ID` from the snapshot on every record and
 sweep (`crates/bot/src/audit_runtime.rs`), where blanking all three parks the
@@ -57,11 +59,8 @@ and purge (`crates/bot/src/ticket_runtime.rs`); the gateway funnel applies
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`
 from the snapshot on every guild message, refreshing the channel classifier
 and the community-facts sink together before the message's channel class is
-stamped (`crates/bot/src/gateway.rs`, `crates/discord/src/leveling_runtime.rs`). Three boot-only edges
-remain: the feed supervisor still wakes on the boot cadence, so a stored
-interval change takes effect no earlier than the previously scheduled slot
-and runs at the stored value rounded up to a multiple of the boot cadence
-(`crates/bot/src/feed_jobs.rs:227-244`); the voice room-name policy is
+stamped (`crates/bot/src/gateway.rs`, `crates/discord/src/leveling_runtime.rs`). Two boot-only edges
+remain: the voice room-name policy is
 built once at boot from the process environment
 (`crates/bot/src/gateway.rs:1608`); and gateway intents plus ticket command
 publication read the ticket destination keys once at boot, so a stored ticket

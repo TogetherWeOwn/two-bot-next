@@ -99,6 +99,7 @@ fn job(action: JobAction) -> Job {
     Job {
         name: NAMES[0],
         cadence,
+        cadence_source: None,
         startup_jitter: jobs::startup_jitter(cadence, rand::random()),
         timeout: Duration::from_secs(120),
         action,

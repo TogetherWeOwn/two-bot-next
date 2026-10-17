@@ -408,6 +408,7 @@ async fn scorecard_stop_cancels_future_retry_ticks() {
         vec![Job {
             name: "community_scorecard",
             cadence: cadence(Kind::Scorecard),
+            cadence_source: None,
             startup_jitter: Duration::ZERO,
             timeout: Duration::from_secs(120),
             action,
