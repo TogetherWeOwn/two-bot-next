@@ -234,8 +234,9 @@ def snapshot_state(client, worker, application):
     rows = app_rollouts(client, app["id"])
     prev = newest_completed_rollout(rows)
     # The provenance receipt's SHA member: the serving version's stamped
-    # deploy message. A pre-stamp version records None (the receipt is
-    # incomplete) instead of blocking the deploy this snapshot precedes.
+    # deploy message. An unstamped version (pre-stamp, or a secret change
+    # without --message) records None (the receipt is incomplete) instead
+    # of blocking the deploy this snapshot precedes.
     serving_sha = version_sha(client, worker, history[0])
     return {
         "has_previous": True,
@@ -299,9 +300,11 @@ class ProvenanceReceipt:
 
 def version_sha(client, worker, version):
     """The Git SHA a Worker version was deployed from: its immutable
-    `workers/message` annotation (`wrangler deploy --message <sha>`).
-    Returns None for a version deployed before SHA stamping, whose
-    annotation is absent or not a commit SHA."""
+    `workers/message` annotation (`wrangler deploy --message <sha>`, or
+    `wrangler versions secret put --message <sha>` for a secret change).
+    Returns None for an unstamped version — deployed before SHA stamping,
+    or a secret change without --message — whose annotation is absent or
+    not a commit SHA."""
     data = base.mapping(client.api(
         f"/workers/scripts/{base.identifier(worker)}/versions/{base.identifier(version)}"))
     require(data.get("id") == version, "version_identity_drift")

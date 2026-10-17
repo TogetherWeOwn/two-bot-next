@@ -657,6 +657,20 @@ class MainProvenanceTests(unittest.TestCase):
             argv, self.live_routes(served_image=bad_image()),
             "provenance_image_never_served")
 
+    def test_manual_rollback_refuses_an_image_from_a_non_completed_rollout(self):
+        # The only rollout carrying the image never completed: without the
+        # completed-only filter it would pass as "served" and traffic would
+        # move to an image from a failed or reverted rollout.
+        for status in ("failed", "reverted"):
+            with self.subTest(status=status):
+                served = rollout_row("r-prev", good_image(), status=status)
+                routes = self.live_routes()
+                routes[("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100")] = \
+                    lambda served=served: {"success": True, "result": [served]}
+                argv = self.manual_argv("--expected-sha", SHA)
+                self.assert_refused_before_posts(argv, routes,
+                                                 "provenance_image_never_served")
+
     def test_complete_receipt_validates_against_live_state(self):
         receipt = rollback.ProvenanceReceipt(WORKER, APPLICATION, GOOD_VERSION,
                                              SHA, good_image())
@@ -715,6 +729,98 @@ class MainProvenanceTests(unittest.TestCase):
             path = self.write_snapshot(tmp)
             self.assert_refused_before_posts(self.snapshot_argv(path), routes,
                                              "provenance_mismatch")
+
+    def snapshot_run_routes(self, revision):
+        """Full main() snapshot-path routes: the recorded receipt
+        revalidates, the worker leg is skipped (the snapshot names the
+        serving version), the image leg posts, and the gate polls the
+        restored build reporting `revision`."""
+        handler, health = ready_probe(GOOD_VERSION, revision=revision)
+        created = {"n": 0}
+
+        def post_rollouts(body):
+            created["n"] += 1
+            return {"id": "r-new", "target_version": 9}
+
+        def get_rollout():
+            return {"success": True, "result": rollout_row(
+                "r-new", good_image(), created="2026-10-15T01:00:00Z",
+                status="completed", target_version=9)}
+
+        deployments = [{"versions": [{"version_id": v, "percentage": 100}]}
+                       for v in (GOOD_VERSION, BAD_VERSION)]
+        return {
+            ("GET", f"/containers/applications/{APP_ID}/rollouts/r-prev"):
+                lambda: {"success": True, "result": rollout_row("r-prev", good_image())},
+            ("GET", f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"):
+                version_route(message=SHA),
+            ("GET", f"/workers/scripts/{WORKER}/deployments"): lambda: {
+                "success": True, "result": {"deployments": deployments}},
+            ("GET", "/containers/applications"): lambda: {
+                "success": True, "result": [{"id": APP_ID, "name": APPLICATION,
+                                             "durable_objects": {"namespace_id": NAMESPACE},
+                                             "configuration": {"image": good_image()}}]},
+            ("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100"): lambda: {
+                "success": True, "result": [rollout_row("r-prev", good_image())]},
+            ("POST", f"/containers/applications/{APP_ID}/rollouts"): post_rollouts,
+            ("GET", f"/containers/applications/{APP_ID}/rollouts/r-new"): get_rollout,
+            ("PROBE", "readyz"): handler,
+            ("PROBE", "health"): health,
+        }
+
+    def run_snapshot_main(self, tmp, revision):
+        """Run main() on a complete snapshot with a stubbed ownership
+        client and a scripted clock; capture the gate's expected SHA."""
+        routes = self.snapshot_run_routes(revision)
+        client = FakeClient(routes)
+        control, _ = control_stub()
+        clock = Clock()
+        captured = {}
+        real_cls = rollback.Rollback
+
+        def spy_factory(*args, **kwargs):
+            kwargs["now"] = clock.now
+            kwargs["sleep"] = clock.sleep
+            instance = real_cls(*args, **kwargs)
+            captured["expected_sha"] = instance.expected_sha
+            return instance
+
+        path = self.write_snapshot(tmp)
+        evidence = str(Path(tmp) / "evidence.json")
+        argv = ["rollback", "--variant", "staging", "--worker-url", self.URL,
+                "--snapshot", str(path), "--actor", "a:b",
+                "--evidence", evidence]
+        stdout = io.StringIO()
+        with (mock.patch.object(rollback, "Rollback", spy_factory),
+              mock.patch.object(rollback, "control_client",
+                                lambda *args, **kwargs: control),
+              redirect_stdout(stdout)):
+            code = rollback.main(argv, environ=self.base_env(),
+                                 client_factory=lambda _a, _t: client)
+        return code, stdout.getvalue(), captured, client, evidence
+
+    def test_snapshot_rollback_pins_the_gate_to_the_recorded_sha(self):
+        # The receipt SHA becomes the stable gate's expected revision, so
+        # the restored build must report it. Deleting the pin leaves the
+        # gate unpinned (None) and this assertion fails.
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, captured, client, evidence = self.run_snapshot_main(tmp, SHA)
+            self.assertEqual(code, 0, out)
+            self.assertEqual(captured.get("expected_sha"), SHA)
+            record = json.loads(Path(evidence).read_text())
+        self.assertEqual(record["provenance"], "validated")
+        self.assertEqual(record["provenance_sha"], SHA)
+        self.assertTrue([call for call in client.calls if call[0] == "POST"],
+                        client.calls)
+
+    def test_snapshot_rollback_gate_refuses_a_revision_other_than_the_receipt_sha(self):
+        # Without the pin this answer passes on the version header alone;
+        # with it the gate polls to its deadline and fails closed.
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, captured, _, _ = self.run_snapshot_main(tmp, "f" * 40)
+        self.assertEqual(code, 1)
+        self.assertEqual(captured.get("expected_sha"), SHA)
+        self.assertIn("gate_timeout", out)
 
 
 class PostStatusTests(unittest.TestCase):
