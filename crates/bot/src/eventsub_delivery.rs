@@ -143,9 +143,13 @@ mod tests {
     #[tokio::test]
     async fn build_delivery_deps_wires_pool_ledger_and_governed_sender() {
         crate::gateway::ensure_crypto_provider();
-        let deps =
-            build_delivery_deps(lazy_pool(), "synthetic-delivery-token", None, &delivery_config())
-                .expect("synthetic inputs build");
+        let deps = build_delivery_deps(
+            lazy_pool(),
+            "synthetic-delivery-token",
+            None,
+            &delivery_config(),
+        )
+        .expect("synthetic inputs build");
         assert_eq!(deps.config.broadcasters, ["111", "222"]);
         assert_eq!(deps.config.invite_url, "https://discord.gg/example");
         assert_eq!(deps.config.channel_id, "777");
