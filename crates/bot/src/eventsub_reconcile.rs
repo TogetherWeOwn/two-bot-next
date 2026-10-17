@@ -987,6 +987,7 @@ mod tests {
             &callback(),
             &["111".to_owned(), "222".to_owned()],
             &test_secret(),
+            &never_shutdown(),
         )
         .await
         .expect("a mixed enabled/pending follow-up must still succeed");
@@ -1030,6 +1031,7 @@ mod tests {
             &callback(),
             &["444".to_owned()],
             &test_secret(),
+            &never_shutdown(),
         )
         .await
         .expect_err("a failed desired subscription in the follow-up must fail the pass");
