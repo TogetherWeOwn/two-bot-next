@@ -184,17 +184,19 @@ mod tests {
                 !activation.permitted(LiveCapability::Announcements),
                 "{label} must not permit announcements"
             );
-            assert!(matches!(
-                build_delivery_deps(
-                    lazy_pool(),
-                    "synthetic-delivery-token",
-                    None,
-                    &delivery_config(),
-                    activation.permitted(LiveCapability::Announcements),
+            assert!(
+                matches!(
+                    build_delivery_deps(
+                        lazy_pool(),
+                        "synthetic-delivery-token",
+                        None,
+                        &delivery_config(),
+                        activation.permitted(LiveCapability::Announcements),
+                    ),
+                    Err("receiver_prerequisites_invalid")
                 ),
-                Err("receiver_prerequisites_invalid"),
                 "{label} must refuse delivery deps"
-            ));
+            );
         }
     }
 
