@@ -754,11 +754,84 @@ const VOICE_ACTOR_LOAD_WARN_INTERVAL_SECS: u64 = 300;
 /// Last wall-clock second a load-failure warn was emitted.
 static VOICE_ACTOR_LOAD_WARN_LAST_SECS: AtomicU64 = AtomicU64::new(0);
 
+/// Deadline for one actor initialization load attempt. The load is
+/// store reads only (no Discord writes), so abandoning a hung attempt and
+/// retrying replays nothing; a healthy load finishes far inside this.
+const VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// First retry delay after a failed initialization attempt; each further
+/// consecutive failure doubles it up to [`VOICE_ACTOR_LOAD_RETRY_MAX`].
+const VOICE_ACTOR_LOAD_RETRY_INITIAL: Duration = Duration::from_secs(1);
+/// Cap on the initialization retry delay: a guild whose store stays down
+/// retries at most once a minute, never a hot loop, and recovers on its
+/// own within a minute of the store healing.
+const VOICE_ACTOR_LOAD_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Delay before retrying actor initialization after `failed_attempts`
+/// consecutive failures (1-based): exponential from
+/// [`VOICE_ACTOR_LOAD_RETRY_INITIAL`], capped at
+/// [`VOICE_ACTOR_LOAD_RETRY_MAX`]. Pure so the bounds are unit-pinned.
+fn voice_actor_load_backoff(failed_attempts: u32) -> Duration {
+    let doublings = failed_attempts.saturating_sub(1).min(6);
+    VOICE_ACTOR_LOAD_RETRY_INITIAL
+        .saturating_mul(1 << doublings)
+        .min(VOICE_ACTOR_LOAD_RETRY_MAX)
+}
+
+#[cfg(test)]
+mod voice_actor_load_backoff_tests {
+    use super::{
+        voice_actor_load_backoff, Duration, VOICE_ACTOR_LOAD_RETRY_INITIAL,
+        VOICE_ACTOR_LOAD_RETRY_MAX,
+    };
+
+    #[test]
+    fn backoff_doubles_from_initial_and_caps() {
+        assert_eq!(voice_actor_load_backoff(1), VOICE_ACTOR_LOAD_RETRY_INITIAL);
+        assert_eq!(
+            voice_actor_load_backoff(2),
+            VOICE_ACTOR_LOAD_RETRY_INITIAL * 2
+        );
+        assert_eq!(
+            voice_actor_load_backoff(3),
+            VOICE_ACTOR_LOAD_RETRY_INITIAL * 4
+        );
+        assert_eq!(voice_actor_load_backoff(7), VOICE_ACTOR_LOAD_RETRY_MAX);
+        assert_eq!(voice_actor_load_backoff(1_000), VOICE_ACTOR_LOAD_RETRY_MAX);
+        assert!(voice_actor_load_backoff(u32::MAX) <= VOICE_ACTOR_LOAD_RETRY_MAX);
+        // Ten virtual minutes of failures stay far from a hot loop and
+        // the first retry lands promptly after a one-off blip.
+        let mut elapsed = Duration::ZERO;
+        let mut attempts = 1u32;
+        while elapsed < Duration::from_secs(600) {
+            elapsed += voice_actor_load_backoff(attempts);
+            attempts += 1;
+        }
+        assert!((2..=600).contains(&attempts), "attempts: {attempts}");
+    }
+}
+
 /// A failed `GuildRoomWorker::load` must not silently drop the guild actor:
-/// count it and warn (throttled). The actor respawns on the next guild
-/// snapshot (`publish_snapshot` on `GuildCreate`/resumed replay); meanwhile
-/// voice, channel and role events for the guild are dropped by `live_actor`.
+/// count it and warn (throttled). Transient failures retry in place with
+/// capped backoff (see [`voice_actor_load_backoff`]); a credential refusal
+/// is not transient, so it is reported once and never retried — the actor
+/// then respawns only on the next guild snapshot (`publish_snapshot` on
+/// `GuildCreate`/resumed replay), and meanwhile voice, channel and role
+/// events for the guild are dropped by `live_actor`.
 fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
+    observe_voice_actor_load_failure_kind(
+        guild,
+        &error.to_string(),
+        *error != StoreError::CredentialRefused,
+    );
+}
+
+/// A load attempt that hit [`VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT`] is a
+/// transient failure like any other: counted, warned (throttled), retried.
+fn observe_voice_actor_load_timeout(guild: Snowflake) {
+    observe_voice_actor_load_failure_kind(guild, "the store load timed out", true);
+}
+
+fn observe_voice_actor_load_failure_kind(guild: Snowflake, error: &str, retrying: bool) {
     metrics::global().db_error("other");
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -770,11 +843,19 @@ fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
             .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
-        warn!(
-            guild_id = guild.to_string(),
-            error = %error,
-            "voice actor load failed; actor respawns on the next guild snapshot"
-        );
+        if retrying {
+            warn!(
+                guild_id = guild.to_string(),
+                error = %error,
+                "voice actor load failed; retrying with capped backoff"
+            );
+        } else {
+            warn!(
+                guild_id = guild.to_string(),
+                error = %error,
+                "voice actor load failed; credential refused, not retrying"
+            );
+        }
     }
 }
 
@@ -6806,7 +6887,9 @@ pub type KickReply = Result<VoteKickUpdate, KickRefusal>;
 
 /// Per-guild actor registry. Actors spawn lazily on the first complete
 /// snapshot and exit when their guild leaves (sender dropped) or their store
-/// load fails (respawned on the next guild snapshot via `UnboundedSender::is_closed`).
+/// load refuses the credential (respawned on the next guild snapshot via
+/// `UnboundedSender::is_closed`); transient load failures retry inside the
+/// spawned task instead (see `load_actor_worker`).
 /// How long an `/import` preview stays confirmable. Past that the Confirm
 /// button answers "expired" and writes nothing; the member uploads again.
 pub const PENDING_IMPORT_TTL: Duration = Duration::from_secs(15 * 60);
@@ -7094,17 +7177,12 @@ where
         let tick = self.tick;
         let name_policy = Arc::clone(&self.name_policy);
         tokio::spawn(async move {
-            let (store, http) = make();
-            let guild_id = live.guild_id;
-            let worker = match GuildRoomWorker::load(live, store, http).await {
-                Ok(worker) => worker,
-                Err(error) => {
-                    observe_voice_actor_load_failure(guild_id, &error);
-                    return;
-                }
+            let mut rx = rx;
+            let Some((worker, buffered)) = load_actor_worker(&make, live, &mut rx).await else {
+                return;
             };
             let mut worker = worker.with_name_policy(name_policy);
-            run_actor(&mut worker, rx, tick).await;
+            run_actor_with_initial(&mut worker, rx, tick, buffered).await;
         });
         actors.insert(guild, actor.clone());
         Some(actor)
@@ -7793,12 +7871,116 @@ where
     }
 }
 
+/// Load one guild worker, retrying transient store failures in place so a
+/// brief database outage during `GuildCreate` no longer leaves the guild
+/// actorless until the next snapshot. Bounds: each attempt is abandoned
+/// after [`VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT`] (the load is reads only, so
+/// abandoning it replays nothing), consecutive failures wait
+/// [`voice_actor_load_backoff`] between attempts, and the same single
+/// spawned task owns every attempt — retries never spawn a second actor.
+///
+/// While initialization is pending, inbox commands are buffered in order
+/// and handed to `run_actor_with_initial`, so a snapshot or voice frame
+/// that arrived during the outage is applied after recovery under the
+/// usual live-state and ticket guards. Cancellation is the inbox closing
+/// (every sender dropped): `remove_guild` and runtime drop both end the
+/// retry loop, and a load that finishes after removal is discarded
+/// instead of resurrecting the guild. A [`StoreError::CredentialRefused`]
+/// attempt is never retried: no credential replacement or permission
+/// repair is attempted here.
+async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
+    make: &(dyn Fn() -> (S, H) + Send + Sync),
+    live: LiveGuild,
+    inbox: &mut mpsc::UnboundedReceiver<ActorCommand>,
+) -> Option<(GuildRoomWorker<S, H>, VecDeque<ActorCommand>)> {
+    let guild_id = live.guild_id;
+    let mut buffered = VecDeque::new();
+    let mut failed_attempts = 0u32;
+    loop {
+        let (store, http) = make();
+        let attempt = GuildRoomWorker::load(live.clone(), store, http);
+        tokio::pin!(attempt);
+        let deadline = tokio::time::sleep(VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT);
+        tokio::pin!(deadline);
+        let mut finished = None;
+        let mut timed_out = false;
+        loop {
+            tokio::select! {
+                result = &mut attempt => {
+                    finished = Some(result);
+                    break;
+                }
+                () = &mut deadline => {
+                    timed_out = true;
+                    break;
+                }
+                command = inbox.recv() => match command {
+                    Some(command) => buffered.push_back(command),
+                    None => return None,
+                },
+            }
+        }
+        // A timed-out attempt future is dropped here, abandoning its
+        // in-flight reads; the next attempt starts from a fresh pair.
+        match finished {
+            Some(Ok(worker)) => {
+                // Drain what is already queued and re-check the cancel
+                // signal: a load that finished after every sender dropped
+                // (guild removed) is discarded, never published.
+                loop {
+                    match inbox.try_recv() {
+                        Ok(command) => buffered.push_back(command),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                    }
+                }
+                return Some((worker, buffered));
+            }
+            Some(Err(error)) => {
+                observe_voice_actor_load_failure(guild_id, &error);
+                if error == StoreError::CredentialRefused {
+                    return None;
+                }
+            }
+            None => {
+                debug_assert!(timed_out);
+                observe_voice_actor_load_timeout(guild_id);
+            }
+        }
+        failed_attempts = failed_attempts.saturating_add(1);
+        let wait = tokio::time::sleep(voice_actor_load_backoff(failed_attempts));
+        tokio::pin!(wait);
+        loop {
+            tokio::select! {
+                () = &mut wait => break,
+                command = inbox.recv() => match command {
+                    Some(command) => buffered.push_back(command),
+                    None => return None,
+                },
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 async fn run_actor<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
     inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
 ) {
     run_actor_with_limits(worker, inbox, tick, ActorLimits::default()).await;
+}
+
+/// Run the actor loop after [`load_actor_worker`], applying the commands
+/// buffered during initialization (in arrival order) before any command
+/// that arrives afterwards.
+async fn run_actor_with_initial<S: RoomPersistence, H: RoomWrites + 'static>(
+    worker: &mut GuildRoomWorker<S, H>,
+    inbox: mpsc::UnboundedReceiver<ActorCommand>,
+    tick: Duration,
+    initial: VecDeque<ActorCommand>,
+) {
+    run_actor_inner(worker, inbox, tick, ActorLimits::default(), initial).await;
 }
 
 /// Bounds for the per-guild actor loop (TOG stall follow-up). All bounds are
@@ -7987,9 +8169,19 @@ impl<H: RoomWrites> StallShared<H> {
 
 async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
+    inbox: mpsc::UnboundedReceiver<ActorCommand>,
+    tick: Duration,
+    limits: ActorLimits,
+) {
+    run_actor_inner(worker, inbox, tick, limits, VecDeque::new()).await;
+}
+
+async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
+    worker: &mut GuildRoomWorker<S, H>,
     mut inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
     limits: ActorLimits,
+    initial: VecDeque<ActorCommand>,
 ) {
     let start = tokio::time::Instant::now();
     let mut timer = tokio::time::interval(tick);
@@ -8041,6 +8233,22 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
             }
         })
     };
+    // Commands buffered while the worker loaded (initialization retry)
+    // apply first, in arrival order, under the same read-through and
+    // apply path as inbox commands; stale joins are refused by the usual
+    // ticket guards inside `apply_command`.
+    for command in initial {
+        let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        if let ActorCommand::Join { ticket, .. } = &command {
+            worker.revalidate_creator(ticket.creator_id).await;
+        }
+        let accepted = apply_command(worker, command, now_ms);
+        if accepted {
+            last_progress = tokio::time::Instant::now();
+        }
+        dispatch_ready |= accepted;
+    }
+    stall.snapshot(worker, last_progress);
     loop {
         tokio::select! {
             biased;

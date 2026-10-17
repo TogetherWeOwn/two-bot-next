@@ -217,15 +217,19 @@ sink attaches to the gateway writer on the cutover path.
 | `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs` (`execute_create`: `voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
 | `voice_event="voice_join_received"` | `crates/bot/src/voice_rooms.rs` (`accept_join_received`: `voice creator join accepted` / `voice creator join refused before queueing`) | One creator-channel join delivered to the guild actor, accepted or refused. The refused line carries a bounded `reason` (`halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked`, `other`) plus the refusing `channel` id and creator-map state at join time (`creators_len`, `known`, `halted`, `ready`, `live_generation`, `ticket_generation`; no member/name/token content); every delivery bumps `two_bot_voice_joins_received_total`, so received-vs-handled drift is the stall signal |
 
-Adjacent actor message without a `voice_event` field:
-`voice actor load failed; actor respawns on the next guild snapshot`
+Adjacent actor messages without a `voice_event` field:
+`voice actor load failed; retrying with capped backoff` and
+`voice actor load failed; credential refused, not retrying`
 (`observe_voice_actor_load_failure` in `crates/bot/src/voice_rooms.rs`):
 the guild actor's store load failed. Every failure bumps
 `two_bot_db_errors_total{op="other"}`; the warn is throttled process-wide to
-one line per 5 minutes, so a burst across guilds names only the first. The
-actor respawns on the next guild snapshot (`publish_snapshot` on
-`GuildCreate`/resumed replay); voice, channel and role events for the guild
-are dropped until then.
+one line per 5 minutes, so a burst across guilds names only the first.
+Transient failures (including a load attempt abandoned at its 30 s
+deadline) retry inside the same actor task: 1 s doubling to a 60 s cap,
+until the load succeeds or the guild is removed. A credential refusal is
+never retried; that actor respawns only on the next guild snapshot
+(`publish_snapshot` on `GuildCreate`/resumed replay), and voice, channel
+and role events for the guild are dropped until then.
 
 Stall-watchdog actor messages without a `voice_event` field (all in
 `run_actor_with_limits` in `crates/bot/src/voice_rooms.rs`, guild-only fields,
