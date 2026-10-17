@@ -189,7 +189,8 @@ class TrackerUnitTests(unittest.TestCase):
 
     def test_held_verdict_decides_nothing(self):
         evidence = str(self.dir / "evidence.json")
-        held = {"slow": False, "fast": False, "held": True, "ring": []}
+        held = {"slow": False, "fast": False, "held": True, "ring": [],
+                "slowCovered": False}
         with mock.patch.object(tracker, "run_driver", return_value=held):
             with mock.patch("subprocess.run",
                              side_effect=AssertionError("gh must not run")):
@@ -201,6 +202,60 @@ class TrackerUnitTests(unittest.TestCase):
         stored = json.loads(Path(evidence).read_text())
         self.assertEqual(stored["verdict"], "held")
         self.assertEqual(stored["action"], "none")
+
+    def test_main_without_argv_reads_process_arguments(self):
+        # A bare main() must read sys.argv: with `argv or []` a fixture
+        # dispatch silently ran live and wrote under the real label.
+        evidence = str(self.dir / "evidence.json")
+        argv = ["slow_burn_tracker.py", "--fixture", "fire", "--dry-run",
+                "--evidence-out", evidence,
+                "--exposition-out", str(self.dir / "expo.prom"),
+                "--ring", str(self.dir / "ring.json"),
+                "--label", "slow-burn-test",
+                "--title-prefix", "[slow-burn-test]",
+                "--node", "node", "--driver", "driver.mjs"]
+        held = {"slow": True, "fast": False, "held": True, "ring": [],
+                "slowCovered": False}
+        with mock.patch.object(tracker.sys, "argv", argv):
+            with mock.patch.object(tracker, "run_driver", return_value=held):
+                with mock.patch("subprocess.run",
+                                 side_effect=AssertionError("gh must not run")):
+                    code = tracker.main(None, base_env())
+        self.assertEqual(code, 0)
+        stored = json.loads(Path(evidence).read_text())
+        self.assertEqual(stored["verdict"], "held")
+        self.assertEqual(stored["action"], "none")
+
+    def test_uncovered_windows_never_close_and_keep_the_ring(self):
+        # Slow windows without full history are unknown, not clear: the open
+        # card stays open, yet the ring still persists so history rebuilds.
+        now = 1_700_000_000
+        body = tracker.with_marker("firing", now - 3600)
+        fake = FakeGh([{"number": 7,
+                        "title": tracker.issue_title(tracker.TITLE_PREFIX),
+                        "body": body}])
+        next_ring = [{"t": now, "received": 10, "duplicate": 0, "fastMoves": 9}]
+        uncovered = {"slow": False, "fast": False, "held": False,
+                     "ring": next_ring, "slowCovered": False}
+        ring_path = str(self.dir / "ring.json")
+        evidence = str(self.dir / "evidence.json")
+        env = base_env({"STAGING_WORKER_URL": "https://staging.example",
+                        "METRICS_SCRAPE_TOKEN": "token"})
+        with mock.patch.object(tracker, "scrape_metrics", return_value="expo"):
+            with mock.patch.object(tracker, "run_driver", return_value=uncovered):
+                with mock.patch("subprocess.run", fake):
+                    code = tracker.main(
+                        ["--ring", ring_path, "--evidence-out", evidence,
+                         "--exposition-out", str(self.dir / "expo.prom")],
+                        env)
+        self.assertEqual(code, 0)
+        stored = json.loads(Path(evidence).read_text())
+        self.assertEqual(stored["verdict"], "unknown")
+        self.assertEqual(stored["action"], "none")
+        self.assertIsNone(stored["issue"])
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(len(fake.issues), 1)
+        self.assertEqual(json.loads(Path(ring_path).read_text()), next_ring)
 
     def test_dry_run_writes_nothing(self):
         fake = FakeGh()
@@ -235,12 +290,14 @@ class TrackerDriverTests(unittest.TestCase):
         verdict = self.run_fixture("fire")
         self.assertTrue(verdict["slow"])
         self.assertFalse(verdict.get("fast"))
+        self.assertTrue(verdict.get("slowCovered"))
         self.assertGreater(len(verdict["ring"]), 0)
 
     def test_clear_fixture_stays_silent(self):
         verdict = self.run_fixture("clear")
         self.assertFalse(verdict["slow"])
         self.assertFalse(verdict.get("fast"))
+        self.assertTrue(verdict.get("slowCovered"))
 
     def test_missing_join_series_holds_instead_of_clearing(self):
         now = int(time.time())
@@ -253,6 +310,7 @@ class TrackerDriverTests(unittest.TestCase):
         verdict = tracker.run_driver(NODE, str(DRIVER), expo, ring_path, now)
         self.assertTrue(verdict["held"])
         self.assertFalse(verdict["slow"])
+        self.assertFalse(verdict.get("slowCovered", True))
 
     def test_malformed_ring_rebuilds_silently(self):
         now = int(time.time())
@@ -263,6 +321,7 @@ class TrackerDriverTests(unittest.TestCase):
         ring_path.write_text("not json", encoding="utf-8")
         verdict = tracker.run_driver(NODE, str(DRIVER), expo, ring_path, now)
         self.assertFalse(verdict["slow"])
+        self.assertFalse(verdict.get("slowCovered", True))
 
 
 if __name__ == "__main__":

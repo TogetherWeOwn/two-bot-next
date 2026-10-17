@@ -64,8 +64,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
+      # Restore-only: a full actions/cache step would save the stale ring in
+      # its post phase and could restore over the tracker's fresh ring.
       - name: Restore the burn ring
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: slow-burn-ring.json
           key: slow-burn-ring-v1-${{ github.run_id }}
@@ -92,14 +94,14 @@ jobs:
           fi
           python3 scripts/slow_burn_tracker.py "${args[@]}"
           echo "fixture=$fixture" >> "$GITHUB_OUTPUT"
+      # Save-only without restore-keys: restoring here would overwrite the
+      # tracker's fresh ring with the stale cached copy before the save.
       - name: Save the burn ring
         if: ${{ !cancelled() && steps.track.outputs.fixture != 'fire' && steps.track.outputs.fixture != 'clear' }}
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: slow-burn-ring.json
           key: slow-burn-ring-v1-${{ github.run_id }}
-          restore-keys: |
-            slow-burn-ring-v1-
       - name: Upload the tracker evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

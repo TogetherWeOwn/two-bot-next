@@ -17,12 +17,14 @@
  *     --exposition <metrics.prom> --ring <ring.json> --now <epoch-seconds>
  *
  * Prints one JSON object to stdout:
- *   {"slow": bool, "fast": bool, "held": bool, "ring": JoinBurnSnapshot[]}
+ *   {"slow": bool, "fast": bool, "held": bool, "slowCovered": bool, "ring": JoinBurnSnapshot[]}
  * `slow` is the tracker's only filing signal; `fast` is reported for the
  * evidence receipt. `held` means the join series were unusable and the
  * previous firing state holds: the caller must treat the verdict as unknown,
- * never as clear. A malformed ring starts empty (windows stay inactive
- * until history covers them, never a false fire).
+ * never as clear. `slowCovered` reports whether both slow windows have
+ * baseline history; silence without it is unknown too, so only a covered
+ * non-firing verdict may resolve the card. A malformed ring starts empty
+ * (windows stay inactive until history covers them, never a false fire).
  */
 
 import { readFileSync } from "node:fs";
@@ -97,11 +99,12 @@ const exposition = readFileSync(expositionPath, "utf8");
 const samples = parseExposition(exposition);
 const ring = loadRing(ringPath);
 const previous = { ...EMPTY_STATE, joinBurn: ring };
-const { firing, state, joinHeld } = evaluateMetrics(samples, previous, now);
+const { firing, state, joinHeld, joinSlowCovered } = evaluateMetrics(samples, previous, now);
 const verdict = {
   slow: firing.includes("voice_join_slow_burn"),
   fast: firing.includes("voice_join_fast_burn"),
   held: joinHeld === true,
+  slowCovered: joinSlowCovered === true,
   ring: state.joinBurn ?? [],
 };
 process.stdout.write(`${JSON.stringify(verdict)}\n`);

@@ -576,6 +576,8 @@ interface JoinBurnResult {
   slow: boolean;
   /** Inputs were missing or malformed: the caller retains the previous firing state. */
   held: boolean;
+  /** Both slow windows have a baseline snapshot: silence here is a confirmed clear. */
+  slowCovered: boolean;
   ring: JoinBurnSnapshot[];
 }
 
@@ -586,7 +588,10 @@ interface JoinBurnResult {
  * nothing. Otherwise the sample is appended, entries older than the slow
  * window plus margin are pruned, and each fully covered window burns as
  * bad / (genuine x budget) against its threshold. Each window also needs the
- * minimum join volume and at least two bad moves to fire.
+ * minimum join volume and at least two bad moves to fire. `slowCovered` is
+ * true only when both slow windows have baseline history; callers that
+ * resolve on silence must also require it, because an uncovered window
+ * reports no burn for lack of history rather than lack of errors.
  */
 function joinBurnEvaluation(samples: Sample[], ring: JoinBurnSnapshot[], nowSeconds: number): JoinBurnResult {
   const gauge = (name: string) => samples.filter((s) => s.name === name);
@@ -594,12 +599,12 @@ function joinBurnEvaluation(samples: Sample[], ring: JoinBurnSnapshot[], nowSeco
   const duplicate = exactSeries(gauge("two_bot_voice_join_refused_total"), { reason: "duplicate" });
   const fastMoves = exactSeries(gauge("two_bot_voice_join_to_move_seconds_bucket"), { le: "5" });
   if (received === undefined || duplicate === undefined || fastMoves === undefined) {
-    return { fast: false, slow: false, held: true, ring };
+    return { fast: false, slow: false, held: true, slowCovered: false, ring };
   }
   const snapshot: JoinBurnSnapshot = { t: nowSeconds, received, duplicate, fastMoves };
   const last = ring[ring.length - 1];
   if (last !== undefined && (received < last.received || duplicate < last.duplicate || fastMoves < last.fastMoves)) {
-    return { fast: false, slow: false, held: false, ring: [snapshot] };
+    return { fast: false, slow: false, held: false, slowCovered: false, ring: [snapshot] };
   }
   const cutoff = nowSeconds - JOIN_SLOW_LONG_SECONDS - JOIN_BURN_HISTORY_MARGIN_SECONDS;
   const next = [...ring.filter((s) => s.t > cutoff && s.t <= nowSeconds), snapshot];
@@ -637,10 +642,16 @@ function joinBurnEvaluation(samples: Sample[], ring: JoinBurnSnapshot[], nowSeco
   const fastShort = burn(JOIN_FAST_SHORT_SECONDS);
   const slowLong = burn(JOIN_SLOW_LONG_SECONDS);
   const slowShort = burn(JOIN_SLOW_SHORT_SECONDS);
+  // Coverage is about history, not burn: a quiet-but-covered window still
+  // counts, while a window without baselines must never read as a clear.
+  const covers = (windowSeconds: number): boolean =>
+    baselineAtOrBefore(end.t - windowSeconds, end.t) !== undefined
+    && baselineAtOrBefore(nowSeconds - windowSeconds, nowSeconds) !== undefined;
   return {
     fast: fastLong !== undefined && fastShort !== undefined && fastLong > JOIN_FAST_BURN && fastShort > JOIN_FAST_BURN,
     slow: slowLong !== undefined && slowShort !== undefined && slowLong > JOIN_SLOW_BURN && slowShort > JOIN_SLOW_BURN,
     held: false,
+    slowCovered: covers(JOIN_SLOW_LONG_SECONDS) && covers(JOIN_SLOW_SHORT_SECONDS),
     ring: next,
   };
 }
@@ -651,6 +662,8 @@ export interface Evaluation {
   state: MetricsAlertState;
   /** The creator-join burn inputs were unusable, so the previous firing state holds. */
   joinHeld: boolean;
+  /** Both slow burn windows have baseline history; silence without it is unknown, not clear. */
+  joinSlowCovered: boolean;
 }
 
 export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowSeconds: number, gatewayReady?: boolean): Evaluation {
@@ -1012,7 +1025,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring, errorBudgetBurn: errorBudgetBurn.ring }, joinHeld: joinBurn.held };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring, errorBudgetBurn: errorBudgetBurn.ring }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
