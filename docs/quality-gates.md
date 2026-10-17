@@ -65,7 +65,10 @@ existing disposable Postgres service, rather than the lint-only `check` lane.
   `docs/voice-synthetic.md`.
 - Test-target inventory (HARD): `scripts/ci/check-test-inventory.py` fails
   when a test or fuzz target is built by no CI job; exemptions carry a reason
-  in the script.
+  in the script. Ignored integration targets need executable routing
+  evidence in a `run:` command (an explicit `--test <name>` argument, or an
+  explicit target-list loop); a name mentioned only in display text, an
+  `env:` value, a comment, an `echo` or a `--skip` argument is no route.
 - Floor guard (HARD): `scripts/ci/check-floor-guard.py` fails when a diff
   adds a checker waiver, adds a test skip, deletes a test file, drops
   assertions from test code, or lowers a number in `CONSTRAINTS.md`. Two
