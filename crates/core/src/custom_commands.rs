@@ -135,12 +135,12 @@ pub fn validate_template(template: &str) -> Result<(), TemplateError> {
 /// Render a validated template against `ctx` (legacy `renderTemplate`).
 /// Unknown-but-pattern-matching keys render literally (unreachable after
 /// validation, kept so render never invents text); output past Discord's
-/// ceiling is refused. Each expansion is measured in bytes before it is pushed
-/// and the render refuses past a byte tripwire (`3 *` the ceiling: byte length
-/// upper-bounds UTF-16 length, so past the tripwire the output is certainly
-/// over-ceiling), without ever materialising the huge string. Outputs within
-/// the tripwire render exactly as before, keeping exact lengths; tripwire
-/// refusals report expansion bytes, always past the ceiling.
+/// ceiling is refused. The render refuses once buffered bytes breach a byte
+/// tripwire (`3 *` the ceiling: byte length upper-bounds UTF-16 length, so
+/// past the tripwire the output is certainly over-ceiling), materialising at
+/// most one expansion past it. Outputs within the tripwire render exactly as
+/// before, keeping exact lengths; tripwire refusals report buffered bytes,
+/// always past the ceiling.
 pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, TemplateError> {
     let bytes = template.as_bytes();
     let mut out = String::new();
@@ -156,9 +156,8 @@ pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, 
                     "channel" => ctx.channel.as_str(),
                     _ => &template[i..end],
                 };
-                let approx = out.len().saturating_add(text.len());
-                if approx > MAX_RENDERED_CHARS * 3 {
-                    return Err(TemplateError::RenderTooLong(approx));
+                if out.len() > MAX_RENDERED_CHARS * 3 {
+                    return Err(TemplateError::RenderTooLong(out.len()));
                 }
                 out.push_str(text);
                 i = end;
@@ -739,10 +738,10 @@ mod tests {
     #[test]
     fn template_render_hostile_expansion_refused_without_panic() {
         // Degenerate expansion: many placeholders over a large context must
-        // fail as a bounded RenderTooLong, never panic, hang, or materialise
-        // the huge string. The byte tripwire refuses before the first push
-        // (here 10_000 expansion bytes already breach it), reporting bytes
-        // always past the ceiling.
+        // fail as a bounded RenderTooLong, never panic, hang, or blow up to
+        // the full expansion. The byte tripwire refuses once buffered bytes
+        // breach it (here the second push sees 10_000 buffered bytes),
+        // reporting bytes always past the ceiling.
         let ctx = TemplateContext {
             user: "y".repeat(10_000),
             username: String::new(),
