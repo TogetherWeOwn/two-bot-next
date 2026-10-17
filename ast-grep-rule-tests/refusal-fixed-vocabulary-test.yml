@@ -22,3 +22,5 @@ invalid:
   - 'raise Refused("refusing: the database login may not set " + key)'
   - 'raise Refused("refusing: the database login may not set " + repr(key))'
   - 'raise Refused(key)'
+  - 'require(port is not None, key)'
+  - 'raise Refused("bad %(key)s" % keymap)'

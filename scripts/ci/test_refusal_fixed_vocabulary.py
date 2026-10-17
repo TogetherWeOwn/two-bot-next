@@ -5,7 +5,8 @@ moved the port read inside fixed-message refusals and removed an
 interpolated unknown query key. Nothing stops the next error path from
 echoing rejected input again, so
 `ast-grep-rules/refusal-fixed-vocabulary.yml` flags interpolation,
-`str()`/`repr()`/`ascii()`/`.join()`/`format()`/`%` rendering,
+`str()`/`repr()`/`ascii()`/`.join()`/`format()`/`%` rendering
+(including `%(name)s` named specifiers and parenthesised operands),
 `+` concatenation and bare-variable messages inside `Refused`,
 `ReadFailed` and `require` refusal constructors in the three covered
 files, with an allowlist for the fixed-vocabulary sites. `sgconfig.yml`
@@ -23,7 +24,14 @@ It is a name-based tripwire, not a proof: it matches the names a
 refusal reaches for, not every way to render rejected input. Every
 `Refused`/`ReadFailed`/`require` constructor call is collected, not just
 `raise` statements, so `error = Refused(f"...{host}..."); raise error`
-trips at the construction site. Known gaps, documented rather than
+trips at the construction site. The trigger runs against the message
+argument only, never a require condition, so
+`require(str(port).isdigit(), "port must be numeric")` stays clean. The
+YAML rule cannot scope that far in ast-grep 0.50 (`has` sees direct
+children only and never unifies an outer $MSG; verified with probe
+rules), so it still matches the whole call and a computed-condition
+shape must never join its valid fixtures. This pin decides CI.
+Known gaps, documented rather than
 gated: `raise Refused(message)` funnels a pre-built variable (the
 `require` helper relay itself is an explicit allowlist entry; the
 `require` call sites are covered); control flow the rule cannot see
@@ -59,8 +67,9 @@ RULE_ID = "refusal-fixed-vocabulary"
 # Pinned literals: the YAML must carry exactly these patterns. A deliberate
 # rule change updates both sides in one reviewed diff.
 EXPECTED_BROAD = (
-    r"(\{|\.format\s*\(|%\s*\w|str\s*\(|repr\s*\(|ascii\s*\(|\.join\s*\(|\+"
-    r"|Refused\(\s*[a-z_]|ReadFailed\(\s*[a-z_])"
+    r"(\{|\.format\s*\(|%\s*[\w\(]|str\s*\(|repr\s*\(|ascii\s*\(|\.join\s*\(|\+"
+    r"|Refused\(\s*[a-z_]|ReadFailed\(\s*[a-z_]"
+    r"|,\s*[a-z_][A-Za-z0-9_]*\s*\)\s*$|^[a-z_][A-Za-z0-9_]*$)"
 )
 EXPECTED_PATTERNS = (
     "Refused($MSG)",
@@ -94,8 +103,46 @@ def func_id(func):
     return getattr(func, "id", "")
 
 
+def first_call(snippet):
+    """Outermost refusal constructor call in one snippet.
+
+    `ast.walk` is breadth-first, so the first `Refused`/`ReadFailed`/
+    `require` call is the outermost one, never a rendering helper nested
+    inside its message.
+    """
+    tree = ast.parse(snippet.strip())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and func_id(node.func) in (
+            "Refused",
+            "ReadFailed",
+            "require",
+        ):
+            return node
+    raise AssertionError(f"no refusal call in snippet: {snippet!r}")
+
+
+def message_segment(text, node, where=""):
+    """Source of the refusal message argument, or "" when it has none.
+
+    `Refused`/`ReadFailed` carry the message in their first argument and
+    `require` in its second; anything else (for example a computed
+    require condition) is deliberately invisible to the trigger.
+    """
+    if func_id(node.func) == "require":
+        assert len(node.args) == 2, (
+            f"{where}: require takes two arguments; "
+            "the ast-grep pattern require($COND, $MSG) would miss this shape"
+        )
+        target = node.args[1]
+    else:
+        target = node.args[0] if node.args else None
+    if target is None:
+        return ""
+    return ast.get_source_segment(text, target) or ""
+
+
 def refusal_statements(path):
-    """(lineno, source segment) for every in-scope refusal constructor call.
+    """(lineno, call segment, message segment) for every in-scope refusal.
 
     Every `Refused`/`ReadFailed`/`require` call is collected wherever it
     sits (`raise`, assignment, `return`), matching the ast-grep rule's
@@ -110,24 +157,39 @@ def refusal_statements(path):
         if isinstance(node, ast.Call) and func_id(node.func) in (
             "Refused",
             "ReadFailed",
+            "require",
         ):
-            found.append((node.lineno, ast.get_source_segment(text, node)))
-        elif isinstance(node, ast.Call) and func_id(node.func) == "require":
-            assert len(node.args) == 2, (
-                f"{path}:{node.lineno}: require takes two arguments; "
-                "the ast-grep pattern require($COND, $MSG) would miss this shape"
+            found.append(
+                (
+                    node.lineno,
+                    ast.get_source_segment(text, node),
+                    message_segment(
+                        text, node, where=f"{path}:{node.lineno}"
+                    ),
+                )
             )
-            found.append((node.lineno, ast.get_source_segment(text, node)))
     return sorted(found)
 
 
-def classify(segment, broad, exempts):
-    """Return flagged/exempted/clean for one refusal statement's source."""
-    if not broad.search(segment):
+def classify(segment, message, broad, exempts):
+    """Return flagged/exempted/clean for one refusal call.
+
+    The trigger runs against the message argument only; the exemptions
+    run against the whole call (entries like `Refused\\(\\s*message\\s*\\)`
+    name the constructor itself).
+    """
+    if not broad.search(message):
         return "clean"
     if any(rx.search(segment) for rx in exempts):
         return "exempted"
     return "flagged"
+
+
+def snippet_verdict(snippet):
+    """classify() for one fixture or mutant snippet."""
+    broad, exempts = broad_and_exempts()
+    message = message_segment(snippet.strip(), first_call(snippet))
+    return classify(snippet, message, broad, exempts)
 
 
 def canon(segment):
@@ -140,8 +202,8 @@ def scan_tree():
     flagged, exempted = [], {}
     for rel in COVERED:
         path = ROOT / rel
-        for lineno, segment in refusal_statements(path):
-            verdict = classify(segment, broad, exempts)
+        for lineno, segment, message in refusal_statements(path):
+            verdict = classify(segment, message, broad, exempts)
             if verdict == "flagged":
                 flagged.append(f"{rel}:{lineno}: {canon(segment)}")
             elif verdict == "exempted":
@@ -245,7 +307,6 @@ class RuleShapeTests(unittest.TestCase):
 
 class FixtureConformanceTests(unittest.TestCase):
     def verdict(self, snippet):
-        broad, exempts = broad_and_exempts()
         stripped = snippet.strip()
         self.assertTrue(
             re.match(
@@ -254,7 +315,7 @@ class FixtureConformanceTests(unittest.TestCase):
             ),
             f"fixture snippet outside the rule scope: {snippet!r}",
         )
-        return classify(snippet, broad, exempts)
+        return snippet_verdict(snippet)
 
     def test_valid_fixtures_pass(self):
         fixture = yaml.safe_load(FIXTURE_PATH.read_text())
@@ -330,6 +391,8 @@ class MutantTests(unittest.TestCase):
         'raise Refused("refusing: the database login may not set " + repr(key))',
         'raise Refused(key)',
         'raise ReadFailed(output)',
+        'require(port is not None, key)',
+        'raise Refused("bad %(key)s" % keymap)',
     ]
     FIXED = [
         'raise Refused("refusing: the database login may not set that query parameter")',
@@ -343,20 +406,21 @@ class MutantTests(unittest.TestCase):
         'raise ReadFailed(f"{classify_failure(done.stderr)} (psql exit {done.returncode})")',
         'raise Refused(f"failed: unexpected {type(error).__name__}; nothing was written")',
         'require(port is None or port == 5432, "pooled ports are refused")',
+        # A computed require condition with a fixed message stays clean:
+        # the trigger never sees the condition.
+        'require(str(port).isdigit(), "port must be numeric")',
     ]
 
     def test_interpolated_mutants_trip(self):
-        broad, exempts = broad_and_exempts()
         for snippet in self.INTERPOLATED:
             with self.subTest(snippet=snippet):
-                self.assertEqual(classify(snippet, broad, exempts), "flagged")
+                self.assertEqual(snippet_verdict(snippet), "flagged")
 
     def test_fixed_mutants_stay_clean(self):
-        broad, exempts = broad_and_exempts()
         for snippet in self.FIXED:
             with self.subTest(snippet=snippet):
                 self.assertIn(
-                    classify(snippet, broad, exempts), ("clean", "exempted")
+                    snippet_verdict(snippet), ("clean", "exempted")
                 )
 
     def test_scratch_mutant_with_interpolated_rejected_key_trips(self):
@@ -376,8 +440,8 @@ class MutantTests(unittest.TestCase):
             mutant.write_text(text.replace(fixed, regressed))
             flagged, exempted = [], {}
             broad, exempt_list = broad_and_exempts()
-            for lineno, segment in refusal_statements(mutant):
-                verdict = classify(segment, broad, exempt_list)
+            for lineno, segment, message in refusal_statements(mutant):
+                verdict = classify(segment, message, broad, exempt_list)
                 if verdict == "flagged":
                     flagged.append((lineno, canon(segment)))
             self.assertEqual(len(flagged), 1)
@@ -407,8 +471,8 @@ class MutantTests(unittest.TestCase):
             mutant.write_text(text + probe)
             flagged = []
             broad, exempt_list = broad_and_exempts()
-            for lineno, segment in refusal_statements(mutant):
-                if classify(segment, broad, exempt_list) == "flagged":
+            for lineno, segment, message in refusal_statements(mutant):
+                if classify(segment, message, broad, exempt_list) == "flagged":
                     flagged.append((lineno, canon(segment)))
             self.assertEqual(len(flagged), 1)
             _, statement = flagged[0]
@@ -463,7 +527,12 @@ class CompanionTests(unittest.TestCase):
         for node in ast.walk(target):
             with self.subTest(node=type(node).__name__):
                 self.assertNotIsInstance(node, ast.JoinedStr)
-                if isinstance(node, ast.Call) and func_id(node.func) == "format":
+                if isinstance(node, ast.Call) and (
+                    func_id(node.func) == "format"
+                    or getattr(node.func, "attr", "") == "format"
+                ):
+                    # `"...".format(x)` is an Attribute call, which func_id
+                    # reports as ""; match it too so formatted outputs trip.
                     self.fail("classify_failure formats a message")
                 if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
                     self.fail("classify_failure %-formats a message")

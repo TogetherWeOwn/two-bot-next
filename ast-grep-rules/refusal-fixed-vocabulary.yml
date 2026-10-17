@@ -12,7 +12,22 @@ rule:
         - pattern: Refused($MSG)
         - pattern: ReadFailed($MSG)
         - pattern: require($COND, $MSG)
-    - regex: '(\{|\.format\s*\(|%\s*\w|str\s*\(|repr\s*\(|ascii\s*\(|\.join\s*\(|\+|Refused\(\s*[a-z_]|ReadFailed\(\s*[a-z_])'
+    # Trigger vocabulary, matched against the whole call. Bare-variable
+    # messages need two shapes: single-argument constructors match
+    # `Refused(<ident>`, while require's message is the second argument, so
+    # a trailing `, <ident>)` matches it. The offline pin in
+    # scripts/ci/test_refusal_fixed_vocabulary.py applies this same literal
+    # to the message argument only (`^[a-z_]...$` there), which is the
+    # precise gate: pinning one literal keeps both sides in one reviewed
+    # diff. Known ast-grep 0.50 limit, verified locally: `has` sees direct
+    # children only and never unifies an outer $MSG, so the YAML cannot
+    # exclude a computed require condition the way the pin does. A require
+    # with a computed condition and a fixed message (for example
+    # `require(str(port).isdigit(), "port must be numeric")`) still trips
+    # this rule locally; the pin stays green and decides CI. Do not add
+    # computed-condition shapes to the YAML valid fixtures: `ast-grep test`
+    # would fail on purpose.
+    - regex: '(\{|\.format\s*\(|%\s*[\w\(]|str\s*\(|repr\s*\(|ascii\s*\(|\.join\s*\(|\+|Refused\(\s*[a-z_]|ReadFailed\(\s*[a-z_]|,\s*[a-z_][A-Za-z0-9_]*\s*\)\s*$|^[a-z_][A-Za-z0-9_]*$)'
   not:
     any:
       # Module constants (MEMBER_ENV, DB_ROLE, ...): fixed vocabulary by construction.

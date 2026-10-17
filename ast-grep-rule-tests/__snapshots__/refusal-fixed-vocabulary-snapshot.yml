@@ -6,6 +6,12 @@ snapshots:
       style: primary
       start: 6
       end: 40
+  raise Refused("bad %(key)s" % keymap):
+    labels:
+    - source: Refused("bad %(key)s" % keymap)
+      style: primary
+      start: 6
+      end: 37
   raise Refused("bad key %s" % key):
     labels:
     - source: Refused("bad key %s" % key)
@@ -78,3 +84,9 @@ snapshots:
       style: primary
       start: 0
       end: 58
+  require(port is not None, key):
+    labels:
+    - source: require(port is not None, key)
+      style: primary
+      start: 0
+      end: 30
