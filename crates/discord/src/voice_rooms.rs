@@ -372,6 +372,11 @@ pub struct RoomHttp {
     transport: HyperClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
     authorization: HeaderValue,
     origin: String,
+    // Scheme/authority used for attachment downloads after the user URL has
+    // been validated against the CDN allowlist. Production is the Discord
+    // CDN itself, so the rewrite is the identity; tests point it at a
+    // loopback server, mirroring the `origin` seam for API requests.
+    cdn_origin: String,
     global_not_before: Arc<Mutex<Option<Instant>>>,
     unauthorized: Arc<AtomicBool>,
     in_flight: Arc<Mutex<InFlightRest>>,
@@ -423,6 +428,7 @@ impl RoomHttp {
             transport,
             authorization,
             origin,
+            cdn_origin: "https://cdn.discordapp.com".to_owned(),
             global_not_before: Arc::new(Mutex::new(None)),
             unauthorized: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(Mutex::new(InFlightRest::default())),
@@ -622,8 +628,17 @@ impl RoomHttp {
     /// Download a Discord-hosted `/import` file, capped at `max_bytes`.
     /// Only the Discord CDN host is fetched, over HTTPS and without the bot
     /// credential: attachment URLs are signed and need no authorization.
-    /// Oversized bodies, non-2xx statuses and transport failures surface as
-    /// errors with no partial bytes.
+    ///
+    /// One ten-second elapsed-time budget covers the request, the status
+    /// check and collection of the whole body together, measured from the
+    /// start of the download; it is never restarted when headers arrive, so
+    /// a response that returns valid headers and then stalls or drips
+    /// chunks still fails at the deadline. The `max_bytes` cap bounds size
+    /// independently: a body of exactly `max_bytes` succeeds, one byte more
+    /// is refused. A deadline expiry, an oversized body, a non-2xx status
+    /// (redirects are classified, never followed) and transport failures
+    /// all surface as errors with no partial bytes. Failures never echo the
+    /// signed attachment URL.
     pub async fn download_attachment(
         &self,
         url: &str,
@@ -635,29 +650,44 @@ impl RoomHttp {
         {
             return Err(RoomHttpError::InvalidRequest);
         }
+        // The user URL is validated above exactly as supplied; only the
+        // transport target's scheme/authority come from `cdn_origin`
+        // (identity in production), preserving path and signed query.
+        let path_and_query = uri
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str);
+        let transport_uri: http::Uri =
+            format!("{}{path_and_query}", self.cdn_origin.trim_end_matches('/'))
+                .parse()
+                .map_err(|_| RoomHttpError::InvalidRequest)?;
         let request = Request::builder()
             .method("GET")
-            .uri(uri)
+            .uri(transport_uri)
             .body(Full::new(Bytes::new()))
             .map_err(|_| RoomHttpError::InvalidRequest)?;
-        let response =
-            tokio::time::timeout(Duration::from_secs(10), self.transport.request(request))
+        let download = async {
+            let response = self
+                .transport
+                .request(request)
+                .await
+                .map_err(|_| RoomHttpError::UnknownOutcome)?;
+            let status = response.status().as_u16();
+            if !(200..300).contains(&status) {
+                return Err(classify_response(status, &[]));
+            }
+            let body = Limited::new(response.into_body(), max_bytes.saturating_add(1))
+                .collect()
                 .await
                 .map_err(|_| RoomHttpError::UnknownOutcome)?
-                .map_err(|_| RoomHttpError::UnknownOutcome)?;
-        let status = response.status().as_u16();
-        if !(200..300).contains(&status) {
-            return Err(classify_response(status, &[]));
-        }
-        let body = Limited::new(response.into_body(), max_bytes.saturating_add(1))
-            .collect()
+                .to_bytes();
+            if body.len() > max_bytes {
+                return Err(RoomHttpError::InvalidRequest);
+            }
+            Ok(body.to_vec())
+        };
+        tokio::time::timeout(Duration::from_secs(10), download)
             .await
             .map_err(|_| RoomHttpError::UnknownOutcome)?
-            .to_bytes();
-        if body.len() > max_bytes {
-            return Err(RoomHttpError::InvalidRequest);
-        }
-        Ok(body.to_vec())
     }
 
     pub async fn create_room(
