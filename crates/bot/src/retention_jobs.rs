@@ -150,48 +150,60 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                 // Stale per-guild game-activity aggregates expire on this same
                 // cadence, never on the hourly flush/send path: quiet guilds
                 // stop accumulating rows while active guilds keep every fresh
-                // row. Execute only; the dry run deletes nothing by contract.
-                // Runs after the report above so an expiry failure never
-                // discards the retention report unlogged.
-                if mode == RetentionMode::Execute {
-                    expire_stale_game_aggregates(&pool).await?;
-                }
+                // row. Execute deletes; drier modes count the same rows and
+                // log them under the same event, so the dry run previews
+                // exactly what execute will delete. Runs after the report
+                // above so an expiry failure never discards the retention
+                // report unlogged.
+                expire_stale_game_aggregates(&pool, mode).await?;
                 Ok(())
             })
         }),
     }
 }
 
-/// Delete per-guild game-activity aggregate rows older than the configured
-/// horizon, one guild scope at a time. Each guild's delete is its own
-/// statement, so one guild's store failure never rolls back another guild's
-/// expiry; any failure returns [`ErrorClass::Database`] so the supervisor
-/// retries on the next bounded opportunity. Expiry is idempotent (deleted
-/// rows stay deleted), and the horizon parser only yields values inside
+/// Delete (execute) or count (any drier mode) per-guild game-activity
+/// aggregate rows older than the configured horizon, one guild scope at a
+/// time. Each guild's statement is its own, so one guild's store failure
+/// never rolls back another guild's sweep; any failure returns
+/// [`ErrorClass::Database`] so the supervisor retries on the next bounded
+/// opportunity. Expiry is idempotent (deleted rows stay deleted), and the
+/// horizon parser only yields values inside
 /// `1..=MAX_AGGREGATE_RETENTION_DAYS`, so a misconfigured setting falls back
 /// to the safe default instead of widening into a wipe or overflowing the
-/// interval arithmetic.
-async fn expire_stale_game_aggregates(pool: &PgPool) -> Result<(), ErrorClass> {
+/// interval arithmetic. Both modes log the same event with the mode
+/// attached, so the dry run previews exactly what execute will delete.
+async fn expire_stale_game_aggregates(
+    pool: &PgPool,
+    mode: RetentionMode,
+) -> Result<(), ErrorClass> {
     let horizon = game_activity_store::aggregate_retention_days_from_setting(
         std::env::var(game_activity_store::AGGREGATE_RETENTION_DAYS_SETTING)
             .ok()
             .as_deref(),
     );
-    let guilds = game_activity_store::list_aggregate_guilds(pool)
+    let guilds = game_activity_store::list_aggregate_guilds(pool, horizon)
         .await
         .map_err(|_| aggregate_expiry_failed())?;
-    let mut expired = 0u64;
+    let mut stale = 0u64;
     for guild_id in &guilds {
-        expired += game_activity_store::expire_stale_guild_aggregates(pool, guild_id, horizon)
-            .await
-            .map_err(|_| aggregate_expiry_failed())?;
+        if mode == RetentionMode::Execute {
+            stale += game_activity_store::expire_stale_guild_aggregates(pool, guild_id, horizon)
+                .await
+                .map_err(|_| aggregate_expiry_failed())?;
+        } else {
+            stale += game_activity_store::count_stale_guild_aggregates(pool, guild_id, horizon)
+                .await
+                .map_err(|_| aggregate_expiry_failed())?;
+        }
     }
-    if expired > 0 {
+    if stale > 0 {
         tracing::info!(
             message = "game_activity_aggregate_expiry",
-            expired_rows = expired,
+            stale_rows = stale,
             horizon_days = horizon,
-            "expired stale aggregates",
+            mode = ?mode,
+            "aggregate expiry sweep",
         );
     }
     Ok(())
