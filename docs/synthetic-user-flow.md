@@ -18,6 +18,17 @@ Each job writes one JSON evidence receipt (`synthetic-staging-<run>.json`,
 or fence refusal. Production is passive: the prod job observes and alerts
 only, and never blocks a deploy.
 
+The production probe accepts only a stamped identity with a 40-character,
+lowercase hexadecimal `build_revision` and a `build_id` containing exactly two
+non-empty decimal components separated by one hyphen (each at most 20 digits;
+64 characters total maximum), or the exact unstamped pair
+`build_revision: "unknown"` and `build_id: "unknown"`. A mixed pair or any
+other shape fails the separate build check with a fixed diagnostic; malformed
+remote values are omitted from stdout, stderr and the receipt. This check does
+not change the independent `/readyz` health classification. The identity is
+observational only: this workflow does not compare it to a deployment SHA and
+does not gate or authorize a deploy.
+
 ## Failure alerts
 
 Two consecutive failed probes open one Discord ops-channel incident via
