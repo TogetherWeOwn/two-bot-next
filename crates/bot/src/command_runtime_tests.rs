@@ -5677,25 +5677,31 @@ async fn privacy_command_purges_suppresses_receipts_and_reenables_through_dispat
         false,
     );
 
-    let events_for = |member: &str| async move {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM events WHERE guild_id = $1 AND member_id = $2",
-        )
-        .bind(GUILD_S)
-        .bind(member)
-        .fetch_one(db.pool())
-        .await
-        .expect("events count reads")
+    let events_for = |member: &str| {
+        let pool = db.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM events WHERE guild_id = $1 AND member_id = $2",
+            )
+            .bind(GUILD_S)
+            .bind(member)
+            .fetch_one(&pool)
+            .await
+            .expect("events count reads")
+        }
     };
-    let suppressed = |member: &str| async move {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
-        )
-        .bind(GUILD_S)
-        .bind(member)
-        .fetch_one(db.pool())
-        .await
-        .expect("suppression reads")
+    let suppressed = |member: &str| {
+        let pool = db.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
+            )
+            .bind(GUILD_S)
+            .bind(member)
+            .fetch_one(&pool)
+            .await
+            .expect("suppression reads")
+        }
     };
 
     // `opt-out`: purge + suppress + exactly one receipt, other member kept.
