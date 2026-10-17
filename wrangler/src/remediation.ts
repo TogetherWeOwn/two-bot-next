@@ -63,7 +63,8 @@ function isScopeGuard(value: unknown): value is ScopeGuard {
   return (
     REMEDIATION_PHASES.includes(guard["phase"] as RemediationPhase) &&
     typeof guard["consecutiveFailures"] === "number" &&
-    Number.isFinite(guard["consecutiveFailures"]) &&
+    Number.isSafeInteger(guard["consecutiveFailures"]) &&
+    (guard["consecutiveFailures"] as number) >= 0 &&
     typeof guard["suppressed"] === "boolean"
   );
 }

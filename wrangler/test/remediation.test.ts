@@ -192,6 +192,15 @@ test("a corrupt guard record restarts the guard instead of wedging it", () => {
         "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false },
       },
     },
+    // Counts this code never writes restart the guard: a negative or
+    // fractional count would otherwise skew the two-failure stop rule.
+    ...[-100, 1.5, Number.MAX_SAFE_INTEGER + 1].map((consecutiveFailures) => ({
+      lastRecommendedAtSeconds: NOW,
+      scopes: {
+        "voice-stall": { phase: "idle", consecutiveFailures, suppressed: false },
+        "crash-loop": { phase: "idle", consecutiveFailures: 0, suppressed: false },
+      },
+    })),
   ]) {
     assert.deepEqual(sanitizeRemediationState(corrupt, NOW), EMPTY_REMEDIATION_STATE);
     // The restarted guard recommends on a firing trigger: remediation speaks
