@@ -55,6 +55,10 @@ struct ReceiverState {
 }
 
 impl ReceiverState {
+    fn new(config: &EventsubReceiverConfig) -> Self {
+        Self::with_delivery(config, None)
+    }
+
     fn with_delivery(config: &EventsubReceiverConfig, delivery: Option<DeliveryDeps>) -> Self {
         Self {
             // Keep one atomic secret snapshot in the state; handlers never
@@ -73,6 +77,10 @@ pub struct BoundEventsubReceiver {
     state: Arc<ReceiverState>,
 }
 
+pub async fn bind(config: EventsubReceiverConfig) -> std::io::Result<BoundEventsubReceiver> {
+    bind_with_delivery(config, None).await
+}
+
 /// Bind with optional go-live delivery dependencies: verified
 /// notifications then run the durable ledger flow instead of ack-only.
 /// Boot passes the production dependencies while delivery is enabled and
@@ -82,7 +90,10 @@ pub async fn bind_with_delivery(
     delivery: Option<DeliveryDeps>,
 ) -> std::io::Result<BoundEventsubReceiver> {
     let listener = TcpListener::bind(config.listen_addr()).await?;
-    let state = ReceiverState::with_delivery(&config, delivery);
+    let state = match delivery {
+        Some(deps) => ReceiverState::with_delivery(&config, Some(deps)),
+        None => ReceiverState::new(&config),
+    };
     Ok(BoundEventsubReceiver {
         listener,
         state: Arc::new(state),
@@ -607,7 +618,7 @@ mod tests {
     }
 
     fn app() -> Router {
-        router(Arc::new(ReceiverState::with_delivery(&config(), None)))
+        router(Arc::new(ReceiverState::new(&config())))
     }
 
     fn sign(message_id: &str, timestamp: &str, body: &[u8]) -> String {
@@ -1320,7 +1331,7 @@ mod tests {
         let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // Hold every permit: the semaphore gate runs before path, method,
         // content-type and verification, so even a bare request gets 503.
-        let state = Arc::new(ReceiverState::with_delivery(&config(), None));
+        let state = Arc::new(ReceiverState::new(&config()));
         let _permits = (0..MAX_REQUESTS)
             .map(|_| state.capacity.clone().try_acquire_owned().expect("permit"))
             .collect::<Vec<_>>();
@@ -1512,7 +1523,7 @@ mod tests {
         let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // The 20 s outer budget maps a stalled receive to 503
         // `upstream_timeout`, retriable.
-        let state = ReceiverState::with_delivery(&config(), None);
+        let state = ReceiverState::new(&config());
         let mut pending_response = Box::pin(receive_with_timeout(
             &state,
             "synthetic-request-0016",
@@ -1611,10 +1622,7 @@ mod tests {
         let old_secret = fresh_reload_secret();
         let new_secret = fresh_reload_secret();
         assert_ne!(old_secret, new_secret, "rotation must change the secret");
-        let state = Arc::new(ReceiverState::with_delivery(
-            &reload_config_for(&old_secret),
-            None,
-        ));
+        let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
         let bound = router(Arc::clone(&state));
         state.reload_secret(&reload_config_for(&new_secret));
 
@@ -1639,10 +1647,7 @@ mod tests {
         let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let old_secret = fresh_reload_secret();
         let new_secret = fresh_reload_secret();
-        let state = Arc::new(ReceiverState::with_delivery(
-            &reload_config_for(&old_secret),
-            None,
-        ));
+        let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
         let bound = router(Arc::clone(&state));
         let body = challenge_body();
         let timestamp = fresh_timestamp();
@@ -1687,10 +1692,7 @@ mod tests {
         let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let old_secret = fresh_reload_secret();
         let new_secret = fresh_reload_secret();
-        let state = Arc::new(ReceiverState::with_delivery(
-            &reload_config_for(&old_secret),
-            None,
-        ));
+        let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
         let bound = router(Arc::clone(&state));
         let body = challenge_body();
         let timestamp = fresh_timestamp();
@@ -1783,10 +1785,7 @@ mod tests {
         // test of events.
         let capture = crate::tracing_capture::global();
         let start = capture.text().len();
-        let state = Arc::new(ReceiverState::with_delivery(
-            &reload_config_for(&old_secret),
-            None,
-        ));
+        let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
         let bound = router(Arc::clone(&state));
         let body = challenge_body();
         state.reload_secret(&reload_config_for(&new_secret));
