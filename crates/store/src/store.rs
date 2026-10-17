@@ -633,7 +633,7 @@ mod privacy_lock_tests {
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use sqlx::{Pool, Postgres};
 
-    use two_bot_core::{EventType, FunnelEvent, FunnelStore};
+    use two_bot_core::{privacy::AnalyticsCategory, EventType, FunnelEvent, FunnelStore};
 
     use super::PgFunnelStore;
 

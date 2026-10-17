@@ -104,6 +104,7 @@ fn message(member: &str, at: &str, is_bot: bool) -> MessageInput {
         channel_class: ChannelClass::Human,
         capture_only: false,
         occurred_at: Some(at.to_owned()),
+        content_length: None,
     }
 }
 
