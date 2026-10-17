@@ -34,6 +34,14 @@ pub const GLOBAL_REQUESTS_PER_SECOND: u64 = 50;
 /// [`GLOBAL_REQUESTS_PER_SECOND`] (1000/50): independent executors sharing a
 /// guard spread out instead of bursting past the documented global rate.
 pub const GLOBAL_MIN_INTERVAL: Duration = Duration::from_millis(1000 / GLOBAL_REQUESTS_PER_SECOND);
+/// Extra safety margin folded into each pacing slot (conservative over the
+/// documented floor, never under it): timer wake granularity plus the
+/// post-admission dispatch overhead (request build, lane queue, connection
+/// reuse variance) can otherwise compress the wire spacing a fraction under
+/// the floor — nightly saw 99.99 ms across five 20 ms slots vs the 100 ms
+/// acceptance threshold. Two milliseconds per slot (≈45 req/s) keeps wire
+/// spacing at or above the documented 50/s floor under loaded-runner jitter.
+pub const GLOBAL_PACING_SAFETY_PAD: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Clone, Copy)]
 pub struct GuardConfig {
@@ -312,18 +320,21 @@ impl RateLimitGuard {
         }
     }
 
-    /// One shared pacing turn: reserve the next [`GLOBAL_MIN_INTERVAL`]
-    /// slot after the previous turn's release on this guard, wait it out,
-    /// and leave the reservation for the next turn. The reservation is
-    /// taken under the bookkeeping lock and the sleep holds no lock, so a
-    /// burst of admitters spaces itself one interval at a time without
-    /// ever parking on a shared async gate: parallel paused-clock tests
-    /// share the process guard, and parking one runtime on another's turn
-    /// advances the parked runtime to its outer timeout while it makes no
-    /// progress. A previous release minted on another runtime's clock
-    /// (foreign Instants name nothing on this clock) starts a fresh chain
-    /// here instead of waiting. Same-runtime reservations chain behind
-    /// each other, bounded by the live concurrency times one interval.
+    /// One shared pacing turn: reserve the next paced slot after the previous
+    /// turn's release on this guard, wait it out, and leave the reservation
+    /// for the next turn. Each slot is [`GLOBAL_MIN_INTERVAL`] plus
+    /// [`GLOBAL_PACING_SAFETY_PAD`]: the pad keeps wire spacing at or above
+    /// the documented floor under timer granularity and post-admission
+    /// dispatch overhead. The reservation is taken under the bookkeeping
+    /// lock and the sleep holds no lock, so a burst of admitters spaces
+    /// itself one interval at a time without ever parking on a shared async
+    /// gate: parallel paused-clock tests share the process guard, and
+    /// parking one runtime on another's turn advances the parked runtime
+    /// to its outer timeout while it makes no progress. A previous release
+    /// minted on another runtime's clock (foreign Instants name nothing on
+    /// this clock) starts a fresh chain here instead of waiting.
+    /// Same-runtime reservations chain behind each other, bounded by the
+    /// live concurrency times one interval.
     async fn pace_once(&self) {
         let runtime = tokio::runtime::Handle::try_current()
             .ok()
@@ -333,7 +344,8 @@ impl RateLimitGuard {
             let now = Instant::now();
             match (state.last_pace_release, runtime) {
                 (Some((id, last)), Some(mine)) if id == mine => {
-                    let earliest = last.checked_add(GLOBAL_MIN_INTERVAL).unwrap_or(now);
+                    let interval = GLOBAL_MIN_INTERVAL + GLOBAL_PACING_SAFETY_PAD;
+                    let earliest = last.checked_add(interval).unwrap_or(now);
                     let wait = earliest.saturating_duration_since(now);
                     state.last_pace_release = Some((mine, earliest.max(now)));
                     wait
