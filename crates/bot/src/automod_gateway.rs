@@ -328,6 +328,7 @@ pub(crate) fn expiry_job(slot: Slot) -> Job {
     Job {
         name: JOB_NAME,
         cadence: EXPIRY_CADENCE,
+        cadence_source: None,
         startup_jitter: jobs::startup_jitter(EXPIRY_CADENCE, rand::random()),
         timeout: Duration::from_secs(5),
         action: Arc::new(move || {
