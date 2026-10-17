@@ -778,6 +778,78 @@ fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
     }
 }
 
+/// One structured line per executed rename decision, so a room that keeps
+/// its default name is diagnosable from logs alone: `decision` names the
+/// outcome, `reason` carries the bounded skip reason when there is one
+/// (empty otherwise) and `retry_after_ms` is 0 unless Discord asked for a
+/// wait. A single callsite per level, not one per decision: each `tracing`
+/// callsite costs release-binary bytes against the container size budget.
+/// The requested name is never logged: it is member-derived text (display
+/// names, stream titles, presence titles), and the decision, IDs and
+/// counts are what the triage needs.
+fn log_rename_decision(
+    guild: Snowflake,
+    channel: Snowflake,
+    decision: &str,
+    reason: &str,
+    retry_after_ms: u64,
+    warn_level: bool,
+) {
+    if warn_level {
+        warn!(
+            guild = %guild,
+            channel = %channel,
+            decision,
+            reason,
+            retry_after_ms,
+            "voice room rename decision"
+        );
+    } else {
+        info!(
+            guild = %guild,
+            channel = %channel,
+            decision,
+            reason,
+            retry_after_ms,
+            "voice room rename decision"
+        );
+    }
+}
+
+/// The template-render counterpart of [`log_rename_decision`]: what the
+/// naming pass decided before anything was queued, including whether a
+/// game activity was detected at all. Like its counterpart it logs no
+/// member-derived text. The `channel_unseen` decision is the retry-only
+/// one — the pass resets and retries it, so it can recur on every pass
+/// while the channel stays unseen — and is logged at debug so that loop
+/// cannot flood the info stream.
+fn log_template_name_decision(
+    guild: Snowflake,
+    channel: Snowflake,
+    playing_members: u32,
+    decision: &str,
+) {
+    if decision == "channel_unseen" {
+        debug!(
+            guild = %guild,
+            channel = %channel,
+            playing_members,
+            activity_detected = playing_members > 0,
+            decision,
+            "voice room rename decision"
+        );
+    } else {
+        info!(
+            guild = %guild,
+            channel = %channel,
+            playing_members,
+            activity_detected = playing_members > 0,
+            decision,
+            "voice room rename decision"
+        );
+    }
+}
+
 /// Where one operator notice is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeTarget {
@@ -6110,6 +6182,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                 };
                 if let Some(reason) = skip {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        if reason == "rename_no_access" {
+                            "permission_denied"
+                        } else {
+                            reason
+                        },
+                        reason,
+                        0,
+                        false,
+                    );
                     metrics::global().voice_name(reason);
                     self.queue.mark_succeeded(&action);
                     return true;
@@ -6133,6 +6217,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                 };
                 if duplicate {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        "duplicate_name",
+                        "",
+                        0,
+                        false,
+                    );
                     metrics::global().voice_name("rename_duplicate");
                     self.desired_names.remove(&channel_id);
                     // The override never landed: clear it (memory plus store)
@@ -6154,6 +6246,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 // One rename per channel at a time: a newer name waits for
                 // the outcome of the one still running.
                 if self.renames_in_flight.contains_key(&channel_id) {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        "in_flight_deferred",
+                        "",
+                        0,
+                        false,
+                    );
                     metrics::global().voice_name("rename_held");
                     self.queue.mark_succeeded(&action);
                     self.rename_retries.insert(
@@ -6162,6 +6262,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     );
                     return true;
                 }
+                log_rename_decision(self.live.guild_id, channel_id, "attempted", "", 0, false);
                 metrics::global().voice_name("rename_sent");
                 let result = match self.http.detached_rename(channel_id, &name) {
                     Some(request) => {
@@ -6184,6 +6285,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 };
                 match result {
                     Ok(()) => {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            "renamed",
+                            "",
+                            0,
+                            false,
+                        );
                         self.queue.mark_succeeded(&action);
                         self.rename_timeouts.remove(&channel_id);
                         if let Some(channel) = self.live.write_state().channels.get_mut(&channel_id)
@@ -6192,6 +6301,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         }
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            "rate_limited",
+                            "",
+                            retry_after_ms,
+                            true,
+                        );
                         self.queue.mark_rate_limited(
                             self.live.guild_id,
                             retry_after_ms.max(RENAME_MIN_INTERVAL_MS),
@@ -6205,6 +6322,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     // update makes the retry a no-op; a Discord limit answers
                     // with its own retry-after.
                     Err(RoomHttpError::RenameDeferred) => {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            "outcome_deferred",
+                            "",
+                            0,
+                            true,
+                        );
                         let delay = self.rename_timeout_delay(channel_id);
                         self.queue.mark_rate_limited(
                             self.live.guild_id,
@@ -6214,6 +6339,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         );
                     }
                     Err(RoomHttpError::UnknownOutcome) => {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            "outcome_unknown",
+                            "",
+                            0,
+                            true,
+                        );
                         self.queue.mark_rate_limited(
                             self.live.guild_id,
                             RENAME_MIN_INTERVAL_MS,
@@ -6221,7 +6354,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             action,
                         );
                     }
-                    Err(error) => self.complete_error(action, channel_id, error),
+                    Err(error) => {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            if matches!(&error, RoomHttpError::AccessDenied) {
+                                "permission_denied"
+                            } else {
+                                "discord_error"
+                            },
+                            "",
+                            0,
+                            true,
+                        );
+                        self.complete_error(action, channel_id, error);
+                    }
                 }
             }
         }
@@ -6520,6 +6667,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.renames_in_flight.remove(&channel_id);
             let retry_in = match result {
                 Ok(()) => {
+                    log_rename_decision(self.live.guild_id, channel_id, "renamed", "", 0, false);
                     self.rename_timeouts.remove(&channel_id);
                     if let Some(channel) = self.live.write_state().channels.get_mut(&channel_id) {
                         channel.name = Some(name);
@@ -6527,11 +6675,51 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     continue;
                 }
                 Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        "rate_limited",
+                        "",
+                        retry_after_ms,
+                        true,
+                    );
                     retry_after_ms.max(RENAME_MIN_INTERVAL_MS)
                 }
-                Err(RoomHttpError::RenameDeferred) => self.rename_timeout_delay(channel_id),
-                Err(RoomHttpError::UnknownOutcome) => RENAME_MIN_INTERVAL_MS,
+                Err(RoomHttpError::RenameDeferred) => {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        "outcome_deferred",
+                        "",
+                        0,
+                        true,
+                    );
+                    self.rename_timeout_delay(channel_id)
+                }
+                Err(RoomHttpError::UnknownOutcome) => {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        "outcome_unknown",
+                        "",
+                        0,
+                        true,
+                    );
+                    RENAME_MIN_INTERVAL_MS
+                }
                 Err(error) => {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        if matches!(&error, RoomHttpError::AccessDenied) {
+                            "permission_denied"
+                        } else {
+                            "discord_error"
+                        },
+                        "",
+                        0,
+                        true,
+                    );
                     self.settle_error(channel_id, error, None);
                     continue;
                 }
