@@ -22,7 +22,11 @@ existing disposable Postgres service, rather than the lint-only `check` lane.
   legacy-verify and staging-migrate suites under the exact `agent_test` URL,
   the internal-events, raid-list and reengagement-list suites under the
   empty-password form, and member-moderation behind `MEMBER_TESTDB`.
-  Shortfalls and missing or empty reports fail the PR. The step runs after the
+  Shortfalls and missing or empty reports fail the PR. Diff paths Git
+  C-quotes (non-ASCII or escaped file names) are decoded to the same
+  repository-relative names the LCOV report uses, so they count like any
+  other changed file; a diff header the parser cannot read fails closed
+  instead of dropping the file from the denominator. The step runs after the
   ordinary rust-tests steps and uses `always()` so their failures do not suppress
   coverage output or get hidden by a coverage shortfall. Measurement also uses
   `--ignore-run-fail` to preserve LCOV output when tests invoked by llvm-cov fail.
@@ -65,7 +69,10 @@ existing disposable Postgres service, rather than the lint-only `check` lane.
   `docs/voice-synthetic.md`.
 - Test-target inventory (HARD): `scripts/ci/check-test-inventory.py` fails
   when a test or fuzz target is built by no CI job; exemptions carry a reason
-  in the script.
+  in the script. Ignored integration targets need executable routing
+  evidence in a `run:` command (an explicit `--test <name>` argument, or an
+  explicit target-list loop); a name mentioned only in display text, an
+  `env:` value, a comment, an `echo` or a `--skip` argument is no route.
 - Floor guard (HARD): `scripts/ci/check-floor-guard.py` fails when a diff
   adds a checker waiver, adds a test skip, deletes a test file, drops
   assertions from test code, or lowers a number in `CONSTRAINTS.md`. Two
