@@ -27,23 +27,26 @@
 //!
 //! ```rust,ignore
 //! // crates/core/src/community_store.rs
-//! pub fn message_fact(
-//!     guild_id: &str,
-//!     message_id: &str,
-//!     channel_id: &str,
-//!     channel_class: &str,
-//!     actor: &ClassifyInput,
-//!     occurred_at: &str,
-//!     content_length: Option<usize>, // NEW, before `classification`
-//!     classification: Classification,
-//! ) -> FactWrite;
-//! pub async fn record_message_fact(
-//!     pool: &Pool<Postgres>, /* same order, plus */ content_length: Option<usize>,
-//!     classification: Classification,
-//! ) -> Result<bool, CommunityStoreError>;
-//! // The new parameter is each function's eighth, so both need
-//! // `#[allow(clippy::too_many_arguments)]`, matching the allowances
-//! // already used on neighbouring functions in the same file.
+//! pub struct MessageFactInput<'a> {
+//!     pub guild_id: &'a str,
+//!     pub message_id: &'a str,
+//!     pub channel_id: &'a str,
+//!     pub channel_class: &'a str,
+//!     pub actor: &'a ClassifyInput,
+//!     pub occurred_at: &'a str,
+//!     pub content_length: Option<usize>, // NEW
+//!     pub classification: Classification,
+//! }
+//! pub fn message_fact(input: MessageFactInput<'_>) -> FactWrite;
+//! ```
+//! The input is a struct on purpose: `message_fact` already sits at the
+//! clippy argument-count limit, so an eighth positional parameter would
+//! force a brand-new checker waiver, which the floor guard forbids.
+//! `record_message_fact` forwards the same length into `message_fact`;
+//! its own shape is the Builder's (its pre-existing argument-count
+//! waiver already covers one more positional parameter, or it can take
+//! the same struct).
+//! ```rust,ignore
 //!
 //! // crates/core/src/handlers.rs
 //! pub struct MessageInput { /* existing fields, plus */ pub content_length: Option<usize> }
@@ -89,7 +92,7 @@ use two_bot_core::community::{
     build_scorecard, Classification, ClassifyInput, FactRow, ScorecardInputs, StreamCoverage,
     COMMUNITY_FACT_TYPES,
 };
-use two_bot_core::community_store::{message_fact, FactWrite};
+use two_bot_core::community_store::{message_fact, FactWrite, MessageFactInput};
 use two_bot_core::{
     ChannelClass, FactsSink, FunnelHandlers, MemStore, MemberJoinFact, MessageFact, MessageInput,
     NoopLeveling, RulesAcceptedFact, VoiceEndedFact, VoiceStartedFact,
@@ -125,16 +128,17 @@ fn verdict() -> Classification {
 }
 
 fn write_for(message_id: &str, occurred_at: &str, content_length: Option<usize>) -> FactWrite {
-    message_fact(
-        GUILD,
+    let who = actor(MEMBER);
+    message_fact(MessageFactInput {
+        guild_id: GUILD,
         message_id,
-        CHANNEL,
-        "human",
-        &actor(MEMBER),
+        channel_id: CHANNEL,
+        channel_class: "human",
+        actor: &who,
         occurred_at,
         content_length,
-        verdict(),
-    )
+        classification: verdict(),
+    })
 }
 
 fn metadata_of(write: &FactWrite) -> serde_json::Value {
