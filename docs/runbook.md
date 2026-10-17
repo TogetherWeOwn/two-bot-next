@@ -486,7 +486,10 @@ flat generation is this alert becoming member-visible.
 
 Escalate when the store cause is not self-clearing, when `unknown_creator`
 refusals dominate, or when the flat generation survives a restart — the fix
-belongs to the on-call engineer, not another redeploy.
+belongs to the on-call engineer, not another redeploy. Guarded remediation
+recommends alongside this alert: the bot's own reload first, then a same-SHA
+takeover card if the alert survives it (see
+[auto-remediation](#auto-remediation-guarded-stall-and-crash-loop-response)).
 
 #### Alert: gateway missed events
 
@@ -556,7 +559,11 @@ the logs show no `gateway ready` after the last disconnect, the gateway is still
 down: escalate to the on-call engineer through the watch escalation path. Do not
 restart the container to clear the alert. A restart re-baselines the counters
 without showing that the gateway came back, so confirm `gateway ready` in the
-new process's logs first.
+new process's logs first. Guarded remediation recommends alongside this alert:
+a same-SHA takeover card, then a CEO page if two takeovers fail (see
+[auto-remediation](#auto-remediation-guarded-stall-and-crash-loop-response)).
+A reload step is skipped here: no in-process reload can fix a gateway that
+never came back.
 
 #### Alert: ticker stale
 
@@ -692,6 +699,69 @@ integration nor paging escalation: it labels the existing transition delivery
 as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
+
+#### Auto-remediation: guarded stall and crash-loop response
+
+Execution-path decision: the Worker cannot restart containers, so remediation
+is recommendation plus guard state, evaluated in `wrangler/src/remediation.ts`
+on every keepalive tick. Nothing there mutates the container, the ownership
+record, or any deployment. Execution stays inside the existing machine
+contract: the bot's own in-process reload (no host action), then one Operator
+host-action card per host step for a same-SHA deployment-takeover through the
+existing deploy workflow. No new endpoint, credential, spend, or authority.
+
+Trigger table (a recommendation fires only while its trigger key fires):
+
+| Scope | Trigger firing key | R1 (first) | R2 (escalation) |
+|---|---|---|---|
+| `voice-stall` | `voice_creator_map_stale` | `creator-map-reload`: the bot's maintenance tick retries the merge every 5 minutes; no host action | `same-sha-takeover`: one Operator card for a same-SHA takeover via the existing deploy workflow |
+| `crash-loop` | `gateway_unpaired_disconnect` | skipped: no in-process reload can fix a gateway that never came back | `same-sha-takeover`: one Operator card, same path as above |
+
+Guard state (persisted in DO storage next to the alert state):
+
+- At most one recommendation per 30 minutes across all scopes. Triggers are
+  visited in table order and the first eligible one consumes the window, so
+  when both scopes fire at once the table order is the priority and the other
+  scope waits for the next window.
+- A recommendation while a prior one for the same scope did not clear the
+  alert counts as one consecutive failure for that scope.
+- After 2 consecutive failures the scope goes quiet and the Worker pages the
+  CEO card once, on the same best-effort webhook path as the alerts
+  themselves: if forwarding is off or delivery fails, the scope still goes
+  quiet until the alert stays clear for a full cooldown window, so a suppressed
+  scope with no CEO line is a paging gap, not a recovery. No further
+  recommendations until the alert stays clear for one cooldown window.
+- Recovery needs a sustained clear, not one quiet line. A recommended takeover
+  restarts the process, which re-baselines the gateway counters and boots
+  `creator_map_generation` at 0, so the next tick goes quiet even when the
+  fault survives. A quiet tick therefore starts a per-scope hold-down instead
+  of resetting the guard; only a full 30-minute window of silence returns the
+  scope to idle. A refire inside the window keeps the failure count, so a
+  flapping alert still reaches the two-failure stop. A scope that stays silent
+  for the full window with generation pinned at 0 never pages from this guard:
+  the stall rule cannot tell parked from wedged at generation 0, so that case
+  needs its own boot/store-fault signal (follow-up), not another redeploy.
+
+Operator card shape for `same-sha-takeover`: name the firing key, the build
+revision from the alert line, and the deploy workflow run to dispatch at that
+same SHA. File a host-action card only from a `same-sha-takeover` line: the
+first (`creator-map-reload`) line is never card authority. File exactly one
+card per host step; act only while the alert is firing. A repeated takeover
+line for the same still-firing alert is the escalation retry, not a second
+step: file it only after the first card's action completed without clearing
+the alert, never while that action is still in flight. When the CEO page
+lands, the on-call pages the CEO card and stops filing takeover cards for
+that scope until the alert stays clear for one cooldown window.
+
+Known limits of v1: the triggers stay pinned to the two keys in the table
+above. A stuck-gateway rule (non-ready `/readyz` gateway component with no
+disconnect edge) is not a trigger in v1; wiring it into the crash-loop scope
+is follow-up work once that rule lands, not part of this slice. Sustained
+`/readyz` red (`container_unready_alert`) and repeated process restarts stay
+manual. A positive-path staging proof (forcing a real stall) needs an injector
+that does not exist; v1 staging proof is a clean deploy with no spurious
+recommendation lines plus the unit suite below. Forcing these two alerts on
+staging is follow-up work, not a silent gap.
 
 ### Event-store capture gaps and lag
 
