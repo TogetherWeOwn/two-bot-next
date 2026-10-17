@@ -54,15 +54,23 @@ pub fn allowed_errors(window_events: u64, budget_error_ratio: f64, burn: f64) ->
     (burn * budget_error_ratio * window_events as f64).ceil() as u64
 }
 
+/// Minimum eligible events per fast-burn window: quiet traffic never pages.
+/// Must match `ERROR_BUDGET_FAST_MIN_EVENTS` in `wrangler/src/alert-rules.ts`.
+pub const FAST_BURN_MIN_EVENTS: u64 = 10;
+/// Minimum budget errors per fast-burn window: one bad minute never pages.
+/// Must match `ERROR_BUDGET_FAST_MIN_ERRORS` in `wrangler/src/alert-rules.ts`.
+pub const FAST_BURN_MIN_ERRORS: u64 = 2;
+
 /// Fast-burn page decision over the two policy windows: page only when the
 /// long window (15 min of eligible events) and the short confirmation window
 /// (2 min) both burn at or above `FAST_BURN_RATE`. One bad window alone never
-/// pages, and an empty window (no eligible events) stays silent instead of
-/// dividing by zero. The Worker (`error_budget_fast_burn` in
-/// `wrangler/src/alert-rules.ts`) evaluates this policy on its keepalive
-/// schedule against cumulative REST counters; this function is the exact
-/// offline pin of that decision, without the Worker's scrape-quantization
-/// allowance.
+/// pages, and a window below either volume floor stays silent instead of
+/// dividing by zero or paging on a trickle. The Worker
+/// (`error_budget_fast_burn` in `wrangler/src/alert-rules.ts`) evaluates this
+/// policy on its keepalive schedule against cumulative REST counters; this
+/// function pins that decision exactly, including the per-window floors. The
+/// only intentional divergence is the Worker's ~1% scrape-quantization
+/// allowance, which exists because window edges land on whole scrapes.
 pub fn fast_burn_pages(
     long_errors: u64,
     long_events: u64,
@@ -70,7 +78,7 @@ pub fn fast_burn_pages(
     short_events: u64,
 ) -> bool {
     fn burns(errors: u64, events: u64) -> bool {
-        if events == 0 {
+        if events < FAST_BURN_MIN_EVENTS || errors < FAST_BURN_MIN_ERRORS {
             return false;
         }
         burn_rate(errors as f64 / events as f64, BUDGET_ERROR_RATIO) >= FAST_BURN_RATE
