@@ -24,6 +24,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_missed_events_total` | Dispatches Discord assigned but this process never received (sequence gaps inside one session). Any nonzero increase over the watch window fails the zero-missed-events acceptance |
 | `two_bot_gateway_events_total{event}` | Received dispatches, including replays/duplicates, plus heartbeat ACKs and closes; fixed type allowlist, remainder `other` |
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert). Fixed three series from process start; no user, activity, application or free-text labels |
+| `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels |
 | `two_bot_handler_duration_seconds` | Cumulative histogram over nonduplicate dispatch parse/pipeline/durable commit, including failures; seconds |
 | `two_bot_rest_requests_total{route,result}` | Executor HTTP sends, including retries; result `2xx`, `3xx`, `4xx`, `429`, `5xx` at response headers or `transport` (failure/cancellation/timeout before headers); later body failures do not hide 429/5xx |
 | `two_bot_rest_guard_invalid_requests_total` | Shared guard observations of 401, 403 or 429 response headers, across guarded REST callers |
@@ -195,6 +196,15 @@ as dynamic labels.
 - `two_bot_presence_capture_total{outcome}` — `outcome` is one of `inserted`,
   `duplicate`, `rejected`. Exactly three series; unrecognised outcomes collapse
   to `rejected`, never to a new series.
+- `two_bot_automod_decisions_total{outcome}` — `outcome` is one of
+  `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`,
+  `warned`, `timed_out` or `sanction_refused`
+  (`crates/core/src/metrics.rs` `AUTOMOD_DECISION_OUTCOMES`, mirroring
+  `automod_runtime::CompletionKind::as_str`). Recorded once per committed
+  `StoredOutcome` in `crates/discord/src/automod_activation.rs` (`settle`);
+  replays, retained claims, bypassed and unavailable inspections never count.
+  No message text, excerpts or user IDs become labels; unrecognised outcomes
+  collapse to `sanction_refused`, never to a new series.
 - `two_bot_rest_requests_total{route,result}` — `result` is one of `2xx`,
   `3xx`, `4xx`, `429`, `5xx`, `transport`. `route` is one of the fixed
   executor route templates (`GET /channels/:channel`,
