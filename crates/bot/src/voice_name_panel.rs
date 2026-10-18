@@ -118,6 +118,10 @@ impl NameDirectory {
         self.names.contains_key(&member)
     }
 
+    fn display_for(&self, member: Snowflake) -> Option<String> {
+        self.names.get(&member).cloned()
+    }
+
     fn retain(&mut self, mut keep: impl FnMut(Snowflake) -> bool) {
         self.names.retain(|member, _| keep(*member));
     }
@@ -400,6 +404,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 prefill: self.custom_names.get(&room_id).cloned(),
             },
             NameInteraction::Submit { text, .. } => {
+                // The submit renders from the interaction's fresh directory
+                // while the background re-render reads the worker's copy: copy
+                // the fresh owner and original-creator names over so the next
+                // fact change keeps the name just promised, instead of
+                // re-rendering with a stale nickname.
+                for member in [room.owner_id, room.original_creator_id] {
+                    if let Some(display) = command.directory.display_for(member) {
+                        self.name_directory.insert(member, display);
+                    }
+                }
                 let facts = self.name_facts(&room, &command);
                 let checks = NameChecks {
                     policy: &command.policy,
@@ -420,6 +434,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 }
             }
             NameInteraction::Restore { .. } => {
+                // Same fresh-directory sync as a submit: the restore reply
+                // promises a render from the interaction's facts.
+                for member in [room.owner_id, room.original_creator_id] {
+                    if let Some(display) = command.directory.display_for(member) {
+                        self.name_directory.insert(member, display);
+                    }
+                }
                 let facts = self.name_facts(&room, &command);
                 let checks = NameChecks {
                     policy: &command.policy,
@@ -740,9 +761,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let room_id = room.channel_id;
         // A person whose display name is unknown would render as "member":
         // wait briefly for the name instead of spending a rename, but never
-        // longer than NAME_WAIT_MS.
-        let uses_original_creator = stored.to_ascii_lowercase().contains("@@original_creator@@");
-        let unknown = !self.name_directory.knows(room.owner_id)
+        // longer than NAME_WAIT_MS. Only wait for names the override actually
+        // reads: occupancy- and limit-only overrides must not wait.
+        let stored_lower = stored.to_ascii_lowercase();
+        let uses_owner = stored_lower.contains("@@owner@@") || stored_lower.contains("@@creator@@");
+        let uses_original_creator = stored_lower.contains("@@original_creator@@");
+        let unknown = (uses_owner && !self.name_directory.knows(room.owner_id))
             || (uses_original_creator && !self.name_directory.knows(room.original_creator_id));
         if unknown {
             if !self.name_waits.contains_key(&room_id) {

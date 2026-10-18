@@ -52,10 +52,12 @@ Refusals are ephemeral and never echo the rejected name.
 Rendering facts come from the live guild snapshot: owner and creator display
 names (from the gateway cache), headcount, whether the owner is present, the
 channel's user limit, the room's stored seed, the guild's named lists and
-"no game" label, and the current time (UTC). Presence data (games, streams)
-and privacy are not tracked by this runtime, so tokens built from them render
-in their "nothing to show" state. `##` numbers a room by its position among
-its creator's tracked rooms until room numbers are persisted.
+"no game" label, and the current time (UTC). With `TWO_VOICE_PRESENCE`
+disabled, presence data (games, streams) is not tracked, so tokens built from
+it render in their "nothing to show" state. When enabled, gateway presence
+supplies those activity facts. Privacy is not tracked by this runtime.
+`##` numbers a room by its position among its creator's tracked rooms until
+room numbers are persisted.
 
 ## Restore
 

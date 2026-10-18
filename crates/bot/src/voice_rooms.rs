@@ -7936,8 +7936,27 @@ where
                 // Prefer the event's role list when the cache has not caught up.
                 let roles =
                     roles.or_else(|| Some(updated.roles.iter().map(|id| id.get()).collect()));
+                // A nickname change renders into `@@owner@@` rooms: forward it
+                // as a display update so the worker's directory (which the
+                // background re-render reads) never stays behind the fresh
+                // directory a `/name` submit just rendered from. Read the name
+                // from the event itself, not the cache, so a lagging cache
+                // cannot re-apply the old nickname.
+                let display = updated
+                    .nick
+                    .clone()
+                    .filter(|nick| !nick.is_empty())
+                    .or_else(|| {
+                        updated
+                            .user
+                            .global_name
+                            .clone()
+                            .filter(|name| !name.is_empty())
+                    })
+                    .unwrap_or_else(|| updated.user.name.clone());
                 if let Some(actor) = self.live_actor(guild_id) {
                     actor.live.set_member_roles(member_id, roles);
+                    let _ = actor.tx.send(ActorCommand::Display { member_id, display });
                 }
             }
             // A warm RESUME replays missed dispatches before RESUMED; only then
