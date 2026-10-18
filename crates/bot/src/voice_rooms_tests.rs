@@ -15,6 +15,8 @@ mod kick;
 mod limit_command;
 #[path = "voice_name_tests.rs"]
 mod name;
+#[path = "voice_name_filter_acceptance_tests.rs"]
+mod name_filter_acceptance;
 #[path = "voice_private_runtime_tests.rs"]
 mod private;
 #[path = "voice_rooms_sink_tests.rs"]
