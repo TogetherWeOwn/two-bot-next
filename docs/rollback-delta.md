@@ -63,10 +63,12 @@ Every `unmeasurable` report entry carries a rollback `disposition`
 alongside its `reason` (and no `count` or `columns`):
 
 - `accept-with-reason`: the rollback decision accepts the stated reason as
-  the window handling, optionally with the named alternate measured evidence
-  attached to the window record. Used only where the spec reason or the
-  reviewed voice-window disposition below names alternate measured evidence,
-  an accepted reason, seed reference data, or no durable state.
+  the window handling, with the named alternate measured evidence attached
+  to the window record (required where the disposition map or the
+  voice-window section below names it). Used only where the spec reason or
+  the reviewed voice-window disposition below names alternate measured
+  evidence (including a per-table dump comparison), an accepted reason,
+  seed reference data, or no durable state.
 - `manual-reconcile-required`: the window delta for this table is invisible
   to the report and no alternate measured evidence is named. The rollback
   operator reconciles it by hand before GO (per-table dump comparison,
@@ -87,8 +89,8 @@ from this map, and the acceptance battery pins the JSON encoding):
 | `level_role_rewards` | `manual-reconcile-required` | Wholesale-replaced configuration with no alternate evidence named |
 | `lfg_roles` | `accept-with-reason` | Child rows are created and updated with the parent `lfg_posts` row |
 | `moderation_channel_executions` | `accept-with-reason` | Written with its parent `moderation_idempotency` claim (measured via `claimed_at`) |
-| `rank_ladder` | `accept-with-reason` | Seed reference data |
-| `self_role_exchange_baselines` | `accept-with-reason` | Written with its exchange lifecycle (`self_role_exchanges.created_at`) |
+| `rank_ladder` | `accept-with-reason` | Rows rewritten with each rank snapshot (measured via `rank_snapshots.snapshot_at` in the same transaction) |
+| `self_role_exchange_baselines` | `accept-with-reason` | Pinned/retired in place by the legacy-journal path; accepted with a per-event baseline dump comparison (freeze vs rollback) as alternate evidence |
 | `voice_channel_templates`, `voice_game_aliases`, `voice_random_lists`, `voice_random_list_choices`, `voice_logging`, `voice_logging_mention_members`, `voice_logging_mention_roles`, `voice_guild_settings`, `voice_command_roles`, `voice_command_role_members` | `accept-with-reason` | Wholesale-replaced configuration, accepted with the freeze/rollback configuration export pair below as alternate evidence |
 | `voice_creators` | `accept-with-reason` | Accepted with the export pair plus a per-guild full-row dump comparison as alternate evidence (see below) |
 | `voice_logging_settings`, `voice_access_controls` | `accept-with-reason` | Mutable per-guild settings rows; accepted with the read-back pair below as alternate evidence |

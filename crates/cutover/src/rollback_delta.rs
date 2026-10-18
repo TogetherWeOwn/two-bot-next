@@ -197,7 +197,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "privacy_opt_outs", measure: TableMeasure::Columns(&["opted_out_at"]) },
     TableSpec {
         table: "rank_ladder",
-        measure: TableMeasure::Unmeasurable("seed reference data with no timestamp column", DISPOSITION_ACCEPT_WITH_REASON),
+        measure: TableMeasure::Unmeasurable("no timestamp column; rows are rewritten with each rank snapshot (measured via rank_snapshots.snapshot_at in the same transaction, see WebsiteStore::write_rank_snapshot)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "rank_snapshots", measure: TableMeasure::Columns(&["snapshot_at"]) },
     TableSpec { table: "rollback_journal", measure: TableMeasure::Columns(&["recorded_at"]) },
@@ -217,7 +217,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "self_role_audit", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec {
         table: "self_role_exchange_baselines",
-        measure: TableMeasure::Unmeasurable("no timestamp column; the baseline row is written with its event's exchange lifecycle (measured via self_role_exchanges.created_at)", DISPOSITION_ACCEPT_WITH_REASON),
+        measure: TableMeasure::Unmeasurable("no timestamp column; baseline rows are pinned/retired in place by the legacy-journal path without touching self_role_exchanges (see pin_legacy_exchange, retire_exchange_evidence); accepted with a per-event baseline dump comparison as alternate evidence", DISPOSITION_ACCEPT_WITH_REASON),
     },
     // Ticket creation, settlement and retirement each rewrite a different
     // column without touching the others, so the maximum is the row's last write.

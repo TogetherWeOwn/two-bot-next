@@ -109,8 +109,9 @@ brief.
    delta report marks `unmeasurable` carry a rollback `disposition`
    (`accept-with-reason` or `manual-reconcile-required`, see
    [rollback-delta.md](rollback-delta.md#dispositions-for-unmeasurable-tables)):
-   record the accepted reason for the former, attaching alternate evidence
-   only when the report names it, and reconcile the
+   record the accepted reason for the former, attaching the alternate
+   evidence named in the report reason or in rollback-delta.md disposition
+   map and voice-window section (required where named), and reconcile the
    latter by hand before GO. Record counts, hashes, conflicts and the
    final applied watermark.
 4. Classify applied Discord effects from delivery, audit and replay
