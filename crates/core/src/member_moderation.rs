@@ -187,6 +187,28 @@ impl DiscordError {
     }
 }
 
+impl MemberError {
+    /// Bounded metrics outcome for `two_bot_moderation_enforcements_total`
+    /// (TOG-28482): `refused` for policy/validation/key-mismatch denials and
+    /// definitive Discord rejections that prove no mutation happened,
+    /// `discord_error` for uncertain Discord failures, `storage_error` for
+    /// persistence failures, `other` for anything else. The caller passes a
+    /// `ModerationAction::command_name` verb; no user id, reason text or
+    /// free-form detail ever becomes a label.
+    #[must_use]
+    pub fn enforcement_outcome(&self) -> &'static str {
+        match self {
+            Self::Policy(_) | Self::Reason(_) | Self::Malformed { .. } | Self::KeyMismatch => {
+                "refused"
+            }
+            Self::Discord(error) if error.is_safe_pre_mutation() => "refused",
+            Self::Discord(_) => "discord_error",
+            Self::Store(_) => "storage_error",
+            Self::InFlight | Self::BotIdentityUnknown => "other",
+        }
+    }
+}
+
 /// The Discord side-effect seam (legacy `ModerationDiscordClient`, member
 /// methods only). Implementations MUST abort each call after 5 s (legacy
 /// `timeoutMs ?? 5000`) and MUST NOT auto-retry: retries replay through the
