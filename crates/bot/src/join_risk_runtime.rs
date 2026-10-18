@@ -197,7 +197,8 @@ pub(crate) trait SettingsSource: Send + 'static {
 
 /// Tuning, the bulk window and the staff channel are store-first (hot rows win
 /// over the deployment environment) and re-read at most every
-/// [`SETTINGS_MAX_AGE`]; a failed refresh keeps the last good values.
+/// [`SETTINGS_MAX_AGE`]; a failed refresh keeps the last outcome (good
+/// settings or the cached refusal).
 pub(crate) struct StoreSettings {
     pool: PgPool,
     guild_id: String,
@@ -205,7 +206,7 @@ pub(crate) struct StoreSettings {
     max_age: Duration,
     cache: Option<SettingsCache>,
     checked: Option<Instant>,
-    last: Option<JoinRiskSettings>,
+    last: Option<Result<JoinRiskSettings, JoinRiskTuningRefusal>>,
 }
 
 impl StoreSettings {
@@ -247,9 +248,11 @@ impl StoreSettings {
 
 impl SettingsSource for StoreSettings {
     async fn current(&mut self) -> Result<JoinRiskSettings, JoinRiskTuningRefusal> {
+        // The cached outcome covers good settings and refusals alike, so a
+        // misconfigured key cannot turn per-15 s polling into per-join load.
         if let (Some(at), Some(last)) = (self.checked, &self.last) {
             if at.elapsed() < self.max_age {
-                return Ok(last.clone());
+                return last.clone();
             }
         }
         self.checked = Some(Instant::now());
@@ -269,26 +272,38 @@ impl SettingsSource for StoreSettings {
         let settings = match JoinRiskSettings::try_from_vars(&vars) {
             Ok(settings) => settings,
             Err(refusal) => {
-                error!(
-                    key = refusal.key(),
-                    "join_risk_tuning_refused: present-but-unusable tuning; scoring disabled"
-                );
+                // Log the refusal at error level only on a state change
+                // (good -> refused, or a different key); a steady refused
+                // state stays cached and quiet until the max age elapses.
+                let changed =
+                    !matches!(&self.last, Some(Err(previous)) if previous.key() == refusal.key());
+                if changed {
+                    error!(
+                        key = refusal.key(),
+                        "join_risk_tuning_refused: present-but-unusable tuning; scoring disabled"
+                    );
+                } else {
+                    debug!(
+                        key = refusal.key(),
+                        "join_risk_tuning_refused: still refused; scoring disabled"
+                    );
+                }
                 // Fail closed: never fall back to stale good values or ship
                 // defaults the operator did not ask for.
-                self.last = None;
+                self.last = Some(Err(refusal));
                 return Err(refusal);
             }
         };
         match &self.last {
-            Some(previous) if previous.tuning != settings.tuning => info!(
+            Some(Ok(previous)) if previous.tuning != settings.tuning => info!(
                 from_threshold = previous.tuning.threshold(),
                 to_threshold = settings.tuning.threshold(),
                 from_window_seconds = previous.tuning.window_seconds(),
                 to_window_seconds = settings.tuning.window_seconds(),
                 "setting_changed: join-risk tuning"
             ),
-            Some(_) => {}
-            None => info!(
+            Some(Ok(_)) => {}
+            Some(Err(_)) | None => info!(
                 threshold = settings.tuning.threshold(),
                 window_seconds = settings.tuning.window_seconds(),
                 alert_target = settings
@@ -298,7 +313,7 @@ impl SettingsSource for StoreSettings {
                 "join_risk_enabled"
             ),
         }
-        self.last = Some(settings.clone());
+        self.last = Some(Ok(settings.clone()));
         Ok(settings)
     }
 }
@@ -339,11 +354,12 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         }
         // Fail closed on present-but-unusable tuning: drop the observation
         // with no scoring side effects (no row, no staff post, never a
-        // Discord message). The refusal is already logged at the source.
+        // Discord message). The refusal is already logged at the source on
+        // state changes, so the per-observation drop stays at debug.
         let settings = match self.settings.current().await {
             Ok(settings) => settings,
             Err(refusal) => {
-                error!(
+                debug!(
                     key = refusal.key(),
                     member_id = join.member_id,
                     "join_risk_tuning_refused: observation dropped; no row claimed, no post attempted"
