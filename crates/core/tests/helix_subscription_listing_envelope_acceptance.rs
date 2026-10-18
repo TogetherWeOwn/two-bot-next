@@ -336,7 +336,8 @@ async fn malformed_later_page_rejects_the_entire_listing() {
 /// closed: no panic, no partial reads, zero subscription mutations.
 #[tokio::test]
 async fn deeply_nested_listing_body_fails_closed_without_mutations() {
-    let deep_body = format!("{{\"data\": {}1{}}}", "{".repeat(300), "}".repeat(300)).into_bytes();
+    // Arrays nest without a key so depth alone triggers the parser's limit.
+    let deep_body = format!("{{\"data\": {}1{}}}", "[".repeat(300), "]".repeat(300)).into_bytes();
     let log = CallLog::default();
     let mut client = client_with(
         vec![

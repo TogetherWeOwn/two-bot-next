@@ -179,8 +179,9 @@ fn fuzz_shapes_deeply_nested_envelopes_fail_closed_or_filter() {
     );
 
     // Bytes nested past the JSON recursion limit are a malformed page, never a
-    // panic: the multi-page driver reports `BadResponse`.
-    let deep = format!("{{\"data\": {}1{}}}", "{".repeat(300), "}".repeat(300));
+    // panic: the multi-page driver reports `BadResponse`. Arrays nest without
+    // a key so depth alone triggers the parser's recursion limit.
+    let deep = format!("{{\"data\": {}1{}}}", "[".repeat(300), "]".repeat(300));
     let error = run_listing(&[deep.as_bytes()])
         .expect_err("over-nested bytes must fail as a malformed page");
     assert!(
