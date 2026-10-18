@@ -37,12 +37,14 @@ IMAGE_MAX_BYTES = 112 * MIB
 # ~2,240 bytes of bounded-vocabulary counters and pure mapping functions
 # (PR merge head 16,778,336 bytes, 1,120 over 16 MiB), main's voice
 # rename-decision logs add 3,160 bytes (merged head 16,779,256 bytes, 2,040
-# over 16 MiB), and the go-live receiver-ledger branch independently measured
-# 16,801,560 bytes (16.02 MiB) after ~450 lines of shipping ledger/receiver
-# code — all with no new dependencies; the release profile is already minimal
-# (opt-level=z, lto, strip). 17 MiB restores ~1.00 MiB
-# of headroom while keeping a working tripwire; revisit if the binary
-# approaches it.
+# over 16 MiB), the game-activity aggregate-expiry slice measured 16,782,608
+# bytes (16.01 MiB, 5,392 over) with no new dependencies (store expiry plus
+# per-guild stale listing and the retention-cadence driver), and the go-live
+# receiver-ledger branch independently measured 16,801,560 bytes (16.02 MiB)
+# after ~450 lines of shipping ledger/receiver code — all with no new
+# dependencies; the release profile is already minimal (opt-level=z, lto,
+# strip). 17 MiB restores ~1.00 MiB of headroom while keeping a working
+# tripwire; revisit if the binary approaches it.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
