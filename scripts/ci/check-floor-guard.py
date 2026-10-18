@@ -577,16 +577,31 @@ def collect(root, base, head_ref="HEAD"):
         if not change:
             continue
         old_path = next(changes)
-        if change.startswith("R"):
+        if change[:1] in ("R", "C"):
             new_path = next(changes)
             # Test-to-test moves preserve the test; moving out of test scope
-            # deletes it even when Git reports an intact R100 rename.
-            if TEST_PATH.search(old_path) and not TEST_PATH.search(new_path):
+            # deletes it even when Git reports an intact R100 rename. A rename
+            # inside tests/ to a non-runnable file type (markdown or a
+            # different suffix) also deletes the test: cargo only compiles
+            # tests/*.rs. Copies never delete: the source file remains.
+            if (
+                change[0] == "R"
+                and TEST_PATH.search(old_path)
+                and (
+                    not TEST_PATH.search(new_path)
+                    or _is_markdown(new_path)
+                    or Path(old_path).suffix != Path(new_path).suffix
+                )
+            ):
                 deleted.append(old_path)
         elif change == "D":
             deleted.append(old_path)
 
     others = _git(root, "ls-files", "--others", "--exclude-standard", "-z")
+    if others.returncode != 0:
+        raise ValueError(
+            f"git ls-files failed with exit code {others.returncode}"
+        )
     for name in others.stdout.split("\0"):
         if not name:
             continue
