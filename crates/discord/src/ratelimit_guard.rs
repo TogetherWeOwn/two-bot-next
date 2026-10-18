@@ -719,7 +719,10 @@ fn parse_retry_after_header(raw: &str) -> Option<f64> {
 /// Parse an IMF-fixdate HTTP-date (`Sun, 06 Nov 1994 08:49:37 GMT`, the form
 /// `Retry-After` may carry instead of delta-seconds) to a wall-clock time.
 /// Weekday is validated loosely (three letters) and otherwise ignored; the
-/// date fields are fully validated. Returns `None` for any other shape.
+/// date fields are fully validated. Field widths follow RFC 9110 section
+/// 5.6.7 (2DIGIT day/hour/minute/second, 4DIGIT year, ASCII digits only), so
+/// an oversized year can never reach the day-count arithmetic below.
+/// Returns `None` for any other shape.
 fn parse_http_date(raw: &str) -> Option<SystemTime> {
     let trimmed = raw.trim();
     let without_zone = trimmed.strip_suffix(" GMT")?;
@@ -728,9 +731,17 @@ fn parse_http_date(raw: &str) -> Option<SystemTime> {
         return None;
     }
     let mut parts = rest.split_whitespace();
-    let day: u32 = parts.next()?.parse().ok()?;
+    let day_raw = parts.next()?;
+    if day_raw.len() != 2 || !day_raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let day: u32 = day_raw.parse().ok()?;
     let month = month_number(parts.next()?)?;
-    let year: i64 = parts.next()?.parse().ok()?;
+    let year_raw = parts.next()?;
+    if year_raw.len() != 4 || !year_raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = year_raw.parse().ok()?;
     let time = parts.next()?;
     if parts.next().is_some() {
         return None;
@@ -739,12 +750,24 @@ fn parse_http_date(raw: &str) -> Option<SystemTime> {
         return None;
     }
     let mut clock = time.split(':');
-    let hour: i64 = clock.next()?.parse().ok()?;
-    let minute: i64 = clock.next()?.parse().ok()?;
-    let mut second: i64 = clock.next()?.parse().ok()?;
+    let hour_raw = clock.next()?;
+    let minute_raw = clock.next()?;
+    let second_raw = clock.next()?;
     if clock.next().is_some() {
         return None;
     }
+    if hour_raw.len() != 2 || minute_raw.len() != 2 || second_raw.len() != 2 {
+        return None;
+    }
+    if !hour_raw.bytes().all(|b| b.is_ascii_digit())
+        || !minute_raw.bytes().all(|b| b.is_ascii_digit())
+        || !second_raw.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let hour: i64 = hour_raw.parse().ok()?;
+    let minute: i64 = minute_raw.parse().ok()?;
+    let mut second: i64 = second_raw.parse().ok()?;
     if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
         return None;
     }
@@ -1237,6 +1260,60 @@ mod tests {
             guard.snapshot().global_pause_remaining,
             GLOBAL_PAUSE_FALLBACK_CAP
         );
+    }
+
+    #[test]
+    fn http_date_edge_cases_fall_back_without_panicking() {
+        // Structural rejects: no usable timing, so the caller falls back to
+        // the capped pause. None of these may panic, however large the year.
+        for raw in [
+            // Impossible calendar dates (rollover into March is rejected).
+            "Sat, 31 Feb 2030 00:00:00 GMT",
+            "Wed, 29 Feb 2023 00:00:00 GMT",
+            // Wrong zone suffix and non-date shapes.
+            "Sun, 01 Jan 2030 00:00:00 UTC",
+            "not-a-number-or-date",
+            "",
+            // IMF-fixdate widths (RFC 9110 section 5.6.7): 2DIGIT day/time,
+            // 4DIGIT year, ASCII digits only.
+            "Sun, 1 Jan 2030 00:00:00 GMT",
+            "Sun, 01 Jan 203 00:00:00 GMT",
+            "Sun, 01 Jan 10000 00:00:00 GMT",
+            "Sun, 01 Jan 2030 0:00:00 GMT",
+            "Sun, 01 Jan 2030 00:0:00 GMT",
+            "Sun, 01 Jan 2030 00:00:0 GMT",
+            // Oversized and extreme years must not reach the day-count math.
+            "Sun, 01 Mar 99999999999999999 00:00:00 GMT",
+            "Sun, 01 Jan -9223372036854775808 00:00:00 GMT",
+        ] {
+            assert!(
+                parse_http_date(raw).is_none(),
+                "malformed HTTP-date must carry no timing: {raw:?}"
+            );
+            // `parse_retry_after_header` runs on every response: it must also
+            // report no usable timing rather than panic or mint a pause.
+            assert!(
+                parse_retry_after_header(raw).is_none(),
+                "malformed Retry-After must fall back: {raw:?}"
+            );
+        }
+        // A past date parses structurally but carries no future wait, so the
+        // header layer still reports no usable timing (capped fallback).
+        let past = "Thu, 01 Jan 1970 00:00:00 GMT";
+        assert_eq!(
+            parse_http_date(past),
+            Some(std::time::UNIX_EPOCH),
+            "a valid past date still parses"
+        );
+        assert!(
+            parse_retry_after_header(past).is_none(),
+            "a past date must fall back to the capped pause"
+        );
+        // Leap second :60 settles on :59 instead of rejecting the date.
+        let leap = parse_http_date("Sun, 01 Jan 2030 00:00:60 GMT");
+        let settled = parse_http_date("Sun, 01 Jan 2030 00:00:59 GMT");
+        assert!(leap.is_some(), "leap second :60 must settle, not reject");
+        assert_eq!(leap, settled, ":60 must name the same instant as :59");
     }
 
     #[tokio::test(start_paused = true)]
