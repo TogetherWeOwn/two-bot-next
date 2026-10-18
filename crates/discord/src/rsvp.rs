@@ -565,7 +565,7 @@ async fn execute(
                 &resolved.canonical_id,
             ))
         }
-        _ => return Err("Invalid command payload.".to_owned()),
+        _ => Err("Invalid command payload.".to_owned()),
     }
 }
 
