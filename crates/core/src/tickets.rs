@@ -95,6 +95,8 @@ pub enum TicketError {
     InvalidTransition,
     #[error("The ticket channel is unavailable")]
     MissingChannel,
+    #[error("This ticket cannot be closed until the bot's channel history access is restored")]
+    MissingHistoryAccess,
     #[error("This ticket close was already recovered or completed")]
     StaleClose,
 }

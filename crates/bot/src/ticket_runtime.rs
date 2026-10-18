@@ -613,6 +613,19 @@ impl TicketRuntime {
     }
 
     async fn close(&self, ticket: &Ticket) -> Result<()> {
+        // Gate before any mutation: a hand-edited channel missing the bot's
+        // explicit overwrite refuses with the ticket still Open and the
+        // opener's writes untouched, instead of wedging in Closing until
+        // recovery reopens. Discord silently returns [] without
+        // READ_MESSAGE_HISTORY, so require the bot's explicit ticket
+        // overwrite before treating [] as complete.
+        let channel = ticket
+            .channel_id
+            .as_deref()
+            .ok_or(Failure::InvalidEvidence)?;
+        let doc = self.channel_document(channel).await?;
+        self.require_history_access(&doc)
+            .map_err(|_| Failure::Store(StoreError::Domain(TicketError::MissingHistoryAccess)))?;
         let ticket = self
             .store
             .begin_close(&ticket.id, now_millis_for_test())
@@ -622,12 +635,8 @@ impl TicketRuntime {
             .channel_id
             .as_deref()
             .ok_or(Failure::InvalidEvidence)?;
-        let doc = self.channel_document(channel).await?;
         self.set_writes(&doc, channel, &ticket.opener_id, false)
             .await?;
-        // Discord silently returns [] without READ_MESSAGE_HISTORY. Require
-        // the bot's explicit ticket overwrite before treating [] as complete.
-        self.require_history_access(&doc)?;
         let snapshot = self.capture_history(channel).await?;
         self.store
             .save_transcript(&ticket.id, started_at, now_millis_for_test(), snapshot)
