@@ -267,12 +267,15 @@ class RuleTests(unittest.TestCase):
             ),
             [],
         )
+        # Conditional creation proves nothing about emptiness: when the
+        # relation already exists the statement is a no-op and the table
+        # may hold production data, so the following index must flag.
         self.assertEqual(
             self.rules(
                 "CREATE TABLE IF NOT EXISTS guilds (id bigint PRIMARY KEY);\n"
                 "CREATE UNIQUE INDEX guilds_uidx ON guilds (id);\n"
             ),
-            [],
+            ["creating-index"],
         )
 
     def test_index_on_other_table_still_flags(self):
@@ -660,6 +663,30 @@ class ExitCodeTests(unittest.TestCase):
         code, out = self.run_checker("--strict")
         self.assertEqual(code, 1)
         self.assertIn("::error file=", out)
+
+    def test_strict_drop_only_passes_with_warning(self):
+        target = self.root / FIRST
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("DROP TABLE legacy_table;\n")
+        code, out = self.run_checker("--strict")
+        self.assertEqual(code, 0)
+        self.assertIn("::warning file=", out)
+        self.assertIn("[squawk:dropping-object]", out)
+        self.assertIn("(advisory)", out)
+
+    def test_strict_drop_and_blocking_finding_fails(self):
+        target = self.root / FIRST
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "DROP TABLE legacy_table;\n"
+            "CREATE INDEX bad_idx ON guilds (name);\n"
+        )
+        code, out = self.run_checker("--strict")
+        self.assertEqual(code, 1)
+        self.assertIn("::warning file=", out)
+        self.assertIn("[squawk:dropping-object]", out)
+        self.assertIn("::error file=", out)
+        self.assertIn("[squawk:creating-index]", out)
 
     def test_clean_tree_passes_in_both_modes(self):
         target = self.root / FIRST

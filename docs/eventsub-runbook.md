@@ -61,7 +61,7 @@ listener and the internal-actions receiver:
   Source: `wrangler/src/index.ts:582-597`.
 - Binding completes before any gateway or job task starts. A bind failure logs
   `eventsub startup refused` and exits the process.
-  Source: `crates/bot/src/eventsub_http.rs:57-70`, `crates/bot/src/main.rs:337-348`.
+  Source: `crates/bot/src/eventsub_http.rs:58-71`, `crates/bot/src/main.rs:337-348`.
 
 ## Secret provisioning and rotation
 
@@ -85,34 +85,176 @@ Rules for the signing secret:
 - The handler never re-reads the environment: the secret is cloned into
   receiver state at bind time. A new value takes effect on container restart,
   not on secret edit alone.
-  Source: `crates/bot/src/eventsub_http.rs:46-55`.
+  Source: `crates/bot/src/eventsub_http.rs:47-56`.
 - Logs carry only scalar `event` / `status` / `error_class`. Header values,
   the challenge, body bytes, and query strings are never logged.
   Source: `crates/bot/src/eventsub_http.rs:1-11`,
-  `crates/bot/src/eventsub_http.rs:117-132`.
+  `crates/bot/src/eventsub_http.rs:122-148`.
 
 Rotation procedure (needs its own authorization; this runbook does not grant
 it): Twitch fixes the transport secret at subscription creation and offers
 no update, and `reconcile()` keeps any healthy subscription on our callback
 without comparing secrets, so a new secret alone orphans the old
-subscription. Generate a fresh value meeting the constraint above, set the
-Worker secret `TWO_TWITCH_WEBHOOK_SECRET`, redeploy that Worker version and
+subscription. Generate a fresh value meeting the constraint above, stage it with
+`wrangler versions secret put --env staging TWO_TWITCH_WEBHOOK_SECRET --message <sha>`
+(stamped with the live `/readyz` `build_revision` of staging, after the
+newest-equals-serving precheck in `docs/production-deploy.md`; a plain `wrangler
+secret put` publishes an unstamped version that can never form a rollback receipt),
+redeploy that Worker version and
 transfer ownership per the enable order above, then restart the container.
-Then delete each `stream.online` v1 subscription on our callback (Helix
-DELETE, `delete_subscription_url`) and recreate it with the new secret
-(delete first: a duplicate create answers `409`). The two sides must agree:
-while they differ, every delivery fails closed with `401 unauthorized` (see
-the matrix below). Confirm agreement by watching for `notification
-acknowledged` or `challenge answered` lines after the recreate, not by
-printing either value. Never use a test fixture as a runtime credential. No
-runtime reconciler is wired yet: nothing calls `reconcile()` /
-`plan_boot_actions()` at boot or after a revocation, so the
-delete-and-recreate step is manual.
-Source: `crates/core/src/twitch_eventsub.rs:526-529` (duplicate create answers
-`409`), `:543-547` (healthy subscriptions on our callback are kept without
-comparing secrets), `:467-472` (`ExistingSubscription` carries no secret),
-`wrangler/src/index.ts:535-537,594`, `crates/core/src/twitch_helix.rs:365,591`,
-`crates/bot/src/main.rs` (wires only `eventsub_http`).
+Restarting first is deliberate: the running container must already carry
+the new secret before any subscription is deleted, so no scheduled pass
+can re-create a deleted subscription with the old secret. The cost is a
+401 window (below) for not-yet-deleted subscriptions signed with the old
+secret, so delete promptly after the restart. The delete step stays
+manual, the recreate does not: delete each `stream.online` v1
+subscription on our callback (Helix DELETE, `delete_subscription_url`),
+then let the reconciler (next section) create the missing subscriptions
+with the new secret on its next pass — restart the container again to run
+the startup pass promptly instead of waiting for the next scheduled pass.
+Do not hand-create a duplicate first: Twitch answers `409`, and the plan
+already orders deletes before creates. The two sides must
+agree: while they differ, every delivery fails closed with `401
+unauthorized` (see the matrix below). Confirm agreement by watching for
+`notification acknowledged` or `challenge answered` lines after the
+reconciler's recreated subscription verifies, not by printing either value.
+Never use a test fixture as a runtime credential.
+Source: `crates/core/src/twitch_eventsub.rs:542-545` (deletes first; a
+duplicate create answers `409`), `:559-563` (healthy wanted subscriptions
+on our callback are kept without comparing secrets), `:481-488`
+(`ExistingSubscription` carries no secret),
+`crates/core/src/twitch_helix.rs:591-593` (a `409` create counts as
+`AlreadyExists` only after a follow-up listing confirms a healthy
+subscription on our callback).
+
+## Subscription reconciler
+
+The reconciler is wired into bot startup. While `TWO_EVENTSUB` is exactly
+`"1"` it runs one pass at startup, then sleeps
+`RECONCILE_INTERVAL_SECS = 3_600` after each pass completes before the
+next one, until shutdown — so the gap between passes is the pass duration
+plus one hour, and no one-hour recovery bound is promised. A failed pass
+is logged and the loop still runs the next tick, so a reconcile failure
+never exits the process (unlike an enabled-but-invalid receiver bind, above). Dark
+spawns no task and logs one parked line (below).
+Source: `crates/bot/src/main.rs:399-403`,
+`crates/bot/src/eventsub_reconcile.rs:40-42,390-444`.
+
+Each pass, from the process environment:
+
+1. Refuse without any Helix call when the configuration is incomplete:
+   `TWO_TWITCH_CALLBACK_URL` must be present and a plain `https` callback
+   with no port, query, or fragment, and the Operator Twitch client id,
+   client secret, and webhook secret must load. Any refusal logs
+   `error_class="reconcile_config_invalid"` and mutates nothing. The Worker
+   forwards the callback, the broadcaster allowlist, and the Helix
+   credentials to the container only on explicit lines while the receiver
+   is forwarded, and only when each value is present, so a
+   half-provisioned enable fails loudly here instead of running dark.
+   Source: `crates/bot/src/eventsub_reconcile.rs:88-104,331-374`,
+   `wrangler/src/index.ts:660-680`.
+2. Park without mutations when `TWO_TWITCH_BROADCASTERS` (comma-separated
+   `broadcaster_user_id` allowlist, trimmed, sorted, deduplicated) is empty:
+   `error_class="reconcile_no_broadcasters"`.
+   Source: `crates/bot/src/eventsub_reconcile.rs:74-86,343-350`.
+3. List existing subscriptions, plan with `plan_boot_actions` /
+   `reconcile()` (deletes before creates, **our callback only**: unwanted,
+   duplicate, and non-healthy subscriptions on our callback are deleted;
+   healthy wanted ones are kept), then — once the plan is built — run it
+   one action at a time so one rejected action cannot starve the rest, and
+   confirm with a follow-up listing that every desired broadcaster holds
+   a healthy (`enabled` or
+   `webhook_callback_verification_pending`) subscription on our callback.
+   Source: `crates/bot/src/eventsub_reconcile.rs:201-315`,
+   `crates/core/src/twitch_eventsub.rs:542-581`,
+   `crates/core/src/twitch_helix.rs:233-243`.
+
+Health signal is the container log, scalar fields only
+(`event="eventsub_reconcile"`). Terminal line per pass:
+
+- `status="healthy"` — `eventsub subscriptions reconciled` (info, with
+  `broadcasters` / `deleted` / `created` / `already_exists` /
+  `prior_failed` counts): converged.
+- `status="pending"` — `eventsub subscriptions re-created but none verified
+  yet` (warn, `reconcile_pending`): every desired subscription exists but
+  none is `enabled` yet; the callback has not completed verification.
+- `error_class="reconcile_unhealthy"` then the wrapping
+  `error_class="reconcile_failed"` (error): the plan ran but an action
+  failed or a desired broadcaster still lacks a healthy subscription
+  (`failed` / `missing` counts). The pair is one failed pass, not two.
+- `error_class="reconcile_failed"` on its own (error, `error` field): the
+  pass errored at the first listing, at the plan, or at the follow-up
+  listing, so no `reconcile_unhealthy` or `reconcile_action_failed` line
+  follows. At the listing or plan stage nothing was mutated; at the
+  follow-up listing the plan may already have run but convergence is
+  unconfirmed. Read the remediation off the `error` field: an invalid
+  broadcaster id (not 1-32 digits) or more than 100 allowlist entries
+  fails the plan before any action and blocks **every** broadcaster on
+  every pass until the allowlist format is fixed; a token-endpoint
+  rejection points at the client id/secret provisioning.
+  Source: `crates/bot/src/eventsub_reconcile.rs:253,264,266,378-386`,
+  `crates/core/src/twitch_eventsub.rs:551-556`,
+  `crates/core/src/stream_funnel.rs:76-77`.
+- `error_class="reconcile_config_invalid"` or
+  `error_class="reconcile_no_broadcasters"`: refused or parked before any
+  mutation, per steps 1-2.
+- `status="parked"`, `reason="flag_dark"` (info, once at spawn time):
+  `TWO_EVENTSUB` is not exactly `1`; no pass ran.
+
+Detail lines inside a pass: `reconcile_prior_failed` (pre-pass
+subscriptions on our callback already in `webhook_callback_verification_failed`,
+`notification_failures_exceeded`, or `authorization_revoked`; this pass
+deletes them and re-creates the ones still wanted) and `reconcile_action_failed` (one `delete` or
+`create` rejected; the rest of the plan and the follow-up listing still
+ran). Source: `crates/bot/src/eventsub_reconcile.rs:106-122,224-315,378-387`;
+the same lines are catalogued in
+[the observability event catalog](observability-event-catalog.md), and
+[the subscription health queries](eventsub-subscription-health-queries.md)
+give the staging log-read procedure (Q2), including which fields the read
+script drops and the dashboard keeps.
+
+Operator verification and remediation (staging only; never run a test
+against production Twitch, and never print a secret value to check one):
+
+- Verify a pass by its terminal log line, not by calling Helix by hand.
+  No terminal line for the startup pass, or none for well over one
+  interval (plus pass time) after the previous one, means check, in order:
+  the flag (parked?), the refusal lines (config invalid or empty
+  allowlist?), and only then container liveness.
+- `reconcile_config_invalid`: compare binding and flag **names** — callback
+  shape, client id/secret, webhook secret — fix the provisioning, redeploy
+  and restart per the enable order; the next pass retries with the new
+  environment. Do not substitute another credential to make the error go
+  away.
+- `reconcile_no_broadcasters`: provision `TWO_TWITCH_BROADCASTERS` and
+  redeploy/restart; until then the reconciler correctly mutates nothing.
+- Repeated `reconcile_prior_failed` or a stuck `pending`: the callback is
+  not verifying. Work the challenge checklist below (route gate, bind,
+  secret agreement, callback URL shape). The reconciler already deletes and
+  re-creates failed subscriptions every pass; manually looping deletes
+  adds nothing.
+- `reconcile_action_failed` / `reconcile_unhealthy`: read the `action` and
+  `error` fields (dashboard; the log-read script drops them). A
+  well-formed numeric broadcaster id that Twitch rejects with 400 during a
+  create is fixed in the allowlist, not at Twitch; transient 429/5xx
+  answers are retried by the next pass, and later broadcasters in the same
+  pass were not starved. That no-starvation note covers rejected actions
+  only — a malformed allowlist entry never reaches an action (see the lone
+  `reconcile_failed` above).
+- Lone `reconcile_failed`: read its `error` field first. An invalid
+  broadcaster id or a more-than-100-entry allowlist means fix the
+  `TWO_TWITCH_BROADCASTERS` format and redeploy/restart — no broadcaster
+  is reconciled until then. A token-endpoint or listing rejection means
+  check the client id/secret provisioning (names, never values); do not
+  substitute another credential.
+- A `revocation` delivery is acknowledged by the receiver and healed by
+  the next scheduled pass (the revoked entry is absent or
+  `authorization_revoked`), not by an immediate revocation-triggered
+  pass. Because the interval is counted from the previous pass's
+  completion, the wait can exceed one hour — restart the container to run
+  the startup pass sooner.
+  Source: `crates/bot/src/eventsub_reconcile.rs:400-425`,
+  `docs/stream-funnel.md:106-108`.
 
 ## Challenge verification
 
@@ -138,13 +280,13 @@ Classification after verification:
   on a `stream.online` v1 subscription is echoed as the `200 text/plain`
   body with `Cache-Control: no-store`.
   Source: `crates/core/src/twitch_eventsub.rs:245-272`,
-  `crates/bot/src/eventsub_http.rs:270-286`.
+  `crates/bot/src/eventsub_http.rs:350-366`.
 - Only `stream.online` version `1` is accepted; any other subscription type
   or version is a deterministic `WrongSubscription` error.
   Source: `crates/core/src/twitch_eventsub.rs:225-231`.
 - An empty, oversized, or non-graphic challenge is `InvalidChallenge` and
   answers `400 malformed`, never an echo.
-  Source: `crates/bot/src/eventsub_http.rs:326-328`.
+  Source: `crates/bot/src/eventsub_http.rs:412-425`.
 
 If the challenge echo never arrives at Twitch, check in order: the Worker
 route gate (both flags `1`?), the container bind (did startup refuse?), the
@@ -153,7 +295,7 @@ the subscription creation (the challenge was not echoed — delete and
 recreate the subscription, see below), and only then the callback URL shape
 (plain `https`, no port, query, fragment, or userinfo; canonical form).
 Source: `crates/core/src/twitch_eventsub.rs:400-431`,
-`crates/bot/src/eventsub_http.rs:318-325`.
+`crates/bot/src/eventsub_http.rs:403-411`.
 
 ## Refusal matrix
 
@@ -163,9 +305,13 @@ and log one scalar warn line (`event="eventsub_receiver"`, `status`,
 `error_class`). Worker-ingress refusals use the same envelope except the
 404 below, which is plain-text `not found`, and log
 `event="eventsub_ingress"`. Retryable refusals are the container
-timeout/busy rows plus the Worker 429 / 504 / 503 rows; this slice has no
-send and no durable ledger, so a verified delivery retries only on a
-pathological scheduling stall, and the retry re-acks with no side effects.
+timeout/busy rows, the Worker 429 / 504 / 503 rows, and the container's
+unknown/future classification fallback (503 `unavailable`). Boot injects no
+go-live delivery dependencies yet, so ordinary verified deliveries have no
+side effects before acknowledgement; once provisioning injects them, a
+transient ledger/send failure on a verified notification also answers the
+retryable 503 `unavailable`, and the durable claim fences keep that
+redelivery from double-posting.
 Container non-POST answers also carry an `Allow: POST` header.
 Source: `wrangler/src/eventsub.ts:101-125`, `crates/bot/src/eventsub_http.rs`.
 
@@ -187,24 +333,31 @@ direct `containerFetch`, because the Worker answers those shapes first):
 
 | Status | Code | Retryable | Meaning / first action |
 |---|---|---|---|
-| 400 | `malformed` | false | Query string present, empty body, or invalid challenge on a direct fetch. The query gate runs before verification. Check the forwarded request shape, not the secret. Source: `crates/bot/src/eventsub_http.rs:180-182,251-253,326-328`. |
-| 401 | `unauthorized` | false | Signature, freshness, or timestamp failure, or (on a direct fetch) missing/malformed delivery headers. Via the Worker, a malformed header shape is 400 at ingress (row above); first action is still secret agreement and clock skew (10-minute window). Source: `crates/bot/src/eventsub_http.rs:223-227,255-268`. |
-| 404 | `not_found` | false | Wrong path (exact path is `/hooks/twitch`) or any non-callback route via the fallback on a direct fetch. Via the public URL the Worker already answered non-POSTs and bad shapes with its own 404. Source: `crates/bot/src/eventsub_http.rs:35,138-146,176-179`. |
-| 405 | `method_not_allowed` | false | Anything but POST on the callback path on a direct fetch. Via the public URL the Worker drops non-POSTs with its own 404 before the container. Source: `crates/bot/src/eventsub_http.rs:183-195`. |
-| 408 | `request_timeout` | true | Body slower than the 5 s read budget while holding one of the 32 permits. Retriable: the sender (Twitch) backs off and redelivers. Source: `crates/bot/src/eventsub_http.rs:38,241-250`. |
-| 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:36,230-240,258-265`, `crates/core/src/twitch_eventsub.rs:49-51`. |
-| 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:198-214`. |
-| 503 | `busy` / `upstream_timeout` | true | All 32 permits held (`busy`), or the whole request past the 20 s budget (`upstream_timeout`). Both mean the receiver is saturated or stalled, not that the delivery was bad; the sender retries. Check container saturation, not the secret. Source: `crates/bot/src/eventsub_http.rs:37-39,150-171`. |
+| 400 | `malformed` | false | Query string present, empty body, or invalid challenge on a direct fetch. The query gate runs before verification. Check the forwarded request shape, not the secret. Source: `crates/bot/src/eventsub_http.rs:223-232,313-322,412-425`. |
+| 401 | `unauthorized` | false | Signature, freshness, or timestamp failure, or (on a direct fetch) missing/malformed delivery headers. Via the Worker, a malformed header shape is 400 at ingress (row above); first action is still secret agreement and clock skew (10-minute window). Source: `crates/bot/src/eventsub_http.rs:269-287,325-347`. |
+| 404 | `not_found` | false | Wrong path (exact path is `/hooks/twitch`) or any non-callback route via the fallback on a direct fetch. Via the public URL the Worker already answered non-POSTs and bad shapes with its own 404. Source: `crates/bot/src/eventsub_http.rs:35-36,88-89,154-165,213-222`. |
+| 405 | `method_not_allowed` | false | Anything but POST on the callback path on a direct fetch. Via the public URL the Worker drops non-POSTs with its own 404 before the container. Source: `crates/bot/src/eventsub_http.rs:233-246`. |
+| 408 | `request_timeout` | true | Body slower than the 5 s read budget while holding one of the 32 permits. Retriable: the sender (Twitch) backs off and redelivers. Source: `crates/bot/src/eventsub_http.rs:38-40,290-312`. |
+| 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:37,290-301`, `crates/core/src/twitch_eventsub.rs:49-51`. |
+| 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:247-266`. |
+| 503 | `busy` / `upstream_timeout` | true | All 32 permits held (`busy`), or the whole request past the 20 s budget (`upstream_timeout`). Both mean the receiver is saturated or stalled, not that the delivery was bad; the sender retries. Check container saturation, not the secret. Source: `crates/bot/src/eventsub_http.rs:38-40,167-199`. |
+| 503 | `unavailable` | true | A future/unrecognized post-verification classification error; the receiver fails closed so Twitch retries and counts it as metric `kind="other"`. This is distinct from Worker-ingress `unavailable` above. Inspect the `eventsub delivery refused` warning and the `two_bot_eventsub_classified_total{kind="other"}` counter; the refusal log uses the bounded error class `unavailable`, so it does not identify a specific future variant. Do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs:426-439`. |
 
 Verified deliveries that need no operator action answer `200`:
 
-- `notification` and `revocation`: acknowledged as `200 {"ok": true}`. This
-  slice has no send and no ledger, so the receiver only acks; the Helix
-  slice plans the reconcile list but nothing calls it at runtime yet, so any
-  re-subscription after a revocation is manual.
-- Unknown message types, and deterministic classification errors on
+- `notification` and `revocation`: acknowledged as `200 {"ok": true}`.
+  Until delivery provisioning lands the receiver only acks a notification;
+  afterwards a 200 also covers a posted or deduplicated go-live. The
+  reconciler (above) re-creates a revoked subscription on its next
+  scheduled pass when the broadcaster is still in the allowlist, so
+  re-subscription after a revocation is automatic, not manual and not
+  immediate — and not bounded by one hour (see above).
+- Unknown message types, and known deterministic classification errors on
   non-verification messages (`WrongSubscription`, `InvalidBody`):
   acknowledged with 2xx so Twitch does not retry what will never succeed.
+  Unknown/future `classify()` errors are not included: they return retryable
+  503 `unavailable` and count as metric `kind="other"` so an unrecognized
+  failure is not silently discarded or conflated with known ignored deliveries.
   This carve-out excludes `webhook_callback_verification`: `classify()`
   returns `WrongSubscription` / `InvalidBody` for a challenge with the wrong
   type or version, or an unparsable signed body, and the handler still acks
@@ -213,24 +366,29 @@ Verified deliveries that need no operator action answer `200`:
   delivery ignored` immediately after a subscription creation means the
   challenge was not echoed: delete and recreate the subscription.
 
-Source: `crates/bot/src/eventsub_http.rs:287-325`.
+Source: `crates/bot/src/eventsub_http.rs:350-411`.
 
 Log lines to expect (scalar fields only):
 
 - `eventsub delivery refused` (warn: `status`, `error_class`)
 - `challenge answered`, `notification acknowledged`, `revocation acknowledged`,
   `delivery ignored` (info: `status = 200`)
+- `eventsub delivery refused` (warn: `status`, bounded `error_class`); for
+  unknown/future classification errors expect `status = 503` and
+  `error_class = "unavailable"`, plus the `kind="other"` metric increment
 
-Source: `crates/bot/src/eventsub_http.rs:117-136,270-325`.
+Source: `crates/bot/src/eventsub_http.rs:131-148,324-439`.
 
 ## Dark-unless-enabled behavior
 
 Dark is the normal state, not an outage:
 
 - `TWO_EVENTSUB` unset or `"0"`: no listener, no bind attempt, no secret
-  read. Health and readiness are unchanged.
+  read, and no reconcile task — the reconciler logs one parked line
+  (`status="parked"`, `reason="flag_dark"`) and spawns nothing. Health and
+  readiness are unchanged.
   Source: `crates/core/src/eventsub_receiver_config.rs:32-51`,
-  `crates/bot/src/main.rs:337-348`.
+  `crates/bot/src/eventsub_reconcile.rs:427-444`.
 - Worker route without both flags: the path keeps today's behavior (404) and
   the container is never contacted.
   Source: `wrangler/src/eventsub.ts:63-69`.

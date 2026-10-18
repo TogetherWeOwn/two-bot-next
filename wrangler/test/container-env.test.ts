@@ -104,6 +104,18 @@ test("unlisted names, secrets and non-string values are dropped", () => {
   assert.deepEqual(forwardedFlagVars(env), { TWO_ANNOUNCEMENTS: "1" });
 });
 
+test("hostile settings-map typo keys stay test-only and never reach the Container", () => {
+  const env = {
+    TWO_ASSISTANT_ENDPOINTS: "https://fixture.invalid/not-a-runtime-endpoint",
+    TWO_OWEN_USER_IDS: "123456789012345678",
+  };
+  for (const name of Object.keys(env)) {
+    assert.match(NOT_FORWARDED[name] ?? "", /test-only/, name);
+  }
+  assert.deepEqual(forwardedFlagVars(env), {});
+  assert.deepEqual(containerEnv(env), { LISTEN_ADDR: "0.0.0.0:8080" });
+});
+
 test("the existing 4 Container vars are unchanged and cannot be overridden", () => {
   const base = {
     DISCORD_TOKEN: "synthetic-discord-token",
@@ -124,6 +136,79 @@ test("the existing 4 Container vars are unchanged and cannot be overridden", () 
   );
   for (const name of BASE_VARS) {
     assert.ok(!(FORWARDED_FLAGS as readonly string[]).includes(name), name);
+  }
+});
+
+test("gateway readiness failure injection forwards only under the staging marker", () => {
+  const key = "TWO_GATEWAY_READINESS_FAIL_INJECTION";
+  // The switch is never on the generic flag allowlist.
+  assert.equal(forwardedFlagVars({ [key]: "1", TWO_DEPLOY_ENV: "staging" })[key], undefined);
+  // Production shape: no marker (or a non-staging one) forwards nothing,
+  // even with the switch set on the Worker.
+  for (const env of [
+    { [key]: "1" },
+    { [key]: "1", TWO_DEPLOY_ENV: "production" },
+    { [key]: "1", TWO_DEPLOY_ENV: "staging " },
+    { [key]: "true", TWO_DEPLOY_ENV: "staging" },
+    { [key]: "0", TWO_DEPLOY_ENV: "staging" },
+    { TWO_DEPLOY_ENV: "staging" },
+  ]) {
+    assert.equal(containerEnv(env)[key], undefined, JSON.stringify(env));
+  }
+  // The one armed shape: staging marker + exact "1" (marker forwarded too,
+  // so the Rust fence can repeat the check in the Container).
+  const armed = containerEnv({ [key]: "1", TWO_DEPLOY_ENV: "staging" });
+  assert.equal(armed[key], "1");
+  assert.equal(armed["TWO_DEPLOY_ENV"], "staging");
+});
+
+test("remediation-drill switches never reach the Container: Worker-only trigger input", () => {
+  for (const key of ["TWO_VOICE_STALL_FAULT_INJECTION", "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"]) {
+    // Never on the generic flag allowlist, even armed.
+    assert.equal(forwardedFlagVars({ [key]: "1", TWO_DEPLOY_ENV: "staging" })[key], undefined, key);
+    // No Worker shape forwards them: the fault injector reads them in the
+    // keepalive tick, so the Container must never see them.
+    for (const env of [
+      { [key]: "1" },
+      { [key]: "1", TWO_DEPLOY_ENV: "staging" },
+      { [key]: "1", TWO_DEPLOY_ENV: "production" },
+    ]) {
+      assert.equal(containerEnv(env)[key], undefined, `${key} ${JSON.stringify(env)}`);
+    }
+  }
+});
+
+test("eventsub reconcile inputs and Helix credentials reach the Container on explicit lines while forwarded", () => {
+  const env = {
+    TWO_EVENTSUB: "1",
+    TWO_TWITCH_WEBHOOK_SECRET: "fixture",
+    TWO_TWITCH_CALLBACK_URL: "https://hooks.example.com/twitch",
+    TWO_TWITCH_BROADCASTERS: "111,222",
+    TWO_TWITCH_CLIENT_ID: "synthetic-operator-client-id-01",
+    TWO_TWITCH_CLIENT_SECRET: ["synthetic", "operator", "client", "secret", "01"].join("-"),
+  };
+  const forwarded = containerEnv(env);
+  for (const name of [
+    "TWO_EVENTSUB",
+    "TWO_TWITCH_WEBHOOK_SECRET",
+    "TWO_TWITCH_CALLBACK_URL",
+    "TWO_TWITCH_BROADCASTERS",
+    "TWO_TWITCH_CLIENT_ID",
+    "TWO_TWITCH_CLIENT_SECRET",
+  ] as const) {
+    assert.equal(forwarded[name], env[name], name);
+  }
+  // Dark without the signing secret: none of the six travel.
+  const dark = containerEnv({ TWO_EVENTSUB: "1" });
+  for (const name of [
+    "TWO_EVENTSUB",
+    "TWO_TWITCH_WEBHOOK_SECRET",
+    "TWO_TWITCH_CALLBACK_URL",
+    "TWO_TWITCH_BROADCASTERS",
+    "TWO_TWITCH_CLIENT_ID",
+    "TWO_TWITCH_CLIENT_SECRET",
+  ]) {
+    assert.equal(dark[name], undefined, name);
   }
 });
 

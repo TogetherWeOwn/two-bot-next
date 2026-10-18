@@ -1,28 +1,62 @@
 # Distroless runtime evaluation ([TOG-12144](/TOG/issues/TOG-12144), follow-up of [TOG-10893](/TOG/issues/TOG-10893))
 
-Trial only. The default image is unchanged (`Dockerfile` still builds
-`debian:bookworm-slim`); switching it is a separate CEO-gated decision.
-The trial variant is `Dockerfile.distroless`: identical to the CI-proven
-runtime from commit `5957e929` ([TOG-10893](/TOG/issues/TOG-10893) SBOM branch)
-except for its header comment. No `wrangler/` or workflow files were touched.
+Historical evaluation. The cutover has adopted the digest-pinned distroless
+runtime as the default image in `Dockerfile`. This document preserves the
+original measurements and compatibility findings; the former trial image
+(`Dockerfile.distroless`, retired in #1007) is not a separate build path.
+The switch did not touch files under `wrangler/`.
+
+Staging TLS-handshake receipt: deploy-staging run `38773972225` verified the
+distroless head `46a30b19e` with `/health` 200 and `/readyz` 200 (all
+components ready, gateway included) plus a green voice-synthetic pass — the
+`rustls-platform-verifier` system-bundle path completes live Discord TLS.
+Rollback requires a coordinated change, not a one-file restore: use a matched,
+pinned bookworm builder and runtime in `Dockerfile` and update the
+distroless-bound gates in the same PR: `dockerfile_parity_errors` in
+`scripts/ci/test_toolchain_parity.py` for the builder pin,
+`scripts/test-supply-chain.py` for the base-image pins and the runtime
+assertions (no RUN, no apt-get/useradd//var/lib/dpkg, USER 65532),
+`scripts/runtime-image-evidence.py` for the status.d layout (it rejects
+var/lib/dpkg/status), and `scripts/vulnerability-preflight.py` for DISTRO. A
+Bookworm rollback also requires a fresh CISO vulnerability disposition for the
+measured HIGH/CRITICAL tuples: the prior 17-tuple decision expired on
+2026-10-08 and does not carry over. Do not restore exceptions or add
+`.trivyignore.yaml` entries until that disposition is recorded; then encode
+only its approved, scoped, expiring exceptions there. In the same PR, update
+both empty-file pins in `scripts/test-supply-chain.py`: the regex asserting
+`vulnerabilities: []` and the active-content equality assertion. Replace them
+with the approved entries and their reviewed evidence. Keep
+`scripts/vulnerability-preflight.py` as a non-accepting tuple/provenance check:
+it must bind the scan to the Bookworm distro and continue to report findings
+as `not-accepted`; do not add exception-acceptance logic to the preflight.
+Without a current disposition, keep the SBOM gate red and fix findings by
+updating the base digest. Keep the Rust version aligned with
+`rust-toolchain.toml`; do not mix trixie-built binaries with bookworm runtime
+libraries. Require the parity guard, the sbom supply-chain lane, image
+build/smoke, staging handshake, and the current CISO disposition for any
+accepted tuples to pass before calling the rollback complete. SBOMs regenerate
+per head through the supply-chain lane.
 
 ## Verdict
 
-Recommend adopting `gcr.io/distroless/cc-debian13:nonroot` (digest-pinned,
-trixie builder) as the default runtime through a separate CEO-gated cutover
-card — not this one — after the preconditions below. Do not use the `static`
-variant; do not deploy a `debug-nonroot` variant.
+The default runtime is `gcr.io/distroless/cc-debian13:nonroot` (digest-pinned,
+trixie builder). Do not use the `static` variant or deploy a `debug-nonroot`
+variant. Per-precondition status: TLS handshake met per the cutover note above
+(deploy-staging run `38773972225`); backup/guild-config upload-hook path still
+open (needs sidecar/static upload binaries or host-side upload per
+`docs/backup.md`; not proven on the distroless image); CISO acknowledgement of
+the 14-package inventory and pin-refresh runbook still open (no receipt linked).
 
 ## Compatibility
 
 - **CA certs:** the base ships Debian trust data (`ca-certificates`) at
   `/etc/ssl/certs/ca-certificates.crt`; nothing is installed or copied in
   except the release binary. Smoke verified the bundle is present and
-  PEM-readable (docker-cp archive inspection of the built image). Caveat:
-  smoke checks readability only, not a live TLS handshake — the
-  `rustls-platform-verifier` path (`crates/discord/src/executor.rs`,
-  `try_with_platform_verifier`) relies on the system bundle, so run a live
-  Discord TLS handshake on staging before cutover.
+  PEM-readable (docker-cp archive inspection of the built image). The live
+  TLS handshake closed the remaining caveat: the `rustls-platform-verifier`
+  path (`crates/discord/src/executor.rs`, `try_with_platform_verifier`)
+  relies on the system bundle, and the staging receipt in the cutover note
+  above proves it handshakes live Discord TLS on this base.
 - **User:** base `nonroot` uid/gid 65532, workdir `/home/nonroot`,
   `COPY --chown=65532:65532`. CI verified PID 1 runs with non-zero
   real/effective/saved/filesystem uids (`docker top`).
@@ -47,7 +81,7 @@ variant; do not deploy a `debug-nonroot` variant.
 
 | Image | Run / head | Size | Binary |
 |---|---|---|---|
-| `debian:bookworm-slim` (current default, main) | [36951099822](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36951099822) / `1c6481b6` (`sha256:715f…`) | 96,108,544 B (91.66 MiB) | 10,517,528 B (10.03 MiB) |
+| `debian:bookworm-slim` (historical default on main at the time) | [36951099822](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36951099822) / `1c6481b6` (`sha256:715f…`) | 96,108,544 B (91.66 MiB) | 10,517,528 B (10.03 MiB) |
 | `cc-debian13:nonroot` (trial) | [36948616604](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36948616604) job attempt 2 / `9cc4815b` (`sha256:2bc5…`) | 42,807,296 B (40.82 MiB) | 10,518,416 B (10.03 MiB) |
 | **Delta** | | **−53,301,248 B (−50.84 MiB, −55.5 %)** | +888 B (noise; same opt-z/LTO/strip profile) |
 
@@ -57,7 +91,7 @@ Both images fit the smoke budgets (112 MiB image, 11 MiB binary).
 
 | Image | Finding |
 |---|---|
-| `debian:bookworm-slim` | 52 HIGH/CRITICAL (16 under CISO conditional acceptance expiring 2026-10-08, 36 unaccepted; gate red) — run `36942267564` (scan job failed, suppression 0) |
+| `debian:bookworm-slim` | 52 HIGH/CRITICAL (16 conditional tuples from the original 17-tuple CISO disposition; one CVE-2026-78408 mount tuple was later retired by removal; the remaining conditions expired 2026-10-08; 36 unaccepted; gate red) — run `36942267564` (scan job failed, suppression 0) |
 | `debian:trixie-slim` Step A | left HIGH/CRITICAL rows with no CISO disposition, superseded by the pre-approved Step B ([TOG-11974](/TOG/issues/TOG-11974) CEO decision) — exact counts not re-verified from reachable logs for this card |
 | `cc-debian13:nonroot` trial | **0 HIGH/CRITICAL** in both Rust-workspace and image gates; 14 deb packages; preflight bound with 0 suppressed — run `36948616604` |
 
@@ -72,21 +106,25 @@ hyper/tokio). The `static` variant ships no libc — it would require retargetin
 to musl, out of scope. `cc` provides exactly the needed userspace and nothing
 else (14 packages, no shell or package manager).
 
-## Cutover preconditions (for the separate CEO-gated card)
+## Cutover preconditions — status at closeout
 
-1. Staging E2E: live Discord TLS handshake plus backup/guild-config upload-hook
-   path on the distroless image.
-2. CISO acknowledgement of the 14-package inventory and pin-refresh runbook.
-3. Keep the shell-free smoke probes (`docker cp`, `docker top`, binary
+1. [MET] Staging E2E TLS handshake on the distroless image (deploy-staging run
+   `38773972225` in the cutover note above).
+   [OPEN] Backup/guild-config upload-hook path on the distroless image —
+   needs sidecar/static upload binaries or host-side upload (see
+   `docs/backup.md`); not proven here.
+2. [OPEN] CISO acknowledgement of the 14-package inventory and pin-refresh
+   runbook — no receipt linked.
+3. [KEPT] Keep the shell-free smoke probes (`docker cp`, `docker top`, binary
    `--healthcheck`); never ship `debug-nonroot`.
 
 ## Runtime profile: cold start, RSS and readiness timings
 
-Trial-image profiling for the cutover guard. The default `Dockerfile` now builds
-the same pinned `cc-debian13:nonroot` base digest as this trial variant — only
-build-provenance labels differ, and labels do not execute — so this profile
-covers both images. No guard logic changes here; thresholds stay where the
-cutover guard reads them in the
+Historical trial-image profiling for the cutover guard. The default
+`Dockerfile` builds the pinned `cc-debian13:nonroot` base digest; current
+build-provenance arguments and labels do not alter the runtime. This profile
+remains historical evidence. No guard logic changes here; thresholds stay
+where the cutover guard reads them in the
 [production signal thresholds](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers).
 
 ### Repeatable procedure
@@ -96,7 +134,7 @@ controller. No secrets, database or Discord traffic are used at any step.
 
 ```sh
 docker buildx build --load --platform linux/amd64 \
-  -t two-bot:distroless-profile -f Dockerfile.distroless .
+  -t two-bot:distroless-profile -f Dockerfile .
 python3 scripts/container-smoke.py two-bot:distroless-profile
 ```
 
@@ -145,5 +183,6 @@ against the B1 floor for separate placement review (not B2 pass/fail), and the
 image/binary size ceilings. The cutover guard keeps reading those values; this
 section is the distroless evidence behind them.
 
-Not claimed here: a live Discord TLS handshake, backup/guild-config upload-hook
-paths, or loaded-guild RSS — those stay on the cutover preconditions above.
+Not claimed here: backup/guild-config upload-hook paths or loaded-guild RSS —
+those stay on the cutover preconditions above. The live Discord TLS handshake
+is claimed in the cutover note above (deploy-staging run `38773972225`).

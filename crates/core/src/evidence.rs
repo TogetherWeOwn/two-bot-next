@@ -27,6 +27,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::analytics_family::AnalyticsCategory;
 use crate::funnel::{idempotency_key, now_iso, parse_iso_millis};
 use crate::{EventType, FunnelEvent, FunnelStore, RecordOutcome, Snowflake};
 
@@ -57,21 +58,29 @@ pub const SOAK_LEDGER_RULE_ID: &str = "soak_expected_committed";
 /// derives its fired-packet names from the same spellings via `ruleFor`, so
 /// this list must stay identical to `RULES` in `wrangler/src/alert-rules.ts`;
 /// the table test below and the Worker test both pin every spelling.
-pub const ALERT_RULE_IDS: [&str; 14] = [
+pub const ALERT_RULE_IDS: [&str; 22] = [
     "job_stale",
     "job_consecutive_failures",
     "rest_429_rate",
+    "rest_5xx_rate",
     "db_pool_saturated",
     "db_errors",
     "send_admission_blocked",
     "voice_failures",
     "gateway_missed_events",
     "gateway_unpaired_disconnect",
+    "gateway_not_ready",
     "ticker_stale",
     "receiver_refusals",
     "dispatch_drops",
     "job_unknown_stale",
     "gateway_checkpoint_failures",
+    "voice_join_fast_burn",
+    "voice_join_slow_burn",
+    "voice_creator_map_stale",
+    "error_budget_fast_burn",
+    "error_budget_slow_burn",
+    "eventsub_tampered",
 ];
 
 /// Stamped packet filename carrying the producer identity:
@@ -729,8 +738,14 @@ impl<S: FunnelStore> FunnelStore for ReceiptingStore<S> {
         outcome
     }
 
-    fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str) {
-        self.inner.touch_activity(guild_id, member_id, at);
+    fn touch_activity(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        at: &str,
+        family: AnalyticsCategory,
+    ) {
+        self.inner.touch_activity(guild_id, member_id, at, family);
     }
 
     fn next_message_rung(
@@ -940,17 +955,25 @@ mod tests {
                 "job_stale",
                 "job_consecutive_failures",
                 "rest_429_rate",
+                "rest_5xx_rate",
                 "db_pool_saturated",
                 "db_errors",
                 "send_admission_blocked",
                 "voice_failures",
                 "gateway_missed_events",
                 "gateway_unpaired_disconnect",
+                "gateway_not_ready",
                 "ticker_stale",
                 "receiver_refusals",
                 "dispatch_drops",
                 "job_unknown_stale",
                 "gateway_checkpoint_failures",
+                "voice_join_fast_burn",
+                "voice_join_slow_burn",
+                "voice_creator_map_stale",
+                "error_budget_fast_burn",
+                "error_budget_slow_burn",
+                "eventsub_tampered",
             ]
         );
         // The soak ledger stamps its own ledger identity, not an alert rule.
@@ -1107,6 +1130,8 @@ mod tests {
             channel_class: ChannelClass::Human,
             capture_only: false,
             occurred_at: Some(T_MSG.to_owned()),
+            content_length: None,
+            has_embed_or_attachment: false,
         });
         let voice_start_out = handlers.on_voice_join(VoiceInput {
             guild_id: G,

@@ -1,7 +1,7 @@
 id: no-unwrap-request-paths
 language: rust
 severity: warning
-message: "no .unwrap() in non-test request paths; handle the error or use .expect() with context"
+message: "no .unwrap() in request-path source files, including inline test modules; handle the error or use .expect() with context"
 rule:
   pattern: $X.unwrap()
 files:

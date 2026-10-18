@@ -29,7 +29,11 @@ use two_bot_discord::{
     ActionExecutor,
 };
 
+#[cfg(not(test))]
 const STORE_TIMEOUT: Duration = Duration::from_secs(5);
+// Shared CI databases can stall for seconds; fixtures assert state, not latency.
+#[cfg(test)]
+const STORE_TIMEOUT: Duration = Duration::from_secs(60);
 const LANE_WAIT: Duration = Duration::from_secs(20);
 const LANE_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -118,9 +122,19 @@ pub(crate) struct SelfRoleRequest {
 }
 
 /// Scalar diagnostics only. Store/provider detail and claim tokens never escape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreErrorKind {
+    Timeout,
+    Database,
+    /// Receipt completion matched zero rows: the database answered
+    /// successfully but token, generation or disposition did not match.
+    /// Deliberately not `Stale` and not `Database`.
+    UnmatchedReceipt,
+}
+
 #[derive(Debug)]
 pub(crate) enum RuntimeError {
-    Store,
+    Store(StoreErrorKind),
     Rest(SelfRoleRestError),
     Stale,
     InvalidSnapshot,
@@ -132,11 +146,11 @@ async fn store_io<T>(
 ) -> Result<T, RuntimeError> {
     tokio::time::timeout(STORE_TIMEOUT, operation)
         .await
-        .map_err(|_| RuntimeError::Store)?
+        .map_err(|_| RuntimeError::Store(StoreErrorKind::Timeout))?
         .map_err(|error| match error {
             StoreError::StaleClaim => RuntimeError::Stale,
             StoreError::PendingExchange => RuntimeError::PendingExchange,
-            _ => RuntimeError::Store,
+            _ => RuntimeError::Store(StoreErrorKind::Database),
         })
 }
 
@@ -456,7 +470,7 @@ impl SelfRoleRuntime {
     ) -> Result<(), RuntimeError> {
         if let Some(receipt) = step_receipt(exchange) {
             if !store_io(self.store.complete_role_exchange(ticket, receipt)).await? {
-                return Err(RuntimeError::Store);
+                return Err(RuntimeError::Store(StoreErrorKind::UnmatchedReceipt));
             }
         }
         Ok(())

@@ -18,6 +18,7 @@ import textwrap
 import threading
 import tomllib
 import unittest
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -42,6 +43,18 @@ AUTO_ROLLBACK_STEP = "Auto-roll back Worker version and container image"
 SNAPSHOT_STEP = "Snapshot the pre-deploy rollback state"
 IMAGE = "registry.cloudflare.com/acct/two-bot-next-twobotcontainer-production@sha256:" + "c" * 64
 WRANGLER_ACTION = "cloudflare/wrangler-action@"
+# R1 short-SHA fixtures (TOG-28737 acceptance; builder TOG-28741 must not edit
+# these). SHORT_UNAMBIGUOUS is a 12-char prefix of SHA that resolves uniquely;
+# AMBIGUOUS_PREFIX is a 7-char prefix shared with COLLIDING_SHA and must refuse.
+# Builder contract: 7-39 hex prefixes resolve via
+# `GET repos/{repo}/commits/{short}` (gh api); success continues with the full
+# 40-char SHA, failure refuses with a message containing both "40-character hex"
+# and ACCEPTED_FORMAT below (e.g. "sha must be a full 40-character hex commit
+# SHA or an unambiguous 7-40 character hex prefix").
+SHORT_UNAMBIGUOUS = SHA[:12]
+AMBIGUOUS_PREFIX = SHA[:7]
+COLLIDING_SHA = SHA[:7] + "f" * 33
+ACCEPTED_FORMAT = "unambiguous 7-40 character hex prefix"
 
 
 def children(lines, indent):
@@ -198,10 +211,17 @@ class StaticGuardTests(unittest.TestCase):
     def test_wrangler_and_secrets_only_run_in_the_production_environment(self):
         production = children(JOBS["production"][1:], 4)
         self.assertEqual(value(production["environment"]), "production")
-        # Drift must block the deploy: the production job waits for the guard
-        # and the prod schema gate. A rollback serves no new schema and waives
-        # the ledger check inside the reviewed gate script, never here.
-        self.assertEqual(value(production["needs"]), "[guard, schema-gate]")
+        # Drift must block the deploy: the production job waits for the guard,
+        # the prod schema gate and the prod roles gate. A rollback serves no
+        # new schema and waives the ledger check inside the reviewed gate
+        # script, never here.
+        self.assertEqual(value(production["needs"]), "[guard, schema-gate, roles-gate]")
+        for gate in ("schema-gate", "roles-gate"):
+            condition = value(children(JOBS[gate][1:], 4)["if"])
+            self.assertEqual(condition, "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'")
+        production_if = value(children(JOBS["production"][1:], 4)["if"])
+        self.assertIn("needs.guard.outputs.mode == 'rollback'", production_if)
+        self.assertIn("needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'", production_if)
         guard = children(JOBS["guard"][1:], 4)
         self.assertNotIn("environment", guard)
         self.assertNotIn("secrets.", "\n".join(JOBS["guard"]))
@@ -220,7 +240,7 @@ class StaticGuardTests(unittest.TestCase):
 
     def test_every_job_uses_the_shared_runner_routing(self):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
-        self.assertEqual(list(JOBS), ["guard", "schema-gate", "production", "release"])
+        self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "production", "release"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
@@ -418,26 +438,44 @@ class StaticGuardTests(unittest.TestCase):
 
 class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
-              ref="refs/heads/main", auto="", **responses):
+              ref="refs/heads/main", auto="", resolved_sha=None, **responses):
         if image is None:
             image = IMAGE if rollback else ""
-        api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]}, **responses}
+        api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
+               "production-readyz": {"status": 200, "build_revision": SHA}, **responses}
         calls = []
         resolved = sha.strip().lower() or (SHA if not rollback else "")
+        # R1 short-SHA fixture routing: a 7-39 hex prefix of SHA (other than the
+        # colliding AMBIGUOUS_PREFIX) resolves to the full SHA; the ambiguous
+        # prefix and any other short hex fail resolution. Downstream gates must
+        # use the full SHA after a successful resolution.
+        is_short = bool(re.fullmatch(r"[0-9a-f]{7,39}", resolved or ""))
+        is_unambiguous = is_short and resolved == SHA[:len(resolved)] and resolved != AMBIGUOUS_PREFIX
+        downstream = SHA if is_unambiguous else resolved
 
         def fake_check_output(args, **kwargs):
             self.assertEqual(args[:4], ["gh", "api", "--method", "GET"])
             self.assertTrue(all(flag == "-f" for flag in args[5::2]), args)
             path, query = args[4], dict(arg.split("=", 1) for arg in args[6::2])
             calls.append((path, query))
-            if path == f"repos/{REPO}/compare/{resolved}...main":
+            if is_short and path == f"repos/{REPO}/commits/{resolved}":
+                # Short-SHA resolution via the commits API (builder contract).
+                if resolved_sha is not None:
+                    # A branch or tag named with a hex string resolves to a
+                    # commit the operator did not type: return the injected
+                    # SHA so the prefix-match check is exercised.
+                    return json.dumps({"sha": resolved_sha})
+                if is_unambiguous:
+                    return json.dumps({"sha": SHA})
+                raise failed_call()
+            if path == f"repos/{REPO}/compare/{downstream}...main":
                 key = "compare"
-            elif path == f"repos/{REPO}/commits/{resolved}/check-runs":
+            elif path == f"repos/{REPO}/commits/{downstream}/check-runs":
                 self.assertEqual(query["app_id"], "15368")
                 self.assertEqual(query["filter"], "latest")
                 key = query["check_name"]
             elif path == f"repos/{REPO}/actions/workflows/check.yml/runs":
-                self.assertEqual(query["head_sha"], resolved)
+                self.assertEqual(query["head_sha"], downstream)
                 self.assertNotIn("status", query)
                 self.assertNotIn("branch", query)
                 key = "ci-runs"
@@ -456,13 +494,13 @@ class GuardBehaviourTests(unittest.TestCase):
                 # Automated approval: every run on the SHA, never a success-only filter.
                 self.assertEqual(
                     {k: query[k] for k in ("head_sha", "branch")},
-                    {"head_sha": resolved, "branch": "main"},
+                    {"head_sha": downstream, "branch": "main"},
                 )
                 key = "staging-all"
             elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs":
                 self.assertEqual(
                     {k: query[k] for k in ("head_sha", "branch", "status")},
-                    {"head_sha": resolved, "branch": "main", "status": "success"},
+                    {"head_sha": downstream, "branch": "main", "status": "success"},
                 )
                 key = "staging"
             elif path == f"repos/{REPO}/environments/production":
@@ -486,17 +524,39 @@ class GuardBehaviourTests(unittest.TestCase):
                 ]}
             return result if isinstance(result, str) else json.dumps(result)
 
+        def fake_urlopen(request, timeout):
+            self.assertIsInstance(request, urllib.request.Request)
+            self.assertEqual(request.get_header("User-agent"), AGENT)
+            calls.append(("production-readyz", {"url": request.full_url, "timeout": timeout}))
+            response = api["production-readyz"]
+
+            class ReadyResponse:
+                status = response.get("status", 200)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_):
+                    return False
+
+                def read(self):
+                    return json.dumps(response).encode()
+
+            return ReadyResponse()
+
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             output, summary = Path(tmp) / "output", Path(tmp) / "summary"
             env = {
                 "GITHUB_REPOSITORY": REPO, "GITHUB_REF": ref, "SHA": sha, "ROLLBACK": rollback,
                 "IMAGE": image, "TAKEOVER": takeover, "ALLOW_UNSTAGED": allow_unstaged,
+                "PRODUCTION_WORKER_URL": "https://production.example.test",
                 "AUTO_APPROVE": auto,
                 "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
             }
             stdout, code = io.StringIO(), 0
             with patch.dict(os.environ, env, clear=True), \
                     patch("subprocess.check_output", side_effect=fake_check_output), \
+                    patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                     contextlib.redirect_stdout(stdout):
                 try:
                     exec(GUARD, {})
@@ -565,11 +625,77 @@ class GuardBehaviourTests(unittest.TestCase):
         )
 
     def test_malformed_sha_is_refused_before_any_api_call(self):
-        for sha in ("main", SHA[:39], SHA + "0", "g" * 40, "$(id)", f"{SHA};id", f"{SHA[:20]} {SHA[20:]}"):
+        # R1: 7-39 hex prefixes are valid short SHAs resolved via the commits
+        # API (see the short-SHA fixtures below); SHA[:39] is no longer
+        # malformed. Shorter than 7, longer than 40, or non-hex refuses before
+        # any API call with the exact accepted format.
+        for sha in ("main", SHA[:6], "abc", SHA + "0", "g" * 40, "g" * 7,
+                    "$(id)", f"{SHA};id", f"{SHA[:20]} {SHA[20:]}"):
             with self.subTest(sha=sha):
                 result = self.guard(sha=sha)
                 self.assertRefused(result, "40-character hex")
+                self.assertRefused(result, ACCEPTED_FORMAT)
                 self.assertEqual(result[3], [])
+
+    def test_unambiguous_short_sha_is_resolved_and_accepted(self):
+        # R1 acceptance (TOG-28737; builder TOG-28741 must not edit): given a
+        # 12-char unambiguous prefix of a green main commit, when the guard
+        # parses it, then it resolves via the commits API and passes with the
+        # full 40-char SHA in outputs. Covers deploy and rollback modes.
+        for rollback in ("", VERSION):
+            with self.subTest(mode="rollback" if rollback else "deploy"):
+                code, outputs, summary, calls, _ = self.guard(
+                    sha=SHORT_UNAMBIGUOUS, rollback=rollback)
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs["sha"], SHA)
+                self.assertEqual(outputs["mode"], "rollback" if rollback else "deploy")
+                self.assertIn(SHA, summary)
+                # Resolution first, then every downstream gate uses the full SHA.
+                self.assertEqual(calls[0][0], f"repos/{REPO}/commits/{SHORT_UNAMBIGUOUS}")
+                self.assertIn((f"repos/{REPO}/compare/{SHA}...main", {"per_page": "1"}), calls)
+                for path, query in calls:
+                    if "head_sha" in query:
+                        self.assertEqual(query["head_sha"], SHA)
+
+    def test_ambiguous_short_sha_is_refused_with_accepted_format(self):
+        # R1 acceptance (TOG-28737; builder TOG-28741 must not edit): given a
+        # 7-char prefix colliding with another commit (fixture: AMBIGUOUS_PREFIX
+        # matches SHA and COLLIDING_SHA), when the guard parses it, then it is
+        # refused with the exact accepted format and gates nothing on the
+        # collision.
+        self.assertEqual(AMBIGUOUS_PREFIX, SHA[:7])
+        self.assertEqual(COLLIDING_SHA[:7], SHA[:7])
+        self.assertNotEqual(COLLIDING_SHA, SHA)
+        result = self.guard(sha=AMBIGUOUS_PREFIX)
+        self.assertRefused(result, "40-character hex")
+        self.assertRefused(result, ACCEPTED_FORMAT)
+        code, outputs, _, calls, _ = result
+        self.assertEqual(code, 1)
+        self.assertEqual(outputs, {})
+        # Only the resolution attempt; no compare/CI/staging gates on ambiguity.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], f"repos/{REPO}/commits/{AMBIGUOUS_PREFIX}")
+
+    def test_short_sha_resolving_to_a_different_commit_is_refused(self):
+        # The commits endpoint resolves any ref, including a branch or tag
+        # named with a hex string: given a typed prefix whose resolution
+        # returns a full SHA that does not start with it, when the guard
+        # parses it, then it refuses with the exact accepted format and runs
+        # no downstream gate on the foreign commit. Mutant: deleting
+        # `not full.startswith(short)` from the guard fails this test.
+        foreign = "f" * 40
+        self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", foreign))
+        self.assertFalse(foreign.startswith(SHORT_UNAMBIGUOUS))
+        result = self.guard(sha=SHORT_UNAMBIGUOUS, resolved_sha=foreign)
+        self.assertRefused(result, "40-character hex")
+        self.assertRefused(result, ACCEPTED_FORMAT)
+        code, outputs, _, calls, _ = result
+        self.assertEqual(code, 1)
+        self.assertEqual(outputs, {})
+        # Only the resolution attempt; no compare/CI/staging gates on the
+        # foreign commit.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], f"repos/{REPO}/commits/{SHORT_UNAMBIGUOUS}")
 
     def test_rollback_needs_a_version_uuid(self):
         for bad in ("1234", "latest", "../v", f"{VERSION} --force", VERSION[:-1]):
@@ -607,6 +733,13 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("never blocks recovery", summary)
         self.assertFalse(any("deploy-staging" in path for path, _ in calls))
 
+    def test_live_sha_waiver_requires_live_readyz_revision(self):
+        result = self.guard(
+            takeover="true", allow_unstaged="true",
+            **{"production-readyz": {"build_revision": "f" * 40}},
+        )
+        self.assertRefused(result, "live production build revision does not match requested SHA")
+
     def test_live_sha_takeover_redeploy_waives_staging_history(self):
         # The owner's first-response cure for a stale bot: re-serve the live
         # SHA with takeover when staging history aged out.
@@ -617,7 +750,22 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
                                    "takeover": "true", "allow_unstaged": "true"})
         self.assertIn("operator confirms the SHA is live", summary)
+        self.assertIn(("production-readyz", {"url": "https://production.example.test/readyz", "timeout": 10}), calls)
         self.assertFalse(any("deploy-staging" in path for path, _ in calls))
+
+    def test_live_sha_waiver_accepts_parked_readyz_only_with_matching_revision(self):
+        result = self.guard(
+            takeover="true", allow_unstaged="true",
+            **{"production-readyz": {"status": 503, "build_revision": SHA}},
+        )
+        self.assertEqual(result[0], 0)
+
+    def test_live_sha_waiver_refuses_unexpected_readyz_status(self):
+        result = self.guard(
+            takeover="true", allow_unstaged="true",
+            **{"production-readyz": {"status": 500, "build_revision": SHA}},
+        )
+        self.assertRefused(result, "unexpected status 500")
 
     def test_allow_unstaged_needs_takeover_and_deploy_mode(self):
         result = self.guard(allow_unstaged="true")
@@ -930,6 +1078,10 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("../tooling/wrangler/scripts/production-ownership-control.mjs", production)
         self.assertIn("tooling/scripts/ci/production_schema_gate.py",
                       "\n".join(JOBS["schema-gate"]))
+        roles_gate = "\n".join(JOBS["roles-gate"])
+        self.assertIn("path: tooling", roles_gate)
+        self.assertIn("ref: ${{ github.sha }}", roles_gate)
+        self.assertIn("tooling/scripts/ci/roles_gate.py", roles_gate)
 
     def test_api_failures_fail_closed(self):
         for key in ("compare", "ci-runs", "ci-run", "ci-jobs", "ci-ok", "worker check", "staging", "branches"):
@@ -1296,7 +1448,7 @@ class ShellStepTests(unittest.TestCase):
                                                        ["database", "ready"], ["token_invalid", "ready"]],
                                        "jobs": {}, "build_revision": "unknown", "build_id": "unknown"})
         pre_stamp = report(revision="unknown", build_id="unknown")
-        for status, body in (("503", pre_stamp), ("200", parked_pre_stamp), ("503", parked_pre_stamp)):
+        for status, body in ((503, pre_stamp), (200, parked_pre_stamp), (503, parked_pre_stamp)):
             with self.subTest(status=status):
                 code, summary, _ = self.gate({"/health": [(200, "{}")], "/readyz": [(status, body)]},
                                              mode="rollback")

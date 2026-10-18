@@ -19,9 +19,9 @@ use std::{sync::Arc, time::Duration};
 use sqlx::PgPool;
 use two_bot_core::{
     activation::LiveCapability, audit_scheduled, claim_due, clamp_retry_delay_ms, complete_run,
-    format_iso_ms, lease_until_ms, post_failure_retryable, retry_scheduled, FeatureGates,
-    OccurrenceOutcome, ScheduledAuditInput, ScheduledMessageRow, ScheduledStoreError,
-    SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
+    format_iso_ms, lease_until_ms, neutralize_scheduled_body, post_failure_retryable,
+    retry_scheduled, FeatureGates, OccurrenceOutcome, ScheduledAuditInput, ScheduledMessageRow,
+    ScheduledStoreError, SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
 };
 use two_bot_discord::executor::{ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordError};
 
@@ -40,6 +40,10 @@ const ORPHAN_REASON: &str = "Scheduled message run was not recorded";
 #[cfg(test)]
 #[path = "scheduled_jobs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "scheduled_stale_audit_acceptance_tests.rs"]
+mod acceptance_tests;
 
 /// The supervised ticker for the configured guild, or `None` while
 /// `TWO_AUTOMATIONS` is off (legacy only started the scheduler when automations
@@ -99,6 +103,7 @@ fn job(action: JobAction) -> Job {
     Job {
         name: NAMES[0],
         cadence,
+        cadence_source: None,
         startup_jitter: jobs::startup_jitter(cadence, rand::random()),
         timeout: Duration::from_secs(120),
         action,
@@ -189,9 +194,18 @@ struct Occurrence<'a> {
 
 impl Occurrence<'_> {
     async fn run(&self, audit_failed: &mut bool) -> Result<Step, ErrorClass> {
+        // Defuse rows written before any validate-side screen on the way to
+        // the channel; benign bodies pass through byte-identical and the
+        // shared send path keeps the closed mention policy. The neutralized
+        // body is truncated to the message ceiling (surrogate-safe) so a
+        // legacy row at the old pre-neutralize limit still posts instead of
+        // failing permanent on the send-path length check.
         let call = ChannelCall::PostMessage {
             channel_id: self.row.channel_id.clone(),
-            content: self.row.body.clone(),
+            content: two_bot_core::message_safety::truncate(
+                &neutralize_scheduled_body(&self.row.body),
+                two_bot_core::message_safety::CONTENT_LIMIT,
+            ),
             nonce: self.row.occurrence_nonce.clone(),
         };
         let posted = match self.rest.execute_channel(&call).await {
@@ -265,7 +279,12 @@ impl Occurrence<'_> {
                     None => false,
                 };
                 // Keep the nonce when the message survives so the re-run
-                // dedupes against it instead of posting a second copy.
+                // dedupes against it instead of posting a second copy. The
+                // unrecorded outcome is audited even when the claim was lost
+                // (the re-queue retains nothing): a posted message must never
+                // vanish without an audit row. A lost claim keeps no nonce,
+                // so a surviving orphan has no idempotent retry: report it
+                // as stale, not retry-idempotent.
                 let retained = retry_scheduled(
                     self.pool,
                     &self.row.guild_id,
@@ -276,14 +295,12 @@ impl Occurrence<'_> {
                 )
                 .await
                 .map_err(database)?;
-                if retained {
-                    self.audit(
-                        &OccurrenceOutcome::PostedUnrecorded { cleaned },
-                        Some(reason),
-                        audit_failed,
-                    )
-                    .await;
-                }
+                let outcome = if retained || cleaned {
+                    OccurrenceOutcome::PostedUnrecorded { cleaned }
+                } else {
+                    OccurrenceOutcome::StaleCompletion
+                };
+                self.audit(&outcome, Some(reason), audit_failed).await;
                 Ok(Step::Stop)
             }
         }
@@ -314,6 +331,17 @@ impl Occurrence<'_> {
                     audit_failed,
                 )
                 .await;
+            } else {
+                // The claim went stale (the definition was replaced or
+                // cancelled while the retryable post was in flight): the
+                // re-queue lands nowhere, so audit the stale completion with
+                // the failure reason instead of vanishing silently.
+                self.audit(
+                    &OccurrenceOutcome::StaleCompletion,
+                    Some(reason),
+                    audit_failed,
+                )
+                .await;
             }
             return Ok(Step::Next);
         }
@@ -336,6 +364,17 @@ impl Occurrence<'_> {
         if completed.is_some() {
             self.audit(
                 &OccurrenceOutcome::FailedPermanent,
+                Some(reason),
+                audit_failed,
+            )
+            .await;
+        } else {
+            // The claim went stale (the definition was replaced or cancelled
+            // while Discord refused the post): the completion lands nowhere,
+            // so audit the stale completion with the refusal reason instead
+            // of vanishing silently.
+            self.audit(
+                &OccurrenceOutcome::StaleCompletion,
                 Some(reason),
                 audit_failed,
             )

@@ -3,6 +3,7 @@
 
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     fmt::Write,
     sync::{Mutex, OnceLock},
     time::Duration,
@@ -254,6 +255,13 @@ pub const VOICE_JOIN_REFUSAL_REASONS: &[&str] = &[
     "name_blocked",
     "other",
 ];
+/// Rendered `le` labels for `two_bot_voice_join_to_move_seconds_bucket`: the
+/// eight finite `BUCKETS_MICROS` bounds as seconds plus `+Inf`. The rendered
+/// exposition is tested against this list, and the Worker scrape validator
+/// (`wrangler/src/metrics-scrape.ts`) and its fixture are checked against it.
+pub const VOICE_JOIN_TO_MOVE_BUCKET_LE: &[&str] = &[
+    "0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf",
+];
 /// Action-queue lanes for the `two_bot_voice_queue_pending{lane}` gauge.
 pub const VOICE_QUEUE_LANES: &[&str] = &["urgent", "deferred"];
 /// Vote-kick outcomes for `two_bot_voice_vote_kick_total{outcome}` (M4.30):
@@ -290,6 +298,31 @@ pub const VOICE_VOTE_KICK_OUTCOMES: &[&str] = &[
     "permission_missing",
     "discord_error",
     "gave_up",
+    "other",
+];
+/// Moderation enforcement verbs for `two_bot_moderation_enforcements_total{verb,outcome}`
+/// (TOG-28482): exactly the nine `ModerationAction::command_name` verbs in
+/// legacy publish order. A test pins this list to
+/// `ModerationAction::ALL.map(command_name)` so a new verb fails the suite
+/// until the budget rows join it. Unknown verbs collapse to the trailing
+/// slot only when the allowlist grows; today every caller passes a real
+/// verb, so no user id, reason text or free-form detail ever becomes a label.
+pub const MODERATION_VERBS: &[&str] = &[
+    "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown", "unlock",
+];
+/// Terminal outcomes for `two_bot_moderation_enforcements_total{verb,outcome}`
+/// (TOG-28482): `success` for every completed enforcement (including
+/// idempotent replays served without a second effect), `refused` for
+/// policy/validation/definitive rejections that prove no mutation happened,
+/// `discord_error` for uncertain Discord failures (timeout, unreachable,
+/// rate-limited), `storage_error` for persistence failures, and `other` for
+/// anything else. Unknown outcomes collapse to the trailing `other`, never
+/// to a dynamic label. No IDs, tokens or bodies are retained.
+pub const MODERATION_ENFORCEMENT_OUTCOMES: &[&str] = &[
+    "success",
+    "refused",
+    "discord_error",
+    "storage_error",
     "other",
 ];
 /// Dispatch-lane names for `two_bot_dispatch_drops_total{lane}`, in the bot's
@@ -335,6 +368,27 @@ pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
 /// unrecognised outcome collapses to the last entry (`rejected`) rather than
 /// growing the series vocabulary.
 pub const PRESENCE_CAPTURE_OUTCOMES: &[&str] = &["inserted", "duplicate", "rejected"];
+/// Terminal automod decision outcomes for
+/// `two_bot_automod_decisions_total{outcome}`. Mirrors
+/// `automod_runtime::CompletionKind::as_str` in declaration order: `accepted`
+/// for clean content, `already_processed` for a counted retry, `dry_run` for
+/// a matched dry-run capture, `protected` for an exempt target, `deleted` /
+/// `warned` / `timed_out` for enforced ladders, and `sanction_refused` when
+/// the delete-adjacent sanction could not run. Exactly eight series from
+/// process start; no message text, excerpts or user IDs ever become labels.
+/// Unknown outcomes collapse to the trailing `sanction_refused` slot only
+/// when the allowlist grows; today every caller passes a member, so that
+/// slot stays zero unless hostile input arrives.
+pub const AUTOMOD_DECISION_OUTCOMES: &[&str] = &[
+    "accepted",
+    "already_processed",
+    "dry_run",
+    "protected",
+    "deleted",
+    "warned",
+    "timed_out",
+    "sanction_refused",
+];
 /// Website-action receiver families for
 /// `two_bot_internal_actions_total{family,outcome}` (TOG-20119, roadmap
 /// M4.23). The signed receiver (`crates/bot/src/internal_action_http.rs`)
@@ -383,6 +437,48 @@ pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
 /// `error` when the facts writer failed, `timeout` when the drain missed the
 /// dispatch deadline. Both warn and continue; `other` absorbs unknown reasons.
 pub const COMMUNITY_FACTS_DRAIN_REASONS: &[&str] = &["error", "timeout", "other"];
+/// Verified EventSub deliveries by bounded receiver classification. `other`
+/// captures unknown/future classification errors; no header, body, broadcaster,
+/// subscription, or secret data reaches the label.
+pub const EVENTSUB_DELIVERY_KINDS: [&str; 6] = [
+    "challenge",
+    "notification",
+    "revocation",
+    "tampered",
+    "ignored",
+    "other",
+];
+/// Go-live post attempts by bounded outcome. The outcome vocabulary is fixed;
+/// post identifiers and error details are never retained.
+pub const EVENTSUB_POST_OUTCOMES: [&str; 4] = ["attempted", "succeeded", "failed", "other"];
+/// Outcomes of one EventSub reconcile pass for
+/// `two_bot_eventsub_reconcile_passes_total{outcome}`: `healthy` when every
+/// desired broadcaster holds a healthy subscription afterwards, `pending` when
+/// re-created but not all verified yet, `failed` when an action failed or a
+/// healthy subscription is missing (including listing failures). Exactly these
+/// three series exist; an unrecognised outcome collapses to the trailing
+/// `failed` (fail-closed) rather than growing the series vocabulary.
+pub const EVENTSUB_RECONCILE_OUTCOMES: &[&str] = &["healthy", "pending", "failed"];
+/// Successful reconcile mutations for
+/// `two_bot_eventsub_reconcile_actions_total{action}`: 2xx creates and deletes
+/// (already-gone deletes count). 409 already-exists confirmations fold into the
+/// pass outcome, not into actions. Unknown actions collapse to the trailing
+/// `delete` slot only when the allowlist grows.
+pub const EVENTSUB_RECONCILE_ACTIONS: &[&str] = &["create", "delete"];
+/// Failure sites for `two_bot_eventsub_reconcile_errors_total{error_class}`:
+/// the failure-site `error_class` log strings in `eventsub_reconcile`
+/// (`reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`,
+/// `reconcile_failed`), so those logs and metrics join without response bytes.
+/// `reconcile_pending`, config refusals and parked passes stay log-only. No
+/// status code, body, broadcaster, subscription id or secret ever becomes a
+/// label. Unknown classes collapse to the trailing `other`.
+pub const EVENTSUB_RECONCILE_ERROR_CLASSES: &[&str] = &[
+    "reconcile_action_failed",
+    "reconcile_prior_failed",
+    "reconcile_unhealthy",
+    "reconcile_failed",
+    "other",
+];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -437,6 +533,20 @@ struct JobMetrics {
     last_error_class: Option<JobErrorClass>,
 }
 
+/// One guild actor incarnation's stall contribution. `generation` fences
+/// replacement: a report older than the recorded generation is ignored,
+/// and a newer generation replaces the whole contribution.
+#[derive(Clone, Copy, Default)]
+struct VoiceActorStall {
+    generation: u64,
+    halted: bool,
+    queue_pending: [u64; VOICE_QUEUE_LANES.len()],
+    oldest_age_secs: u64,
+    /// Seconds this actor's live view has been not ready while the gateway
+    /// is connected (joins are dropped meanwhile); 0 when ready or offline.
+    live_not_ready_secs: u64,
+}
+
 #[derive(Default)]
 struct Values {
     events: [u64; EVENTS.len()],
@@ -460,14 +570,22 @@ struct Values {
     voice_joins_received: u64,
     /// Actor-received creator joins refused before queueing, by reason.
     voice_join_refused: [u64; VOICE_JOIN_REFUSAL_REASONS.len()],
-    /// Guild-actor halt latch (CredentialRefused): 1 while halted.
-    voice_worker_halted: u64,
-    /// Queued (not in-flight) action depth by lane; last writer wins.
-    voice_queue_pending: [u64; VOICE_QUEUE_LANES.len()],
-    /// Age of the oldest queued action in seconds; 0 when the queue is empty.
-    voice_queue_oldest_age_secs: u64,
+    /// Per-guild-actor stall contributions, keyed by an opaque
+    /// process-local actor key that is never rendered, labelled or
+    /// persisted. The public halt/queue series are aggregates over this
+    /// set (any halted, per-lane sums, maximum oldest age), so a healthy
+    /// actor cannot overwrite a stalled actor's signal. Entries live only
+    /// while their actor does; removal deletes the entry.
+    voice_actors: HashMap<u64, VoiceActorStall>,
     /// Age of the oldest in-flight voice REST attempt in seconds; 0 when idle.
     voice_rest_in_flight_age_secs: u64,
+    /// Last merged creator-map generation (live snapshot generation stamped
+    /// by `reload_creators`); 0 before the first merge. Last writer wins.
+    creator_map_generation: u64,
+    /// Seconds since the last successful creator-map merge on the actor clock;
+    /// 0 when never merged. Last writer wins; the per-tick publish refreshes
+    /// it so the gauge shows staleness, not the merge-time zero.
+    creator_map_age_secs: u64,
     /// Global-backoff waits refused (capped) instead of parking the actor.
     voice_global_backoff_capped: u64,
     /// Actor dispatches that exceeded the per-dispatch timeout.
@@ -476,7 +594,10 @@ struct Values {
     voice_watchdog_stucks: u64,
     /// Halt-latch recoveries via credential re-probe.
     voice_halt_recoveries: u64,
+    /// Live views republished by the not-ready-while-connected self-heal.
+    voice_live_self_heals: u64,
     voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
+    moderation_enforcements: [[u64; MODERATION_ENFORCEMENT_OUTCOMES.len()]; MODERATION_VERBS.len()],
     voice_names: [u64; VOICE_NAME_OUTCOMES.len()],
     db_errors: [u64; DB_ERROR_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
@@ -484,6 +605,7 @@ struct Values {
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
     presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
+    automod_decisions: [u64; AUTOMOD_DECISION_OUTCOMES.len()],
     last_ready_unix: Option<u64>,
     last_resume_unix: Option<u64>,
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
@@ -500,15 +622,46 @@ struct Values {
     /// channel, user, dedup-key, content or body label ever reaches
     /// exposition.
     event_store_consumer_lag_secs: f64,
+    eventsub_received: u64,
+    eventsub_classified: [u64; EVENTSUB_DELIVERY_KINDS.len()],
+    eventsub_posts: [u64; EVENTSUB_POST_OUTCOMES.len()],
+    eventsub_reconcile_passes: [u64; EVENTSUB_RECONCILE_OUTCOMES.len()],
+    eventsub_reconcile_actions: [u64; EVENTSUB_RECONCILE_ACTIONS.len()],
+    eventsub_reconcile_errors: [u64; EVENTSUB_RECONCILE_ERROR_CLASSES.len()],
 }
 
-/// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
+/// Storage is fixed-size, except the per-actor voice stall map, which is
+/// bounded by the live guild-actor set. Unknown labels collapse to
+/// `other`, including hostile input.
 #[derive(Default)]
 pub struct Metrics(Mutex<Values>);
 
 pub fn global() -> &'static Metrics {
     static METRICS: OnceLock<Metrics> = OnceLock::new();
     METRICS.get_or_init(Metrics::default)
+}
+
+/// The recorded contribution for `actor`, fenced by generation: an older
+/// generation gets `None` (a stale incarnation cannot erase or resurrect
+/// state), a newer one first resets the whole contribution (replacement
+/// retires the old incarnation).
+fn voice_actor_entry(
+    values: &mut Values,
+    actor: u64,
+    generation: u64,
+) -> Option<&mut VoiceActorStall> {
+    let entry = values.voice_actors.entry(actor).or_default();
+    if generation < entry.generation {
+        return None;
+    }
+    if generation > entry.generation {
+        entry.generation = generation;
+        entry.halted = false;
+        entry.queue_pending = [0; VOICE_QUEUE_LANES.len()];
+        entry.oldest_age_secs = 0;
+        entry.live_not_ready_secs = 0;
+    }
+    Some(entry)
 }
 
 impl Metrics {
@@ -566,6 +719,22 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter =
             &mut values.presence_capture[bounded_index(outcome, PRESENCE_CAPTURE_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One terminal automod decision (see [`AUTOMOD_DECISION_OUTCOMES`]).
+    /// Call once per committed [`StoredOutcome`](crate::automod_runtime::StoredOutcome):
+    /// the shared activation settles exactly one receipt per inspection, so
+    /// replays and retained claims never call this. The outcome is the whole
+    /// label vocabulary — no message text, excerpts or user IDs ever become
+    /// labels — and an unrecognised outcome collapses to `sanction_refused`.
+    pub fn automod_decision(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.automod_decisions[bounded_index(outcome, AUTOMOD_DECISION_OUTCOMES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -755,6 +924,26 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
+    /// One moderation enforcement terminal outcome (TOG-28482). Call once per
+    /// terminal member/channel enforcement from each dispatch site (slash
+    /// member/channel runtimes and website member/channel executors): each
+    /// request records exactly once, so an idempotent replay counts as
+    /// `success` on its own serve while the in-flight duplicate that prompted
+    /// it counts on its own terminal outcome. `verb` is a
+    /// `ModerationAction::command_name` verb; `outcome` is one of
+    /// [`MODERATION_ENFORCEMENT_OUTCOMES`]. Unknown verbs/outcomes collapse
+    /// to the trailing slots only when the allowlists grow. No user id,
+    /// reason text or free-form detail ever becomes a label.
+    pub fn moderation_enforcement(&self, verb: &str, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.moderation_enforcements[bounded_index(verb, MODERATION_VERBS)]
+            [bounded_index(outcome, MODERATION_ENFORCEMENT_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
     /// One automatic room-name decision (see [`VOICE_NAME_OUTCOMES`]).
     pub fn voice_name(&self, outcome: &str) {
         let mut values = self
@@ -788,24 +977,113 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
-    /// Guild-actor halt latch state: 1 while CredentialRefused halted the
-    /// worker, 0 otherwise. Last writer wins.
-    pub fn set_voice_halted(&self, halted: bool) {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .voice_worker_halted = u64::from(halted);
-    }
-
-    /// Queued action depth by lane plus the oldest pending item's age.
-    /// Last writer wins; render 0 age when the queue is empty.
-    pub fn set_voice_queue(&self, urgent: u64, deferred: u64, oldest_age_secs: u64) {
+    /// Record one guild actor's halt latch. `actor` is an opaque
+    /// process-local key, never rendered. The public
+    /// `two_bot_voice_worker_halted` gauge is 1 while ANY current actor
+    /// is halted, so a healthy actor cannot hide another's stall.
+    /// Reports from a generation older than the one recorded for the
+    /// actor are ignored; a newer generation replaces that actor's
+    /// whole recorded contribution.
+    pub fn set_voice_actor_halted(&self, actor: u64, generation: u64, halted: bool) {
         let mut values = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        values.voice_queue_pending = [urgent, deferred];
-        values.voice_queue_oldest_age_secs = oldest_age_secs;
+        if let Some(entry) = voice_actor_entry(&mut values, actor, generation) {
+            entry.halted = halted;
+        }
+    }
+
+    /// Record how long one guild actor's live view has been not ready while
+    /// the gateway is connected (0 when ready or while the transport is
+    /// down). The public `two_bot_voice_live_not_ready_seconds` gauge is the
+    /// maximum across current actors, so a healthy guild cannot hide a
+    /// guild whose joins are being dropped. Generation fencing matches
+    /// [`Self::set_voice_actor_halted`].
+    pub fn set_voice_actor_live_not_ready(&self, actor: u64, generation: u64, secs: u64) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = voice_actor_entry(&mut values, actor, generation) {
+            entry.live_not_ready_secs = secs;
+        }
+    }
+
+    /// One live view republished from the gateway cache by the self-heal
+    /// path: it was not ready while the gateway was connected.
+    pub fn voice_live_self_heal(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_live_self_heals = values.voice_live_self_heals.saturating_add(1);
+    }
+
+    /// Record one guild actor's queued depth by lane plus its oldest
+    /// pending age (0 when its queue is empty). The public
+    /// `two_bot_voice_queue_pending{lane}` gauges are saturating sums
+    /// across current actors and
+    /// `two_bot_voice_queue_oldest_age_seconds` is their maximum.
+    /// Generation fencing matches [`Self::set_voice_actor_halted`].
+    pub fn set_voice_actor_queue(
+        &self,
+        actor: u64,
+        generation: u64,
+        urgent: u64,
+        deferred: u64,
+        oldest_age_secs: u64,
+    ) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = voice_actor_entry(&mut values, actor, generation) {
+            entry.queue_pending = [urgent, deferred];
+            entry.oldest_age_secs = oldest_age_secs;
+        }
+    }
+
+    /// Retire one guild actor incarnation's stall contribution (actor
+    /// shutdown / guild removal). A generation older than the recorded
+    /// one must not erase a replacement actor's state; removing an
+    /// unknown actor changes nothing.
+    pub fn remove_voice_actor(&self, actor: u64, generation: u64) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if values
+            .voice_actors
+            .get(&actor)
+            .is_some_and(|entry| generation >= entry.generation)
+        {
+            values.voice_actors.remove(&actor);
+        }
+    }
+
+    /// One actor's recorded stall contribution as `(generation, halted,
+    /// queue_pending by lane, oldest_age_secs)`, or `None` when the actor
+    /// has no recorded contribution. Test/diagnostic seam only: the actor
+    /// key is process-local and this lookup is never rendered, labelled
+    /// or persisted.
+    #[doc(hidden)]
+    pub fn voice_actor_contribution(
+        &self,
+        actor: u64,
+    ) -> Option<(u64, bool, [u64; VOICE_QUEUE_LANES.len()], u64)> {
+        let values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_actors.get(&actor).map(|entry| {
+            (
+                entry.generation,
+                entry.halted,
+                entry.queue_pending,
+                entry.oldest_age_secs,
+            )
+        })
     }
 
     /// Age of the oldest in-flight voice REST attempt in seconds; 0 idles it.
@@ -815,6 +1093,18 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .voice_rest_in_flight_age_secs = age_secs;
+    }
+
+    /// Creator-map freshness: last merged generation plus seconds since that
+    /// merge. Last writer wins; the actor tick republishes every tick so age
+    /// keeps climbing between merges instead of freezing at the merge-time 0.
+    pub fn set_voice_creator_map(&self, generation: u64, age_secs: u64) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.creator_map_generation = generation;
+        values.creator_map_age_secs = age_secs;
     }
 
     /// One global-backoff wait capped instead of parking the actor: the call
@@ -965,6 +1255,87 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
+    /// One EventSub delivery accepted for verification, including a delivery
+    /// whose signature will fail. Rejected requests before body intake do not
+    /// count as deliveries.
+    pub fn eventsub_received(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.eventsub_received = values.eventsub_received.saturating_add(1);
+    }
+
+    /// One EventSub receiver classification. Unknown values collapse to
+    /// `other`; caller-controlled input can never become a label.
+    pub fn eventsub_classified(&self, kind: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.eventsub_classified[bounded_index(kind, &EVENTSUB_DELIVERY_KINDS)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One go-live post outcome. Call `attempted` immediately before the send,
+    /// then `succeeded` or `failed` once its result is known. Unknown outcomes
+    /// collapse to `other`.
+    pub fn eventsub_post(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.eventsub_posts[bounded_index(outcome, &EVENTSUB_POST_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One completed EventSub reconcile pass by outcome (see
+    /// [`EVENTSUB_RECONCILE_OUTCOMES`]). Call exactly once per pass from the
+    /// reconcile executor: `healthy`, `pending`, or `failed`. Unknown outcomes
+    /// collapse to `failed`.
+    pub fn eventsub_reconcile_pass(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.eventsub_reconcile_passes
+            [bounded_index(outcome, EVENTSUB_RECONCILE_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// Successful reconcile mutations by bounded action (`create`/`delete`),
+    /// counted from the executed plan outcomes. Call with the per-pass counts;
+    /// zero is a no-op. Unknown actions collapse to `delete` only when the
+    /// allowlist grows. No broadcaster, subscription id or body is retained.
+    pub fn eventsub_reconcile_action(&self, action: &str, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.eventsub_reconcile_actions
+            [bounded_index(action, EVENTSUB_RECONCILE_ACTIONS)];
+        *counter = counter.saturating_add(count);
+    }
+
+    /// One reconcile failure site by log `error_class` (see
+    /// [`EVENTSUB_RECONCILE_ERROR_CLASSES`]). Call once per site per pass,
+    /// except `reconcile_action_failed`, which counts once per failed action.
+    /// Unknown classes collapse to `other`; no status, body or response bytes
+    /// ever become a label.
+    pub fn eventsub_reconcile_error(&self, error_class: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.eventsub_reconcile_errors
+            [bounded_index(error_class, EVENTSUB_RECONCILE_ERROR_CLASSES)];
+        *counter = counter.saturating_add(1);
+    }
+
     /// Current audit mirror delivery-halt state (M4.48): `true` while the
     /// persistent kill switch is engaged, `false` once it is cleared. Call
     /// once per readable `audit_retry` sweep from the store's `delivery_halt`
@@ -1064,6 +1435,22 @@ impl Metrics {
             writeln!(
                 out,
                 "two_bot_presence_capture_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_automod_decisions_total",
+            "counter",
+            "Terminal automod inspection outcomes by bounded CompletionKind; fixed eight series.",
+        );
+        for (outcome, count) in AUTOMOD_DECISION_OUTCOMES
+            .iter()
+            .zip(values.automod_decisions)
+        {
+            writeln!(
+                out,
+                "two_bot_automod_decisions_total{{outcome=\"{outcome}\"}} {count}"
             )
             .unwrap();
         }
@@ -1271,25 +1658,33 @@ impl Metrics {
             )
             .unwrap();
         }
+        // Aggregates over the current guild-actor set: any actor halted,
+        // per-lane saturating sums, maximum oldest-pending age.
+        let voice_halted = u64::from(values.voice_actors.values().any(|actor| actor.halted));
+        let mut voice_queue_pending = [0_u64; VOICE_QUEUE_LANES.len()];
+        let mut voice_queue_oldest_age_secs = 0_u64;
+        let mut voice_live_not_ready_secs = 0_u64;
+        for actor in values.voice_actors.values() {
+            for (total, depth) in voice_queue_pending.iter_mut().zip(actor.queue_pending) {
+                *total = total.saturating_add(depth);
+            }
+            voice_queue_oldest_age_secs = voice_queue_oldest_age_secs.max(actor.oldest_age_secs);
+            voice_live_not_ready_secs = voice_live_not_ready_secs.max(actor.live_not_ready_secs);
+        }
         header(
             &mut out,
             "two_bot_voice_worker_halted",
             "gauge",
-            "Guild-actor halt latch: 1 while CredentialRefused halted join processing.",
+            "Guild-actor halt latch: 1 while any guild actor is halted (CredentialRefused halted join processing).",
         );
-        writeln!(
-            out,
-            "two_bot_voice_worker_halted {}",
-            values.voice_worker_halted
-        )
-        .unwrap();
+        writeln!(out, "two_bot_voice_worker_halted {voice_halted}").unwrap();
         header(
             &mut out,
             "two_bot_voice_queue_pending",
             "gauge",
-            "Queued (not in-flight) voice actions by lane.",
+            "Queued (not in-flight) voice actions by lane, summed across guild actors.",
         );
-        for (lane, count) in VOICE_QUEUE_LANES.iter().zip(values.voice_queue_pending) {
+        for (lane, count) in VOICE_QUEUE_LANES.iter().zip(voice_queue_pending) {
             writeln!(
                 out,
                 "two_bot_voice_queue_pending{{lane=\"{lane}\"}} {count}"
@@ -1300,14 +1695,30 @@ impl Metrics {
             &mut out,
             "two_bot_voice_queue_oldest_age_seconds",
             "gauge",
-            "Age of the oldest queued voice action in seconds; 0 when empty.",
+            "Age of the oldest queued voice action in seconds, maximum across guild actors; 0 when empty.",
         );
         writeln!(
             out,
-            "two_bot_voice_queue_oldest_age_seconds {}",
-            values.voice_queue_oldest_age_secs
+            "two_bot_voice_queue_oldest_age_seconds {voice_queue_oldest_age_secs}"
         )
         .unwrap();
+        header(
+            &mut out,
+            "two_bot_voice_live_not_ready_seconds",
+            "gauge",
+            "Seconds a guild live voice view has been not ready while the gateway is connected (creator joins are dropped meanwhile), maximum across guild actors; 0 when every view is ready or the gateway is down.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_live_not_ready_seconds {voice_live_not_ready_secs}"
+        )
+        .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_voice_live_self_heal_total",
+            "counter",
+            values.voice_live_self_heals,
+        );
         header(
             &mut out,
             "two_bot_voice_rest_in_flight_age_seconds",
@@ -1318,6 +1729,30 @@ impl Metrics {
             out,
             "two_bot_voice_rest_in_flight_age_seconds {}",
             values.voice_rest_in_flight_age_secs
+        )
+        .unwrap();
+        header(
+            &mut out,
+            "two_bot_voice_creator_map_generation",
+            "gauge",
+            "Last merged creator-map generation; 0 before the first merge.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_creator_map_generation {}",
+            values.creator_map_generation
+        )
+        .unwrap();
+        header(
+            &mut out,
+            "two_bot_voice_creator_map_age_seconds",
+            "gauge",
+            "Seconds since the last successful creator-map merge; 0 when never merged.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_creator_map_age_seconds {}",
+            values.creator_map_age_secs
         )
         .unwrap();
         scalar(
@@ -1454,6 +1889,21 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_moderation_enforcements_total",
+            "counter",
+            "Moderation enforcement terminal outcomes by bounded verb and outcome; retries and rate-limit backoffs are not outcomes.",
+        );
+        for (verb, outcomes) in MODERATION_VERBS.iter().zip(values.moderation_enforcements) {
+            for (outcome, count) in MODERATION_ENFORCEMENT_OUTCOMES.iter().zip(outcomes) {
+                writeln!(
+                    out,
+                    "two_bot_moderation_enforcements_total{{verb=\"{verb}\",outcome=\"{outcome}\"}} {count}"
+                )
+                .unwrap();
+            }
+        }
+        header(
+            &mut out,
             "two_bot_community_facts_drain_failures_total",
             "counter",
             "Community-facts drain failures by bounded reason; the worker warns and continues, so each failed dispatch counts once.",
@@ -1492,6 +1942,89 @@ impl Metrics {
             values.event_store_consumer_lag_secs
         )
         .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_eventsub_received_total",
+            "counter",
+            values.eventsub_received,
+        );
+        header(
+            &mut out,
+            "two_bot_eventsub_classified_total",
+            "counter",
+            "EventSub deliveries by bounded receiver classification.",
+        );
+        for (kind, count) in EVENTSUB_DELIVERY_KINDS
+            .iter()
+            .zip(values.eventsub_classified)
+        {
+            writeln!(
+                out,
+                "two_bot_eventsub_classified_total{{kind=\"{kind}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_eventsub_posts_total",
+            "counter",
+            "Go-live announcement post attempts by bounded outcome.",
+        );
+        for (outcome, count) in EVENTSUB_POST_OUTCOMES.iter().zip(values.eventsub_posts) {
+            writeln!(
+                out,
+                "two_bot_eventsub_posts_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_eventsub_reconcile_passes_total",
+            "counter",
+            "EventSub reconcile passes by bounded outcome; alert when failed rises across scrapes.",
+        );
+        for (outcome, count) in EVENTSUB_RECONCILE_OUTCOMES
+            .iter()
+            .zip(values.eventsub_reconcile_passes)
+        {
+            writeln!(
+                out,
+                "two_bot_eventsub_reconcile_passes_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_eventsub_reconcile_actions_total",
+            "counter",
+            "Successful EventSub reconcile mutations by bounded action.",
+        );
+        for (action, count) in EVENTSUB_RECONCILE_ACTIONS
+            .iter()
+            .zip(values.eventsub_reconcile_actions)
+        {
+            writeln!(
+                out,
+                "two_bot_eventsub_reconcile_actions_total{{action=\"{action}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_eventsub_reconcile_errors_total",
+            "counter",
+            "EventSub reconcile failure sites by bounded log error_class; no response bytes in labels.",
+        );
+        for (error_class, count) in EVENTSUB_RECONCILE_ERROR_CLASSES
+            .iter()
+            .zip(values.eventsub_reconcile_errors)
+        {
+            writeln!(
+                out,
+                "two_bot_eventsub_reconcile_errors_total{{error_class=\"{error_class}\"}} {count}"
+            )
+            .unwrap();
+        }
         for (name, count) in [
             (
                 "two_bot_rest_guard_invalid_requests_total",
@@ -1711,6 +2244,7 @@ mod tests {
             metrics.checkpoint_failure(&hostile);
             metrics.presence_capture(&hostile);
             metrics.internal_action(&hostile, &hostile);
+            metrics.moderation_enforcement(&hostile, &hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
@@ -1900,6 +2434,22 @@ mod tests {
     }
 
     #[test]
+    fn voice_join_bucket_labels_match_the_pinned_contract() {
+        let metrics = Metrics::default();
+        metrics.voice_join_to_move(Duration::from_millis(1));
+        let text = metrics.render(None);
+        let rendered: Vec<&str> = text
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("two_bot_voice_join_to_move_seconds_bucket{le=\"")?
+                    .split('"')
+                    .next()
+            })
+            .collect();
+        assert_eq!(rendered, VOICE_JOIN_TO_MOVE_BUCKET_LE);
+    }
+
+    #[test]
     fn voice_join_occupancy_buckets_cap_without_new_series() {
         // Seeding TEST (occupancy-to-join curve): one counter per occupancy
         // bucket, capped at 7+ so cardinality stays fixed. No channel, member
@@ -2015,6 +2565,68 @@ mod tests {
             "two_bot_voice_vote_kick_total{{outcome=\"started\"}} {}\n",
             u64::MAX
         )));
+    }
+
+    #[test]
+    fn moderation_verbs_match_the_nine_command_names() {
+        let names: Vec<&str> = crate::moderation::ModerationAction::ALL
+            .iter()
+            .map(|action| action.command_name())
+            .collect();
+        assert_eq!(names, MODERATION_VERBS);
+        assert_eq!(MODERATION_VERBS.len(), 9);
+        assert_eq!(MODERATION_ENFORCEMENT_OUTCOMES.len(), 5);
+        assert_eq!(MODERATION_ENFORCEMENT_OUTCOMES.last(), Some(&"other"));
+    }
+
+    #[test]
+    fn moderation_enforcements_cover_every_verb_and_outcome() {
+        // TOG-28482 acceptance: each verb/outcome pair records with no network.
+        let metrics = Metrics::default();
+        for verb in MODERATION_VERBS {
+            for outcome in MODERATION_ENFORCEMENT_OUTCOMES {
+                metrics.moderation_enforcement(verb, outcome);
+            }
+        }
+        let text = metrics.render(None);
+        for verb in MODERATION_VERBS {
+            for outcome in MODERATION_ENFORCEMENT_OUTCOMES {
+                assert!(
+                    text.contains(&format!(
+                        "two_bot_moderation_enforcements_total{{verb=\"{verb}\",outcome=\"{outcome}\"}} 1\n"
+                    )),
+                    "missing {verb}/{outcome}"
+                );
+            }
+        }
+        // Fixed cardinality: 9 verbs x 5 outcomes.
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_moderation_enforcements_total{"))
+                .count(),
+            MODERATION_VERBS.len() * MODERATION_ENFORCEMENT_OUTCOMES.len()
+        );
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn moderation_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.moderation_enforcement(&hostile, &hostile);
+            metrics.moderation_enforcement("ban", &hostile);
+            metrics.moderation_enforcement(&hostile, "success");
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
     }
 
     #[test]
@@ -2373,6 +2985,79 @@ mod tests {
     }
 
     #[test]
+    fn creator_map_gauges_are_label_free_generation_and_age() {
+        // Observability v1: the creator-map freshness renders as two label-free
+        // gauge series — the last merged generation and the seconds since that
+        // merge, both 0 before the first merge — so no channel, creator,
+        // guild or timestamp label can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_creator_map_generation gauge\n"));
+        assert!(text.contains("two_bot_voice_creator_map_generation 0\n"));
+        assert!(text.contains("# TYPE two_bot_voice_creator_map_age_seconds gauge\n"));
+        assert!(text.contains("two_bot_voice_creator_map_age_seconds 0\n"));
+        metrics.set_voice_creator_map(7, 42);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_creator_map_generation 7\n"));
+        assert!(text.contains("two_bot_voice_creator_map_age_seconds 42\n"));
+        assert!(!text.contains("two_bot_voice_creator_map_generation{"));
+        assert!(!text.contains("two_bot_voice_creator_map_age_seconds{"));
+        // Last writer wins on both series together.
+        metrics.set_voice_creator_map(9, 300);
+        metrics.set_voice_creator_map(8, 301);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_creator_map_generation 8\n"));
+        assert!(text.contains("two_bot_voice_creator_map_age_seconds 301\n"));
+        // Fixed cardinality: exactly one series each, parseable numbers.
+        for name in [
+            "two_bot_voice_creator_map_generation",
+            "two_bot_voice_creator_map_age_seconds",
+        ] {
+            let series: Vec<_> = text
+                .lines()
+                .filter(|line| line.starts_with(&format!("{name} ")))
+                .collect();
+            assert_eq!(series.len(), 1, "missing series: {name}");
+            let (_, value) = series[0].rsplit_once(' ').unwrap();
+            value.parse::<u64>().expect("bad sample");
+        }
+    }
+
+    #[test]
+    fn live_not_ready_gauge_is_the_label_free_maximum_across_actors() {
+        // A live voice view left not ready on a connected gateway drops every
+        // creator join silently (production 2026-10-17/18). The host watchdog
+        // alerts on this gauge directly; a healthy guild must not hide it.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_live_not_ready_seconds gauge\n"));
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 0\n"));
+        assert!(text.contains("two_bot_voice_live_self_heal_total 0\n"));
+        metrics.set_voice_actor_live_not_ready(1, 1, 0);
+        metrics.set_voice_actor_live_not_ready(2, 1, 95);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 95\n"));
+        assert!(!text.contains("two_bot_voice_live_not_ready_seconds{"));
+        // A stale incarnation cannot overwrite; a newer one resets the entry.
+        metrics.set_voice_actor_halted(2, 2, false);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 0\n"));
+        metrics.set_voice_actor_live_not_ready(2, 1, 400);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 0\n"));
+        // Retiring the stuck actor removes its contribution.
+        metrics.set_voice_actor_live_not_ready(2, 2, 30);
+        metrics.remove_voice_actor(2, 2);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 0\n"));
+        metrics.voice_live_self_heal();
+        metrics.voice_live_self_heal();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_live_self_heal_total counter\n"));
+        assert!(text.contains("two_bot_voice_live_self_heal_total 2\n"));
+    }
+
+    #[test]
     fn rest_errors_and_reconnects_are_distinguished() {
         let metrics = Metrics::default();
         for status in [Some(204), Some(302), Some(403), Some(429), Some(503), None] {
@@ -2389,6 +3074,111 @@ mod tests {
         }
         assert!(text.contains("two_bot_gateway_reconnects_total 1\n"));
         assert!(text.contains("two_bot_gateway_latency_seconds NaN\n"));
+    }
+
+    #[test]
+    fn eventsub_reconcile_signals_stay_bounded_and_saturate() {
+        // Reconcile health: one pass series per outcome, one action series per
+        // mutation kind, one error series per log error_class. Per-subscription
+        // labels never reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"healthy\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"pending\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 0\n"));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_unhealthy\"} 0\n"
+        ));
+        metrics.eventsub_reconcile_pass("healthy");
+        metrics.eventsub_reconcile_pass("pending");
+        metrics.eventsub_reconcile_pass("failed");
+        metrics.eventsub_reconcile_action("create", 2);
+        metrics.eventsub_reconcile_action("delete", 1);
+        metrics.eventsub_reconcile_action("create", 0);
+        metrics.eventsub_reconcile_error("reconcile_action_failed");
+        metrics.eventsub_reconcile_error("reconcile_prior_failed");
+        metrics.eventsub_reconcile_error("reconcile_unhealthy");
+        metrics.eventsub_reconcile_error("reconcile_failed");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"healthy\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"pending\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 2\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_action_failed\"} 1\n"
+        ));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_prior_failed\"} 1\n"
+        ));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_unhealthy\"} 1\n"
+        ));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_failed\"} 1\n"
+        ));
+        // Fixed cardinality: 3 pass outcomes + 2 actions + 5 error classes.
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_eventsub_reconcile_"))
+            .collect();
+        assert_eq!(
+            series.len(),
+            EVENTSUB_RECONCILE_OUTCOMES.len()
+                + EVENTSUB_RECONCILE_ACTIONS.len()
+                + EVENTSUB_RECONCILE_ERROR_CLASSES.len()
+        );
+        let mut unique = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(unique.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn eventsub_reconcile_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.eventsub_reconcile_pass(&hostile);
+            metrics.eventsub_reconcile_action(&hostile, 1);
+            metrics.eventsub_reconcile_error(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 100\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 100\n"));
+        assert!(
+            text.contains("two_bot_eventsub_reconcile_errors_total{error_class=\"other\"} 100\n")
+        );
+    }
+
+    #[test]
+    fn eventsub_reconcile_counters_saturate_without_wrapping() {
+        let metrics = Metrics::default();
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.eventsub_reconcile_passes
+                [bounded_index("healthy", EVENTSUB_RECONCILE_OUTCOMES)] = u64::MAX;
+            values.eventsub_reconcile_actions
+                [bounded_index("create", EVENTSUB_RECONCILE_ACTIONS)] = u64::MAX;
+        }
+        metrics.eventsub_reconcile_pass("healthy");
+        metrics.eventsub_reconcile_action("create", 9);
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_eventsub_reconcile_passes_total{{outcome=\"healthy\"}} {}\n",
+            u64::MAX
+        )));
+        assert!(text.contains(&format!(
+            "two_bot_eventsub_reconcile_actions_total{{action=\"create\"}} {}\n",
+            u64::MAX
+        )));
     }
 
     #[test]
@@ -2414,6 +3204,93 @@ mod tests {
         assert!(text.contains(&format!("two_bot_gateway_disconnects_total {}\n", u64::MAX)));
         assert!(text.contains(&format!(
             "two_bot_gateway_missed_events_total {}\n",
+            u64::MAX
+        )));
+    }
+
+    #[test]
+    fn automod_decisions_cover_each_completion_kind_without_new_series() {
+        // TOG-28481: one counter per terminal CompletionKind, fixed 8-value
+        // vocabulary. No message text, excerpts or user IDs ever reach labels.
+        use crate::automod_runtime::CompletionKind;
+        let kinds = [
+            CompletionKind::Accepted,
+            CompletionKind::AlreadyProcessed,
+            CompletionKind::DryRun,
+            CompletionKind::Protected,
+            CompletionKind::Deleted,
+            CompletionKind::Warned,
+            CompletionKind::TimedOut,
+            CompletionKind::SanctionRefused,
+        ];
+        assert_eq!(
+            kinds.map(CompletionKind::as_str).as_slice(),
+            AUTOMOD_DECISION_OUTCOMES,
+            "CompletionKind::as_str must mirror the metrics allowlist in order"
+        );
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        for outcome in AUTOMOD_DECISION_OUTCOMES {
+            assert!(text.contains(&format!(
+                "two_bot_automod_decisions_total{{outcome=\"{outcome}\"}} 0\n"
+            )));
+        }
+        for kind in kinds {
+            metrics.automod_decision(kind.as_str());
+        }
+        metrics.automod_decision("deleted");
+        let text = metrics.render(None);
+        for (kind, count) in [
+            (CompletionKind::Accepted, 1),
+            (CompletionKind::AlreadyProcessed, 1),
+            (CompletionKind::DryRun, 1),
+            (CompletionKind::Protected, 1),
+            (CompletionKind::Deleted, 2),
+            (CompletionKind::Warned, 1),
+            (CompletionKind::TimedOut, 1),
+            (CompletionKind::SanctionRefused, 1),
+        ] {
+            assert!(text.contains(&format!(
+                "two_bot_automod_decisions_total{{outcome=\"{}\"}} {count}\n",
+                kind.as_str()
+            )));
+        }
+        // Fixed cardinality: exactly eight series, parseable samples.
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_automod_decisions_total{"))
+            .collect();
+        assert_eq!(series.len(), AUTOMOD_DECISION_OUTCOMES.len());
+        let mut unique = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(unique.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn automod_decision_hostile_labels_collapse_and_saturate() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.automod_decision(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(
+            text.contains("two_bot_automod_decisions_total{outcome=\"sanction_refused\"} 100\n")
+        );
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.automod_decisions = [u64::MAX; AUTOMOD_DECISION_OUTCOMES.len()];
+        }
+        metrics.automod_decision("accepted");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_automod_decisions_total{{outcome=\"accepted\"}} {}\n",
             u64::MAX
         )));
     }

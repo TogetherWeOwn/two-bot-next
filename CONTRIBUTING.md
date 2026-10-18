@@ -55,8 +55,9 @@ exact head commit. Never bypass or weaken a check.
 
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
-(unit, integration and doc tests) and two database lanes, `ignored db (stores)`
-and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
+(unit, integration and doc tests), `rust nextest` (workspace lib/bins under
+cargo-nextest with one retry, JUnit and a flake ledger) and two database lanes,
+`ignored db (stores)` and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
 (`job-inputs` and `container-inputs`), every selected lane, `worker check`, the
 SBOM dry-run and standalone database jobs. Both selectors and lint must always
 succeed; a heavy lane may skip only when selection explicitly deselects it.
@@ -66,11 +67,13 @@ in `scripts/ci/test_required_checks.py`. Only advisory `container smoke` is
 exempt: it can take up to 30 minutes, and image security stays gated through
 the SBOM job. The legacy `required-checks` aggregate is removed.
 
-Deterministic quality gates (patch coverage WARN, per-PR advisories HARD,
-ast-grep and Semgrep WARN, required voice synthetic, test-target inventory
-HARD) run as steps of the `check` lane on the existing routed runner; see
-[`docs/quality-gates.md`](docs/quality-gates.md). New checks start in WARN
-(report, never fail) and flip to HARD only with their backlog burned down.
+Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
+HARD, required voice synthetic, test-target inventory HARD) run as steps of
+the `check` lane on the existing routed runner; see
+[`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs in
+`rust-tests` with the disposable Postgres service and ignored database-backed
+tests. New checks start in WARN (report, never fail) and flip to HARD only with
+their backlog burned down.
 
 Every Rust setup step in `check.yml` installs the exact version from
 `rust-toolchain.toml`, including fmt/clippy components where required. Do not use

@@ -36,6 +36,7 @@ mod onboarding;
 mod persistent;
 mod recovery;
 mod rsvp;
+mod supervised_reconnect;
 mod voice;
 
 const GUILD: &str = "2222";

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Advisory lint for risky Postgres migration statements (squawk subset).
+"""Lint risky Postgres migration statements (squawk subset).
 
 Scans changed migration files for statements that take disruptive locks or
 break running application code. Deterministic: standard library only, no
@@ -14,9 +14,10 @@ squawk binary or shared reusable workflow:
 - dropping-object: DROP TABLE or DROP COLUMN breaks running code.
 
 Advisory by default: findings print as ::warning annotations and exit 0.
---strict prints ::error and exits 1 (the promotion path to a required
-check). Tooling failures (unresolvable baseline, unreadable file) always
-exit 1 so blindness can never read as clean.
+--strict makes the first four rules blocking; dropping-object remains a
+warning because coordinated removals still require a final DROP. Tooling
+failures (unresolvable baseline, unreadable file) always exit 1 so blindness
+can never read as clean.
 """
 
 import argparse
@@ -36,6 +37,7 @@ RULES = (
     "changing-column-type",
     "dropping-object",
 )
+STRICT_RULES = frozenset(RULES) - {"dropping-object"}
 
 ADVICE = {
     "adding-required-field": (
@@ -46,8 +48,10 @@ ADVICE = {
     "creating-index": (
         "CREATE INDEX without CONCURRENTLY blocks writes on existing tables; "
         "use CREATE INDEX CONCURRENTLY in a separate migration run outside "
-        "a transaction (sqlx no-transaction). Indexes on a table created "
-        "earlier in the same file target an empty table and are not flagged"
+        "a transaction (sqlx no-transaction). Indexes on the same qualified "
+        "relation created unconditionally earlier in the same file target "
+        "an empty table and are not flagged; CREATE TABLE IF NOT EXISTS "
+        "earns no such exemption"
     ),
     "adding-check-constraint": (
         "CHECK constraint without NOT VALID scans and locks the table; "
@@ -89,7 +93,7 @@ ALTER_TABLE_PREFIX = re.compile(
 BARE_DROP = re.compile(r"^\s*DROP\s+(?!CONSTRAINT\b)", re.IGNORECASE)
 CREATE_TABLE = re.compile(
     r"\bCREATE\s+(?:(?:GLOBAL|LOCAL)\s+)?(?:TEMP(?:ORARY)?\s+|UNLOGGED\s+)?"
-    r"TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:ONLY\s+)?"
+    r"TABLE\s+(?P<conditional>IF\s+NOT\s+EXISTS\s+)?(?:ONLY\s+)?"
     r'(?P<name>"[^"]+"|[A-Za-z_][A-Za-z0-9_\.]*)',
     re.IGNORECASE,
 )
@@ -104,20 +108,40 @@ INDEX_TARGET = re.compile(
 DOLLAR_OPEN = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
 
 
-def normalize_table(raw):
-    """Lowercase unqualified table name for same-file empty-table checks.
+def _normalize_part(part):
+    """Normalise one dot-separated identifier part from blanked() output.
 
-    Inputs arrive via blanked(), which maps every quoted identifier to a
-    placeholder: simple lowercase names (``"guilds"``) become ``_qq_guilds_``
-    (the same placeholder for the same name) while every other quoted name
-    becomes a case-sensitive ``_qq_<n>_`` token. Placeholders never match
-    keyword regexes (``\\b`` cannot fire inside ``_..._``), so quoted
-    keyword names such as ``"default"`` stay inert. Stripping the wrapper
-    restores equality: ``_qq_guilds_`` compares equal to unquoted ``guilds``.
+    blanked() maps every quoted identifier to a placeholder: simple
+    lowercase names (``"guilds"``) become ``_qq_guilds_`` (the same
+    placeholder for the same name) while every other quoted name becomes
+    a case-sensitive ``_qq_<n>_`` token. Placeholders never match keyword
+    regexes (``\\b`` cannot fire inside ``_..._``), so quoted keyword
+    names such as ``"default"`` stay inert. Lowercasing folds unquoted
+    names as Postgres does, and stripping the wrapper restores equality:
+    ``_qq_guilds_`` compares equal to unquoted ``guilds``, while a
+    case-sensitive ``_qq_<n>_`` never equals a folded unquoted name.
     """
-    base = raw.strip().split(".")[-1].strip().lower()
+    base = part.strip().lower()
     match = re.fullmatch(r"_qq_(.+)_", base)
     return match.group(1) if match else base
+
+
+def normalize_relation(raw):
+    """Return the (schema, table) identity of a possibly qualified relation.
+
+    The same-file empty-table exemption belongs to the exact relation
+    that was created, schema and table together: ``scratch.items`` must
+    never exempt an index on ``public.items``, which may already hold
+    data. An unqualified name means the ``public`` schema (the one
+    justified compatibility, in either direction); any other explicitly
+    named schema is a different relation. Names with more than two
+    parts keep every part, so an ambiguous identity only ever matches
+    itself exactly and never broadens the exemption.
+    """
+    parts = tuple(_normalize_part(part) for part in raw.strip().split("."))
+    if len(parts) == 1:
+        return ("public", parts[0])
+    return parts
 
 
 class SquawkError(ValueError):
@@ -133,7 +157,7 @@ def blanked(text):
     such as ``"default"`` never reads as a live keyword. Simple lowercase
     names (``"guilds"``) emit ``_qq_guilds_`` (the same placeholder for the
     same name) so they compare equal to the unquoted form once
-    normalize_table() strips the wrapper, as Postgres folds unquoted names
+    _normalize_part() strips the wrapper, as Postgres folds unquoted names
     to lowercase. Every other quoted identifier maps to a unique
     placeholder per distinct name (``_qq_<n>_``), so two different quoted
     table names never collapse to one token while the same quoted name
@@ -329,7 +353,7 @@ def index_on_existing_table(sql, created_tables):
     match = INDEX_TARGET.search(sql)
     if not match:
         return True
-    return normalize_table(match.group("name")) not in created_tables
+    return normalize_relation(match.group("name")) not in created_tables
 
 
 def has_dropping_object(sql):
@@ -376,9 +400,12 @@ def lint_statement(sql, created_tables=frozenset()):
 def lint_text(text):
     """Return [(line, rule)] findings for one migration file's contents.
 
-    CREATE TABLE names accumulate in statement order so an index on a table
-    created earlier in the same file (still empty) is not flagged, while an
-    index on any other table still is.
+    Unconditional CREATE TABLE names accumulate in statement order so an
+    index on a table created earlier in the same file (still empty) is not
+    flagged, while an index on any other table still is. Conditional
+    CREATE TABLE IF NOT EXISTS is a no-op when the relation already
+    exists, so it proves nothing about emptiness and never qualifies the
+    relation for the exemption.
     """
     findings = []
     created = set()
@@ -386,7 +413,8 @@ def lint_text(text):
         for rule in lint_statement(sql, created):
             findings.append((line, rule))
         for match in CREATE_TABLE.finditer(sql):
-            created.add(normalize_table(match.group("name")))
+            if match.group("conditional") is None:
+                created.add(normalize_relation(match.group("name")))
     return findings
 
 
@@ -469,7 +497,11 @@ def main(argv=None):
         help="repeatable fnmatch exclusion applied after the globs",
     )
     parser.add_argument("--base-ref", default=None, help="Git baseline; lint files changed since it (default: lint all files)")
-    parser.add_argument("--strict", action="store_true", help="exit 1 on findings (required-check mode)")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 1 on the four blocking rules; dropping-object remains advisory",
+    )
     args = parser.parse_args(argv)
     globs = args.migration_glob if args.migration_glob else [DEFAULT_GLOB]
     try:
@@ -477,18 +509,21 @@ def main(argv=None):
     except (SquawkError, OSError) as error:
         print(f"squawk gate: {error}", file=sys.stderr)
         return 1
-    level = "error" if args.strict else "warning"
     for relative, line, rule in findings:
+        level = "error" if args.strict and rule in STRICT_RULES else "warning"
         print(f"::{level} file={relative},line={line}::[squawk:{rule}] {ADVICE[rule]}")
+    blocking = args.strict and any(
+        rule in STRICT_RULES for _, _, rule in findings
+    )
     if findings:
         files = sorted({relative for relative, _, _ in findings})
         print(
             f"squawk gate: {len(findings)} finding(s) in {len(files)} file(s)"
-            + ("" if args.strict else " (advisory)")
+            + ("" if blocking else " (advisory)")
         )
     else:
         print("squawk gate: no risky migration statements")
-    return 1 if args.strict and findings else 0
+    return 1 if blocking else 0
 
 
 if __name__ == "__main__":

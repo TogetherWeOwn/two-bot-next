@@ -147,7 +147,13 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             .required()
             .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
         CommandDefinition::new("schedule-list", "List scheduled messages for this server")
-            .permissions(PERM_MANAGE_GUILD),
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![CommandOption::new(
+                "page",
+                "Page of the schedule list (1-based)",
+                CommandOptionType::Integer,
+            )
+            .min_value(1)]),
         CommandDefinition::new("sticky", "Set this channel's sticky message")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
@@ -422,11 +428,11 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 3 core + 1 scorecard + 8 automation + 7 announcement.
-        assert_eq!(merged.len(), 19);
+        // 4 core + 1 scorecard + 8 automation + 7 announcement.
+        assert_eq!(merged.len(), 20);
         assert_eq!(
-            &names(&merged)[..4],
-            ["rank", "leaderboard", "help", "attendance"]
+            &names(&merged)[..5],
+            ["rank", "leaderboard", "help", "privacy", "attendance"]
         );
         assert!(!merged.iter().any(|d| d.dm_permission));
     }

@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Pool, Postgres};
-use two_bot_core::{EventType, FunnelEvent, FunnelStore, InviteSnapshotStore, InviteState};
+use two_bot_core::{
+    analytics_family::AnalyticsCategory, EventType, FunnelEvent, FunnelStore, InviteSnapshotStore,
+    InviteState,
+};
 use two_bot_store::{migrate, PgFunnelStore, PgInviteSnapshots, DB_POOL_MAX};
 
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
@@ -329,7 +332,12 @@ async fn insert_first_projection_rungs_and_rollback() {
         store.next_message_rung(123, 456, "2026-09-29T12:00:03.000Z"),
         None
     );
-    store.touch_activity(123, 456, "2026-09-29T11:00:00.000Z");
+    store.touch_activity(
+        123,
+        456,
+        "2026-09-29T11:00:00.000Z",
+        AnalyticsCategory::Activity,
+    );
     let recency: String = sqlx::query_scalar("SELECT to_char(last_active_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM members WHERE guild_id = '123' AND member_id = '456'")
         .fetch_one(&f.pool).await.unwrap();
     assert_eq!(recency, "2026-09-29T12:00:02.000Z");
@@ -575,7 +583,7 @@ async fn suppressed_pair_drops_funnel_writes_while_others_persist() {
             .inserted,
         "suppressed pair drops"
     );
-    store.touch_activity(123, 456, at);
+    store.touch_activity(123, 456, at, AnalyticsCategory::Activity);
     store.mark_bot(123, 456);
     let suppressed: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM members WHERE guild_id = '123' AND member_id = '456'",

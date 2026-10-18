@@ -75,6 +75,29 @@ MERGED_SUITE = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+# Non-finite / overflowing durations: a corrupted or non-nextest JUnit
+# producer can emit time values float() parses but int() cannot convert
+# (inf, or finite seconds whose millisecond scaling overflows to inf).
+# Those must contribute 0 ms, not abort the whole ledger run.
+BAD_TIMES = ["NaN", "inf", "-inf", "1e308", "-1e308", "1e999"]
+
+
+def nonfinite_suite(bad):
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="unit" tests="3" failures="0" errors="0" skipped="0">
+    <testcase classname="ledger" name="bad_case_time" time="{bad}">
+      <flakyFailure message="first attempt failed" type="assert" time="0.020">boom</flakyFailure>
+    </testcase>
+    <testcase classname="ledger" name="bad_retry_time" time="0.005">
+      <flakyFailure message="first attempt failed" type="assert" time="{bad}">boom</flakyFailure>
+    </testcase>
+    <testcase classname="ledger" name="ordinary_truncation" time="0.0129"/>
+  </testsuite>
+</testsuites>
+"""
+
+
 def run_ledger(junit_text):
     with tempfile.TemporaryDirectory() as tmp:
         junit = Path(tmp) / "junit.xml"
@@ -150,6 +173,34 @@ class FlakeLedgerTests(unittest.TestCase):
         self.assertTrue(rows[0]["flaky"])
         self.assertEqual(rows[0]["attempts"], 2)
         self.assertEqual(rows[0]["time_ms"], 25)
+
+    def test_nonfinite_and_overflowing_times_contribute_zero(self):
+        for bad in BAD_TIMES:
+            with self.subTest(bad=bad):
+                code, rows = run_ledger(nonfinite_suite(bad))
+                self.assertEqual(code, 0)
+                by_name = {row["name"]: row for row in rows}
+                # Bad testcase time contributes 0; the finite retry time
+                # on the flakyFailure child still counts.
+                self.assertEqual(
+                    by_name["bad_case_time"],
+                    {
+                        "suite": "unit",
+                        "classname": "ledger",
+                        "name": "bad_case_time",
+                        "status": "pass",
+                        "flaky": True,
+                        "attempts": 2,
+                        "time_ms": 20,
+                    },
+                )
+                # Bad retry-child time contributes 0; the finite testcase
+                # time still counts.
+                self.assertEqual(by_name["bad_retry_time"]["time_ms"], 5)
+                self.assertEqual(by_name["bad_retry_time"]["attempts"], 2)
+                self.assertTrue(by_name["bad_retry_time"]["flaky"])
+                # Ordinary finite values keep truncating to whole ms.
+                self.assertEqual(by_name["ordinary_truncation"]["time_ms"], 12)
 
     def test_identical_input_bytes_give_identical_output_bytes(self):
         first = run_ledger(FLAKY_SUITE)

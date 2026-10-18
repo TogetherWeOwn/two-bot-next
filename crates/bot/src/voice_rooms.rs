@@ -16,7 +16,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex, RwLock, Weak,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -47,7 +47,7 @@ use twilight_model::{
         interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
     },
     id::{
-        marker::{AttachmentMarker, RoleMarker, UserMarker},
+        marker::{AttachmentMarker, GuildMarker, RoleMarker, UserMarker},
         Id,
     },
 };
@@ -778,6 +778,78 @@ fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
     }
 }
 
+/// One structured line per executed rename decision, so a room that keeps
+/// its default name is diagnosable from logs alone: `decision` names the
+/// outcome, `reason` carries the bounded skip reason when there is one
+/// (empty otherwise) and `retry_after_ms` is 0 unless Discord asked for a
+/// wait. A single callsite per level, not one per decision: each `tracing`
+/// callsite costs release-binary bytes against the container size budget.
+/// The requested name is never logged: it is member-derived text (display
+/// names, stream titles, presence titles), and the decision, IDs and
+/// counts are what the triage needs.
+fn log_rename_decision(
+    guild: Snowflake,
+    channel: Snowflake,
+    decision: &str,
+    reason: &str,
+    retry_after_ms: u64,
+    warn_level: bool,
+) {
+    if warn_level {
+        warn!(
+            guild = %guild,
+            channel = %channel,
+            decision,
+            reason,
+            retry_after_ms,
+            "voice room rename decision"
+        );
+    } else {
+        info!(
+            guild = %guild,
+            channel = %channel,
+            decision,
+            reason,
+            retry_after_ms,
+            "voice room rename decision"
+        );
+    }
+}
+
+/// The template-render counterpart of [`log_rename_decision`]: what the
+/// naming pass decided before anything was queued, including whether a
+/// game activity was detected at all. Like its counterpart it logs no
+/// member-derived text. The `channel_unseen` decision is the retry-only
+/// one — the pass resets and retries it, so it can recur on every pass
+/// while the channel stays unseen — and is logged at debug so that loop
+/// cannot flood the info stream.
+fn log_template_name_decision(
+    guild: Snowflake,
+    channel: Snowflake,
+    playing_members: u32,
+    decision: &str,
+) {
+    if decision == "channel_unseen" {
+        debug!(
+            guild = %guild,
+            channel = %channel,
+            playing_members,
+            activity_detected = playing_members > 0,
+            decision,
+            "voice room rename decision"
+        );
+    } else {
+        info!(
+            guild = %guild,
+            channel = %channel,
+            playing_members,
+            activity_detected = playing_members > 0,
+            decision,
+            "voice room rename decision"
+        );
+    }
+}
+
 /// Where one operator notice is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeTarget {
@@ -1260,6 +1332,12 @@ fn wall_ms() -> u64 {
 #[derive(Debug, Default)]
 pub(crate) struct LiveState {
     ready: bool,
+    /// When the gateway last reported itself connected (READY or RESUMED
+    /// handled) while this live view was still not ready. `None` while the
+    /// view is ready or the transport is down. Joins are silently dropped
+    /// for as long as this is set, so its age is exported per actor tick as
+    /// `two_bot_voice_live_not_ready_seconds` for the host watchdog.
+    not_ready_since: Option<tokio::time::Instant>,
     generation: u64,
     next_transition: u64,
     next_channel_revision: u64,
@@ -1666,6 +1744,7 @@ impl LiveGuild {
             live.refresh_empty_since(channel);
         }
         live.ready = true;
+        live.not_ready_since = None;
         true
     }
 
@@ -1674,6 +1753,34 @@ impl LiveGuild {
         live.ready = false;
         live.generation += 1;
         live.empty_since.clear();
+    }
+
+    /// Transport loss: the view is not ready, and that is expected until the
+    /// next READY/RESUMED, so the not-ready-while-connected clock stops too.
+    pub fn transport_lost(&self) {
+        self.disconnect();
+        self.write_state().not_ready_since = None;
+    }
+
+    /// The gateway is connected again (READY or RESUMED handled). A view
+    /// that is still not ready starts (or keeps) its not-ready clock; the
+    /// first stamp wins so repeated heal attempts cannot reset the age.
+    pub fn gateway_connected(&self, now: tokio::time::Instant) {
+        let mut live = self.write_state();
+        if !live.ready {
+            live.not_ready_since.get_or_insert(now);
+        }
+    }
+
+    /// Whole seconds this view has been not ready while the gateway was
+    /// connected; 0 while ready or while the transport is down.
+    #[must_use]
+    pub fn not_ready_secs(&self, now: tokio::time::Instant) -> u64 {
+        let live = self.read_state();
+        match live.not_ready_since {
+            Some(since) if !live.ready => now.saturating_duration_since(since).as_secs(),
+            _ => 0,
+        }
     }
 
     /// V10 health check: the bot's missing Manage Channels, Move Members,
@@ -2503,8 +2610,13 @@ pub struct GuildRoomWorker<S, H> {
     /// re-read; the maintenance tick merges it, debounced. Set by
     /// `ActorCommand::RefreshCreators`, cleared by `reload_creators`.
     creators_refresh_due: bool,
-    /// Actor clock of the last creator-view merge (periodic refresh).
+    /// Actor clock of the last creator refresh *attempt* (success or
+    /// failure); paces the interval/debounce retries.
     creators_read_ms: Option<u64>,
+    /// Actor clock of the last *successful* creator-view merge. The age
+    /// gauge counts from this field only, so it keeps climbing through a
+    /// store outage instead of resetting on every failed attempt.
+    creators_merged_ms: Option<u64>,
     /// Live generation the creator view was last merged at. A gateway
     /// reconnect (GuildCreate/Resumed) bumps the generation but sends no
     /// channel event, so with no RefreshCreators flag the merge would wait
@@ -2573,6 +2685,16 @@ pub struct GuildRoomWorker<S, H> {
     name_settings_loaded: bool,
     /// Actor clock of the last settings read (periodic reload).
     name_settings_read_ms: Option<u64>,
+    /// Boot fallback for the empty-room grace (`TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS`
+    /// at boot). A stored per-guild row overrides it live; unset and
+    /// out-of-range rows keep it.
+    empty_grace_fallback: Duration,
+    /// Revision of the live snapshot the empty grace was last resolved from.
+    /// Revision-gated so steady-state maintenance costs two mutex reads.
+    empty_grace_revision: Option<i64>,
+    /// Live-settings source for the stored empty-grace override (production
+    /// poller snapshot; tests resolve explicit snapshots instead).
+    live_source: Arc<dyn Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync>,
     /// Cheap fingerprint of every input automatic names depend on; an idle
     /// guild skips the per-room work entirely.
     name_inputs: Option<u64>,
@@ -2890,6 +3012,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         let guild_id = live.guild_id;
         let creators_generation = live.read_state().generation;
+        let empty_grace_fallback = live.read_state().empty_grace.unwrap_or(EMPTY_ROOM_GRACE);
         let worker = Self {
             live,
             store,
@@ -2897,6 +3020,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             creators,
             creators_refresh_due: false,
             creators_read_ms: None,
+            creators_merged_ms: None,
             creators_generation,
             creator_misses: HashSet::new(),
             creator_revalidate_cooldown_until: None,
@@ -2920,6 +3044,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             name_signatures: HashMap::new(),
             name_settings_loaded,
             name_settings_read_ms: None,
+            empty_grace_fallback,
+            empty_grace_revision: None,
+            live_source: Arc::new(|| None),
             name_inputs: None,
             room_status: HashMap::new(),
             pending_status: HashMap::new(),
@@ -2973,6 +3100,31 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             );
         }
         Ok(worker)
+    }
+
+    /// Re-resolve the empty-room grace from the live snapshot. Revision-gated,
+    /// so steady-state calls cost two mutex reads. A stored change applies
+    /// without a restart; unset and out-of-range rows keep the boot fallback.
+    /// Tests pass an explicit snapshot pair.
+    pub(crate) fn refresh_empty_grace_with(
+        &mut self,
+        live: Option<&two_bot_core::settings::LiveSettings>,
+    ) {
+        let revision = live.map(|live| live.revision());
+        if self.empty_grace_revision == revision {
+            return;
+        }
+        self.empty_grace_revision = revision;
+        let guild = self.live.guild_id.to_string();
+        let grace = stored_empty_grace_with(&guild, self.empty_grace_fallback, live);
+        self.live.set_empty_grace(grace);
+    }
+
+    /// Refresh from the runtime's live-settings source (production poller
+    /// snapshot; no reader in tests, so the boot fallback stands).
+    pub(crate) fn refresh_empty_grace(&mut self) {
+        let live = (self.live_source)();
+        self.refresh_empty_grace_with(live.as_ref());
     }
 
     /// Run the create-path name filter under `policy` from here on.
@@ -3278,6 +3430,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         match self.store.creators(self.live.guild_id).await {
             Ok(rows) => {
                 self.creators_generation = generation;
+                self.creators_merged_ms = Some(now_ms);
                 self.creator_misses.clear();
                 self.creator_revalidate_cooldown_until = None;
                 let mut added = 0u64;
@@ -6103,6 +6256,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                 };
                 if let Some(reason) = skip {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        if reason == "rename_no_access" {
+                            "permission_denied"
+                        } else {
+                            reason
+                        },
+                        reason,
+                        0,
+                        false,
+                    );
                     metrics::global().voice_name(reason);
                     self.queue.mark_succeeded(&action);
                     return true;
@@ -6126,6 +6291,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                 };
                 if duplicate {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        "duplicate_name",
+                        "",
+                        0,
+                        false,
+                    );
                     metrics::global().voice_name("rename_duplicate");
                     self.desired_names.remove(&channel_id);
                     // The override never landed: clear it (memory plus store)
@@ -6147,6 +6320,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 // One rename per channel at a time: a newer name waits for
                 // the outcome of the one still running.
                 if self.renames_in_flight.contains_key(&channel_id) {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        "in_flight_deferred",
+                        "",
+                        0,
+                        false,
+                    );
                     metrics::global().voice_name("rename_held");
                     self.queue.mark_succeeded(&action);
                     self.rename_retries.insert(
@@ -6155,6 +6336,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     );
                     return true;
                 }
+                log_rename_decision(self.live.guild_id, channel_id, "attempted", "", 0, false);
                 metrics::global().voice_name("rename_sent");
                 let result = match self.http.detached_rename(channel_id, &name) {
                     Some(request) => {
@@ -6177,6 +6359,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 };
                 match result {
                     Ok(()) => {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            "renamed",
+                            "",
+                            0,
+                            false,
+                        );
                         self.queue.mark_succeeded(&action);
                         self.rename_timeouts.remove(&channel_id);
                         if let Some(channel) = self.live.write_state().channels.get_mut(&channel_id)
@@ -6185,6 +6375,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         }
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            "rate_limited",
+                            "",
+                            retry_after_ms,
+                            true,
+                        );
                         self.queue.mark_rate_limited(
                             self.live.guild_id,
                             retry_after_ms.max(RENAME_MIN_INTERVAL_MS),
@@ -6198,6 +6396,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     // update makes the retry a no-op; a Discord limit answers
                     // with its own retry-after.
                     Err(RoomHttpError::RenameDeferred) => {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            "outcome_deferred",
+                            "",
+                            0,
+                            true,
+                        );
                         let delay = self.rename_timeout_delay(channel_id);
                         self.queue.mark_rate_limited(
                             self.live.guild_id,
@@ -6207,6 +6413,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         );
                     }
                     Err(RoomHttpError::UnknownOutcome) => {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            "outcome_unknown",
+                            "",
+                            0,
+                            true,
+                        );
                         self.queue.mark_rate_limited(
                             self.live.guild_id,
                             RENAME_MIN_INTERVAL_MS,
@@ -6214,7 +6428,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             action,
                         );
                     }
-                    Err(error) => self.complete_error(action, channel_id, error),
+                    Err(error) => {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            if matches!(&error, RoomHttpError::AccessDenied) {
+                                "permission_denied"
+                            } else {
+                                "discord_error"
+                            },
+                            "",
+                            0,
+                            true,
+                        );
+                        self.complete_error(action, channel_id, error);
+                    }
                 }
             }
         }
@@ -6513,6 +6741,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.renames_in_flight.remove(&channel_id);
             let retry_in = match result {
                 Ok(()) => {
+                    log_rename_decision(self.live.guild_id, channel_id, "renamed", "", 0, false);
                     self.rename_timeouts.remove(&channel_id);
                     if let Some(channel) = self.live.write_state().channels.get_mut(&channel_id) {
                         channel.name = Some(name);
@@ -6520,11 +6749,51 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     continue;
                 }
                 Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        "rate_limited",
+                        "",
+                        retry_after_ms,
+                        true,
+                    );
                     retry_after_ms.max(RENAME_MIN_INTERVAL_MS)
                 }
-                Err(RoomHttpError::RenameDeferred) => self.rename_timeout_delay(channel_id),
-                Err(RoomHttpError::UnknownOutcome) => RENAME_MIN_INTERVAL_MS,
+                Err(RoomHttpError::RenameDeferred) => {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        "outcome_deferred",
+                        "",
+                        0,
+                        true,
+                    );
+                    self.rename_timeout_delay(channel_id)
+                }
+                Err(RoomHttpError::UnknownOutcome) => {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        "outcome_unknown",
+                        "",
+                        0,
+                        true,
+                    );
+                    RENAME_MIN_INTERVAL_MS
+                }
                 Err(error) => {
+                    log_rename_decision(
+                        self.live.guild_id,
+                        channel_id,
+                        if matches!(&error, RoomHttpError::AccessDenied) {
+                            "permission_denied"
+                        } else {
+                            "discord_error"
+                        },
+                        "",
+                        0,
+                        true,
+                    );
                     self.settle_error(channel_id, error, None);
                     continue;
                 }
@@ -6818,10 +7087,50 @@ struct PendingImport {
     expires_at: Instant,
 }
 
+/// Reply for a command whose required guild-role facts have not loaded
+/// yet: retryable, never a permanent permission denial.
+const WARMING_UP_REPLY: &str =
+    "Voice commands are warming up while I load this server's permissions. Please try again shortly.";
+
+/// Whether guild-role authority could be established for an interaction.
+/// `WarmingUp` covers absent, unready, disconnected or incomplete
+/// guild-role facts; `MissingMember` covers an interaction without the
+/// member/user facts needed to evaluate authority at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuildAuthority {
+    Ready(Permissions),
+    WarmingUp,
+    MissingMember,
+}
+
+/// Commands gated on guild-role authority (`may_create`, the admin flag,
+/// or `may_manage_server`). Only these get the warming-up reply when cold;
+/// commands that do not depend on that authority keep their behaviour.
+fn requires_guild_authority(command: &VoiceCommand) -> bool {
+    matches!(
+        command,
+        VoiceCommand::Create { .. }
+            | VoiceCommand::TextChannels { .. }
+            | VoiceCommand::Position { .. }
+            | VoiceCommand::Group { .. }
+            | VoiceCommand::InheritPermissions { .. }
+            | VoiceCommand::DefaultLimit { .. }
+            | VoiceCommand::AlwaysPrivate { .. }
+            | VoiceCommand::Access(_)
+            | VoiceCommand::Logging(_)
+            | VoiceCommand::Export
+            | VoiceCommand::Import { .. }
+    )
+}
+
 pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,
     enabled: bool,
+    /// Live-settings source for the per-guild empty-grace override. Production
+    /// reads the settings-poller snapshot; tests default to no reader (boot
+    /// fallback, byte-identical).
+    live_source: Arc<dyn Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync>,
     protected_channels: HashSet<Snowflake>,
     /// Boot creator set (the generator channel): copied into each new actor's
     /// `creator_channels` alongside the store creators loaded later.
@@ -6830,6 +7139,11 @@ pub struct VoiceRuntime<S, H> {
     synthetic_humans: HashSet<Snowflake>,
     seeds: AtomicU64,
     actors: Mutex<HashMap<Snowflake, GuildActor>>,
+    /// The gateway is connected as far as voice is concerned: set once READY
+    /// or RESUMED is handled, cleared by every transport `disconnect`. While
+    /// set, a live view that is not ready is a fault, not an outage, and
+    /// every dispatch retries the cached snapshot (see `heal_not_ready`).
+    gateway_connected: AtomicBool,
     /// Serializes `/access` read-modify-write cycles so two admins cannot
     /// overwrite each other's change (rare, admin-only, so one lock is enough).
     access_lock: tokio::sync::Mutex<()>,
@@ -6864,12 +7178,14 @@ where
             make: Arc::new(make),
             tick,
             enabled,
+            live_source: Arc::new(|| None),
             protected_channels: HashSet::new(),
             creator_channels: HashSet::new(),
             empty_grace: None,
             synthetic_humans: HashSet::new(),
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
+            gateway_connected: AtomicBool::new(false),
             access_lock: tokio::sync::Mutex::new(()),
             pending_imports: Mutex::new(HashMap::new()),
             name_policy: Arc::new(AutomodPolicy::default()),
@@ -6902,6 +7218,17 @@ where
     /// production; fixtures shorten it for unrelated lifecycle races).
     pub fn with_empty_grace(mut self, grace: Duration) -> Self {
         self.empty_grace = Some(grace);
+        self
+    }
+
+    /// Live-settings source for the stored per-guild empty-grace override.
+    /// Production passes the settings-poller snapshot reader; tests keep the
+    /// default (no reader, boot fallback).
+    pub fn with_live_source(
+        mut self,
+        source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
+    ) -> Self {
+        self.live_source = Arc::new(source);
         self
     }
 
@@ -6955,23 +7282,53 @@ where
         interaction: &Interaction,
         now_micros: i128,
     ) -> Option<Permissions> {
-        let guild = interaction_guild(interaction)?;
-        let member = interaction.member.as_ref()?;
-        let member_id = member.user.as_ref()?.id.get();
-        let actor = self.live_actor(guild)?;
+        match self.guild_authority_at(interaction, now_micros) {
+            GuildAuthority::Ready(permissions) => Some(permissions),
+            GuildAuthority::WarmingUp | GuildAuthority::MissingMember => None,
+        }
+    }
+
+    fn guild_authority(&self, interaction: &Interaction) -> GuildAuthority {
+        self.guild_authority_at(
+            interaction,
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000,
+        )
+    }
+
+    /// Tri-state behind [`Self::guild_permissions_at`]: a generic `None`
+    /// cannot tell a cold snapshot (retryable) from a missing member
+    /// (malformed, never relabelled as warm-up). Missing/disconnected or
+    /// incomplete guild-role facts are `WarmingUp` and stay fail-closed.
+    fn guild_authority_at(&self, interaction: &Interaction, now_micros: i128) -> GuildAuthority {
+        let Some(guild) = interaction_guild(interaction) else {
+            return GuildAuthority::MissingMember;
+        };
+        let Some(member) = interaction.member.as_ref() else {
+            return GuildAuthority::MissingMember;
+        };
+        let Some(member_id) = member.user.as_ref().map(|user| user.id.get()) else {
+            return GuildAuthority::MissingMember;
+        };
+        let Some(actor) = self.live_actor(guild) else {
+            return GuildAuthority::WarmingUp;
+        };
         let live = actor.live.read_state();
         if !live.ready {
-            return None;
+            return GuildAuthority::WarmingUp;
         }
-        let bot = live.bot.as_ref()?;
-        let mut permissions = effective_permissions(
+        let Some(bot) = live.bot.as_ref() else {
+            return GuildAuthority::WarmingUp;
+        };
+        let Some(mut permissions) = effective_permissions(
             guild,
             bot.guild_owner_id,
             member_id,
             &member.roles,
             &bot.roles,
             &[],
-        )?;
+        ) else {
+            return GuildAuthority::WarmingUp;
+        };
         // Discord exempts the guild owner and Administrator, both of which
         // effective_permissions resolves to all bits. Other timed-out members
         // retain only their existing View Channel and Read Message History bits.
@@ -6983,7 +7340,7 @@ where
         {
             permissions &= Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY;
         }
-        Some(permissions)
+        GuildAuthority::Ready(permissions)
     }
 
     fn ensure_actor(&self, guild: Snowflake) -> Option<GuildActor> {
@@ -7009,9 +7366,21 @@ where
         actor
             .live
             .protect_creators(self.creator_channels.iter().copied());
-        if let Some(grace) = self.empty_grace {
+        // Boot fallback first, then the stored per-guild override: a stored
+        // change reaches new actors without a restart; unset and out-of-range
+        // rows keep the boot value.
+        let fallback = self.empty_grace.unwrap_or(EMPTY_ROOM_GRACE);
+        let guild_id = guild.to_string();
+        let snapshot = (self.live_source)();
+        let stored = snapshot
+            .as_ref()
+            .and_then(|live| live.get(&guild_id, EMPTY_GRACE_KEY));
+        let grace = stored_empty_grace_with(&guild_id, fallback, snapshot.as_ref());
+        if self.empty_grace.is_some() || stored.is_some() {
             actor.live.set_empty_grace(grace);
         }
+        // Else leave `empty_grace` unset: `empty_grace_elapsed` falls back to
+        // `EMPTY_ROOM_GRACE`, byte-identical to today.
         let synthetic = synthetic_humans_for(guild, &self.synthetic_humans);
         if !synthetic.is_empty() {
             actor.live.set_synthetic_humans(synthetic);
@@ -7020,6 +7389,7 @@ where
         let make = Arc::clone(&self.make);
         let tick = self.tick;
         let name_policy = Arc::clone(&self.name_policy);
+        let live_source = Arc::clone(&self.live_source);
         tokio::spawn(async move {
             let (store, http) = make();
             let guild_id = live.guild_id;
@@ -7031,6 +7401,15 @@ where
                 }
             };
             let mut worker = worker.with_name_policy(name_policy);
+            worker.live_source = live_source;
+            // `load` captures the fallback from the shared live state, which
+            // already holds the stored override here; restore the true boot
+            // value so a later row removal or out-of-range edit falls back
+            // to boot, not to the stale stored grace.
+            worker.empty_grace_fallback = fallback;
+            // Apply the stored override at spawn; later stored changes arrive
+            // through the maintenance refresh without a restart.
+            worker.refresh_empty_grace();
             run_actor(&mut worker, rx, tick).await;
         });
         actors.insert(guild, actor.clone());
@@ -7053,6 +7432,64 @@ where
             return false;
         };
         actor.live.publish(snapshot) && actor.tx.send(ActorCommand::Reconcile).is_ok()
+    }
+
+    /// READY or RESUMED was handled: the gateway is connected again. Any
+    /// known live view still not ready now starts its not-ready clock.
+    fn gateway_now_connected(&self) {
+        self.gateway_connected.store(true, Ordering::Release);
+        let now = tokio::time::Instant::now();
+        for actor in self.actors.lock().expect("voice runtime lock").values() {
+            actor.live.gateway_connected(now);
+        }
+    }
+
+    /// Self-correction for a live view left not ready while the gateway is
+    /// connected (no RESUMED/GUILD_CREATE publish will come for it). Every
+    /// dispatch retries the complete post-update cached snapshot; until one
+    /// publishes, joins in that guild are dropped and the actor tick exports
+    /// the age as `two_bot_voice_live_not_ready_seconds`.
+    ///
+    /// `joining` is the member of the VOICE_STATE_UPDATE being handled. The
+    /// cache already holds its new channel, so it is left out of the snapshot
+    /// and the frame that follows is still a transition that can ticket.
+    fn heal_not_ready(
+        &self,
+        cache: &DefaultInMemoryCache,
+        joining: Option<(Snowflake, Snowflake)>,
+    ) {
+        if !self.gateway_connected.load(Ordering::Acquire) {
+            return;
+        }
+        let stuck: Vec<Snowflake> = self
+            .actors
+            .lock()
+            .expect("voice runtime lock")
+            .iter()
+            .filter(|(_, actor)| !actor.live.read_state().ready)
+            .map(|(guild, _)| *guild)
+            .collect();
+        for guild_id in stuck {
+            let healed = snapshot_from_cache(cache, guild_id).is_some_and(|mut snapshot| {
+                if let Some((guild, member)) = joining {
+                    if guild == guild_id {
+                        snapshot
+                            .members
+                            .retain(|occupant| occupant.member_id != member);
+                    }
+                }
+                self.publish_snapshot(guild_id, snapshot)
+            });
+            if healed {
+                metrics::global().voice_live_self_heal();
+                warn!(
+                    guild = guild_id.to_string(),
+                    "voice live view was not ready on a connected gateway; republished from cache"
+                );
+            } else if let Some(actor) = self.live_actor(guild_id) {
+                actor.live.gateway_connected(tokio::time::Instant::now());
+            }
+        }
     }
 
     /// Feed one voice transition to an existing actor. Returns false when the
@@ -7451,8 +7888,11 @@ where
     }
 
     pub fn disconnect(&self) {
+        // Clear before invalidating the views so a concurrent dispatch
+        // cannot heal a view this transport loss is about to invalidate.
+        self.gateway_connected.store(false, Ordering::Release);
         for actor in self.actors.lock().expect("voice runtime lock").values() {
-            actor.live.disconnect();
+            actor.live.transport_lost();
         }
         // Game-activity wiring: transport loss invalidates live voice state,
         // so open spans close here instead of covering the offline gap.
@@ -7508,7 +7948,23 @@ where
         if !self.enabled {
             return;
         }
+        // READY, RESUMED and GUILD_CREATE publish (or wait for) snapshots
+        // themselves; every other dispatch on a connected gateway retries a
+        // live view that was left not ready.
         match event {
+            Event::Ready(_) | Event::Resumed | Event::GuildCreate(_) => {}
+            Event::VoiceStateUpdate(update) => self.heal_not_ready(
+                cache,
+                update
+                    .guild_id
+                    .map(|guild| (guild.get(), update.user_id.get())),
+            ),
+            _ => self.heal_not_ready(cache, None),
+        }
+        match event {
+            // Fresh session: GUILD_CREATE follows with complete state; until
+            // it publishes, known views count as not ready while connected.
+            Event::Ready(_) => self.gateway_now_connected(),
             Event::GuildCreate(gc) => {
                 if let twilight_model::gateway::payload::incoming::GuildCreate::Available(guild) =
                     gc.as_ref()
@@ -7675,8 +8131,27 @@ where
                 // Prefer the event's role list when the cache has not caught up.
                 let roles =
                     roles.or_else(|| Some(updated.roles.iter().map(|id| id.get()).collect()));
+                // A nickname change renders into `@@owner@@` rooms: forward it
+                // as a display update so the worker's directory (which the
+                // background re-render reads) never stays behind the fresh
+                // directory a `/name` submit just rendered from. Read the name
+                // from the event itself, not the cache, so a lagging cache
+                // cannot re-apply the old nickname.
+                let display = updated
+                    .nick
+                    .clone()
+                    .filter(|nick| !nick.is_empty())
+                    .or_else(|| {
+                        updated
+                            .user
+                            .global_name
+                            .clone()
+                            .filter(|name| !name.is_empty())
+                    })
+                    .unwrap_or_else(|| updated.user.name.clone());
                 if let Some(actor) = self.live_actor(guild_id) {
                     actor.live.set_member_roles(member_id, roles);
+                    let _ = actor.tx.send(ActorCommand::Display { member_id, display });
                 }
             }
             // A warm RESUME replays missed dispatches before RESUMED; only then
@@ -7703,6 +8178,7 @@ where
                         }
                     }
                 }
+                self.gateway_now_connected();
             }
             Event::GuildDelete(deleted) => {
                 self.remove_guild(deleted.id.get());
@@ -7770,10 +8246,62 @@ fn watchdog_due(
     queue_nonempty && now.saturating_duration_since(last_progress) >= stuck_after
 }
 
+/// Creator-map staleness on the actor-uptime clock: seconds since the last
+/// successful merge; 0 when never merged. Pure, unit-tested: the gauge must
+/// keep climbing between merges instead of freezing at the merge-time zero.
+fn creator_map_age_secs(creators_merged_ms: Option<u64>, now_ms: u64) -> u64 {
+    creators_merged_ms.map_or(0, |last| now_ms.saturating_sub(last) / 1000)
+}
+
+/// Process-wide guild-actor incarnation counter for the per-actor stall
+/// gauges. Each actor loop start takes the next generation, so a
+/// replacement actor's first publish retires the old incarnation's
+/// contribution and late publishes from the old incarnation (e.g. its
+/// watchdog sibling outliving it by a tick) are fenced out.
+static VOICE_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn next_voice_actor_generation() -> u64 {
+    VOICE_ACTOR_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1)
+}
+
+/// Retires one actor incarnation's stall-gauge contribution when the
+/// actor loop ends — including a panic unwind, which skips the loop's
+/// own shutdown steps. Retirement fences the watchdog sibling first:
+/// setting `retired` under the snapshot lock (the lock the sibling
+/// publishes under) means an in-flight sibling publish either completes
+/// before the removal or never happens, so it cannot resurrect the
+/// contribution after removal. A dead weak means no sibling can publish
+/// again, which fences it the same way.
+struct VoiceActorMetricGuard<H> {
+    actor: Snowflake,
+    generation: u64,
+    stall: Weak<StallShared<H>>,
+}
+
+impl<H> Drop for VoiceActorMetricGuard<H> {
+    fn drop(&mut self) {
+        if let Some(stall) = self.stall.upgrade() {
+            let _state = stall
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            stall.retired.store(true, Ordering::Relaxed);
+        }
+        metrics::global().remove_voice_actor(self.actor, self.generation);
+    }
+}
+
 /// Publish the per-tick stall gauges: halt latch plus per-lane queue depth
-/// and oldest-pending age. Cheap atomics; called every actor tick so
-/// `/ops/metrics` always shows the worker's stall posture.
-fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWorker<S, H>) {
+/// and oldest-pending age, as this guild actor incarnation's contribution
+/// to the process-wide aggregates. Cheap atomics; called every actor tick
+/// so `/ops/metrics` always shows the worker's stall posture.
+fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(
+    worker: &GuildRoomWorker<S, H>,
+    generation: u64,
+    now_ms: u64,
+) {
     let guild = worker.live.guild_id;
     let (urgent, deferred) = worker.queue.pending_counts(guild);
     let oldest_age_secs = worker
@@ -7781,12 +8309,23 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWor
         .oldest_pending_age(guild)
         .map_or(0, |age| age.as_secs());
     let gauges = metrics::global();
-    gauges.set_voice_halted(worker.halted());
+    gauges.set_voice_actor_halted(guild, generation, worker.halted());
+    gauges.set_voice_actor_live_not_ready(
+        guild,
+        generation,
+        worker.live.not_ready_secs(tokio::time::Instant::now()),
+    );
+    gauges.set_voice_creator_map(
+        worker.creators_generation,
+        creator_map_age_secs(worker.creators_merged_ms, now_ms),
+    );
     // Recompute the in-flight REST age from attempts still live, so the
     // gauge shows a currently-stalled request instead of the begin/drop
     // snapshots (0 at begin, already removed at drop).
     worker.http.republish_rest_age();
-    gauges.set_voice_queue(
+    gauges.set_voice_actor_queue(
+        guild,
+        generation,
         u64::try_from(urgent).unwrap_or(u64::MAX),
         u64::try_from(deferred).unwrap_or(u64::MAX),
         oldest_age_secs,
@@ -7802,7 +8341,18 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWor
 /// main task recovers once the write returns.
 struct StallShared<H> {
     guild: Snowflake,
+    /// Actor incarnation generation for the per-actor stall gauges; the
+    /// sibling publishes under the same generation as the main task.
+    generation: u64,
+    /// Set by the metric guard under the `state` lock when the actor loop
+    /// ends; `observe` checks it under the same lock before publishing,
+    /// so no sibling publish can follow the contribution's removal.
+    retired: AtomicBool,
     http: Arc<H>,
+    /// Actor start instant: the sibling computes the creator-map age from
+    /// the stored merge stamp on this clock, so the age keeps climbing
+    /// while the main task (and its snapshots) are hung in a dispatch.
+    start: tokio::time::Instant,
     state: Mutex<StallState>,
 }
 
@@ -7813,6 +8363,8 @@ struct StallState {
     deferred: usize,
     oldest_age_secs: u64,
     halted: bool,
+    creators_generation: u64,
+    creators_merged_ms: Option<u64>,
 }
 
 impl<H: RoomWrites> StallShared<H> {
@@ -7833,24 +8385,49 @@ impl<H: RoomWrites> StallShared<H> {
             deferred,
             oldest_age_secs,
             halted: worker.halted(),
+            creators_generation: worker.creators_generation,
+            creators_merged_ms: worker.creators_merged_ms,
         };
+    }
+
+    /// Creator-map age for a snapshot, computed on the sibling's own clock:
+    /// a frozen snapshot (hung dispatch) still yields a climbing age.
+    fn snapshot_creator_map_age_secs(&self, snap: &StallState) -> u64 {
+        let now_ms = self.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        creator_map_age_secs(snap.creators_merged_ms, now_ms)
     }
 
     /// Watchdog + gauge publish from the shared snapshot. Reads only: safe
     /// to run on the sibling task while the main task is hung in dispatch.
     fn observe(&self, stuck_after: Duration, last_fire: &mut Option<tokio::time::Instant>) {
-        let snap = *self.state.lock().expect("stall snapshot lock");
-        // Recompute the in-flight REST age from attempts still live, so the
-        // gauge shows a currently-stalled request instead of the begin/drop
-        // snapshots (0 at begin, already removed at drop).
-        self.http.republish_rest_age();
-        let gauges = metrics::global();
-        gauges.set_voice_halted(snap.halted);
-        gauges.set_voice_queue(
-            u64::try_from(snap.urgent).unwrap_or(u64::MAX),
-            u64::try_from(snap.deferred).unwrap_or(u64::MAX),
-            snap.oldest_age_secs,
-        );
+        // Publish under the snapshot lock: the metric guard sets `retired`
+        // under the same lock before removing this actor's contribution,
+        // so a publish either lands before that removal or not at all.
+        let snap = {
+            let state = self.state.lock().expect("stall snapshot lock");
+            if self.retired.load(Ordering::Relaxed) {
+                return;
+            }
+            let snap = *state;
+            // Recompute the in-flight REST age from attempts still live, so
+            // the gauge shows a currently-stalled request instead of the
+            // begin/drop snapshots (0 at begin, already removed at drop).
+            self.http.republish_rest_age();
+            let gauges = metrics::global();
+            gauges.set_voice_actor_halted(self.guild, self.generation, snap.halted);
+            gauges.set_voice_actor_queue(
+                self.guild,
+                self.generation,
+                u64::try_from(snap.urgent).unwrap_or(u64::MAX),
+                u64::try_from(snap.deferred).unwrap_or(u64::MAX),
+                snap.oldest_age_secs,
+            );
+            gauges.set_voice_creator_map(
+                snap.creators_generation,
+                self.snapshot_creator_map_age_secs(&snap),
+            );
+            snap
+        };
         // Stuck-worker watchdog: queued work with no completed turn for the
         // full window. Log + metric only; the queue keeps its retries so a
         // transient outage still drains on recovery.
@@ -7885,6 +8462,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     tick: Duration,
     limits: ActorLimits,
 ) {
+    let generation = next_voice_actor_generation();
     let start = tokio::time::Instant::now();
     let mut timer = tokio::time::interval(tick);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -7899,16 +8477,29 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     // gauges. The sibling never touches `worker`.
     let stall = Arc::new(StallShared {
         guild: worker.live.guild_id,
+        generation,
+        retired: AtomicBool::new(false),
         http: Arc::clone(&worker.http),
+        start,
         state: Mutex::new(StallState {
             last_progress,
             urgent: 0,
             deferred: 0,
             oldest_age_secs: 0,
             halted: false,
+            creators_generation: 0,
+            creators_merged_ms: None,
         }),
     });
     stall.snapshot(worker, last_progress);
+    // Retires this incarnation's stall contribution on every exit path
+    // (inbox close or panic unwind). Declared after `stall`, so it drops
+    // while the strong ref is still alive and its retire fence can engage.
+    let _metric_guard = VoiceActorMetricGuard {
+        actor: worker.live.guild_id,
+        generation,
+        stall: Arc::downgrade(&stall),
+    };
     let stop_watchdog = Arc::new(AtomicBool::new(false));
     let watchdog = {
         // Weak, not a clone: the actor task owns the only strong ref. If a
@@ -7984,7 +8575,8 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 dispatch_budget = dispatch_budget.saturating_sub(1);
             }
             _ = timer.tick() => {
-                publish_voice_gauges(worker);
+                let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                publish_voice_gauges(worker, generation, now_ms);
                 // The stuck-worker watchdog lives on the sibling task now, so
                 // it fires while a dispatch is hung: see `StallShared`. The
                 // tick arm keeps the fresh gauge publish plus recovery below.
@@ -8057,7 +8649,13 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 maintenance_ready = false;
                 let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 worker.reload_creators(now_ms).await;
+                // Republish the merge stamp now, not next tick: until then
+                // the watchdog sibling would keep ageing the pre-merge stamp.
+                stall.snapshot(worker, last_progress);
                 worker.reload_name_settings(now_ms).await;
+                // A stored empty-grace change applies without a restart;
+                // revision-gated so steady-state ticks stay cheap.
+                worker.refresh_empty_grace();
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
                 dispatch_budget = 8;
@@ -8217,6 +8815,7 @@ pub fn build_production_runtime(
     token: &str,
     pool: sqlx::PgPool,
     name_policy: AutomodPolicy,
+    live_source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
     // Malformed protection IDs refuse the whole runtime. The gateway reports it
     // through its cataloged `voice HTTP setup failed` event.
@@ -8250,7 +8849,8 @@ pub fn build_production_runtime(
             .with_creator_channels(generator.into_iter().collect())
             .with_empty_grace(empty_grace)
             .with_synthetic_humans(synthetic_humans)
-            .with_name_policy(name_policy),
+            .with_name_policy(name_policy)
+            .with_live_source(live_source),
         ),
         Arc::new(replies),
     ))
@@ -8279,6 +8879,50 @@ pub fn configured_empty_grace(value: Option<&str>) -> Result<Duration, InvalidEm
 /// `0..=600`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidEmptyGrace;
+
+/// The stored per-guild empty-grace key served from the live settings snapshot.
+pub(crate) const EMPTY_GRACE_KEY: &str = "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS";
+
+/// Effective empty-room grace: the stored per-guild value wins over the boot
+/// fallback, an absent/malformed/out-of-range stored value falls back
+/// (store-first, like the feed interval). Pure for tests via `live`.
+pub(crate) fn stored_empty_grace_with(
+    guild: &str,
+    fallback: Duration,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> Duration {
+    let Some(live) = live else {
+        return fallback;
+    };
+    let Some(value) = live.get(guild, EMPTY_GRACE_KEY) else {
+        return fallback;
+    };
+    let seconds: Option<u64> = match &value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                trimmed.parse::<u64>().ok()
+            }
+        }
+        _ => None,
+    };
+    match seconds {
+        Some(seconds) if seconds <= MAX_EMPTY_ROOM_GRACE_SECONDS => Duration::from_secs(seconds),
+        _ => {
+            warn!(
+                guild = guild.to_string(),
+                key = EMPTY_GRACE_KEY,
+                reason = "out_of_range",
+                value = %value,
+                "stored empty-grace override out of range; using boot fallback"
+            );
+            fallback
+        }
+    }
+}
 
 /// The synthetic test identities a guild's actor may use: none for the live
 /// guild, whatever `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` says.
@@ -8336,8 +8980,7 @@ fn snapshot_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Opt
         .iter()
         .filter_map(|id| cache.channel(*id).map(|channel| channel.value().clone()))
         .collect();
-    let members: Vec<VoiceMember> = cache
-        .guild_voice_states(guild_key)?
+    let members: Vec<VoiceMember> = guild_voice_users(cache, guild_key)?
         .iter()
         .filter_map(|user_id| {
             let state = cache.voice_state(*user_id, guild_key)?;
@@ -8367,6 +9010,32 @@ fn snapshot_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Opt
         bot: bot_access_from_cache(cache, guild_id)?,
         member_roles,
     })
+}
+
+/// Members the cache holds in voice for a cached guild. GUILD_CREATE always
+/// installs the guild's voice-state set (empty when nobody is in voice), but
+/// Twilight removes that set again when the guild's last voice member leaves
+/// and only re-creates it on the next join. For a guild the cache holds, with
+/// voice states cached, a missing set therefore means "nobody in voice", not
+/// "not loaded yet": reading it as `None` left the live view unpublished
+/// after a warm RESUME into an empty guild, silently dropping every later
+/// creator join until a restart. `None` only when voice states are not
+/// cached at all, so the snapshot can never claim completeness it lacks.
+fn guild_voice_users(
+    cache: &DefaultInMemoryCache,
+    guild_key: Id<GuildMarker>,
+) -> Option<Vec<Id<UserMarker>>> {
+    match cache.guild_voice_states(guild_key) {
+        Some(users) => Some(users.iter().copied().collect()),
+        None if cache
+            .config()
+            .resource_types()
+            .contains(twilight_cache_inmemory::ResourceType::VOICE_STATE) =>
+        {
+            Some(Vec::new())
+        }
+        None => None,
+    }
 }
 
 fn bot_access_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Option<BotAccess> {
@@ -10739,6 +11408,15 @@ where
     let Some(command) = runtime.parse_voice_command(interaction) else {
         return false;
     };
+    // Cold guild-role facts are not a permanent denial: a command that
+    // needs that authority gets the retryable warming-up reply and fails
+    // closed before any gate read or protected effect. Missing-member
+    // interactions keep their existing handling.
+    let authority = runtime.guild_authority(interaction);
+    if matches!(authority, GuildAuthority::WarmingUp) && requires_guild_authority(&command) {
+        reply(ephemeral_response(WARMING_UP_REPLY)).await;
+        return true;
+    }
     // Guild-level role gate first. Settings that cannot be read fail closed for
     // members: only an admin proceeds without them.
     let member = access_member(interaction, runtime.guild_permissions(interaction));
@@ -11466,6 +12144,13 @@ where
     }
     let permissions = runtime.guild_permissions(interaction);
     if !may_manage_server(permissions) {
+        if matches!(
+            runtime.guild_authority(interaction),
+            GuildAuthority::WarmingUp
+        ) {
+            reply(ephemeral_response(WARMING_UP_REPLY)).await;
+            return true;
+        }
         reply(ephemeral_response(
             "You need Manage Server to confirm an import.",
         ))

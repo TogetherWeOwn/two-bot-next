@@ -155,15 +155,15 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
           python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
 
-      # Squawk-subset migration lint (advisory, docs/quality-gates.md): flags
-      # risky statements in changed migration files without failing the PR.
-      # Broken tooling still fails so blindness cannot hide. Promotion to a
-      # required check flips this step to --strict after the advisory soak.
-      - name: Squawk migration lint (advisory)
+      # Squawk-subset migration lint (required, docs/quality-gates.md): in
+      # --strict mode four rules fail the PR; dropping-object stays advisory
+      # because coordinated removals still require a final DROP. Broken tooling
+      # still fails so blindness cannot hide.
+      - name: Squawk migration lint (required)
         env:
           SQUAWK_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
         run: |
-          python3 scripts/ci/check-squawk-migrations.py --base-ref "$SQUAWK_BASE"
+          python3 scripts/ci/check-squawk-migrations.py --base-ref "$SQUAWK_BASE" --strict
 
       # Finish the pinned toolchain before the first pip run. The image ships
       # the pinned Rust version without rustfmt or clippy, and rust-toolchain.toml
@@ -202,8 +202,8 @@ jobs:
         run: |
           set -euo pipefail
           curl -fsSL -o "$RUNNER_TEMP/actionlint.tgz" \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
-          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes=
 
@@ -234,6 +234,10 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
 
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_probe.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_redirect_refusal.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_history_redirect_refusal.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_voice_synthetic_redirect_refusal.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_token_redirect_gate.py' -v
 
       - name: soak evidence parser (offline, fixtures only)
         run: |
@@ -253,6 +257,7 @@ jobs:
         run: |
           python3 scripts/check_run_record.py --record scripts/fixtures/staging_e2e_run_record_mock.json --allow-mock
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_no_echo_acceptance.py' -v
 
       - name: Validate voice template fixtures (hermetic, no renderer)
         run: |
@@ -274,11 +279,32 @@ jobs:
           command: check all
 
       - name: Install Rust toolchain
+        id: toolchain
         if: needs.job-inputs.outputs.rust != 'false'
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
 
       # Fail-fast (TOG-12055): cheap lint/format/guard checks run before the
       # ~4 GiB cargo cache restore, so a failure skips the big download. The
@@ -353,9 +379,10 @@ jobs:
       # Deterministic quality gates (docs/quality-gates.md). Steps, not jobs:
       # they reuse this lane's runner, container and toolchain, so no new
       # runner minutes beyond the step itself, and ci-ok already covers them.
-      # WARN gates annotate but never fail on findings; a broken gate step
-      # still fails so blindness cannot hide. The inventory gate is HARD and
-      # always on (pure Python, milliseconds); the rest are gated on the rust
+      # Patch coverage, squawk, unwrap request-paths and semgrep are HARD and
+      # fail on new findings. A broken gate step still fails so blindness cannot
+      # hide. The inventory gate is HARD and always on (pure Python,
+      # milliseconds); the rest are gated on the rust
       # selector like the other heavy steps.
       - name: CI test-target inventory
         run: python3 scripts/ci/check-test-inventory.py
@@ -369,38 +396,7 @@ jobs:
           FLOOR_HEAD: ${{ github.sha }}
         run: python3 scripts/ci/check-floor-guard.py --base-ref "$FLOOR_BASE" --head-ref "$FLOOR_HEAD"
 
-      - name: Patch coverage (WARN, 80% of added lines)
-        if: needs.job-inputs.outputs.rust != 'false'
-        # The check job runs in a container whose default shell is sh (no pipefail).
-        shell: bash
-        env:
-          QUALITY_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}
-          QUALITY_HEAD: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          rustup component add llvm-tools-preview
-          archive="$RUNNER_TEMP/cargo-llvm-cov.tar.gz"
-          for attempt in 1 2 3; do
-            curl -fsSL -o "$archive" \
-              https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz && break
-            [ "$attempt" -lt 3 ] || exit 1
-            sleep 5
-          done
-          echo "b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a  $archive" | sha256sum --check -
-          tar -xzf "$archive" -C "$RUNNER_TEMP" cargo-llvm-cov
-          # WARN measurement only: unit-test failures are owned HARD by the
-          # rust-tests lane, so a failed measurement run warns here instead of
-          # failing this lane (for example DB-backed lib tests behave
-          # differently without the lane's database service).
-          if "$RUNNER_TEMP/cargo-llvm-cov" llvm-cov --workspace --lib --locked --lcov \
-            --output-path "$RUNNER_TEMP/lcov.info"; then
-            python3 scripts/ci/check-patch-coverage.py --lcov "$RUNNER_TEMP/lcov.info" \
-              --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
-          else
-            echo "::warning::patch coverage measurement did not complete; see the rust-tests lane for the authoritative unit-test result"
-          fi
-
-      - name: Unwrap in request paths (WARN)
+      - name: Unwrap in request paths (HARD)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
@@ -425,7 +421,7 @@ jobs:
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
           PATH="$RUNNER_TEMP/ast-grep:$PATH" ast-grep test -c sgconfig.yml
 
-      - name: Semgrep Rust rules (WARN)
+      - name: Semgrep Rust rules (HARD)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
@@ -451,7 +447,12 @@ jobs:
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on `check`.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'rust-tests') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
-    timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
+    # The HARD patch-coverage step re-runs the whole suite under llvm-cov
+    # (measured 30 min of a 42m16s job; four earlier runs of this design
+    # took 36-42 min), so every event gets 60 minutes: a cache-cold or slow
+    # runner must still finish measuring and report a coverage verdict, not
+    # be killed mid-measurement as a job timeout on an unrelated PR.
+    timeout-minutes: 60
     # Self-hosted runners share one Docker host, so a published 5432 collides
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
@@ -503,9 +504,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Job-container prerequisites (loopback forward to agent-testdb)
+        shell: bash
         run: |
           # On hosted/overflow runners the job container's root does not own the
           # runner-owned checkout, so Git refuses it as dubious ownership.
@@ -515,6 +517,35 @@ jobs:
           # Disk hygiene for hosted overflow runners (TOG-12134): the package
           # lists stay on the job-container overlay otherwise.
           rm -rf /var/lib/apt/lists/*
+          set -e
+          # /etc/hosts is mounted in the job container; sed -i cannot rename over it.
+          # Remove any runner/image mapping first so resolution uses the
+          # disposable service's current job-scoped address.
+          hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"
+          sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > "$hosts_tmp"
+          cat "$hosts_tmp" > /etc/hosts
+          rm -f "$hosts_tmp"
+          # Resolve the disposable service and pin its job-scoped address so
+          # long database runs do not depend on service-alias DNS staying up.
+          service_ip=""
+          for attempt in $(seq 1 30); do
+            service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk 'NR == 1 { print $1; exit }')"
+            if [[ "$service_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+              break
+            fi
+            service_ip=""
+            sleep 1
+          done
+          if [ -z "$service_ip" ]; then
+            echo "agent-testdb did not resolve to an IPv4 address"
+            exit 1
+          fi
+          printf '%s agent-testdb\n' "$service_ip" >> /etc/hosts
+          pinned_ip="$(getent ahostsv4 agent-testdb | awk 'NR == 1 { print $1; exit }')"
+          if [ "$pinned_ip" != "$service_ip" ]; then
+            echo "agent-testdb hosts pin did not take effect"
+            exit 1
+          fi
           # Tests that pin 127.0.0.1/localhost:5432 reach the service through
           # this job-private forward.
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
@@ -523,7 +554,7 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -539,6 +570,8 @@ jobs:
       # toolchain stays missing, so a broken pin still fails closed.
       - name: Retry Rust toolchain install on transient network failure
         if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
         env:
           RUSTUP_PERMIT_COPY_RENAME: 1
         run: |
@@ -605,13 +638,21 @@ jobs:
           save-if: ${{ github.event_name == 'push' }}
 
       - name: Prepare isolated test databases
+        id: prepare_test_databases
         run: |
+          # The database service stores data and WAL on a 1 GiB tmpfs. The HARD
+          # coverage lane replays the database suites, so keep WAL recycling
+          # bounded with headroom for relation files and segment creation.
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
           createdb -h agent-testdb -U agent_test two_bot_test_ci
           createdb -h agent-testdb -U agent_test two_next_backup_ci
           createdb -h agent-testdb -U agent_test two_next_backup_publication_ci
           printf 'PAPERCLIP_RUN_SCRATCH_DIR=%s/two-bot-check-scratch\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Verify disposable Postgres defaults
+        id: verify_disposable_postgres
         run: |
           python3 - <<'PY'
           import json
@@ -625,6 +666,8 @@ jobs:
               'fsync': 'on',
               'full_page_writes': 'on',
               'synchronous_commit': 'on',
+              'max_wal_size': '512MB',
+              'min_wal_size': '64MB',
           }
           fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
           settings = json.loads(subprocess.check_output([
@@ -659,7 +702,7 @@ jobs:
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
         # The publication regression has its own guarded DB and actual binary
         # in the dedicated step below; never feed it the round-trip fixture URL.
-        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump --skip per_route_bucket_headers_gate_same_bucket_without_hardcoded_limits --skip independent_workers_share_global_pacing --skip reset_after_header_drives_sleep_then_retry_with_no_request_during_pause --skip shared_scope_429_does_not_spend_invalid_budget_while_others_do --skip header_absent_responses_keep_conservative_spacing
+        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
 
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).
@@ -676,6 +719,126 @@ jobs:
 
       - name: Measure metrics RSS (local fixtures only)
         run: cargo run -p two-bot-core --example metrics_rss --locked
+
+      # Run after the ordinary tests so coverage shortfalls do not hide their
+      # failures. Still collect coverage when an earlier test step failed.
+      - name: Patch coverage (HARD, 80% of added lines)
+        if: always() && !cancelled() && steps.prepare_test_databases.outcome == 'success' && steps.verify_disposable_postgres.outcome == 'success'
+        shell: bash
+        env:
+          QUALITY_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}
+          QUALITY_HEAD: ${{ github.sha }}
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          TWO_RSVP_RUNTIME_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
+          TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
+          AUTOMOD_CI_TESTDB: '1'
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-coverage-tests
+        run: |
+          set -euo pipefail
+          rustup component add llvm-tools-preview
+          archive="$RUNNER_TEMP/cargo-llvm-cov.tar.gz"
+          for attempt in 1 2 3; do
+            curl -fsSL -o "$archive" \
+              https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz && break
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep 5
+          done
+          echo "b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a  $archive" | sha256sum --check -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" cargo-llvm-cov
+          report_path="$GITHUB_WORKSPACE/lcov.info"
+          rm -f "$report_path"
+          COV="$RUNNER_TEMP/cargo-llvm-cov"
+          cov_run() {
+            if ! "$@"; then
+              echo "::error::patch coverage measurement failed to build or report" >&2
+              exit 1
+            fi
+          }
+          # Main sweep under the bootstrap URL: non-ignored tests first at
+          # full parallelism, then ignored tests serially. The ignored stores
+          # share tables and locks, so parallel runs race and
+          # --ignore-run-fail would then drop their coverage silently.
+          # The reference-docs regen never runs in CI: it rewrites committed docs.
+          cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
+            --features two-bot-core/db --locked --ignore-run-fail --no-report
+          cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
+            --features two-bot-core/db --locked --ignore-run-fail \
+            --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          # Guarded suites accept only the exact agent_test URL (no password
+          # segment). Under the bootstrap URL above their guards panic, so
+          # re-run them here with their accepted URL; profiles merge below.
+          # Flags mirror the corresponding ignored-db lane steps.
+          export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test
+          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked -- channel_moderation --include-ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test channel_moderation_runtime -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --test feeds_store --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test legacy_verify_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test legacy_tls_fence --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test staging_migrate_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          # Suites pinned to the agent_test database under the empty-password
+          # URL form, plus the member-moderation suite behind MEMBER_TESTDB.
+          export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test
+          export MEMBER_TESTDB=agent-testdb
+          cov_run "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test internal_events -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test raid_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test reengagement_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test game_activity_report_db --locked -- --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test member_moderation_db -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          # Merge every collected profile into the mounted workspace report the gate reads.
+          # `report` must carry --workspace: without it the report scopes to
+          # the current (root) package only and excludes every crates/*
+          # member directory, and the root library (a single const) has no
+          # coverable lines, so the export succeeds with an empty file.
+          # Keep a stdout retry as a second export path if the file is still
+          # missing or empty; the check below stays fail-closed either way.
+          cov_run "$COV" llvm-cov report --workspace --lcov --output-path "$report_path"
+          if [ ! -s "$report_path" ]; then
+            echo "::warning::llvm-cov reported a saved LCOV report, but the file is missing or empty; retrying via stdout"
+            cov_run "$COV" llvm-cov report --workspace --lcov > "$report_path"
+          fi
+          if [ ! -s "$report_path" ]; then
+            echo "::error::patch coverage measurement produced no lcov report"
+            ls -la "$GITHUB_WORKSPACE" || true
+            ls -la "$RUNNER_TEMP" || true
+            df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" || true
+            du -sh target/llvm-cov-target 2>/dev/null || true
+            exit 1
+          fi
+          python3 scripts/ci/check-patch-coverage.py --lcov "$report_path" \
+            --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
+  # Required nextest lane (SDLC 2.3 CI speed pilot, promoted): the workspace
+  # lib/bins scope under cargo-nextest (one retry, JUnit, flake ledger) via
+  # the shared reusable lane. Same rust-selector gate as the other Rust test
+  # lanes; `ci-ok` only accepts the skip when the selector deselected it.
+  nextest:
+    name: rust nextest
+    permissions:
+      contents: read
+    needs: [job-inputs]
+    # Skip when the selector sees no Rust inputs (docs-only, worker-UI-only PRs);
+    # `ci-ok` only accepts the skip when the selector deselected the job.
+    if: needs.job-inputs.outputs.rust != 'false'
+    uses: ./.github/workflows/reusable-rust-nextest.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    # R2 write credentials flow only on push to main and workflow_dispatch:
+    # the lane compiles and executes code, and any other event (pull_request,
+    # merge_group, ...) runs a head that is not on `main` yet. The reusable
+    # lane independently refuses shared backends off those two events
+    # (defense in depth; see its backend step). Empty elsewhere, so the lane
+    # falls back to local-disk sccache.
+    # NOTE: the gate must read `(== 'push' || == 'workflow_dispatch') &&
+    # secrets.X || ''`. A `!= 'pull_request' && secrets.X` form forwards the
+    # secret on merge_group, and `== 'pull_request' && '' || secrets.X`
+    # forwards it everywhere, because '' is falsy in GitHub expressions.
+    secrets:
+      SCCACHE_BUCKET: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_BUCKET || '' }}
+      SCCACHE_ENDPOINT: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_ENDPOINT || '' }}
+      SCCACHE_REGION: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_REGION || '' }}
+      AWS_ACCESS_KEY_ID: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_SECRET_ACCESS_KEY || '' }}
 
   ignored-db-stores:
     name: ignored db (stores)
@@ -748,10 +911,31 @@ jobs:
           exit 1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        id: toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
 
       - name: Pin native tests to one CPU (loaded-runner validation)
         if: github.event_name == 'workflow_dispatch' && inputs.single_core_tests
@@ -879,6 +1063,16 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime -- --ignored --test-threads=1
 
+      - name: seasonal leaderboard command boundary (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test leveling_seasonal_leaderboard_acceptance -- --ignored --test-threads=1
+
+      - name: seasonal leaderboard quarter boundary (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test leveling_seasonal_leaderboard_boundary_acceptance -- --ignored --test-threads=1
+
       - name: community voice fact round trip (CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
@@ -900,7 +1094,7 @@ jobs:
       - name: Store Postgres integration (isolated CI schemas)
         env:
           TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
-        run: cargo test -p two-bot-store --locked --test postgres --test journal --test membership_pg --test backfill_cursors --test backfill_history --test backfill_audit_log --test backfill_event_users_reactions_pins --test backfill_bans_invites_onboarding --test explain_seqscan -- --ignored --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window --skip audit_log_requests_ride_rate_limit_client_never_direct_rest --skip audit_cursor_persists_per_window_and_resumes_mid_window --skip audit_rows_hold_ids_timestamps_enums_only --skip audit_429_retry_after_pauses_without_losing_place --skip event_users_paginate_through_rate_limit_client_with_max_100 --skip reaction_users_paginate_through_rate_limit_client --skip pins_list_through_rate_limit_client_persists_metadata_only --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting --skip persisted_rows_hold_ids_timestamps_enums_only --skip resume_continues_from_persisted_cursors_per_family --skip bans_fetch_applies_blocklist_and_counts_everyone --skip invite_rows_hold_metadata_only --skip onboarding_rows_hold_ids_enums_metadata_only --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
+        run: cargo test -p two-bot-store --locked --test postgres --test journal --test journal_writer --test membership_pg --test backfill_cursors --test backfill_history --test backfill_audit_log --test backfill_event_users_reactions_pins --test backfill_bans_invites_onboarding --test explain_seqscan -- --ignored --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window --skip audit_log_requests_ride_rate_limit_client_never_direct_rest --skip audit_cursor_persists_per_window_and_resumes_mid_window --skip audit_rows_hold_ids_timestamps_enums_only --skip audit_429_retry_after_pauses_without_losing_place --skip event_users_paginate_through_rate_limit_client_with_max_100 --skip reaction_users_paginate_through_rate_limit_client --skip pins_list_through_rate_limit_client_persists_metadata_only --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting --skip persisted_rows_hold_ids_timestamps_enums_only --skip resume_continues_from_persisted_cursors_per_family --skip bans_fetch_applies_blocklist_and_counts_everyone --skip invite_rows_hold_metadata_only --skip onboarding_rows_hold_ids_enums_metadata_only --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
 
       - name: sticky live store regressions (CI service container only)
         run: cargo test -p two-bot-core --features db --locked --test sticky_store_live -- --ignored
@@ -1066,10 +1260,31 @@ jobs:
           exit 1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        id: toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
 
       - name: Pin native tests to one CPU (loaded-runner validation)
         if: github.event_name == 'workflow_dispatch' && inputs.single_core_tests
@@ -1179,6 +1394,11 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-cutover --test reengagement_list_db --locked -- --ignored
 
+      - name: Game-activity report query (CI service container only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-cutover --test game_activity_report_db --locked
+
       - name: settings database regressions (CI service only)
         run: cargo test -p two-bot-cutover --test settings_db --locked -- --ignored
 
@@ -1200,6 +1420,11 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-cutover --test legacy_verify_db --locked -- --ignored
+
+      - name: Legacy TLS fence acceptance (binaries honor the TLS policy)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-cutover --test legacy_tls_fence --locked -- --ignored
 
       - name: Staging migration runner acceptance (real SQLx, disposable CI database)
         env:
@@ -1286,11 +1511,34 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         if: needs.job-inputs.outputs.rust != 'false'
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component clippy; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
+
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
@@ -1363,9 +1611,32 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
+
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
@@ -1595,15 +1866,38 @@ jobs:
           --health-cmd "pg_isready -U agent_test -d postgres"
           --health-interval 10s --health-timeout 5s --health-retries 5
     env:
-      TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/postgres
+      TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component clippy; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
+
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
@@ -1611,6 +1905,19 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
+      # The presence fixtures now route through the shared disposable-database
+      # guard, which accepts only the explicit-empty-password bootstrap URL
+      # naming a two_bot_test_* database. Create that bootstrap here; the
+      # legacy bespoke helpers in the sibling stores accept the same URL
+      # (they check host and principal only), so one URL serves all four
+      # suites below. The rust:bookworm job container ships no PostgreSQL
+      # client, so install it first like the other DB jobs do.
+      - name: Prepare isolated test database
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
+          rm -rf /var/lib/apt/lists/*
+          createdb -h agent-testdb -U agent_test two_bot_test_ci
       - name: Check feature-gated community stores
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - name: Test presence, scorecard and inactivity ledgers on ephemeral Postgres
@@ -1651,10 +1958,33 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component clippy; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
+
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache
@@ -1698,9 +2028,32 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        # Container steps default to sh, where pipefail aborts before any retry.
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
+
       # TOG-11810: dependency build cache, as in the `check` job. The key
       # includes the job id, so this job keeps its own entry (it builds a
       # different dependency set); saved only on pushes to main.
@@ -1738,7 +2091,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "nightly-2026-10-01" # Pinned nightly for libFuzzer; stable pin stays in rust-toolchain.toml.
           components: rust-src
@@ -1757,9 +2110,10 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Compile-only: builds all fourteen libFuzzer targets without executing them.
-      # No execution, no corpus output, no schedule; the bounded
-      # vote_kick smoke stays a manual non-controller step (see fuzz/README.md).
+      # Builds all twenty-two libFuzzer targets. No campaign or generated corpus
+      # output; the existing weekly run replays the bounded eventsub_delivery
+      # and helix_token seeds below. Bounded vote_kick and helix_token smokes
+      # are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -1767,6 +2121,19 @@ jobs:
       - name: Compile-only fuzz build (no execution)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz build
+      # Bounded seed replay, eventsub_delivery and helix_token: `-runs=0`
+      # executes each committed corpus seed exactly once (plus the target's
+      # fixed matrix) and exits without fuzzing. A signing-key drift between
+      # the harness and production, a token-contract drift between the
+      # helix_token oracle and the parser, or seed misrouting panics an
+      # assertion here instead of passing a compile-only gate. Compile stays
+      # the only gate for the other twenty targets.
+      - name: Seed replay for eventsub_delivery (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
+      - name: Seed replay for helix_token (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run helix_token -- -runs=0 -timeout=10 -rss_limit_mb=2048
 
   worker:
     name: worker check
@@ -1837,10 +2204,16 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill.py -v
       - name: Verify worker-container rollback (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback.py -v
+      - name: Verify worker-container rollback listing lag (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback_listing.py -v
       - name: Verify staging container backout/restore drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
         run: node --test scripts/test-ownership-control.mjs
+      - name: Verify staging ownership status read (offline fixtures)
+        run: node --test scripts/test-staging-ownership-status.mjs
+      - name: Verify staging ownership status workflow (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_ownership_status.py -v
       - name: Verify staging redirect smoke (offline fixtures)
         if: needs.job-inputs.outputs.worker != 'false'
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_redirect_smoke.py -v
@@ -1855,6 +2228,14 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic.py -v
       - name: Verify staging health-contract probe (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_health_contract_probe.py -v
+      - name: Verify passive production probe (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe.py -v
+      - name: Verify passive production probe build identity (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_build_identity_acceptance.py -v
+      - name: Verify synthetic alert delivery (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
+      - name: Verify synthetic alert history rollover (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert_history_rollover.py -v
       - name: Verify voice denied-copy fixtures (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_voice_denied_copy.py -v
       - name: Verify staging-guild E2E prep skeleton (offline fixtures)
@@ -1881,6 +2262,11 @@ jobs:
         # Version bumps, notes, rollback guard and off-main refusal against a
         # throwaway git repository (no network, no token).
         run: node ../scripts/test-release-on-promote.cjs
+      - name: Verify release latest repair guard
+        if: needs.job-inputs.outputs.worker != 'false'
+        # Repairing an older tag's missing release must not move "Latest"
+        # backward (mocked gh against a throwaway git repository).
+        run: node --test ../scripts/test-release-on-promote-latest-repair.cjs
       - name: Verify the commit-parse guard
         if: needs.job-inputs.outputs.worker != 'false'
         # The PR-side guard uses release-please's pinned conventional-commit
@@ -1902,7 +2288,7 @@ jobs:
     name: ci-ok
     permissions:
       contents: read
-    needs: [job-inputs, container-inputs, supply-chain, check, rust-tests, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile]
+    needs: [job-inputs, container-inputs, supply-chain, check, rust-tests, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile, nextest]
     # A skipped or cancelled dependency must not read as green.
     if: ${{ always() }}
     # Runner routing: see the note on the first job above.
@@ -1930,6 +2316,7 @@ jobs:
           TICKETS_RESULT: ${{ needs.tickets-postgres.result }}
           MODERATION_DB_RESULT: ${{ needs.moderation-db.result }}
           FUZZ_COMPILE_RESULT: ${{ needs.fuzz-compile.result }}
+          NEXTEST_RESULT: ${{ needs.nextest.result }}
         run: |
           python3 - <<'PY'
           import os
@@ -1962,6 +2349,7 @@ jobs:
                   ("ignored-db-stores", "IGNORED_DB_STORES_RESULT", "RUST_SELECTED"),
                   ("ignored-db-runtime", "IGNORED_DB_RUNTIME_RESULT", "RUST_SELECTED"),
                   ("fuzz-compile", "FUZZ_COMPILE_RESULT", "RUST_SELECTED"),
+                  ("nextest", "NEXTEST_RESULT", "RUST_SELECTED"),
               ]
               for job, result_var, sel_var in gated:
                   result = os.environ.get(result_var, "")

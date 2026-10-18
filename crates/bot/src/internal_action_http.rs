@@ -36,6 +36,7 @@ use axum::{
 use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
 use tokio::{net::TcpListener, sync::Semaphore};
+use tracing::Instrument;
 use two_bot_core::{
     automation_transfer::{
         diff_import, export_document, max_import_entries, parse_import_document, ImportOutcome,
@@ -57,11 +58,10 @@ use two_bot_core::{
         InternalStoreError, RequestIdentity, TerminalFailure, TerminalResponse,
     },
     internal_actions::{
-        new_request_id, require_field_str, require_snowflake, unmapped_event_key,
-        validate_announcement, validate_event_input, validate_event_key, validate_idempotency_key,
-        ActionError, AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode,
-        GuildAddMemberRequest, InternalFlags, RoleAssignRequest, TokenBuckets, ACTIONS_PATH,
-        MAX_BODY_BYTES, SKEW_SECONDS,
+        require_field_str, require_snowflake, unmapped_event_key, validate_announcement,
+        validate_event_input, validate_event_key, validate_idempotency_key, ActionError,
+        AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode, GuildAddMemberRequest,
+        InternalFlags, RoleAssignRequest, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
     },
     internal_settings::SettingsCommand,
     member_moderation_store::PgMemberModerationStore,
@@ -319,8 +319,22 @@ impl ModerationEffect for ModerationExecutor {
                         "moderation_snapshot_unavailable",
                     )
                 })?;
+            // The resolver runs before the instrumented executor: definitive
+            // refusals (`ActionNotAllowed`) record `refused` here so the
+            // website path counts what slash counts via `preflight_refused`.
+            // Snapshot failures stay unsampled.
             let (actor, target, bot_position) =
-                moderation_resolve(&self.discord, request, &facts, bot_position).await?;
+                match moderation_resolve(&self.discord, request, &facts, bot_position).await {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        record_resolver_refusal(
+                            metrics::global(),
+                            request.action().command_name(),
+                            &err,
+                        );
+                        return Err(err);
+                    }
+                };
             match self
                 .inner
                 .execute(
@@ -413,7 +427,19 @@ impl ChannelModerationEffect for ChannelModerationExecutor {
         Box::pin(async move {
             let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
             let facts = moderation_guild_facts(&self.discord, guild_id).await?;
-            let actor = channel_resolve(&self.discord, request, &facts).await?;
+            // Same boundary as the member path: definitive resolver refusals
+            // record `refused` here, before the instrumented executor runs.
+            let actor = match channel_resolve(&self.discord, request, &facts).await {
+                Ok(actor) => actor,
+                Err(err) => {
+                    record_resolver_refusal(
+                        metrics::global(),
+                        request.action().command_name(),
+                        &err,
+                    );
+                    return Err(err);
+                }
+            };
             self.inner
                 .execute(request, &actor, request_id, idempotency_key, now)
                 .await
@@ -443,6 +469,21 @@ fn channel_action_outcome(action: &str) -> Option<&'static str> {
         "moderation.lockdown" => Some("locked_down"),
         "moderation.unlock" => Some("unlocked"),
         _ => None,
+    }
+}
+
+/// Record a definitive website resolver refusal. The actor/target checks in
+/// [`moderation_resolve`] and [`channel_resolve`] run before the instrumented
+/// executors, so without this the website path under-counts `refused`
+/// relative to slash (which counts the same refusals via `preflight_refused`
+/// and service policy errors). Snapshot failures (`DiscordUnavailable`) and
+/// other indeterminate errors prove nothing about the enforcement and stay
+/// unsampled, matching the slash rule for indeterminate preflight reads.
+/// Takes the recorder so tests assert on a fresh [`metrics::Metrics`]
+/// instead of the process-global registry.
+fn record_resolver_refusal(metrics: &metrics::Metrics, verb: &str, err: &ActionError) {
+    if err.code == ErrorCode::ActionNotAllowed {
+        metrics.moderation_enforcement(verb, "refused");
     }
 }
 
@@ -1191,46 +1232,59 @@ fn router(state: Arc<ReceiverState>) -> Router {
         .with_state(state)
 }
 
-async fn not_found(State(state): State<Arc<ReceiverState>>) -> Response {
-    state.reject(
-        Failure::http(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            false,
-            ErrorCode::Malformed,
-        ),
-        KeyLabel::Invalid,
-        ActionLabel::Unknown,
-        &request_id(),
-    )
-}
-
-async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
-    let id = request_id();
-    let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
-        return state.reject(
+async fn not_found(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
+    let id = crate::logging::incoming_request_id(request.headers());
+    let span = crate::logging::request_span(&id);
+    async move {
+        state.reject(
             Failure::http(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "busy",
-                true,
-                ErrorCode::RateLimited,
+                StatusCode::NOT_FOUND,
+                "not_found",
+                false,
+                ErrorCode::Malformed,
             ),
             KeyLabel::Invalid,
             ActionLabel::Unknown,
             &id,
-        );
-    };
-    match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id)).await {
-        Ok(response) => response,
-        // Dropping the future retains an announcement claim (a fresh nonce sees
-        // InFlight or NeedsReconciliation); event mutations finish in their own task.
-        Err(_) => state.reject(
-            Failure::code(ErrorCode::UpstreamTimeout),
-            KeyLabel::Invalid,
-            ActionLabel::Unknown,
-            &id,
-        ),
+        )
     }
+    .instrument(span)
+    .await
+}
+
+async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
+    // Honor the Worker's `x-request-id` when it has a generated shape, so one
+    // id joins the Worker, Durable Object, container and queued-work logs.
+    let id = crate::logging::incoming_request_id(request.headers());
+    let span = crate::logging::request_span(&id);
+    async move {
+        let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
+            return state.reject(
+                Failure::http(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "busy",
+                    true,
+                    ErrorCode::RateLimited,
+                ),
+                KeyLabel::Invalid,
+                ActionLabel::Unknown,
+                &id,
+            );
+        };
+        match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id)).await {
+            Ok(response) => response,
+            // Dropping the future retains an announcement claim (a fresh nonce sees
+            // InFlight or NeedsReconciliation); event mutations finish in their own task.
+            Err(_) => state.reject(
+                Failure::code(ErrorCode::UpstreamTimeout),
+                KeyLabel::Invalid,
+                ActionLabel::Unknown,
+                &id,
+            ),
+        }
+    }
+    .instrument(span)
+    .await
 }
 
 async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Response {
@@ -1342,18 +1396,25 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         let task_idempotency = headers.idempotency.map(str::to_owned);
         let task_id = id.to_owned();
         let task_key = key.clone();
-        let task = tokio::spawn(async move {
-            mutate_event(
-                &task_state,
-                &task_decision,
-                &task_raw,
-                task_idempotency.as_deref(),
-                &task_id,
-                task_key,
-                action,
-            )
-            .await
-        });
+        // Queued work inherits the request span: `tokio::spawn` does not
+        // propagate tracing context, so without this the follow-up's log
+        // lines could not join the Worker/DO/container request by id.
+        let task_span = tracing::Span::current();
+        let task = tokio::spawn(
+            async move {
+                mutate_event(
+                    &task_state,
+                    &task_decision,
+                    &task_raw,
+                    task_idempotency.as_deref(),
+                    &task_id,
+                    task_key,
+                    action,
+                )
+                .await
+            }
+            .instrument(task_span),
+        );
         return match task.await {
             Ok(response) => response,
             Err(_) => state.reject(Failure::reconciliation(), key, action, id),
@@ -1827,12 +1888,14 @@ async fn moderation_member(
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
     // Resolution (guild facts, actor/target/bot snapshots) and the shared
-    // moderation service run inside the effect. Definitive refusals become
-    // terminal receipts; snapshot/transport uncertainty stays fenced.
+    // moderation service run inside the effect. Keep the caller-correlated `id`
+    // for logs and wire responses; ledger rows need a container-owned identity
+    // so a caller cannot collide separate moderation executions.
     let now = now_ms() as i64;
+    let ledger_id = two_bot_core::internal_actions::new_request_id(now as u64, &rand::random());
     match state
         .moderation
-        .execute_moderation(&request, id, &idempotency, now)
+        .execute_moderation(&request, &ledger_id, &idempotency, now)
         .await
     {
         Ok(response) => {
@@ -2026,11 +2089,14 @@ async fn moderate_channel(
     };
     // Actor resolution and the shared channel-moderation service run inside
     // the effect. Definitive refusals become terminal receipts; snapshot,
-    // transport and rate-limit uncertainty stays fenced.
-    let now = format_iso_millis(now_ms() as i64);
+    // transport and rate-limit uncertainty stays fenced. Keep the caller-
+    // correlated `id` for logs and wire responses, but use an owned ledger id.
+    let now_ms = now_ms() as i64;
+    let ledger_id = two_bot_core::internal_actions::new_request_id(now_ms as u64, &rand::random());
+    let now = format_iso_millis(now_ms);
     match state
         .channel
-        .execute_channel(&request, id, &idempotency, &now)
+        .execute_channel(&request, &ledger_id, &idempotency, &now)
         .await
     {
         Ok(result) => {
@@ -2974,21 +3040,26 @@ fn wire_headers(headers: &HeaderMap) -> Result<WireHeaders<'_>, Failure> {
         ));
     }
     if let Some(length) = one_header(headers, header::CONTENT_LENGTH.as_str(), 20)? {
-        match length.parse::<usize>() {
-            Ok(length) if length <= MAX_BODY_BYTES => {}
-            _ => {
-                return Err(Failure::http(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "malformed",
-                    false,
-                    ErrorCode::Malformed,
-                ))
-            }
+        // Wire grammar is digits only: `usize` parsing would accept a leading
+        // `+`, which is not a digit on the wire. Refuse with the existing
+        // fixed vocabulary, never echoing the value.
+        let usable = !length.is_empty()
+            && length.bytes().all(|b| b.is_ascii_digit())
+            && matches!(length.parse::<usize>(), Ok(n) if n <= MAX_BODY_BYTES);
+        if !usable {
+            return Err(Failure::http(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "malformed",
+                false,
+                ErrorCode::Malformed,
+            ));
         }
     }
     let required = |name, max| {
+        // A whitespace-only value carries no credential material: treat it as
+        // the existing missing-header refusal (`unauthorized`), not as present.
         one_header(headers, name, max)?
-            .filter(|v| !v.is_empty())
+            .filter(|v| !v.trim().is_empty())
             .ok_or_else(|| Failure::code(ErrorCode::Unauthorized))
     };
     Ok(WireHeaders {
@@ -3213,9 +3284,20 @@ fn now_ms() -> u64 {
         })
 }
 
-fn request_id() -> String {
-    new_request_id(now_ms(), &rand::random())
-}
+/// Serializes exact-delta `two_bot_moderation_enforcements_total` assertions
+/// on the process-global registry across test modules (TOG-28482): the
+/// website refusal/executor tests in `tests` and the slash preflight test in
+/// `command_runtime_tests` both record `refused` for the same member verbs,
+/// and `cargo test --workspace --lib --bins` runs them as threads of one
+/// process. Hold across the before/after reads. Test-only; never used in
+/// production. Acquire before any flag lock; flag locks are leaves under it.
+#[cfg(test)]
+pub(crate) static MODERATION_METRICS_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "internal_action_envelope_tests.rs"]
+mod internal_action_envelope_tests;

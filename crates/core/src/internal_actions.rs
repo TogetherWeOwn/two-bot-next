@@ -632,6 +632,27 @@ impl ActionError {
     pub fn status(&self) -> u16 {
         self.code.status()
     }
+
+    /// Bounded metrics outcome for `two_bot_moderation_enforcements_total`
+    /// (TOG-28482): `refused` for malformed/forbidden/definitive Discord
+    /// rejections, `discord_error` for uncertain Discord failures,
+    /// `storage_error` for persistence failures, `other` for anything else
+    /// (auth, stale, in-progress, version conflicts, replays). The caller
+    /// passes a `ModerationAction::command_name` verb; no user id, reason
+    /// text or free-form detail ever becomes a label.
+    #[must_use]
+    pub fn enforcement_outcome(&self) -> &'static str {
+        match self.code {
+            ErrorCode::Malformed | ErrorCode::ActionNotAllowed | ErrorCode::DiscordRejected => {
+                "refused"
+            }
+            ErrorCode::UpstreamTimeout | ErrorCode::RateLimited | ErrorCode::DiscordUnavailable => {
+                "discord_error"
+            }
+            ErrorCode::Internal => "storage_error",
+            _ => "other",
+        }
+    }
 }
 
 /// Every auth failure is this one error: same code, same message, detail only
@@ -1569,6 +1590,21 @@ pub fn assert_private_bind(host: &str) -> Result<String, BindError> {
 
 /// Crockford base-32 alphabet (legacy `CROCKFORD`; I/L/O/U excluded).
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// End-to-end correlation header: the Worker stamps it, the Durable Object
+/// forwards it, and the container receivers honor it when it has a generated
+/// shape (otherwise they mint a fresh [`new_request_id`]). Lowercase on the
+/// wire; Axum header lookup is case-insensitive.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// True only for values [`new_request_id`] could have generated: exactly
+/// [`REQUEST_ID_LEN`] Crockford characters. Anything else (bearer tokens,
+/// URLs, UUIDs, free text) is never honored or logged as an id, so a
+/// caller-supplied secret cannot become a join key in logs or metrics.
+#[must_use]
+pub fn is_request_id(value: &str) -> bool {
+    value.len() == REQUEST_ID_LEN && value.bytes().all(|b| CROCKFORD.contains(&b))
+}
 
 /// A ULID-ish request id: time-ordered, so a grep of the log sorts naturally,
 /// and random enough not to collide. Randomness arrives as a parameter (16
@@ -2799,11 +2835,14 @@ mod tests {
         // voice synthetic adds one env-only key (TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS).
         // TOG-23387 adds five env-only EventSub keys (TWO_EVENTSUB,
         // TWO_EVENTSUB_BIND, TWO_TWITCH_CLIENT_ID, TWO_TWITCH_CLIENT_SECRET,
-        // TWO_TWITCH_WEBHOOK_SECRET).
+        // TWO_TWITCH_WEBHOOK_SECRET). This change adds two env-only keys
+        // (TWO_TWITCH_BROADCASTERS, TWO_TWITCH_CALLBACK_URL). TOG-29862 moves
+        // TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS from cold to hot, shifting one
+        // entry between those classes.
         for (class, expected) in [
-            (SettingClass::Hot, 42),
-            (SettingClass::Cold, 27),
-            (SettingClass::EnvOnly, 59),
+            (SettingClass::Hot, 43),
+            (SettingClass::Cold, 26),
+            (SettingClass::EnvOnly, 61),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
@@ -3323,6 +3362,26 @@ mod tests {
         // Time-ordered: a later timestamp sorts later.
         let later = new_request_id(1_720_000_000_001, &[0u8; 16]);
         assert!(later > id);
+    }
+
+    #[test]
+    fn inbound_request_ids_accept_only_generated_shapes() {
+        assert!(is_request_id(&new_request_id(
+            1_720_000_000_000,
+            &[1u8; 16]
+        )));
+        for bad in [
+            "",
+            "short",
+            "01J9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ!", // 26 chars but `!` is outside the alphabet
+            "01j9zq9zq9zq9zq9zq9zq9zq9zq",  // lowercase is never generated
+            "01J9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQI", // `I` is excluded from Crockford
+            "01J9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9", // 27 chars
+            "Bearer synthetic-token-value",
+            "https://example.invalid/with-credentials",
+        ] {
+            assert!(!is_request_id(bad), "{bad:?} must not be honored");
+        }
     }
 
     fn signed_headers<'a>(

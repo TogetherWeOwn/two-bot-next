@@ -20,6 +20,9 @@ creator) and asserts:
 | rejoin | the test bot hops from that room straight back into the creator, and a second new room appears and it is moved into that room (a member must never stay in the lobby) |
 | delete | after the test bot leaves, every room it was moved into (the first room and the rejoin room) is deleted within the empty grace |
 | rename | the creator is renamed before the join and restored after; the post-rename join must still move the test bot into a new room (SKIP while the test bot may not rename — see below) |
+| limit | the room's `user_limit` PATCHes to a probed value and back, each write verified by read-back (FAIL on 403, SKIP on 429) |
+| privacy | read-only checks confirm the room's @everyone overwrite does not deny Connect (the public baseline: a Connect deny is the `/private` marker; an inherited Connect allow stays public), the staging product bot has effective View Channel and Manage Roles (the `/private` overwrite precondition), and no member overwrite grants Manage Roles (FAIL on any mismatch or read error) |
+| name_panel | the room's name after the rename cycle still renders from its template, not the fallback (what the `/name` panel's Current-name line shows) |
 | metrics | optional: `two_bot_voice_names_total{outcome="created_with_template"}` grows (SKIP without a metrics token) |
 
 A failed `create` names the refusal reason: the run snapshots
@@ -51,7 +54,7 @@ WebSocket is not an HTTP body and is outside this cap.
   never echoes the body, headers, URL or a parse exception.
 - A refused read fails the run: the `run` check reports `FAIL` with that fixed
   message, the evidence JSON still uploads, and the script exits 1. The
-  workflow's single retry applies as for any other failure.
+  workflow's retries apply as for any other failure.
 - A metrics read that answers an in-cap error status stays optional (`metrics`
   reports SKIP). Only an over-cap body is a failure.
 
@@ -71,7 +74,9 @@ exact-cap pass, the cap-plus-one refusal on both paths and the fixed messages.
   PR's code is not deployed to staging before merge, so a live run would test
   main, not the PR.
 
-Each live run retries once after 30 s; two failures fail it. Evidence JSON is
+Each live run retries twice after 60 s; three failures fail it. The longer
+window covers the documented 95-139 s per-deploy gateway drop as well as a
+transient gateway/REST hiccup. Evidence JSON is
 uploaded as the `voice-synthetic-<run id>` artifact for 14 days.
 
 ## Identity
@@ -110,13 +115,45 @@ Channels: grant the test bot's staging role Manage Channels once (staging
 guild only; the test bot lives nowhere else). Until then the check reports
 SKIP with that detail and every other check still runs. A rename PATCH
 answered with HTTP 429 (Discord allows 2 channel renames per 10 minutes)
-also reports SKIP: the workflow retries after 30 seconds and dispatches can
+also reports SKIP: the workflow retries after 60 seconds and dispatches can
 collide within 10 minutes, and neither must fail the run. A name already
 carrying ` (synthetic)` means a previous run did not restore: the rename is
 skipped and the check FAILs naming the residue, so it is restored manually
 instead of being renamed over. Restore runs whenever a rename was attempted
 and the live name differs from the original, so a rename Discord applied but
 whose response was lost is still restored.
+
+## Owner-command checks (limit, privacy, name panel)
+
+While the test bot owns its room, the synthetic exercises the same Discord
+fields `/limit`, `/unlimit` and `/name` manage through the REST paths the bot
+writes: `user_limit` PATCHes and a final read of the template-rendered room
+name. Each write is verified by a read-back and restored, so a green run leaves
+the room as the bot made it. Privacy is different: it performs only GETs and
+checks the room's public @everyone Connect baseline, the staging product bot's
+effective View Channel and Manage Roles permission (the `/private` overwrite
+precondition), and that no member overwrite grants Manage
+Roles. It does not edit or restore an overwrite.
+
+What this proves — and what it does not: a PASS means the room the staging
+bot created is owner-manageable for the tested limit/name operations, and its
+privacy permissions match the read-only assertions. It does not invoke the
+slash commands themselves: Discord creates interactions only for real users,
+so a bot token cannot. The slash path (registration, gating, replies) stays
+covered by the Rust test suite and the registry smoke.
+
+Grants and SKIP conditions, mirroring the rename case:
+
+- `limit` needs the owner Manage Channels grant the room already carries. A
+  403 FAILs: the test bot owns its room, so the grant was lost or ineffective
+  after creation (the `owner` check reads creation-time grants and cannot see
+  this loss). A 429 SKIPs.
+- `privacy` is read-only and requires no Manage Roles grant for the test bot.
+  A mismatch or REST read error FAILs; privacy never SKIPs on 403 or 429. If
+  the staging product bot lacks effective View Channel and Manage Roles, the
+  failure names its staging role.
+- `name_panel` is read-only and needs no grant: it FAILs when the
+  post-rename room name is missing or the `<display>'s room` fallback.
 
 ## Run it by hand
 

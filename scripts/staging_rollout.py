@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed staging gate for Wrangler 4.149.0's rolling Containers API.
+"""Fail-closed staging gate for Wrangler 4.151.0's rolling Containers API.
 
 Only allowlisted provenance is persisted/printed. API configurations and error
 bodies can contain secrets: never print them, including in exception messages.
@@ -19,7 +19,7 @@ from urllib.request import Request, HTTPRedirectHandler, build_opener
 WORKER = "two-bot-next-staging"
 APPLICATION = "two-bot-next-twobotcontainer-staging"
 CLASS = "TwoBotContainer"
-WRANGLER = "4.149.0"
+WRANGLER = "4.151.0"
 VERSION_PROBES = (["--version"], ["-v"])
 LIMIT = 100
 MAX_BODY = 2 * 1024 * 1024
@@ -32,15 +32,16 @@ USER_AGENT = "two-bot-next-staging-rollout/1.0"
 ACTIVE_LAG_CONFIRMATIONS = 2
 # Polls tolerated while a completed rollout's target image is not yet reflected
 # by the application listing. The listing is read separately from the rollout
-# record and can trail it right after a deploy; a persistent mismatch still
-# fails closed as `application_image_drift`. A poll cycle runs about 11s in CI
-# (5s sleep plus the control-plane reads), so 24 polls is roughly 4.5 minutes.
-# Stale polls only count once the rollout completes while the 300s verify
-# deadline runs from the start, so the deadline usually ends a mismatch that
-# never clears before this cap does; verify reports that as the same drift
-# (see `IMAGE_DRIFT_DIAGNOSTIC_SECONDS`). Twelve (about 2.5 minutes) sat in the
-# middle of the observed lag: on 10-05..10-07 completed verify steps ran up to
-# 192s while eight runs with a healthy, exact-build container failed at 129-186s.
+# record and can trail it right after a deploy. A mismatch is accepted only when
+# the pinned rollout plus exact-build /readyz and /health probes prove the new
+# build is serving; otherwise persistent staleness fails as drift. A poll cycle
+# runs about 11s in CI (5s sleep plus the control-plane reads), so 24 polls is
+# roughly 4.5 minutes. Stale polls only count once the rollout completes while
+# the 300s verify deadline runs from the start, so the deadline usually ends a
+# mismatch that never clears before this cap does (see
+# `IMAGE_DRIFT_DIAGNOSTIC_SECONDS`). Twelve (about 2.5 minutes) sat in the middle
+# of the observed lag: on 10-05..10-07 completed verify steps ran up to 192s while
+# eight runs with a healthy, exact-build container failed at 129-186s.
 APPLICATION_IMAGE_STALE_POLLS = 24
 # Extra time after the verify deadline for the control-plane read behind the
 # drift diagnostic, including when an in-flight poll read reaches the deadline.
@@ -61,6 +62,7 @@ READINESS_TOKENS = frozenset({
     "deployment_id_missing", "operation_failed",
 })
 VERIFY_TIMEOUT_SECONDS = 300
+API_TRANSPORT_BACKOFF_SECONDS = (0.25, 0.5)
 MAX_TIMEOUT_DIAGNOSTIC_SECONDS = 3600
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -167,11 +169,24 @@ class Client:
             return 0, {}, b""
 
     def api(self, path):
-        status, _, body = self.request(self.base + path, authenticated=True)
-        require(status == 200, "api_http_failure")
-        data = decode(body)
-        require(mapping(data).get("success") is True and "result" in data, "api_failure")
-        return data["result"]
+        for attempt in range(len(API_TRANSPORT_BACKOFF_SECONDS) + 1):
+            try:
+                status, _, body = self.request(self.base + path, authenticated=True)
+            except GateError as error:
+                if str(error) != "api_transport_failure":
+                    raise
+                if attempt == len(API_TRANSPORT_BACKOFF_SECONDS):
+                    raise GateError("api_transport_failure") from None
+                delay = API_TRANSPORT_BACKOFF_SECONDS[attempt]
+                if self.deadline is not None:
+                    delay = min(delay, self.deadline - time.monotonic())
+                    require(delay > 0, "rollout_timeout")
+                time.sleep(delay)
+                continue
+            require(status == 200, "api_http_failure")
+            data = decode(body)
+            require(mapping(data).get("success") is True and "result" in data, "api_failure")
+            return data["result"]
 
 
 def decode(body):
@@ -610,6 +625,79 @@ def save(path, value):
     Path(path).write_text(json.dumps(value, indent=2) + "\n")
 
 
+DEPLOY_ENV_VAR = "TWO_DEPLOY_ENV"
+GATEWAY_FAIL_INJECTION_VAR = "TWO_GATEWAY_READINESS_FAIL_INJECTION"
+VOICE_STALL_FAULT_VAR = "TWO_VOICE_STALL_FAULT_INJECTION"
+UNPAIRED_FAULT_VAR = "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"
+
+
+def apply_gateway_fail_injection(config, enabled):
+    """Stage the rollback-drill injection in the GENERATED config only.
+
+    The committed TOML may never carry the switch or a deploy-env marker
+    outside staging (wrangler/scripts/check-env-bindings.py); this helper
+    refuses such a source again so a hand-generated config cannot smuggle
+    either past CI. When `enabled`, the staging fence marker must already
+    be exactly "staging" and only the staging vars of the generated config
+    gain the switch — top-level, production and every other environment
+    stay untouched, and the checked-in file is never modified. When not
+    enabled nothing is added, so a plain push deploy is byte-identical in
+    behavior to before the drill existed.
+    """
+    envs = config.get("env") or {}
+    tables = [("top-level", config.get("vars") or {})]
+    tables += [(name, (env or {}).get("vars") or {}) for name, env in envs.items()]
+    for _name, variables in tables:
+        require(GATEWAY_FAIL_INJECTION_VAR not in variables,
+                "gateway_fail_injection_in_source_config")
+    for name, variables in tables:
+        if name != "staging":
+            require(DEPLOY_ENV_VAR not in variables, "deploy_env_outside_staging")
+    if not enabled:
+        return
+    staging = mapping(mapping(config.get("env")).get("staging"))
+    variables = staging.get("vars")
+    require(isinstance(variables, dict) and variables.get(DEPLOY_ENV_VAR) == "staging",
+            "gateway_fail_injection_fence_missing")
+    variables[GATEWAY_FAIL_INJECTION_VAR] = "1"
+
+
+def apply_remediation_fault_injection(config, voice_stall, unpaired_disconnect):
+    """Stage the remediation-drill switches in the GENERATED config only.
+
+    Same fence as the rollback-drill helper above: the committed TOML may
+    never carry either switch (wrangler/scripts/check-env-bindings.py), and
+    this helper refuses such a source again so a hand-generated config cannot
+    smuggle either past CI. When armed, the staging fence marker must already
+    be exactly "staging" and only the staging vars of the generated config
+    gain the requested switches — top-level, production and every other
+    environment stay untouched, and the checked-in file is never modified.
+    When neither drill is requested nothing is added, so a plain push deploy
+    is byte-identical in behavior to before the injector existed.
+    """
+    envs = config.get("env") or {}
+    tables = [("top-level", config.get("vars") or {})]
+    tables += [(name, (env or {}).get("vars") or {}) for name, env in envs.items()]
+    for _name, variables in tables:
+        require(VOICE_STALL_FAULT_VAR not in variables,
+                "remediation_fault_in_source_config")
+        require(UNPAIRED_FAULT_VAR not in variables,
+                "remediation_fault_in_source_config")
+    for name, variables in tables:
+        if name != "staging":
+            require(DEPLOY_ENV_VAR not in variables, "deploy_env_outside_staging")
+    if not voice_stall and not unpaired_disconnect:
+        return
+    staging = mapping(mapping(config.get("env")).get("staging"))
+    variables = staging.get("vars")
+    require(isinstance(variables, dict) and variables.get(DEPLOY_ENV_VAR) == "staging",
+            "remediation_fault_fence_missing")
+    if voice_stall:
+        variables[VOICE_STALL_FAULT_VAR] = "1"
+    if unpaired_disconnect:
+        variables[UNPAIRED_FAULT_VAR] = "1"
+
+
 def prepare(args, client):
     staging_url()
     revision = os.environ.get("GITHUB_SHA", "")
@@ -637,6 +725,13 @@ def prepare(args, client):
         container["image_build_context"] = str(source.parent.parent)
     containers[0]["image_vars"] = {"BOT_BUILD_REVISION": revision, "BOT_BUILD_ID": build_id}
     containers[0]["rollout_kind"] = "full_auto"
+    # Rollback drill only: the dispatch-only workflow input reaches the
+    # deployed build solely as this flag on the generated staging config.
+    apply_gateway_fail_injection(config, bool(getattr(args, "inject_gateway_failure", False)))
+    # Remediation drills only: the dispatch-only workflow inputs reach the
+    # deployed build solely as these flags on the generated staging config.
+    apply_remediation_fault_injection(config, bool(getattr(args, "inject_voice_stall", False)),
+                                      bool(getattr(args, "inject_unpaired_disconnect", False)))
     save(args.deploy_config, config)
     save(args.receipt, {"started": started, "application_id": app["id"],
                         "namespace_id": app["durable_objects"]["namespace_id"],
@@ -726,15 +821,19 @@ def verify(args, client):
     pinned = None
     lag_streak = 0
     image_stale = 0
+    listing_seen_target = False
     drift_candidate = False
     app = row = None
     while time.monotonic() < client.deadline:
         probed = False
         passed = False
+        stale = False
         app = deadline_aware_read(
             client, lambda: application(client), app, row, image, drift_candidate, verification_started)
         require(app["id"] == baseline["application_id"]
                 and app["durable_objects"]["namespace_id"] == baseline["namespace_id"], "application_identity_drift")
+        listed_image = mapping(app.get("configuration")).get("image")
+        listing_seen_target = listing_seen_target or listed_image == image
         if pinned is None:
             pinned = select_rollout(rollouts(client, app["id"]), baseline, image)
             client.observation = "no_new_rollout"
@@ -754,25 +853,31 @@ def verify(args, client):
                 deadline_aware_read(
                     client, lambda: active_worker(client, version), app, row, image,
                     drift_candidate, verification_started)
-            stale = (complete or lag) and mapping(app.get("configuration")).get("image") != image
+            stale = (complete or lag) and listed_image != image
             drift_candidate = stale
             if stale:
                 image_stale += 1
                 client.observation += f" application_image=stale polls={image_stale}"
-                if image_stale > APPLICATION_IMAGE_STALE_POLLS:
-                    raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
             else:
                 image_stale = 0
-            if (complete or lag) and not stale:
+            # The application listing is eventually consistent and can remain on
+            # its baseline image after the rollout and serving process converge.
+            # The pinned rollout plus exact-build /readyz and /health probes are
+            # the acceptance evidence; keep polling those while the listing lags.
+            if complete or lag:
                 active_worker(client, version)
                 status, headers, body = client.request(url + "/readyz")
                 probed = True
                 observed = "rollout=active_lag " if lag else "rollout=converged "
                 client.observation = observed + runtime_observation(
                     status, headers, body, version, baseline["revision"], baseline["build_id"])
+                if stale:
+                    client.observation += f" application_image=stale polls={image_stale}"
                 if runtime_ready(status, headers, body, version, baseline["revision"], baseline["build_id"]):
                     health, health_headers, _ = client.request(url + "/health")
                     client.observation = f"{observed}readyz=200 health={health}"
+                    if stale:
+                        client.observation += f" application_image=stale polls={image_stale}"
                     if health == 200 and health_headers.get("x-two-worker-version") == version:
                         # Re-read control plane after the runtime probes; neither
                         # Worker activation nor container rollout is transactional.
@@ -787,18 +892,37 @@ def verify(args, client):
                                 or active_lag(final, image, pinned["target_version"]),
                                 "rollout_not_converged")
                         final_app = application(client)
-                        if not (final_app["id"] == app["id"]
-                                and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"]
-                                and mapping(final_app.get("configuration")).get("image") == image):
-                            client.observation += " application_image=final_mismatch"
+                        require(final_app["id"] == app["id"]
+                                and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"],
+                                "application_identity_drift")
+                        final_image = mapping(final_app.get("configuration")).get("image")
+                        listing_seen_target = listing_seen_target or final_image == image
+                        final_previous_image = mapping(final.get("current_configuration")).get("image")
+                        verified_previous_image = (
+                            isinstance(final_image, str) and re.fullmatch(IMAGE, final_image)
+                            and isinstance(final_previous_image, str)
+                            and re.fullmatch(IMAGE, final_previous_image)
+                            and final_image == final_previous_image
+                        )
+                        later_rollouts = []
+                        if final_image != image and verified_previous_image and not listing_seen_target:
+                            later_rollouts = [mapping(item) for item in rollouts(client, app["id"])
+                                              if mapping(item).get("id") != pinned["id"]
+                                              and timestamp(mapping(item).get("created_at"))
+                                              > timestamp(pinned.get("created_at"))]
+                        if (final_image != image and (not verified_previous_image or listing_seen_target
+                                                      or later_rollouts)):
                             raise GateError("application_image_drift",
-                                            image_drift_detail(client, final_app, row, image))
+                                            image_drift_detail(client, final_app, final, image))
+                        listing_lag = final_image != image
                         if complete or lag_streak + 1 >= ACTIVE_LAG_CONFIRMATIONS:
                             evidence = {"worker_version": version, "application_id": app["id"],
                                         "rollout_id": pinned["id"],
                                         "target_version": pinned["target_version"],
                                         "image": image, "revision": baseline["revision"],
                                         "build_id": baseline["build_id"], "readyz": 200, "health": 200}
+                            if listing_lag:
+                                evidence["application_listing_lag"] = True
                             if lag:
                                 evidence["active_lag"] = True
                             save(args.evidence, evidence)
@@ -828,6 +952,9 @@ def verify(args, client):
                         client.zero_instance_last = diagnostic
                 if failure and "gateway_failure=" not in client.observation:
                     client.observation += " gateway_failure=" + failure
+        if (stale and not passed and image_stale > APPLICATION_IMAGE_STALE_POLLS
+                and "gateway_failure=" not in (client.observation or "")):
+            raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
         if not passed:
             lag_streak = 0
         time.sleep(max(0, min(5, client.deadline - time.monotonic())))
@@ -850,7 +977,22 @@ def main():
     parser.add_argument("--config", default="wrangler.toml")
     parser.add_argument("--deploy-config", default="staging-deploy.json")
     parser.add_argument("--evidence", default="staging-rollout-evidence.json")
+    parser.add_argument("--inject-gateway-failure", action="store_true",
+                        help="prepare only: staging rollback drill — the generated "
+                             "staging deploy config reports gateway not-ready")
+    parser.add_argument("--inject-voice-stall", action="store_true",
+                        help="prepare only: staging remediation drill — the generated "
+                             "staging deploy config holds a stale creator map")
+    parser.add_argument("--inject-unpaired-disconnect", action="store_true",
+                        help="prepare only: staging remediation drill — the generated "
+                             "staging deploy config holds an unpaired disconnect")
     args = parser.parse_args()
+    if args.inject_gateway_failure and args.mode != "prepare":
+        parser.error("--inject-gateway-failure is prepare-only")
+    if args.inject_voice_stall and args.mode != "prepare":
+        parser.error("--inject-voice-stall is prepare-only")
+    if args.inject_unpaired_disconnect and args.mode != "prepare":
+        parser.error("--inject-unpaired-disconnect is prepare-only")
     client = None
     try:
         deadline = time.monotonic() + VERIFY_TIMEOUT_SECONDS if args.mode == "verify" else None

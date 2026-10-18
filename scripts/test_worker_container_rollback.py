@@ -5,12 +5,15 @@ memory, time is scripted, and the ownership client is a recording stub.
 Nothing here dispatches a workflow or moves traffic.
 """
 
+import dataclasses
 import io
 import json
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # E402-safe by convention: every scripts/ test adds its own directory first,
@@ -134,6 +137,13 @@ def make_rollback(routes, variant="staging", control=None, now=None, sleep=None,
     return rb, client, log
 
 
+def version_route(version=GOOD_VERSION, message=SHA):
+    result = {"id": version}
+    if message is not None:
+        result["annotations"] = {"workers/message": message}
+    return lambda: {"success": True, "result": result}
+
+
 class SnapshotTests(unittest.TestCase):
     def test_snapshot_records_allowlisted_serving_state(self):
         prev = rollout_row("r-prev", good_image(), created="2026-10-14T00:00:00Z")
@@ -146,16 +156,49 @@ class SnapshotTests(unittest.TestCase):
             ("GET", f"/workers/scripts/{WORKER}/deployments"): lambda: {
                 "success": True, "result": {"deployments": [
                     {"versions": [{"version_id": GOOD_VERSION, "percentage": 100}]}]}},
+            ("GET", f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"): version_route(),
         }
         state = rollback.snapshot_state(FakeClient(routes), WORKER, APPLICATION)
         self.assertEqual(state, {"has_previous": True, "worker": WORKER,
                                  "application": APPLICATION, "application_id": APP_ID,
                                  "namespace_id": NAMESPACE, "serving_version": GOOD_VERSION,
+                                 "serving_sha": SHA, "provenance_complete": True,
                                  "serving_rollout_id": "r-prev", "serving_image": good_image(),
                                  "recorded_at": state["recorded_at"]})
         # The previous target configuration is re-read at rollback time and
         # held in memory only: it must never reach the snapshot artifact.
         self.assertNotIn("target_configuration", json.dumps(state))
+
+    def test_snapshot_of_pre_stamp_version_records_no_sha(self):
+        # A version deployed before --message stamping has no SHA member:
+        # the snapshot records the incomplete receipt instead of blocking
+        # the deploy it precedes. A non-SHA message is just as absent.
+        for message in (None, "deploy from dashboard", "0123abc"):
+            with self.subTest(message=message):
+                prev = rollout_row("r-prev", good_image(), created="2026-10-14T00:00:00Z")
+                routes = {
+                    ("GET", "/containers/applications"): lambda: {
+                        "success": True, "result": [{"id": APP_ID, "name": APPLICATION,
+                                                     "durable_objects": {"namespace_id": NAMESPACE}}]},
+                    ("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100"): lambda: {
+                        "success": True, "result": [prev]},
+                    ("GET", f"/workers/scripts/{WORKER}/deployments"): lambda: {
+                        "success": True, "result": {"deployments": [
+                            {"versions": [{"version_id": GOOD_VERSION, "percentage": 100}]}]}},
+                    ("GET", f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"):
+                        version_route(message=message),
+                }
+                state = rollback.snapshot_state(FakeClient(routes), WORKER, APPLICATION)
+                self.assertTrue(state["has_previous"])
+                self.assertIsNone(state["serving_sha"])
+                self.assertFalse(state["provenance_complete"])
+
+    def test_version_sha_refuses_identity_drift(self):
+        routes = {("GET", f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"):
+                  version_route(version=BAD_VERSION)}
+        with self.assertRaises(base.GateError) as raised:
+            rollback.version_sha(FakeClient(routes), WORKER, GOOD_VERSION)
+        self.assertEqual(str(raised.exception), "version_identity_drift")
 
     def test_split_traffic_has_no_previous(self):
         routes = {
@@ -308,6 +351,17 @@ class StableGateTests(unittest.TestCase):
 
 
 class RollbackRunTests(unittest.TestCase):
+    def test_stable_gate_budget_starts_after_restore_steps(self):
+        clock = Clock()
+        rb, _, _ = make_rollback({}, clock=clock)
+        gate_started = []
+        rb.restore_image = lambda image: clock.sleep(400)
+        rb.take_over = lambda version: clock.sleep(500)
+        rb.wait_stable = lambda version, started: gate_started.append(started)
+        with mock.patch.object(rollback, "serving_version", return_value=GOOD_VERSION):
+            rb.run(GOOD_VERSION, good_image())
+        self.assertEqual(gate_started, [900.0])
+
     def routes(self, serving=BAD_VERSION):
         prev = rollout_row("r-prev", good_image(), created="2026-10-14T00:00:00Z")
         created = {"n": 0}
@@ -472,66 +526,393 @@ class MainValidationTests(unittest.TestCase):
         self.assertIn("invalid_expected_sha", out)
 
 
-class ScriptedResponse:
-    """Minimal urllib response: status plus a fixed body."""
+class ProvenanceReceiptTests(unittest.TestCase):
+    def receipt(self, **overrides):
+        fields = {"worker": WORKER, "application": APPLICATION,
+                  "version": GOOD_VERSION, "sha": SHA, "image": good_image()}
+        fields.update(overrides)
+        return rollback.ProvenanceReceipt(**fields)
 
-    def __init__(self, status, payload):
-        self.status = status
-        self.payload = payload
+    def test_complete_tuple_builds_and_validates(self):
+        receipt = self.receipt()
+        receipt.validate(version=GOOD_VERSION, sha=SHA, image=good_image())
 
-    def __enter__(self):
-        return self
+    def test_missing_or_malformed_members_refuse_construction(self):
+        cases = [
+            ({"worker": ""}, "provenance_worker_invalid"),
+            ({"worker": None}, "provenance_worker_invalid"),
+            ({"application": ""}, "provenance_application_invalid"),
+            ({"version": None}, "provenance_version_invalid"),
+            ({"version": "not-a-uuid"}, "provenance_version_invalid"),
+            ({"sha": None}, "provenance_sha_invalid"),
+            ({"sha": ""}, "provenance_sha_invalid"),
+            ({"sha": SHA[:39]}, "provenance_sha_invalid"),
+            ({"sha": SHA.upper()}, "provenance_sha_invalid"),
+            ({"image": None}, "provenance_image_invalid"),
+            ({"image": good_image().replace(APPLICATION, "other-app")},
+             "provenance_image_invalid"),
+            ({"image": good_image().replace("@sha256:", ":latest@sha256:")},
+             "provenance_image_invalid"),
+        ]
+        for overrides, code in cases:
+            with self.subTest(overrides=str(overrides)[:60]):
+                with self.assertRaises(base.GateError) as raised:
+                    self.receipt(**overrides)
+                self.assertEqual(str(raised.exception), code)
 
-    def __exit__(self, *args):
-        return False
+    def test_mismatched_inputs_refuse_and_name_the_member(self):
+        receipt = self.receipt()
+        cases = [
+            ({"version": BAD_VERSION, "sha": SHA, "image": good_image()}, "member=version"),
+            ({"version": GOOD_VERSION, "sha": "f" * 40, "image": good_image()}, "member=sha"),
+            ({"version": GOOD_VERSION, "sha": SHA, "image": bad_image()}, "member=image"),
+            ({"version": GOOD_VERSION, "sha": None, "image": good_image()}, "member=sha"),
+        ]
+        for inputs, member in cases:
+            with self.subTest(member=member):
+                with self.assertRaises(base.GateError) as raised:
+                    receipt.validate(**inputs)
+                self.assertEqual(str(raised.exception), "provenance_mismatch")
+                self.assertEqual(raised.exception.detail, member)
 
-    def read(self, limit=None):
-        return self.payload
-
-
-class ScriptedOpener:
-    def __init__(self, status, payload):
-        self.status = status
-        self.payload = payload
-
-    def open(self, request, timeout=None):
-        return ScriptedResponse(self.status, self.payload)
-
-
-def real_post(status, payload):
-    """Run the real RollbackClient.post against a scripted HTTP status."""
-    client = rollback.RollbackClient(ACCOUNT, "token")
-    client.opener = ScriptedOpener(status, payload)
-    return client.post(f"/containers/applications/{APP_ID}/rollouts",
-                       {"strategy": "rolling"})
-
-
-def success_envelope(result):
-    return json.dumps({"success": True, "result": result}).encode()
+    def test_receipt_is_immutable(self):
+        receipt = self.receipt()
+        for member in ("worker", "application", "version", "sha", "image"):
+            with self.subTest(member=member):
+                with self.assertRaises(dataclasses.FrozenInstanceError):
+                    setattr(receipt, member, "tampered")
+        self.assertEqual(receipt.sha, SHA)
 
 
-class PostHttpStatusTests(unittest.TestCase):
-    def test_post_accepts_201_created(self):
-        # The container rollout-create POST answers 201 on success; the
-        # staging auto-rollback once failed a restored image as
-        # api_http_failure status=201.
-        self.assertEqual(real_post(201, success_envelope({"id": "r-new"})),
-                         {"id": "r-new"})
+class MainProvenanceTests(unittest.TestCase):
+    """Manual and snapshot rollbacks refuse a bad receipt before any POST."""
 
-    def test_post_still_accepts_200(self):
-        self.assertEqual(real_post(200, success_envelope({"id": "r-new"})),
-                         {"id": "r-new"})
+    URL = "https://two-bot-next-staging.acct.workers.dev"
 
-    def test_post_rejects_500(self):
-        with self.assertRaises(base.GateError) as caught:
-            real_post(500, b"{}")
-        self.assertEqual(caught.exception.args[0], "api_http_failure")
-        self.assertEqual(caught.exception.detail, "status=500")
+    def base_env(self):
+        return {"CLOUDFLARE_ACCOUNT_ID": ACCOUNT, "CLOUDFLARE_API_TOKEN": "token",
+                "OWNERSHIP_CONTROL_TOKEN": "t" * 32, "GITHUB_RUN_ID": "700"}
 
-    def test_post_rejects_unsuccessful_envelope(self):
-        with self.assertRaises(base.GateError) as caught:
-            real_post(201, json.dumps({"success": False, "result": {}}).encode())
-        self.assertEqual(caught.exception.args[0], "api_failure")
+    def run_main(self, argv, client):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = rollback.main(argv, environ=self.base_env(),
+                                 client_factory=lambda _a, _t: client)
+        return code, stdout.getvalue()
+
+    def manual_argv(self, *extra):
+        return ["rollback", "--variant", "staging", "--worker-url", self.URL,
+                "--target-version", GOOD_VERSION, "--target-image", good_image(),
+                "--actor", "a:b", "--evidence", "e.json", *extra]
+
+    def live_routes(self, message=SHA, history=(BAD_VERSION, GOOD_VERSION),
+                    served_image=None):
+        served_image = good_image() if served_image is None else served_image
+        deployments = [{"versions": [{"version_id": v, "percentage": 100}]}
+                       for v in history]
+        return {
+            ("GET", f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"):
+                version_route(message=message),
+            ("GET", f"/workers/scripts/{WORKER}/deployments"): lambda: {
+                "success": True, "result": {"deployments": deployments}},
+            ("GET", "/containers/applications"): lambda: {
+                "success": True, "result": [{"id": APP_ID, "name": APPLICATION,
+                                             "durable_objects": {"namespace_id": NAMESPACE}}]},
+            ("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100"): lambda: {
+                "success": True, "result": [rollout_row("r-prev", served_image)]},
+        }
+
+    def assert_refused_before_posts(self, argv, routes, code_text):
+        client = FakeClient(routes)
+        code, out = self.run_main(argv, client)
+        self.assertEqual(code, 1)
+        self.assertIn(code_text, out)
+        self.assertFalse([call for call in client.calls if call[0] == "POST"],
+                         client.calls)
+
+    def test_manual_rollback_needs_the_receipt_sha(self):
+        self.assert_refused_before_posts(self.manual_argv(), self.live_routes(),
+                                         "manual_rollback_needs_expected_sha")
+
+    def test_manual_rollback_refuses_a_sha_the_version_was_not_built_from(self):
+        # The dispatch SHA is CI-green-shaped but is not this version's
+        # commit: the version annotation refuses the pairing.
+        argv = self.manual_argv("--expected-sha", "f" * 40)
+        self.assert_refused_before_posts(argv, self.live_routes(), "provenance_mismatch")
+
+    def test_manual_rollback_refuses_a_pre_stamp_version(self):
+        argv = self.manual_argv("--expected-sha", SHA)
+        self.assert_refused_before_posts(argv, self.live_routes(message=None),
+                                         "provenance_mismatch")
+
+    def test_manual_rollback_refuses_a_version_that_never_served(self):
+        argv = self.manual_argv("--expected-sha", SHA)
+        self.assert_refused_before_posts(
+            argv, self.live_routes(history=(BAD_VERSION,)),
+            "provenance_version_never_served")
+
+    def test_manual_rollback_refuses_an_image_that_never_served(self):
+        argv = self.manual_argv("--expected-sha", SHA)
+        self.assert_refused_before_posts(
+            argv, self.live_routes(served_image=bad_image()),
+            "provenance_image_never_served")
+
+    def test_manual_rollback_refuses_an_image_from_a_non_completed_rollout(self):
+        # The only rollout carrying the image never completed: without the
+        # completed-only filter it would pass as "served" and traffic would
+        # move to an image from a failed or reverted rollout.
+        for status in ("failed", "reverted"):
+            with self.subTest(status=status):
+                served = rollout_row("r-prev", good_image(), status=status)
+                routes = self.live_routes()
+                routes[("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100")] = \
+                    lambda served=served: {"success": True, "result": [served]}
+                argv = self.manual_argv("--expected-sha", SHA)
+                self.assert_refused_before_posts(argv, routes,
+                                                 "provenance_image_never_served")
+
+    def test_complete_receipt_validates_against_live_state(self):
+        receipt = rollback.ProvenanceReceipt(WORKER, APPLICATION, GOOD_VERSION,
+                                             SHA, good_image())
+        rollback.validate_receipt_against_live(FakeClient(self.live_routes()), receipt)
+
+    def snapshot_argv(self, path, *extra):
+        return ["rollback", "--variant", "staging", "--worker-url", self.URL,
+                "--snapshot", str(path), "--actor", "a:b", "--evidence", "e.json",
+                *extra]
+
+    def write_snapshot(self, tmp, **overrides):
+        state = {"has_previous": True, "worker": WORKER, "application": APPLICATION,
+                 "application_id": APP_ID, "namespace_id": NAMESPACE,
+                 "serving_version": GOOD_VERSION, "serving_sha": SHA,
+                 "provenance_complete": True, "serving_rollout_id": "r-prev",
+                 "serving_image": good_image(), "recorded_at": 1.0}
+        state.update(overrides)
+        path = Path(tmp) / "snapshot.json"
+        path.write_text(json.dumps(state))
+        return path
+
+    def snapshot_routes(self, image=None):
+        image = good_image() if image is None else image
+        return {("GET", f"/containers/applications/{APP_ID}/rollouts/r-prev"):
+                lambda: {"success": True, "result": rollout_row("r-prev", image)}}
+
+    def test_snapshot_rollback_refuses_image_drift_since_the_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_snapshot(tmp)
+            self.assert_refused_before_posts(self.snapshot_argv(path),
+                                             self.snapshot_routes(bad_image()),
+                                             "provenance_mismatch")
+
+    def test_snapshot_rollback_refuses_a_conflicting_expected_sha(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_snapshot(tmp)
+            argv = self.snapshot_argv(path, "--expected-sha", "f" * 40)
+            self.assert_refused_before_posts(argv, self.snapshot_routes(),
+                                             "provenance_mismatch")
+
+    def test_snapshot_rollback_refuses_a_malformed_recorded_sha(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_snapshot(tmp, serving_sha="zzz")
+            self.assert_refused_before_posts(self.snapshot_argv(path),
+                                             self.snapshot_routes(),
+                                             "invalid_snapshot_sha")
+
+    def test_snapshot_rollback_revalidates_the_receipt_against_live_state(self):
+        # A stale or hand-edited snapshot whose recorded SHA is not the
+        # version's stamped deploy SHA refuses before any POST, exactly
+        # like a manual rollback: never at the stable gate after restore.
+        routes = self.snapshot_routes()
+        routes[("GET", f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}")] = \
+            version_route(message="f" * 40)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_snapshot(tmp)
+            self.assert_refused_before_posts(self.snapshot_argv(path), routes,
+                                             "provenance_mismatch")
+
+    def snapshot_run_routes(self, revision):
+        """Full main() snapshot-path routes: the recorded receipt
+        revalidates, the worker leg is skipped (the snapshot names the
+        serving version), the image leg posts, and the gate polls the
+        restored build reporting `revision`."""
+        handler, health = ready_probe(GOOD_VERSION, revision=revision)
+        created = {"n": 0}
+
+        def post_rollouts(body):
+            created["n"] += 1
+            return {"id": "r-new", "target_version": 9}
+
+        def get_rollout():
+            return {"success": True, "result": rollout_row(
+                "r-new", good_image(), created="2026-10-15T01:00:00Z",
+                status="completed", target_version=9)}
+
+        deployments = [{"versions": [{"version_id": v, "percentage": 100}]}
+                       for v in (GOOD_VERSION, BAD_VERSION)]
+        return {
+            ("GET", f"/containers/applications/{APP_ID}/rollouts/r-prev"):
+                lambda: {"success": True, "result": rollout_row("r-prev", good_image())},
+            ("GET", f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"):
+                version_route(message=SHA),
+            ("GET", f"/workers/scripts/{WORKER}/deployments"): lambda: {
+                "success": True, "result": {"deployments": deployments}},
+            ("GET", "/containers/applications"): lambda: {
+                "success": True, "result": [{"id": APP_ID, "name": APPLICATION,
+                                             "durable_objects": {"namespace_id": NAMESPACE},
+                                             "configuration": {"image": good_image()}}]},
+            ("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100"): lambda: {
+                "success": True, "result": [rollout_row("r-prev", good_image())]},
+            ("POST", f"/containers/applications/{APP_ID}/rollouts"): post_rollouts,
+            ("GET", f"/containers/applications/{APP_ID}/rollouts/r-new"): get_rollout,
+            ("PROBE", "readyz"): handler,
+            ("PROBE", "health"): health,
+        }
+
+    def run_snapshot_main(self, tmp, revision):
+        """Run main() on a complete snapshot with a stubbed ownership
+        client and a scripted clock; capture the gate's expected SHA."""
+        routes = self.snapshot_run_routes(revision)
+        client = FakeClient(routes)
+        control, _ = control_stub()
+        clock = Clock()
+        captured = {}
+        real_cls = rollback.Rollback
+
+        def spy_factory(*args, **kwargs):
+            kwargs["now"] = clock.now
+            kwargs["sleep"] = clock.sleep
+            instance = real_cls(*args, **kwargs)
+            captured["expected_sha"] = instance.expected_sha
+            return instance
+
+        path = self.write_snapshot(tmp)
+        evidence = str(Path(tmp) / "evidence.json")
+        argv = ["rollback", "--variant", "staging", "--worker-url", self.URL,
+                "--snapshot", str(path), "--actor", "a:b",
+                "--evidence", evidence]
+        stdout = io.StringIO()
+        with (mock.patch.object(rollback, "Rollback", spy_factory),
+              mock.patch.object(rollback, "control_client",
+                                lambda *args, **kwargs: control),
+              redirect_stdout(stdout)):
+            code = rollback.main(argv, environ=self.base_env(),
+                                 client_factory=lambda _a, _t: client)
+        return code, stdout.getvalue(), captured, client, evidence
+
+    def test_snapshot_rollback_pins_the_gate_to_the_recorded_sha(self):
+        # The receipt SHA becomes the stable gate's expected revision, so
+        # the restored build must report it. Deleting the pin leaves the
+        # gate unpinned (None) and this assertion fails.
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, captured, client, evidence = self.run_snapshot_main(tmp, SHA)
+            self.assertEqual(code, 0, out)
+            self.assertEqual(captured.get("expected_sha"), SHA)
+            record = json.loads(Path(evidence).read_text())
+        self.assertEqual(record["provenance"], "validated")
+        self.assertEqual(record["provenance_sha"], SHA)
+        self.assertTrue([call for call in client.calls if call[0] == "POST"],
+                        client.calls)
+
+    def test_snapshot_rollback_gate_refuses_a_revision_other_than_the_receipt_sha(self):
+        # Without the pin this answer passes on the version header alone;
+        # with it the gate polls to its deadline and fails closed.
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, captured, _, _ = self.run_snapshot_main(tmp, "f" * 40)
+        self.assertEqual(code, 1)
+        self.assertEqual(captured.get("expected_sha"), SHA)
+        self.assertIn("gate_timeout", out)
+
+
+class PostStatusTests(unittest.TestCase):
+    """A created rollout (201) is success; the 10-16 staging auto-rollback
+    posted its rollout, read 201 and failed the run as api_http_failure."""
+
+    class Response:
+        def __init__(self, status, body):
+            self.status, self.body = status, body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, limit):
+            return self.body[:limit]
+
+    def client(self, status):
+        body = json.dumps({"success": True, "result": {"id": "r-1"}}).encode()
+        client = rollback.RollbackClient(ACCOUNT, "token")
+        client.opener = type("Opener", (), {"open": lambda _self, request, timeout: self.Response(status, body)})()
+        return client
+
+    def test_created_201_is_success(self):
+        self.assertEqual(self.client(201).post("/x", {}), {"id": "r-1"})
+
+    def test_ok_200_is_success(self):
+        self.assertEqual(self.client(200).post("/x", {}), {"id": "r-1"})
+
+    def test_other_2xx_fails_closed(self):
+        with self.assertRaises(base.GateError) as raised:
+            self.client(202).post("/x", {})
+        self.assertEqual(str(raised.exception), "api_http_failure")
+
+
+class ControlFenceHintTests(unittest.TestCase):
+    FENCED = ("Singleton is intentionally fenced or uninitialized; "
+              "explicit staging release required\n")
+
+    def refusal(self, stderr, variant="staging", action="takeover", epoch=None):
+        failed = rollback.subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=stderr)
+        control = rollback.control_client(variant, "secret-token", "https://w.example",
+                                          "https://s.example", "actor")
+        with mock.patch.object(rollback.subprocess, "run", return_value=failed):
+            with self.assertRaises(base.GateError) as raised:
+                control(action, epoch)
+        return raised.exception
+
+    def test_fenced_refusal_carries_no_release_hint(self):
+        # The client must stay hint-free: its takeover calls run with
+        # OWNERSHIP_RELEASE_FENCE=true (pinned below), so the fenced refusal
+        # is unreachable through them, and production throws the same prefix
+        # with a different release route. The scoped fence guidance lives in
+        # the deploy-staging takeover step instead.
+        error = self.refusal(self.FENCED)
+        self.assertEqual(str(error), "ownership_control_failed")
+        # Only the allowlisted prefix reaches the detail, with no hint.
+        self.assertEqual(error.detail, "Singleton is intentionally fenced or uninitialized")
+        self.assertNotIn("secret-token", error.detail)
+
+    def test_production_fenced_refusal_names_no_staging_route(self):
+        error = self.refusal(self.FENCED, variant="production", action="fence", epoch=9)
+        self.assertEqual(str(error), "ownership_control_failed")
+        self.assertNotIn("deploy-staging", error.detail)
+        self.assertNotIn("release_fence", error.detail)
+
+    def test_other_refusals_carry_no_release_hint(self):
+        error = self.refusal("Ownership transition not confirmed\n")
+        self.assertEqual(error.detail, "Ownership transition not confirmed")
+
+    def test_fence_env_contract_that_makes_the_hint_dead(self):
+        # Pins the env contract behind the hint removal: takeover-style
+        # actions release the fence, fence/status do not. A fenced refusal
+        # can therefore never answer this client's takeover calls.
+        seen = {}
+
+        def fake_run(command, **kwargs):
+            seen[command[2]] = kwargs["env"]["OWNERSHIP_RELEASE_FENCE"]
+            return rollback.subprocess.CompletedProcess(args=command, returncode=0,
+                                                       stdout='{"ok": true}', stderr="")
+
+        control = rollback.control_client("staging", "t" * 32, "https://w.example",
+                                          "https://s.example", "actor")
+        with mock.patch.object(rollback.subprocess, "run", side_effect=fake_run):
+            control("deployment-takeover")
+            control("takeover", 9)
+            control("fence", 9)
+            control("status")
+        self.assertEqual(seen, {"deployment-takeover": "true", "takeover": "true",
+                                "fence": "false", "status": "false"})
 
 
 if __name__ == "__main__":

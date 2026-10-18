@@ -29,8 +29,10 @@ with a valid broadcaster id/login/`started_at`, matching condition, and an
 `channel.update`) and versions are not announced. After signature verification,
 a notification that cannot be classified or planned is deterministic and MUST
 be acknowledged with 2XX and ignored; do not return an error status that makes
-Twitch retry it. Only a transient send or durable-ledger failure is retriable:
-release the claim and return 5XX. See `crates/core/src/stream_funnel.rs`.
+Twitch retry it. Only a transient send or durable-ledger failure is retriable
+(5XX); only a send that provably never reached Discord releases the claim —
+claim and stamp failures never release it. See
+`crates/core/src/stream_funnel.rs`.
 
 ## YouTube VOD linking convention (confirmed 2026-10-12)
 
@@ -81,15 +83,33 @@ What the core does, in order, for every delivery:
    only a transient side-effect failure is retriable.
 4. For a go-live: check the broadcaster allowlist, render the post from the
    validated invite, then claim the go-live key. A retry or replay of the same
-   `broadcaster + started_at` is skipped. If the send or durable-ledger operation
-   fails transiently, the caller releases the claim and answers 5XX so Twitch
-   retries. Classification or planning errors alone must not trigger a retry.
+   `broadcaster + started_at` whose row is started or delivered is skipped
+   with 2XX; a fresh never-started row is answered 5XX (`InFlight`), which
+   asks Twitch to retry. If the send or
+   durable-ledger operation fails transiently, the caller answers 5XX so
+   Twitch retries; it releases the claim ONLY when the send provably never
+   reached Discord (`SendFailed` in `stream_live::disposition`) — a claim
+   failure or a stamp failure after a possibly-successful send never
+   releases, or the retry could double-post. Classification or planning
+   errors alone must not trigger a retry.
 
 Subscription management is pure request building plus a diff
-(`create_subscription_body`, `parse_subscriptions`, `reconcile`). It runs at
-boot and after a `revocation`, never on a timer, and it only touches
-subscriptions on the bot's own callback. Deletes precede creates because
-Twitch answers 409 to a duplicate create.
+(`create_subscription_body`, `parse_subscriptions`, `reconcile`). The runtime
+wiring (`crates/bot/src/eventsub_reconcile.rs`) runs it once at startup and on
+a bounded hourly interval while `TWO_EVENTSUB` is exactly `1`, and it only
+touches subscriptions on the bot's own callback (`TWO_TWITCH_CALLBACK_URL`).
+Deletes precede creates because Twitch answers 409 to a duplicate create. The
+plan runs one action at a time: a rejected action (for example a 400 for a
+mistyped broadcaster id) is logged and counted, the later actions and the
+final listing still run, and the pass then fails with the failed and missing
+counts, so one bad id never starves the broadcasters after it. A
+`revocation` delivery is acknowledged by the receiver and healed by the next
+pass; the desired set comes from `TWO_TWITCH_BROADCASTERS` (empty parks the
+pass without mutations). A successful Helix listing answer counts as
+evidence only when it is an object carrying a `data` array: a missing or
+non-array `data` envelope on any page fails the whole listing closed, so no
+reconcile mutations are planned from invalid evidence and a malformed
+confirmation listing can never report the pass healthy.
 
 Secret handling: the signing secret is a `WebhookSecret` (10-100 ASCII, as
 Twitch requires) wrapping `Secret<String>`; its `Debug` is `[REDACTED]`. It is
@@ -100,33 +120,70 @@ the Twitch client id/secret; they never appear in code, logs or PR text.
 The public Worker route (`POST /hooks/twitch`, `wrangler/src/eventsub.ts`)
 is staging-only and dark unless `EVENTSUB_INGRESS` and `TWO_EVENTSUB` are
 both exactly `"1"`. The private container receiver below lands in this
-slice; Operator secret provisioning stays an Operator action. The ledger
-below is present but is not called by a runtime receiver yet.
+slice; Operator secret provisioning stays an Operator action. The receiver
+calls the ledger below through `deliver_go_live` when delivery
+dependencies are injected at bind time; boot injects none yet (no
+announcements-channel or invite configuration is provisioned), so posting
+stays dark even on an enabled receiver.
 
 ## Durable go-live ledger
 
 - One `stream_live_claims` row per go-live, keyed by `live_dedup_key`.
-  `claim_live` inserts with `ON CONFLICT DO NOTHING`: the inserter owns
-  the post, while any existing claim is acknowledged with 2xx and skipped.
-- Claims have no expiry. A receiver crash after claiming but before sending
-  leaves an unposted row that suppresses Twitch retries indefinitely. The
-  receiver MUST add stale-claim recovery before wiring `claim_live` into the
-  runtime; this ledger alone is not a complete delivery/recovery protocol.
+  `claim_live` inserts with `ON CONFLICT DO NOTHING` and classifies a
+  conflicting row in the same call, so its outcome is final: the inserter
+  (or the taker-over of a stale never-started claim) owns the post. An
+  existing started or delivered claim is acknowledged with 2xx and
+  skipped; an existing fresh never-started claim is answered 5xx
+  (`InFlight`, see `stream_live::disposition`), which asks Twitch to retry.
+- Crash recovery is a bounded lease over never-started claims only
+  (migration 0443, `send_started_at`, `STALE_CLAIM_LEASE_SECS = 30 s`).
+  The receiver MUST call `mark_live_send_started` before the first Discord
+  POST; the takeover inside `claim_live` (also exposed as
+  `reclaim_stale_live`) atomically takes over one stale row with
+  `delivered_at IS NULL AND send_started_at IS NULL` and restarts its
+  `claimed_at` lease, so concurrent retries cannot both win. Lease length
+  does not affect safety: the `send_started_at` fence alone decides who
+  may post. A crash before send is answered 5xx while the lease is fresh
+  and recovers by takeover only if a retry arrives after the lease
+  expires. Twitch documents no retry schedule and this slice has no
+  sweeper, so a go-live that is never retried is not recovered here.
+- Ownership is fenced by a claim token (migration 0443): claiming
+  generates one, takeover rotates it, and `mark_live_send_started`,
+  `mark_live_delivered`, `release_live` and `release_started_live` act
+  only for the token they are given. A timed-out-but-running original
+  owner therefore cannot
+  start, stamp or release a row a takeover gave to a new owner; exactly
+  one owner can post. If the conflicting row disappears before the
+  takeover lands, `claim_live` loops back to the insert instead of
+  answering 2xx for a go-live nobody posted.
 - A Discord send may succeed while `mark_live_delivered` fails. The claim can
-  then remain `delivered_at IS NULL`; `release_live` deletes the targeted row
-  only when it is unstamped. Stale-claim recovery MUST NOT treat every stale
-  null-stamp row as unsent. It must preserve or distinguish deliveries that
-  may already have reached Discord, or a retry can double-post.
-- Delivered rows are retained indefinitely as dedup fences. This slice adds no
-  purge or retention policy; runtime wiring needs an explicit storage policy
-  that does not discard an active go-live's dedup fence.
-- The receiver MUST post with `allowed_mentions: { parse: [] }`. No sender
-  exists in this slice, so that no-ping contract has not been runtime-verified.
+  then remain `delivered_at IS NULL` with `send_started_at NOT NULL`;
+  `release_live` deletes a row only for its token-holding owner while it
+  is still never-started, so it must never be used as stale recovery or
+  after a stamp failure; `release_started_live` is the separate
+  token-gated path for a started row whose send provably never landed,
+  and must likewise never be used on an ambiguous outcome or after a
+  stamp failure. Started and delivered rows are never
+  reclaimed, even when stale, or a retry can double-post a delivery that may
+  already have reached Discord.
+- Delivered rows are kept as dedup fences until they age past
+  `DELIVERED_DEDUP_RETENTION_DAYS` (90 days), then the retention cadence purges
+  them whole (`expire_delivered_live`, full-row deletes, no tombstone). The
+  purge only ever matches `delivered_at IS NOT NULL`, so never-started and
+  started-but-ambiguous rows stay fenced however old, and a retry inside the
+  horizon still dedups instead of double-posting.
+- The sender posts with `allowed_mentions: { parse: [] }`: the production
+  `LiveSender` is the shared REST executor's `post_message`, whose body
+  pins exactly that shape.
 - A send that provably never reached Discord deletes its unposted row
-  (`release_live`) and the receiver answers 5xx so Twitch retries; a
+  (`release_live` before the send starts, `release_started_live` after
+  it starts) and the receiver answers 5xx so Twitch retries; a
   delivered row is stamped and never deleted, so retries after a successful
   stamp cannot double-post. The claim → send → settle table is
-  `stream_live::disposition`; its async glue belongs with the receiver.
+  `stream_live::disposition`; its async glue is
+  `stream_live_store::deliver_go_live`, called by the receiver for a
+  verified notification when delivery dependencies are injected
+  (`crates/bot/src/eventsub_delivery.rs`).
 
 ## Private container receiver
 
@@ -141,25 +198,31 @@ below is present but is not called by a runtime receiver yet.
 - Runs `verify_delivery` plus `classify` with the Operator secret. Nothing
   is parsed before verification passes.
 - Echoes `Delivery::Challenge` as `200 text/plain`; acknowledges
-  `Notification`, `Revocation`, `Ignored` and deterministic classification
+  `Revocation`, `Ignored` and deterministic classification
   errors (`WrongSubscription`, `InvalidBody`) as `200 {"ok":true}` so Twitch
-  does not retry what will never succeed.
+  does not retry what will never succeed. A verified `Notification` is
+  acknowledged the same way while no delivery dependencies are injected;
+  with them, it runs `deliver_go_live` and answers its disposition (200, or
+  a retryable 503 after a transient ledger/send failure).
 - Answers `400` for a malformed challenge, `401` for a missing or mismatched
   signature, stale timestamp or malformed delivery headers, `405` for a
   non-POST, `408` for a body slower than the read budget, `413` for an
   oversize body, `415` for a wrong content type, `404` for a wrong path, and
   `503` (`retryable: true`) while the receiver is busy or past the overall
-  20 s budget. Only the `408` and `503` paths are retriable; this slice has no send or
-  durable ledger, so a verified delivery retries only on a pathological
-  scheduling stall, and the retry re-acks with no side effects. No header
+  20 s budget. Only the `408` and `503` paths are retriable; with delivery
+  dependencies injected, a transient ledger/send failure also answers the
+  retryable 503, and the claim fences make that redelivery safe. No header
   value, challenge, body byte or query is ever logged; only scalar
   `event`/`status`/`error_class`.
 - Keeps the callback path out of trace spans: `/hooks/twitch` is not in
   `TRACED_PATHS` (`crates/bot/src/server.rs`) and renders as `[REDACTED]`.
 - The DO adds `8092` to `requiredPorts` plus the container bind only while
   `TWO_EVENTSUB` is `"1"` with the signing secret present; the Worker
-  forwards the flag, the fixed bind, the container marker and the Operator
-  secret on explicit lines, and forwards nothing when the secret is missing.
+  forwards the flag, the fixed bind, the container marker, the reconcile
+  inputs (`TWO_TWITCH_CALLBACK_URL`, `TWO_TWITCH_BROADCASTERS`) and the Twitch
+  credentials (`TWO_TWITCH_CLIENT_ID`, `TWO_TWITCH_CLIENT_SECRET`,
+  `TWO_TWITCH_WEBHOOK_SECRET`) on explicit lines, and forwards nothing when
+  the secret is missing.
   `scripts/check-env-bindings.py` rejects any `TWO_EVENTSUB*` or
   `TWO_TWITCH_*` var in `wrangler.toml`.
 
@@ -168,15 +231,20 @@ below is present but is not called by a runtime receiver yet.
 `crates/core/src/twitch_helix.rs` drives the plan from `twitch_eventsub`:
 
 - Credentials are Operator-provisioned (`TWO_TWITCH_CLIENT_ID`,
-  `TWO_TWITCH_CLIENT_SECRET`, `TWO_TWITCH_WEBHOOK_SECRET`); the Container
-  reads them from its own environment, never from forwarded Worker vars.
+  `TWO_TWITCH_CLIENT_SECRET`, `TWO_TWITCH_WEBHOOK_SECRET`); the Worker
+  forwards them on explicit containerEnvVars lines while the EventSub receiver
+  is forwarded, and the Container reads them from its process environment.
   Every value travels inside `Secret`, so even a `Debug` dump renders
   `[REDACTED]`.
 - The app token is cached and refreshed 60 s before its `expires_in`
-  instant, plus once on a 401 with a single retry. No timers: reconcile
-  runs at boot and after a `revocation` only.
+  instant, plus once on a 401 with a single retry. The Helix calls have no
+  timers of their own; the bot runtime (`crates/bot/src/eventsub_reconcile.rs`)
+  invokes them once at startup and on a bounded hourly interval.
 - `list_subscriptions` follows every `stream.online` page (up to a bounded
   limit); pass its complete result to `plan_boot_actions` for the deletes-first
   plan, then `execute_actions` runs it in order. A create that answers 409
   counts as done only after a follow-up listing confirms a healthy subscription
-  for that broadcaster on the configured callback.
+  for that broadcaster on the configured callback. After the plan executes, a
+  final listing confirms every desired broadcaster holds a healthy subscription
+  on the bot callback; anything missing or unhealthy logs with an `error_class`
+  and fails the pass, never silently.

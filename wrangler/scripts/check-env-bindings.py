@@ -50,6 +50,9 @@ OPTIONAL_SECRET_BINDINGS = {
     # secrets only; a committed value would hand out dashboard access.
     "OPS_DASHBOARD_CLIENT_ID",
     "OPS_DASHBOARD_CLIENT_SECRET",
+    # TOG-29201: the MCP shared bearer (docs/mcp.md). Optional Worker
+    # secret only; a committed var would publish the bearer.
+    "MCP_TOKEN",
 }
 # TOG-22861 workers.dev break-glass: staging and production serve the public
 # suffix until a custom domain and Access app exist. Every named environment
@@ -104,6 +107,23 @@ OPS_CONFIG_WRITES_VAR = "OPS_CONFIG_WRITES_ENABLED"
 OPS_CONFIG_WRITES_ENVS = {"staging"}
 OPS_KILLSWITCH_VAR = "OPS_KILLSWITCH_ENABLED"
 OPS_KILLSWITCH_ENVS = {"staging"}
+# Rollback-drill fence (docs/staging-rollout-gate.md): the deploy-env marker
+# is exactly "staging" in the staging vars only, so neither the Worker
+# forward nor the Rust readiness fence can treat another environment as
+# staging. The injection switch itself is denied in every vars table,
+# staging included: only the generated per-deploy staging config written
+# by scripts/staging_rollout.py for a manual dispatch may carry it, so a
+# toml change alone can never arm (or leave armed) a failing gateway.
+DEPLOY_ENV_VAR = "TWO_DEPLOY_ENV"
+DEPLOY_ENV_ENVS = {"staging"}
+GATEWAY_FAIL_INJECTION_VAR = "TWO_GATEWAY_READINESS_FAIL_INJECTION"
+# Remediation-drill fence (staging fault injector): the same generated-only
+# rule as the rollback-drill switch above. Either switch committed anywhere —
+# staging included — fails; only the generated per-deploy staging config from
+# a manual drill dispatch may carry them, so a toml change alone can never
+# arm (or leave armed) a synthetic stall or unpaired disconnect.
+VOICE_STALL_FAULT_VAR = "TWO_VOICE_STALL_FAULT_INJECTION"
+UNPAIRED_FAULT_VAR = "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"
 
 
 def check(path: Path) -> list[str]:
@@ -214,6 +234,24 @@ def _collect_errors(cfg: dict) -> list[str]:
             )
         if variables.get(OPS_KILLSWITCH_VAR, "1") != "1":
             errors.append(f'{prefix}: {OPS_KILLSWITCH_VAR} must be exactly "1" or absent')
+        if DEPLOY_ENV_VAR in variables and env_name not in DEPLOY_ENV_ENVS:
+            errors.append(
+                f"{prefix}: {DEPLOY_ENV_VAR} is staging-only "
+                "(top-level vars are required in every env; production must never carry the staging fence marker)"
+            )
+        if variables.get(DEPLOY_ENV_VAR, "staging") != "staging":
+            errors.append(f'{prefix}: {DEPLOY_ENV_VAR} must be exactly "staging" or absent')
+        if GATEWAY_FAIL_INJECTION_VAR in variables:
+            errors.append(
+                f"{prefix}: {GATEWAY_FAIL_INJECTION_VAR} must never be a committed var "
+                "(only the generated staging deploy config from a manual drill dispatch may carry it)"
+            )
+        for fault_var in (VOICE_STALL_FAULT_VAR, UNPAIRED_FAULT_VAR):
+            if fault_var in variables:
+                errors.append(
+                    f"{prefix}: {fault_var} must never be a committed var "
+                    "(only the generated staging deploy config from a manual drill dispatch may carry it)"
+                )
         for key in sorted(k for k in variables if k.startswith(RECEIVER_CONFIG_PREFIX)):
             errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
         for key in sorted(
