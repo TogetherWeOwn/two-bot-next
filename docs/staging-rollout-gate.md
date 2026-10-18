@@ -7,13 +7,16 @@ successful Wrangler deployment (the `deploy` job was re-enabled by
 `verify`. `preflight` and `deployment-takeover` live outside
 `staging_rollout.py`. Readiness cannot be proven before the takeover, because a
 fenced or non-owner singleton refuses `/readyz`; the Wrangler receipt is local
-and is therefore accepted before ownership moves. A red `verify` (or red
-error-rate gate) after a successful deploy triggers a conditional automatic
+and is therefore accepted before ownership moves. Any failed step after a
+successful deploy triggers a conditional automatic
 rollback attempt by the workflow: `deploy-staging.yml` runs
-`scripts/worker_container_rollback.py rollback` only when both the `deploy`
-and `snapshot` steps succeeded; `scripts/staging_rollout.py` itself performs
+`scripts/worker_container_rollback.py rollback` when both the `deploy`
+and `snapshot` steps succeeded and a later step fails (receipt validation,
+ownership takeover, `verify`, or the error-rate gate);
+`scripts/staging_rollout.py` itself performs
 no rollback. On success the pre-deploy Worker version **and** container image
-are restored (with takeover), and the run still stays red — the restore
+are restored (with takeover, which releases an intentional fence onto the
+restored version after a fenced takeover refusal), and the run still stays red — the restore
 recovers service, it never certifies the failed build. Without a successful
 deploy and snapshot there is nothing to restore, so no rollback is attempted.
 The gate does not
@@ -36,11 +39,13 @@ not production authorization or a migration tool.
 4. `verify` (steps 5-7) needs an owning singleton: a parked singleton answers
    `/readyz` 503 by design, so rollout convergence and runtime readiness cannot be
    checked before takeover. `verify` repeats the receipt checks first.
-5. If `verify` (or the error-rate gate) goes red after a successful deploy with a
-   successful snapshot, the workflow attempts an automatic rollback to the pre-deploy
+5. If any step after a successful deploy with a
+   successful snapshot fails (receipt validation, ownership takeover,
+   `verify`, or the error-rate gate), the workflow attempts an automatic rollback to the pre-deploy
    snapshot (Worker version **and** container image, with takeover) via
    `scripts/worker_container_rollback.py`; `scripts/staging_rollout.py` only reports
-   the failure. A restored deployment still leaves the job red on `main`: the rollback
+   the failure. After a fenced takeover refusal the rollback's own takeover
+   releases the fence onto the restored version. A restored deployment still leaves the job red on `main`: the rollback
    restores service, it never certifies the failed build. There is deliberately **no
    automatic permanent fence**: a successful restore ends with takeover (`active`), so
    the next push can hand off again without a manual `release_fence` dispatch. When
