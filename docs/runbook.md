@@ -836,6 +836,42 @@ First response: read the scrape through the existing authorized `/ops/metrics` p
 
 A lost scrape never resolves any metric-rule incident: missing evidence is not recovery evidence, so previously firing alerts stay firing through the loss, and the existing dispatch-drop interruption still applies. The first complete valid scrape after the incident resolves only the scrape-loss ticket; metric rules re-evaluate on that same scrape and resolve only on their own evidence. A valid scrape before the third failure silently resets the streak with no resolve.
 
+#### Alert: EventSub tampered
+
+`two_bot_eventsub_classified_total{kind="tampered"}` rose in 3 consecutive
+keepalive samples after a baseline. Only `BadSignature` counts as `tampered`;
+every other kind stays silent. The streak (not a single window) pages, because
+a sustained rise means an active forgery attempt or a broken secret rotation
+while one forged probe must not. The firing key is the bare rule id
+(`eventsub_tampered`): no broadcaster, subscription ID, body, token, or
+free-text label ever rides on it. The first valid sample only stores the
+baseline and never fires, a backwards counter means the process restarted and
+rebaselines without firing, missing/invalid scrapes preserve a firing alert
+without manufacturing recovery, and a flat valid window resolves.
+
+First response: scope the fixed `kind="tampered"` counter through the existing
+authorized `/ops/metrics` path; confirm no deploy is in progress (a fresh
+deploy restarts the process and resets the counter); then read the container
+logs for the matching `eventsub delivery refused` warn lines (scalar `status`
+/ `error_class` only: header values, challenge, body bytes, and query strings
+are never logged). A single historic rise with no growth never re-pages.
+Forgery versus rotation: a rotation in progress shows 401 `unauthorized`
+refusals while the two sides disagree (the running container must already
+carry the new secret before old subscriptions are deleted, so not-yet-deleted
+subscriptions signed with the old secret fail until the reconciler recreates
+them). When no rotation or deploy is underway, treat a sustained rise as
+forged traffic. Follow the existing
+[secret provisioning and rotation](eventsub-runbook.md#secret-provisioning-and-rotation)
+procedure for any credential change; this alert changes no verification, Helix,
+or secret handling. Record only the fixed kind and sanitized counts, never
+IDs, payloads, or scrape tokens.
+
+Escalate when tampered growth persists across windows after the suspect caller
+or rotation is identified, when it coincides with 429, DB-error, or
+reconcile-failure alerts, or when `notification` traffic for the same window
+collapses while tampered rises — the receiver may be refusing legitimate work
+and the fix belongs to the on-call engineer, not another redeploy.
+
 #### Auto-remediation: guarded stall and crash-loop response
 
 Execution-path decision: the Worker cannot restart containers, so remediation

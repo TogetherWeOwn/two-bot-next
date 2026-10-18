@@ -3,7 +3,7 @@
 use super::{mapping, Table};
 use sqlx::postgres::PgConnectOptions;
 use sqlx::ConnectOptions;
-use two_bot_core::database_url;
+use two_bot_core::{database_tls, database_url};
 
 #[derive(Default)]
 pub struct Options {
@@ -89,6 +89,10 @@ impl Options {
 
     /// Only the tool-specific variables are read; never TWO_DATABASE_URL,
     /// DATABASE_URL, production bindings, or fallback credentials.
+    /// Threat-model F6: both URLs pass the `TWO_DATABASE_TLS` policy
+    /// (unset means `required`) before SQLx parses them, and the effective
+    /// TLS mode is applied to both option sets (see `docs/database-tls.md`).
+    /// Refusals are fixed strings; nothing echoes the URL, host or credential.
     pub fn connections(&self) -> Result<(PgConnectOptions, PgConnectOptions), &'static str> {
         let source_url = self
             .source_url
@@ -100,8 +104,13 @@ impl Options {
             .clone()
             .or_else(|| std::env::var("LEGACY_COPY_TARGET_URL").ok())
             .ok_or("target URL required (--target-url or LEGACY_COPY_TARGET_URL)")?;
-        let source = explicit_connection(&source_url)?;
-        let target = guarded_target(&target_url, self.allow_live_target)?;
+        let tls = tls_policy_from_env()?;
+        for url in [&source_url, &target_url] {
+            database_url::validate(url)?;
+            database_tls::enforce(url, tls)?;
+        }
+        let source = database_tls::apply(explicit_connection(&source_url)?, tls);
+        let target = database_tls::apply(guarded_target(&target_url, self.allow_live_target)?, tls);
         if source.get_host() == target.get_host()
             && source.get_port() == target.get_port()
             && source.get_database() == target.get_database()
@@ -110,6 +119,13 @@ impl Options {
         }
         Ok((source, target))
     }
+}
+
+/// Read the one TLS policy setting; an unset value is `Required`.
+fn tls_policy_from_env() -> Result<database_tls::TlsPolicy, &'static str> {
+    let value = std::env::var_os(database_tls::POLICY_SETTING);
+    // A non-UTF-8 value parses as "" and is refused like any unknown value.
+    database_tls::TlsPolicy::from_setting(value.as_ref().map(|v| v.to_str().unwrap_or("")))
 }
 
 fn explicit_connection(url: &str) -> Result<PgConnectOptions, &'static str> {
@@ -150,6 +166,10 @@ fn explicit_connection(url: &str) -> Result<PgConnectOptions, &'static str> {
 /// Everything not proven disposable is treated as live, including staging and
 /// loopback. Matching a 'test' substring or Neon hostname is never sufficient.
 /// This flag is an operator fence, NOT authorization to execute on live data.
+///
+/// This guard does not enforce the TLS policy itself: `Options::connections`
+/// runs `database_url::validate` plus `database_tls::enforce`/`apply` around
+/// it. New connection-building callers must fence the TLS policy the same way.
 pub fn guarded_target(url: &str, allow_live: bool) -> Result<PgConnectOptions, &'static str> {
     let options = explicit_connection(url)?;
     if !allow_live {
@@ -227,6 +247,130 @@ mod tests {
             assert!(guarded_target(&format!("{safe}{suffix}"), false).is_err());
         }
         assert!(guarded_target("postgres://operator:explicit@live.invalid:5432/bot", true).is_ok());
+    }
+
+    /// Serializes the env-mutating TLS-fence assertions below: `connections`
+    /// reads `TWO_DATABASE_TLS` (and the tool-specific URL fallback), so no
+    /// other test in this module may touch those variables concurrently.
+    static TLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SavedTlsEnv(Vec<(String, Option<std::ffi::OsString>)>);
+
+    impl SavedTlsEnv {
+        fn set(value: Option<&str>) -> (std::sync::MutexGuard<'static, ()>, Self) {
+            let guard = TLS_ENV_LOCK.lock().unwrap();
+            let mut saved = Vec::new();
+            for key in [
+                database_tls::POLICY_SETTING,
+                "LEGACY_COPY_SOURCE_URL",
+                "LEGACY_COPY_TARGET_URL",
+            ] {
+                saved.push((key.to_owned(), std::env::var_os(key)));
+                std::env::remove_var(key);
+            }
+            if let Some(v) = value {
+                std::env::set_var(database_tls::POLICY_SETTING, v);
+            }
+            (guard, Self(saved))
+        }
+    }
+
+    impl Drop for SavedTlsEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn parse_urls(source: &str, target: &str, allow_live: bool) -> Options {
+        let mut argv = vec![
+            format!("--source-url={source}"),
+            format!("--target-url={target}"),
+        ];
+        if allow_live {
+            argv.push("--allow-live-target".to_owned());
+        }
+        Options::parse(&argv).unwrap()
+    }
+
+    #[test]
+    fn tls_policy_fence_refuses_before_connect_with_fixed_strings() {
+        let remote =
+            "postgres://fixture-user:fixture-secret@ep-fixture-host.us-east-2.aws.neon.tech";
+        {
+            // Unset means `required`: weak and missing modes refuse, and the
+            // disposable local endpoints refuse with the local-host string.
+            let (_lock, _env) = SavedTlsEnv::set(None);
+            for (source, target, expected) in [
+                (
+                    format!("{remote}/fixture-source?sslmode=disable"),
+                    format!("{remote}/fixture-target?sslmode=disable"),
+                    "database sslmode does not require TLS",
+                ),
+                (
+                    format!("{remote}/fixture-source"),
+                    format!("{remote}/fixture-target"),
+                    "database URL must set sslmode under the required TLS policy",
+                ),
+                (
+                    "postgres://agent_test:@agent-testdb:5432/two_bot_test_tls_source".to_owned(),
+                    "postgres://agent_test:@agent-testdb:5432/two_bot_test_tls_target".to_owned(),
+                    "local database host is refused under the required TLS policy",
+                ),
+            ] {
+                let options = parse_urls(&source, &target, true);
+                let error = options.connections().unwrap_err();
+                assert_eq!(error, expected);
+                assert!(
+                    !error.contains("fixture"),
+                    "TLS refusal echoed URL material: {error}"
+                );
+            }
+        }
+        {
+            // Explicit `local-only`: the disposable endpoints pass the fence,
+            // while a remote host refuses.
+            let (_lock, _env) = SavedTlsEnv::set(Some("local-only"));
+            let options = parse_urls(
+                "postgres://agent_test:@agent-testdb:5432/two_bot_test_tls_source",
+                "postgres://agent_test:@agent-testdb:5432/two_bot_test_tls_target",
+                false,
+            );
+            assert!(options.connections().is_ok());
+            let options = parse_urls(
+                &format!("{remote}/fixture-source?sslmode=require"),
+                &format!("{remote}/fixture-target?sslmode=require"),
+                true,
+            );
+            let error = options.connections().unwrap_err();
+            assert_eq!(
+                error,
+                "remote database host is refused under the local-only TLS policy"
+            );
+            assert!(
+                !error.contains("fixture"),
+                "TLS refusal echoed URL material: {error}"
+            );
+        }
+        {
+            // An unknown policy value refuses without echoing the value.
+            let (_lock, _env) = SavedTlsEnv::set(Some("fixture-invalid-setting"));
+            let options = parse_urls(
+                &format!("{remote}/fixture-source?sslmode=disable"),
+                &format!("{remote}/fixture-target?sslmode=disable"),
+                true,
+            );
+            let error = options.connections().unwrap_err();
+            assert_eq!(error, "invalid TWO_DATABASE_TLS setting");
+            assert!(
+                !error.contains("fixture"),
+                "TLS refusal echoed the policy value: {error}"
+            );
+        }
     }
 
     #[test]

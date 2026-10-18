@@ -80,6 +80,7 @@ pub const ALERT_RULE_IDS: [&str; 21] = [
     "voice_creator_map_stale",
     "community_facts_drain_failures",
     "error_budget_fast_burn",
+    "eventsub_tampered",
 ];
 
 /// Stamped packet filename carrying the producer identity:
@@ -972,6 +973,7 @@ mod tests {
                 "voice_creator_map_stale",
                 "community_facts_drain_failures",
                 "error_budget_fast_burn",
+                "eventsub_tampered",
             ]
         );
         // The soak ledger stamps its own ledger identity, not an alert rule.
