@@ -1040,12 +1040,12 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         if let Some(types) = row.get("column_types") {
             let types = types.as_array().ok_or_else(|| {
                 refuse(format!(
-                    "manifest table {name} has an invalid column type list"
+                    "manifest table {name} has a malformed column type list"
                 ))
             })?;
             if types.iter().any(|t| !t.is_string()) {
                 return Err(refuse(format!(
-                    "manifest table {name} has an invalid column type list"
+                    "manifest table {name} has a malformed column type list"
                 )));
             }
             if !types.is_empty() && types.len() != columns.len() {
