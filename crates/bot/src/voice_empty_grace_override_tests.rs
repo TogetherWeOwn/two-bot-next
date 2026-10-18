@@ -177,14 +177,17 @@ fn out_of_range_stored_values_fail_closed_to_the_boot_fallback() {
 /// force. An in-range value logs no such reason.
 #[test]
 fn out_of_range_stored_value_logs_a_named_reason() {
-    let capture = crate::tracing_capture::global();
+    // Install the process-wide capture first so callsite interest stays
+    // stable, then read only this call's events from a scoped capture.
+    super::tracing_capture::global();
+
     let live = live_with(vec![setting_row(&guild(), json!(601))]);
-    let start = capture.text().len();
-    assert_eq!(
-        stored_empty_grace_with(&guild(), EMPTY_ROOM_GRACE, Some(&live)),
-        EMPTY_ROOM_GRACE
-    );
-    let logged = capture.text()[start..].to_owned();
+    let capture = super::tracing_capture::Capture::default();
+    let resolved = tracing::subscriber::with_default(capture.clone(), || {
+        stored_empty_grace_with(&guild(), EMPTY_ROOM_GRACE, Some(&live))
+    });
+    assert_eq!(resolved, EMPTY_ROOM_GRACE);
+    let logged = capture.text();
     assert!(
         logged
             .lines()
@@ -193,12 +196,12 @@ fn out_of_range_stored_value_logs_a_named_reason() {
     );
 
     let live = live_with(vec![setting_row(&guild(), json!(30))]);
-    let start = capture.text().len();
-    assert_eq!(
-        stored_empty_grace_with(&guild(), EMPTY_ROOM_GRACE, Some(&live)),
-        Duration::from_secs(30)
-    );
-    let logged = capture.text()[start..].to_owned();
+    let capture = super::tracing_capture::Capture::default();
+    let resolved = tracing::subscriber::with_default(capture.clone(), || {
+        stored_empty_grace_with(&guild(), EMPTY_ROOM_GRACE, Some(&live))
+    });
+    assert_eq!(resolved, Duration::from_secs(30));
+    let logged = capture.text();
     assert!(
         !logged
             .lines()
