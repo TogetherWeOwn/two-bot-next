@@ -382,7 +382,6 @@ fn hostile_name_ids_refuse_through_the_router() {
         "two:voice:name-custom:1.5",
         "two:voice:name-custom:NaN",
         "two:voice:name-custom:abc",
-        "two:voice:name-custom:18446744073709551616",
         // Control bytes, NUL and non-ASCII rooms.
         "two:voice:name-custom:\u{0}",
         "two:voice:name-custom:500\u{0}",
@@ -403,6 +402,25 @@ fn hostile_name_ids_refuse_through_the_router() {
             "{id:?}"
         );
     }
+    // 2^64 overflows `u64`: built arithmetically so the source holds no
+    // 17-20 digit snowflake literal (snowflake gate).
+    let overflow = format!("two:voice:name-custom:{}", (u64::MAX as u128) + 1);
+    assert_eq!(parse_voice_custom_id(&overflow), None, "{overflow:?}");
+    assert_eq!(
+        name_component_action(&click(&overflow)),
+        None,
+        "{overflow:?}"
+    );
+    assert_eq!(
+        name_component_action(&modal(&overflow)),
+        None,
+        "{overflow:?}"
+    );
+    assert_eq!(
+        name_component_action(&modal_interaction(&overflow, Vec::new())),
+        None,
+        "{overflow:?}"
+    );
     // Exact-boundary overlong ids refuse on both paths. The 100-byte custom
     // id is all digits but overflows `u64`; the 101-byte id trips the length
     // gate first. Lengths are pinned so the boundary cannot drift.
@@ -441,6 +459,9 @@ async fn hostile_clicks_leave_state_machine_and_trace_untouched() {
     // machine is not confused and hostile input is never echoed.
     let (mut worker, trace) = setup().await;
     let overlong = format!("two:voice:name-custom:{}", "1".repeat(79));
+    // 2^64 overflows `u64`: built arithmetically so the source holds no
+    // 17-20 digit snowflake literal (snowflake gate).
+    let overflow = format!("two:voice:name-custom:{}", (u64::MAX as u128) + 1);
     let hostile: Vec<&str> = vec![
         "two:voice:Name-Custom:500",
         "two:voice:name-custom:500:600",
@@ -449,7 +470,7 @@ async fn hostile_clicks_leave_state_machine_and_trace_untouched() {
         "two:voice:name-custom:0",
         "two:voice:name-custom:+500",
         "two:voice:name-custom:abc",
-        "two:voice:name-custom:18446744073709551616",
+        &overflow,
         "two:voice:name-custom:\u{0}",
         "two:voice:name-custom:500\u{0}",
         "two:voice:name-custom:\u{1f600}",
