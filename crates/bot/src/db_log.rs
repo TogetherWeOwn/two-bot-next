@@ -21,7 +21,6 @@
 //! sites in the four in-scope files, so add new failure logs with one of
 //! these helpers instead of formatting the error.
 
-use sqlx::error::ErrorKind;
 use two_bot_core::{
     automation_quota::QuotaWriteError, feeds_store::FeedStoreError,
     leveling_store::LevelingStoreError, send_admission::AdmissionError,
@@ -38,22 +37,32 @@ use two_bot_discord::{
 /// are never surfaced: rerun the failing operation path for detail.
 #[must_use]
 pub(crate) fn db_class(error: &sqlx::Error) -> &'static str {
+    two_bot_core::error_chain::db_cause(error)
+}
+
+/// Reason text for the gateway failure log line (TOG-25067): the
+/// `InvalidArgument` message verbatim, the [`db_class`] token for every
+/// other variant. Every `InvalidArgument` payload constructed on the gateway
+/// path is a string literal naming the failed inner step (never a URL,
+/// token or remote value); keep it that way — any other variant's `Display`
+/// can carry a connection URL or statement detail and must stay unlogged.
+#[must_use]
+pub(crate) fn failure_reason(error: &sqlx::Error) -> std::borrow::Cow<'_, str> {
     match error {
-        sqlx::Error::Database(db) => match db.kind() {
-            ErrorKind::UniqueViolation => "unique_violation",
-            ErrorKind::ForeignKeyViolation => "foreign_key_violation",
-            ErrorKind::NotNullViolation => "not_null_violation",
-            ErrorKind::CheckViolation => "check_violation",
-            ErrorKind::ExclusionViolation => "exclusion_violation",
-            // `ErrorKind::Other` and any future kind: never the code/message.
-            _ => "database",
-        },
-        sqlx::Error::PoolTimedOut => "pool_timeout",
-        sqlx::Error::PoolClosed => "pool_closed",
-        sqlx::Error::WorkerCrashed => "worker_crashed",
-        sqlx::Error::Io(_) | sqlx::Error::Tls(_) => "connection",
-        sqlx::Error::RowNotFound => "row_not_found",
-        _ => "query",
+        sqlx::Error::InvalidArgument(message) => std::borrow::Cow::Borrowed(message),
+        _ => std::borrow::Cow::Borrowed(db_class(error)),
+    }
+}
+
+/// Postgres SQLSTATE for database errors (`42P01`, `42501`, …), `None`
+/// otherwise. The 5-character code is fixed vocabulary from our own database
+/// server — it names the failure without the message, severity or statement
+/// — so the gateway failure line can carry it where the raw error cannot go.
+#[must_use]
+pub(crate) fn error_code(error: &sqlx::Error) -> Option<String> {
+    match error {
+        sqlx::Error::Database(error) => error.code().map(|code| code.into_owned()),
+        _ => None,
     }
 }
 
@@ -135,7 +144,7 @@ pub(crate) fn channel_response_class(error: &ChannelResponseError) -> &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::error::DatabaseError;
+    use sqlx::error::{DatabaseError, ErrorKind};
     use std::borrow::Cow;
     use std::fmt;
 
@@ -240,6 +249,30 @@ mod tests {
             "query"
         );
         assert_eq!(db_class(&sqlx::Error::BeginFailed), "query");
+    }
+
+    #[test]
+    fn failure_reason_keeps_inner_step_and_code_without_error_text() {
+        // `InvalidArgument` literals name the failed inner gateway step.
+        assert_eq!(
+            failure_reason(&sqlx::Error::InvalidArgument(
+                "leveling gateway dispatch failed; checkpoint unchanged".into()
+            )),
+            "leveling gateway dispatch failed; checkpoint unchanged"
+        );
+        // Every other variant collapses to the fixed token, never the text.
+        let gap = database("42P01");
+        let reason = failure_reason(&gap);
+        assert_eq!(reason, "database");
+        assert!(!reason.contains("secret"), "reason leaked error text");
+        // The SQLSTATE rides along separately for database errors only.
+        assert_eq!(error_code(&database("42P01")), Some("42P01".to_owned()));
+        assert_eq!(error_code(&database("42501")), Some("42501".to_owned()));
+        assert_eq!(error_code(&sqlx::Error::PoolTimedOut), None);
+        assert_eq!(
+            error_code(&sqlx::Error::InvalidArgument("literal".into())),
+            None
+        );
     }
 
     #[test]

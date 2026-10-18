@@ -58,8 +58,8 @@ use twilight_model::id::marker::{
 use twilight_model::id::Id;
 use two_bot_core::{
     backoff_ms, classify_kick_status, pace_wait_ms, parse_retry_after_secs, plan_purge,
-    retry_after_ms, utf16_len, ActionOutcome, KickOutcome, KickResult, KickStatus,
-    ModerationExecution, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
+    retry_after_ms, retry_after_ms_unclamped, utf16_len, ActionOutcome, KickOutcome, KickResult,
+    KickStatus, ModerationExecution, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
 };
 
 /// Minimum gap between paced requests, ms (legacy `rest.ts` default).
@@ -315,6 +315,7 @@ impl RawResponse {
 
     /// Legacy 429 wait: body wins, then header, default 1 s; +250 ms pad;
     /// clamped so a bad header cannot park a run (legacy `retryAfterMs`).
+    /// Kick/publish lanes and registry reads keep this clamp.
     #[must_use]
     pub fn retry_after_wait_ms(&self) -> u64 {
         let header = self
@@ -322,6 +323,23 @@ impl RawResponse {
             .as_deref()
             .and_then(|s| parse_retry_after_secs(Some(s)));
         retry_after_ms(header, self.body_retry_after_secs())
+    }
+
+    /// Backfill-read 429 wait: same header/body/padding policy without the
+    /// 60 s clamp, so a long per-route `Retry-After` is waited out in one
+    /// sleep instead of retry-storming past it — but still bounded by the
+    /// 5 min backfill ceiling, so a malformed or hostile value cannot park a
+    /// caller. Only the paced backfill reads (`get_json_observed`,
+    /// `get_json_checked` via `read_json`) use this; every other lane
+    /// (including the general `get_json` read) keeps
+    /// [`Self::retry_after_wait_ms`].
+    #[must_use]
+    pub fn retry_after_wait_ms_unclamped(&self) -> u64 {
+        let header = self
+            .retry_after_header
+            .as_deref()
+            .and_then(|s| parse_retry_after_secs(Some(s)));
+        retry_after_ms_unclamped(header, self.body_retry_after_secs())
     }
 }
 
@@ -590,12 +608,25 @@ impl HyperTransport {
             response.headers(),
             !is_interaction_token_request(request),
         );
+        // Learn per-route bucket state from this response's `X-RateLimit-*`
+        // headers before the body is read: the next admission gates on it.
+        self.guard
+            .observe_bucket(&bucket_route_key(request), response.headers());
         attempt.finish(Some(status));
-        let retry_after_header = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
+        // The 429 wait honors `retry-after` first, then the bucket
+        // `reset-after` hint: on a 429 both name the same pause, and the reset
+        // hint is the only timing when `retry-after` is absent (official
+        // rate-limits page, verified 2026-10-12). Body `retry_after` still
+        // wins inside `retry_after_wait_ms`.
+        let retry_after_header = ["retry-after", "x-ratelimit-reset-after"]
+            .into_iter()
+            .find_map(|name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            });
         // Reads cannot mutate; a complete failure may be retried independently.
         // Mutation success needs its caller's validated receipt. 5xx, redirects
         // and request-timeout responses remain uncertain even with a full body.
@@ -776,6 +807,18 @@ fn is_interaction_callback(request: &Request) -> bool {
     request.path().starts_with("interactions/") && request.path().ends_with("/callback")
 }
 
+/// Bucket identity for one request: HTTP method plus path, without the
+/// query string. Paginated reads change `after`/`before`/`limit` on every
+/// page, so keying learned bucket state on the full path would orphan the
+/// deadline a response teaches before the next page admits; Discord can
+/// also bucket different methods on one path separately. Admission and
+/// `observe_bucket` share this key so a response's deadline gates the
+/// next page of the same route.
+fn bucket_route_key(request: &Request) -> String {
+    let path = request.path().split('?').next().unwrap_or(request.path());
+    format!("{} {path}", request.method().name())
+}
+
 fn is_interaction_token_request(request: &Request) -> bool {
     // Webhook-token routes (`webhooks/{app}/{token}…`: interaction originals
     // and followups) authenticate with the URL token, not the bot token.
@@ -912,6 +955,17 @@ impl ActionExecutor {
         Self::build(token, proxy_url, None)
     }
 
+    /// Build a loopback test executor with an explicit moderation request budget.
+    #[cfg(feature = "test-support")]
+    pub fn with_proxy_and_moderation_timeout(
+        token: String,
+        proxy_url: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let transport = HyperTransport::build(token.clone(), proxy_url.clone(), None)?;
+        Self::assemble_with_timeout(token, proxy_url, transport, timeout)
+    }
+
     /// Mandatory for non-loopback sends; every retry uses this same lane.
     pub fn with_admission(
         token: String,
@@ -948,10 +1002,24 @@ impl ActionExecutor {
         proxy_url: Option<String>,
         transport: HyperTransport,
     ) -> Result<Self, String> {
+        Self::assemble_with_timeout(
+            token,
+            proxy_url,
+            transport,
+            Duration::from_millis(MODERATION_TIMEOUT_MS),
+        )
+    }
+
+    fn assemble_with_timeout(
+        token: String,
+        proxy_url: Option<String>,
+        transport: HyperTransport,
+        moderation_timeout: Duration,
+    ) -> Result<Self, String> {
         let mut builder = TwilightClient::builder()
             .token(token)
             .ratelimiter(None)
-            .timeout(Duration::from_millis(MODERATION_TIMEOUT_MS));
+            .timeout(moderation_timeout);
         if proxy_url.is_some() {
             // Reuse the already-validated origin, never reparse raw input for
             // the nested request factory with a different set of rules.
@@ -970,7 +1038,7 @@ impl ActionExecutor {
                 command_identities: crate::command_identity::CommandIdentities::default(),
                 pace_interval: Duration::from_millis(PACE_INTERVAL_MS),
                 kick_interval: Duration::from_millis(KICK_INTERVAL_MS),
-                moderation_timeout: Duration::from_millis(MODERATION_TIMEOUT_MS),
+                moderation_timeout,
                 boot_until: tokio::time::Instant::now() + Duration::from_millis(BOOT_WINDOW_MS),
                 pace_last_at: tokio::sync::Mutex::new(
                     tokio::time::Instant::now() - Duration::from_secs(60),
@@ -1029,8 +1097,29 @@ impl ActionExecutor {
     }
 
     async fn admit(&self, request: &Request, lane: Option<bool>) -> Result<(), GuardError> {
+        self.admit_essential(request, lane, is_interaction_callback(request))
+            .await
+    }
+
+    /// 429 sleep-then-retry admission: essential, so a breaker this read's
+    /// own 429 tally just opened cannot refuse its retry — and only that.
+    /// The guard still enforces `token_invalid`, pending/global pauses, the
+    /// learned bucket deadline and shared pacing, so no retry leaves during
+    /// a pause another request installed while this one slept.
+    async fn admit_retry(&self, request: &Request, lane: Option<bool>) -> Result<(), GuardError> {
+        self.admit_essential(request, lane, true).await
+    }
+
+    async fn admit_essential(
+        &self,
+        request: &Request,
+        lane: Option<bool>,
+        essential: bool,
+    ) -> Result<(), GuardError> {
         let guard = &self.inner.transport.guard;
-        let essential = is_interaction_callback(request);
+        // Route-aware admission on the paced lanes: the guard paces all
+        // executors sharing it and holds same-bucket reads until the header
+        // reset (see admit_route). Lane-less sends keep plain admission.
         let Some(kick_lane) = lane else {
             return guard.admit(essential).await;
         };
@@ -1039,18 +1128,50 @@ impl ActionExecutor {
         } else {
             (&self.inner.pace_last_at, self.inner.pace_interval)
         };
-        // Keep the lane reservation through cooldown and pacing. Timestamp only
-        // the actual dispatch, not each queued caller's pre-cooldown admission.
-        let mut last = lock.lock().await;
-        guard.admit(essential).await?;
-        let earliest = *last + interval;
-        if earliest > tokio::time::Instant::now() {
-            tokio::time::sleep_until(earliest).await;
+        let route_key = bucket_route_key(request);
+        // Wait out guard gates (global pause, this route's bucket deadline,
+        // shared pacing) before taking the lane lock: a route-local bucket
+        // reset can be seconds away, and sleeping it out under the lane
+        // lock would stall every unrelated route sharing the lane until
+        // their own admission budgets expire. The first pass also takes
+        // this admission's one pacing turn; later passes only re-wait
+        // gates that arrived while this caller queued for or slept in the
+        // lane, detected by the non-blocking re-check under the lock.
+        let mut paced = false;
+        loop {
+            if paced {
+                guard.admit_route_recheck(&route_key, essential).await?;
+            } else {
+                guard.admit_route(&route_key, essential).await?;
+                paced = true;
+            }
+            // Keep the lane reservation through the lane sleep. Timestamp
+            // only the actual dispatch, not each queued caller's
+            // pre-cooldown admission.
+            let mut last = lock.lock().await;
+            if let Err(error) = guard.check_route_now(&route_key, essential) {
+                drop(last);
+                match error {
+                    GuardError::GlobalPaused => continue,
+                    other => return Err(other),
+                }
+            }
+            let earliest = *last + interval;
+            if earliest > tokio::time::Instant::now() {
+                tokio::time::sleep_until(earliest).await;
+            }
+            // A global response/breaker/bucket reset may arrive during the
+            // lane sleep; re-wait it outside the lock, never under it.
+            if let Err(error) = guard.check_route_now(&route_key, essential) {
+                drop(last);
+                match error {
+                    GuardError::GlobalPaused => continue,
+                    other => return Err(other),
+                }
+            }
+            self.stamp_paced_lane(&mut last, kick_lane);
+            return Ok(());
         }
-        // A global response/breaker may arrive during the lane sleep.
-        guard.admit(essential).await?;
-        self.stamp_paced_lane(&mut last, kick_lane);
-        Ok(())
     }
 
     /// Keep pacing/global waits before the audit service's late DB fence, and
@@ -1727,41 +1848,76 @@ impl ActionExecutor {
         .map_err(|e| e.to_string())
     }
 
-    /// Paced GET: 110 ms lane, 403/404 → `None`, 429 waits (`retry-after +
-    /// 250 ms`; a global 429 rides the shared pause at next admission) and
-    /// retries within the same 5-try budget as 5xx/transport, other statuses
-    /// → `None` (legacy `DiscordRest::get`). Supported paths cover the
+    /// Paced GET: 110 ms lane, 403/404 → `None`, 429 sleeps-then-retries under
+    /// the same admission (`retry-after`/`reset-after` + 250 ms, clamped at
+    /// 60 s like kick/publish; a global 429 additionally rides out the shared
+    /// pause) within the same 5-try budget as 5xx/transport, other statuses →
+    /// `None` (legacy `DiscordRest::get`). This is the general interactive
+    /// read (containment snapshot, website jobs, onboarding probe): it keeps
+    /// the clamp so a long per-route wait cannot park a serialized worker.
+    /// Supported paths cover the
     /// parity §6 reads —
     /// guild, guild members (+`after`/`limit`), guild scheduled-events
     /// (+`with_user_count`), single channel and the channel-messages list
     /// (+`after`/`around`/`before`/`limit`). Anything else is a caller bug and
     /// is refused without I/O, never silently rewritten (finding 2).
     pub async fn get_json(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
-        Ok(self.get_json_observed(path).await?.map(|(data, _)| data))
+        Ok(self
+            .get_json_observed_inner(path, false)
+            .await?
+            .map(|(data, _)| data))
     }
 
     /// Permission evidence must distinguish denied/absent (403/404) from an
     /// unavailable or unreadable response. Keep the shared paced read policy,
     /// but never let a transient failure look like a proven delivery skip.
+    /// Shares the backfill evidence-read wait policy with
+    /// [`Self::get_json_observed`] (unclamped, 5 min ceiling).
     pub async fn get_json_checked(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
-        self.read_json(path, true).await
+        self.read_json(path, true, true).await
     }
 
     /// Membership evidence is bounded by the successful attempt's request
     /// start, after pacing, never by headers/body completion or an earlier
     /// failed attempt. Ordinary `get_json` keeps its data-only contract.
+    /// This is the backfill evidence read (driven by the store backfill): a
+    /// long per-route 429 is waited out unclamped (5 min ceiling per wait)
+    /// instead of retry-storming past it.
     pub async fn get_json_observed(
         &self,
         path: &str,
     ) -> Result<Option<(serde_json::Value, String)>, String> {
+        self.get_json_observed_inner(path, true).await
+    }
+
+    /// Shared observed-read loop: `backfill_wait` selects the unclamped
+    /// backfill 429 wait; the general read keeps the 60 s clamp.
+    async fn get_json_observed_inner(
+        &self,
+        path: &str,
+        backfill_wait: bool,
+    ) -> Result<Option<(serde_json::Value, String)>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
+        // A 429 proves the attempt reached Discord, so its sleep-then-retry
+        // re-admits as essential: a breaker the tally just opened must not
+        // refuse the in-flight read's own retry, while every other guard
+        // gate (token, pauses, bucket, pacing) still applies. New reads
+        // admit (and refuse) as usual.
+        let mut admitted_retry = false;
         loop {
             let request = Request::from_route(&route);
             // Guard refusals are terminal; pacing completes before the stamp.
-            self.admit(&request, Some(false))
-                .await
-                .map_err(|error| error.to_string())?;
+            if admitted_retry {
+                self.admit_retry(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            } else {
+                self.admit(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            admitted_retry = false;
             let observed_at = two_bot_core::now_iso();
             // Each attempt gets the moderation bound across headers and body,
             // so a response that never answers cannot park the caller (the
@@ -1791,15 +1947,30 @@ impl ActionExecutor {
                 429 => {
                     // Every 429 spends one read attempt, like 5xx/transport:
                     // a steady 429 stream exhausts the budget instead of
-                    // parking the read until a separate guard refuses it. A
-                    // global 429 installs the shared pause at next admission,
-                    // so only route-local 429s sleep here.
+                    // parking the read until a separate guard refuses it. The
+                    // retry re-admits as essential (see `admitted_retry`):
+                    // no request leaves during the wait or a shared pause.
+                    // Backfill evidence reads wait out a long per-route
+                    // Retry-After unclamped (5 min ceiling per wait): waking
+                    // early only earns another 429 and burns another try.
+                    // The general read and kick/publish keep the 60 s clamp.
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return Ok(None);
                     }
                     if !global {
-                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                        let wait_ms = if backfill_wait {
+                            res.retry_after_wait_ms_unclamped()
+                        } else {
+                            res.retry_after_wait_ms()
+                        };
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     }
+                    // A global 429 already installed the shared pause at
+                    // headers receipt, anchored to that instant: sleeping
+                    // the full wait again after the body would restart the
+                    // deadline. The essential re-admission waits out
+                    // whatever of the pause remains instead.
+                    admitted_retry = true;
                     attempt += 1;
                 }
                 403 | 404 => return Ok(None),
@@ -1852,19 +2023,33 @@ impl ActionExecutor {
         }
     }
 
+    /// `backfill_wait` selects the unclamped backfill 429 wait (5 min ceiling
+    /// per wait); callers outside the backfill evidence reads keep the clamp
+    /// by passing `false`.
     async fn read_json(
         &self,
         path: &str,
         checked: bool,
+        backfill_wait: bool,
     ) -> Result<Option<serde_json::Value>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
+        // Same essential re-admission as the observed read: a 429 retry
+        // bypasses only a just-opened breaker, never the other guard gates.
+        let mut admitted_retry = false;
         loop {
             let request = Request::from_route(&route);
             // Guard refusals are terminal; pacing completes before the send.
-            self.admit(&request, Some(false))
-                .await
-                .map_err(|error| error.to_string())?;
+            if admitted_retry {
+                self.admit_retry(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            } else {
+                self.admit(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            admitted_retry = false;
             let (res, global) = match self.send_admitted(&request).await {
                 Ok(r) => r,
                 Err(detail) => {
@@ -1892,8 +2077,10 @@ impl ActionExecutor {
                     // spends one attempt, so persistent rate limiting ends in
                     // the fixed transient-exhaustion error for checked reads
                     // (absence for unchecked ones), never an open-ended park.
-                    // Global pauses apply at next admission; only
-                    // route-local 429s sleep here.
+                    // The retry re-admits as essential after sleeping out
+                    // a route-local wait — unclamped (5 min ceiling) for the
+                    // backfill evidence reads, clamped otherwise, like the
+                    // observed read; a shared pause rides admission.
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return if checked {
                             Err("Discord evidence unavailable".to_owned())
@@ -1902,8 +2089,17 @@ impl ActionExecutor {
                         };
                     }
                     if !global {
-                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                        let wait_ms = if backfill_wait {
+                            res.retry_after_wait_ms_unclamped()
+                        } else {
+                            res.retry_after_wait_ms()
+                        };
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     }
+                    // Global: no local sleep — the shared pause is anchored
+                    // at headers receipt and the essential re-admission
+                    // waits out its remainder (see the observed read).
+                    admitted_retry = true;
                     attempt += 1;
                 }
                 403 | 404 => return Ok(None),
@@ -3879,12 +4075,41 @@ pub fn pace_delay_ms(last_at_ms: u64, interval_ms: u64, now_ms: u64) -> u64 {
     pace_wait_ms(last_at_ms, interval_ms, now_ms)
 }
 
+/// The shared executor is the production go-live `LiveSender`:
+/// `post_message` builds the exact no-ping body
+/// (`allowed_mentions: { parse: [] }`, pinned above) and makes a single
+/// attempt. Only an error that proves no effect (explicit rejection, 429,
+/// a local guard refusal, or the shared admission-lane refusal before any
+/// wire attempt) may release the durable claim; timeouts and transport
+/// failures are ambiguous and stay fenced. The impl lives here,
+/// with the type, because the trait is defined in `two-bot-core`.
+#[cfg(feature = "db")]
+impl two_bot_core::stream_live_store::LiveSender for ActionExecutor {
+    fn send_live<'a>(
+        &'a self,
+        channel_id: &'a str,
+        content: &'a str,
+    ) -> two_bot_core::stream_live_store::SendFuture<'a> {
+        use two_bot_core::stream_live_store::LiveSendError;
+        Box::pin(async move {
+            match self.post_message(channel_id, content, None).await {
+                Ok(message_id) => Ok(message_id),
+                Err(error) if error.is_admission_blocked() || error.proves_no_effect() => {
+                    Err(LiveSendError::ProvenNoSend)
+                }
+                Err(_) => Err(LiveSendError::Ambiguous),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use two_bot_core::send_admission::{
         AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, TokenKey,
     };
+    use two_bot_core::MAX_BACKFILL_RETRY_AFTER_MS;
 
     #[derive(Debug)]
     struct NeverSendAdmission(TokenKey);
@@ -4186,6 +4411,40 @@ mod tests {
             completion: None,
         };
         assert_eq!(clamped.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
+    }
+
+    #[test]
+    fn backfill_read_waits_out_long_header_unclamped() {
+        let long = RawResponse {
+            status: 429,
+            retry_after_header: Some("75".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        // Backfill reads honor the 75 s header in one wait; the kick/publish
+        // clamp stays pinned at 60 s for the same response.
+        assert_eq!(long.retry_after_wait_ms_unclamped(), 75_250);
+        assert_eq!(long.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
+        let short = RawResponse {
+            status: 429,
+            retry_after_header: Some("2".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        assert_eq!(short.retry_after_wait_ms_unclamped(), 2250);
+        // A huge header stops at the 5 min backfill ceiling instead of
+        // parking the caller, while the clamped wait is untouched.
+        let huge = RawResponse {
+            status: 429,
+            retry_after_header: Some("86400".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        assert_eq!(
+            huge.retry_after_wait_ms_unclamped(),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+        assert_eq!(huge.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
     }
 
     #[test]

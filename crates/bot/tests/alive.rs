@@ -422,6 +422,9 @@ async fn wait_http(bot: &mut Bot, addr: SocketAddr, path: &str, code: u16) -> St
                     return response;
                 }
             }
+            // Bounded 10 ms backoff under the outer STEP deadline (~100
+            // polls/s): throttles the /readyz round trips instead of
+            // busy-spinning on scheduler wakeups.
             sleep(Duration::from_millis(10)).await;
         }
     })
@@ -441,6 +444,8 @@ async fn checkpoint(db: &TestDb, seq: u64) {
             {
                 break;
             }
+            // Bounded 10 ms backoff under the outer STEP deadline: spaces
+            // the store loads against the same Postgres the bot writes to.
             sleep(Duration::from_millis(10)).await;
         }
     })
@@ -595,7 +600,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         // advertised.
         assert_eq!(
             names,
-            ["rank", "leaderboard", "help", "attendance"],
+            ["rank", "leaderboard", "help", "privacy", "attendance"],
             "publish the narrowed shared registry exactly once, nothing withheld or extra"
         );
         if boot == 1 {
@@ -645,6 +650,9 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                     {
                         break;
                     }
+                    // Bounded 10 ms backoff under the outer STEP deadline:
+                    // spaces the rest_requests lock polls during the jitter
+                    // window instead of spinning on the mutex.
                     sleep(Duration::from_millis(10)).await;
                 }
             })
@@ -654,7 +662,15 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                 "events job never hit REST during first boot"
             );
         }
-        sleep(Duration::from_millis(100)).await;
+        // Post-ready settle window: poll liveness for 200 ms so a crash
+        // just after RESUMED fails as "bot exited early" instead of being
+        // masked by an immediate SIGTERM. Bounded 10 ms backoff keeps the
+        // window cheap under load.
+        let settle_until = tokio::time::Instant::now() + Duration::from_millis(200);
+        while tokio::time::Instant::now() < settle_until {
+            bot.assert_alive();
+            sleep(Duration::from_millis(10)).await;
+        }
         bot.assert_alive();
         assert_ready_correlation(&logs.lock().await);
         bot.terminate().await;

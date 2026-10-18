@@ -1,0 +1,7 @@
+id: no-unwrap-request-paths-in-macros
+valid:
+- 'fn f() { let a = x.unwrap(); }'
+invalid:
+- 'fn f() { assert_eq!(x.unwrap(), 1); }'
+- 'fn f() { let v = vec![x.unwrap()]; }'
+- 'fn f() { let s = format!("{}", x.unwrap()); }'

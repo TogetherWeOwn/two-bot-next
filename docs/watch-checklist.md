@@ -22,24 +22,30 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 
 | Alert | Fires when | Reads from | Runbook |
 |---|---|---|---|
-| `container_unready_alert` | keepalive `/readyz` probes fail 10 consecutive samples (≈10 min at default 60 s cadence) | Worker logs (structured JSON event) | [container-readiness.md](container-readiness.md#responding-to-an-alert) |
+| `container_unready_alert` | keepalive `/readyz` probes fail 2 consecutive samples (≈2 min at default 60 s cadence) | Worker logs (structured JSON event) | [container-readiness.md](container-readiness.md#responding-to-an-alert) |
 | `container_unready_recovery` | first ready sample after an alert | Worker logs | same as above |
 | `container_keepalive_arm_failed` | keepalive schedule lookup/insert fails (monitoring outage, not a readiness sample) | Worker logs | [container-readiness.md](container-readiness.md) |
 | `container_unready_webhook_failed` | alert/recovery webhook POST failed or timed out (type + HTTP status only) | Worker logs | [container-readiness.md](container-readiness.md) |
 | `job_stale:<job>` | job's last success older than 2 x its cadence (never-succeeded is ignored) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-stale) |
 | `job_consecutive_failures:<job>` | 3 failed completions in a row; page includes the latest fixed error class when available | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s above 10% of REST requests between samples (min 10 requests; restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-429) |
+| `rest_5xx_rate` | 5xx above 10% of REST requests between samples (min 10 requests; restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-5xx) |
 | `db_pool_saturated` | pool at max with zero idle for 3 consecutive samples | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-db-pool) |
 | `db_errors` | 3 or more storage-layer errors between samples (restarts skip the window; send-admission SQL `op="admission"` plus voice actor load `op="other"`) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | new send-admission refusals in 3 consecutive windows | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-send-admission-blocked) |
 | `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-failures) |
 | `gateway_missed_events` | any increase of `two_bot_gateway_missed_events_total` between samples (first sample and restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-gateway-missed-events) |
 | `gateway_unpaired_disconnect` | disconnects without a RESUMED or fresh READY for 3 consecutive samples (first sample and restarts re-baseline; any recovery growth clears) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-gateway-unpaired-disconnect) |
+| `gateway_not_ready` | `/readyz` gateway component `starting`/`down` for 3 consecutive valid samples with no disconnect edge required (first valid sample and restarts re-baseline; any ready sample clears) | keepalive `/readyz` probe | [runbook.md](runbook.md#alert-gateway-not-ready) |
 | `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-ticker-stale) |
 | `receiver_refusals:<family>` | refused website-action outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak; `other` holds pre-auth refusals) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-receiver-refusals) |
 | `dispatch_drops:<lane>` | **ticket**, not page: drops grow in 3 consecutive completed sample windows per bounded lane after a baseline; reactions include fairness refusals, not proof of gateway packet loss | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-dispatch-drops) |
 | `job_unknown_stale:<job>` | **ticket**, not page: job without a cadence entry with no success for more than 2 hours (never-succeeded is ignored; `session_checkpoint` is event-driven and excluded) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-unknown-stale) |
 | `gateway_checkpoint_failures` | any increase of `two_bot_gateway_checkpoint_failures_total` summed over every `stage` between samples (first sample is baseline-only; the 75 s runtime linger leaves ~3 s margin over a 60 s tick plus two 6 s probes for a pre-exit scrape) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-checkpoint-failures) |
+| `voice_join_fast_burn` | **page**: genuine creator joins burn the 99.5% move-within-5s budget faster than 14.4x in both the 1 h and 5 min windows (each needs at least 10 joins and two bad moves; incomplete startup/restart windows stay inactive) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-join-fast-burn) |
+| `voice_join_slow_burn` | **ticket**: genuine creator joins burn the 99.5% move-within-5s budget faster than 6x in both the 6 h and 30 min windows (each uses the same volume and bad-move floors) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-join-slow-burn) |
+| `voice_creator_map_stale` | creator-map age past 600 s (two missed 5 min refreshes) after at least one merge; generation 0 never fires, older containers without the gauges hold state | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-creator-map-stale) |
+| `error_budget_fast_burn` | **page**: REST error budget burns faster than 12x in both the 15 min and 2 min windows (each needs at least 10 requests and two budget errors; incomplete startup/restart windows stay inactive) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-error-budget-fast-burn) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via
@@ -122,7 +128,7 @@ provisioner and records the receipt on the execution card:
   `wrangler.toml`, a PR or a log); forwarding must also be on.
 - [ ] Scrape token provisioned as the production Worker secret backing
   `GET /ops/metrics`; an off-container scrape returns exposition.
-- [ ] Readiness threshold confirmed: default (≈10 min) or the
+- [ ] Readiness threshold confirmed: default (≈2 min) or the
   per-environment override value.
 - [ ] No `container_keepalive_arm_failed` in recent Worker logs
   (the loop is actually armed).

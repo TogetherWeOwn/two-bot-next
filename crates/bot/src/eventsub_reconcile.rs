@@ -1,0 +1,1414 @@
+//! EventSub subscription reconcile at startup plus a bounded interval (M3.3).
+//!
+//! The receiver (`eventsub_http`) is served when `TWO_EVENTSUB` is exactly
+//! `1`, but without subscriptions Twitch never delivers. This module drives
+//! the pure-core plan (`plan_boot_actions` over `list_subscriptions`) through
+//! the verifying executor (`execute_actions`, whose 409 path confirms via a
+//! follow-up broadcaster listing) against the bot's own callback, then runs a
+//! final listing that confirms every desired broadcaster holds a healthy
+//! subscription. Anything unhealthy is logged with an `error_class`, never
+//! silent.
+//!
+//! The plan runs one action at a time: a rejected action (a typo'd
+//! broadcaster id answers 400, a rate limit 429, a blip 5xx) is logged and
+//! counted, and the rest of the plan and the final listing still run, so one
+//! bad id cannot starve the broadcasters sorted after it. The pass then fails
+//! with the failed and missing counts.
+//!
+//! The task runs once at startup and on a bounded interval afterwards. The
+//! signing secret travels only inside `WebhookSecret` (HMAC plus the
+//! create-subscription body, both inside core) and no log line carries a
+//! secret value, header, challenge or body byte: only scalar counts, statuses
+//! and error classes.
+
+use std::{collections::HashMap, future::Future, time::Duration};
+
+use two_bot_core::metrics::Metrics;
+use two_bot_core::twitch_eventsub::{
+    CallbackUrl, ExistingSubscription, SubscriptionAction, WebhookSecret,
+};
+use two_bot_core::twitch_helix::{
+    plan_boot_actions, webhook_secret_from_env, ActionOutcome, HelixClient, HelixCredentials,
+    HelixError, HelixTransport, HyperHelixTransport,
+};
+
+/// Environment variable carrying the bot's own public callback. Reconcile only
+/// ever touches subscriptions on this URL, never a foreign one.
+pub const CALLBACK_ENV: &str = "TWO_TWITCH_CALLBACK_URL";
+/// Environment variable carrying the comma-separated broadcaster allowlist
+/// (`broadcaster_user_id` values) to subscribe to on the bot callback.
+pub const BROADCASTERS_ENV: &str = "TWO_TWITCH_BROADCASTERS";
+/// Reconcile cadence after the startup run. Hourly is cheap (a few Helix calls
+/// per pass) and bounds how long a dropped subscription stays dark.
+pub const RECONCILE_INTERVAL_SECS: u64 = 3_600;
+
+/// What one reconcile pass did, for scalar receiver logs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileSummary {
+    /// Stale/failed subscriptions deleted (plus already-gone deletes).
+    pub deleted: usize,
+    /// Subscriptions created with a 2xx answer.
+    pub created: usize,
+    /// 409 creates confirmed healthy by the follow-up listing.
+    pub already_exists: usize,
+    /// Pre-pass subscriptions on our callback already in a failed status
+    /// (`webhook_callback_verification_failed`,
+    /// `notification_failures_exceeded`, `authorization_revoked`). Surfaced
+    /// even when the re-create succeeds so a never-verifying callback cannot
+    /// log `healthy` while cycling delete/create every hour.
+    pub prior_failed: usize,
+    /// Final follow-up status for a successful reconcile pass.
+    pub status: Option<&'static str>,
+}
+
+/// True when the EventSub slice is enabled in `vars`.
+fn gate_open(vars: &HashMap<String, String>) -> bool {
+    vars.get("TWO_EVENTSUB")
+        .is_some_and(|flag| flag.as_str() == "1")
+}
+
+/// True when the process environment enables the reconcile task.
+fn enabled() -> bool {
+    gate_open(&std::env::vars().collect())
+}
+
+/// Split the broadcaster allowlist: comma-separated, trimmed, sorted and
+/// deduplicated so the plan is deterministic.
+fn parse_broadcasters(raw: &str) -> Vec<String> {
+    let mut ids: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Load the callback plus desired broadcasters. An empty allowlist parks the
+/// pass without mutations (the caller logs it); a missing or invalid callback
+/// fails loudly so the operator notices.
+fn load_from_map(vars: &HashMap<String, String>) -> Result<(CallbackUrl, Vec<String>), HelixError> {
+    let raw = vars.get(CALLBACK_ENV).map(String::as_str).unwrap_or("");
+    if raw.trim().is_empty() {
+        return Err(HelixError::Missing(CALLBACK_ENV));
+    }
+    let callback = CallbackUrl::new(raw.trim()).map_err(|_| HelixError::InvalidCredential {
+        name: CALLBACK_ENV,
+        reason: "value must be an https callback without port, query or fragment",
+    })?;
+    let desired = vars
+        .get(BROADCASTERS_ENV)
+        .map_or_else(Vec::new, |raw| parse_broadcasters(raw));
+    Ok((callback, desired))
+}
+
+/// Mirrors the healthy set in core (the authoritative check lives next to the
+/// listing parser in `twitch_eventsub`): only these statuses deliver.
+fn is_healthy_status(status: &str) -> bool {
+    matches!(status, "enabled" | "webhook_callback_verification_pending")
+}
+
+/// True when the status is a terminal Twitch failure that `reconcile` deletes
+/// and re-creates (as opposed to healthy `enabled`/`pending` or an unknown
+/// value, which the follow-up listing judges).
+fn is_failed_status(status: &str) -> bool {
+    matches!(
+        status,
+        "webhook_callback_verification_failed"
+            | "notification_failures_exceeded"
+            | "authorization_revoked"
+    )
+}
+
+/// Pre-pass subscriptions on our callback already in a failed status.
+fn count_prior_failed(existing: &[ExistingSubscription], callback: &CallbackUrl) -> usize {
+    existing
+        .iter()
+        .filter(|sub| sub.callback == callback.as_str() && is_failed_status(&sub.status))
+        .count()
+}
+
+/// True only when every desired broadcaster holds an `enabled` subscription
+/// on our callback in the follow-up listing: the only state the pass may log
+/// as `healthy`. A desired broadcaster served only by a
+/// `webhook_callback_verification_pending` subscription keeps the pass at
+/// `pending`, even when other desired broadcasters are already `enabled`.
+/// An empty desired set is vacuously satisfied (the startup path parks that
+/// case before this check runs). Foreign-callback subscriptions never count.
+fn all_desired_enabled(
+    desired: &[String],
+    callback: &CallbackUrl,
+    confirmed: &[ExistingSubscription],
+) -> bool {
+    desired.iter().all(|id| {
+        confirmed.iter().any(|sub| {
+            &sub.broadcaster_user_id == id
+                && sub.callback == callback.as_str()
+                && sub.status == "enabled"
+        })
+    })
+}
+
+/// Desired broadcasters without a healthy subscription on our callback in the
+/// follow-up listing.
+fn unconfirmed_broadcasters(
+    desired: &[String],
+    callback: &CallbackUrl,
+    listed: &[ExistingSubscription],
+) -> Vec<String> {
+    desired
+        .iter()
+        .filter(|id| {
+            !listed.iter().any(|sub| {
+                &sub.broadcaster_user_id == *id
+                    && sub.callback == callback.as_str()
+                    && is_healthy_status(&sub.status)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Count one executed plan by outcome, for the scalar run log.
+fn summarize(outcomes: &[ActionOutcome]) -> ReconcileSummary {
+    let mut summary = ReconcileSummary::default();
+    for outcome in outcomes {
+        match outcome {
+            ActionOutcome::Deleted { .. } => summary.deleted += 1,
+            ActionOutcome::Created { .. } => summary.created += 1,
+            ActionOutcome::AlreadyExists { .. } => summary.already_exists += 1,
+        }
+    }
+    summary
+}
+
+/// What running a plan action by action produced.
+struct PlanRun {
+    /// Outcomes of the actions that succeeded, in plan order.
+    outcomes: Vec<ActionOutcome>,
+    /// Actions that failed; every later action still ran.
+    failed: usize,
+    /// The first failed action's error, returned when the pass fails.
+    first_failure: Option<HelixError>,
+}
+
+/// `delete` or `create`, for the scalar action-failure log.
+fn action_label(action: &SubscriptionAction) -> &'static str {
+    match action {
+        SubscriptionAction::Delete { .. } => "delete",
+        SubscriptionAction::Create { .. } => "create",
+    }
+}
+
+/// Run `plan` one action at a time so a rejected action cannot starve the
+/// ones after it: `execute_actions` returns on the first non-2xx answer, and
+/// the creates are sorted, so a poisoned broadcaster id would otherwise block
+/// every later create on every pass. Each failure is logged with its action
+/// kind and error, counted, and the plan carries on; the plan is bounded by
+/// the broadcaster allowlist, so the pass stays bounded too.
+async fn run_plan<T: HelixTransport>(
+    client: &mut HelixClient<T>,
+    plan: &[SubscriptionAction],
+    callback: &CallbackUrl,
+    secret: &WebhookSecret,
+) -> PlanRun {
+    let mut run = PlanRun {
+        outcomes: Vec::with_capacity(plan.len()),
+        failed: 0,
+        first_failure: None,
+    };
+    for action in plan {
+        match client
+            .execute_actions(std::slice::from_ref(action), callback, secret)
+            .await
+        {
+            Ok(mut done) => run.outcomes.append(&mut done),
+            Err(error) => {
+                tracing::error!(
+                    event = "eventsub_reconcile",
+                    error_class = "reconcile_action_failed",
+                    action = action_label(action),
+                    error = %error,
+                    "eventsub reconcile action failed; continuing with the rest of the plan"
+                );
+                run.failed += 1;
+                if run.first_failure.is_none() {
+                    run.first_failure = Some(error);
+                }
+            }
+        }
+    }
+    run
+}
+
+/// Record the successful mutations of one executed plan in the metrics
+/// registry: 2xx creates and deletes. Zero counts are no-ops; 409
+/// already-exists confirmations fold into the pass outcome, not into actions.
+fn record_actions(metrics: &Metrics, outcomes: &[ActionOutcome]) {
+    let summary = summarize(outcomes);
+    metrics.eventsub_reconcile_action("create", summary.created as u64);
+    metrics.eventsub_reconcile_action("delete", summary.deleted as u64);
+}
+
+/// List, diff with `plan_boot_actions` (deletes before creates, our callback
+/// only), run the plan action by action, then confirm with a follow-up
+/// `list_subscriptions` that always runs: the pass fails loudly, with the
+/// failed and missing counts, when any action failed or a desired broadcaster
+/// lacks a healthy subscription afterwards.
+pub async fn reconcile_all<T: HelixTransport>(
+    client: &mut HelixClient<T>,
+    callback: &CallbackUrl,
+    desired: &[String],
+    secret: &WebhookSecret,
+) -> Result<ReconcileSummary, HelixError> {
+    reconcile_all_with_metrics(
+        client,
+        callback,
+        desired,
+        secret,
+        two_bot_core::metrics::global(),
+    )
+    .await
+}
+
+/// [`reconcile_all`] against an explicit metrics registry. Every pass that
+/// reaches Helix records exactly one
+/// `two_bot_eventsub_reconcile_passes_total{outcome}` sample (`healthy`,
+/// `pending`, `failed`), the successful creates/deletes in
+/// `two_bot_eventsub_reconcile_actions_total{action}`, and each failure site in
+/// `two_bot_eventsub_reconcile_errors_total{error_class}` under the
+/// failure-site `error_class` log strings (`reconcile_action_failed`,
+/// `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed`).
+/// `reconcile_pending`, config refusals and parked startup passes stay
+/// log-only, and the `startup_reconcile` wrapper's `reconcile_failed` line
+/// surfaces the same failure the pass already counted. Cardinality is bounded
+/// per-outcome, never per-subscription: no broadcaster, subscription id,
+/// status code or body byte reaches a label. Callers pass a fresh
+/// [`Metrics`] in tests; production passes the global registry.
+pub async fn reconcile_all_with_metrics<T: HelixTransport>(
+    client: &mut HelixClient<T>,
+    callback: &CallbackUrl,
+    desired: &[String],
+    secret: &WebhookSecret,
+    metrics: &Metrics,
+) -> Result<ReconcileSummary, HelixError> {
+    let existing = match client.list_subscriptions().await {
+        Ok(existing) => existing,
+        Err(error) => {
+            metrics.eventsub_reconcile_pass("failed");
+            metrics.eventsub_reconcile_error("reconcile_failed");
+            return Err(error);
+        }
+    };
+    let prior_failed = count_prior_failed(&existing, callback);
+    if prior_failed > 0 {
+        metrics.eventsub_reconcile_error("reconcile_prior_failed");
+        tracing::error!(
+            event = "eventsub_reconcile",
+            error_class = "reconcile_prior_failed",
+            broadcasters = desired.len(),
+            prior_failed = prior_failed,
+            "eventsub reconcile found failed subscriptions on our callback; deleting and re-creating"
+        );
+    }
+    let plan = match plan_boot_actions(desired, callback, &existing) {
+        Ok(plan) => plan,
+        Err(error) => {
+            metrics.eventsub_reconcile_pass("failed");
+            metrics.eventsub_reconcile_error("reconcile_failed");
+            return Err(error);
+        }
+    };
+    let run = run_plan(client, &plan, callback, secret).await;
+    for _ in 0..run.failed {
+        metrics.eventsub_reconcile_error("reconcile_action_failed");
+    }
+    let confirmed = match client.list_subscriptions().await {
+        Ok(confirmed) => confirmed,
+        Err(error) => {
+            record_actions(metrics, &run.outcomes);
+            metrics.eventsub_reconcile_pass("failed");
+            metrics.eventsub_reconcile_error("reconcile_failed");
+            return Err(error);
+        }
+    };
+    let missing = unconfirmed_broadcasters(desired, callback, &confirmed);
+    if run.failed > 0 || !missing.is_empty() {
+        record_actions(metrics, &run.outcomes);
+        metrics.eventsub_reconcile_error("reconcile_unhealthy");
+        metrics.eventsub_reconcile_pass("failed");
+        tracing::error!(
+            event = "eventsub_reconcile",
+            error_class = "reconcile_unhealthy",
+            broadcasters = desired.len(),
+            failed = run.failed,
+            missing = missing.len(),
+            prior_failed = prior_failed,
+            "eventsub reconcile did not converge: an action failed or a healthy subscription is missing"
+        );
+        return Err(run.first_failure.unwrap_or(HelixError::BadResponse(
+            "reconcile follow-up listing is missing a healthy subscription",
+        )));
+    }
+    let mut summary = summarize(&run.outcomes);
+    record_actions(metrics, &run.outcomes);
+    summary.prior_failed = prior_failed;
+    let status = if all_desired_enabled(desired, callback, &confirmed) {
+        "healthy"
+    } else {
+        "pending"
+    };
+    summary.status = Some(status);
+    if status == "pending" {
+        metrics.eventsub_reconcile_pass("pending");
+        tracing::warn!(
+            event = "eventsub_reconcile",
+            error_class = "reconcile_pending",
+            status = "pending",
+            broadcasters = desired.len(),
+            deleted = summary.deleted,
+            created = summary.created,
+            already_exists = summary.already_exists,
+            prior_failed = summary.prior_failed,
+            "eventsub subscriptions re-created but not all verified yet"
+        );
+        return Ok(summary);
+    }
+    metrics.eventsub_reconcile_pass("healthy");
+    tracing::info!(
+        event = "eventsub_reconcile",
+        status = "healthy",
+        broadcasters = desired.len(),
+        deleted = summary.deleted,
+        created = summary.created,
+        already_exists = summary.already_exists,
+        prior_failed = summary.prior_failed,
+        "eventsub subscriptions reconciled"
+    );
+    Ok(summary)
+}
+
+/// One reconcile pass from the process environment: gate, Operator
+/// credentials, callback plus allowlist, then `reconcile_all`. Every refusal
+/// and failure is logged with an `error_class`; callers need no extra log.
+pub async fn startup_reconcile() -> Result<ReconcileSummary, HelixError> {
+    let vars: HashMap<String, String> = std::env::vars().collect();
+    if !gate_open(&vars) {
+        tracing::info!(
+            event = "eventsub_reconcile",
+            status = "parked",
+            reason = "flag_dark",
+            "eventsub reconcile parked: TWO_EVENTSUB is not exactly 1"
+        );
+        return Ok(ReconcileSummary::default());
+    }
+    let (callback, desired) = match load_from_map(&vars) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            tracing::error!(
+                event = "eventsub_reconcile",
+                error_class = "reconcile_config_invalid",
+                error = %error,
+                "eventsub reconcile refused: callback configuration is invalid"
+            );
+            return Err(error);
+        }
+    };
+    if desired.is_empty() {
+        tracing::warn!(
+            event = "eventsub_reconcile",
+            error_class = "reconcile_no_broadcasters",
+            "eventsub reconcile parked: broadcaster allowlist is empty, no subscriptions mutated"
+        );
+        return Ok(ReconcileSummary::default());
+    }
+    let creds = match HelixCredentials::from_env() {
+        Ok(creds) => creds,
+        Err(error) => {
+            tracing::error!(
+                event = "eventsub_reconcile",
+                error_class = "reconcile_config_invalid",
+                error = %error,
+                "eventsub reconcile refused: Twitch credentials are missing or invalid"
+            );
+            return Err(error);
+        }
+    };
+    let secret = match webhook_secret_from_env() {
+        Ok(secret) => secret,
+        Err(error) => {
+            tracing::error!(
+                event = "eventsub_reconcile",
+                error_class = "reconcile_config_invalid",
+                error = %error,
+                "eventsub reconcile refused: webhook secret is missing or invalid"
+            );
+            return Err(error);
+        }
+    };
+    let mut client = HelixClient::new(HyperHelixTransport, creds);
+    match reconcile_all(&mut client, &callback, &desired, &secret).await {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            tracing::error!(
+                event = "eventsub_reconcile",
+                error_class = "reconcile_failed",
+                error = %error,
+                "eventsub reconcile failed"
+            );
+            Err(error)
+        }
+    }
+}
+
+/// One pass; the outcome is already logged inside `startup_reconcile`.
+async fn run_once() {
+    let _ = startup_reconcile().await;
+}
+
+/// Shutdown latch for the interval loop.
+fn stopped(shutdown: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
+/// Startup run, then the bounded interval, until shutdown. Failures are
+/// logged per pass and never stop the loop: the next tick retries.
+async fn run_loop<P, Fut>(
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    interval: Duration,
+    mut pass: P,
+) where
+    P: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    pass().await;
+    loop {
+        tokio::select! {
+            biased;
+            result = shutdown.changed() => {
+                let _ = result;
+                return;
+            }
+            _ = tokio::time::sleep(interval) => {}
+        }
+        if stopped(&shutdown) {
+            return;
+        }
+        pass().await;
+    }
+}
+
+/// Spawn the reconcile task when `TWO_EVENTSUB` is exactly `1`. Dark is a
+/// parked info log, never a silent downgrade of an enabled receiver.
+pub fn spawn_if_enabled(shutdown: tokio::sync::watch::Receiver<bool>) {
+    if !enabled() {
+        tracing::info!(
+            event = "eventsub_reconcile",
+            status = "parked",
+            reason = "flag_dark",
+            "eventsub reconcile parked: TWO_EVENTSUB is not exactly 1"
+        );
+        return;
+    }
+    tokio::spawn(run_loop(
+        shutdown,
+        Duration::from_secs(RECONCILE_INTERVAL_SECS),
+        run_once,
+    ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use axum::http::{Method, StatusCode};
+    use serde_json::{json, Value};
+    use two_bot_core::twitch_helix::{HelixRequest, HelixResponse};
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn subscription_entry(id: &str, status: &str, broadcaster: &str, callback: &str) -> Value {
+        json!({
+            "id": id,
+            "status": status,
+            "type": "stream.online",
+            "version": "1",
+            "condition": {"broadcaster_user_id": broadcaster},
+            "transport": {"method": "webhook", "callback": callback},
+        })
+    }
+
+    struct ScriptTransport {
+        answers: Mutex<VecDeque<Result<HelixResponse, HelixError>>>,
+        log: CallLog,
+    }
+
+    impl ScriptTransport {
+        fn new(answers: Vec<Result<HelixResponse, HelixError>>, log: CallLog) -> Self {
+            Self {
+                answers: Mutex::new(answers.into()),
+                log,
+            }
+        }
+
+        fn token_answer() -> Result<HelixResponse, HelixError> {
+            Ok(HelixResponse {
+                status: StatusCode::OK,
+                body: json!({"access_token": "synthetic-token", "expires_in": 3_600})
+                    .to_string()
+                    .into_bytes(),
+            })
+        }
+
+        fn listing_answer(document: &Value) -> Result<HelixResponse, HelixError> {
+            Ok(HelixResponse {
+                status: StatusCode::OK,
+                body: document.to_string().into_bytes(),
+            })
+        }
+
+        fn no_content() -> Result<HelixResponse, HelixError> {
+            Ok(HelixResponse {
+                status: StatusCode::NO_CONTENT,
+                body: Vec::new(),
+            })
+        }
+
+        fn rejected(status: StatusCode) -> Result<HelixResponse, HelixError> {
+            Ok(HelixResponse {
+                status,
+                body: Vec::new(),
+            })
+        }
+    }
+
+    impl HelixTransport for ScriptTransport {
+        async fn send(&self, request: HelixRequest) -> Result<HelixResponse, HelixError> {
+            self.log
+                .inner
+                .lock()
+                .expect("call log must unlock")
+                .push(request);
+            self.answers
+                .lock()
+                .expect("script must unlock")
+                .pop_front()
+                .expect("script must answer every call")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CallLog {
+        inner: std::sync::Arc<Mutex<Vec<HelixRequest>>>,
+    }
+
+    impl CallLog {
+        fn requests(&self) -> Vec<HelixRequest> {
+            self.inner.lock().expect("call log must unlock").clone()
+        }
+    }
+
+    fn test_secret() -> WebhookSecret {
+        WebhookSecret::new("synthetic-webhook-secret-01".to_owned())
+            .expect("fixture secret must parse")
+    }
+
+    fn callback() -> CallbackUrl {
+        CallbackUrl::new("https://hooks.example.com/twitch").expect("fixture callback must parse")
+    }
+
+    fn creds() -> HelixCredentials {
+        HelixCredentials {
+            client_id: two_bot_core::Secret::new("fixture-client-id".to_owned()),
+            client_secret: two_bot_core::Secret::new("fixture-client-secret".to_owned()),
+        }
+    }
+
+    #[test]
+    fn gate_opens_only_on_exact_one() {
+        assert!(!gate_open(&vars(&[])));
+        assert!(!gate_open(&vars(&[("TWO_EVENTSUB", "0")])));
+        assert!(!gate_open(&vars(&[("TWO_EVENTSUB", "true")])));
+        assert!(gate_open(&vars(&[("TWO_EVENTSUB", "1")])));
+    }
+
+    #[test]
+    fn broadcasters_split_trim_and_dedupe() {
+        assert_eq!(
+            parse_broadcasters("222, 444,,222,  ,111"),
+            vec!["111".to_owned(), "222".to_owned(), "444".to_owned()]
+        );
+        assert!(parse_broadcasters(" , ,").is_empty());
+    }
+
+    #[test]
+    fn config_requires_a_valid_callback() {
+        let err = load_from_map(&vars(&[])).expect_err("missing callback must fail");
+        assert!(matches!(err, HelixError::Missing(CALLBACK_ENV)));
+        let err = load_from_map(&vars(&[(CALLBACK_ENV, "http://plain.example.com/hook")]))
+            .expect_err("non-https callback must fail");
+        assert!(matches!(err, HelixError::InvalidCredential { .. }));
+    }
+
+    #[test]
+    fn config_loads_callback_and_allowlist() {
+        let (callback, desired) = load_from_map(&vars(&[
+            (CALLBACK_ENV, "https://hooks.example.com/twitch"),
+            (BROADCASTERS_ENV, "444,222,444"),
+        ]))
+        .expect("valid config must load");
+        assert_eq!(callback.as_str(), "https://hooks.example.com/twitch");
+        assert_eq!(desired, vec!["222".to_owned(), "444".to_owned()]);
+        let (_, desired) =
+            load_from_map(&vars(&[(CALLBACK_ENV, "https://hooks.example.com/twitch")]))
+                .expect("missing allowlist parks with an empty list");
+        assert!(desired.is_empty());
+    }
+
+    #[test]
+    fn healthy_set_covers_enabled_and_pending() {
+        assert!(is_healthy_status("enabled"));
+        assert!(is_healthy_status("webhook_callback_verification_pending"));
+        for status in [
+            "webhook_callback_verification_failed",
+            "notification_failures_exceeded",
+            "authorization_revoked",
+            "",
+        ] {
+            assert!(!is_healthy_status(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn failed_status_set_covers_terminal_twitch_states() {
+        for status in [
+            "webhook_callback_verification_failed",
+            "notification_failures_exceeded",
+            "authorization_revoked",
+        ] {
+            assert!(is_failed_status(status), "{status}");
+        }
+        for status in [
+            "enabled",
+            "webhook_callback_verification_pending",
+            "",
+            "other",
+        ] {
+            assert!(!is_failed_status(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn prior_failed_counts_only_failed_subscriptions_on_our_callback() {
+        let other = CallbackUrl::new("https://other.example.com/twitch")
+            .expect("fixture callback must parse");
+        let existing = vec![
+            ExistingSubscription {
+                id: "failed-id".to_owned(),
+                status: "webhook_callback_verification_failed".to_owned(),
+                broadcaster_user_id: "444".to_owned(),
+                callback: callback().as_str().to_owned(),
+            },
+            ExistingSubscription {
+                id: "pending-id".to_owned(),
+                status: "webhook_callback_verification_pending".to_owned(),
+                broadcaster_user_id: "444".to_owned(),
+                callback: callback().as_str().to_owned(),
+            },
+            ExistingSubscription {
+                id: "foreign-failed-id".to_owned(),
+                status: "authorization_revoked".to_owned(),
+                broadcaster_user_id: "444".to_owned(),
+                callback: other.as_str().to_owned(),
+            },
+        ];
+        assert_eq!(count_prior_failed(&existing, &callback()), 1);
+    }
+
+    #[test]
+    fn all_desired_enabled_requires_every_desired_broadcaster_enabled() {
+        fn sub(
+            id: &str,
+            status: &str,
+            broadcaster: &str,
+            callback: &CallbackUrl,
+        ) -> ExistingSubscription {
+            ExistingSubscription {
+                id: id.to_owned(),
+                status: status.to_owned(),
+                broadcaster_user_id: broadcaster.to_owned(),
+                callback: callback.as_str().to_owned(),
+            }
+        }
+        let desired = vec!["222".to_owned(), "444".to_owned()];
+        let enabled_222 = sub("id-222", "enabled", "222", &callback());
+        let enabled_444 = sub("id-444", "enabled", "444", &callback());
+        let pending_444 = sub(
+            "id-444-pending",
+            "webhook_callback_verification_pending",
+            "444",
+            &callback(),
+        );
+        let failed_444 = sub(
+            "id-444-failed",
+            "webhook_callback_verification_failed",
+            "444",
+            &callback(),
+        );
+        let other = CallbackUrl::new("https://other.example.com/twitch")
+            .expect("fixture callback must parse");
+        let foreign_enabled_444 = sub("id-444-foreign", "enabled", "444", &other);
+
+        assert!(
+            all_desired_enabled(&desired, &callback(), &[enabled_222.clone(), enabled_444]),
+            "all desired broadcasters enabled is healthy"
+        );
+        assert!(
+            !all_desired_enabled(&desired, &callback(), &[enabled_222.clone(), pending_444]),
+            "a mixed enabled/pending desired set is not healthy"
+        );
+        assert!(
+            !all_desired_enabled(&desired, &callback(), &[enabled_222.clone(), failed_444]),
+            "a failed desired subscription is not healthy"
+        );
+        assert!(
+            !all_desired_enabled(&desired, &callback(), std::slice::from_ref(&enabled_222)),
+            "a missing desired subscription is not healthy"
+        );
+        assert!(
+            !all_desired_enabled(&desired, &callback(), &[enabled_222, foreign_enabled_444]),
+            "an enabled subscription on a foreign callback does not count"
+        );
+        assert!(
+            all_desired_enabled(&[], &callback(), &[]),
+            "an empty desired set is vacuously satisfied"
+        );
+    }
+
+    #[test]
+    fn interval_is_bounded_and_nonzero() {
+        const {
+            assert!(RECONCILE_INTERVAL_SECS > 0);
+            assert!(RECONCILE_INTERVAL_SECS <= 24 * 3_600);
+        }
+    }
+
+    #[test]
+    fn summary_counts_by_outcome() {
+        let summary = summarize(&[
+            ActionOutcome::Deleted {
+                id: "gone".to_owned(),
+            },
+            ActionOutcome::Created {
+                broadcaster_user_id: "444".to_owned(),
+            },
+            ActionOutcome::AlreadyExists {
+                broadcaster_user_id: "222".to_owned(),
+            },
+        ]);
+        assert_eq!(
+            summary,
+            ReconcileSummary {
+                deleted: 1,
+                created: 1,
+                already_exists: 1,
+                prior_failed: 0,
+                status: None,
+            }
+        );
+        assert_eq!(
+            summarize(&[]),
+            ReconcileSummary::default(),
+            "an empty plan reconciles to nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_runs_deletes_before_creates_then_confirms_healthy() {
+        let listing = json!({
+            "data": [
+                subscription_entry("stale-id", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("keep-id", "enabled", "222", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let confirmed = json!({
+            "data": [
+                subscription_entry("keep-id", "enabled", "222", "https://hooks.example.com/twitch"),
+                subscription_entry("fresh-id", "enabled", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let log = CallLog::default();
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            log.clone(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let summary = reconcile_all(
+            &mut client,
+            &callback(),
+            &["222".to_owned(), "444".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect("healthy follow-up must succeed");
+        assert_eq!(summary.status, Some("healthy"));
+        assert_eq!(
+            summary,
+            ReconcileSummary {
+                deleted: 1,
+                created: 1,
+                already_exists: 0,
+                prior_failed: 0,
+                status: Some("healthy"),
+            }
+        );
+        let seen = log.requests();
+        assert_eq!(
+            seen.len(),
+            5,
+            "token, listing, delete, create, follow-up listing"
+        );
+        assert_eq!(seen[2].method, Method::DELETE);
+        assert_eq!(seen[3].method, Method::POST);
+    }
+
+    #[tokio::test]
+    async fn reconcile_reports_pending_when_only_some_desired_are_enabled() {
+        let listing = json!({"data": [], "pagination": {}});
+        let confirmed = json!({
+            "data": [
+                subscription_entry("id-111", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("id-222", "webhook_callback_verification_pending", "222", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let log = CallLog::default();
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            log.clone(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let summary = reconcile_all(
+            &mut client,
+            &callback(),
+            &["111".to_owned(), "222".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect("a mixed enabled/pending follow-up must still succeed");
+        assert_eq!(
+            summary.status,
+            Some("pending"),
+            "one enabled desired broadcaster must not mask a pending one"
+        );
+        assert_eq!(summary.created, 2);
+        let seen = log.requests();
+        assert_eq!(
+            seen.len(),
+            5,
+            "token, listing, two creates, follow-up listing"
+        );
+        assert_eq!(seen[2].method, Method::POST);
+        assert_eq!(seen[3].method, Method::POST);
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_when_followup_desired_subscription_is_failed() {
+        let listing = json!({"data": [], "pagination": {}});
+        let confirmed = json!({
+            "data": [
+                subscription_entry("id-444", "webhook_callback_verification_failed", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let error = reconcile_all(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect_err("a failed desired subscription in the follow-up must fail the pass");
+        assert!(
+            matches!(error, HelixError::BadResponse(_)),
+            "a failed follow-up subscription must surface, not count as done: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_loudly_when_followup_listing_is_unhealthy() {
+        let listing = json!({"data": [], "pagination": {}});
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&listing),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let error = reconcile_all(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect_err("missing follow-up subscription must fail");
+        assert!(
+            matches!(error, HelixError::BadResponse(_)),
+            "unhealthy state must surface, not count as done: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_runs_later_creates_after_a_rejected_create_then_fails() {
+        let listing = json!({"data": [], "pagination": {}});
+        let confirmed = json!({
+            "data": [
+                subscription_entry("id-111", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("id-333", "enabled", "333", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let log = CallLog::default();
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::rejected(StatusCode::BAD_REQUEST),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            log.clone(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let error = reconcile_all(
+            &mut client,
+            &callback(),
+            &["111".to_owned(), "222".to_owned(), "333".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect_err("a rejected create must fail the pass");
+        assert!(
+            matches!(
+                error,
+                HelixError::HelixRejected { status, .. } if status == StatusCode::BAD_REQUEST
+            ),
+            "the first rejected action is the pass error: {error}"
+        );
+        let seen = log.requests();
+        assert_eq!(
+            seen.len(),
+            6,
+            "token, listing, three creates, follow-up listing"
+        );
+        assert_eq!(seen[4].method, Method::POST);
+        assert!(
+            seen[4]
+                .body
+                .as_ref()
+                .expect("create carries a body")
+                .expose()
+                .contains("333"),
+            "the create after the rejected one is still issued"
+        );
+        assert_eq!(
+            seen[5].method,
+            Method::GET,
+            "the follow-up listing runs after a failed action"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_on_a_rejected_delete_even_when_nothing_is_missing() {
+        let listing = json!({
+            "data": [
+                subscription_entry("stale-id", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("keep-id", "enabled", "222", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let confirmed = json!({
+            "data": [
+                subscription_entry("stale-id", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("keep-id", "enabled", "222", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let log = CallLog::default();
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::rejected(StatusCode::INTERNAL_SERVER_ERROR),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            log.clone(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let error = reconcile_all(
+            &mut client,
+            &callback(),
+            &["222".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect_err("a rejected delete must fail the pass even though 222 is healthy");
+        assert!(
+            matches!(
+                error,
+                HelixError::HelixRejected { status, .. }
+                    if status == StatusCode::INTERNAL_SERVER_ERROR
+            ),
+            "the rejected delete is the pass error: {error}"
+        );
+        assert_eq!(
+            log.requests().len(),
+            4,
+            "token, listing, delete, follow-up listing"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_surfaces_prior_failed_when_failed_entry_is_recreated_to_pending() {
+        let listing = json!({
+            "data": [
+                subscription_entry("failed-id", "webhook_callback_verification_failed", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let confirmed = json!({
+            "data": [
+                subscription_entry("fresh-id", "webhook_callback_verification_pending", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let log = CallLog::default();
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            log.clone(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let summary = reconcile_all(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect("pending follow-up after a prior failure must still succeed");
+        assert_eq!(summary.status, Some("pending"));
+        assert_eq!(summary.prior_failed, 1);
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(summary.created, 1);
+        let seen = log.requests();
+        assert_eq!(
+            seen.len(),
+            5,
+            "token, listing, delete, create, follow-up listing"
+        );
+        assert_eq!(seen[2].method, Method::DELETE);
+        assert_eq!(seen[3].method, Method::POST);
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_healthy_pass_creates_and_deletes() {
+        let listing = json!({
+            "data": [
+                subscription_entry("stale-id", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("keep-id", "enabled", "222", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let confirmed = json!({
+            "data": [
+                subscription_entry("keep-id", "enabled", "222", "https://hooks.example.com/twitch"),
+                subscription_entry("fresh-id", "enabled", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let metrics = two_bot_core::metrics::Metrics::default();
+        let summary = reconcile_all_with_metrics(
+            &mut client,
+            &callback(),
+            &["222".to_owned(), "444".to_owned()],
+            &test_secret(),
+            &metrics,
+        )
+        .await
+        .expect("healthy follow-up must succeed");
+        assert_eq!(summary.status, Some("healthy"));
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"healthy\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"pending\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 1\n"));
+        for error_class in [
+            "reconcile_action_failed",
+            "reconcile_prior_failed",
+            "reconcile_unhealthy",
+            "reconcile_failed",
+        ] {
+            assert!(
+                text.contains(&format!(
+                    "two_bot_eventsub_reconcile_errors_total{{error_class=\"{error_class}\"}} 0\n"
+                )),
+                "no {error_class} on a clean healthy pass"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_pending_pass_with_prior_failed() {
+        let listing = json!({
+            "data": [
+                subscription_entry("failed-id", "webhook_callback_verification_failed", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let confirmed = json!({
+            "data": [
+                subscription_entry("fresh-id", "webhook_callback_verification_pending", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let metrics = two_bot_core::metrics::Metrics::default();
+        let summary = reconcile_all_with_metrics(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+            &metrics,
+        )
+        .await
+        .expect("pending follow-up after a prior failure must still succeed");
+        assert_eq!(summary.status, Some("pending"));
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"pending\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"healthy\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_prior_failed\"} 1\n"
+        ));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_unhealthy\"} 0\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_failed_pass_when_initial_listing_fails() {
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                Err(HelixError::BadResponse("fixture listing must fail")),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let metrics = two_bot_core::metrics::Metrics::default();
+        reconcile_all_with_metrics(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+            &metrics,
+        )
+        .await
+        .expect_err("a failed listing must fail the pass");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"healthy\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"pending\"} 0\n"));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_failed\"} 1\n"
+        ));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 0\n"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_failed_pass_when_followup_listing_fails() {
+        let listing = json!({"data": [], "pagination": {}});
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                Err(HelixError::BadResponse(
+                    "fixture follow-up listing must fail",
+                )),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let metrics = two_bot_core::metrics::Metrics::default();
+        reconcile_all_with_metrics(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+            &metrics,
+        )
+        .await
+        .expect_err("a failed follow-up listing must fail the pass");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_failed\"} 1\n"
+        ));
+        // The successful create still counts even though confirmation never ran.
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 1\n"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_unhealthy_verdict_with_partial_actions() {
+        let listing = json!({"data": [], "pagination": {}});
+        let confirmed = json!({
+            "data": [
+                subscription_entry("id-111", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("id-333", "enabled", "333", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::rejected(StatusCode::BAD_REQUEST),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let metrics = two_bot_core::metrics::Metrics::default();
+        reconcile_all_with_metrics(
+            &mut client,
+            &callback(),
+            &["111".to_owned(), "222".to_owned(), "333".to_owned()],
+            &test_secret(),
+            &metrics,
+        )
+        .await
+        .expect_err("a rejected create must fail the pass");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_action_failed\"} 1\n"
+        ));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_unhealthy\"} 1\n"
+        ));
+        // The two successful creates still count even though the pass failed.
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 2\n"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_loop_repeats_each_interval_until_shutdown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let passes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&passes);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_loop(shutdown_rx, Duration::from_secs(60), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async {}
+        }));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            1,
+            "startup pass runs at once"
+        );
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            2,
+            "first interval tick runs a pass"
+        );
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            3,
+            "second interval tick runs a pass"
+        );
+        shutdown_tx.send(true).expect("loop holds the receiver");
+        task.await.expect("loop exits on shutdown");
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            3,
+            "no pass runs after shutdown"
+        );
+    }
+}

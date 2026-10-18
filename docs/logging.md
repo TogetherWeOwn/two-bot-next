@@ -39,13 +39,16 @@ Docker explicitly sets `LOG_FORMAT=json`; native runs also default to JSON.
 | `message` | Optional human explanation; not an alert key |
 | `guild_id`, `interaction_id` | Discord snowflakes as decimal **strings**, not JSON numbers |
 | `run_id` | Process invocation correlation: boot Unix nanoseconds + PID; not a durable job/session ID |
+| `request_id` | End-to-end correlation id, promoted from spans like the other ids. Present on every request-scoped line; absent on boot/shutdown lines with no request context |
+| `build_sha`, `release` | Image build identity on every line: the built/released git SHA (`BOT_BUILD_REVISION`), `"unknown"` for local builds. Reserved envelope keys, never spoofable by application fields |
 | `spans` | Root-to-leaf list of named spans and typed fields; omitted when no span applies |
 | `code`, `count`, `hot_keys`, `revision` | Numeric bounded status/counters/revisions |
-| `signal`, `missing`, `reason` | Short bounded classifications/binding names, not raw provider data |
+| `signal`, `missing`, `reason`, `message_type` | Short bounded classifications/binding names, not raw provider data |
 
 Event fields are flattened into the root. Correlation fields from spans are also
 promoted to the root: inner span wins over outer; explicit event field wins over
-spans. `ts`, `level`, `msg`, `target`, and `spans` are reserved envelope keys.
+spans. `ts`, `level`, `msg`, `target`, `spans`, `build_sha`, and `release` are
+reserved envelope keys.
 The server future is instrumented with a run span; the spawned gateway task adds
 a guild span. The synchronous interaction route adapter adds interaction/guild
 spans. Futures use `Instrument`, not an entered guard held over an `.await`.
@@ -53,8 +56,8 @@ New tasks must propagate context explicitly; synchronous span context is not
 implicitly inherited by `tokio::spawn`. Axum spawns the graceful-shutdown signal
 future internally, so that future explicitly carries the run span and subscriber
 as well; `shutdown_started` keeps the same `run_id` as boot and drain completion.
-Run/guild/interaction correlation spans remain enabled independently of event
-verbosity, including `WARN`, `ERROR`, and `OFF`; `OFF` still emits no events.
+Run/guild/interaction/request correlation spans remain enabled independently of
+event verbosity, including `WARN`, `ERROR`, and `OFF`; `OFF` still emits no events.
 HTTP request execution restores the serving future's run span and subscriber
 around the trace layer, including Axum's separately spawned connection tasks.
 HTTP request spans record the method and an allowlisted path only: the
@@ -62,6 +65,20 @@ listener's own health, readiness and metrics routes are recorded verbatim, and
 every other path (unknown, parameterized, mixed-case or percent-encoded) is
 replaced by the constant `[REDACTED]`. Query strings and headers are never
 recorded. Spans remain available for failure logs.
+
+## Request-id propagation
+
+One `request_id` joins the Worker, Durable Object, container and queued-work
+logs for a single flow. The Worker stamps `x-request-id` (honoring a valid
+inbound value, else minting a 26-char Crockford id), the DO forwards it to the
+container, and the container receivers honor it when it has the generated
+shape — anything else (bearer tokens, URLs, free text, or a missing header)
+mints a fresh id and is never logged as one. The private receivers wrap each
+request in a `request` span and queued follow-up tasks inherit it via
+`Instrument`, so their lines carry the same id. Refusal envelopes echo the
+flow's id in `request_id`, so one staging request can be verified per hop
+without reading another hop's logs first. See the runbook's correlation
+section for the join procedure.
 
 Existing snake_case message-only events retain their name as `msg`. Events with
 neither a valid string `msg` nor a snake_case `message` use `msg=tracing_event`,
@@ -138,6 +155,11 @@ headers, interaction callback paths/tokens, database DSNs, S3 signed URLs/keys,
 gateway session IDs/resume URLs, raw packets, request bodies, message contents,
 modal/component values, and debug dumps of config/interactions/requests. Prefer
 binding names, allowlisted identifiers, counts, status codes, and bounded reasons.
+The `x-request-id` honor-vs-mint rule is part of this: only the 26-char
+generated shape is ever logged as an id, so a caller-supplied secret can never
+become a join key. The redaction tests drive the real routers with
+credential-bearing URLs, authorization/cookie headers and bodies, and assert
+none of those values reach the captured JSON output.
 Do not add `%error`/`?error` for SQL/HTTP/provider failures: their display/debug
 chains can contain URLs. HTTP tracing records only the method and an allowlisted path. Existing settings
 reports log only catalog-approved hot-key values; never add env-only/secret values

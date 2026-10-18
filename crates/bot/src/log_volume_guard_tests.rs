@@ -610,6 +610,16 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         3,
         "community-facts drain-reason family grew; update the cardinality budget and the guard doc"
     );
+    assert_eq!(
+        metrics::MODERATION_VERBS.len(),
+        9,
+        "moderation verb family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::MODERATION_ENFORCEMENT_OUTCOMES.len(),
+        5,
+        "moderation enforcement outcome family grew; update the cardinality budget and the guard doc"
+    );
     for (allowlist, name) in [
         (metrics::EVENTS, "EVENTS"),
         (metrics::REST_ROUTES, "routes"),
@@ -630,6 +640,10 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         (
             metrics::COMMUNITY_FACTS_DRAIN_REASONS,
             "community-facts drain reasons",
+        ),
+        (
+            metrics::MODERATION_ENFORCEMENT_OUTCOMES,
+            "moderation-enforcement-outcomes",
         ),
     ] {
         assert_eq!(
@@ -666,6 +680,21 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         6,
         "dispatch-lane family changed the budget"
     );
+    assert_eq!(
+        metrics::EVENTSUB_RECONCILE_OUTCOMES.len(),
+        3,
+        "reconcile-pass family changed the budget"
+    );
+    assert_eq!(
+        metrics::EVENTSUB_RECONCILE_ACTIONS.len(),
+        2,
+        "reconcile-action family changed the budget"
+    );
+    assert_eq!(
+        metrics::EVENTSUB_RECONCILE_ERROR_CLASSES.len(),
+        5,
+        "reconcile-error family changed the budget"
+    );
     let text = metrics::Metrics::default().render(None);
     let help_headers = text
         .lines()
@@ -675,13 +704,13 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         .lines()
         .filter(|line| line.starts_with("# TYPE "))
         .count();
-    assert_eq!(help_headers, 57, "rendered HELP family count changed");
-    assert_eq!(type_headers, 57, "rendered TYPE family count changed");
+    assert_eq!(help_headers, 69, "rendered HELP family count changed");
+    assert_eq!(type_headers, 69, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 615,
-        "exposition grew past the 615-sample budget (21 events + 4 scalars + 1 latency \
-         + 22 histograms + 180 rest + 11 REST guard + 64 jobs + 112 job-last-error-class + 51 voice + 8 join-occupancy + 26 vote-kick + 15 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 3 presence-capture + 4 pool + 1 audit-halt + 1 event-store-lag); \
+        series, 693,
+        "exposition grew past the 693-sample budget (21 events + 4 scalars + 1 latency \
+         + 22 histograms + 180 rest + 11 REST guard + 64 jobs + 112 job-last-error-class + 55 voice + 8 join-occupancy + 26 vote-kick + 15 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 45 moderation-enforcements + 3 facts-drain + 3 presence-capture + 8 automod-decisions + 4 pool + 1 audit-halt + 1 event-store-lag + 1 eventsub-received + 6 eventsub-classified + 4 eventsub-posts + 3 reconcile-passes + 2 reconcile-actions + 5 reconcile-errors); \
          update docs/log-volume-guard.md with the new series"
     );
 }

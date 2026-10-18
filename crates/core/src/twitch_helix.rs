@@ -12,8 +12,9 @@
 //!   refresh-before-expiry ([`TOKEN_REFRESH_SKEW_MS`]) and
 //!   [`parse_token_response`].
 //! - [`plan_boot_actions`]: the accumulated subscription list plus desired
-//!   broadcasters in, deletes-before-creates plan out. Pure: runs at boot and
-//!   after a `revocation`, never on a timer.
+//!   broadcasters in, deletes-before-creates plan out. Pure: holds no timers;
+//!   the bot runtime (`eventsub_reconcile`) runs it at startup and on a
+//!   bounded interval.
 //! - [`HelixClient`]: executes the plan over a [`HelixTransport`]. Tests
 //!   inject a scripted transport; production uses [`HyperHelixTransport`]
 //!   (hyper 1.x over rustls, one fresh client per request, fixed hosts only).
@@ -40,10 +41,10 @@ use hyper_util::rt::TokioExecutor;
 use thiserror::Error;
 use url::form_urlencoded;
 
+pub use crate::twitch_eventsub::HELIX_SUBSCRIPTIONS_URL;
 use crate::twitch_eventsub::{
     create_subscription_body, delete_subscription_url, parse_subscriptions, reconcile, CallbackUrl,
     EventSubError, ExistingSubscription, SubscriptionAction, WebhookSecret,
-    HELIX_SUBSCRIPTIONS_URL,
 };
 use crate::Secret;
 
@@ -184,24 +185,69 @@ impl AppToken {
     }
 }
 
+/// Largest `expires_in` accepted from the token endpoint: 365 days in seconds.
+/// Real Twitch app tokens live far below this; zero, negatives and absurd
+/// values are refused fail-closed.
+const MAX_TOKEN_EXPIRES_IN_SECS: i64 = 31_536_000;
+/// Largest top-level string value accepted in a token response body, in bytes.
+/// Covers `access_token`, `token_type` and any unknown field; other unknown
+/// fields of ordinary size stay ignored for forward compatibility.
+const MAX_TOKEN_STRING_BYTES: usize = 1024;
+
 /// Parse a `POST` token response (`{"access_token","expires_in",...}`) into a
 /// cached [`AppToken`]. `now_ms` is a parameter so tests pin the clock.
+///
+/// Fail-closed: the body must be a JSON object, `access_token` must be a
+/// 1..=1024-byte printable non-space ASCII string (`0x21..=0x7E`, suitable
+/// for an `Authorization` header), `expires_in` must be a JSON integer in
+/// `1..=31_536_000` seconds with no coercion, and every top-level string
+/// value must fit the same 1024-byte bound. Every refusal is the existing
+/// fixed-vocabulary [`HelixError::BadResponse`] with no body content echo.
 pub fn parse_token_response(body: &serde_json::Value, now_ms: i64) -> Result<AppToken, HelixError> {
-    let token = body
+    let obj = body.as_object().ok_or(HelixError::BadResponse(
+        "token response body must be an object",
+    ))?;
+    let token = obj
         .get("access_token")
         .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
         .ok_or(HelixError::BadResponse(
             "token response is missing access_token",
         ))?;
-    let expires_in_secs = body
-        .get("expires_in")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|secs| *secs > 0)
-        .ok_or(HelixError::BadResponse(
-            "token response is missing expires_in",
-        ))?;
-    let ttl_ms = i64::try_from(expires_in_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
+    let token_usable = !token.is_empty()
+        && token.len() <= MAX_TOKEN_STRING_BYTES
+        && token.bytes().all(|byte| (0x21..=0x7E).contains(&byte));
+    if !token_usable {
+        return Err(HelixError::BadResponse(
+            "token response has unusable access_token",
+        ));
+    }
+    let expires_in_secs = match obj.get("expires_in") {
+        Some(serde_json::Value::Number(n)) if n.is_i64() => n.as_i64().unwrap_or(0),
+        Some(serde_json::Value::Number(n)) if n.is_u64() => {
+            let raw = n.as_u64().unwrap_or(u64::MAX);
+            i64::try_from(raw).unwrap_or(i64::MAX)
+        }
+        _ => {
+            return Err(HelixError::BadResponse(
+                "token response is missing expires_in",
+            ));
+        }
+    };
+    if !(1..=MAX_TOKEN_EXPIRES_IN_SECS).contains(&expires_in_secs) {
+        return Err(HelixError::BadResponse(
+            "token response has unusable expires_in",
+        ));
+    }
+    for value in obj.values() {
+        if let Some(text) = value.as_str() {
+            if text.len() > MAX_TOKEN_STRING_BYTES {
+                return Err(HelixError::BadResponse(
+                    "token response has oversized field",
+                ));
+            }
+        }
+    }
+    let ttl_ms = expires_in_secs.saturating_mul(1_000);
     Ok(AppToken {
         token: Secret::new(token.to_owned()),
         expires_at_ms: now_ms.saturating_add(ttl_ms),
@@ -386,6 +432,48 @@ fn subscriptions_url(broadcaster_user_id: Option<&str>, cursor: Option<&str>) ->
     format!("{HELIX_SUBSCRIPTIONS_URL}?{}", query.finish())
 }
 
+/// Validate one subscription-listing page envelope and return its next-page
+/// cursor, if any.
+///
+/// A successful answer is only listing evidence when it is an object carrying
+/// a `data` array. [`parse_subscriptions`]
+/// is deliberately lenient per entry (other types, versions, transports and
+/// malformed entries are skipped), but a missing or non-array `data` envelope
+/// must not read as "no subscriptions": reconciliation would plan creates from
+/// invalid evidence, and a malformed later page would truncate the accumulated
+/// pages into partial success. Fail the whole listing instead; the messages
+/// are static and carry no bytes from the response.
+///
+/// Returns `Ok(None)` for a terminal page (no `pagination`, a missing/null
+/// `cursor`, or a non-object `pagination`, which carries no cursor), `Ok(Some)`
+/// for a non-empty string cursor, and `Err(BadResponse)` for a missing or
+/// non-array `data` envelope or a present-but-unusable cursor (empty string,
+/// number, boolean, array or object). Pure and sync so the fuzz target drives
+/// this exact check without network or credentials.
+pub fn validate_subscription_listing_page(
+    document: &serde_json::Value,
+) -> Result<Option<String>, HelixError> {
+    if document
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .is_none()
+    {
+        return Err(HelixError::BadResponse(
+            "subscription listing has no data array",
+        ));
+    }
+    match document.get("pagination") {
+        Some(pagination) => match pagination.get("cursor") {
+            Some(serde_json::Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+            Some(serde_json::Value::Null) | None => Ok(None),
+            Some(_) => Err(HelixError::BadResponse(
+                "subscription pagination cursor is not usable",
+            )),
+        },
+        None => Ok(None),
+    }
+}
+
 /// The Helix client: cached app token plus plan execution. `T` is the
 /// transport (`HyperHelixTransport` in production, a script in tests);
 /// `clock` supplies Unix millis (default [`system_millis`]) so refresh
@@ -554,26 +642,16 @@ impl<T: HelixTransport> HelixClient<T> {
                 .await?;
             let document: serde_json::Value = serde_json::from_slice(&response.body)
                 .map_err(|_| HelixError::BadResponse("subscription listing is not JSON"))?;
+            // Fail closed on malformed envelopes via the shared pure
+            // validator (also driven by the fuzz target); see
+            // [`validate_subscription_listing_page`].
+            let next_cursor = validate_subscription_listing_page(&document)?;
             subscriptions.extend(parse_subscriptions(&document));
 
-            let next_cursor = match document.get("pagination") {
-                Some(pagination) => match pagination.get("cursor") {
-                    Some(serde_json::Value::String(value)) if !value.is_empty() => {
-                        Some(value.as_str())
-                    }
-                    Some(serde_json::Value::Null) | None => None,
-                    Some(_) => {
-                        return Err(HelixError::BadResponse(
-                            "subscription pagination cursor is not usable",
-                        ));
-                    }
-                },
-                None => None,
-            };
             let Some(next_cursor) = next_cursor else {
                 return Ok(subscriptions);
             };
-            if !seen_cursors.insert(next_cursor.to_owned()) {
+            if !seen_cursors.insert(next_cursor.clone()) {
                 return Err(HelixError::BadResponse(
                     "subscription pagination cursor repeated",
                 ));
@@ -581,7 +659,7 @@ impl<T: HelixTransport> HelixClient<T> {
             if page + 1 == HELIX_MAX_SUBSCRIPTION_PAGES {
                 return Err(HelixError::SubscriptionPageLimit);
             }
-            cursor = Some(next_cursor.to_owned());
+            cursor = Some(next_cursor);
         }
 
         Err(HelixError::SubscriptionPageLimit)

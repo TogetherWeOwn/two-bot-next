@@ -38,7 +38,7 @@ sample image named under Measured sample image.
 | R1 | `FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792…` | 21 base layers, 29,128,192 bytes (27.78 MiB) as saved-tar blobs | Debian trust bundle plus 14 documented OS packages; no shell, package manager, or OpenSSL CLI |
 | R2 | `LABEL org.opencontainers.image.revision`, `com.togetherweown.build-id` | Metadata only | Non-secret build provenance; zero bytes |
 | R3 | `USER 65532:65532`, `WORKDIR /home/nonroot` | One empty layer (no tar entries), 1,024 bytes as saved-tar blob; `USER` is config-only | Config; the layer is empty because `/home/nonroot` already exists in base layer 7 |
-| R4 | `COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot` | Yes, one file layer, 16,065,536 bytes (15.32 MiB) as saved-tar blob; file itself 16,062,800 bytes (15.32 MiB) | The only added file content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 16 MiB per `scripts/container-smoke.py` |
+| R4 | `COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot` | Yes, one file layer, 16,065,536 bytes (15.32 MiB) as saved-tar blob; file itself 16,062,800 bytes (15.32 MiB) | The only added file content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 17 MiB per `scripts/container-smoke.py` |
 | R5 | `EXPOSE 8080`, `ENV LISTEN_ADDR=0.0.0.0:8080 LOG_FORMAT=json` | Metadata only | Liveness/readiness port, bind address and JSON log format |
 | R6 | `HEALTHCHECK CMD ["/home/nonroot/two-bot", "--healthcheck"]` | Metadata only | Exec-form probe; needs no shell |
 | R7 | `ENTRYPOINT ["/home/nonroot/two-bot"]` | Metadata only | Exec form so PID 1 receives SIGTERM |
@@ -93,7 +93,7 @@ No SBOM file is committed to the repo. Per-image SBOMs are produced by the
 reusable `sbom.yml` workflow (called from `check.yml` on PRs and from
 `release.yml` on releases) and live in CI artifacts:
 
-- Scanner: Trivy Action 0.35.0 with Trivy v0.69.3, fresh vulnerability DB per
+- Scanner: Trivy Action 0.36.0 with Trivy v0.69.3, fresh vulnerability DB per
   run, no shared layer/DB cache, `cache: false` everywhere.
 - `sbom/rust-workspace.cdx.json`: CycloneDX inventory of `Cargo.lock`
   (workspace, optional and dev dependencies; not a claim every locked crate
@@ -143,10 +143,9 @@ or the current PR diff.
   image: no Dockerfile, base digest, release profile, or SBOM workflow change
   rode with that branch. The separately sourced builder refresh changes the
   builder tag and digest, not the runtime image or its measurement status.
-- `Dockerfile.distroless` is a local-trial-only variant, never built by CI
-  and never the cutover image. It omits the provenance `ARG`/`LABEL` block
-  the CI `Dockerfile` carries, so do not substitute one for the other when
-  collecting cutover evidence.
+- The distroless runtime is now the default image in `Dockerfile`; its
+  provenance arguments and labels are part of the cutover image build. Earlier
+  trial measurements remain historical evidence, not a separate build path.
 - Runtime is Debian 13 distroless (`cc-debian13:nonroot`); the older Bookworm
   notes and conditional dispositions in `docs/supply-chain.md` do not carry
   over. Automated Docker updates track both pinned references; the unversioned
@@ -168,7 +167,7 @@ Before the deployment digest is pinned:
    names, `SHA256SUMS`, and both gate results under the Releases receipt of
    the B4 evidence manifest (`docs/cutover.md` B4). That receipt does not list
    SBOMs yet, so add them there.
-3. Re-measure on the candidate's image ID, and confirm the 112 MiB / 16 MiB
+3. Re-measure on the candidate's image ID, and confirm the 112 MiB / 17 MiB
    budgets pass. CI keeps the candidate image only as the
    `sbom-partial-<run_id>-<attempt>` artifact (`image.tar`, 1-day retention),
    so download it within that window. R1 and R4 are saved-tar layer-blob

@@ -29,7 +29,6 @@
 //! (<https://docs.discord.com/developers/topics/rate-limits>).
 
 use sqlx::{Pool, Postgres};
-use thiserror::Error;
 
 /// Upsert SQL, byte-for-byte the acceptance target's `PUT_HISTORY_MESSAGE_SQL`.
 const PUT_MESSAGE_SQL: &str = "INSERT INTO backfill_history_messages
@@ -46,39 +45,86 @@ const RECORD_COUNT_SQL: &str = "INSERT INTO backfill_history_counts
 
 /// History-store failure: a database error, or ids/count that fail validation.
 /// Validation runs before any SQL, so an invalid write never touches the database.
-#[derive(Debug, Error)]
+///
+/// Fail closed: the `Db` variant keeps its `sqlx::Error` payload (the
+/// frozen acceptance suite constructs it directly, and `?` conversions need
+/// the `From` impl), but its `Display`, `Debug` and `source()` never touch
+/// it, so no SQLSTATE, message, connection URL or statement detail can
+/// surface through error formatting. Structured callers that need a failure
+/// token use their own fixed `db_class`/`db_cause` values, never this
+/// error's text.
 pub enum BackfillHistoryError {
-    #[error("backfill history database error: {0}")]
-    Db(#[from] sqlx::Error),
-    #[error("invalid backfill history row: {0}")]
+    Db(sqlx::Error),
     Invalid(&'static str),
+}
+
+impl std::fmt::Display for BackfillHistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Db(_) => write!(f, "backfill history database error: database error"),
+            Self::Invalid(reason) => write!(f, "invalid backfill history row: {reason}"),
+        }
+    }
+}
+
+impl std::fmt::Debug for BackfillHistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Never the payload: derived `Debug` would print the whole sqlx chain.
+            Self::Db(_) => write!(f, "Db"),
+            Self::Invalid(reason) => write!(f, "Invalid({reason:?})"),
+        }
+    }
+}
+
+impl std::error::Error for BackfillHistoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Never the payload: the sqlx chain carries URLs and statements.
+        None
+    }
+}
+
+impl From<sqlx::Error> for BackfillHistoryError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
 }
 
 /// Build the paged history path for `GET /channels/{channel}/messages`.
 ///
 /// `limit` clamps into Discord's 1-100 range. Exactly one of `before` (page
 /// backward from the previous page's floor), `after` (page forward) or
-/// `around` (anchored read) may be set; passing more than one panics, mirroring
-/// the acceptance helper so a misuse fails loudly in tests rather than paging
-/// the wrong window live.
-#[must_use]
+/// `around` (anchored read) may be set; passing more than one returns
+/// [`BackfillHistoryError::Invalid`], mirroring the acceptance helper so a
+/// misuse surfaces as a typed error the caller can handle rather than
+/// paging the wrong window live.
 pub fn history_messages_path(
     channel_id: &str,
     limit: u8,
     before: Option<&str>,
     after: Option<&str>,
     around: Option<&str>,
-) -> String {
+) -> Result<String, BackfillHistoryError> {
+    if [before.is_some(), after.is_some(), around.is_some()]
+        .into_iter()
+        .filter(|present| *present)
+        .count()
+        > 1
+    {
+        return Err(BackfillHistoryError::Invalid(
+            "one cursor shape per history read",
+        ));
+    }
     let limit = limit.clamp(1, 100);
     let mut path = format!("/channels/{channel_id}/messages?limit={limit}");
-    match (before, after, around) {
-        (Some(cursor), None, None) => path.push_str(&format!("&before={cursor}")),
-        (None, Some(cursor), None) => path.push_str(&format!("&after={cursor}")),
-        (None, None, Some(cursor)) => path.push_str(&format!("&around={cursor}")),
-        (None, None, None) => {}
-        _ => panic!("one cursor shape per history read"),
+    if let Some(cursor) = before {
+        path.push_str(&format!("&before={cursor}"));
+    } else if let Some(cursor) = after {
+        path.push_str(&format!("&after={cursor}"));
+    } else if let Some(cursor) = around {
+        path.push_str(&format!("&around={cursor}"));
     }
-    path
+    Ok(path)
 }
 
 /// Persist one fetched message as metadata only: ids plus the send timestamp.
@@ -141,6 +187,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn db_error_display_and_debug_hide_sqlx_text() {
+        // Fail-closed regression: ordinary non-pattern text such as
+        // `invalid member display name` matches no token redactor, so the
+        // fixed Display/Debug/source must drop it structurally. The
+        // `InvalidArgument` case is the strongest one: its message is
+        // verbatim caller text, the exact shape a pattern redactor keeps.
+        for raw in [
+            sqlx::Error::InvalidArgument("invalid member display name".into()),
+            sqlx::Error::RowNotFound,
+        ] {
+            let err: BackfillHistoryError = raw.into();
+            let display = err.to_string();
+            assert_eq!(display, "backfill history database error: database error");
+            assert!(
+                !display.contains("invalid member display name"),
+                "Display leaked sqlx text: {display}"
+            );
+            let debug = format!("{err:?}");
+            assert!(
+                !debug.contains("invalid member display name"),
+                "Debug leaked sqlx text: {debug}"
+            );
+            assert!(
+                std::error::Error::source(&err).is_none(),
+                "source chain re-exposed the sqlx error"
+            );
+        }
+    }
+
+    #[test]
     fn wrapper_sql_matches_the_acceptance_target_byte_for_byte() {
         // The acceptance target inlines these literals; the wrappers must agree
         // byte for byte so the two can never drift apart.
@@ -157,35 +233,52 @@ mod tests {
     #[test]
     fn history_path_clamps_limit_and_admits_one_cursor_shape() {
         assert_eq!(
-            history_messages_path("123", 2, None, None, None),
+            history_messages_path("123", 2, None, None, None).unwrap(),
             "/channels/123/messages?limit=2"
         );
         // Discord's 1-100 range: 0 clamps to 1, 200 clamps to 100.
         assert_eq!(
-            history_messages_path("123", 0, None, None, None),
+            history_messages_path("123", 0, None, None, None).unwrap(),
             "/channels/123/messages?limit=1"
         );
         assert_eq!(
-            history_messages_path("123", 200, None, None, None),
+            history_messages_path("123", 200, None, None, None).unwrap(),
             "/channels/123/messages?limit=100"
         );
         assert_eq!(
-            history_messages_path("123", 2, Some("9"), None, None),
+            history_messages_path("123", 2, Some("9"), None, None).unwrap(),
             "/channels/123/messages?limit=2&before=9"
         );
         assert_eq!(
-            history_messages_path("123", 2, None, Some("9"), None),
+            history_messages_path("123", 2, None, Some("9"), None).unwrap(),
             "/channels/123/messages?limit=2&after=9"
         );
         assert_eq!(
-            history_messages_path("123", 2, None, None, Some("9")),
+            history_messages_path("123", 2, None, None, Some("9")).unwrap(),
             "/channels/123/messages?limit=2&around=9"
         );
     }
 
     #[test]
-    #[should_panic(expected = "one cursor shape per history read")]
-    fn history_path_rejects_two_cursor_shapes() {
-        let _ = history_messages_path("123", 2, Some("1"), Some("2"), None);
+    fn history_path_rejects_every_multi_cursor_shape_with_a_typed_error() {
+        for (before, after, around) in [
+            (Some("1"), Some("2"), None),
+            (Some("1"), None, Some("3")),
+            (None, Some("2"), Some("3")),
+            (Some("1"), Some("2"), Some("3")),
+        ] {
+            // `expect_err` plus a non-constant `matches!` keeps the test free
+            // of `panic!` literals (rust-panic-in-prod gate) and of
+            // `assert!(false, ..)` (clippy::assertions-on-constants).
+            let err = history_messages_path("123", 2, before, after, around)
+                .expect_err("expected typed Invalid cursor error");
+            assert!(
+                matches!(
+                    err,
+                    BackfillHistoryError::Invalid(reason) if reason.contains("cursor")
+                ),
+                "error reason must name the cursor problem, got: {err:?}"
+            );
+        }
     }
 }

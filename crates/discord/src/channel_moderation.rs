@@ -195,7 +195,32 @@ impl ChannelModerationRuntime {
 
     /// Returns None for other slices. The caller defers an ephemeral response
     /// before awaiting this method, then edits that response via the shared executor.
+    ///
+    /// Records one `two_bot_moderation_enforcements_total` sample per terminal
+    /// call on this slice (TOG-28482): `success` for completed enforcements
+    /// including idempotent replays, `refused` for router/validation/fence
+    /// refusals and proven no-effect Discord rejections, `storage_error` for
+    /// persistence failures, and `other` for uncertain/lane outcomes
+    /// (`in_progress` collapses here; the website executor classifies
+    /// uncertain Discord failures as `discord_error`). The verb is the
+    /// `ModerationAction::command_name`; no user id, reason text or
+    /// free-form detail ever becomes a label.
     pub async fn execute(
+        &self,
+        router: &InteractionRouter,
+        interaction: &Interaction,
+    ) -> Result<Option<ChannelReply>, ChannelRuntimeError> {
+        let result = self.execute_inner(router, interaction).await;
+        if let (Some(action), Some(outcome)) = (
+            channel_action_for(interaction),
+            channel_enforcement_outcome(&result),
+        ) {
+            two_bot_core::metrics::global().moderation_enforcement(action.command_name(), outcome);
+        }
+        result
+    }
+
+    async fn execute_inner(
         &self,
         router: &InteractionRouter,
         interaction: &Interaction,
@@ -538,6 +563,44 @@ impl ChannelModerationRuntime {
             }
         }
         unreachable!()
+    }
+}
+
+/// The channel moderation verb for this interaction, if it names one.
+/// Mirrors `execute_inner`'s routing predicate over the same source
+/// (`route_interaction` clones `data.name` into the routed slash name, so
+/// matching `data.name` here cannot drift from the inner lookup): slash
+/// interactions whose command name is a non-member
+/// `ModerationAction::command_name`.
+fn channel_action_for(interaction: &Interaction) -> Option<ModerationAction> {
+    match (interaction.kind, interaction.data.as_ref()) {
+        (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(data))) => {
+            ModerationAction::ALL
+                .into_iter()
+                .find(|a| !a.targets_member() && a.command_name() == data.name)
+        }
+        _ => None,
+    }
+}
+
+/// Bounded metrics outcome for a terminal `execute_inner` result (TOG-28482):
+/// `None` when this slice did not handle the interaction (no enforcement, no
+/// sample), otherwise the `MODERATION_ENFORCEMENT_OUTCOMES` class. Success
+/// outcome names (including idempotent replays) count as `success`;
+/// `refused` covers every terminal refusal; `in_progress` (lane held,
+/// uncertain Discord, stale fence) collapses to `other`; persistence
+/// failures count as `storage_error`.
+fn channel_enforcement_outcome(
+    result: &Result<Option<ChannelReply>, ChannelRuntimeError>,
+) -> Option<&'static str> {
+    match result {
+        Ok(None) => None,
+        Ok(Some(reply)) => Some(match reply.outcome.as_str() {
+            "refused" => "refused",
+            "in_progress" => "other",
+            _ => "success",
+        }),
+        Err(_) => Some("storage_error"),
     }
 }
 

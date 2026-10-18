@@ -31,15 +31,18 @@ the `RESOLVED` line before closing the incident
 | `job_stale:<job>` | on-call operator | 15 min from the page |
 | `job_consecutive_failures:<job>` | on-call operator | 15 min from the page |
 | `rest_429_rate` | on-call operator | 15 min from the page |
+| `rest_5xx_rate` | on-call operator | 15 min from the page |
 | `db_pool_saturated` | on-call operator | 15 min from the page |
 | `db_errors` | on-call operator | 15 min from the page |
 | `send_admission_blocked` | on-call operator | 15 min from the page |
 | `voice_failures` | on-call operator | 15 min from the page |
 | `gateway_missed_events` | on-call operator | 15 min from the page |
 | `gateway_unpaired_disconnect` | on-call operator | 15 min from the page |
+| `gateway_not_ready` | on-call operator | 15 min from the page |
 | `ticker_stale:<job>` | on-call operator | 15 min from the page |
 | `receiver_refusals:<family>` | on-call operator | 15 min from the page |
 | `gateway_checkpoint_failures` | on-call operator | 15 min from the page |
+| `voice_join_fast_burn` | on-call operator | 15 min from the page |
 
 Log-only findings (gateway session starts, handler-latency quantiles,
 unban-queue depth, restart counts) need no ack; they are recorded on the

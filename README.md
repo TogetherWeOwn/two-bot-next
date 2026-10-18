@@ -18,8 +18,9 @@ backup/restore operator commands.
 
 On-call: [operations runbook](docs/runbook.md) — health/logs, redeploy/rollback,
 RESUME semantics, kill-switch/feature wiring boundaries, backups and common
-failures. See also [backup procedures](docs/backup.md) and
-[staging soak](docs/staging-soak.md).
+failures. The [observability runbook](docs/runbook-observability.md) explains
+alert triage, deployment-to-PR correlation, and current monitoring limits. See
+also [backup procedures](docs/backup.md) and [staging soak](docs/staging-soak.md).
 
 ## Architecture
 
@@ -60,6 +61,9 @@ claim. Staging deploys from `main`; production deploys through the manual
   `containment_runtime.rs:186`, `join_risk_runtime.rs:198`) and onboarding's
   per-event refresh (`onboarding.rs:167`), if at all (see the reference;
   re-checked at `bce86a791`).
+- [Feed supervisor](docs/feed-supervisor.md): running feed delivery —
+  source configuration, fetch cadence as-coded, failure signals and triage,
+  read-only guarantees, and worked examples.
 - [Gateway recovery runbook](docs/gateway-recovery.md): readiness, durable RESUME,
   failure handling and rollback.
 - [Staging soak acceptance](docs/staging-soak.md): the evidence required before
@@ -73,6 +77,39 @@ claim. Staging deploys from `main`; production deploys through the manual
   generation fencing, atomic audit and preserved lockdown recovery.
 - [Command registry drift](docs/command-publish.md): dry-run-first
   `two-bot commands diff|publish` and opt-in boot publication for cutover.
+- [Game-activity aggregate report](docs/game-activity-report.md): on-demand
+  read-only per-game play/in-voice/session JSON for one guild.
+- [Automod operator guide](docs/automod-operator-guide.md): filter/effect
+  semantics, repeat expiry, corpus management, failure signals and triage.
+
+### Stream delivery (Twitch EventSub)
+
+Twitch `stream.online` deliveries arrive at the staging-only public Worker
+route (`POST /hooks/twitch`, `wrangler/src/eventsub.ts:30`), which forwards
+them inward (`wrangler/src/eventsub.ts:223`) to the private container
+receiver (`crates/bot/src/eventsub_http.rs:1`). The Worker route answers only
+when the staging-only Worker var `EVENTSUB_INGRESS` and the Operator-set Worker
+secret `TWO_EVENTSUB` are both exactly `1`. A missing `TWO_TWITCH_WEBHOOK_SECRET`
+leaves the route live but forwards nothing, so it responds `503 unavailable`;
+flags other than `1` keep the route dark. The container listener on a direct
+start requires `TWO_EVENTSUB` exactly `1`, a valid bind with a nonzero port, and
+a valid webhook secret (`crates/core/src/eventsub_receiver_config.rs:5`). On a
+direct container start, unset or `0` stays dark; any other value, or an enabled
+configuration with a missing or invalid bind or secret, stops startup. Through
+the Worker, a present-but-invalid secret stops container startup. There is no
+health-only fallback; see the [EventSub runbook](docs/eventsub-runbook.md).
+Every delivery body is capped at 64 KiB and verified
+(`twitch_eventsub::verify_delivery`,
+`crates/core/src/twitch_eventsub.rs:169`) before JSON parsing or classification
+(`classify`, `crates/core/src/twitch_eventsub.rs:245`). Only `stream.online`
+version 1 is accepted for classification. The runtime receiver currently only
+acknowledges verified notifications and revocations: it does not create a post
+plan, claim a durable ledger row, or publish an announcement. Core planning and
+claim logic is not yet wired to a send path. Planning rules live in the
+[stream funnel](docs/stream-funnel.md); the operator runbook is the
+[EventSub runbook](docs/eventsub-runbook.md). The keys (`TWO_EVENTSUB`,
+`TWO_EVENTSUB_BIND`, `TWO_TWITCH_WEBHOOK_SECRET`) are catalogued in
+[Configuration](docs/configuration.md) (`docs/configuration.md:194`).
 
 ### Regenerate the references
 

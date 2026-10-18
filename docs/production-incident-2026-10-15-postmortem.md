@@ -1,11 +1,36 @@
 # Postmortem — 2026-10-15 production gateway crash-loop
 
-**Status: root cause PROVISIONAL.** The cause below is the leading hypothesis
-from the incident investigation (production 19 migrations behind staging).
-It stays provisional until the RCA fix PR (#978: `failed_step` + error-code
-logging, schema-gap survival) merges and names the failing step from a real
-log line. Update this section when that lands; do not treat the hypothesis
-as proven before then.
+**Status: root cause PROVISIONAL — non-reproduction recorded 2026-10-17.**
+The cause below is the leading hypothesis from the incident investigation
+(production 19 migrations behind staging). The RCA fix PR (#978:
+`failed_step` + error-code logging, schema-gap survival) merged on
+2026-10-15 at 21:35Z. As of this revision no production `gateway_failed`
+log line from a #978 build naming the failing step is quoted anywhere in
+this repo: the 10-15 logs carry no cause chain, and the only post-#978
+production crash-loop on record (2026-10-16 role drift, SQLSTATE `42501`,
+see the role gate in [production-deploy.md](production-deploy.md)) quotes
+no `failed_step` line either — and its mechanism (missing grant, cursor
+held on rejoin) is distinct from this hypothesis (missing table `42P01`).
+The retention write cannot confirm this hypothesis via `gateway_failed` on a
+#978+ build: `retention_lifecycle` classifies `42P01` as a schema gap
+(`crates/bot/src/gateway.rs:655`, `is_schema_gap` at
+`crates/bot/src/gateway_failure.rs:198`), logs `retention lifecycle
+skipped; schema gap, nothing to cancel` with `error_code=42P01`, and returns
+`None` — so that path emits no `gateway_run` step failure
+(`crates/bot/src/gateway.rs:877-887`, `crates/bot/src/main.rs:700`) and no
+`gateway_failed` line (`publish_gateway_failure` at
+`crates/bot/src/main.rs:861`). The observable #978-era signal for the
+retention trigger is that schema-gap skip line with `error_code=42P01`. The
+section's second trigger (XP awards inserting into `member_season_xp` via the
+leveling drain) can still log `gateway_failed` on #978+: a failed drain maps
+to `leveling_dispatch_failure()` (`crates/bot/src/gateway.rs:905-915`,
+`InvalidArgument` at `:344`), surfaces as a `gateway_run` step failure
+(`crates/bot/src/main.rs:700`), and `publish_gateway_failure`
+(`crates/bot/src/main.rs:861`) logs it with `failed_step=gateway_run` and
+`error_code=none` — narrowing the step but not the SQLSTATE. A
+`gateway_failed` confirmation of the retention trigger would need a pre-#978
+build or a staging restore. Update this section when such a line is captured;
+do not treat the hypothesis as proven before then.
 
 ## Timeline (all UTC, 2026-10-15)
 
@@ -34,7 +59,7 @@ There is no `0434` in `crates/cutover/migrations` (counted there), so the
 gap is exactly these 19. (`crates/store/migrations/0434_privacy_opt_out.sql`
 exists outside the cutover set, as does `0442_game_activity_guild_aggregates.sql`.)
 
-Fitted mechanism (code-verified at `6baab871`, log proof pending #978): on the first
+Fitted mechanism (code-verified at `6baab871`; log proof pending a #978 build): on the first
 `GUILD_CREATE` after boot, `retention_lifecycle`
 (`crates/bot/src/gateway.rs:611`, inner call at `:626`) calls
 `cancel_guild_purge` (`crates/cutover/src/retention.rs:527`, DELETE at
@@ -52,7 +77,8 @@ What is still missing: the 10-15 log line carries no cause/source chain, so
 no log names the failing step. That is exactly what #978 adds (every
 `*_failed` event carries `failed_step` plus the sanitized reason and SQL
 error code; the retention lifecycle skips `42P01`/`42501` instead of holding
-the cursor). Until a log line confirms the step, the mechanism above is a
+the cursor, except `42501` on an available `GUILD_CREATE`, which holds the
+cursor). Until a log line confirms the step, the mechanism above is a
 strong fit, not proof.
 
 ## Detection gap: the gate passed a 503 "parked" gateway
@@ -111,8 +137,9 @@ prior good SHA has no production drill record").
 
 Pre-dispatch step: before any rollback dispatch, derive `sha` from the
 target Worker version's recorded build SHA (the version Summary/metadata,
-not the incident commit), and confirm a successful `deploy-staging` run
-exists on it. Do not re-dispatch with a guessed or incident-commit SHA.
+not the incident commit), and derive `image` from the pre-deploy rollback
+snapshot in the failed run's summary. The current guard waives staging history
+for rollback; do not re-dispatch with a guessed SHA or image.
 
 ## Rollback receipts (quoted, not re-executed)
 
@@ -132,12 +159,13 @@ That dispatch is the single sanctioned production rollback method
 version's recorded build SHA first (pre-dispatch step above), then dispatch
 `deploy-production` with `sha` set to the commit the previous version was
 built from, `rollback` set to the previous Worker version ID from the failed
-run's summary, and `takeover: true`. Inside the workflow that becomes
-`wrangler rollback <version-id> --message <sha> --yes`, which fails unless
-the target version serves 100% of traffic, followed by the same
-`/health` 200 + build-identity `/readyz` gate. When the Rust image itself is
-the fault, dispatch in deploy mode with `takeover: true` and the prior good
-SHA instead.
+run's summary, `image` set to the previous container image digest from the
+rollback snapshot, and `takeover: true`. The reviewed
+`worker_container_rollback.py rollback` step restores both the Worker version
+and container image, then runs the `/health` 200 + build-identity `/readyz`
+stability gate; the workflow does not use `wrangler rollback`. When the Rust
+image itself is the fault, dispatch in deploy mode with `takeover: true` and
+the prior good SHA instead.
 
 Successful host rollback (Cloudflare API, outside the workflow): Worker
 version `952618ab` + container image `sha256:bfe1038e`
@@ -229,12 +257,19 @@ prompts.
 
 ## Follow-ups (not this doc's scope)
 
-- Prod schema gate: `deploy-production` must refuse a build whose migrations
-  are ahead of the production ledger (staging has the drift gate; production
-  does not).
-- Strict ready gate: a 503-`starting` answer must not pass a deploy on a
-  single early poll; require a 200 (or a bounded parked-with-evidence rule)
-  before green.
+- Prod schema gate: DONE. `deploy-production` refuses a build whose
+  migrations are ahead of the production ledger (schema gate, #979) and
+  whose grants lag the migrations (role gate: `roles verify` must read 0,
+  #1019). Rollback and live-SHA redeploy skip both gate jobs
+  (guard-validated modes only; the production job accepts exactly those),
+  so recovery never waits on them.
+- Strict ready gate: DONE (#979). A 503-`starting` answer never passes a
+  deploy on a single early poll: green requires 200 with gateway `ready`
+  held for 18 consecutive polls (~3 min), and any parked answer keeps
+  polling, then fails. After a takeover, a failed gate rolls back
+  automatically when the deploy and pre-deploy snapshot succeeded;
+  otherwise the run just fails without restoring. See the gate table in
+  [production-deploy.md](production-deploy.md#build-identity-and-the-readyz-gate).
 - Rollback inputs: record a pinned known-good Worker version + Git SHA +
   image after every production deploy (version discovery above), and make the
   rollback dispatch derive `sha` from that record. Do not widen the guard to

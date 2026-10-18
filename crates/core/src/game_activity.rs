@@ -153,6 +153,79 @@ pub struct GuildGameAggregate {
     pub session_count: u64,
 }
 
+/// Most per-game rows the operator report renders for one guild.
+pub const GAME_ACTIVITY_REPORT_MAX_ROWS: usize = 100;
+
+/// Rendering of an untitled game (`game: None`, stored as `''`).
+pub const GAME_ACTIVITY_UNTITLED_PLACEHOLDER: &str = "(untitled)";
+
+/// Unscoped invocation (no `--guild`): the report object shape with a null
+/// guild, no rows and a hint naming the flag, so the CLI exits 0 without
+/// opening a database (the `render_reengagement_unscoped` precedent).
+#[must_use]
+pub fn render_game_activity_unscoped() -> String {
+    let mut report = serde_json::json!({
+        "guild_id": serde_json::Value::Null,
+        "rows": [],
+        "truncated": false,
+        "hint": "no --guild given; pass --guild <ID> to report one guild",
+    })
+    .to_string();
+    report.push('\n');
+    report
+}
+
+/// Read-only aggregate operator report for one guild, as one JSON object:
+/// `{"guild_id", "rows", "truncated"}` plus a `"hint"` exactly when no row
+/// renders. Each row is exactly `{"game", "total_play_ms", "in_voice_ms",
+/// "session_count"}`; the aggregate carries no per-person key and the report
+/// must not invent one.
+///
+/// Rows for other guilds never render (defense in depth behind the
+/// guild-scoped store read). Ordering is deterministic and input-order
+/// independent: `total_play_ms` desc, `in_voice_ms` desc, then game title
+/// asc with the untitled row first among full ties. At most
+/// [`GAME_ACTIVITY_REPORT_MAX_ROWS`] rows render, with `"truncated": true`
+/// when bounded input was cut.
+#[must_use]
+pub fn render_game_activity_report(guild_id: &str, rows: &[GuildGameAggregate]) -> String {
+    let mut scoped: Vec<&GuildGameAggregate> =
+        rows.iter().filter(|row| row.guild_id == guild_id).collect();
+    scoped.sort_by(|a, b| {
+        b.total_play_ms
+            .cmp(&a.total_play_ms)
+            .then_with(|| b.in_voice_ms.cmp(&a.in_voice_ms))
+            // `Option<&str>` order is `None` before any `Some`, then
+            // lexicographic: untitled first among full ties, titles asc.
+            .then_with(|| a.game.as_deref().cmp(&b.game.as_deref()))
+            .then_with(|| b.session_count.cmp(&a.session_count))
+    });
+    let truncated = scoped.len() > GAME_ACTIVITY_REPORT_MAX_ROWS;
+    scoped.truncate(GAME_ACTIVITY_REPORT_MAX_ROWS);
+    let rendered: Vec<serde_json::Value> = scoped
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "game": row.game.as_deref().unwrap_or(GAME_ACTIVITY_UNTITLED_PLACEHOLDER),
+                "total_play_ms": row.total_play_ms,
+                "in_voice_ms": row.in_voice_ms,
+                "session_count": row.session_count,
+            })
+        })
+        .collect();
+    let mut value = serde_json::json!({
+        "guild_id": guild_id,
+        "rows": rendered,
+        "truncated": truncated,
+    });
+    if scoped.is_empty() {
+        value["hint"] = serde_json::json!("no game activity recorded for this guild");
+    }
+    let mut report = value.to_string();
+    report.push('\n');
+    report
+}
+
 fn bounded(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {

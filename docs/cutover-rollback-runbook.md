@@ -105,8 +105,15 @@ brief.
    schedules and feeds, moderation actions and unbans, voice ownership,
    audit and internal-action ledgers. Use the tested per-table and
    per-key mapping over a transactionally consistent capture, not a bare
-   timestamp filter (which misses deletes and ledger rows). Record
-   counts, hashes, conflicts and the final applied watermark.
+   timestamp filter (which misses deletes and ledger rows). Tables the
+   delta report marks `unmeasurable` carry a rollback `disposition`
+   (`accept-with-reason` or `manual-reconcile-required`, see
+   [rollback-delta.md](rollback-delta.md#dispositions-for-unmeasurable-tables)):
+   record the accepted reason for the former, attaching the alternate
+   evidence named in the report reason or in rollback-delta.md disposition
+   map and voice-window section (required where named), and reconcile the
+   latter by hand before GO. Record counts, hashes, conflicts and the
+   final applied watermark.
 4. Classify applied Discord effects from delivery, audit and replay
    receipts. Completed messages, sanctions, role changes, unbans and
    callbacks are **not** replayed or undone by a database restore.
@@ -150,33 +157,34 @@ brief.
   configuration, not DNS.
 - The production workflow dispatch below is the single production
   rollback method. Revert by dispatching the production workflow with
-  `takeover: true` and the previous Worker version ID recorded in the
-  watch header. The guard requires a full commit on the main branch
-  with green checks and a successful staging run, plus reviewer
-  approval; the workflow fails unless the target version serves 100%
-  of traffic, then re-runs the `/health` 200 and the build-identity
-  `/readyz` gate. The gate proves the rolled-back revision serves only
-  after the takeover order releases the fence: fenced answers carry no
-  build fields and fail the gate by design
+  `takeover: true`, the previous Worker version ID recorded in the
+  watch header, and the previous container image digest from the failed
+  run's rollback-snapshot line. The guard requires a full commit on the
+  main branch with green checks plus reviewer approval, but never
+  staging history for a rollback; the workflow restores BOTH the Worker
+  version and the container image with takeover, then re-runs the
+  `/health` 200 and the stable gateway-ready `/readyz` gate. The gate
+  proves the rolled-back revision serves only after the takeover order
+  releases the fence: fenced answers carry no build fields and fail the
+  gate by design
   ([production-deploy.md](production-deploy.md#build-identity-and-the-readyz-gate)).
-  Coverage: §7 below is a dry-walk that checked this route without
-  executing a rollback or deploy; the staging rollback drill
+  A failed gate after a takeover rolls back automatically to the
+  pre-deploy snapshot and still fails the run. Coverage: §7 below is a
+  dry-walk that checked this route without executing a rollback or
+  deploy; the staging rollback drill
   ([ci-security.md](ci-security.md#staging-rollback-drill-manual),
   [runbook.md](runbook.md#worker-version-rollback)) rehearses fence,
   unforced deployment with immediate Durable Object update, takeover
-  and restore, which differs from production's `rollback --yes`
-  (auto-confirms the changed-secrets prompt) with deferred Durable
-  Object default.
-- A Worker-version rollback does **not** rebuild the container image or
-  rewind data. A standalone full redeploy of a known-good pair is
-  **superseded as a production rollback path**: when the Rust image is
-  the fault, dispatch the same production workflow in deploy mode with
-  `takeover: true` and the prior good SHA (guard, takeover order and
-  `/readyz` build-identity gate apply unchanged), only after confirming
-  it supports the current schema and bindings, then confirm the running
-  image separately. That deploy-mode path has no production drill
-  record; the closest analogue is the digest-pinned full-rollout
-  staging container drill in
+  and restore, which matches the rollback's immediate update strategy.
+- A rollback restores the previous container image; it does **not**
+  rebuild an image or rewind data. A standalone `wrangler rollback` or
+  full redeploy outside this workflow is **superseded as a production
+  rollback path**: the former leaves the new image serving, and the
+  latter is only for a prior good SHA with `takeover: true` (guard,
+  takeover order and stable `/readyz` gate apply unchanged), only after
+  confirming it supports the current schema and bindings. That
+  deploy-mode path has no production drill record; the closest analogue
+  is the digest-pinned full-rollout staging container drill in
   [runbook.md](runbook.md#worker-version-rollback), which is not a
   production dispatch.
 - Never roll back to a pre-fence wrapper version: it ignores the

@@ -516,6 +516,10 @@ pub const PICKER_DRY_RUN_REPLY: &str = "Dry run: no roles were changed.";
 /// Cleared-selection reply (legacy empty-`roleIds` branch).
 pub const PICKER_CLEARED_REPLY: &str =
     "Cleared your game roles. Open the menu again whenever you like.";
+/// Stale-menu reply: the submission named choices but none matched the
+/// catalog (a replaced/retired menu). Roles are preserved and nothing is
+/// recorded; the member retries from a fresh menu.
+pub const PICKER_STALE_REPLY: &str = "That menu looks stale - I did not recognize those choices.\nNothing was changed. Open the picker again and choose afresh.";
 
 /// Game-picker outcome for the executor (from `handleGameSelect`):
 /// add/remove roles to match the menu exactly, ephemeral reply, funnel writes
@@ -547,8 +551,9 @@ pub struct GamePickerOutcome {
 impl GamePickerOutcome {
     /// Finalize a successful role selection using refreshed member visibility.
     /// The executor must call this after role writes and before replying or
-    /// recording funnel events. Dry runs and clears retain their special reply
-    /// and record no events. Role deltas and unknown-key diagnostics survive.
+    /// recording funnel events. Dry runs, clears and stale-menu answers retain
+    /// their special reply and record no events. Role deltas and unknown-key
+    /// diagnostics survive.
     #[must_use]
     pub fn finalize_after_grant(mut self, visible: &dyn Fn(&str) -> bool, guild_id: u64) -> Self {
         if !self.record_selected {
@@ -597,8 +602,10 @@ pub fn game_picker_reply(plan: &GameSelection, guild_id: u64) -> String {
 
 /// Adjudicate one game-picker submission. `member_role_ids` is the member's
 /// current role set; unticked game roles they hold are removed so roles never
-/// drift from the declared answer. Unknown keys are logged by the caller, not
-/// shown to the member.
+/// drift from the declared answer. Only a raw empty submission clears: a
+/// nonempty submission with no recognized keys is a stale menu, which
+/// preserves every role and records nothing. Unknown keys are logged by the
+/// caller; the stale subset of a mixed submission is still reported.
 pub fn adjudicate_game_select(
     mode: OnboardingMode,
     selected_keys: &[&str],
@@ -623,9 +630,11 @@ pub fn adjudicate_game_select(
         });
     }
     let plan = plan_game_selection(selected_keys, visible);
-    if plan.role_ids.is_empty() {
+    if selected_keys.is_empty() {
         // The clear branch replies and returns before either recorder call —
-        // roles are removed but no funnel rows are written.
+        // roles are removed but no funnel rows are written. Only a raw empty
+        // submission clears; wholly unrecognized input falls through to the
+        // stale branch below and preserves every role.
         return Some(GamePickerOutcome {
             add_role_ids: Vec::new(),
             remove_role_ids: GAME_PICKS
@@ -634,6 +643,20 @@ pub fn adjudicate_game_select(
                 .filter(|r| member_role_ids.contains(&r.as_str()))
                 .collect(),
             reply: PICKER_CLEARED_REPLY.to_owned(),
+            ephemeral: true,
+            record_selected: false,
+            record_routed: false,
+            routed: plan,
+        });
+    }
+    if plan.role_ids.is_empty() {
+        // Stale menu: the member answered, but no key matched the catalog.
+        // Preserve every role, record nothing, and invite a retry from a
+        // fresh menu. Mixed known/stale input still takes the normal branch.
+        return Some(GamePickerOutcome {
+            add_role_ids: Vec::new(),
+            remove_role_ids: Vec::new(),
+            reply: PICKER_STALE_REPLY.to_owned(),
             ephemeral: true,
             record_selected: false,
             record_routed: false,
@@ -1727,7 +1750,7 @@ mod tests {
     fn welcome_effects_post_the_renderer_bytes_unchanged() {
         // The adjudicated Post content is the renderer output verbatim —
         // no wrapper, no footer, no truncation.
-        match adjudicate_welcome(
+        let legacy = adjudicate_welcome(
             OnboardingMode::Legacy,
             MEMBER,
             Some("111"),
@@ -1735,11 +1758,15 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post { content, .. } => assert_eq!(content, legacy_welcome_text(MEMBER)),
-            WelcomeEffect::Skip { .. } => panic!("legacy with a channel posts"),
+        );
+        assert!(
+            matches!(&legacy, WelcomeEffect::Post { .. }),
+            "legacy with a channel posts"
+        );
+        if let WelcomeEffect::Post { content, .. } = legacy {
+            assert_eq!(content, legacy_welcome_text(MEMBER));
         }
-        match adjudicate_welcome(
+        let session = adjudicate_welcome(
             OnboardingMode::Session,
             MEMBER,
             Some("222"),
@@ -1747,13 +1774,15 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post { content, .. } => {
-                assert_eq!(content, session_welcome_text(MEMBER))
-            }
-            WelcomeEffect::Skip { .. } => panic!("session with a channel posts"),
+        );
+        assert!(
+            matches!(&session, WelcomeEffect::Post { .. }),
+            "session with a channel posts"
+        );
+        if let WelcomeEffect::Post { content, .. } = session {
+            assert_eq!(content, session_welcome_text(MEMBER));
         }
-        match adjudicate_welcome(
+        let anchor = adjudicate_welcome(
             OnboardingMode::Anchor,
             MEMBER,
             None,
@@ -1761,12 +1790,16 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post { content, .. } => assert_eq!(
+        );
+        assert!(
+            matches!(&anchor, WelcomeEffect::Post { .. }),
+            "anchor always posts"
+        );
+        if let WelcomeEffect::Post { content, .. } = anchor {
+            assert_eq!(
                 content,
                 anchor_welcome_text(MEMBER, BEFORE_RUN_1, SUNDAY_SQUAD)
-            ),
-            WelcomeEffect::Skip { .. } => panic!("anchor always posts"),
+            );
         }
     }
 
@@ -2004,7 +2037,7 @@ mod tests {
 
     #[test]
     fn welcome_posts_picker_per_mode_and_skips_without_a_channel() {
-        match adjudicate_welcome(
+        let legacy = adjudicate_welcome(
             OnboardingMode::Legacy,
             MEMBER,
             Some("111"),
@@ -2012,20 +2045,23 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post {
-                channel_id,
-                picker,
-                mention_user_id,
-                ..
-            } => {
-                assert_eq!(channel_id, "111");
-                assert_eq!(picker, Some(PickerKind::Games));
-                assert_eq!(mention_user_id, MEMBER);
-            }
-            WelcomeEffect::Skip { .. } => panic!("legacy with a channel posts"),
+        );
+        assert!(
+            matches!(&legacy, WelcomeEffect::Post { .. }),
+            "legacy with a channel posts"
+        );
+        if let WelcomeEffect::Post {
+            channel_id,
+            picker,
+            mention_user_id,
+            ..
+        } = legacy
+        {
+            assert_eq!(channel_id, "111");
+            assert_eq!(picker, Some(PickerKind::Games));
+            assert_eq!(mention_user_id, MEMBER);
         }
-        match adjudicate_welcome(
+        let session = adjudicate_welcome(
             OnboardingMode::Session,
             MEMBER,
             Some("222"),
@@ -2033,17 +2069,20 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post {
-                picker, content, ..
-            } => {
-                assert_eq!(picker, Some(PickerKind::Session));
-                assert!(content.contains("whole application"));
-            }
-            WelcomeEffect::Skip { .. } => panic!("session with a channel posts"),
+        );
+        assert!(
+            matches!(&session, WelcomeEffect::Post { .. }),
+            "session with a channel posts"
+        );
+        if let WelcomeEffect::Post {
+            picker, content, ..
+        } = session
+        {
+            assert_eq!(picker, Some(PickerKind::Session));
+            assert!(content.contains("whole application"));
         }
         // Anchor posts the one message with no picker, channel config aside.
-        match adjudicate_welcome(
+        let anchor = adjudicate_welcome(
             OnboardingMode::Anchor,
             MEMBER,
             None,
@@ -2051,18 +2090,21 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post {
-                channel_id,
-                picker,
-                content,
-                ..
-            } => {
-                assert_eq!(channel_id, ANCHOR_CHANNEL_ID);
-                assert_eq!(picker, None);
-                assert!(content.contains("Sunday Squad"));
-            }
-            WelcomeEffect::Skip { .. } => panic!("anchor always posts"),
+        );
+        assert!(
+            matches!(&anchor, WelcomeEffect::Post { .. }),
+            "anchor always posts"
+        );
+        if let WelcomeEffect::Post {
+            channel_id,
+            picker,
+            content,
+            ..
+        } = anchor
+        {
+            assert_eq!(channel_id, ANCHOR_CHANNEL_ID);
+            assert_eq!(picker, None);
+            assert!(content.contains("Sunday Squad"));
         }
         assert!(matches!(
             adjudicate_welcome(
@@ -2166,17 +2208,21 @@ mod tests {
             adjudicate_goodbye(OnboardingMode::Anchor, "dave", Some(3), Some("999"), false),
             None
         );
-        match adjudicate_goodbye(OnboardingMode::Session, "dave", Some(3), Some("999"), false) {
-            Some(GoodbyeEffect::Post {
-                channel_id,
-                content,
-                mentions,
-            }) => {
-                assert_eq!(mentions, MentionPolicy::None);
-                assert_eq!(channel_id, "999");
-                assert!(content.starts_with("**dave** left the server (was here 3 days)."));
-            }
-            _ => panic!("session with a channel posts the goodbye"),
+        let goodbye =
+            adjudicate_goodbye(OnboardingMode::Session, "dave", Some(3), Some("999"), false);
+        assert!(
+            matches!(&goodbye, Some(GoodbyeEffect::Post { .. })),
+            "session with a channel posts the goodbye"
+        );
+        if let Some(GoodbyeEffect::Post {
+            channel_id,
+            content,
+            mentions,
+        }) = goodbye
+        {
+            assert_eq!(mentions, MentionPolicy::None);
+            assert_eq!(channel_id, "999");
+            assert!(content.starts_with("**dave** left the server (was here 3 days)."));
         }
         // GoodbyeEffect::Post uses explicit MentionPolicy::None — the
         // executor renders allowedMentions { parse: [] }.

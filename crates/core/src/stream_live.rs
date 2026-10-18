@@ -4,17 +4,40 @@
 //! For one validated [`StreamOnline`](crate::stream_funnel::StreamOnline):
 //! check the broadcaster allowlist, render the post, claim the go-live row
 //! ([`ClaimOutcome`](crate::stream_live_store::ClaimOutcome)), and send it to
-//! the announcements channel. The receiver MUST send with
-//! `allowed_mentions: { parse: [] }`; this repository does not yet contain
-//! that sender, so the no-ping guarantee is a receiver contract, not verified
-//! behavior. On a provable send failure release the claim and answer 5xx so
-//! Twitch retries; a retry of any existing claim is acknowledged with 2xx and
-//! skipped. Claims do not expire, so the receiver must add stale-claim
-//! recovery before wiring this core path into the runtime.
+//! the announcements channel. The sender MUST send with
+//! `allowed_mentions: { parse: [] }`; that is the `LiveSender` contract in
+//! `stream_live_store`, and the bot's executor-backed implementation posts
+//! through the shared executor shape that pins it. Only a provably-unsent
+//! send failure releases the claim (the
+//! store deletes it only for the token-holding owner:
+//! [`release_live`](crate::stream_live_store::release_live) before the
+//! send starts,
+//! [`release_started_live`](crate::stream_live_store::release_started_live)
+//! after it starts) and
+//! answers 5xx so Twitch retries; claim and stamp failures answer
+//! 5xx WITHOUT releasing, because a stamped-failed send may already have
+//! reached Discord. A retry of a started or delivered claim is acknowledged
+//! with 2xx and skipped, while a retry of a fresh never-started claim is
+//! answered 5xx (`InFlight`), which asks Twitch to retry instead of
+//! treating the go-live as delivered. `claim_live` classifies a
+//! conflicting row itself, so that answer needs no follow-up call.
+//! Never-started claims expire on a bounded lease
+//! (`STALE_CLAIM_LEASE_SECS`, 30 s) via atomic stale takeover; started rows
+//! never expire and are never reclaimed, while delivered rows expire past
+//! the dedup horizon on the retention cadence (see
+//! [`crate::stream_live_store::expire_delivered_live`]). Twitch documents
+//! no retry schedule, so recovery depends on a retry arriving after the
+//! lease; there is no sweeper in this slice.
 //!
 //! [`disposition`] is the table the receiver executes; every row is pinned
-//! below. The async glue (claim → post → stamp-or-release) belongs with the
-//! receiver, which is not implemented in this slice.
+//! below. The async glue (claim → start → post → stamp-or-release, with
+//! stale takeover of never-started claims inside
+//! [`crate::stream_live_store::claim_live`]) is
+//! [`crate::stream_live_store::deliver_go_live`], which the receiver calls
+//! for a verified notification when delivery dependencies are injected. It
+//! calls `mark_live_send_started` before the first Discord POST so an
+//! ambiguous send (posted but unstamped) stays fenced as `Duplicate`
+//! forever.
 
 /// What one pipeline stage decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +50,13 @@ pub enum Stage {
     ClaimFailed,
     /// The go-live row already exists (retry, replay, or restart).
     Duplicate,
-    /// This delivery owns the post but the Discord send failed.
+    /// A never-started claim exists but its lease is still fresh: answer
+    /// 5xx, asking Twitch to retry after the lease can expire or the owner
+    /// settles the row.
+    InFlight,
+    /// This delivery owns the post but the Discord send provably never
+    /// reached Discord (never a timeout, an ambiguous result, or a stamp
+    /// failure after a possibly-successful send).
     SendFailed,
     /// Sent and stamped with the Discord message receipt.
     Sent,
@@ -43,7 +72,11 @@ pub struct Disposition {
     /// to retry.
     pub status: u16,
     /// Release the unposted claim so the retry can claim again. Only set
-    /// when the send provably never reached Discord.
+    /// when the send provably never reached Discord (`SendFailed`); the
+    /// store honours it only for the claim-token owner, via `release_live`
+    /// for a never-started row or `release_started_live` for a started
+    /// one. An ambiguous or stamp-failed send never sets this, so its row
+    /// stays fenced.
     pub release: bool,
 }
 
@@ -55,10 +88,12 @@ pub fn disposition(stage: Stage) -> Disposition {
             status: 200,
             release: false,
         },
-        Stage::InvalidInvite | Stage::ClaimFailed | Stage::StampFailed => Disposition {
-            status: 500,
-            release: false,
-        },
+        Stage::InvalidInvite | Stage::ClaimFailed | Stage::StampFailed | Stage::InFlight => {
+            Disposition {
+                status: 500,
+                release: false,
+            }
+        }
         Stage::SendFailed => Disposition {
             status: 500,
             release: true,
@@ -88,6 +123,7 @@ mod tests {
             (Stage::InvalidInvite, 500, false),
             (Stage::ClaimFailed, 500, false),
             (Stage::StampFailed, 500, false),
+            (Stage::InFlight, 500, false),
             (Stage::SendFailed, 500, true),
         ] {
             assert_eq!(
@@ -105,6 +141,7 @@ mod tests {
             Stage::InvalidInvite,
             Stage::ClaimFailed,
             Stage::Duplicate,
+            Stage::InFlight,
             Stage::Sent,
             Stage::StampFailed,
         ] {
@@ -120,6 +157,7 @@ mod tests {
             Stage::ClaimFailed,
             Stage::SendFailed,
             Stage::StampFailed,
+            Stage::InFlight,
         ] {
             assert_eq!(
                 disposition(stage).status,
