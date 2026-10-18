@@ -2197,6 +2197,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        # Guarded channel-moderation fixtures panic under the bootstrap URL
+        # by design; they skip the bootstrap sweep and are measured in the
+        # dedicated channel_moderation rerun with their accepted URL.
+        self.assertIn("--skip channel_moderation_store::", ignored_sweeps[0])
         self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
         self.assertEqual(len(guarded), 12)
