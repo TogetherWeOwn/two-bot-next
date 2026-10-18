@@ -152,9 +152,11 @@ line per pick; otherwise `Done. Here is where to go:` plus one
   there at all.
 - Dry run returns empty role deltas with `Dry run: no roles were changed.`
   and records nothing.
-- An empty grant is the clear branch: held game roles are removed, the
+- A raw empty grant is the clear branch: held game roles are removed, the
   reply is `Cleared your game roles. Open the menu again whenever you
-  like.`, and no funnel rows are written.
+  like.`, and no funnel rows are written. A nonempty grant with no
+  recognized keys is not a clear: every role is preserved, nothing is
+  recorded, and the ephemeral reply invites a retry from a fresh menu.
 - Otherwise roles are matched to the menu exactly (unticked held game roles
   are removed), the reply is ephemeral (only the clicker sees it),
   `record_selected` is true and `record_routed` is true only when
