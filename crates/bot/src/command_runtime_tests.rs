@@ -4462,6 +4462,292 @@ async fn schedule_remove_deletes_by_unique_prefix_and_refuses_ambiguous() {
     db.close().await;
 }
 
+/// `/schedule-remove` invalid ids refuse before any store access (TOG-29645,
+/// IN-03 schedule-remove half): empty and over-128-UTF-16-unit ASCII and
+/// multibyte ids through the real router against a never-usable lazy pool.
+/// A store touch would fail the refused pool and reply with the generic store
+/// failure; the documented refusal instead proves the handler guard returned
+/// first. Only the permitted defer (POST /callback) + completion edit (PATCH)
+/// are recorded — no Discord mutation beyond the acknowledgement.
+#[tokio::test]
+async fn schedule_remove_invalid_ids_refuse_before_database_access() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+
+    // Lengths are UTF-16 units (the guard's unit), not bytes: `é` is one
+    // unit, `😀` is two (a surrogate pair).
+    let ascii_over = "x".repeat(129);
+    let multibyte_over = "é".repeat(129);
+    let surrogate_over = "😀".repeat(65);
+    let hostile_over = format!("{}@everyone{}", "a".repeat(120), "b".repeat(20));
+    assert_eq!(ascii_over.encode_utf16().count(), 129);
+    assert_eq!(multibyte_over.encode_utf16().count(), 129);
+    assert_eq!(surrogate_over.encode_utf16().count(), 65 * 2);
+    assert!(hostile_over.encode_utf16().count() > 128);
+
+    let empty_reply =
+        "No unique scheduled message matches ``. Use the full id from /schedule-list.";
+    let overlong_reply =
+        "No unique scheduled message matches that id. Use the full id from /schedule-list.";
+    let store_failure = "Schedule command failed; try again.";
+
+    // Missing option and empty string both hit the empty guard.
+    let cases: Vec<(Vec<CommandDataOption>, &str)> = vec![
+        (Vec::new(), empty_reply),
+        (
+            vec![option("id", CommandOptionValue::String(String::new()))],
+            empty_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(ascii_over))],
+            overlong_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(multibyte_over))],
+            overlong_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(surrogate_over))],
+            overlong_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(hostile_over))],
+            overlong_reply,
+        ),
+    ];
+    let expected: Vec<String> = cases.iter().map(|(_, reply)| reply.to_string()).collect();
+    for (options, _) in &cases {
+        runtime
+            .on_interaction(&slash("schedule-remove", Some(CHANNEL), options.clone()))
+            .await;
+    }
+
+    let requests = mock.requests();
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 6, "one permitted defer per refusal");
+    let edits: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(edits.len(), 6, "one permitted completion edit per refusal");
+    assert_eq!(
+        requests.len(),
+        12,
+        "permitted defer+edit only, no other Discord call: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.method == "POST" || r.method == "PATCH"),
+        "no DELETE/PUT/message post on refusal: {requests:?}"
+    );
+    for (edit, want) in edits.iter().zip(expected.iter()) {
+        let reply: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+        assert_eq!(&reply["content"], want);
+        assert_ne!(
+            &reply["content"], store_failure,
+            "guard ran before any store access"
+        );
+        assert_eq!(reply["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+    // The overlong reply is a hard-coded literal: hostile input is never echoed.
+    for edit in &edits[2..] {
+        let reply: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+        let content = reply["content"].as_str().expect("string reply");
+        assert_eq!(content, overlong_reply);
+        assert!(
+            !content.contains("@everyone"),
+            "hostile tail must not echo: {content:?}"
+        );
+    }
+    mock.shutdown().await;
+}
+
+/// `/schedule-remove` invalid ids mutate nothing durable (TOG-29645, IN-03
+/// schedule-remove half): the same invalid matrix plus exact-128-unit boundary
+/// and whitespace-only missing-ID controls through the real router against a
+/// disposable database. Stored rows and audit rows are unchanged until the
+/// valid-prefix control deletes exactly one row.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_remove_invalid_ids_leave_store_untouched() {
+    let db = TestDb::new().await;
+    db.seed_schedule(GUILD_S, "keep111").await;
+    db.seed_schedule(GUILD_S, "keep222").await;
+    db.seed_schedule(GUILD_S, "xyz999").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    let ascii_over = "x".repeat(129);
+    let multibyte_over = "é".repeat(129);
+    let surrogate_over = "😀".repeat(65);
+    let hostile_over = format!("{}@everyone{}", "a".repeat(120), "b".repeat(20));
+    let ascii_exact = "x".repeat(128);
+    let multibyte_exact = "é".repeat(128);
+    assert_eq!(ascii_over.encode_utf16().count(), 129);
+    assert_eq!(multibyte_over.encode_utf16().count(), 129);
+    assert_eq!(surrogate_over.encode_utf16().count(), 65 * 2);
+    assert_eq!(ascii_exact.encode_utf16().count(), 128);
+    assert_eq!(multibyte_exact.encode_utf16().count(), 128);
+
+    let empty_reply =
+        "No unique scheduled message matches ``. Use the full id from /schedule-list.";
+    let overlong_reply =
+        "No unique scheduled message matches that id. Use the full id from /schedule-list.";
+    let whitespace_reply =
+        "No unique scheduled message matches `   `. Use the full id from /schedule-list.";
+    let ascii_exact_reply = format!(
+        "No unique scheduled message matches `{ascii_exact}`. Use the full id from /schedule-list."
+    );
+    let multibyte_exact_reply = format!(
+        "No unique scheduled message matches `{multibyte_exact}`. Use the full id from /schedule-list."
+    );
+
+    // Invalid: missing, empty, overlong ASCII / multibyte / surrogate /
+    // hostile. Boundary/missing controls: whitespace-only (a missing-ID
+    // control under current behavior, not a pre-lookup refusal) and the two
+    // exact-128-unit ids (they pass the guard, miss in the store, and echo).
+    let invalid_cases: Vec<(Vec<CommandDataOption>, String)> = vec![
+        (Vec::new(), empty_reply.to_owned()),
+        (
+            vec![option("id", CommandOptionValue::String(String::new()))],
+            empty_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(ascii_over))],
+            overlong_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(multibyte_over))],
+            overlong_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(surrogate_over))],
+            overlong_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(hostile_over))],
+            overlong_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String("   ".to_owned()))],
+            whitespace_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(ascii_exact))],
+            ascii_exact_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(multibyte_exact))],
+            multibyte_exact_reply,
+        ),
+    ];
+    for (options, _) in &invalid_cases {
+        runtime
+            .on_interaction(&slash("schedule-remove", Some(CHANNEL), options.clone()))
+            .await;
+    }
+
+    // Forbidden effects: no row removed, no audit written.
+    let remaining: Vec<String> = db
+        .schedule_rows()
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        remaining,
+        vec![
+            "keep111".to_owned(),
+            "keep222".to_owned(),
+            "xyz999".to_owned()
+        ],
+        "invalid and boundary/missing ids delete nothing"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "refusals write no scheduled.delete audit row"
+    );
+
+    // Permitted vs forbidden Discord effects: one defer + one completion edit
+    // per refusal; no channel post, delete, or registry publish.
+    let requests = mock.requests();
+    assert_eq!(
+        mock.posts_to("/callback").await.len(),
+        9,
+        "one permitted defer per refusal"
+    );
+    let edits: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(edits.len(), 9, "one permitted completion edit per refusal");
+    assert_eq!(
+        requests.len(),
+        18,
+        "permitted defer+edit only on refusal: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.method == "POST" || r.method == "PATCH"),
+        "no DELETE/PUT/message post on refusal: {requests:?}"
+    );
+    assert!(mock.deletes().is_empty(), "no Discord delete on refusal");
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "no channel post on refusal"
+    );
+    for (edit, (_, want)) in edits.iter().zip(invalid_cases.iter()) {
+        let reply: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+        assert_eq!(&reply["content"], want);
+        assert_eq!(reply["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+    let hostile_edit: serde_json::Value =
+        serde_json::from_slice(&edits[5].body).expect("hostile edit json");
+    assert!(
+        !hostile_edit["content"]
+            .as_str()
+            .expect("string reply")
+            .contains("@everyone"),
+        "overlong reply never echoes hostile input"
+    );
+
+    // Valid control: the uniquely-resolving prefix still deletes exactly one
+    // row through the same router, proving the fixture was live and the
+    // invalid inputs left the store usable.
+    runtime
+        .on_interaction(&slash(
+            "schedule-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::String("xyz".to_owned()))],
+        ))
+        .await;
+    let remaining: Vec<String> = db
+        .schedule_rows()
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        remaining,
+        vec!["keep111".to_owned(), "keep222".to_owned()],
+        "valid prefix still deletes its row after the invalid matrix"
+    );
+    assert_eq!(
+        db.schedule_audits().await,
+        vec![(
+            "scheduled.delete".to_owned(),
+            "xyz999".to_owned(),
+            "ok".to_owned()
+        )],
+        "only the valid control audits"
+    );
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), 10, "one completion per interaction");
+    let valid: serde_json::Value = serde_json::from_slice(&edits[9].body).unwrap();
+    assert_eq!(valid["content"], "Cancelled.");
+    mock.shutdown().await;
+    db.close().await;
+}
+
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn schedule_store_failure_replies_generic() {
