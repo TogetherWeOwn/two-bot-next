@@ -282,8 +282,7 @@ async fn close_gate_refusal_reply_is_a_clear_refusal_not_the_recovery_copy() {
     let error = runtime
         .execute(&staff_close_button(), TicketAction::Close)
         .await
-        .err()
-        .expect("staff close on an ungated channel is refused");
+        .expect_err("staff close on an ungated channel is refused");
     let reply = error.reply();
     assert_ne!(reply, RECOVERY_COPY);
     assert!(!reply.trim().is_empty(), "a refusal says something");
