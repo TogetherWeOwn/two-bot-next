@@ -233,7 +233,8 @@ async fn valid_awards_commit_lifetime_cooldown_audit_and_seasonal_together() -> 
     // seasonal projection: seasonal mirrors new awards only.
     seed_imported(&pool, GUILD, MEMBER, 99).await?;
 
-    let message = store::award_message(&pool, GUILD, MEMBER, &at(0), Some(&channel(0))).await?;
+    let message =
+        store::award_message(&pool, GUILD, MEMBER, &at(0), Some(&channel(0)), None, false).await?;
     assert_eq!(message.awarded, 15);
     assert_eq!(message.total_xp, 114);
     assert!(message.leveled_up, "crossing 100 XP still levels up");
@@ -273,7 +274,7 @@ async fn valid_awards_commit_lifetime_cooldown_audit_and_seasonal_together() -> 
     // Guild isolation: the same member in another guild starts empty, and
     // awarding there leaves this guild's snapshot untouched.
     assert_eq!(store::profile(&pool, OTHER_GUILD, MEMBER).await?.xp, 0);
-    let other = store::award_message(&pool, OTHER_GUILD, MEMBER, &at(0), None).await?;
+    let other = store::award_message(&pool, OTHER_GUILD, MEMBER, &at(0), None, None, false).await?;
     assert_eq!(other.awarded, 15);
     assert_eq!(snapshot(&pool, GUILD, MEMBER).await?, after);
     assert_eq!(seasonal_xp(&pool, OTHER_GUILD, MEMBER).await?, Some(15));
@@ -293,7 +294,8 @@ async fn seasonal_write_failure_rolls_back_message_award_and_retry_awards_once()
     assert!(before.cooldowns.is_empty() && before.awards.is_empty() && before.seasonal.is_empty());
 
     install_seasonal_failure(&pool).await?;
-    let failed = store::award_message(&pool, GUILD, MEMBER, &at(0), Some(&channel(0))).await;
+    let failed =
+        store::award_message(&pool, GUILD, MEMBER, &at(0), Some(&channel(0)), None, false).await;
     assert_not_silent_success(&failed, |award| award.awarded);
     assert_eq!(
         snapshot(&pool, GUILD, MEMBER).await?,
@@ -301,7 +303,8 @@ async fn seasonal_write_failure_rolls_back_message_award_and_retry_awards_once()
         "a seasonal failure must leave lifetime, cooldown, audit and seasonal rows unchanged"
     );
     // Control while the fault is active: another guild still awards fully.
-    let control = store::award_message(&pool, OTHER_GUILD, MEMBER, &at(0), None).await?;
+    let control =
+        store::award_message(&pool, OTHER_GUILD, MEMBER, &at(0), None, None, false).await?;
     assert_eq!(control.awarded, 15);
     assert_eq!(seasonal_xp(&pool, OTHER_GUILD, MEMBER).await?, Some(15));
     remove_seasonal_failure(&pool).await?;
@@ -309,7 +312,8 @@ async fn seasonal_write_failure_rolls_back_message_award_and_retry_awards_once()
     // Retry at the same event instant: exactly one complete award. If the
     // faulted attempt had committed a cooldown, this would wrongly read 0;
     // if it had committed lifetime XP, the totals below would double-count.
-    let retry = store::award_message(&pool, GUILD, MEMBER, &at(0), Some(&channel(0))).await?;
+    let retry =
+        store::award_message(&pool, GUILD, MEMBER, &at(0), Some(&channel(0)), None, false).await?;
     assert_eq!(retry.awarded, 15);
     assert_eq!(retry.total_xp, 114);
     let after = snapshot(&pool, GUILD, MEMBER).await?;
@@ -411,7 +415,8 @@ async fn seasonal_ceiling_rejection_is_non_partial_and_retry_awards_once() -> St
     .await?;
     let before = snapshot(&pool, GUILD, MEMBER).await?;
 
-    let rejected = store::award_message(&pool, GUILD, MEMBER, &at(0), Some(&channel(0))).await;
+    let rejected =
+        store::award_message(&pool, GUILD, MEMBER, &at(0), Some(&channel(0)), None, false).await;
     assert_not_silent_success(&rejected, |award| award.awarded);
     assert_eq!(
         snapshot(&pool, GUILD, MEMBER).await?,
@@ -429,7 +434,8 @@ async fn seasonal_ceiling_rejection_is_non_partial_and_retry_awards_once() -> St
     .bind(MEMBER)
     .execute(&pool)
     .await?;
-    let retry = store::award_message(&pool, GUILD, MEMBER, &at(0), Some(&channel(0))).await?;
+    let retry =
+        store::award_message(&pool, GUILD, MEMBER, &at(0), Some(&channel(0)), None, false).await?;
     assert_eq!(retry.awarded, 15);
     let after = snapshot(&pool, GUILD, MEMBER).await?;
     assert_eq!(after.awards.len(), 1, "exactly one audit row after retry");
@@ -449,9 +455,16 @@ async fn concurrent_message_awards_at_distinct_instants_never_exceed_last_ladder
     // Seed nine same-day awards through the real store: ladder rungs
     // 15 x5 then 5 x4 = 95. One 5-XP rung remains for the day.
     for index in 0..9_i64 {
-        let award =
-            store::award_message(&pool, GUILD, MEMBER, &at(index * 61), Some(&channel(index)))
-                .await?;
+        let award = store::award_message(
+            &pool,
+            GUILD,
+            MEMBER,
+            &at(index * 61),
+            Some(&channel(index)),
+            None,
+            false,
+        )
+        .await?;
         assert_eq!(
             award.awarded,
             if index < 5 { 15 } else { 5 },
@@ -480,7 +493,7 @@ async fn concurrent_message_awards_at_distinct_instants_never_exceed_last_ladder
         let instant = at(index * 61);
         let chan = channel(index);
         tasks.spawn(async move {
-            store::award_message(&pool, GUILD, MEMBER, &instant, Some(&chan)).await
+            store::award_message(&pool, GUILD, MEMBER, &instant, Some(&chan), None, false).await
         });
     }
     wait_for_lock_waiters(&pool, 2).await?;
