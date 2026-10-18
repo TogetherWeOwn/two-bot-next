@@ -117,7 +117,8 @@ fn happy_path_single_headers_pass_byte_identical() {
     assert_eq!(wire.auth.signature, signature());
     assert_eq!(wire.idempotency, Some("intent-1"));
 
-    let wire = admitted(&happy_headers());
+    let headers = happy_headers();
+    let wire = admitted(&headers);
     assert_eq!(wire.idempotency, None);
 }
 
