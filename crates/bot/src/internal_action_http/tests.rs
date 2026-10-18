@@ -3099,6 +3099,302 @@ async fn moderation_snapshot_unavailable_stays_fenced_without_effect() {
     db.close().await.unwrap();
 }
 
+/// Read one `two_bot_moderation_enforcements_total{verb,outcome}` sample count
+/// from the process-global registry. Callers must hold
+/// `super::MODERATION_METRICS_LOCK` across the before/after reads: the
+/// DB-backed resolver tests in this module and the slash preflight test in
+/// `command_runtime_tests` record the same `refused` series, and
+/// `cargo test --workspace --lib --bins` runs them as threads of one
+/// process. Acquire the metrics lock before `MODERATION_FLAG_LOCK`.
+fn moderation_samples(verb: &str, outcome: &str) -> u64 {
+    let prefix =
+        format!("two_bot_moderation_enforcements_total{{verb=\"{verb}\",outcome=\"{outcome}\"}} ");
+    two_bot_core::metrics::global()
+        .render(None)
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix.as_str()))
+        .filter_map(|value| value.trim().parse::<u64>().ok())
+        .sum()
+}
+
+#[test]
+fn resolver_refusal_counts_only_action_not_allowed() {
+    // Fresh recorder per case, never the process-global registry: parallel
+    // tests must not observe each other's samples.
+    for (name, code, expected) in [
+        ("not_allowed", ErrorCode::ActionNotAllowed, 1),
+        ("unavailable", ErrorCode::DiscordUnavailable, 0),
+        ("malformed", ErrorCode::Malformed, 0),
+        ("in_progress", ErrorCode::InProgress, 0),
+    ] {
+        let recorder = metrics::Metrics::default();
+        record_resolver_refusal(
+            &recorder,
+            "kick",
+            &ActionError::new(code, "test refusal", "test"),
+        );
+        let line = format!(
+            "two_bot_moderation_enforcements_total{{verb=\"kick\",outcome=\"refused\"}} {expected}\n"
+        );
+        assert!(
+            recorder.render(None).contains(&line),
+            "{name} must record {expected} refused sample(s)"
+        );
+    }
+}
+
+/// The blocking review scenario: a website kick for a departed target is
+/// refused by `moderation_resolve` before the executor runs, and must still
+/// record exactly one `refused` sample. Offline: the resolver refuses before
+/// any store use, so the lazy pool never connects and no database is needed.
+#[tokio::test]
+async fn website_kick_departed_target_records_one_refused_sample() {
+    let _metrics = super::MODERATION_METRICS_LOCK.lock().await;
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    let mock = MockMembers::start(200, false).await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(mock.origin.clone()))
+            .unwrap();
+    let store = PgMemberModerationStore::new(lazy_pool(), staging_guild().to_owned());
+    let inner = InternalMemberExecutor::new(
+        store,
+        discord.clone(),
+        InternalMemberConfig {
+            guild_id: staging_guild().to_owned(),
+            enabled: true,
+            policy: ModerationPolicy {
+                owen_user_id: RESOLVE_OWNER_ID.to_owned(),
+                protected_role_ids: HashSet::new(),
+                bot_user_id: None,
+            },
+            audit_secret: None,
+        },
+    )
+    .unwrap();
+    let effect = ModerationExecutor::new(inner, discord);
+    let body = serde_json::json!({
+        "actor_id": RESOLVE_ACTOR_ID,
+        "discord_id": RESOLVE_TARGET_ID,
+        "reason": "spam",
+    });
+    let request =
+        InternalMemberRequest::from_body("moderation.kick", body.as_object().unwrap()).unwrap();
+    let before = moderation_samples("kick", "refused");
+    let err = effect
+        .execute_moderation(
+            &request,
+            "req-refused-kick",
+            "website-refused-001",
+            1_760_000_000_000,
+        )
+        .await
+        .expect_err("departed kick target must refuse");
+    assert_eq!(err.code, ErrorCode::ActionNotAllowed);
+    assert_eq!(
+        moderation_samples("kick", "refused") - before,
+        1,
+        "one terminal website refusal records one sample"
+    );
+    assert!(
+        mock.methods().iter().all(|method| method == "GET"),
+        "a refusal performs no Discord mutation: {:?}",
+        mock.paths()
+    );
+}
+
+/// Channel mirror: the fixture actor holds Kick + Moderate Members, never
+/// Manage Messages, so a website purge is refused by `channel_resolve` before
+/// the executor runs — and must still record exactly one `refused` sample.
+#[tokio::test]
+async fn website_purge_forbidden_actor_records_one_refused_sample() {
+    let _metrics = super::MODERATION_METRICS_LOCK.lock().await;
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    let mock = MockMembers::start(200, true).await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(mock.origin.clone()))
+            .unwrap();
+    let store = ChannelModerationStore::from_pool(lazy_pool());
+    let inner = InternalChannelExecutor::new(
+        store,
+        discord.clone(),
+        InternalChannelConfig {
+            guild_id: staging_guild().to_owned(),
+            enabled: true,
+            policy: ModerationPolicy {
+                owen_user_id: RESOLVE_OWNER_ID.to_owned(),
+                protected_role_ids: HashSet::new(),
+                bot_user_id: None,
+            },
+            audit_secret: None,
+        },
+    )
+    .unwrap();
+    let effect = ChannelModerationExecutor::new(inner, discord);
+    let body = serde_json::json!({
+        "actor_id": RESOLVE_ACTOR_ID,
+        "channel_id": "222222222222222222",
+        "count": 10,
+        "reason": "cleanup",
+    });
+    let request =
+        InternalChannelRequest::from_body("moderation.purge", body.as_object().unwrap()).unwrap();
+    let before = moderation_samples("purge", "refused");
+    let err = effect
+        .execute_channel(
+            &request,
+            "req-refused-purge",
+            "website-refused-002",
+            "2026-10-17T00:00:00+00:00",
+        )
+        .await
+        .expect_err("actor without Manage Messages must refuse");
+    assert_eq!(err.code, ErrorCode::ActionNotAllowed);
+    assert_eq!(
+        moderation_samples("purge", "refused") - before,
+        1,
+        "one terminal website refusal records one sample"
+    );
+    assert!(
+        mock.methods().iter().all(|method| method == "GET"),
+        "a refusal performs no Discord mutation: {:?}",
+        mock.paths()
+    );
+}
+
+/// The inner member executor records its own disabled refusal exactly once,
+/// without touching Discord or the store.
+#[tokio::test]
+async fn website_member_executor_disabled_records_one_refused_sample() {
+    let _metrics = super::MODERATION_METRICS_LOCK.lock().await;
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    let mock = MockMembers::start(200, true).await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(mock.origin.clone()))
+            .unwrap();
+    let executor = InternalMemberExecutor::new(
+        PgMemberModerationStore::new(lazy_pool(), staging_guild().to_owned()),
+        discord,
+        InternalMemberConfig {
+            guild_id: staging_guild().to_owned(),
+            enabled: false,
+            policy: ModerationPolicy {
+                owen_user_id: RESOLVE_OWNER_ID.to_owned(),
+                protected_role_ids: HashSet::new(),
+                bot_user_id: None,
+            },
+            audit_secret: None,
+        },
+    )
+    .unwrap();
+    let actor = ModerationActor {
+        user_id: RESOLVE_ACTOR_ID.to_owned(),
+        highest_role_position: 5,
+        role_ids: vec![staging_guild().to_owned()],
+        permissions: 0,
+    };
+    let target = ModerationTarget {
+        user_id: RESOLVE_TARGET_ID.to_owned(),
+        highest_role_position: 0,
+        role_ids: vec![staging_guild().to_owned()],
+        is_bot: false,
+        is_guild_owner: false,
+    };
+    let body = serde_json::json!({
+        "actor_id": RESOLVE_ACTOR_ID,
+        "discord_id": RESOLVE_TARGET_ID,
+        "reason": "spam",
+    });
+    let request =
+        InternalMemberRequest::from_body("moderation.kick", body.as_object().unwrap()).unwrap();
+    let before = moderation_samples("kick", "refused");
+    let err = executor
+        .execute(
+            &request,
+            &actor,
+            &target,
+            50,
+            "req-disabled-member",
+            "website-disabled-001",
+            1_760_000_000_000,
+        )
+        .await
+        .expect_err("disabled member executor must refuse");
+    assert_eq!(err.code, ErrorCode::ActionNotAllowed);
+    assert_eq!(
+        moderation_samples("kick", "refused") - before,
+        1,
+        "one terminal executor refusal records one sample"
+    );
+    assert!(
+        mock.paths().is_empty(),
+        "a disabled executor touches neither Discord nor the store: {:?}",
+        mock.paths()
+    );
+}
+
+/// The inner channel executor records its own disabled refusal exactly once,
+/// without touching Discord or the store.
+#[tokio::test]
+async fn website_channel_executor_disabled_records_one_refused_sample() {
+    let _metrics = super::MODERATION_METRICS_LOCK.lock().await;
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    let mock = MockMembers::start(200, true).await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(mock.origin.clone()))
+            .unwrap();
+    let executor = InternalChannelExecutor::new(
+        ChannelModerationStore::from_pool(lazy_pool()),
+        discord,
+        InternalChannelConfig {
+            guild_id: staging_guild().to_owned(),
+            enabled: false,
+            policy: ModerationPolicy {
+                owen_user_id: RESOLVE_OWNER_ID.to_owned(),
+                protected_role_ids: HashSet::new(),
+                bot_user_id: None,
+            },
+            audit_secret: None,
+        },
+    )
+    .unwrap();
+    let actor = ModerationActor {
+        user_id: RESOLVE_ACTOR_ID.to_owned(),
+        highest_role_position: 5,
+        role_ids: vec![staging_guild().to_owned()],
+        permissions: 0,
+    };
+    let body = serde_json::json!({
+        "actor_id": RESOLVE_ACTOR_ID,
+        "channel_id": "222222222222222222",
+        "count": 10,
+        "reason": "cleanup",
+    });
+    let request =
+        InternalChannelRequest::from_body("moderation.purge", body.as_object().unwrap()).unwrap();
+    let before = moderation_samples("purge", "refused");
+    let err = executor
+        .execute(
+            &request,
+            &actor,
+            "req-disabled-channel",
+            "website-disabled-002",
+            "2026-10-17T00:00:00+00:00",
+        )
+        .await
+        .expect_err("disabled channel executor must refuse");
+    assert_eq!(err.code, ErrorCode::ActionNotAllowed);
+    assert_eq!(
+        moderation_samples("purge", "refused") - before,
+        1,
+        "one terminal executor refusal records one sample"
+    );
+    assert!(
+        mock.paths().is_empty(),
+        "a disabled executor touches neither Discord nor the store: {:?}",
+        mock.paths()
+    );
+}
+
 #[tokio::test]
 async fn event_read_flag_off_is_refused_before_any_discord_call() {
     let Some(db) = database().await else { return };

@@ -136,10 +136,20 @@ pub fn normalize_event(raw: &RawScheduledEvent) -> Option<ScheduledEvent> {
 }
 
 /// Normalize a whole poll response (legacy `raw.map(normalize)` + the
-/// `some(null)` rejection): one malformed event rejects the snapshot.
+/// `some(null)` rejection): one malformed event rejects the snapshot. A
+/// repeated event ID also rejects the whole snapshot before any storage
+/// replacement, so conflicting duplicates have no order-dependent
+/// last-row-wins outcome and identical duplicates share the same refusal.
 #[must_use]
 pub fn normalize_events(raw: &[RawScheduledEvent]) -> Option<Vec<ScheduledEvent>> {
-    raw.iter().map(normalize_event).collect()
+    let events: Vec<ScheduledEvent> = raw.iter().map(normalize_event).collect::<Option<_>>()?;
+    let mut seen = std::collections::HashSet::with_capacity(events.len());
+    for event in &events {
+        if !seen.insert(event.id.as_str()) {
+            return None;
+        }
+    }
+    Some(events)
 }
 
 /// Parse the complete RFC 3339 instant fallibly, then reuse the UTC millis

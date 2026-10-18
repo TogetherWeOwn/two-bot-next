@@ -212,6 +212,20 @@ class AlertBindingTests(unittest.TestCase):
                 )
         self.assertEqual(self.check_config(BASE), [])
 
+    def test_remediation_fault_switches_are_never_committed_vars(self):
+        # Same generated-only rule as the rollback-drill switch: either
+        # remediation drill switch committed anywhere fails.
+        for key in ["TWO_VOICE_STALL_FAULT_INJECTION", "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"]:
+            for section in ["vars", "env.staging.vars", "env.production.vars"]:
+                with self.subTest(key=key, section=section):
+                    config = BASE.replace(f"[{section}]", f'[{section}]\n{key} = "1"', 1)
+                    errors = self.check_config(config)
+                    self.assertTrue(
+                        any(f"{key} must never be a committed var" in e for e in errors),
+                        errors,
+                    )
+        self.assertEqual(self.check_config(BASE), [])
+
     def test_dashboard_secrets_are_never_toml_vars(self):
         # TOG-22861: the dashboard service-token pair gates human access; a
         # committed value would hand out that access. Both keys must stay
@@ -293,6 +307,34 @@ class AlertBindingTests(unittest.TestCase):
                     errors,
                 )
                 self.assertFalse(any("synthetic-secret" in e for e in errors))
+
+    def test_mcp_token_is_never_a_toml_var(self):
+        # TOG-29201: MCP_TOKEN is an optional Worker secret (docs/mcp.md);
+        # a plain var in any section must be refused without echoing the
+        # synthetic value, while absence stays valid and introduces no
+        # required binding.
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]", f'[{section}]\nMCP_TOKEN = "synthetic-secret"', 1
+                )
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("MCP_TOKEN must be an optional Worker secret" in e for e in errors),
+                    errors,
+                )
+                self.assertFalse(any("synthetic-secret" in e for e in errors))
+        extra = BASE + '\n[env.preview]\nworkers_dev = false\n[env.preview.vars]\nTWO_GUILD_NAME = "Preview"\nMCP_TOKEN = "synthetic-secret"\n'
+        errors = self.check_config(extra)
+        self.assertTrue(
+            any(
+                "[env.preview.vars]: MCP_TOKEN must be an optional Worker secret" in e
+                for e in errors
+            ),
+            errors,
+        )
+        self.assertFalse(any("synthetic-secret" in e for e in errors))
+        self.assertEqual(self.check_config(BASE), [])
 
     def test_receiver_config_is_never_a_toml_var(self):
         for section in ["vars", "env.staging.vars", "env.production.vars"]:
