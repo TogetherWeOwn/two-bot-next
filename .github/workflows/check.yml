@@ -1371,6 +1371,9 @@ jobs:
       - name: containment runtime acceptance (mock Discord and CI service only)
         run: cargo test -p two-bot --locked containment_runtime_ -- --include-ignored
 
+      - name: containment worker-path soak (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked --test containment_worker_soak -- --include-ignored
+
       - name: Raid cohort query (CI service container only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test

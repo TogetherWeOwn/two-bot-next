@@ -18,7 +18,7 @@ use two_bot_discord::{ActionExecutor, JoinObservation, JoinObserver};
 
 use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
 use crate::gateway::ensure_crypto_provider;
-use crate::join_risk_runtime::{self, AntiNukeFences, Fanout, JoinRiskSettings, SettingsSource};
+use two_bot::join_risk_runtime::{self, AntiNukeFences, Fanout, JoinRiskSettings, SettingsSource};
 
 const GUILD: u64 = 22;
 const CHANNEL: &str = "12";

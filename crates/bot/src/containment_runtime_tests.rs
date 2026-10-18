@@ -18,9 +18,11 @@ use two_bot_core::containment_store::ContainmentStore;
 use two_bot_cutover::parse::date_to_snowflake;
 use two_bot_discord::{ActionExecutor, AuditEntryObserver, AuditLogObservation, MemPipeline};
 
-use crate::containment_runtime::{self, id_list, map_action, ContainmentSettings, SettingsSource};
 use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
 use crate::gateway::ensure_crypto_provider;
+use two_bot::containment_runtime::{
+    self, id_list, map_action, ContainmentSettings, SettingsSource,
+};
 
 const GUILD: u64 = 22;
 const CHANNEL: &str = "12";

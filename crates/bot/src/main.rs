@@ -25,7 +25,6 @@ mod command_runtime;
 mod command_runtime_tests;
 mod commands_cli;
 mod community_jobs;
-mod containment_runtime;
 #[cfg(test)]
 mod containment_runtime_tests;
 mod database_roles_cli;
@@ -59,7 +58,6 @@ mod internal_action_http;
 #[cfg(test)]
 mod job_emission_conformance_tests;
 mod jobs;
-mod join_risk_runtime;
 #[cfg(test)]
 mod join_risk_runtime_tests;
 #[cfg(test)]
@@ -80,7 +78,6 @@ mod onboarding_tests;
 mod ops_backfill;
 mod ops_http;
 mod preflight;
-mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
 mod restore_drill;
@@ -121,6 +118,7 @@ use gateway::{
 };
 use gateway_failure::{step_failure, FailureClass, FailureSlot, GatewayFailure};
 use server::SharedState;
+use two_bot::{containment_runtime, join_risk_runtime, raid_runtime};
 use website_jobs::serve;
 
 #[tokio::main]

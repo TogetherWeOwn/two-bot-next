@@ -13,7 +13,7 @@ use two_bot_discord::{ActionExecutor, JoinObservation, JoinObserver};
 
 use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
 use crate::gateway::ensure_crypto_provider;
-use crate::raid_runtime::{self, RaidSettings, SettingsSource, StoreSettings};
+use two_bot::raid_runtime::{self, RaidSettings, SettingsSource, StoreSettings};
 
 const GUILD: u64 = 22;
 const CHANNEL: &str = "12";
