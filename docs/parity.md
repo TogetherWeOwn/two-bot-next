@@ -95,7 +95,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `lfg-close` | docs/parity.md §1 #27 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |
 | `feed-add` | docs/parity.md §1 #28 caps | Advertise only `max_length` 2048 on `source`, matching the server-side byte bound enforced before URL parsing. |
 | `feed-remove` | docs/parity.md §1 #29 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |
-| `schedule-list` | docs/parity.md §1 #19 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every configured id stays discoverable within Discord's 2,000-unit cap; command name, description and permissions stay legacy-identical. |
+| `schedule-list` | docs/parity.md §1 #19 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every configured id through the first 50 rows stays discoverable within Discord's 2,000-unit cap (guild list reads at most 25 earliest rows per window; over-cap guilds page past the overflow line to reach hidden rows); command name, description and permissions stay legacy-identical. |
 
 These are the complete registry exceptions, mirrored by the test allowlist.
 Only equivalent guild-API representation defaults are canonicalized: omitted
