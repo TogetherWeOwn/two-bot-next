@@ -874,11 +874,13 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     Some(Value::Object(data)) => data,
                     _ => return Err(refuse("dump row has no data object")),
                 };
-                // The manifest column list is the restore contract: a row key it
-                // never declared refuses here, before any publish/restore or
-                // `--dry-run` success. Missing keys stay valid (a row may carry
-                // a subset); only keys outside the manifest refuse. The message
-                // is fixed vocabulary: it never echoes the hostile key.
+                // The manifest column list gates unknown keys here, before any
+                // publish/restore or `--dry-run` success: a row key it never
+                // declared refuses. This check does not verify column
+                // completeness: a row carrying a subset stays valid at
+                // inspect, while restore refuses a row with a missing cell
+                // (`missing cell`, dump.rs). The message is fixed vocabulary:
+                // it never echoes the hostile key.
                 // Membership is tested against the per-table set built with the
                 // manifest, so the per-row cost is O(row keys). The fallback
                 // linear scan is unreachable (the set is built from the same
