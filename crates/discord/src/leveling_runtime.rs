@@ -23,7 +23,8 @@ use two_bot_core::{
         voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite, MessageFactInput,
     },
     leveling::{
-        leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
+        leaderboard_reply_for_season, plan_reward_roles, rank_reply, season_id_for_ms, XpAward,
+        LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
     ClassifierConfig, ClassifyInput, FactsSink, FunnelHandlers, FunnelStore, HandlerId,
@@ -538,6 +539,22 @@ impl LevelingRuntime {
         interaction: &Interaction,
         handler: HandlerId,
     ) -> Result<bool, LevelingRuntimeError> {
+        self.handle_interaction_at(interaction, handler, &two_bot_core::now_iso())
+            .await
+    }
+
+    /// [`Self::handle_interaction`] at an explicit event-time instant (AC3):
+    /// the routed `/leaderboard` serves `season_id_for_ms` of `at`, scoped to
+    /// `member_season_xp`, with an explicit season label and no lifetime
+    /// fallback. `/rank` stays lifetime-based at every instant. Shaped like
+    /// the pipeline's existing `handle_at` ISO-millis convention; the season
+    /// convention itself is unchanged.
+    pub async fn handle_interaction_at(
+        &self,
+        interaction: &Interaction,
+        handler: HandlerId,
+        at: &str,
+    ) -> Result<bool, LevelingRuntimeError> {
         if interaction.guild_id.map(|id| id.get()) != Some(self.configured_guild)
             || !matches!(handler, HandlerId::Rank | HandlerId::Leaderboard)
         {
@@ -580,10 +597,17 @@ impl LevelingRuntime {
                 }
             }
             HandlerId::Leaderboard => {
-                let entries =
-                    leveling_store::leaderboard(&self.pool, &guild, LEADERBOARD_DEFAULT_LIMIT)
-                        .await?;
-                let reply = leaderboard_reply(&entries);
+                let at_ms = two_bot_core::parse_iso_millis(at)
+                    .ok_or(LevelingRuntimeError::InvalidInteraction)?;
+                let season = season_id_for_ms(at_ms);
+                let entries = leveling_store::seasonal_leaderboard(
+                    &self.pool,
+                    &guild,
+                    &season,
+                    LEADERBOARD_DEFAULT_LIMIT,
+                )
+                .await?;
+                let reply = leaderboard_reply_for_season(&entries, &season);
                 InteractionResponse {
                     kind: InteractionResponseType::ChannelMessageWithSource,
                     data: Some(InteractionResponseData {
