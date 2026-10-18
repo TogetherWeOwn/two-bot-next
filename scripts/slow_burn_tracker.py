@@ -138,26 +138,11 @@ def ring_gap_seconds(ring, now):
     return now - newest
 
 
-def load_covered_at(path):
-    """Most recent covered epoch from the coverage sidecar, or None.
-
-    A missing, unreadable or malformed sidecar means coverage was never
-    recorded (fresh install): the caller stays silent, it does not warn.
-    """
-    try:
-        raw = Path(path).read_text(encoding="utf-8")
-    except OSError:
+def _sidecar_tick(parsed, key):
+    """One valid positive epoch from the sidecar dict, or None."""
+    if not isinstance(parsed, dict):
         return None
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        return None
-    if isinstance(parsed, dict):
-        tick = parsed.get("last_covered")
-    elif isinstance(parsed, (int, float)):
-        tick = parsed
-    else:
-        return None
+    tick = parsed.get(key)
     if isinstance(tick, bool) or not isinstance(tick, (int, float)):
         return None
     if tick != tick or tick <= 0:
@@ -165,10 +150,67 @@ def load_covered_at(path):
     return int(tick)
 
 
+def _load_sidecar_dict(path):
+    """Sidecar dict, or {} when missing/unreadable/malformed."""
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, (int, float)) and not isinstance(parsed, bool) \
+            and parsed == parsed and parsed > 0:
+        return {"last_covered": int(parsed)}
+    return {}
+
+
+def load_covered_at(path):
+    """Most recent covered epoch from the coverage sidecar, or None.
+
+    A missing sidecar means coverage was never recorded (fresh install):
+    the caller seeds the tracking start instead of staying silent forever.
+    """
+    return _sidecar_tick(_load_sidecar_dict(path), "last_covered")
+
+
+def load_tracking_since(path):
+    """First live unknown epoch from the coverage sidecar, or None."""
+    return _sidecar_tick(_load_sidecar_dict(path), "tracking_since")
+
+
 def save_covered_at(path, now):
-    """Record a covered moment beside the cached ring."""
-    Path(path).write_text(json.dumps({"last_covered": int(now)}) + "\n",
+    """Record a covered moment beside the cached ring.
+
+    Preserves an existing tracking start so a later loss still measures
+    from the most recent coverage, not from the install day.
+    """
+    sidecar = _load_sidecar_dict(path)
+    sidecar["last_covered"] = int(now)
+    Path(path).write_text(json.dumps(sidecar, sort_keys=True) + "\n",
                            encoding="utf-8")
+
+
+def seed_tracking_since(path, now):
+    """Seed the first-unknown moment when the sidecar has neither stamp.
+
+    A tracker that never reaches coverage has no covered moment to measure
+    from; without this seed it would stay green-unknown forever. Warm-up
+    takes about 6 h, so the 6.5 h warn threshold still leaves a healthy
+    install a margin before it can warn.
+    """
+    sidecar = _load_sidecar_dict(path)
+    if _sidecar_tick(sidecar, "last_covered") is not None:
+        return sidecar
+    if _sidecar_tick(sidecar, "tracking_since") is not None:
+        return sidecar
+    sidecar["tracking_since"] = int(now)
+    Path(path).write_text(json.dumps(sidecar, sort_keys=True) + "\n",
+                           encoding="utf-8")
+    return sidecar
 
 
 def run_driver(node, driver, exposition_path, ring_path, now):
@@ -486,16 +528,22 @@ def main(argv=None, env=None):
         if args.fixture == "live":
             Path(args.ring).write_text(json.dumps(next_ring) + "\n", encoding="utf-8")
             covered_at = load_covered_at(args.coverage_path)
-            if covered_at is not None:
-                uncovered = max(0, now - covered_at)
-                evidence["uncovered_seconds"] = uncovered
-                if uncovered >= UNCOVERED_WARN_SECONDS:
-                    evidence["cadence"] = "coarse"
-                    print(f"::warning::slow-burn tracker has no covered "
-                          f"slow-window verdict for {int(uncovered)}s "
-                          f"(threshold {UNCOVERED_WARN_SECONDS}s); genuine "
-                          f"burns go unfiled and open cards stay unclosed "
-                          f"until coverage returns")
+            tracking_since = load_tracking_since(args.coverage_path)
+            if covered_at is None and tracking_since is None:
+                seed_tracking_since(args.coverage_path, now)
+                tracking_since = now
+            reference = covered_at if covered_at is not None else tracking_since
+            if covered_at is not None and tracking_since is not None:
+                reference = max(covered_at, tracking_since)
+            uncovered = max(0, now - reference)
+            evidence["uncovered_seconds"] = uncovered
+            if uncovered >= UNCOVERED_WARN_SECONDS:
+                evidence["cadence"] = "coarse"
+                print(f"::warning::slow-burn tracker has no covered "
+                      f"slow-window verdict for {int(uncovered)}s "
+                      f"(threshold {UNCOVERED_WARN_SECONDS}s); genuine "
+                      f"burns go unfiled and open cards stay unclosed "
+                      f"until coverage returns")
         Path(args.evidence_out).write_text(json.dumps(evidence, indent=2) + "\n",
                                            encoding="utf-8")
         print(f"slow-burn tracker: verdict=unknown action=none ring={len(next_ring)}")
