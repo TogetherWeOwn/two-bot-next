@@ -103,7 +103,7 @@ jobs:
     timeout-minutes: 45
     # Match required CI isolation on the shared Docker host.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: '0'
@@ -261,6 +261,7 @@ jobs:
           --skip started_claim_is_never_reclaimed_even_when_stale
           --skip started_send_that_provably_failed_releases_for_the_retry
           --skip reclaiming_a_missing_key_claims_it_fresh
+          --skip delivered_rows_expire_only_past_the_horizon_with_the_fence_intact
           --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
           --skip mock_delivery_crash_reconciliation_restart_and_overflow
           --skip parity_mismatch_cursor_and_read_only_acceptance

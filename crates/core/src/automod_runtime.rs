@@ -472,6 +472,24 @@ pub enum CompletionKind {
     SanctionRefused,
 }
 
+impl CompletionKind {
+    /// Fixed 8-value outcome vocabulary for metrics labels. No message text,
+    /// excerpts or user IDs ever become labels; callers pass only this.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::AlreadyProcessed => "already_processed",
+            Self::DryRun => "dry_run",
+            Self::Protected => "protected",
+            Self::Deleted => "deleted",
+            Self::Warned => "warned",
+            Self::TimedOut => "timed_out",
+            Self::SanctionRefused => "sanction_refused",
+        }
+    }
+}
+
 /// Store-agnostic arbitration outcome, mirroring the durable store's claim
 /// result so the shared activation orchestrator (TOG-10261) runs against
 /// `AutomodStore` in production and an in-memory ledger in fast tests.

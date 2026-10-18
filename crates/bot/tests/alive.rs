@@ -600,7 +600,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         // advertised.
         assert_eq!(
             names,
-            ["rank", "leaderboard", "help", "attendance"],
+            ["rank", "leaderboard", "help", "privacy", "attendance"],
             "publish the narrowed shared registry exactly once, nothing withheld or extra"
         );
         if boot == 1 {
