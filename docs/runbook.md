@@ -576,6 +576,68 @@ a same-SHA takeover card, then a CEO page if two takeovers fail (see
 A reload step is skipped here: no in-process reload can fix a gateway that
 never came back.
 
+#### Alert: gateway not ready
+
+The scraped `/readyz` gateway component stayed non-ready (`starting` or
+`down`) for 3 consecutive valid samples. Unlike
+[`gateway_unpaired_disconnect`](#alert-gateway-unpaired-disconnect), this rule
+needs no disconnect edge: it catches a gateway stuck starting (Armed,
+reconnecting but never connecting), parked (Unconfigured, so the shard never
+starts) or draining, where `two_bot_gateway_disconnects_total` never grows
+and the pairing rule stays silent. This is page severity (SEV-1 in the
+[watch escalation path](watch-escalation-path.md)).
+
+The bound is 3 samples. Samples arrive about every 60 s, so the third
+consecutive non-ready sample comes about two to three minutes after the
+gateway stopped being ready. The bound matches the sibling unpaired rule, so
+both gateway pages tell one story, and at the default `UNREADY_ALERT_FAILURES`
+threshold it never fires sooner than the generic
+`container_unready_alert` (about two minutes of failed `/readyz` probes): the
+generic page fires first and this rule attributes the outage to the gateway
+with its own runbook, an order of magnitude inside the 15-minute
+acknowledgement window. (A raised `UNREADY_ALERT_FAILURES` override can invert
+that order; do not rely on generic-first with an override.) At the default
+threshold, any outage long enough to trip this rule already
+tripped the generic unready page a sample earlier, so it adds no new
+false-page class for slow boots; with an override it can page first, so a
+slow boot can page here with no prior generic page.
+
+A non-ready component is read from the `components` breakdown of the
+keepalive `/readyz` probe, not from `gateway_failure.failed_step`: the
+failure field is absent until a failure is recorded, so a shard stuck
+starting with no recorded failure has no step to read, while the component
+entry always names the gateway state. Only `ready` (Connected) counts as
+ready; `starting` and `down` both extend the streak, and unknown vocabulary
+holds rather than guessing. The first valid sample only stores the baseline.
+A failed probe, an unparsable body, or a failed `/metrics` scrape changes
+nothing and holds the current state, so the rule needs consecutive ticks
+where both the probe parsed and the scrape succeeded. A counter reset
+(process restart) re-baselines the streak and holds a firing non-ready or
+invalid alert rather than clearing it. A `ready` sample clears at once,
+even across a restart.
+The firing key is the constant `gateway_not_ready`.
+
+A parked gateway (Unconfigured, for example a missing `DISCORD_TOKEN`) pages
+here too, exactly as it already trips the generic unready page: confirm the
+expected token configuration before touching the bot. The staging
+rollback-drill injection reports this exact shape on purpose, so a drill that
+holds the injection for three consecutive samples trips this rule by design;
+treat a page inside a known drill window as the drill working — the drill
+gate rolls back on the 503 regardless.
+
+First response: scrape `/ops/metrics` as described above and confirm the
+disconnect and recovery counters are flat (flat counters with this page mean
+the gateway never started or never came back without an edge, not an
+unpaired loss). Then read `/readyz` for the full component breakdown: a
+`database` or `token_invalid` down alongside a ready gateway is not this
+alert's territory. Read the container logs for `gateway reconnect failed;
+Twilight will retry` (still retrying) and `gateway ready; checkpoint
+committed` (a recovery). If the logs show no `gateway ready`, the gateway is
+still down: escalate to the on-call engineer through the watch escalation
+path. Do not restart the container to clear the alert. A restart re-baselines
+the streak without showing that the gateway came back, so confirm `gateway
+ready` in the new process's logs first.
+
 #### Alert: ticker stale
 
 A 15 s ticker (`scheduled_messages` or `settings`) recorded no successful
