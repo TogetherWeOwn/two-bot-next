@@ -57,6 +57,7 @@ use crate::command_runtime::{
     sticky_options, CommandRuntime, RegistrySyncError,
 };
 use crate::member_runtime::MemberRuntime;
+use crate::privacy_command::{privacy_action, PrivacyAction};
 use crate::schedule_runtime::{schedule_options, schedule_remove_option};
 
 const GUILD: u64 = 2222;
@@ -715,7 +716,7 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard", "help"],
+                vec!["rank", "leaderboard", "help", "privacy"],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -829,7 +830,7 @@ async fn activation_boot_from_env_fixture() {
     let defs = runtime.router().publish_set(&[]).unwrap();
     let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
     if expected == "narrowed" {
-        assert_eq!(names, ["rank", "leaderboard", "help"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
         assert!(!runtime.router().gates().announcements);
@@ -842,6 +843,249 @@ async fn activation_boot_from_env_fixture() {
         assert!(names.contains(&"ban"));
         assert!(names.contains(&"sticky"));
     }
+}
+
+/// Process-isolated fixture evidence for the two `run()` call-site guards the
+/// port record flags as fixture-only: the `SelfRoles` match arm gating
+/// `SelfRoleService::from_env` on `(gateway_prerequisites, store, permitted)`
+/// and the `Automod`-permitted fence before `automod_gateway::resolve`. Each
+/// case runs in an isolated child process with a cleared environment,
+/// following `activation_boot_from_env_isolates_denied_moderation_validation`.
+/// The fixture calls the real `crate::gateway_prerequisites` plus the
+/// permission fence and constructors, and pins the exact
+/// `live activation refused` log line plus narrow-not-throw per call site. It
+/// does not execute `run()`, so a deleted or inverted guard in `run()` would
+/// not fail this test; it pins the composition behavior the guards implement.
+/// No boot/intent/gateway semantics change.
+#[test]
+fn activation_boot_call_sites_narrow_refused_guards() {
+    const VALID_PANELS: &str = r#"[{"id":"games","channelId":"10000000000000007","messageId":"10000000000000008","mode":"button","options":[{"key":"chess","label":"Chess","roleId":"10000000000000004","permissions":"0"}]}]"#;
+    for (guild, token, owen, protected_roles, panels, expected) in [
+        // Staging pair with a valid catalogue: both guards permit, both
+        // construct as today.
+        (
+            "1545644954272137297",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "123456789012345678",
+            "",
+            VALID_PANELS,
+            "permitted-constructs",
+        ),
+        // Live pair: the reviewed self_roles clearance stays while automod
+        // refuses and never resolves, even with vars that would fail
+        // validation once permitted.
+        (
+            "326474832151838730",
+            "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+            "",
+            "invalid",
+            VALID_PANELS,
+            "live-automod-refused",
+        ),
+        // Unknown guild: both refuse; invalid vars prove narrow-not-throw.
+        (
+            "1555555555555555555",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "",
+            "invalid",
+            "not-json",
+            "both-refused",
+        ),
+        // Control: the same invalid vars under a permitted identity fail
+        // loudly, so the refused narrow comes from the guard, not the vars.
+        (
+            "1545644954272137297",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "",
+            "invalid",
+            "not-json",
+            "permitted-validates",
+        ),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "command_runtime_tests::activation_boot_call_site_fixture",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("ACTIVATION_CALL_SITE_EXPECTED", expected)
+            .env("GUILD_ID", guild)
+            .env("DISCORD_TOKEN", token)
+            .env(
+                "DATABASE_URL",
+                "postgres://agent_test@agent-testdb:5432/agent_test",
+            )
+            .env("DISCORD_API_BASE", "http://127.0.0.1:9")
+            .env("TWO_MODERATION", "1")
+            .env("TWO_OWEN_USER_ID", owen)
+            .env("TWO_MODERATION_PROTECTED_ROLE_IDS", protected_roles)
+            .env("TWO_AUTOMOD", "1")
+            .env("TWO_SELF_ROLE_PANELS", panels)
+            .env("TWO_SELF_ROLE_DRY_RUN", "0")
+            .output()
+            .expect("isolated call-site fixture");
+        assert!(
+            output.status.success(),
+            "fixture {expected}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("1 passed"));
+        // The marker goes to stderr (`print_stdout` is denied workspace-wide):
+        // its presence proves the child ran this case's arm instead of
+        // early-returning with the env var unset.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("CALL_SITE") && stderr.contains(expected),
+            "fixture {expected} must emit its summary line"
+        );
+    }
+}
+
+#[tokio::test]
+async fn activation_boot_call_site_fixture() {
+    let Ok(expected) = std::env::var("ACTIVATION_CALL_SITE_EXPECTED") else {
+        return;
+    };
+    // Capture the boot refusal lines: `log_refusals` is the only writer in
+    // this process, so the buffer holds exactly this identity's refusals.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let capture = Capture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let config = two_bot_core::Config::from_env().unwrap();
+    let guild = config.guild_id.unwrap();
+    let activation = crate::activation::BootActivation::from_config(&config);
+    activation.log_refusals();
+    let log = String::from_utf8(capture.0.lock().expect("capture lock").clone()).unwrap();
+
+    let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+    // Mirror the `SelfRoles` match arm in `run()`: the real
+    // `crate::gateway_prerequisites` plus a present store gate the permission
+    // check, and only the permitted path reaches catalogue parsing, the first
+    // fallible step of `SelfRoleService::from_env`. No pool is built here; the
+    // fixture stops at parsing, so the store is treated as present and the
+    // permission fence is the varying input.
+    let prerequisites_ok = crate::gateway_prerequisites(&config).is_ok();
+    let self_permitted = activation.permitted(two_bot_core::activation::LiveCapability::SelfRoles);
+    let automod_permitted = activation.permitted(two_bot_core::activation::LiveCapability::Automod);
+    let mut self_constructed = false;
+    let self_gates = if prerequisites_ok && self_permitted {
+        self_constructed = true;
+        Some(two_bot_core::self_roles::SelfRoleGates::from_map(&vars))
+    } else {
+        None
+    };
+    // Mirror the `Automod`-permitted fence in `run()`: a refused automod
+    // capability is never resolved or validated; the refusal was already
+    // logged once above.
+    let mut automod_resolved = false;
+    let automod_config = if automod_permitted {
+        automod_resolved = true;
+        Some(crate::automod_gateway::resolve(&vars, guild))
+    } else {
+        None
+    };
+
+    match expected.as_str() {
+        "permitted-constructs" => {
+            assert!(self_permitted && automod_permitted);
+            assert!(
+                !log.contains("live activation refused"),
+                "staging permits every capability, so nothing is refused"
+            );
+            let gates = self_gates.expect("permitted self-roles reaches parsing");
+            let gates = gates.expect("valid panels parse");
+            assert!(!gates.panels.is_empty());
+            let resolved = automod_config.expect("permitted automod reaches resolve");
+            assert!(
+                resolved.expect("valid automod resolves").is_some(),
+                "permitted automod constructs as today"
+            );
+        }
+        "live-automod-refused" => {
+            assert!(
+                self_permitted,
+                "live pair keeps the reviewed self_roles clearance"
+            );
+            assert!(!automod_permitted);
+            assert!(log.contains("live activation refused"));
+            assert!(log.contains("automod"));
+            assert!(
+                !log.contains("self_roles"),
+                "permitted self_roles logs no refusal"
+            );
+            let gates = self_gates.expect("permitted self-roles reaches parsing");
+            assert!(
+                !gates.expect("valid panels parse").panels.is_empty(),
+                "permitted self-roles constructs as today"
+            );
+            assert!(
+                !automod_resolved,
+                "refused automod never resolves or validates"
+            );
+            assert!(
+                automod_config.is_none(),
+                "refused automod narrows, not throws"
+            );
+        }
+        "both-refused" => {
+            assert!(!self_permitted && !automod_permitted);
+            assert!(log.contains("live activation refused"));
+            assert!(log.contains("self_roles"));
+            assert!(log.contains("automod"));
+            assert!(
+                !self_constructed,
+                "refused SelfRoles composes no SelfRoleService"
+            );
+            assert!(self_gates.is_none());
+            assert!(
+                !automod_resolved,
+                "refused Automod never resolves or validates"
+            );
+            assert!(
+                automod_config.is_none(),
+                "refused automod narrows, not throws"
+            );
+        }
+        "permitted-validates" => {
+            assert!(self_permitted && automod_permitted);
+            assert!(
+                self_gates
+                    .expect("permitted self-roles reaches parsing")
+                    .is_err(),
+                "invalid panels fail once permitted"
+            );
+            assert!(
+                automod_config
+                    .expect("permitted automod reaches resolve")
+                    .is_err(),
+                "invalid automod vars fail once permitted"
+            );
+        }
+        other => panic!("unknown call-site expectation {other}"),
+    }
+    // `eprintln!`: `clippy::print_stdout` is denied workspace-wide, and the
+    // parent reads this marker from the child's stderr.
+    eprintln!("CALL_SITE {expected} self_permitted={self_permitted} automod_permitted={automod_permitted}");
 }
 
 #[test]
@@ -1032,12 +1276,14 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "rank"
                         | "leaderboard"
                         | "help"
+                        | "privacy"
                 )
             })
             .collect();
         assert!(!unwired.contains(&"rank"));
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
+        assert!(!unwired.contains(&"privacy"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -5579,4 +5825,495 @@ async fn worker_verdict_drives_prefix_trigger_from_call_site() {
     );
     mock.shutdown().await;
     db.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// `/privacy` member self-serve (parity §1 row 32)
+// ---------------------------------------------------------------------------
+
+fn privacy_interaction(member: u64, subcommand: Option<&str>) -> Interaction {
+    let options = subcommand
+        .map(|name| vec![option(name, CommandOptionValue::SubCommand(Vec::new()))])
+        .unwrap_or_default();
+    let base = slash("privacy", Some(CHANNEL), options);
+    from_member(base, member, Permissions::empty())
+}
+
+/// Guild-scoped privacy interaction for store-backed tests: the privacy
+/// service validates guild and member as Discord snowflakes (17–20 digits),
+/// so the small `GUILD`/`88` fixtures used elsewhere would refuse before any
+/// purge. Callers pass real-shaped snowflake IDs for both.
+fn privacy_interaction_in(guild: u64, member: u64, subcommand: Option<&str>) -> Interaction {
+    let mut interaction = privacy_interaction(member, subcommand);
+    interaction.guild_id = Some(Id::new(guild));
+    interaction
+}
+
+#[test]
+fn privacy_action_decodes_only_the_three_known_subcommands() {
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("opt-out"))),
+        PrivacyAction::OptOut
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("opt-in"))),
+        PrivacyAction::OptIn
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("status"))),
+        PrivacyAction::Status
+    );
+    // Missing options, a non-subcommand value and an unknown name all
+    // refuse before any database access.
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, None)),
+        PrivacyAction::Invalid
+    );
+    let mut flat = slash(
+        "privacy",
+        Some(CHANNEL),
+        vec![option(
+            "opt-out",
+            CommandOptionValue::String("yes".to_owned()),
+        )],
+    );
+    flat = from_member(flat, 88, Permissions::empty());
+    assert_eq!(privacy_action(&flat), PrivacyAction::Invalid);
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("erase-everything"))),
+        PrivacyAction::Invalid
+    );
+    // A non-command interaction never dispatches.
+    let mut component = privacy_interaction(88, Some("opt-out"));
+    component.data = None;
+    assert_eq!(privacy_action(&component), PrivacyAction::Invalid);
+}
+
+/// `/privacy` end to end through gateway dispatch: `opt-out` purges the
+/// invoker's guild rows, installs suppression and writes exactly one
+/// `member:self-serve` receipt; `status` reports suppression plus the guild
+/// switches; `opt-in` clears suppression; the other member's rows survive
+/// throughout. Every step defers once and completes with one ephemeral edit.
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb and mock REST only"]
+async fn privacy_command_purges_suppresses_receipts_and_reenables_through_dispatch() {
+    use two_bot_cutover::db::{CutoverDb, FunnelWrite};
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test bootstrap URL");
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .expect("migrated test database; no credential fallback");
+    let cutover = CutoverDb::from_pool(db.pool().clone());
+    // Real-shaped snowflakes: `opt_out_member` validates both identities
+    // (17–20 digits), so the small `GUILD`/`88` fixtures would refuse.
+    const PRIVACY_GUILD: u64 = 100000000000000411;
+    const MEMBER_A: u64 = 100000000000000412;
+    const MEMBER_B: u64 = 100000000000000413;
+    let guild_s = PRIVACY_GUILD.to_string();
+    let member_a_s = MEMBER_A.to_string();
+    let member_b_s = MEMBER_B.to_string();
+    let seed = |member: &str| FunnelWrite {
+        member_id: Some(member.to_owned()),
+        guild_id: guild_s.clone(),
+        event_type: "first_message".to_owned(),
+        occurred_at: "2026-10-12T00:00:00Z".to_owned(),
+        source: "privacy-command-fixture".to_owned(),
+        metadata: Some("{}".to_owned()),
+    };
+    for member in [&member_a_s, &member_b_s] {
+        let (inserted, _) = two_bot_cutover::db::record_event(&cutover, &seed(member))
+            .await
+            .expect("seed persists before the opt-out");
+        assert!(inserted, "seed row for member {member}");
+    }
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
+    let mut privacy_gates = gates(false, false);
+    privacy_gates.configured_guild = Some(PRIVACY_GUILD);
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor.clone(),
+        router_with_commands(privacy_gates),
+        PRIVACY_GUILD,
+        false,
+    );
+
+    let events_for = |member: &str| {
+        let pool = db.pool().clone();
+        let guild = guild_s.clone();
+        let member = member.to_owned();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM events WHERE guild_id = $1 AND member_id = $2",
+            )
+            .bind(guild)
+            .bind(member)
+            .fetch_one(&pool)
+            .await
+            .expect("events count reads")
+        }
+    };
+    let suppressed = |member: &str| {
+        let pool = db.pool().clone();
+        let guild = guild_s.clone();
+        let member = member.to_owned();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
+            )
+            .bind(guild)
+            .bind(member)
+            .fetch_one(&pool)
+            .await
+            .expect("suppression reads")
+        }
+    };
+
+    // `opt-out`: purge + suppress + exactly one receipt, other member kept.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(
+        events_for(&member_a_s).await,
+        0,
+        "opt-out purges the invoker rows"
+    );
+    assert_eq!(
+        events_for(&member_b_s).await,
+        1,
+        "other member rows survive"
+    );
+    assert!(
+        suppressed(&member_a_s).await,
+        "opt-out installs suppression"
+    );
+    assert!(
+        !suppressed(&member_b_s).await,
+        "no suppression for anyone else"
+    );
+    let receipts: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT guild_id, member_id, actor FROM privacy_opt_out_audit")
+            .fetch_all(db.pool())
+            .await
+            .expect("receipt reads");
+    assert_eq!(receipts.len(), 1, "exactly one audit receipt");
+    assert_eq!(
+        receipts[0],
+        (
+            guild_s.clone(),
+            member_a_s.clone(),
+            "member:self-serve".to_owned()
+        ),
+        "receipt scopes the pair with a subject-free actor label"
+    );
+    // A write that passes after the purge still drops for the pair.
+    let (inserted, _) = two_bot_cutover::db::record_event(&cutover, &seed(&member_a_s))
+        .await
+        .expect("post-purge write attempts");
+    assert!(!inserted, "suppressed pair stays dropped");
+
+    // `status`: opted out, guild switches default on.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            Some("status"),
+        ))
+        .await;
+    // `opt-in`: suppression clears, purged rows stay gone.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            Some("opt-in"),
+        ))
+        .await;
+    assert!(!suppressed(&member_a_s).await, "opt-in clears suppression");
+    assert_eq!(events_for(&member_a_s).await, 0, "opt-in restores nothing");
+    // `status` again: persistence back on.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            Some("status"),
+        ))
+        .await;
+    // Unknown subcommand shape: usage reply, no writes.
+    runtime
+        .on_interaction(&privacy_interaction_in(PRIVACY_GUILD, MEMBER_A, None))
+        .await;
+    assert_eq!(
+        events_for(&member_b_s).await,
+        1,
+        "usage path writes nothing"
+    );
+
+    // Guild-less invocation refuses on a direct call (dispatch itself stays
+    // silent outside the configured guild via the router fence).
+    let mut dm = privacy_interaction_in(PRIVACY_GUILD, MEMBER_A, Some("status"));
+    dm.guild_id = None;
+    crate::privacy_command::privacy_command(db.pool(), &executor, &dm).await;
+
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 5, "one defer per dispatched command");
+    for callback in &callbacks {
+        let body: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
+        assert_eq!(body["type"], 5, "defer before any store work");
+        assert_eq!(body["data"]["flags"], 64, "defer stays ephemeral");
+    }
+    let edits: Vec<serde_json::Value> = mock
+        .requests()
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.ends_with("/@original"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(
+        edits.len(),
+        6,
+        "one completion edit per command plus the direct call"
+    );
+    let text = |index: usize| {
+        edits[index]["content"]
+            .as_str()
+            .expect("edit carries text")
+            .to_owned()
+    };
+    assert!(
+        text(0).contains("opted out of analytics"),
+        "opt-out confirms, got: {}",
+        text(0)
+    );
+    assert!(
+        text(1).contains("opted out") && text(1).contains("presence on"),
+        "status reports suppression plus switches, got: {}",
+        text(1)
+    );
+    assert!(
+        text(2).contains("back on"),
+        "opt-in confirms, got: {}",
+        text(2)
+    );
+    assert!(
+        text(3).contains("Analytics for you in this server: on"),
+        "status reports restored persistence, got: {}",
+        text(3)
+    );
+    assert!(
+        text(4).contains("/privacy opt-out"),
+        "unknown shape teaches usage, got: {}",
+        text(4)
+    );
+    assert!(
+        text(5).contains("only works in a server"),
+        "guild-less call refuses, got: {}",
+        text(5)
+    );
+    for edit in &edits {
+        let content = edit["content"].as_str().unwrap_or_default();
+        assert!(!content.contains("token-"), "no interaction token echoes");
+        assert!(!content.contains("@everyone"), "no mass mentions");
+    }
+    mock.shutdown().await;
+    db.close().await.expect("drop own disposable database");
+}
+
+/// `/privacy opt-out` abuse guards through gateway dispatch: a repeat tap
+/// while suppressed returns the already-opted-out reply, and a rapid re-opt
+/// right after opt-in returns the cooldown reply. Both early returns skip
+/// `opt_out_member` — the only `LOCK TABLE ... SHARE ROW EXCLUSIVE` on this
+/// path — so neither writes a new receipt. Backdating the receipt past the
+/// cooldown restores the full purge. Receipt count is the observable proxy:
+/// every purge writes exactly one receipt, every skipped purge writes none.
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb and mock REST only"]
+async fn privacy_command_repeat_opt_out_skips_purge_and_cooldown_blocks_rapid_reopt() {
+    use two_bot_cutover::db::{CutoverDb, FunnelWrite};
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test bootstrap URL");
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .expect("migrated test database; no credential fallback");
+    let cutover = CutoverDb::from_pool(db.pool().clone());
+    const GUARD_GUILD: u64 = 100000000000000421;
+    const GUARD_MEMBER: u64 = 100000000000000422;
+    let guild_s = GUARD_GUILD.to_string();
+    let member_s = GUARD_MEMBER.to_string();
+    let (inserted, _) = two_bot_cutover::db::record_event(
+        &cutover,
+        &FunnelWrite {
+            member_id: Some(member_s.clone()),
+            guild_id: guild_s.clone(),
+            event_type: "first_message".to_owned(),
+            occurred_at: "2026-10-12T00:00:00Z".to_owned(),
+            source: "privacy-guard-fixture".to_owned(),
+            metadata: Some("{}".to_owned()),
+        },
+    )
+    .await
+    .expect("seed persists before the opt-out");
+    assert!(inserted, "seed row for the guard member");
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
+    let mut privacy_gates = gates(false, false);
+    privacy_gates.configured_guild = Some(GUARD_GUILD);
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor.clone(),
+        router_with_commands(privacy_gates),
+        GUARD_GUILD,
+        false,
+    );
+
+    async fn receipts(pool: &sqlx::Pool<sqlx::Postgres>, guild: &str, member: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM privacy_opt_out_audit WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(guild)
+        .bind(member)
+        .fetch_one(pool)
+        .await
+        .expect("receipt reads")
+    }
+
+    async fn suppressed(pool: &sqlx::Pool<sqlx::Postgres>, guild: &str, member: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
+        )
+        .bind(guild)
+        .bind(member)
+        .fetch_one(pool)
+        .await
+        .expect("suppression reads")
+    }
+
+    // First purge: one receipt, suppression installed.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(receipts(db.pool(), &guild_s, &member_s).await, 1);
+    assert!(suppressed(db.pool(), &guild_s, &member_s).await);
+
+    // Repeat tap while suppressed: no new receipt, suppression stays.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(
+        receipts(db.pool(), &guild_s, &member_s).await,
+        1,
+        "repeat opt-out writes no new receipt, so no purge ran"
+    );
+    assert!(suppressed(db.pool(), &guild_s, &member_s).await);
+
+    // Opt back in clears suppression without a receipt.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-in"),
+        ))
+        .await;
+    assert!(!suppressed(db.pool(), &guild_s, &member_s).await);
+    assert_eq!(receipts(db.pool(), &guild_s, &member_s).await, 1);
+
+    // Rapid re-opt inside the cooldown: blocked, still no receipt and no
+    // suppression reinstall.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(
+        receipts(db.pool(), &guild_s, &member_s).await,
+        1,
+        "cooldown re-opt writes no new receipt, so no purge ran"
+    );
+    assert!(
+        !suppressed(db.pool(), &guild_s, &member_s).await,
+        "cooldown path installs no suppression"
+    );
+
+    // Past the cooldown the purge runs again: backdate the receipt, then a
+    // fresh opt-out receipts and suppresses.
+    sqlx::query(
+        "UPDATE privacy_opt_out_audit
+         SET opted_out_at = clock_timestamp() - make_interval(mins => 11)
+         WHERE guild_id = $1 AND member_id = $2",
+    )
+    .bind(&guild_s)
+    .bind(&member_s)
+    .execute(db.pool())
+    .await
+    .expect("backdate writes");
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(
+        receipts(db.pool(), &guild_s, &member_s).await,
+        2,
+        "post-cooldown opt-out purges again"
+    );
+    assert!(suppressed(db.pool(), &guild_s, &member_s).await);
+
+    let edits: Vec<serde_json::Value> = mock
+        .requests()
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.ends_with("/@original"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(edits.len(), 5, "one completion edit per command");
+    let text = |index: usize| {
+        edits[index]["content"]
+            .as_str()
+            .expect("edit carries text")
+            .to_owned()
+    };
+    assert!(
+        text(0).contains("opted out of analytics"),
+        "first purge confirms, got: {}",
+        text(0)
+    );
+    assert!(
+        text(1).contains("already opted out"),
+        "repeat tap reports suppression, got: {}",
+        text(1)
+    );
+    assert!(
+        text(2).contains("back on"),
+        "opt-in confirms, got: {}",
+        text(2)
+    );
+    assert!(
+        text(3).contains("recently"),
+        "cooldown asks to retry later, got: {}",
+        text(3)
+    );
+    assert!(
+        text(4).contains("opted out of analytics"),
+        "post-cooldown purge confirms, got: {}",
+        text(4)
+    );
+    mock.shutdown().await;
+    db.close().await.expect("drop own disposable database");
 }
