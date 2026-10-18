@@ -409,9 +409,10 @@ fn name_exact_boundary_and_valid_controls_stay_green() {
         assert!(id.len() <= MAX_VOICE_CUSTOM_ID_CHARS, "{id}");
         assert!(parse_voice_custom_id(&id).is_some(), "{id}");
     }
-    // Exact byte-length boundary: 100 bytes are checked for shape (still
-    // `None` for these overflowing rooms) while 101 bytes trip the length
-    // gate first. Lengths are asserted so the boundary cannot drift.
+    // Exact byte-length boundary for shape rejections: both 100- and
+    // 101-byte all-`1` rooms overflow `u64`, so they refuse on shape at any
+    // length. Lengths are asserted so the boundary cannot drift; the
+    // zero-padded pair below pins the length gate itself.
     let custom_100 = format!("two:voice:name-custom:{}", "1".repeat(78));
     let custom_101 = format!("two:voice:name-custom:{}", "1".repeat(79));
     assert_eq!(custom_100.len(), MAX_VOICE_CUSTOM_ID_CHARS);
@@ -430,6 +431,19 @@ fn name_exact_boundary_and_valid_controls_stay_green() {
     assert_eq!(modal_101.len(), MAX_VOICE_CUSTOM_ID_CHARS + 1);
     assert_eq!(parse_voice_custom_id(&modal_100), None);
     assert_eq!(parse_voice_custom_id(&modal_101), None);
+    // Zero-padded gate pin: `parse_id` accepts leading zeros, so the
+    // exactly-100-byte room `000…0500` (value 500) parses while the 101-byte
+    // form trips the length gate. Deleting the gate (or an off-by-one `>=`)
+    // flips exactly one of these asserts.
+    let zero_100 = format!("two:voice:name-custom:{}{}", "0".repeat(75), 500);
+    let zero_101 = format!("two:voice:name-custom:{}{}", "0".repeat(76), 500);
+    assert_eq!(zero_100.len(), MAX_VOICE_CUSTOM_ID_CHARS);
+    assert_eq!(zero_101.len(), MAX_VOICE_CUSTOM_ID_CHARS + 1);
+    assert_eq!(
+        parse_voice_custom_id(&zero_100),
+        Some(VoiceAction::NameCustom { room_id: 500 })
+    );
+    assert_eq!(parse_voice_custom_id(&zero_101), None);
     // Multibyte boundary: byte length (not chars or UTF-16 units) gates the
     // id. 39 `é` (78 bytes) plus the 22-byte custom prefix is exactly 100
     // bytes; 40 `é` is 102 bytes. Both refuse without panicking.

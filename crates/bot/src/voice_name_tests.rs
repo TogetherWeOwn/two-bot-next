@@ -421,9 +421,10 @@ fn hostile_name_ids_refuse_through_the_router() {
         None,
         "{overflow:?}"
     );
-    // Exact-boundary overlong ids refuse on both paths. The 100-byte custom
-    // id is all digits but overflows `u64`; the 101-byte id trips the length
-    // gate first. Lengths are pinned so the boundary cannot drift.
+    // Exact-boundary shape rejections refuse on both paths. The 100- and
+    // 101-byte all-`1` custom ids overflow `u64`, so they refuse on shape at
+    // any length. Lengths are pinned so the boundary cannot drift; the
+    // zero-padded pair below pins the length gate itself.
     let custom_100 = format!("two:voice:name-custom:{}", "1".repeat(78));
     let custom_101 = format!("two:voice:name-custom:{}", "1".repeat(79));
     assert_eq!(custom_100.len(), MAX_VOICE_CUSTOM_ID_CHARS);
@@ -433,6 +434,29 @@ fn hostile_name_ids_refuse_through_the_router() {
         assert_eq!(name_component_action(&click(id)), None, "{id:?}");
         assert_eq!(name_component_action(&modal(id)), None, "{id:?}");
     }
+    // Zero-padded gate pin through the real router: `parse_id` accepts
+    // leading zeros, so the exactly-100-byte room `000…0500` (value 500)
+    // opens the modal while the 101-byte form refuses on both paths.
+    // Deleting the length gate (or an off-by-one `>=`) flips these asserts.
+    let zero_100 = format!("two:voice:name-custom:{}{}", "0".repeat(75), 500);
+    let zero_101 = format!("two:voice:name-custom:{}{}", "0".repeat(76), 500);
+    assert_eq!(zero_100.len(), MAX_VOICE_CUSTOM_ID_CHARS);
+    assert_eq!(zero_101.len(), MAX_VOICE_CUSTOM_ID_CHARS + 1);
+    assert_eq!(
+        name_component_action(&click(&zero_100)),
+        Some(NameInteraction::OpenModal { room_id: 500 })
+    );
+    assert_eq!(parse_voice_custom_id(&zero_101), None, "{zero_101:?}");
+    assert_eq!(
+        name_component_action(&click(&zero_101)),
+        None,
+        "{zero_101:?}"
+    );
+    assert_eq!(
+        name_component_action(&modal(&zero_101)),
+        None,
+        "{zero_101:?}"
+    );
     // Multibyte boundary: 39 `é` are 78 bytes, so with the 22-byte custom
     // prefix the id is exactly 100 bytes; 40 `é` are 102 bytes. Both refuse.
     // One emoji is one char but two UTF-16 units and four bytes.
@@ -453,10 +477,14 @@ fn hostile_name_ids_refuse_through_the_router() {
 }
 
 #[tokio::test]
-async fn hostile_clicks_leave_state_machine_and_trace_untouched() {
-    // Hostile button ids never become a `NameInteraction`, so the worker
-    // writes nothing and the next valid step still applies: the state
-    // machine is not confused and hostile input is never echoed.
+async fn hostile_clicks_refuse_at_the_router_and_valid_flow_still_applies() {
+    // Hostile button ids never become a `NameInteraction` through the real
+    // router, and the next valid step still applies, so a hostile battery
+    // cannot confuse the state machine. This test never feeds the worker,
+    // so it asserts no worker state here; hostile-input worker-write and
+    // trace coverage lives in
+    // `hostile_runtime_clicks_are_unowned_and_echo_nothing`, which routes
+    // through the real runtime.
     let (mut worker, trace) = setup().await;
     let overlong = format!("two:voice:name-custom:{}", "1".repeat(79));
     // 2^64 overflows `u64`: built arithmetically so the source holds no
@@ -483,9 +511,6 @@ async fn hostile_clicks_leave_state_machine_and_trace_untouched() {
         let submitted = modal_interaction(id, labelled_input("Den"));
         assert_eq!(name_component_action(&submitted), None, "{id:?}");
     }
-    assert!(worker.custom_names.is_empty());
-    drain(&mut worker).await;
-    assert!(trace.lock().unwrap().is_empty());
     // The valid panel flow still runs after the hostile battery.
     applied(worker.apply_name(command(OWNER, false, submit("Den")), 0));
     assert_eq!(
@@ -533,6 +558,16 @@ async fn hostile_runtime_clicks_are_unowned_and_echo_nothing() {
         assert!(!owned, "{id:?}");
         assert!(response.is_none(), "{id:?}");
     }
+    // Hostile clicks reached the real runtime above, so an empty trace here
+    // proves they queued no worker write and emitted no Discord call. The
+    // actor runs concurrently, so settle before asserting.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "hostile runtime clicks write nothing: {:?}",
+        trace.lock().unwrap()
+    );
     let click = component_interaction(&name_custom_custom_id(500), None, OWNER);
     let (owned, response) = name_capture_full(&runtime, &click, &names).await;
     assert!(owned);
