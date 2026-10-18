@@ -57,6 +57,7 @@ use crate::command_runtime::{
     sticky_options, CommandRuntime, RegistrySyncError,
 };
 use crate::member_runtime::MemberRuntime;
+use crate::privacy_command::{privacy_action, PrivacyAction};
 use crate::schedule_runtime::{schedule_options, schedule_remove_option};
 
 const GUILD: u64 = 2222;
@@ -715,7 +716,7 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard", "help"],
+                vec!["rank", "leaderboard", "help", "privacy"],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -829,7 +830,7 @@ async fn activation_boot_from_env_fixture() {
     let defs = runtime.router().publish_set(&[]).unwrap();
     let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
     if expected == "narrowed" {
-        assert_eq!(names, ["rank", "leaderboard", "help"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
         assert!(!runtime.router().gates().announcements);
@@ -1032,12 +1033,14 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "rank"
                         | "leaderboard"
                         | "help"
+                        | "privacy"
                 )
             })
             .collect();
         assert!(!unwired.contains(&"rank"));
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
+        assert!(!unwired.contains(&"privacy"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -5968,4 +5971,495 @@ async fn worker_verdict_drives_prefix_trigger_from_call_site() {
     );
     mock.shutdown().await;
     db.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// `/privacy` member self-serve (parity §1 row 32)
+// ---------------------------------------------------------------------------
+
+fn privacy_interaction(member: u64, subcommand: Option<&str>) -> Interaction {
+    let options = subcommand
+        .map(|name| vec![option(name, CommandOptionValue::SubCommand(Vec::new()))])
+        .unwrap_or_default();
+    let base = slash("privacy", Some(CHANNEL), options);
+    from_member(base, member, Permissions::empty())
+}
+
+/// Guild-scoped privacy interaction for store-backed tests: the privacy
+/// service validates guild and member as Discord snowflakes (17–20 digits),
+/// so the small `GUILD`/`88` fixtures used elsewhere would refuse before any
+/// purge. Callers pass real-shaped snowflake IDs for both.
+fn privacy_interaction_in(guild: u64, member: u64, subcommand: Option<&str>) -> Interaction {
+    let mut interaction = privacy_interaction(member, subcommand);
+    interaction.guild_id = Some(Id::new(guild));
+    interaction
+}
+
+#[test]
+fn privacy_action_decodes_only_the_three_known_subcommands() {
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("opt-out"))),
+        PrivacyAction::OptOut
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("opt-in"))),
+        PrivacyAction::OptIn
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("status"))),
+        PrivacyAction::Status
+    );
+    // Missing options, a non-subcommand value and an unknown name all
+    // refuse before any database access.
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, None)),
+        PrivacyAction::Invalid
+    );
+    let mut flat = slash(
+        "privacy",
+        Some(CHANNEL),
+        vec![option(
+            "opt-out",
+            CommandOptionValue::String("yes".to_owned()),
+        )],
+    );
+    flat = from_member(flat, 88, Permissions::empty());
+    assert_eq!(privacy_action(&flat), PrivacyAction::Invalid);
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("erase-everything"))),
+        PrivacyAction::Invalid
+    );
+    // A non-command interaction never dispatches.
+    let mut component = privacy_interaction(88, Some("opt-out"));
+    component.data = None;
+    assert_eq!(privacy_action(&component), PrivacyAction::Invalid);
+}
+
+/// `/privacy` end to end through gateway dispatch: `opt-out` purges the
+/// invoker's guild rows, installs suppression and writes exactly one
+/// `member:self-serve` receipt; `status` reports suppression plus the guild
+/// switches; `opt-in` clears suppression; the other member's rows survive
+/// throughout. Every step defers once and completes with one ephemeral edit.
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb and mock REST only"]
+async fn privacy_command_purges_suppresses_receipts_and_reenables_through_dispatch() {
+    use two_bot_cutover::db::{CutoverDb, FunnelWrite};
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test bootstrap URL");
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .expect("migrated test database; no credential fallback");
+    let cutover = CutoverDb::from_pool(db.pool().clone());
+    // Real-shaped snowflakes: `opt_out_member` validates both identities
+    // (17–20 digits), so the small `GUILD`/`88` fixtures would refuse.
+    const PRIVACY_GUILD: u64 = 100000000000000411;
+    const MEMBER_A: u64 = 100000000000000412;
+    const MEMBER_B: u64 = 100000000000000413;
+    let guild_s = PRIVACY_GUILD.to_string();
+    let member_a_s = MEMBER_A.to_string();
+    let member_b_s = MEMBER_B.to_string();
+    let seed = |member: &str| FunnelWrite {
+        member_id: Some(member.to_owned()),
+        guild_id: guild_s.clone(),
+        event_type: "first_message".to_owned(),
+        occurred_at: "2026-10-12T00:00:00Z".to_owned(),
+        source: "privacy-command-fixture".to_owned(),
+        metadata: Some("{}".to_owned()),
+    };
+    for member in [&member_a_s, &member_b_s] {
+        let (inserted, _) = two_bot_cutover::db::record_event(&cutover, &seed(member))
+            .await
+            .expect("seed persists before the opt-out");
+        assert!(inserted, "seed row for member {member}");
+    }
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
+    let mut privacy_gates = gates(false, false);
+    privacy_gates.configured_guild = Some(PRIVACY_GUILD);
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor.clone(),
+        router_with_commands(privacy_gates),
+        PRIVACY_GUILD,
+        false,
+    );
+
+    let events_for = |member: &str| {
+        let pool = db.pool().clone();
+        let guild = guild_s.clone();
+        let member = member.to_owned();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM events WHERE guild_id = $1 AND member_id = $2",
+            )
+            .bind(guild)
+            .bind(member)
+            .fetch_one(&pool)
+            .await
+            .expect("events count reads")
+        }
+    };
+    let suppressed = |member: &str| {
+        let pool = db.pool().clone();
+        let guild = guild_s.clone();
+        let member = member.to_owned();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
+            )
+            .bind(guild)
+            .bind(member)
+            .fetch_one(&pool)
+            .await
+            .expect("suppression reads")
+        }
+    };
+
+    // `opt-out`: purge + suppress + exactly one receipt, other member kept.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(
+        events_for(&member_a_s).await,
+        0,
+        "opt-out purges the invoker rows"
+    );
+    assert_eq!(
+        events_for(&member_b_s).await,
+        1,
+        "other member rows survive"
+    );
+    assert!(
+        suppressed(&member_a_s).await,
+        "opt-out installs suppression"
+    );
+    assert!(
+        !suppressed(&member_b_s).await,
+        "no suppression for anyone else"
+    );
+    let receipts: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT guild_id, member_id, actor FROM privacy_opt_out_audit")
+            .fetch_all(db.pool())
+            .await
+            .expect("receipt reads");
+    assert_eq!(receipts.len(), 1, "exactly one audit receipt");
+    assert_eq!(
+        receipts[0],
+        (
+            guild_s.clone(),
+            member_a_s.clone(),
+            "member:self-serve".to_owned()
+        ),
+        "receipt scopes the pair with a subject-free actor label"
+    );
+    // A write that passes after the purge still drops for the pair.
+    let (inserted, _) = two_bot_cutover::db::record_event(&cutover, &seed(&member_a_s))
+        .await
+        .expect("post-purge write attempts");
+    assert!(!inserted, "suppressed pair stays dropped");
+
+    // `status`: opted out, guild switches default on.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            Some("status"),
+        ))
+        .await;
+    // `opt-in`: suppression clears, purged rows stay gone.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            Some("opt-in"),
+        ))
+        .await;
+    assert!(!suppressed(&member_a_s).await, "opt-in clears suppression");
+    assert_eq!(events_for(&member_a_s).await, 0, "opt-in restores nothing");
+    // `status` again: persistence back on.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            Some("status"),
+        ))
+        .await;
+    // Unknown subcommand shape: usage reply, no writes.
+    runtime
+        .on_interaction(&privacy_interaction_in(PRIVACY_GUILD, MEMBER_A, None))
+        .await;
+    assert_eq!(
+        events_for(&member_b_s).await,
+        1,
+        "usage path writes nothing"
+    );
+
+    // Guild-less invocation refuses on a direct call (dispatch itself stays
+    // silent outside the configured guild via the router fence).
+    let mut dm = privacy_interaction_in(PRIVACY_GUILD, MEMBER_A, Some("status"));
+    dm.guild_id = None;
+    crate::privacy_command::privacy_command(db.pool(), &executor, &dm).await;
+
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 5, "one defer per dispatched command");
+    for callback in &callbacks {
+        let body: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
+        assert_eq!(body["type"], 5, "defer before any store work");
+        assert_eq!(body["data"]["flags"], 64, "defer stays ephemeral");
+    }
+    let edits: Vec<serde_json::Value> = mock
+        .requests()
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.ends_with("/@original"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(
+        edits.len(),
+        6,
+        "one completion edit per command plus the direct call"
+    );
+    let text = |index: usize| {
+        edits[index]["content"]
+            .as_str()
+            .expect("edit carries text")
+            .to_owned()
+    };
+    assert!(
+        text(0).contains("opted out of analytics"),
+        "opt-out confirms, got: {}",
+        text(0)
+    );
+    assert!(
+        text(1).contains("opted out") && text(1).contains("presence on"),
+        "status reports suppression plus switches, got: {}",
+        text(1)
+    );
+    assert!(
+        text(2).contains("back on"),
+        "opt-in confirms, got: {}",
+        text(2)
+    );
+    assert!(
+        text(3).contains("Analytics for you in this server: on"),
+        "status reports restored persistence, got: {}",
+        text(3)
+    );
+    assert!(
+        text(4).contains("/privacy opt-out"),
+        "unknown shape teaches usage, got: {}",
+        text(4)
+    );
+    assert!(
+        text(5).contains("only works in a server"),
+        "guild-less call refuses, got: {}",
+        text(5)
+    );
+    for edit in &edits {
+        let content = edit["content"].as_str().unwrap_or_default();
+        assert!(!content.contains("token-"), "no interaction token echoes");
+        assert!(!content.contains("@everyone"), "no mass mentions");
+    }
+    mock.shutdown().await;
+    db.close().await.expect("drop own disposable database");
+}
+
+/// `/privacy opt-out` abuse guards through gateway dispatch: a repeat tap
+/// while suppressed returns the already-opted-out reply, and a rapid re-opt
+/// right after opt-in returns the cooldown reply. Both early returns skip
+/// `opt_out_member` — the only `LOCK TABLE ... SHARE ROW EXCLUSIVE` on this
+/// path — so neither writes a new receipt. Backdating the receipt past the
+/// cooldown restores the full purge. Receipt count is the observable proxy:
+/// every purge writes exactly one receipt, every skipped purge writes none.
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb and mock REST only"]
+async fn privacy_command_repeat_opt_out_skips_purge_and_cooldown_blocks_rapid_reopt() {
+    use two_bot_cutover::db::{CutoverDb, FunnelWrite};
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test bootstrap URL");
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .expect("migrated test database; no credential fallback");
+    let cutover = CutoverDb::from_pool(db.pool().clone());
+    const GUARD_GUILD: u64 = 100000000000000421;
+    const GUARD_MEMBER: u64 = 100000000000000422;
+    let guild_s = GUARD_GUILD.to_string();
+    let member_s = GUARD_MEMBER.to_string();
+    let (inserted, _) = two_bot_cutover::db::record_event(
+        &cutover,
+        &FunnelWrite {
+            member_id: Some(member_s.clone()),
+            guild_id: guild_s.clone(),
+            event_type: "first_message".to_owned(),
+            occurred_at: "2026-10-12T00:00:00Z".to_owned(),
+            source: "privacy-guard-fixture".to_owned(),
+            metadata: Some("{}".to_owned()),
+        },
+    )
+    .await
+    .expect("seed persists before the opt-out");
+    assert!(inserted, "seed row for the guard member");
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
+    let mut privacy_gates = gates(false, false);
+    privacy_gates.configured_guild = Some(GUARD_GUILD);
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor.clone(),
+        router_with_commands(privacy_gates),
+        GUARD_GUILD,
+        false,
+    );
+
+    async fn receipts(pool: &sqlx::Pool<sqlx::Postgres>, guild: &str, member: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM privacy_opt_out_audit WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(guild)
+        .bind(member)
+        .fetch_one(pool)
+        .await
+        .expect("receipt reads")
+    }
+
+    async fn suppressed(pool: &sqlx::Pool<sqlx::Postgres>, guild: &str, member: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
+        )
+        .bind(guild)
+        .bind(member)
+        .fetch_one(pool)
+        .await
+        .expect("suppression reads")
+    }
+
+    // First purge: one receipt, suppression installed.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(receipts(db.pool(), &guild_s, &member_s).await, 1);
+    assert!(suppressed(db.pool(), &guild_s, &member_s).await);
+
+    // Repeat tap while suppressed: no new receipt, suppression stays.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(
+        receipts(db.pool(), &guild_s, &member_s).await,
+        1,
+        "repeat opt-out writes no new receipt, so no purge ran"
+    );
+    assert!(suppressed(db.pool(), &guild_s, &member_s).await);
+
+    // Opt back in clears suppression without a receipt.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-in"),
+        ))
+        .await;
+    assert!(!suppressed(db.pool(), &guild_s, &member_s).await);
+    assert_eq!(receipts(db.pool(), &guild_s, &member_s).await, 1);
+
+    // Rapid re-opt inside the cooldown: blocked, still no receipt and no
+    // suppression reinstall.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(
+        receipts(db.pool(), &guild_s, &member_s).await,
+        1,
+        "cooldown re-opt writes no new receipt, so no purge ran"
+    );
+    assert!(
+        !suppressed(db.pool(), &guild_s, &member_s).await,
+        "cooldown path installs no suppression"
+    );
+
+    // Past the cooldown the purge runs again: backdate the receipt, then a
+    // fresh opt-out receipts and suppresses.
+    sqlx::query(
+        "UPDATE privacy_opt_out_audit
+         SET opted_out_at = clock_timestamp() - make_interval(mins => 11)
+         WHERE guild_id = $1 AND member_id = $2",
+    )
+    .bind(&guild_s)
+    .bind(&member_s)
+    .execute(db.pool())
+    .await
+    .expect("backdate writes");
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(
+        receipts(db.pool(), &guild_s, &member_s).await,
+        2,
+        "post-cooldown opt-out purges again"
+    );
+    assert!(suppressed(db.pool(), &guild_s, &member_s).await);
+
+    let edits: Vec<serde_json::Value> = mock
+        .requests()
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.ends_with("/@original"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(edits.len(), 5, "one completion edit per command");
+    let text = |index: usize| {
+        edits[index]["content"]
+            .as_str()
+            .expect("edit carries text")
+            .to_owned()
+    };
+    assert!(
+        text(0).contains("opted out of analytics"),
+        "first purge confirms, got: {}",
+        text(0)
+    );
+    assert!(
+        text(1).contains("already opted out"),
+        "repeat tap reports suppression, got: {}",
+        text(1)
+    );
+    assert!(
+        text(2).contains("back on"),
+        "opt-in confirms, got: {}",
+        text(2)
+    );
+    assert!(
+        text(3).contains("recently"),
+        "cooldown asks to retry later, got: {}",
+        text(3)
+    );
+    assert!(
+        text(4).contains("opted out of analytics"),
+        "post-cooldown purge confirms, got: {}",
+        text(4)
+    );
+    mock.shutdown().await;
+    db.close().await.expect("drop own disposable database");
 }
