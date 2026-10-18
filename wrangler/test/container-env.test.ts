@@ -104,6 +104,18 @@ test("unlisted names, secrets and non-string values are dropped", () => {
   assert.deepEqual(forwardedFlagVars(env), { TWO_ANNOUNCEMENTS: "1" });
 });
 
+test("hostile settings-map typo keys stay test-only and never reach the Container", () => {
+  const env = {
+    TWO_ASSISTANT_ENDPOINTS: "https://fixture.invalid/not-a-runtime-endpoint",
+    TWO_OWEN_USER_IDS: "123456789012345678",
+  };
+  for (const name of Object.keys(env)) {
+    assert.match(NOT_FORWARDED[name] ?? "", /test-only/, name);
+  }
+  assert.deepEqual(forwardedFlagVars(env), {});
+  assert.deepEqual(containerEnv(env), { LISTEN_ADDR: "0.0.0.0:8080" });
+});
+
 test("the existing 4 Container vars are unchanged and cannot be overridden", () => {
   const base = {
     DISCORD_TOKEN: "synthetic-discord-token",
