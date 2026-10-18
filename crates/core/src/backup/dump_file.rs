@@ -857,6 +857,16 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     Some(Value::Object(data)) => data,
                     _ => return Err(refuse("dump row has no data object")),
                 };
+                // The manifest column list is the restore contract: a row key it
+                // never declared refuses here, before any publish/restore or
+                // `--dry-run` success. Missing keys stay valid (a row may carry
+                // a subset); only keys outside the manifest refuse. The message
+                // is fixed vocabulary: it never echoes the hostile key.
+                if data.keys().any(|key| !info.columns.contains(key)) {
+                    return Err(refuse(format!(
+                        "{table} row on line {line_no} has a column outside the manifest"
+                    )));
+                }
                 // Frozen v3 has native driver-decoded cells and no type metadata.
                 // This port's text-output encoding must remain strings/nulls.
                 if !info.column_types.is_empty() {
@@ -1022,6 +1032,27 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             return Err(refuse(format!(
                 "manifest table {name} has an invalid column list"
             )));
+        }
+        // `column_types` is parallel to `columns`: when present and non-empty
+        // its length must match, or the restore cast for some column is
+        // ambiguous. Absent or empty stays legacy-readable (frozen v3 omits it
+        // entirely). Fixed vocabulary: never echo the hostile type entries.
+        if let Some(types) = row.get("column_types") {
+            let types = types.as_array().ok_or_else(|| {
+                refuse(format!(
+                    "manifest table {name} has an invalid column type list"
+                ))
+            })?;
+            if types.iter().any(|t| !t.is_string()) {
+                return Err(refuse(format!(
+                    "manifest table {name} has an invalid column type list"
+                )));
+            }
+            if !types.is_empty() && types.len() != columns.len() {
+                return Err(refuse(format!(
+                    "manifest table {name} has a column/column_types length mismatch"
+                )));
+            }
         }
         let count = row
             .get("count")
