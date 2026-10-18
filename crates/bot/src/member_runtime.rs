@@ -619,4 +619,127 @@ mod tests {
             "Banned. Already applied."
         );
     }
+
+    #[test]
+    fn tempban_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact `/tempban` success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::TemporarilyBanned,
+                replayed: false,
+            }),
+            "Temporarily banned."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::TemporarilyBanned,
+                replayed: true,
+            }),
+            "Temporarily banned. Already applied."
+        );
+    }
+
+    #[test]
+    fn kick_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact `/kick` success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Kicked,
+                replayed: false,
+            }),
+            "Kicked."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Kicked,
+                replayed: true,
+            }),
+            "Kicked. Already applied."
+        );
+    }
+
+    #[test]
+    fn timeout_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact `/timeout` success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::TimedOut,
+                replayed: false,
+            }),
+            "Timed out."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::TimedOut,
+                replayed: true,
+            }),
+            "Timed out. Already applied."
+        );
+    }
+
+    #[test]
+    fn warn_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact `/warn` success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Warned,
+                replayed: false,
+            }),
+            "Warned."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Warned,
+                replayed: true,
+            }),
+            "Warned. Already applied."
+        );
+    }
+
+    #[test]
+    fn unban_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact unban-sweep success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Unbanned,
+                replayed: false,
+            }),
+            "Unbanned."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Unbanned,
+                replayed: true,
+            }),
+            "Unbanned. Already applied."
+        );
+    }
+
+    #[test]
+    fn replay_suffix_confirmation_copy_is_pinned() {
+        // The replay suffix is one uniform arm: every outcome replays by
+        // appending exactly ` Already applied.` to its fresh copy.
+        let fresh = [
+            (MemberOutcome::Banned, "Banned."),
+            (MemberOutcome::TemporarilyBanned, "Temporarily banned."),
+            (MemberOutcome::Kicked, "Kicked."),
+            (MemberOutcome::TimedOut, "Timed out."),
+            (MemberOutcome::Warned, "Warned."),
+            (MemberOutcome::Unbanned, "Unbanned."),
+        ];
+        for (outcome, base) in fresh {
+            assert_eq!(
+                outcome_text(&MemberResult {
+                    outcome,
+                    replayed: true,
+                }),
+                format!("{base} Already applied.")
+            );
+        }
+    }
 }
