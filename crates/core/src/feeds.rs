@@ -186,37 +186,83 @@ pub fn normalize_source(kind: FeedKind, source: &str) -> Result<String, FeedErro
 const MAX_FEED_LIST_SOURCE_UNITS: usize = 128;
 
 fn truncate_feed_list_source(source: &str) -> String {
-    let truncated = truncate_utf16(source, MAX_FEED_LIST_SOURCE_UNITS);
+    truncate_feed_list_source_with_budget(source, MAX_FEED_LIST_SOURCE_UNITS)
+}
+
+fn truncate_feed_list_source_with_budget(source: &str, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    let truncated = truncate_utf16(source, budget);
     if truncated == source {
         truncated
     } else {
-        format!(
-            "{}…",
-            truncate_utf16(&truncated, MAX_FEED_LIST_SOURCE_UNITS - 1)
-        )
+        format!("{}…", truncate_utf16(&truncated, budget - 1))
     }
+}
+
+fn feed_list_row_with_budget(feed: &FeedRelay, source_budget: usize) -> String {
+    let source = truncate_feed_list_source_with_budget(&feed.source, source_budget);
+    format!(
+        "`{}` {} → <#{}> {source}",
+        feed.id,
+        feed.kind.as_str(),
+        feed.channel_id
+    )
 }
 
 pub fn feed_list_text(feeds: &[FeedRelay]) -> String {
     if feeds.is_empty() {
         return "No feed relays configured.".into();
     }
-    truncate_utf16(
-        &feeds
-            .iter()
-            .map(|feed| {
-                let source = truncate_feed_list_source(&feed.source);
-                format!(
-                    "`{}` {} → <#{}> {source}",
-                    feed.id,
-                    feed.kind.as_str(),
-                    feed.channel_id
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        2000,
-    )
+    // Fast path: today's per-row 128-unit rendering when the whole list fits.
+    // This preserves empty/short output exactly.
+    let full = feeds
+        .iter()
+        .map(|feed| feed_list_row_with_budget(feed, MAX_FEED_LIST_SOURCE_UNITS))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if full.encode_utf16().count() <= DISCORD_MESSAGE_CONTENT_LIMIT {
+        return full;
+    }
+    // At capacity the fixed per-row overhead alone (~66-70 units for a
+    // 32-hex id plus kind/channel) fits, but 25 long sources do not. Shrink
+    // every source to a uniform budget so all exact `id` removal ids stay
+    // discoverable in list order within the single 2,000-unit response,
+    // instead of truncating trailing rows away. Short sources keep their
+    // full text; only long ones shrink to the shared budget.
+    let fixed_units = feeds
+        .iter()
+        .map(|feed| {
+            format!(
+                "`{}` {} → <#{}> ",
+                feed.id,
+                feed.kind.as_str(),
+                feed.channel_id
+            )
+            .encode_utf16()
+            .count()
+        })
+        .sum::<usize>()
+        + feeds.len().saturating_sub(1);
+    let available = DISCORD_MESSAGE_CONTENT_LIMIT.saturating_sub(fixed_units);
+    let budget = (available / feeds.len()).min(MAX_FEED_LIST_SOURCE_UNITS);
+    let bounded = feeds
+        .iter()
+        .map(|feed| feed_list_row_with_budget(feed, budget))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if bounded.encode_utf16().count() <= DISCORD_MESSAGE_CONTENT_LIMIT {
+        return bounded;
+    }
+    // Defensive: fixed overhead alone exceeds the limit (e.g. pathological
+    // max-length ids). Keep every exact removal id in the smallest possible
+    // rows rather than dropping trailing ids.
+    feeds
+        .iter()
+        .map(|feed| format!("`{}`", feed.id))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn feed_removed_text(removed: bool) -> &'static str {

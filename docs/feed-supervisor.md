@@ -17,7 +17,7 @@ available in DMs (`docs/commands.md`):
 | Command | Options | Notes |
 | --- | --- | --- |
 | `/feed-add` | `kind` (required choice: `"rss"`, `"youtube"`, `"twitch"`), `source` (required string, max 2048 chars) | Posts into the invoking channel. At most 2,048 input bytes total. |
-| `/feed-list` | none | Ephemeral text; each source truncated to 128 UTF-16 units before the 2,000-unit message cap (`crates/core/src/feeds.rs:186-220`). |
+| `/feed-list` | none | Ephemeral text; each source capped at 128 UTF-16 units, shrinking adaptively at capacity so every relay id stays discoverable within the 2,000-unit message cap (`crates/core/src/feeds.rs`). |
 | `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.` or `No feed relay with that id.` (`crates/core/src/feeds.rs:222-228`). Guild-scoped delete. |
 
 Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
@@ -208,7 +208,7 @@ not part of feed operation.
    Expect the relay id in the confirmation reply; copy it.
 2. Run `/feed-list` in the same guild. Expect a line
    `` `<id>` rss → <#<channel>> https://example.com/feed.xml ``
-   (source truncated to 128 units if long).
+   (sources shrink to fit at capacity; every relay id stays listed).
 3. Wait one poll interval (default 300 s; configured via
    `TWO_FEED_POLL_SECONDS`). Adding a relay does not fetch the source —
    the first delivery happens on the next pass.
