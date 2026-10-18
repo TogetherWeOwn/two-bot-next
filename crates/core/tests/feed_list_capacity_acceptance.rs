@@ -32,7 +32,7 @@ fn relay(index: usize, source: String) -> FeedRelay {
         source,
         // Every fifth relay is disabled, including the trailing one:
         // disabled relays still count toward capacity and stay listed.
-        enabled: index % 5 != 0,
+        enabled: !index.is_multiple_of(5),
         last_checked_at: None,
         created_by: "actor".into(),
         created_at: 0,
