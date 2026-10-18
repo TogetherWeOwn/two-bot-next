@@ -272,6 +272,7 @@ pub trait LevelingHook: Send + Sync {
         member_id: Snowflake,
         at: &str,
         channel_id: Snowflake,
+        shape: MessageShape,
     ) -> LevelOutcome;
     fn award_voice(
         &self,
@@ -294,6 +295,7 @@ impl LevelingHook for NoopLeveling {
         _member_id: Snowflake,
         _at: &str,
         _channel_id: Snowflake,
+        _shape: MessageShape,
     ) -> LevelOutcome {
         LevelOutcome {
             leveled_up: false,
@@ -453,6 +455,29 @@ pub struct GateClearedInput {
     pub source: Option<String>,
 }
 
+/// Minimal transient message shape for the anti-gaming short-message rule.
+/// Only scalar counts and an embed/attachment bit travel; bodies are never
+/// threaded, persisted or logged. `content_length: None` means the shape is
+/// unknown (MESSAGE_CONTENT absent) and preserves existing award behavior;
+/// `Some(n)` is the trimmed Unicode scalar count (including zero for a known
+/// empty message).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageShape {
+    pub content_length: Option<usize>,
+    pub has_embed_or_attachment: bool,
+}
+
+impl MessageShape {
+    /// Unknown shape: content not delivered, rule cannot fire.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            content_length: None,
+            has_embed_or_attachment: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MessageInput {
     pub guild_id: Snowflake,
@@ -466,7 +491,24 @@ pub struct MessageInput {
     pub capture_only: bool,
     pub occurred_at: Option<String>,
     /// Unicode scalar count measured at capture; content is never threaded.
+    /// `None` is unknown shape (MESSAGE_CONTENT absent); `Some(n)` is the
+    /// trimmed scalar count, including zero for a known empty message.
     pub content_length: Option<usize>,
+    /// Whether the gateway message carried an embed or attachment. Threaded
+    /// alongside the length so the short-message rule can exempt such
+    /// messages; never carries body content.
+    pub has_embed_or_attachment: bool,
+}
+
+impl MessageInput {
+    /// Transient shape for the leveling hook: length plus embed bit only.
+    #[must_use]
+    pub fn shape(&self) -> MessageShape {
+        MessageShape {
+            content_length: self.content_length,
+            has_embed_or_attachment: self.has_embed_or_attachment,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -670,7 +712,8 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
             .touch_activity(i.guild_id, i.member_id, &at, AnalyticsCategory::Activity);
         let mut leveled_up_to = None;
         if let Some(leveling) = &self.leveling {
-            let award = leveling.award_message(i.guild_id, i.member_id, &at, i.channel_id);
+            let award =
+                leveling.award_message(i.guild_id, i.member_id, &at, i.channel_id, i.shape());
             if award.leveled_up {
                 leveled_up_to = Some(award.level);
             }
@@ -1065,6 +1108,7 @@ mod tests {
             capture_only: false,
             occurred_at: Some(at.to_owned()),
             content_length: None,
+            has_embed_or_attachment: false,
         };
         let kinds: Vec<Option<EventType>> = [
             "2026-09-20T12:00:00.000Z",
@@ -1123,6 +1167,7 @@ mod tests {
             capture_only: false,
             occurred_at: Some(at.to_owned()),
             content_length: None,
+            has_embed_or_attachment: false,
         });
         assert_eq!(
             first.event.map(|e| e.event_type),
@@ -1141,6 +1186,7 @@ mod tests {
             capture_only: false,
             occurred_at: Some(at.to_owned()),
             content_length: None,
+            has_embed_or_attachment: false,
         });
         assert!(dup.event.is_none());
     }
@@ -1257,7 +1303,14 @@ mod tests {
     }
 
     impl LevelingHook for &RecordingLeveling {
-        fn award_message(&self, _: Snowflake, _: Snowflake, _: &str, _: Snowflake) -> LevelOutcome {
+        fn award_message(
+            &self,
+            _: Snowflake,
+            _: Snowflake,
+            _: &str,
+            _: Snowflake,
+            _: MessageShape,
+        ) -> LevelOutcome {
             LevelOutcome {
                 leveled_up: false,
                 level: 0,

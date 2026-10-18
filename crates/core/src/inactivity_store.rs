@@ -19,7 +19,7 @@
 use sqlx::{Pool, Postgres};
 
 use super::inactivity::{
-    flag_inactive, InactivityCandidate, InactivityOutcome, INACTIVITY_EVENT_SOURCE,
+    flag_inactive, should_flag, InactivityCandidate, InactivityOutcome, INACTIVITY_EVENT_SOURCE,
 };
 
 /// Inactivity store failure: transport only.
@@ -86,6 +86,7 @@ pub async fn run_sweep(
         )
         .collect();
     let mut outcome = flag_inactive(&candidates, now_ms, days);
+    let cutoff_ms = super::inactivity::inactivity_cutoff_ms(now_ms, days);
     let mut written: Vec<(String, String)> = Vec::with_capacity(outcome.flagged.len());
     for flagged in &outcome.flagged {
         let key = super::inactivity::member_inactive_event_key(
@@ -102,6 +103,42 @@ pub async fn run_sweep(
         sqlx::query("LOCK TABLE events, members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
             .execute(&mut *tx)
             .await?;
+        // Revalidate the initial SELECT's eligibility atomically with the
+        // write: the member may have become active, left, become a bot, or
+        // been flagged by a concurrent sweep after selection. `FOR UPDATE`
+        // pins the row so a concurrent winner commits first and this
+        // transaction observes its flag stamp; a stale candidate rolls back
+        // with no event, no flag mutation, and no outcome entry.
+        type FreshRow = (
+            Option<sqlx::types::time::OffsetDateTime>,
+            Option<sqlx::types::time::OffsetDateTime>,
+            bool,
+            Option<sqlx::types::time::OffsetDateTime>,
+        );
+        let fresh: Option<FreshRow> = sqlx::query_as(
+            "SELECT COALESCE(last_active_at, joined_at), inactive_flagged_at, is_bot, left_at
+               FROM members WHERE guild_id = $1 AND member_id = $2 FOR UPDATE",
+        )
+        .bind(&flagged.guild_id)
+        .bind(&flagged.member_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((last_seen, flagged_at, is_bot, left_at)) = fresh else {
+            tx.rollback().await?;
+            continue;
+        };
+        let current = InactivityCandidate {
+            guild_id: flagged.guild_id.clone(),
+            member_id: flagged.member_id.clone(),
+            last_seen_ms: last_seen.as_ref().map(epoch_millis),
+            flagged_at_ms: flagged_at.as_ref().map(epoch_millis),
+            is_bot,
+            has_left: left_at.is_some(),
+        };
+        if !should_flag(&current, cutoff_ms) {
+            tx.rollback().await?;
+            continue;
+        }
         if crate::privacy::suppressed_in(&mut tx, &flagged.guild_id, &flagged.member_id).await? {
             tx.rollback().await?;
             continue;
