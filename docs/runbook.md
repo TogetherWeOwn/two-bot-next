@@ -450,6 +450,15 @@ drift; `discord`/`persistence` move outcomes point at REST or storage. Then
 read the container logs for `voice_event="voice_join_received"` refusal lines
 and `voice_event="voice_join"` terminal lines with their stage durations.
 
+The burn rules cannot see joins that never reach the actor. If members stop
+being moved while `joins_received` stays flat and no refusal lines appear,
+read `two_bot_voice_live_not_ready_seconds`: above 0 means the guild's live
+view is not ready on a connected gateway, so joins are dropped before a
+ticket. Every dispatch retries the cached snapshot
+(`two_bot_voice_live_self_heal_total` counts the repairs); a value that keeps
+climbing past 120 s needs a restart (fresh IDENTIFY + GUILD_CREATE) and a bug
+report with the logs around the last gateway close.
+
 Escalate when the burn persists across hours (the slow-burn ticket below will
 already be open), when `halted` refusals dominate, or when the stall matches a
 deploy — the fix belongs to the on-call engineer, not another redeploy.
