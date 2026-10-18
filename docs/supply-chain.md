@@ -178,17 +178,18 @@ the tag; require the assets before treating the release as fully delivered.
 # supply-chain job, so there is no supply-chain artifact to download.
 # The 40-minute job has contents: read, no deploy secrets and no publishing path.
 # No release workflow dispatch or pull_request_target is required.
-# On a selected run that completes the handoff and reaches verification,
-# inspect the supply-chain artifact: two nonempty CycloneDX BOMs, SHA256SUMS,
-# source SHA/image ID, and both vulnerability reports.
+# On a selected run that completes the handoff and reaches and passes SBOM
+# inventory validation, inspect the supply-chain artifact: two nonempty
+# CycloneDX BOMs, SHA256SUMS, source SHA/image ID, and both vulnerability reports.
 gh run download <run-id> -n supply-chain -D <run-owned-scratch-directory>
 # Repair assets on an existing stable release; rebuilds its tag, not current main.
 gh workflow run release.yml --ref main -f release_tag=vX.Y.Z
 ```
 
 On a selected PR, the dry-run inventories the exact PR head SHA and records
-checksums/provenance before scanning, then validates lockfile coverage and
-Debian image components in `verify` after the image vulnerability gates.
+source SHA and image ID before scanning; `verify` then validates lockfile
+coverage and Debian image components and records SHA256SUMS after the image
+vulnerability gates.
 Image tags include the Actions run ID and attempt. No shared cache exists:
 the image build uses no `cache-from`/`cache-to`, and Trivy caching is off
 (`cache: false`), so per-run state lives only under `runner.temp`.
