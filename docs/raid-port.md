@@ -145,9 +145,18 @@ over the boot value; a delete hands the key back) when the
 bot can View and Send there, with empty allowed mentions. Missing channel,
 denied permission and send failure are logged and never retried; the cooldown is
 consumed at proposal. It is always on (legacy parity) and independent of
-`TWO_ANTI_NUKE`. `DISCORD_STAFF_ALERT_CHANNEL_ID` is hot-wired but is not yet
-forwarded into the Container by the Worker, so staging stays log-only until a
-separate change forwards it. **Landed — join-risk delivery:**
+`TWO_ANTI_NUKE`. `DISCORD_STAFF_ALERT_CHANNEL_ID` is forwarded into the
+Container through the Worker's explicit `FORWARDED_DISCORD_IDS` allowlist
+(`wrangler/src/container-env.ts:139-157`), pinned by the executable
+`DISCORD_ID_FIXTURES` allowlist-shape and verbatim-forwarding tests
+(`wrangler/test/container-env.test.ts:199-242`). Missing, non-string, empty
+and whitespace-only values are dropped silently before the Container (the
+runtime sees the variable as unset); only a non-empty value that fails
+snowflake validation is dropped with a Worker warning that names the variable
+and never logs its value (`wrangler/src/container-env.ts:227-249`,
+`wrangler/test/container-env.test.ts:289-310`), so the runtime sees it as
+unset and stays log-only for that boot. Forwarding
+alone never claims a live channel is configured or that delivery succeeds. **Landed — join-risk delivery:**
 `crates/bot/src/join_risk_runtime.rs`. The pipeline takes one observer, so risk
 chains behind the raid watch in a fan-out and both stay behind the funnel's join
 row. The chain is built only under exact `TWO_ANTI_NUKE=1` on the staging guild;
@@ -175,6 +184,64 @@ claim store (`join_risk_store`, migration `0360_join_risk_flags.sql`, legacy
 processing-time `created_at`, scores with the current join, and persists the
 evidence in one transaction — now wired to the gateway and executor
 (`crates/bot/src/join_risk_runtime.rs`).
+
+## Staff-alert delivery troubleshooting (inspection only)
+
+This runbook describes code paths, not live configuration. It authorizes
+read-only inspection only: no activation, no replay of old alerts, no
+permission, channel, tuning or runtime changes.
+
+- Boot value versus stored override. The Container boots from the forwarded
+  `DISCORD_STAFF_ALERT_CHANNEL_ID` deployment value; the settings store then
+  wins per observation for the hot keys (`crates/bot/src/raid_runtime.rs:159-200`,
+  `SETTING_KEYS`). A stored row moves the next observation, and deleting the
+  row hands the key back to the boot value. Tuning behaves the same way: a
+  failed refresh keeps the last good values. The first join the worker
+  observes after each start logs `raid_watch_enabled` with the target in force
+  at that moment (`crates/bot/src/raid_runtime.rs:190-198`, reached only via
+  `handle` at `:322-339`; `start`/`start_from_env` log nothing) — a quiet
+  guild logs nothing from the raid worker until a join arrives, and
+  `raid_watch_enabled` is not logged again when the channel changes. A hot
+  change to the channel (set, change or delete) is logged separately by the
+  settings poll job within one 15 s poll: `settings_applied` (key names only)
+  plus `setting_changed` with `key=DISCORD_STAFF_ALERT_CHANNEL_ID`,
+  `guild_id`, `from` and `to` (`crates/bot/src/settings_jobs.rs:192-207`).
+  Search for that line to see when an override or delete took effect; fall
+  back to the settings-store row for the live value only if the log line is
+  unavailable.
+- Delivery requirements. Every post needs all three: a usable channel value
+  (unusable falls back to log-only, `RaidSettings::from_vars`), a guild text
+  channel the bot can View and Send in (`MemberAccess::load` plus
+  `permits(channel, true)`), and `MentionPolicy::None` with empty allowed
+  mentions — a proposal asking for anything else is refused
+  (`raid_alert_refused`) rather than widened (`crates/bot/src/raid_runtime.rs:230-297`).
+  No identifier or credential is ever needed to check these: read the log
+  lines, not the values.
+- Evidence map (raid alerts; join risk shares the staff channel and the
+  `Delivery` enum under `join_risk_*` strings). Search logs for these exact
+  strings: `raid_alert` is the log-first proposal (always emitted, even when
+  nothing is posted — an unset staff channel logs only this line and no
+  delivery-status line, `crates/bot/src/raid_runtime.rs:244-246`);
+  `raid_alert_posted` means `Delivery::Posted`; `raid_alert_undeliverable`
+  means the channel is missing, not text, or View/Send was refused
+  (`Delivery::Undeliverable`); `raid_alert_post_failed` means delivery failed
+  (`Delivery::Failed`: failed bot-identity lookup, failed member/permission
+  read — so an unproven permission reports as post_failed, not
+  undeliverable — the 12 s delivery timeout, or a failed send,
+  `crates/bot/src/raid_runtime.rs:267-297`). Join-risk equivalents are
+  `join_risk_posted`, `join_risk_undeliverable`, `join_risk_post_failed` and
+  `join_risk_refused` (`crates/bot/src/join_risk_runtime.rs:372-389`). The
+  proposal consumes the cooldown, so a missing channel, a refusal and a
+  failed send are all logged and never retried — do not re-post, replay or
+  "fix" them into a second send.
+- Restart semantics. Restarting clears the volatile `RaidWatch` (window,
+  repeat and cooldown), because one worker owns it in memory. That resets
+  future detection; it does not repair, re-deliver or erase an old alert,
+  whose evidence stays in the logs.
+- Gates stay. Join risk still builds only under exact `TWO_ANTI_NUKE=1` on
+  the staging guild, with dry-run default, armed-only removals and
+  session-mode refusal of armed containment (`docs/containment.md`). Nothing
+  here relaxes anti-nuke, staging or session fences.
 
 `raid.rs` unit tests cover strict clocks/age/window/cooldown boundaries, reverse
 arrival, dedupe-before-prune, fractional/live tuning, guild isolation, payload

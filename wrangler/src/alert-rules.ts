@@ -114,6 +114,8 @@ export const DB_ERROR_MIN_ERRORS = 3;
 export const SEND_BLOCKED_SAMPLES = 3;
 /** Website-action receiver refusals must appear in this many consecutive samples. */
 export const RECEIVER_REFUSAL_SAMPLES = 3;
+/** EventSub tampered-signature deliveries must rise in this many consecutive samples. */
+export const EVENTSUB_TAMPERED_SAMPLES = 3;
 /** Consecutive unpaired gateway samples before the page; bound justified in the runbook. */
 export const GATEWAY_UNPAIRED_SAMPLES = 3;
 /**
@@ -129,6 +131,19 @@ export const GATEWAY_NOT_READY_SAMPLES = 3;
 export const VOICE_FAILURE_RATIO = 0.05;
 /** ...and the window must hold at least this many operations. */
 export const VOICE_FAILURE_MIN_OPS = 10;
+/**
+ * Vote-kick enforcement outcomes that extend the `voice_failures` rule: any
+ * increase between two samples fires. These are the terminal
+ * `EnforcementOutcome` codes where the room-scoped enforcement of a passed
+ * vote did not complete (`crates/core/src/voice_vote_kick_audit.rs`), a
+ * subset of `VOICE_VOTE_KICK_OUTCOMES` in `crates/core/src/metrics.rs`.
+ * Every other outcome stays quiet: refusals (e.g. `cooldown`) are admission
+ * policy working as designed, and the remaining enforcement codes
+ * (`connect_denied_and_disconnected`, `connect_denied_target_absent`,
+ * `skipped_room_gone`, `skipped_target_protected`) are successful or
+ * already-terminal writes. Fixed enum only: no voter or target labels.
+ */
+export const VOICE_VOTE_KICK_FAILURE_OUTCOMES = ["discord_error", "gave_up", "permission_missing"] as const;
 /** Dispatch drops must grow in this many consecutive completed sample windows. */
 export const DISPATCH_DROP_SAMPLES = 3;
 /** Mirrors the fixed DISPATCH_LANES allowlist in crates/core/src/metrics.rs. */
@@ -202,7 +217,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "db_pool_saturated", summary: `database pool exhausted for ${POOL_SATURATED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-db-pool" },
   { id: "db_errors", summary: `database errors reached ${DB_ERROR_MIN_ERRORS}+ between samples`, runbook: "runbook.md#alert-db-errors" },
   { id: "send_admission_blocked", summary: `Discord sends refused admission for ${SEND_BLOCKED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-send-admission-blocked" },
-  { id: "voice_failures", summary: `voice room lifecycle failures exceed ${VOICE_FAILURE_RATIO * 100}% of operations (min ${VOICE_FAILURE_MIN_OPS} ops), or new dead-letters/orphans`, runbook: "runbook.md#alert-voice-failures" },
+  { id: "voice_failures", summary: `voice room lifecycle failures exceed ${VOICE_FAILURE_RATIO * 100}% of operations (min ${VOICE_FAILURE_MIN_OPS} ops), or new dead-letters/orphans/vote-kick enforcement failures`, runbook: "runbook.md#alert-voice-failures" },
   { id: "gateway_missed_events", summary: `gateway missed events increased between samples`, runbook: "runbook.md#alert-gateway-missed-events" },
   { id: "gateway_unpaired_disconnect", summary: `gateway disconnect with no RESUMED or fresh READY for ${GATEWAY_UNPAIRED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-gateway-unpaired-disconnect" },
   { id: "gateway_not_ready", summary: `/readyz gateway component non-ready for ${GATEWAY_NOT_READY_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-gateway-not-ready" },
@@ -215,6 +230,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_join_slow_burn", summary: `creator-join error budget burning faster than ${JOIN_SLOW_BURN}x over 6 h and 30 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-slow-burn", severity: "ticket" },
   { id: "voice_creator_map_stale", summary: `voice creator map has not merged for more than ${CREATOR_MAP_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-voice-creator-map-stale" },
   { id: "error_budget_fast_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_FAST_BURN}x over ${ERROR_BUDGET_FAST_LONG_SECONDS / 60} min and ${ERROR_BUDGET_FAST_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-fast-burn" },
+  { id: "eventsub_tampered", summary: `EventSub tampered-signature deliveries rose in ${EVENTSUB_TAMPERED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-eventsub-tampered" },
 ];
 
 /**
@@ -276,6 +292,12 @@ export interface MetricsAlertState {
   voiceFailures: number;
   voiceDeadLetters: number;
   voiceOrphans: number;
+  /** Summed `discord_error`/`gave_up`/`permission_missing` vote-kick outcomes at the last valid sample. */
+  voiceVoteKickFailures: number;
+  /** False until a valid vote-kick family sample stores a baseline: the first sample never fires. */
+  voiceVoteKickFailuresSeen: boolean;
+  /** True when the last evaluation left `voice_failures` firing via the vote-kick arm (growth or hold). */
+  voiceVoteKickFiring: boolean;
   gatewayMissed: number;
   /** False until the first evaluation stores a baseline: the first sample never fires. */
   gatewayMissedSeen: boolean;
@@ -288,6 +310,12 @@ export interface MetricsAlertState {
   receiverRefusalsSeen: boolean;
   /** Per-family consecutive windows with new refusals (sustained surge, not one probe). */
   receiverRefusalStreaks: Record<string, number>;
+  /** EventSub `tampered` counter at the last valid baseline or window. */
+  eventsubTampered: number;
+  /** False until a valid sample stores the EventSub baseline: the first sample never fires. */
+  eventsubTamperedSeen: boolean;
+  /** Consecutive windows with new tampered deliveries (sustained surge, not one probe). */
+  eventsubTamperedStreak: number;
   /** Gateway disconnect counter at the last valid baseline or window. */
   gatewayDisconnects: number;
   /** RESUMED plus fresh READY counters at the last valid baseline or window. */
@@ -442,7 +470,7 @@ function errorBudgetBurnEvaluation(
   };
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0 };
 
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
@@ -803,7 +831,47 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const dVoiceFailures = voiceFailures - prevVoiceFailures;
   const dVoiceDead = voiceDeadLetters - prevVoiceDeadLetters;
   const dVoiceOrphans = voiceOrphans - prevVoiceOrphans;
-  if (!voiceReset && ((dVoiceOps >= VOICE_FAILURE_MIN_OPS && dVoiceFailures / dVoiceOps > VOICE_FAILURE_RATIO) || dVoiceDead >= 1 || dVoiceOrphans >= 1)) {
+  // Vote-kick enforcement failures extend the same rule: any increase in the
+  // summed `discord_error`/`gave_up`/`permission_missing` outcomes of
+  // `two_bot_voice_vote_kick_total` fires, so a vote-kick path that always
+  // fails enforcement pages even while room operations look healthy. Every
+  // other vote-kick outcome is never summed: refusals (e.g. `cooldown`) and
+  // successful or already-terminal enforcements never fire. Each failure
+  // series needs exactly one row carrying only its `outcome` label with a
+  // safe nonnegative integer, so a Rust rename, a duplicate row, a malformed
+  // value, or an extra (e.g. voter/target) label fails this arm instead of
+  // silently holding it off. A missing family (older containers never
+  // emitted it) or a malformed sample holds a vote-kick-caused firing alert
+  // instead of resolving it, and never fires on its own; a backwards counter
+  // (process restart) rebaselines, and a room-operation counter reset breaks
+  // the hold and resolves like the window above. The first valid sample only
+  // stores a baseline and never fires, so lifetime counts predating the
+  // deploy do not page.
+  let voiceVoteKickFailures: number | undefined;
+  const voteKickRows = gauge("two_bot_voice_vote_kick_total");
+  if (voteKickRows.length > 0) {
+    let sum = 0;
+    let valid = true;
+    for (const outcome of VOICE_VOTE_KICK_FAILURE_OUTCOMES) {
+      const value = exactSeries(voteKickRows, { outcome });
+      if (value === undefined) { valid = false; break; }
+      sum += value;
+    }
+    if (valid) voiceVoteKickFailures = sum;
+  }
+  // `??` covers DO storage written before these fields existed: the first
+  // valid sample only stores a baseline and never fires (mirrors the
+  // `gatewayMissedSeen`/`checkpointFailuresSeen`/`receiverRefusalsSeen` arms),
+  // and the missing-family hold applies only to a vote-kick-caused alert so a
+  // room-operation alert still resolves on a quiet window.
+  const prevVoiceVoteKickFailures = prev.voiceVoteKickFailures ?? 0;
+  const prevVoteKickSeen = prev.voiceVoteKickFailuresSeen ?? false;
+  const prevVoteKickFiring = prev.voiceVoteKickFiring ?? false;
+  const voteKickReset = voiceVoteKickFailures !== undefined && voiceVoteKickFailures < prevVoiceVoteKickFailures;
+  const voteKickGrowth = voiceVoteKickFailures !== undefined && prevVoteKickSeen && !voteKickReset && voiceVoteKickFailures > prevVoiceVoteKickFailures;
+  const voteKickHold = voiceVoteKickFailures === undefined && !voiceReset && prevVoteKickFiring;
+  const voiceVoteKickFiring = voteKickGrowth || voteKickHold;
+  if (!voiceReset && ((dVoiceOps >= VOICE_FAILURE_MIN_OPS && dVoiceFailures / dVoiceOps > VOICE_FAILURE_RATIO) || dVoiceDead >= 1 || dVoiceOrphans >= 1 || voteKickGrowth || voteKickHold)) {
     firing.push("voice_failures");
   }
 
@@ -959,6 +1027,48 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     for (const family of Object.keys(receiverRefusals)) receiverRefusalStreaks[family] = 0;
   }
 
+  // EventSub tampered-signature surge: `two_bot_eventsub_classified_total`
+  // with exactly `kind="tampered"` (only `BadSignature`) must rise in
+  // EVENTSUB_TAMPERED_SAMPLES consecutive windows before paging, so an active
+  // forgery attempt or a broken secret rotation pages while one forged probe
+  // stays quiet. Only the fixed kind label counts: any extra label, any other
+  // kind, a duplicated row, or a non-integer value invalidates the sample.
+  // The first valid sample only stores the baseline and never fires; a
+  // backwards counter means the process restarted and rebaselines without
+  // firing; missing/invalid scrapes preserve a firing alert and never
+  // manufacture recovery; a flat valid window resolves. `??` covers DO
+  // storage written before these fields existed.
+  const TAMPERED_RULE = "eventsub_tampered";
+  const tamperedValue = exactSeries(gauge("two_bot_eventsub_classified_total"), { kind: "tampered" });
+  const prevTampered = prev.eventsubTampered ?? 0;
+  const tamperedSeen = prev.eventsubTamperedSeen ?? false;
+  const prevTamperedStreak = prev.eventsubTamperedStreak ?? 0;
+  const wasTamperedFiring = prev.firing.includes(TAMPERED_RULE);
+  let eventsubTampered = prevTampered;
+  let eventsubTamperedSeen = tamperedSeen;
+  let eventsubTamperedStreak = prevTamperedStreak;
+  if (tamperedValue === undefined) {
+    if (wasTamperedFiring) firing.push(TAMPERED_RULE);
+  } else if (!tamperedSeen) {
+    eventsubTampered = tamperedValue;
+    eventsubTamperedSeen = true;
+    eventsubTamperedStreak = 0;
+  } else if (tamperedValue < prevTampered) {
+    eventsubTampered = tamperedValue;
+    eventsubTamperedSeen = true;
+    eventsubTamperedStreak = 0;
+  } else if (tamperedValue > prevTampered) {
+    const streak = prevTamperedStreak + 1;
+    eventsubTampered = tamperedValue;
+    eventsubTamperedSeen = true;
+    eventsubTamperedStreak = streak;
+    if (streak >= EVENTSUB_TAMPERED_SAMPLES) firing.push(TAMPERED_RULE);
+  } else {
+    eventsubTampered = tamperedValue;
+    eventsubTamperedSeen = true;
+    eventsubTamperedStreak = 0;
+  }
+
   // Dispatch saturation is a ticket, not evidence of gateway sequence loss.
   // Iterate only the fixed lanes: neither storage nor firing keys can acquire
   // member/channel labels from a malformed exposition. Each lane needs one
@@ -1010,7 +1120,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring, errorBudgetBurn: errorBudgetBurn.ring } };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

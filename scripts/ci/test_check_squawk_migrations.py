@@ -294,12 +294,15 @@ class RuleTests(unittest.TestCase):
             ),
             [],
         )
+        # Conditional creation proves nothing about emptiness: when the
+        # relation already exists the statement is a no-op and the table
+        # may hold production data, so the following index must flag.
         self.assertEqual(
             self.rules(
                 "CREATE TABLE IF NOT EXISTS guilds (id bigint PRIMARY KEY);\n"
                 "CREATE UNIQUE INDEX guilds_uidx ON guilds (id);\n"
             ),
-            [],
+            ["creating-index"],
         )
 
     def test_index_on_other_table_still_flags(self):

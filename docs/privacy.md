@@ -218,6 +218,17 @@ stay retryable. The existing `presence_probe`, funnel `events` and
 or database failures can retain those rows beyond their nominal windows until a
 later successful run. The cadence headroom below is specific to `event_store`.
 
+An authenticated erasure intake
+(`two-bot-cutover::deletion_intake`) exists for the published `/privacy`
+surface but is not yet invoked on live interactions, so members cannot yet
+submit requests through it. When wired, the request binds to the invoker's
+guild/member pair, acknowledges pending only, and persists to the same
+deletion-request ledger the scheduler drains — never the narrower opt-out
+purge. Status and completion receipts are readable by the requester without
+the interaction token; receipts name the guild/member footprint and the
+retained limits, never global erasure. Live-dispatch call sites that invoke
+the intake on real interactions are follow-up work.
+
 When the database is behind the binary (an unapplied migration or grant), the
 gateway acks dispatches whose queue write hits the schema gap instead of
 crash-looping, with one exception: a missing grant (`42501`) on an available

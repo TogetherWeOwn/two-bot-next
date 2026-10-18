@@ -62,8 +62,10 @@ Write migrations that stay silent:
   separate migration run outside a transaction (sqlx no-transaction;
   `CONCURRENTLY` cannot run inside a transaction block). An index on the
   same qualified relation (schema and table; an unqualified name means
-  `public`) created earlier in the same migration file targets an empty
-  table and is not flagged. Creating a same-named table in a different
+  `public`) created unconditionally earlier in the same migration file
+  targets an empty table and is not flagged. `CREATE TABLE IF NOT EXISTS`
+  earns no such exemption: when the relation already exists it is a no-op
+  and the table may hold data. Creating a same-named table in a different
   schema does not exempt the index.
 - If a concurrent index migration fails before it is recorded, the interrupted
   build may leave an invalid index, and a successful build may be unrecorded.

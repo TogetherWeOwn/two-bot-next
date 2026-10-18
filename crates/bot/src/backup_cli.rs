@@ -82,6 +82,18 @@ async fn open_pool_with_tls(
         .map_err(|_| "cannot connect; database details redacted")
 }
 
+/// Typed restore pool-open: `None` is a fixed, non-echoing `&'static str`
+/// failure in the same type as [`open_pool`], never a panic. `Some` delegates
+/// to [`open_pool`] unchanged (same constants, TLS policy, connection
+/// behavior). Defense in depth behind the exit-2 `TWO_RESTORE_URL` guard in
+/// `cmd_restore`.
+pub(crate) async fn open_restore_pool(url: Option<&str>) -> Result<sqlx::PgPool, &'static str> {
+    let Some(url) = url else {
+        return Err("missing restore database URL");
+    };
+    open_pool(url).await
+}
+
 /// Only an absent credential permits the deliberate environment fallback.
 /// Inject the directory and lazy fallback so tests never mutate process env.
 fn load_staging_token(
@@ -246,6 +258,13 @@ pub async fn dispatch(args: &[String]) -> i32 {
         }
         print!("{USAGE}");
         return 0;
+    }
+    // Bare-boot owed-release override: the documented `two-bot --allow-owed`
+    // service-start flag falls through to the boot preflight in `run`
+    // (100 = not a backup subcommand). Only the exact single flag; typos,
+    // extra arguments and operator subcommands keep exit 2 below.
+    if args.len() == 1 && args[0] == two_bot_core::disable_preflight::OVERRIDE_FLAG {
+        return 100;
     }
     match route(&args[0], &args[1..]) {
         Route::Help => {
@@ -510,9 +529,9 @@ async fn cmd_restore(args: &[String]) -> i32 {
         return cmd_restore_dry_run(&file, url.as_deref()).await;
     }
 
-    // Every failure is a bounded constant from `open_pool`: the URL and its
-    // query secrets never reach logs or CLI output.
-    let pool = match open_pool(url.as_ref().expect("checked")).await {
+    // Every failure is a bounded constant from `open_restore_pool`: the URL and
+    // its query secrets never reach logs or CLI output.
+    let pool = match open_restore_pool(url.as_deref()).await {
         Ok(pool) => pool,
         Err(detail) => {
             eprintln!("restore: {detail}");
@@ -1703,6 +1722,34 @@ mod tests {
         // unknown-subcommand refusal.
         for subcommand in ["db", "erase-member", "serve"] {
             assert_eq!(route(subcommand, &strings(&["--help"])), Route::Run);
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_boot_allow_owed_falls_through_to_service_preflight() {
+        // The exact documented service-start flag is not a backup
+        // subcommand: 100 tells `main` to run the boot preflight in `run`.
+        assert_eq!(
+            super::dispatch(&strings(&[two_bot_core::disable_preflight::OVERRIDE_FLAG])).await,
+            100
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_boot_near_misses_and_extra_args_stay_usage_errors() {
+        // Only the exact single flag falls through; typos, unknown flags
+        // and the flag beside another argument keep exit 2 without touching
+        // env, DB or network.
+        for args in [
+            &["--allow-owwed"][..],
+            &["--allow-owed-releases"][..],
+            &["--allow-owed=1"][..],
+            &["--allow_owed"][..],
+            &["--frobnicate"][..],
+            &["--allow-owed", "--frobnicate"][..],
+            &["backup", "--allow-owed"][..],
+        ] {
+            assert_eq!(super::dispatch(&strings(args)).await, 2, "{args:?}");
         }
     }
 

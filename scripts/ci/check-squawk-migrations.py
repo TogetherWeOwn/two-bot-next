@@ -66,8 +66,9 @@ ADVICE = {
         "CREATE INDEX without CONCURRENTLY blocks writes on existing tables; "
         "use CREATE INDEX CONCURRENTLY in a separate migration run outside "
         "a transaction (sqlx no-transaction). Indexes on the same qualified "
-        "relation created earlier in the same file target an empty table "
-        "and are not flagged"
+        "relation created unconditionally earlier in the same file target "
+        "an empty table and are not flagged; CREATE TABLE IF NOT EXISTS "
+        "earns no such exemption"
     ),
     "adding-check-constraint": (
         "CHECK constraint without NOT VALID scans and locks the table; "
@@ -109,7 +110,7 @@ ALTER_TABLE_PREFIX = re.compile(
 BARE_DROP = re.compile(r"^\s*DROP\s+(?!CONSTRAINT\b)", re.IGNORECASE)
 CREATE_TABLE = re.compile(
     r"\bCREATE\s+(?:(?:GLOBAL|LOCAL)\s+)?(?:TEMP(?:ORARY)?\s+|UNLOGGED\s+)?"
-    r"TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:ONLY\s+)?"
+    r"TABLE\s+(?P<conditional>IF\s+NOT\s+EXISTS\s+)?(?:ONLY\s+)?"
     r'(?P<name>"[^"]+"|[A-Za-z_][A-Za-z0-9_\.]*)',
     re.IGNORECASE,
 )
@@ -424,9 +425,12 @@ def is_waived_finding(path, rule, sql):
 def lint_text(text, path=None):
     """Return [(line, rule)] findings for one migration file's contents.
 
-    CREATE TABLE names accumulate in statement order so an index on a table
-    created earlier in the same file (still empty) is not flagged, while an
-    index on any other table still is. Waivers apply only when a path is given.
+    Unconditional CREATE TABLE names accumulate in statement order so an
+    index on a table created earlier in the same file (still empty) is not
+    flagged, while an index on any other table still is. Conditional
+    CREATE TABLE IF NOT EXISTS is a no-op when the relation already
+    exists, so it proves nothing about emptiness and never qualifies the
+    relation for the exemption. Waivers apply only when a path is given.
     """
     findings = []
     created = set()
@@ -435,7 +439,8 @@ def lint_text(text, path=None):
             if path is None or not is_waived_finding(path, rule, sql):
                 findings.append((line, rule))
         for match in CREATE_TABLE.finditer(sql):
-            created.add(normalize_relation(match.group("name")))
+            if match.group("conditional") is None:
+                created.add(normalize_relation(match.group("name")))
     return findings
 
 

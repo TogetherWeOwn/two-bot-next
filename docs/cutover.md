@@ -167,8 +167,8 @@ before invoking tools. `two-bot` with no subcommand starts the server;
 `two-bot guild-config-snapshot --help`, and `--help` after any subcommand print
 usage and exit 0 before any env, DB or network read, so `--help` never dumps,
 prunes or uploads
-([help routing](../crates/bot/src/backup_cli.rs#L216), [dispatch](../crates/bot/src/backup_cli.rs#L242)).
-A trailing argument that is not `--help` is refused with exit 2 (`:231-236`).
+([help routing](../crates/bot/src/backup_cli.rs#L228), [dispatch](../crates/bot/src/backup_cli.rs#L254)).
+A trailing argument that is not `--help` is refused with exit 2 (`:243-248`).
 Other binaries or future subcommand help paths still require source/fixture
 verification before approval; a `--help` suffix is not a universal read-only
 safety boundary.
@@ -182,8 +182,8 @@ safety boundary.
 | `two-bot backup-upload <dump.ndjson.gz>` | Uploads one dump using approved S3 bindings; an upload is not proof of completeness or restore compatibility |
 | `two-bot guild-config-snapshot` / `two-bot guild-config-restore --snapshot FILE` | Pinned **staging-only** guild structure recovery. Does **not** snapshot application commands; never use as production registry rollback |
 
-Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L136),
-[restore implementation](../crates/bot/src/backup_cli.rs#L482) and
+Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L148),
+[restore implementation](../crates/bot/src/backup_cli.rs#L501) and
 [backup runbook](backup.md). `restore --dry-run` optionally reads a target when
 `TWO_RESTORE_URL` is set; do not mistake it for automatically offline operation.
 For local fixture/artifact inspection **without any DB connection**:
@@ -355,7 +355,7 @@ alongside an unconfirmed Next gateway.
   `FORWARDED_DISCORD_IDS`:
   [configuration](../crates/core/src/config.rs#L24),
   [tool connection](../crates/cutover/src/cli.rs#L180),
-  [Worker environment](../wrangler/src/index.ts#L656).
+  [Worker environment](../wrangler/src/index.ts#L666).
 - Configured server startup runs embedded migrations; it is not a read-only
   preflight. Gateway boot wires the funnel pipeline, not the full feature/job
   stack. Domain/store libraries and command definitions are not activated
