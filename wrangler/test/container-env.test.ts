@@ -150,6 +150,22 @@ test("gateway readiness failure injection forwards only under the staging marker
   assert.equal(armed["TWO_DEPLOY_ENV"], "staging");
 });
 
+test("remediation-drill switches never reach the Container: Worker-only trigger input", () => {
+  for (const key of ["TWO_VOICE_STALL_FAULT_INJECTION", "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"]) {
+    // Never on the generic flag allowlist, even armed.
+    assert.equal(forwardedFlagVars({ [key]: "1", TWO_DEPLOY_ENV: "staging" })[key], undefined, key);
+    // No Worker shape forwards them: the fault injector reads them in the
+    // keepalive tick, so the Container must never see them.
+    for (const env of [
+      { [key]: "1" },
+      { [key]: "1", TWO_DEPLOY_ENV: "staging" },
+      { [key]: "1", TWO_DEPLOY_ENV: "production" },
+    ]) {
+      assert.equal(containerEnv(env)[key], undefined, `${key} ${JSON.stringify(env)}`);
+    }
+  }
+});
+
 test("eventsub reconcile inputs and Helix credentials reach the Container on explicit lines while forwarded", () => {
   const env = {
     TWO_EVENTSUB: "1",

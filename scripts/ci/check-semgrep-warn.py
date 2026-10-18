@@ -140,10 +140,16 @@ def added_lines(base_ref, head_ref):
             path, in_hunk = None, False
             continue
         if not in_hunk and raw.startswith("+++ "):
-            if raw == "+++ /dev/null":
+            # Git terminates the +++ header with a single TAB delimiter when
+            # the path contains a space (see check-patch-coverage.py). Strip
+            # exactly one trailing TAB so spaced names match the scanner's
+            # exact repository-relative filename. A literal tab would arrive
+            # C-escaped, and quoted/malformed headers still fail closed below.
+            header = raw[:-1] if raw.endswith("\t") else raw
+            if header == "+++ /dev/null":
                 path = None
-            elif raw.startswith("+++ b/") and raw[len("+++ b/"):]:
-                path = raw[len("+++ b/"):]
+            elif header.startswith("+++ b/") and header[len("+++ b/"):]:
+                path = header[len("+++ b/"):]
             else:
                 return None, "git diff contains an unrecognized file path header"
             continue
