@@ -1894,9 +1894,14 @@ jobs:
       # naming a two_bot_test_* database. Create that bootstrap here; the
       # legacy bespoke helpers in the sibling stores accept the same URL
       # (they check host and principal only), so one URL serves all four
-      # suites below.
+      # suites below. The rust:bookworm job container ships no PostgreSQL
+      # client, so install it first like the other DB jobs do.
       - name: Prepare isolated test database
-        run: createdb -h agent-testdb -U agent_test two_bot_test_ci
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
+          rm -rf /var/lib/apt/lists/*
+          createdb -h agent-testdb -U agent_test two_bot_test_ci
       - name: Check feature-gated community stores
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - name: Test presence, scorecard and inactivity ledgers on ephemeral Postgres
