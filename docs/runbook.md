@@ -491,6 +491,35 @@ recommends alongside this alert: the bot's own reload first, then a same-SHA
 takeover card if the alert survives it (see
 [auto-remediation](#auto-remediation-guarded-stall-and-crash-loop-response)).
 
+#### Alert: error budget fast burn
+
+The REST error budget (99.9% success over the 48h watch, `docs/error-budget-alerts.md`)
+is burning faster than 12x in both the last 15 minutes and the last 2 minutes
+(`two_bot_rest_requests_total` eligible requests against `result="5xx"` plus
+`result="transport"` errors; `4xx`/`429` are caller or rate-limit outcomes, not
+spend). Each window needs at least 10 eligible requests and two budget errors;
+one bad minute alone never pages. After startup or restart, a window stays
+inactive until its full history is available; a counter reset rebuilds the
+window history instead of firing. A scrape gap never resolves a firing page by
+itself: a window without coverage holds the existing state, and only full
+coverage below threshold resolves. Window edges land on whole keepalive scrapes,
+so a burn sustained exactly at the policy rate reads up to ~1% low and the
+comparison carries that allowance instead of flapping.
+
+First response: confirm the spike is server-side via the authorized
+`/ops/metrics` scrape — compare `5xx` growth against `transport` growth by
+`route`. `transport` points at timeouts and cancellations before response
+headers (check job timeout classes); `5xx` concentrated on one route after a
+deploy points at a broken request shape from the fresh build (check the page's
+build SHA and the recent-deploy rollback one-pager); `5xx` across routes
+points at the Discord API (check the Discord status page). Then read the
+container logs for the failing route's error lines.
+
+Escalate when the burn persists across windows (the budget exhausts in 4 hours
+at full fast burn), when half the 48h budget is spent, or when the spike
+matches a deploy — the fix belongs to the on-call engineer, not another
+redeploy.
+
 #### Alert: gateway missed events
 
 `two_bot_gateway_missed_events_total` increased between two keepalive

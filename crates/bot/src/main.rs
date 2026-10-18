@@ -40,6 +40,8 @@ mod event_cli;
 mod eventsub_delivery;
 mod eventsub_http;
 mod eventsub_reconcile;
+#[cfg(test)]
+mod fast_burn_page_tests;
 mod feed_jobs;
 mod gateway;
 // Bounded reconnect schedule and runner: no runtime caller yet. Test-only
