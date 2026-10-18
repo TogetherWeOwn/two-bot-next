@@ -31,6 +31,13 @@ IMAGE_MAX_BYTES = 112 * MIB
 # (15.04 MiB) before the event-executor merge; the combined-head
 # measurement comes from hosted CI on the merged head. 16 MiB restores a
 # working tripwire with headroom; revisit if the binary approaches it.
+# Revisited: main at d7774644 measured 16,768,848 bytes (15.99 MiB), and
+# the backfill rate-limit client head measured 16,780,912 bytes
+# (16.00 MiB) on hosted CI — the guard's bucket/pacing code, no new
+# dependencies, release profile already minimal. The game-activity
+# aggregate-expiry slice measured 16,782,608 bytes (16.01 MiB) on hosted CI,
+# 5,392 bytes over the 16 MiB budget with no new dependencies: the store
+# expiry plus its per-guild stale listing and the retention-cadence driver.
 # 2026-10-17 recalibration: main tip 89503f71 measured 16,776,096 bytes
 # (16.00 MiB) in hosted CI, leaving 1,120 bytes of headroom — the tripwire
 # is exhausted even before new code lands. This branch's voice
