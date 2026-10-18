@@ -270,8 +270,11 @@ impl Occurrence<'_> {
                     None => false,
                 };
                 // Keep the nonce when the message survives so the re-run
-                // dedupes against it instead of posting a second copy.
-                let retained = retry_scheduled(
+                // dedupes against it instead of posting a second copy. The
+                // unrecorded outcome is audited even when the claim was lost
+                // (the re-queue retains nothing): a posted message must never
+                // vanish without an audit row.
+                retry_scheduled(
                     self.pool,
                     &self.row.guild_id,
                     &self.row.id,
@@ -281,14 +284,12 @@ impl Occurrence<'_> {
                 )
                 .await
                 .map_err(database)?;
-                if retained {
-                    self.audit(
-                        &OccurrenceOutcome::PostedUnrecorded { cleaned },
-                        Some(reason),
-                        audit_failed,
-                    )
-                    .await;
-                }
+                self.audit(
+                    &OccurrenceOutcome::PostedUnrecorded { cleaned },
+                    Some(reason),
+                    audit_failed,
+                )
+                .await;
                 Ok(Step::Stop)
             }
         }
@@ -341,6 +342,17 @@ impl Occurrence<'_> {
         if completed.is_some() {
             self.audit(
                 &OccurrenceOutcome::FailedPermanent,
+                Some(reason),
+                audit_failed,
+            )
+            .await;
+        } else {
+            // The claim went stale (the definition was replaced or cancelled
+            // while Discord refused the post): the completion lands nowhere,
+            // so audit the stale completion with the refusal reason instead
+            // of vanishing silently.
+            self.audit(
+                &OccurrenceOutcome::StaleCompletion,
                 Some(reason),
                 audit_failed,
             )
