@@ -33,14 +33,13 @@ URLs are not printed.
 
 ## What the report proves
 
-Each table reports `{table, status, columns?, count?, reason?}`. `status` is
-`measured` (exact post-`T_f` row count), `unmeasurable` (no usable timestamp
-column, with a reason: `community_scorecard_attempts`,
-`guild_settings_revision`, `level_role_rewards`,
-`lfg_roles`, `moderation_channel_executions`, `rank_ladder`,
-`self_role_exchange_baselines`, `web_contract_meta`), or `missing` (table absent
-from this database, e.g. a partially migrated one). Every classified table
-appears exactly once: the unit test fails on any unclassified
+Each table reports `{table, status, columns?, count?, reason?, disposition?}`.
+`status` is `measured` (exact post-`T_f` row count), `unmeasurable` (no usable
+timestamp column, with a reason plus a rollback `disposition`, see
+[Dispositions for unmeasurable tables](#dispositions-for-unmeasurable-tables)),
+or `missing` (table absent from this database, e.g. a partially migrated one).
+`measured` and `missing` entries carry no `disposition` key. Every classified
+table appears exactly once: the unit test fails on any unclassified
 `sql/database_role_matrix.sql` / backup-allowlist table, and on any spec
 entry that appears in neither list.
 
@@ -58,6 +57,48 @@ entry that appears in neither list.
   50,000 post-`T_f` rows, so a mis-set `--since` cannot silently spill a
   partial window into a rollback decision.
 
+## Dispositions for unmeasurable tables
+
+Every `unmeasurable` report entry carries a rollback `disposition`
+alongside its `reason` (and no `count` or `columns`):
+
+- `accept-with-reason`: the rollback decision accepts the stated reason as
+  the window handling, optionally with the named alternate measured evidence
+  attached to the window record. Used only where the spec reason or the
+  reviewed voice-window disposition below names alternate measured evidence,
+  an accepted reason, seed reference data, or no durable state.
+- `manual-reconcile-required`: the window delta for this table is invisible
+  to the report and no alternate measured evidence is named. The rollback
+  operator reconciles it by hand before GO (per-table dump comparison,
+  moderator record, or config export pair recorded in the window log). The
+  watermark-gap trigger fires on any such entry until the manual
+  reconciliation is attached. Never silently accept loss for these tables.
+
+Pinned map (mirrored in `crates/cutover/src/rollback_delta.rs`
+`TABLE_SPECS`; the coverage test fails on any unmeasurable table missing
+from this map, and the acceptance battery pins the JSON encoding):
+
+| Table | Disposition | Why |
+|---|---|---|
+| `backfill_history_messages` | `manual-reconcile-required` | Catch-up inserts are invisible after the fact; no alternate measured evidence is named for the window |
+| `community_scorecard_attempts` | `accept-with-reason` | A completed week is visible via `community_scorecard_runs.generated_at` |
+| `gateway_onboarding_jobs` | `accept-with-reason` | Transient restart-recovery queue; rows hold no durable member state |
+| `guild_settings_revision` | `accept-with-reason` | Changes are visible via `guild_settings.updated_at` |
+| `level_role_rewards` | `manual-reconcile-required` | Wholesale-replaced configuration with no alternate evidence named |
+| `lfg_roles` | `accept-with-reason` | Child rows are created and updated with the parent `lfg_posts` row |
+| `moderation_channel_executions` | `accept-with-reason` | Written with its parent `moderation_idempotency` claim (measured via `claimed_at`) |
+| `rank_ladder` | `accept-with-reason` | Seed reference data |
+| `self_role_exchange_baselines` | `accept-with-reason` | Written with its exchange lifecycle (`self_role_exchanges.created_at`) |
+| `voice_channel_templates`, `voice_game_aliases`, `voice_random_lists`, `voice_random_list_choices`, `voice_logging`, `voice_logging_mention_members`, `voice_logging_mention_roles`, `voice_guild_settings`, `voice_command_roles`, `voice_command_role_members` | `accept-with-reason` | Wholesale-replaced configuration, accepted with the freeze/rollback configuration export pair below as alternate evidence |
+| `voice_creators` | `accept-with-reason` | Accepted with the export pair plus a per-guild full-row dump comparison as alternate evidence (see below) |
+| `voice_logging_settings`, `voice_access_controls` | `accept-with-reason` | Mutable per-guild settings rows; accepted with the read-back pair below as alternate evidence |
+| `web_contract_meta` | `manual-reconcile-required` | Singleton contract row; a window change is invisible and no alternate measured evidence is named |
+
+A new `unmeasurable` spec without a pinned disposition breaks the coverage
+test (`acceptance_every_unmeasurable_spec_has_a_pinned_disposition`): pin
+`accept-with-reason` only under the rule above, otherwise
+`manual-reconcile-required`.
+
 ## Reviewed disposition: unmeasurable voice tables (voice window)
 
 `rollback-delta` marks a table `unmeasurable` when it has no usable
@@ -67,8 +108,9 @@ fires its watermark-gap trigger on any `unmeasurable` table without a
 reviewed disposition; this section is that disposition for the voice
 window, recorded 2026-10-04 from an offline tabletop replay of the trigger
 document against merged source (verdict on the day: no data, no reviewed
-disposition on record). Non-voice unmeasurable tables keep their existing
-handling.
+disposition on record). Every unmeasurable table now carries its `disposition`
+in the report JSON per the map above; this section records the reviewed
+alternate evidence for the voice window.
 
 | Tables | Why unmeasurable | Disposition | Alternate evidence for the window |
 |---|---|---|---|
