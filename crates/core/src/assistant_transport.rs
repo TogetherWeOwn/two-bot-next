@@ -237,8 +237,8 @@ impl std::fmt::Debug for AssistantRequest {
 
 /// A buffered assistant HTTPS answer.
 ///
-/// `Debug` renders the status, the recorded redirect target and the body
-/// length; the body itself never renders.
+/// `Debug` renders the status, whether a redirect target was recorded, and
+/// the body length; the location value and the body itself never render.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AssistantResponse {
     /// Answer status. Any 3xx becomes
@@ -255,7 +255,7 @@ impl std::fmt::Debug for AssistantResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AssistantResponse")
             .field("status", &self.status)
-            .field("location", &self.location)
+            .field("location", &self.location.as_ref().map(|_| "[REDACTED]"))
             .field("body_bytes", &self.body.len())
             .finish()
     }
@@ -743,7 +743,7 @@ mod tests {
         };
         let response = AssistantResponse {
             status: 200,
-            location: Some("https://assistant.example.com/next".to_string()),
+            location: Some("https://assistant.example.com/next?token=hunter2".to_string()),
             body: b"hunter2-response".to_vec(),
         };
         for rendered in [
