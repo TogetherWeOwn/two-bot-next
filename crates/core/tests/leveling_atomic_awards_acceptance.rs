@@ -156,7 +156,9 @@ async fn seed_imported(pool: &sqlx::PgPool, guild: &str, member: &str, xp: i64) 
 /// Install a trigger that rejects every seasonal write for `GUILD` only, so
 /// another guild stays a live control while the fault is active.
 async fn install_seasonal_failure(pool: &sqlx::PgPool) -> StoreResult<()> {
-    sqlx::query(&format!(
+    // Audit for AssertSqlSafe: the only interpolated value is this file's
+    // `GUILD` string literal; a plpgsql body cannot take a bind parameter.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE OR REPLACE FUNCTION reject_seasonal_write_for_atomicity_test()
          RETURNS trigger AS $$
          BEGIN
@@ -166,7 +168,7 @@ async fn install_seasonal_failure(pool: &sqlx::PgPool) -> StoreResult<()> {
            RETURN NEW;
          END;
          $$ LANGUAGE plpgsql"
-    ))
+    )))
     .execute(pool)
     .await?;
     sqlx::query(
