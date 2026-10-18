@@ -397,13 +397,17 @@ fix belongs to the on-call engineer, not another redeploy.
 
 Voice room lifecycle failures between two keepalive samples
 (`two_bot_voice_operations_total`, `two_bot_voice_dead_letters_total`,
-`two_bot_voice_orphans_total`). Fires when failed operations exceed 5% of
+`two_bot_voice_orphans_total`, `two_bot_voice_vote_kick_total`). Fires when failed operations exceed 5% of
 room operations with at least 10 operations in the window (the T3 room
 create/move/delete budget in
 [voice-cutover-rollback-triggers.md](voice-cutover-rollback-triggers.md)),
-or when any new dead-letter (a queue write that exhausted 10 attempts) or
+when any new dead-letter (a queue write that exhausted 10 attempts) or
 orphan (an untracked creator-channel orphan needing manual deletion)
-appears — so a low-volume stranded-member failure still pages. Any outcome
+appears — so a low-volume stranded-member failure still pages — or when any
+new vote-kick enforcement failure (`discord_error`, `gave_up` or
+`permission_missing` on `two_bot_voice_vote_kick_total`) appears, so a
+vote-kick path that always fails enforcement pages even while room
+operations look healthy. Any outcome
 other than `success` (`category_full`, `discord`, `persistence`,
 `cancelled`) counts as a failure: the join did not place a room, or the
 move/delete did not complete. `refused` (a room cap or create burst, per
@@ -411,11 +415,18 @@ member or per guild) is admission policy working as designed, so it never
 pages. No installed rule watches it: read it from
 `two_bot_voice_operations_total{outcome="refused"}`, and if joins stop placing
 rooms while it climbs, look for a stuck cap (an unsettled reservation holding a
-slot). A counter reset (process restart) skips the window rather than firing,
-and a slow trickle below threshold stays silent.
+slot). Benign vote-kick outcomes never page either: refusals such as
+`cooldown` are admission policy, and the remaining enforcement codes
+(`connect_denied_and_disconnected`, `connect_denied_target_absent`,
+`skipped_room_gone`, `skipped_target_protected`) are successful or
+already-terminal writes. A counter reset (process restart) skips the window rather than firing,
+and a slow trickle below threshold stays silent. A missing vote-kick family
+(older containers never emitted it) or a malformed sample holds a firing
+alert instead of resolving it.
 
 First response: scope the failing operation from the `op`/`outcome` labels
-on `two_bot_voice_operations_total` via the authorized `/ops/metrics`
+on `two_bot_voice_operations_total` and the `outcome` label on
+`two_bot_voice_vote_kick_total` via the authorized `/ops/metrics`
 scrape; confirm no deploy is in progress; then read the container logs for
 the matching `voice_event="voice_operation"` warn lines (see the lifecycle
 signal inventory in
@@ -449,6 +460,15 @@ First response: confirm the spike is joins, not moves, via the authorized
 drift; `discord`/`persistence` move outcomes point at REST or storage. Then
 read the container logs for `voice_event="voice_join_received"` refusal lines
 and `voice_event="voice_join"` terminal lines with their stage durations.
+
+The burn rules cannot see joins that never reach the actor. If members stop
+being moved while `joins_received` stays flat and no refusal lines appear,
+read `two_bot_voice_live_not_ready_seconds`: above 0 means the guild's live
+view is not ready on a connected gateway, so joins are dropped before a
+ticket. Every dispatch retries the cached snapshot
+(`two_bot_voice_live_self_heal_total` counts the repairs); a value that keeps
+climbing past 120 s needs a restart (fresh IDENTIFY + GUILD_CREATE) and a bug
+report with the logs around the last gateway close.
 
 Escalate when the burn persists across hours (the slow-burn ticket below will
 already be open), when `halted` refusals dominate, or when the stall matches a
@@ -519,6 +539,33 @@ Escalate when the burn persists across windows (the budget exhausts in 4 hours
 at full fast burn), when half the 48h budget is spent, or when the spike
 matches a deploy — the fix belongs to the on-call engineer, not another
 redeploy.
+
+#### Alert: error budget slow burn
+
+The same REST error budget is burning faster than 3x in both the last 2 hours
+and the last 15 minutes. This is the ticket-severity companion to the
+fast-burn page above: a moderate but sustained degradation — a slow leak of
+`5xx` or `transport` errors — that never spikes hard enough to page. Each
+window needs at least 10 eligible requests and two budget errors; quiet
+traffic and one bad event stay silent. After startup the ticket waits for a
+full 2 h of history; a counter reset (process restart) rebuilds the ring
+instead of firing and holds a firing ticket instead of resolving it, so a
+deploy never posts a spurious RESOLVED. A scrape gap or missing series
+holds a firing ticket, and a covered quiet or below-threshold 15 min window
+resolves it even while the 2 h window is still unknown. Window edges land
+on whole
+keepalive scrapes, so the comparison carries the same ~1% allowance as the
+fast rule.
+
+First response: same signals as the fast burn — compare `5xx` against
+`transport` growth by `route` via the authorized `/ops/metrics` scrape, then
+read the container logs for the failing route. Triage within the watch
+shift; do not close it as "fast burn resolved": the fast window can clear
+while the slow grind continues.
+
+Escalate to a page when half the 48h budget is spent, when the slow burn
+persists across two consecutive 2 h windows, or when the leak matches a
+deploy — the fix belongs to the on-call engineer, not another redeploy.
 
 #### Alert: gateway missed events
 
@@ -799,6 +846,42 @@ First response: read the scrape through the existing authorized `/ops/metrics` p
 
 A lost scrape never resolves any metric-rule incident: missing evidence is not recovery evidence, so previously firing alerts stay firing through the loss, and the existing dispatch-drop interruption still applies. The first complete valid scrape after the incident resolves only the scrape-loss ticket; metric rules re-evaluate on that same scrape and resolve only on their own evidence. A valid scrape before the third failure silently resets the streak with no resolve.
 
+#### Alert: EventSub tampered
+
+`two_bot_eventsub_classified_total{kind="tampered"}` rose in 3 consecutive
+keepalive samples after a baseline. Only `BadSignature` counts as `tampered`;
+every other kind stays silent. The streak (not a single window) pages, because
+a sustained rise means an active forgery attempt or a broken secret rotation
+while one forged probe must not. The firing key is the bare rule id
+(`eventsub_tampered`): no broadcaster, subscription ID, body, token, or
+free-text label ever rides on it. The first valid sample only stores the
+baseline and never fires, a backwards counter means the process restarted and
+rebaselines without firing, missing/invalid scrapes preserve a firing alert
+without manufacturing recovery, and a flat valid window resolves.
+
+First response: scope the fixed `kind="tampered"` counter through the existing
+authorized `/ops/metrics` path; confirm no deploy is in progress (a fresh
+deploy restarts the process and resets the counter); then read the container
+logs for the matching `eventsub delivery refused` warn lines (scalar `status`
+/ `error_class` only: header values, challenge, body bytes, and query strings
+are never logged). A single historic rise with no growth never re-pages.
+Forgery versus rotation: a rotation in progress shows 401 `unauthorized`
+refusals while the two sides disagree (the running container must already
+carry the new secret before old subscriptions are deleted, so not-yet-deleted
+subscriptions signed with the old secret fail until the reconciler recreates
+them). When no rotation or deploy is underway, treat a sustained rise as
+forged traffic. Follow the existing
+[secret provisioning and rotation](eventsub-runbook.md#secret-provisioning-and-rotation)
+procedure for any credential change; this alert changes no verification, Helix,
+or secret handling. Record only the fixed kind and sanitized counts, never
+IDs, payloads, or scrape tokens.
+
+Escalate when tampered growth persists across windows after the suspect caller
+or rotation is identified, when it coincides with 429, DB-error, or
+reconcile-failure alerts, or when `notification` traffic for the same window
+collapses while tampered rises — the receiver may be refusing legitimate work
+and the fix belongs to the on-call engineer, not another redeploy.
+
 #### Auto-remediation: guarded stall and crash-loop response
 
 Execution-path decision: the Worker cannot restart containers, so remediation
@@ -857,10 +940,30 @@ above. A stuck-gateway rule (non-ready `/readyz` gateway component with no
 disconnect edge) is not a trigger in v1; wiring it into the crash-loop scope
 is follow-up work once that rule lands, not part of this slice. Sustained
 `/readyz` red (`container_unready_alert`) and repeated process restarts stay
-manual. A positive-path staging proof (forcing a real stall) needs an injector
-that does not exist; v1 staging proof is a clean deploy with no spurious
-recommendation lines plus the unit suite below. Forcing these two alerts on
-staging is follow-up work, not a silent gap.
+manual.
+
+#### Staging fault injector drill
+
+Positive-path staging proof uses the staging-only fault injector
+(`wrangler/src/staging-fault.ts`), armed solely through the generated
+staging deploy config by a manual `deploy-staging` dispatch with
+`inject_voice_stall` and/or `inject_unpaired_disconnect` (both default
+false; a push can never arm them, and the switches are never committed
+vars). While armed, the keepalive tick holds
+`two_bot_voice_creator_map_generation` at 1 with age 660 s (past the 600 s
+bound, the 2x300 s refresh) and/or advances
+`two_bot_gateway_disconnects_total` with no recovery so the unpaired rule
+holds an outstanding disconnect; the alert rules and the guard above run
+unmodified, so every recommendation still fires only alongside its trigger.
+Expected timeline at the 60 s keepalive: the stall alert fires on the first
+armed tick, the unpaired alert needs one baseline tick plus three
+outstanding ticks (about 4 min). Observe one full 30-minute cooldown window
+for R1-to-R2 escalation (`creator-map-reload`, no host action, then one
+Operator card for `same-sha-takeover` at the same SHA); a further window
+proves the two-failure CEO page and silence. Re-dispatching without the
+flags (or any plain push deploy) disarms the drill: the triggers resolve on
+their own rules and the guards reset. Rollback is disarm-by-redeploy; the
+Worker recommends only, so nothing executes from this path.
 
 ### Event-store capture gaps and lag
 

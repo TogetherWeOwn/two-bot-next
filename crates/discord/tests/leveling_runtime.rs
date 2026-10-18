@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use twilight_model::{application::interaction::Interaction, gateway::event::Event};
 use two_bot_core::{
-    leveling::{rank_text, LevelRoleReward},
+    leveling::{leaderboard_reply_for_season, rank_text, season_id_for_ms, LevelRoleReward},
     leveling_store as store, HandlerId, MemStore, OnboardingGates, OnboardingMode,
 };
 use two_bot_discord::{
@@ -24,6 +24,12 @@ const CHANNEL: u64 = 300000000000000001;
 
 fn at(seconds: i64) -> String {
     two_bot_core::format_iso_millis(1_786_771_200_000 + seconds * 1000)
+}
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_millis() as i64
 }
 fn user(id: u64) -> Value {
     json!({"id":id.to_string(),"username":"username","global_name":"Global name","discriminator":"0","avatar":null,"bot":false})
@@ -46,7 +52,7 @@ fn runtime(pool: PgPool, mock: &MockRest, mode: OnboardingMode) -> LevelingRunti
 }
 fn message(seconds: i64) -> Event {
     Event::MessageCreate(Box::new(serde_json::from_value(json!({
-        "id":(4_000_000_000_000_000_000_u64 + seconds as u64).to_string(),"guild_id":GUILD.to_string(),"channel_id":CHANNEL.to_string(),"author":user(MEMBER),"content":"hello","timestamp":at(seconds).replace('Z', "+00:00"),"edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0,"components":[]
+        "id":(4_000_000_000_000_000_000_u64 + seconds as u64).to_string(),"guild_id":GUILD.to_string(),"channel_id":CHANNEL.to_string(),"author":user(MEMBER),"content":"hello there","timestamp":at(seconds).replace('Z', "+00:00"),"edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0,"components":[]
     })).unwrap()))
 }
 fn voice(channel: Option<u64>) -> Event {
@@ -122,9 +128,13 @@ async fn routed_rank_optional_member_and_fixed_public_top_ten_match_legacy() {
         .handle_interaction(&interaction("leaderboard", false), HandlerId::Leaderboard)
         .await
         .unwrap();
+    // The routed board reads the current season only: lifetime stays empty,
+    // so every row below must come from `member_season_xp`.
+    let season = season_id_for_ms(now_ms());
     for offset in 0..12_u64 {
-        sqlx::query("INSERT INTO member_levels (guild_id,member_id,xp,imported_xp,updated_at) VALUES ($1,$2,$3,$3,NOW())")
+        sqlx::query("INSERT INTO member_season_xp (guild_id,season_id,member_id,seasonal_xp,updated_at) VALUES ($1,$2,$3,$4,NOW())")
             .bind(GUILD.to_string())
+            .bind(&season)
             .bind((MEMBER + offset).to_string())
             .bind(100_i64 + offset as i64)
             .execute(&db.pool)
@@ -160,7 +170,10 @@ async fn routed_rank_optional_member_and_fixed_public_top_ten_match_legacy() {
         rank_text("username", 0, None, 0, 0)
     );
     assert_eq!(body[0]["data"]["flags"], 64);
-    assert_eq!(body[2]["data"]["content"], "No XP has been earned yet.");
+    assert_eq!(
+        body[2]["data"]["content"],
+        leaderboard_reply_for_season(&[], &season).content
+    );
     assert_eq!(body[3]["data"]["allowed_mentions"]["parse"], json!([]));
     assert_eq!(
         body[3]["data"]["content"].as_str().unwrap().lines().count(),
@@ -545,7 +558,7 @@ async fn community_message_fact_capture_round_trip() {
             .unwrap();
     assert_eq!(row.0, "eligible_human");
     assert!(row.1.contains("\"channelClass\""), "channel class travels");
-    assert!(!row.1.contains("hello"), "no message content stored");
+    assert!(!row.1.contains("hello there"), "no message content stored");
 
     // Duplicate delivery: the same message id dedupes to zero inserts.
     let requests = pipeline.collect_at(&message(10), &at(10), MessageEligibility::default());
@@ -812,6 +825,274 @@ async fn foreign_guild_message_and_voice_xp_leave_zero_rows_own_guild_writes() {
         .await
         .unwrap();
     assert_eq!(own_xp_after, own_xp);
+    mock.shutdown().await;
+    db.close().await;
+}
+
+// Short-message rule from real gateway metadata: a trimmed message shorter
+// than 8 Unicode scalars with no embed/attachment earns zero while
+// consuming the message cooldown once. These tests drive real
+// `MessageCreate` events through the ordered pipeline into the store, so
+// the rule is proven gateway-to-store, not only in the pure policy. They
+// pin the existing public seams only (pipeline, store rows); the builder
+// chooses how the minimal transient shape is threaded internally. Message
+// bodies must never be persisted or logged to satisfy them.
+
+fn shaped_message(seconds: i64, content: &str, variant: &str) -> Event {
+    let mut value = json!({
+        "id":(4_000_000_000_000_000_000_u64 + seconds as u64).to_string(),"guild_id":GUILD.to_string(),"channel_id":CHANNEL.to_string(),"author":user(MEMBER),"content":content,"timestamp":at(seconds).replace('Z', "+00:00"),"edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0,"components":[]
+    });
+    match variant {
+        "attachment" => {
+            value["attachments"] = json!([{
+                "id": "888888888888888888", "filename": "note.txt", "size": 1,
+                "url": "http://mock.invalid/file", "proxy_url": "http://mock.invalid/file"
+            }]);
+        }
+        "embed" => {
+            value["embeds"] = json!([{"type": "link", "url": "http://mock.invalid/"}]);
+        }
+        _ => {}
+    }
+    Event::MessageCreate(Box::new(serde_json::from_value(value).unwrap()))
+}
+
+fn delivered_pipeline(pool: PgPool, mock: &MockRest) -> OrderedLevelingPipeline<MemStore> {
+    let pipeline = OrderedLevelingPipeline::new(
+        MemStore::new(),
+        Some(runtime(pool, mock, OnboardingMode::Legacy)),
+    );
+    // The shard feeding these events subscribed MESSAGE_CONTENT.
+    pipeline.set_message_content_delivered(true);
+    pipeline
+}
+
+async fn message_award_rows(pool: &PgPool) -> Vec<(i32, Option<String>)> {
+    sqlx::query_as("SELECT xp, decision FROM xp_awards WHERE source = 'message' ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or credential-free CI service"]
+async fn short_gateway_message_earns_zero_and_consumes_cooldown_once() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let pipeline = delivered_pipeline(db.pool.clone(), &mock);
+
+    // Seven trimmed scalars, no embed/attachment: earns zero.
+    let short = pipeline
+        .handle_at(
+            &shaped_message(0, "1234567", "plain"),
+            &at(0),
+            MessageEligibility::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(short.len(), 1, "the award attempt still resolves");
+    assert_eq!(
+        short[0].awarded, 0,
+        "a 7-char gateway message earns zero XP"
+    );
+    let profile = store::profile(&db.pool, &GUILD.to_string(), &MEMBER.to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            profile.xp,
+            profile.message_xp,
+            profile.voice_xp,
+            profile.imported_xp
+        ),
+        (0, 0, 0, 0),
+        "a short message grants no lifetime XP"
+    );
+
+    // The short message consumed the cooldown once: a valid follow-up ten
+    // seconds later is still blocked, and that blocked attempt must not
+    // restart the clock.
+    let blocked = pipeline
+        .handle_at(
+            &shaped_message(10, "12345678", "plain"),
+            &at(10),
+            MessageEligibility::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked[0].awarded, 0,
+        "a quick valid follow-up cannot bypass the consumed cooldown"
+    );
+
+    // Exactly 60 s after the short message the cooldown has lapsed.
+    let after = pipeline
+        .handle_at(
+            &shaped_message(60, "12345678", "plain"),
+            &at(60),
+            MessageEligibility::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        after[0].awarded, 15,
+        "an 8-char message after the cooldown earns the normal award"
+    );
+
+    // Audit semantics: the short attempt leaves exactly one decision-marked
+    // 0-XP row naming the short-message reason; the cooldown-blocked
+    // follow-up stays silent; the valid message leaves one granted row.
+    let rows = message_award_rows(&db.pool).await;
+    assert_eq!(rows.len(), 2, "short audit row plus one granted row");
+    assert_eq!(rows[0].0, 0, "the short audit row grants no XP");
+    assert_eq!(
+        rows[0].1.as_deref(),
+        Some("short_message"),
+        "the short attempt is decision-marked as short-message: {rows:?}"
+    );
+    assert_eq!(rows[1], (15, None), "the granted row carries no decision");
+
+    let profile = store::profile(&db.pool, &GUILD.to_string(), &MEMBER.to_string())
+        .await
+        .unwrap();
+    assert_eq!((profile.xp, profile.message_xp), (15, 15));
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or credential-free CI service"]
+async fn short_message_boundaries_use_trimmed_scalar_counts() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let pipeline = delivered_pipeline(db.pool.clone(), &mock);
+
+    // (seconds, content, expected award). Messages sit 700 s apart: outside
+    // the 60 s cooldown and outside the 10-minute same-channel burst
+    // window, and both controls land inside the first five daily ladder
+    // rungs, so each expectation isolates the short-message rule alone.
+    let cases: [(i64, &str, u64); 7] = [
+        // Known empty content delivered by the gateway: short.
+        (0, "", 0),
+        // Whitespace-only trims to empty: short.
+        (700, "   \t  ", 0),
+        // Eight multibyte scalars (32 UTF-8 bytes): control earns.
+        (
+            1400,
+            "\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}",
+            15,
+        ),
+        // Padding does not count: 7 trimmed scalars behind spaces is short.
+        (2100, "  1234567  ", 0),
+        // Exactly 8 trimmed scalars behind padding: control earns.
+        (2800, "  12345678  ", 15),
+        // Seven multibyte scalars (10 UTF-8 bytes): short by scalar count,
+        // even though the byte length clears the floor.
+        (3500, "caf\u{00E9} \u{2615}x", 0),
+        // Seven trimmed scalars with an interior space: still short.
+        (4200, "abc def", 0),
+    ];
+    for (seconds, content, expected) in cases {
+        let awards = pipeline
+            .handle_at(
+                &shaped_message(seconds, content, "plain"),
+                &at(seconds),
+                MessageEligibility::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(awards.len(), 1);
+        assert_eq!(
+            awards[0].awarded,
+            expected,
+            "content with {} trimmed scalars at {seconds}s",
+            content.trim().chars().count()
+        );
+    }
+    let granted: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(xp), 0)::bigint FROM xp_awards")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(granted, 30, "only the two >=8-scalar controls earn");
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or credential-free CI service"]
+async fn embed_and_attachment_messages_keep_existing_award_behavior() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let pipeline = delivered_pipeline(db.pool.clone(), &mock);
+
+    // Empty content with an attachment is not a short message.
+    let attached = pipeline
+        .handle_at(
+            &shaped_message(0, "", "attachment"),
+            &at(0),
+            MessageEligibility::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        attached[0].awarded, 15,
+        "an attachment-only message keeps the existing award"
+    );
+
+    // A 2-char body with an embed is not a short message either.
+    let embedded = pipeline
+        .handle_at(
+            &shaped_message(120, "hi", "embed"),
+            &at(120),
+            MessageEligibility::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        embedded[0].awarded, 15,
+        "a short body with an embed keeps the existing award"
+    );
+
+    assert_eq!(
+        message_award_rows(&db.pool).await,
+        vec![(15, None), (15, None)],
+        "both controls leave plain granted rows, no short-message audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or credential-free CI service"]
+async fn unavailable_content_keeps_unavailable_not_known_short_behavior() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    // No set_message_content_delivered(true): this pipeline's shard did not
+    // subscribe MESSAGE_CONTENT, so the shape is unknown rather than a
+    // known empty/short message. Existing unavailable-content behavior is
+    // preserved: the message awards as before, with no new intent asked.
+    let pipeline = OrderedLevelingPipeline::new(
+        MemStore::new(),
+        Some(runtime(db.pool.clone(), &mock, OnboardingMode::Legacy)),
+    );
+
+    let unknown = pipeline
+        .handle_at(
+            &shaped_message(0, "hi", "plain"),
+            &at(0),
+            MessageEligibility::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown[0].awarded, 15,
+        "unknown shape (content not delivered) keeps the existing award"
+    );
+    assert_eq!(
+        message_award_rows(&db.pool).await,
+        vec![(15, None)],
+        "no short-message audit row for an unknown shape"
+    );
     mock.shutdown().await;
     db.close().await;
 }

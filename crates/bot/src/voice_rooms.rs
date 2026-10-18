@@ -47,7 +47,7 @@ use twilight_model::{
         interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
     },
     id::{
-        marker::{AttachmentMarker, RoleMarker, UserMarker},
+        marker::{AttachmentMarker, GuildMarker, RoleMarker, UserMarker},
         Id,
     },
 };
@@ -1332,6 +1332,12 @@ fn wall_ms() -> u64 {
 #[derive(Debug, Default)]
 pub(crate) struct LiveState {
     ready: bool,
+    /// When the gateway last reported itself connected (READY or RESUMED
+    /// handled) while this live view was still not ready. `None` while the
+    /// view is ready or the transport is down. Joins are silently dropped
+    /// for as long as this is set, so its age is exported per actor tick as
+    /// `two_bot_voice_live_not_ready_seconds` for the host watchdog.
+    not_ready_since: Option<tokio::time::Instant>,
     generation: u64,
     next_transition: u64,
     next_channel_revision: u64,
@@ -1738,6 +1744,7 @@ impl LiveGuild {
             live.refresh_empty_since(channel);
         }
         live.ready = true;
+        live.not_ready_since = None;
         true
     }
 
@@ -1746,6 +1753,34 @@ impl LiveGuild {
         live.ready = false;
         live.generation += 1;
         live.empty_since.clear();
+    }
+
+    /// Transport loss: the view is not ready, and that is expected until the
+    /// next READY/RESUMED, so the not-ready-while-connected clock stops too.
+    pub fn transport_lost(&self) {
+        self.disconnect();
+        self.write_state().not_ready_since = None;
+    }
+
+    /// The gateway is connected again (READY or RESUMED handled). A view
+    /// that is still not ready starts (or keeps) its not-ready clock; the
+    /// first stamp wins so repeated heal attempts cannot reset the age.
+    pub fn gateway_connected(&self, now: tokio::time::Instant) {
+        let mut live = self.write_state();
+        if !live.ready {
+            live.not_ready_since.get_or_insert(now);
+        }
+    }
+
+    /// Whole seconds this view has been not ready while the gateway was
+    /// connected; 0 while ready or while the transport is down.
+    #[must_use]
+    pub fn not_ready_secs(&self, now: tokio::time::Instant) -> u64 {
+        let live = self.read_state();
+        match live.not_ready_since {
+            Some(since) if !live.ready => now.saturating_duration_since(since).as_secs(),
+            _ => 0,
+        }
     }
 
     /// V10 health check: the bot's missing Manage Channels, Move Members,
@@ -2650,6 +2685,16 @@ pub struct GuildRoomWorker<S, H> {
     name_settings_loaded: bool,
     /// Actor clock of the last settings read (periodic reload).
     name_settings_read_ms: Option<u64>,
+    /// Boot fallback for the empty-room grace (`TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS`
+    /// at boot). A stored per-guild row overrides it live; unset and
+    /// out-of-range rows keep it.
+    empty_grace_fallback: Duration,
+    /// Revision of the live snapshot the empty grace was last resolved from.
+    /// Revision-gated so steady-state maintenance costs two mutex reads.
+    empty_grace_revision: Option<i64>,
+    /// Live-settings source for the stored empty-grace override (production
+    /// poller snapshot; tests resolve explicit snapshots instead).
+    live_source: Arc<dyn Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync>,
     /// Cheap fingerprint of every input automatic names depend on; an idle
     /// guild skips the per-room work entirely.
     name_inputs: Option<u64>,
@@ -2967,6 +3012,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         let guild_id = live.guild_id;
         let creators_generation = live.read_state().generation;
+        let empty_grace_fallback = live.read_state().empty_grace.unwrap_or(EMPTY_ROOM_GRACE);
         let worker = Self {
             live,
             store,
@@ -2998,6 +3044,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             name_signatures: HashMap::new(),
             name_settings_loaded,
             name_settings_read_ms: None,
+            empty_grace_fallback,
+            empty_grace_revision: None,
+            live_source: Arc::new(|| None),
             name_inputs: None,
             room_status: HashMap::new(),
             pending_status: HashMap::new(),
@@ -3051,6 +3100,31 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             );
         }
         Ok(worker)
+    }
+
+    /// Re-resolve the empty-room grace from the live snapshot. Revision-gated,
+    /// so steady-state calls cost two mutex reads. A stored change applies
+    /// without a restart; unset and out-of-range rows keep the boot fallback.
+    /// Tests pass an explicit snapshot pair.
+    pub(crate) fn refresh_empty_grace_with(
+        &mut self,
+        live: Option<&two_bot_core::settings::LiveSettings>,
+    ) {
+        let revision = live.map(|live| live.revision());
+        if self.empty_grace_revision == revision {
+            return;
+        }
+        self.empty_grace_revision = revision;
+        let guild = self.live.guild_id.to_string();
+        let grace = stored_empty_grace_with(&guild, self.empty_grace_fallback, live);
+        self.live.set_empty_grace(grace);
+    }
+
+    /// Refresh from the runtime's live-settings source (production poller
+    /// snapshot; no reader in tests, so the boot fallback stands).
+    pub(crate) fn refresh_empty_grace(&mut self) {
+        let live = (self.live_source)();
+        self.refresh_empty_grace_with(live.as_ref());
     }
 
     /// Run the create-path name filter under `policy` from here on.
@@ -7053,6 +7127,10 @@ pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,
     enabled: bool,
+    /// Live-settings source for the per-guild empty-grace override. Production
+    /// reads the settings-poller snapshot; tests default to no reader (boot
+    /// fallback, byte-identical).
+    live_source: Arc<dyn Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync>,
     protected_channels: HashSet<Snowflake>,
     /// Boot creator set (the generator channel): copied into each new actor's
     /// `creator_channels` alongside the store creators loaded later.
@@ -7061,6 +7139,11 @@ pub struct VoiceRuntime<S, H> {
     synthetic_humans: HashSet<Snowflake>,
     seeds: AtomicU64,
     actors: Mutex<HashMap<Snowflake, GuildActor>>,
+    /// The gateway is connected as far as voice is concerned: set once READY
+    /// or RESUMED is handled, cleared by every transport `disconnect`. While
+    /// set, a live view that is not ready is a fault, not an outage, and
+    /// every dispatch retries the cached snapshot (see `heal_not_ready`).
+    gateway_connected: AtomicBool,
     /// Serializes `/access` read-modify-write cycles so two admins cannot
     /// overwrite each other's change (rare, admin-only, so one lock is enough).
     access_lock: tokio::sync::Mutex<()>,
@@ -7095,12 +7178,14 @@ where
             make: Arc::new(make),
             tick,
             enabled,
+            live_source: Arc::new(|| None),
             protected_channels: HashSet::new(),
             creator_channels: HashSet::new(),
             empty_grace: None,
             synthetic_humans: HashSet::new(),
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
+            gateway_connected: AtomicBool::new(false),
             access_lock: tokio::sync::Mutex::new(()),
             pending_imports: Mutex::new(HashMap::new()),
             name_policy: Arc::new(AutomodPolicy::default()),
@@ -7133,6 +7218,17 @@ where
     /// production; fixtures shorten it for unrelated lifecycle races).
     pub fn with_empty_grace(mut self, grace: Duration) -> Self {
         self.empty_grace = Some(grace);
+        self
+    }
+
+    /// Live-settings source for the stored per-guild empty-grace override.
+    /// Production passes the settings-poller snapshot reader; tests keep the
+    /// default (no reader, boot fallback).
+    pub fn with_live_source(
+        mut self,
+        source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
+    ) -> Self {
+        self.live_source = Arc::new(source);
         self
     }
 
@@ -7270,9 +7366,21 @@ where
         actor
             .live
             .protect_creators(self.creator_channels.iter().copied());
-        if let Some(grace) = self.empty_grace {
+        // Boot fallback first, then the stored per-guild override: a stored
+        // change reaches new actors without a restart; unset and out-of-range
+        // rows keep the boot value.
+        let fallback = self.empty_grace.unwrap_or(EMPTY_ROOM_GRACE);
+        let guild_id = guild.to_string();
+        let snapshot = (self.live_source)();
+        let stored = snapshot
+            .as_ref()
+            .and_then(|live| live.get(&guild_id, EMPTY_GRACE_KEY));
+        let grace = stored_empty_grace_with(&guild_id, fallback, snapshot.as_ref());
+        if self.empty_grace.is_some() || stored.is_some() {
             actor.live.set_empty_grace(grace);
         }
+        // Else leave `empty_grace` unset: `empty_grace_elapsed` falls back to
+        // `EMPTY_ROOM_GRACE`, byte-identical to today.
         let synthetic = synthetic_humans_for(guild, &self.synthetic_humans);
         if !synthetic.is_empty() {
             actor.live.set_synthetic_humans(synthetic);
@@ -7281,6 +7389,7 @@ where
         let make = Arc::clone(&self.make);
         let tick = self.tick;
         let name_policy = Arc::clone(&self.name_policy);
+        let live_source = Arc::clone(&self.live_source);
         tokio::spawn(async move {
             let (store, http) = make();
             let guild_id = live.guild_id;
@@ -7292,6 +7401,15 @@ where
                 }
             };
             let mut worker = worker.with_name_policy(name_policy);
+            worker.live_source = live_source;
+            // `load` captures the fallback from the shared live state, which
+            // already holds the stored override here; restore the true boot
+            // value so a later row removal or out-of-range edit falls back
+            // to boot, not to the stale stored grace.
+            worker.empty_grace_fallback = fallback;
+            // Apply the stored override at spawn; later stored changes arrive
+            // through the maintenance refresh without a restart.
+            worker.refresh_empty_grace();
             run_actor(&mut worker, rx, tick).await;
         });
         actors.insert(guild, actor.clone());
@@ -7314,6 +7432,64 @@ where
             return false;
         };
         actor.live.publish(snapshot) && actor.tx.send(ActorCommand::Reconcile).is_ok()
+    }
+
+    /// READY or RESUMED was handled: the gateway is connected again. Any
+    /// known live view still not ready now starts its not-ready clock.
+    fn gateway_now_connected(&self) {
+        self.gateway_connected.store(true, Ordering::Release);
+        let now = tokio::time::Instant::now();
+        for actor in self.actors.lock().expect("voice runtime lock").values() {
+            actor.live.gateway_connected(now);
+        }
+    }
+
+    /// Self-correction for a live view left not ready while the gateway is
+    /// connected (no RESUMED/GUILD_CREATE publish will come for it). Every
+    /// dispatch retries the complete post-update cached snapshot; until one
+    /// publishes, joins in that guild are dropped and the actor tick exports
+    /// the age as `two_bot_voice_live_not_ready_seconds`.
+    ///
+    /// `joining` is the member of the VOICE_STATE_UPDATE being handled. The
+    /// cache already holds its new channel, so it is left out of the snapshot
+    /// and the frame that follows is still a transition that can ticket.
+    fn heal_not_ready(
+        &self,
+        cache: &DefaultInMemoryCache,
+        joining: Option<(Snowflake, Snowflake)>,
+    ) {
+        if !self.gateway_connected.load(Ordering::Acquire) {
+            return;
+        }
+        let stuck: Vec<Snowflake> = self
+            .actors
+            .lock()
+            .expect("voice runtime lock")
+            .iter()
+            .filter(|(_, actor)| !actor.live.read_state().ready)
+            .map(|(guild, _)| *guild)
+            .collect();
+        for guild_id in stuck {
+            let healed = snapshot_from_cache(cache, guild_id).is_some_and(|mut snapshot| {
+                if let Some((guild, member)) = joining {
+                    if guild == guild_id {
+                        snapshot
+                            .members
+                            .retain(|occupant| occupant.member_id != member);
+                    }
+                }
+                self.publish_snapshot(guild_id, snapshot)
+            });
+            if healed {
+                metrics::global().voice_live_self_heal();
+                warn!(
+                    guild = guild_id.to_string(),
+                    "voice live view was not ready on a connected gateway; republished from cache"
+                );
+            } else if let Some(actor) = self.live_actor(guild_id) {
+                actor.live.gateway_connected(tokio::time::Instant::now());
+            }
+        }
     }
 
     /// Feed one voice transition to an existing actor. Returns false when the
@@ -7712,8 +7888,11 @@ where
     }
 
     pub fn disconnect(&self) {
+        // Clear before invalidating the views so a concurrent dispatch
+        // cannot heal a view this transport loss is about to invalidate.
+        self.gateway_connected.store(false, Ordering::Release);
         for actor in self.actors.lock().expect("voice runtime lock").values() {
-            actor.live.disconnect();
+            actor.live.transport_lost();
         }
         // Game-activity wiring: transport loss invalidates live voice state,
         // so open spans close here instead of covering the offline gap.
@@ -7769,7 +7948,23 @@ where
         if !self.enabled {
             return;
         }
+        // READY, RESUMED and GUILD_CREATE publish (or wait for) snapshots
+        // themselves; every other dispatch on a connected gateway retries a
+        // live view that was left not ready.
         match event {
+            Event::Ready(_) | Event::Resumed | Event::GuildCreate(_) => {}
+            Event::VoiceStateUpdate(update) => self.heal_not_ready(
+                cache,
+                update
+                    .guild_id
+                    .map(|guild| (guild.get(), update.user_id.get())),
+            ),
+            _ => self.heal_not_ready(cache, None),
+        }
+        match event {
+            // Fresh session: GUILD_CREATE follows with complete state; until
+            // it publishes, known views count as not ready while connected.
+            Event::Ready(_) => self.gateway_now_connected(),
             Event::GuildCreate(gc) => {
                 if let twilight_model::gateway::payload::incoming::GuildCreate::Available(guild) =
                     gc.as_ref()
@@ -7936,8 +8131,27 @@ where
                 // Prefer the event's role list when the cache has not caught up.
                 let roles =
                     roles.or_else(|| Some(updated.roles.iter().map(|id| id.get()).collect()));
+                // A nickname change renders into `@@owner@@` rooms: forward it
+                // as a display update so the worker's directory (which the
+                // background re-render reads) never stays behind the fresh
+                // directory a `/name` submit just rendered from. Read the name
+                // from the event itself, not the cache, so a lagging cache
+                // cannot re-apply the old nickname.
+                let display = updated
+                    .nick
+                    .clone()
+                    .filter(|nick| !nick.is_empty())
+                    .or_else(|| {
+                        updated
+                            .user
+                            .global_name
+                            .clone()
+                            .filter(|name| !name.is_empty())
+                    })
+                    .unwrap_or_else(|| updated.user.name.clone());
                 if let Some(actor) = self.live_actor(guild_id) {
                     actor.live.set_member_roles(member_id, roles);
+                    let _ = actor.tx.send(ActorCommand::Display { member_id, display });
                 }
             }
             // A warm RESUME replays missed dispatches before RESUMED; only then
@@ -7964,6 +8178,7 @@ where
                         }
                     }
                 }
+                self.gateway_now_connected();
             }
             Event::GuildDelete(deleted) => {
                 self.remove_guild(deleted.id.get());
@@ -8095,6 +8310,11 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(
         .map_or(0, |age| age.as_secs());
     let gauges = metrics::global();
     gauges.set_voice_actor_halted(guild, generation, worker.halted());
+    gauges.set_voice_actor_live_not_ready(
+        guild,
+        generation,
+        worker.live.not_ready_secs(tokio::time::Instant::now()),
+    );
     gauges.set_voice_creator_map(
         worker.creators_generation,
         creator_map_age_secs(worker.creators_merged_ms, now_ms),
@@ -8433,6 +8653,9 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 // the watchdog sibling would keep ageing the pre-merge stamp.
                 stall.snapshot(worker, last_progress);
                 worker.reload_name_settings(now_ms).await;
+                // A stored empty-grace change applies without a restart;
+                // revision-gated so steady-state ticks stay cheap.
+                worker.refresh_empty_grace();
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
                 dispatch_budget = 8;
@@ -8592,6 +8815,7 @@ pub fn build_production_runtime(
     token: &str,
     pool: sqlx::PgPool,
     name_policy: AutomodPolicy,
+    live_source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
     // Malformed protection IDs refuse the whole runtime. The gateway reports it
     // through its cataloged `voice HTTP setup failed` event.
@@ -8625,7 +8849,8 @@ pub fn build_production_runtime(
             .with_creator_channels(generator.into_iter().collect())
             .with_empty_grace(empty_grace)
             .with_synthetic_humans(synthetic_humans)
-            .with_name_policy(name_policy),
+            .with_name_policy(name_policy)
+            .with_live_source(live_source),
         ),
         Arc::new(replies),
     ))
@@ -8654,6 +8879,50 @@ pub fn configured_empty_grace(value: Option<&str>) -> Result<Duration, InvalidEm
 /// `0..=600`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidEmptyGrace;
+
+/// The stored per-guild empty-grace key served from the live settings snapshot.
+pub(crate) const EMPTY_GRACE_KEY: &str = "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS";
+
+/// Effective empty-room grace: the stored per-guild value wins over the boot
+/// fallback, an absent/malformed/out-of-range stored value falls back
+/// (store-first, like the feed interval). Pure for tests via `live`.
+pub(crate) fn stored_empty_grace_with(
+    guild: &str,
+    fallback: Duration,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> Duration {
+    let Some(live) = live else {
+        return fallback;
+    };
+    let Some(value) = live.get(guild, EMPTY_GRACE_KEY) else {
+        return fallback;
+    };
+    let seconds: Option<u64> = match &value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                trimmed.parse::<u64>().ok()
+            }
+        }
+        _ => None,
+    };
+    match seconds {
+        Some(seconds) if seconds <= MAX_EMPTY_ROOM_GRACE_SECONDS => Duration::from_secs(seconds),
+        _ => {
+            warn!(
+                guild = guild.to_string(),
+                key = EMPTY_GRACE_KEY,
+                reason = "out_of_range",
+                value = %value,
+                "stored empty-grace override out of range; using boot fallback"
+            );
+            fallback
+        }
+    }
+}
 
 /// The synthetic test identities a guild's actor may use: none for the live
 /// guild, whatever `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` says.
@@ -8711,8 +8980,7 @@ fn snapshot_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Opt
         .iter()
         .filter_map(|id| cache.channel(*id).map(|channel| channel.value().clone()))
         .collect();
-    let members: Vec<VoiceMember> = cache
-        .guild_voice_states(guild_key)?
+    let members: Vec<VoiceMember> = guild_voice_users(cache, guild_key)?
         .iter()
         .filter_map(|user_id| {
             let state = cache.voice_state(*user_id, guild_key)?;
@@ -8742,6 +9010,32 @@ fn snapshot_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Opt
         bot: bot_access_from_cache(cache, guild_id)?,
         member_roles,
     })
+}
+
+/// Members the cache holds in voice for a cached guild. GUILD_CREATE always
+/// installs the guild's voice-state set (empty when nobody is in voice), but
+/// Twilight removes that set again when the guild's last voice member leaves
+/// and only re-creates it on the next join. For a guild the cache holds, with
+/// voice states cached, a missing set therefore means "nobody in voice", not
+/// "not loaded yet": reading it as `None` left the live view unpublished
+/// after a warm RESUME into an empty guild, silently dropping every later
+/// creator join until a restart. `None` only when voice states are not
+/// cached at all, so the snapshot can never claim completeness it lacks.
+fn guild_voice_users(
+    cache: &DefaultInMemoryCache,
+    guild_key: Id<GuildMarker>,
+) -> Option<Vec<Id<UserMarker>>> {
+    match cache.guild_voice_states(guild_key) {
+        Some(users) => Some(users.iter().copied().collect()),
+        None if cache
+            .config()
+            .resource_types()
+            .contains(twilight_cache_inmemory::ResourceType::VOICE_STATE) =>
+        {
+            Some(Vec::new())
+        }
+        None => None,
+    }
 }
 
 fn bot_access_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Option<BotAccess> {

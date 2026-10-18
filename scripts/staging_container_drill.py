@@ -329,7 +329,7 @@ class Drill:
         self.log(f"{name} {iso(moment)}")
         return moment
 
-    def deploy_image(self, image, label):
+    def deploy_image(self, image, label, source_sha):
         """Full-container deploy of the pinned pre-built image, no rebuild.
 
         The deploy config is generated from the reviewed `wrangler.toml` on
@@ -337,12 +337,14 @@ class Drill:
         registry reference (Cloudflare docs: for a registry image
         `wrangler deploy` uses the configured reference without building).
         Old source is never checked out and no Dockerfile is rebuilt.
+        The version is stamped with the pinned source SHA (`--message`) so
+        the drill leg keeps its provenance receipt.
         Wrangler's own output may carry paths or gleamed config, so it is
         discarded: only the exit code and duration are recorded.
         """
         generate_deploy_config(self.deploy_path, image, self.wrangler_dir)
         started = self.now()
-        returncode = self.deploy(self.deploy_path)
+        returncode = self.deploy(self.deploy_path, source_sha)
         elapsed = round(self.now() - started, 1)
         require(returncode == 0, "deploy_failed",
                 f"elapsed={elapsed} code={returncode}")
@@ -592,7 +594,7 @@ class Drill:
         fenced = self.stamp(f"{name}: fenced")
         leg["fenced"] = iso(fenced)
         if serving_image(self.client, rollout.application(self.client)) != pin["image"]:
-            deployed, deploy_elapsed = self.deploy_image(pin["image"], name)
+            deployed, deploy_elapsed = self.deploy_image(pin["image"], name, pin["source_sha"])
             expect_rollout = True
         else:
             # Restore after a refused backout deploy: the baseline still serves.
@@ -750,13 +752,18 @@ WRANGLER_ENV_KEYS = ("PATH", "HOME", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT
 
 
 def wrangler_deploy(wrangler_bin, wrangler_dir, environ):
-    """Deploy closure: pinned wrangler binary, discarded output, exit code only."""
+    """Deploy closure: pinned wrangler binary, discarded output, exit code only.
+
+    The deployed version is stamped with the pinned source SHA (`--message`)
+    so the drill leg keeps its provenance receipt.
+    """
     child_env = {key: environ[key] for key in WRANGLER_ENV_KEYS if key in environ}
 
-    def deploy(config_path):
+    def deploy(config_path, message_sha):
         try:
             result = subprocess.run(
-                [wrangler_bin, "deploy", "--config", config_path, "--env", "staging"],
+                [wrangler_bin, "deploy", "--config", config_path, "--env", "staging",
+                 "--message", message_sha],
                 cwd=wrangler_dir, env=child_env, capture_output=True,
                 timeout=WRANGLER_TIMEOUT_SECONDS)
         except (OSError, subprocess.SubprocessError):

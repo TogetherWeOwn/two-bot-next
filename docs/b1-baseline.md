@@ -132,8 +132,8 @@ unpacked snapshots and is logged separately, not compared to that ceiling.
 See [Docker's store documentation](https://docs.docker.com/engine/storage/containerd/)
 and [Moby's layer-history implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_history.go).
 The 112 MiB image ceiling is unchanged. The binary budget was 15 MiB at the
-2026-10-01 calibration and is now 16 MiB; the 2026-10-10 measurements below
-explain the tighter tripwire.
+2026-10-01 calibration and is now 17 MiB (2026-10-17 recalibration below);
+the 2026-10-10 measurements record the tighter tripwire it replaced.
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
 at source `307b50708ec42e8fc4744c1b804216a22a17625e`. The 2026-09-30
@@ -156,14 +156,31 @@ tripwire without wedging ordinary code changes. A later event-executors head
 measured 15,770,928 bytes (15.04 MiB) in the [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38062362788/job/114254309361),
 42,288 bytes above the former ceiling. The internal-actions families (event
 executors plus channel-moderation union) measured 15,741,344 bytes (15.01 MiB).
-The 16 MiB working tripwire leaves 1,006,288 bytes (0.96 MiB, 6.4%) above the
+The then-current 16 MiB working tripwire left 1,006,288 bytes (0.96 MiB, 6.4%) above the
 event-executors measurement. No new dependencies or release-profile changes;
 revisit if the binary approaches the limit. The 112 MiB image ceiling is
 unchanged.
 
+On 2026-10-17 the 16 MiB ceiling was reached: main at `f2baa19` measured
+16,776,096 bytes (1,120 bytes of headroom), and the stream delivered-dedup
+expiry slice (PR #1079, `ac8fd66`) added 1,280 bytes with no new dependencies,
+measuring 16,777,376 bytes — 160 bytes over the ceiling on hosted CI and
+failing the check workflow on main twice, including a re-run of the failed
+jobs. The release profile is already minimal (opt-level=z, lto, strip), so
+the binary ceiling moves to 17 MiB; revisit if the binary approaches it. The
+112 MiB image ceiling is unchanged (42.43 MiB measured on the same builds).
+
+On 2026-10-17, the landed slices since the 16 MiB bump consumed its headroom:
+main at `89c859b1` measured 16,777,376 bytes (16.00 MiB), 160 bytes over the
+ceiling, so the gate trips on main itself. The moderation-enforcement-outcomes
+head measured 16,778,152 bytes (16.00 MiB), 936 bytes over, with no new
+dependencies and the same minimal release profile. The budget is therefore
+rebumped to 17 MiB, leaving about 1 MiB of headroom above the measured heads;
+revisit if the binary approaches it. The 112 MiB image ceiling is unchanged.
+
 This branch's automation-only head separately measured 15,769,872 bytes
-(15.04 MiB) before the event-executor merge. This PR keeps the current-main
-16 MiB binary ceiling; the combined exact-head CI measurement is still
+(15.04 MiB) before the event-executor merge. This PR raises the binary
+ceiling to 17 MiB; the combined exact-head CI measurement is still
 required.
 
 ### Docker history image measurement and immutable-ID pinning
@@ -202,7 +219,7 @@ The unused streamed-archive helper and its archive-specific builders/tests
 have been removed in favor of main's history metric; the smoke/runtime
 contract fixtures remain.
 
-The 112 MiB image ceiling is unchanged; the release-binary ceiling is 16 MiB
+The 112 MiB image ceiling is unchanged; the release-binary ceiling is 17 MiB
 (see the current calibration above). CI on this PR's exact head must still
 record the corrected image size and pass the runtime contract and both
 one-byte-budget negative checks; fixture success alone cannot establish

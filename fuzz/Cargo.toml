@@ -137,6 +137,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "custom_command_template"
+path = "fuzz_targets/custom_command_template.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "self_role_custom_id"
 path = "fuzz_targets/self_role_custom_id.rs"
 test = false
@@ -146,6 +153,13 @@ bench = false
 [[bin]]
 name = "helix_subscription_listing"
 path = "fuzz_targets/helix_subscription_listing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "voice_assistant_reply"
+path = "fuzz_targets/voice_assistant_reply.rs"
 test = false
 doc = false
 bench = false

@@ -18,7 +18,9 @@ use two_bot_discord::{ActionExecutor, JoinObservation, JoinObserver};
 
 use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
 use crate::gateway::ensure_crypto_provider;
-use crate::join_risk_runtime::{self, AntiNukeFences, Fanout, JoinRiskSettings, SettingsSource};
+use crate::join_risk_runtime::{
+    self, AntiNukeFences, Fanout, JoinRiskSettings, JoinRiskTuningRefusal, SettingsSource,
+};
 
 const GUILD: u64 = 22;
 const CHANNEL: &str = "12";
@@ -83,7 +85,9 @@ fn join_risk_armed_needs_explicit_dry_run_zero_outside_session_mode() {
 
 #[test]
 fn join_risk_settings_defaults_and_bad_values() {
-    let defaults = JoinRiskSettings::from_vars(&vars(&[]));
+    // Absent keys keep the shipped defaults.
+    let defaults =
+        JoinRiskSettings::try_from_vars(&vars(&[])).expect("absent keys are not a refusal");
     assert_eq!(
         defaults.tuning,
         RaidTuning::new(60.0, 5.0).unwrap(),
@@ -92,30 +96,63 @@ fn join_risk_settings_defaults_and_bad_values() {
     assert_eq!(defaults.bulk_join_window_until_ms, None);
     assert_eq!(defaults.staff_channel, None);
 
-    let set = JoinRiskSettings::from_vars(&vars(&[
+    let set = JoinRiskSettings::try_from_vars(&vars(&[
         ("TWO_JOIN_RISK_THRESHOLD", "8"),
         ("TWO_JOIN_RISK_WINDOW_SECONDS", "30.5"),
         ("TWO_BULK_JOIN_WINDOW_UNTIL", "1790780400000"),
         ("DISCORD_STAFF_ALERT_CHANNEL_ID", "123456789012345678"),
-    ]));
+    ]))
+    .expect("valid present values read");
     assert_eq!(set.tuning, RaidTuning::new(30.5, 8.0).unwrap());
     assert_eq!(set.bulk_join_window_until_ms, Some(1_790_780_400_000));
     assert_eq!(set.staff_channel.as_deref(), Some("123456789012345678"));
 
-    // Unusable numbers never disable scoring or invent a bulk window.
-    for bad in ["0", "-3", "abc", "NaN", "inf"] {
-        let parsed = JoinRiskSettings::from_vars(&vars(&[
-            ("TWO_JOIN_RISK_THRESHOLD", bad),
-            ("TWO_JOIN_RISK_WINDOW_SECONDS", bad),
-            ("TWO_BULK_JOIN_WINDOW_UNTIL", bad),
-        ]));
-        assert_eq!(parsed.tuning, RaidTuning::new(60.0, 5.0).unwrap(), "{bad}");
-        assert_eq!(parsed.bulk_join_window_until_ms, None, "{bad}");
+    // Present-but-unusable values refuse with the refusing key named, never
+    // silent defaults. The refusal Display names the key without echoing it.
+    let refused = |pairs: &[(&str, &str)]| -> JoinRiskTuningRefusal {
+        let err = JoinRiskSettings::try_from_vars(&vars(pairs))
+            .expect_err("present-but-unusable tuning must refuse, not default");
+        assert!(
+            format!("{err}").contains(err.key()),
+            "refusal Display must name the key: {err}"
+        );
+        err
+    };
+    for bad in ["0", "-3", "abc", "NaN", "inf", "-inf", "1e999"] {
+        assert_eq!(
+            refused(&[("TWO_JOIN_RISK_WINDOW_SECONDS", bad)]).key(),
+            "TWO_JOIN_RISK_WINDOW_SECONDS",
+            "window {bad:?} refuses, never defaults to 60s"
+        );
+        assert_eq!(
+            refused(&[("TWO_JOIN_RISK_THRESHOLD", bad)]).key(),
+            "TWO_JOIN_RISK_THRESHOLD",
+            "threshold {bad:?} refuses, never defaults to 5.0"
+        );
     }
-    for bad in ["not-a-channel", "1234567890123456789012"] {
-        let parsed = JoinRiskSettings::from_vars(&vars(&[("DISCORD_STAFF_ALERT_CHANNEL_ID", bad)]));
-        assert_eq!(parsed.staff_channel, None, "{bad}");
+    for bad in ["abc", "0", "-3", "1.5", "NaN"] {
+        assert_eq!(
+            refused(&[("TWO_BULK_JOIN_WINDOW_UNTIL", bad)]).key(),
+            "TWO_BULK_JOIN_WINDOW_UNTIL",
+            "bulk-until {bad:?} refuses, never reads as no bulk window"
+        );
     }
+    for bad in ["not-a-channel", "123", "1234567890123456789012"] {
+        assert_eq!(
+            refused(&[("DISCORD_STAFF_ALERT_CHANNEL_ID", bad)]).key(),
+            "DISCORD_STAFF_ALERT_CHANNEL_ID",
+            "channel {bad:?} refuses, never reads as log-only"
+        );
+    }
+    // Both tuning numbers unusable: the window (evaluated first) is named.
+    assert_eq!(
+        refused(&[
+            ("TWO_JOIN_RISK_WINDOW_SECONDS", "0"),
+            ("TWO_JOIN_RISK_THRESHOLD", "-1")
+        ])
+        .key(),
+        "TWO_JOIN_RISK_WINDOW_SECONDS"
+    );
 }
 
 #[test]
@@ -257,8 +294,8 @@ fn executor(mock: &MockRest) -> ActionExecutor {
 struct Scripted(JoinRiskSettings);
 
 impl SettingsSource for Scripted {
-    async fn current(&mut self) -> JoinRiskSettings {
-        self.0.clone()
+    async fn current(&mut self) -> Result<JoinRiskSettings, JoinRiskTuningRefusal> {
+        Ok(self.0.clone())
     }
 }
 
