@@ -142,7 +142,7 @@ jobs:
       - name: Guarded fixture routing and doc references (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
       - name: Cache cargo
@@ -255,11 +255,13 @@ jobs:
           --skip claim_is_owned_once_then_in_flight
           --skip failed_send_releases_the_claim_for_the_retry
           --skip delivered_rows_are_never_reclaimed
+          --skip delivered_rows_expire_only_past_the_horizon_with_the_fence_intact
           --skip fresh_claim_cannot_be_reclaimed
           --skip stale_unposted_claim_is_taken_over_atomically
           --skip started_claim_is_never_reclaimed_even_when_stale
           --skip started_send_that_provably_failed_releases_for_the_retry
           --skip reclaiming_a_missing_key_claims_it_fresh
+          --skip delivered_rows_expire_only_past_the_horizon_with_the_fence_intact
           --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
           --skip mock_delivery_crash_reconciliation_restart_and_overflow
           --skip parity_mismatch_cursor_and_read_only_acceptance

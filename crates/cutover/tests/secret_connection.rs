@@ -201,6 +201,292 @@ async fn connection_errors_and_their_source_chains_never_echo_urls() {
     }
 }
 
+/// Legacy explicit-connection hostile keys never reach SQLx WARN logs.
+/// `guarded_target(allow_live=true)` exercises the same `explicit_connection`
+/// parse path the operator fence relies on; no environment is mutated here.
+#[test]
+fn legacy_explicit_hostile_query_keys_rejected_before_driver_logs() {
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        for query in [
+            "API_KEY=fixture-query-secret",
+            "api%5Fkey=fixture-query-secret",
+            "API%5FKEY=fixture-query-secret",
+            "SSLMODE=require",
+            "sslmode=require&API_KEY=fixture-query-secret",
+        ] {
+            let url = format!("postgres://operator:explicit@live.invalid:5432/bot?{query}");
+            let error =
+                two_bot_cutover::legacy_copy::options::guarded_target(&url, true).unwrap_err();
+            assert!(
+                !error.contains("fixture"),
+                "legacy rejection echoed the query value"
+            );
+        }
+        tracing::warn!("capture remains active");
+    });
+    let text = capture.text();
+    assert!(text.contains("capture remains active"));
+    assert!(!text.contains("fixture-query-secret"));
+    assert!(!text.contains("ignoring unrecognized connect parameter"));
+}
+
+/// Shared-parser child: a well-formed synthetic PGPASSFILE entry supplies the
+/// password through the silenced parse without reaching logs.
+#[test]
+fn shared_parser_valid_passfile_child() {
+    if std::env::var("CUTOVER_SHARED_VALID_PROBE").is_err() {
+        return;
+    }
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let options = two_bot_core::database_url::connect_options(
+            "postgres://fixture-user@agent-testdb/db?sslmode=disable",
+        )
+        .unwrap();
+        // `PgConnectOptions` derives `Debug` with the password visible
+        // in-memory; the assertion message itself carries no credential.
+        let debug = format!("{options:?}");
+        assert!(
+            debug.contains("fixture-valid-pass"),
+            "valid passfile entry did not supply password"
+        );
+        tracing::warn!("capture remains active");
+    });
+    let text = capture.text();
+    assert!(text.contains("capture remains active"));
+    assert!(!text.contains("fixture-valid-pass"));
+    assert!(!text.contains("Malformed line in pgpass file"));
+}
+
+/// Parent: run the shared-parser valid-passfile probe isolated from the
+/// host's real HOME/passfile with only synthetic fixtures.
+#[test]
+fn shared_parser_valid_passfile_supplies_password() {
+    if std::env::var("CUTOVER_SHARED_VALID_PROBE").is_ok() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "two-bot-shared-valid-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("probe scratch dir");
+    let passfile = dir.join("pgpass");
+    std::fs::write(
+        &passfile,
+        "agent-testdb:5432:db:fixture-user:fixture-valid-pass\n",
+    )
+    .expect("write synthetic passfile fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&passfile, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only passfile fixture");
+    }
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).expect("empty probe HOME");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "shared_parser_valid_passfile_child",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("CUTOVER_SHARED_VALID_PROBE", "1")
+        .env("PGPASSFILE", &passfile)
+        .env("HOME", &home)
+        .env_remove("PGPASSWORD")
+        .env_remove("PGOPTIONS")
+        .env_remove("PGHOST")
+        .env_remove("PGHOSTADDR")
+        .env_remove("PGPORT")
+        .env_remove("PGUSER")
+        .env_remove("PGDATABASE")
+        .output()
+        .expect("run isolated valid-passfile probe");
+    std::fs::remove_dir_all(&dir).ok();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "valid-passfile probe failed: {stderr}"
+    );
+    assert!(!stderr.contains("fixture-valid-pass"));
+    assert!(!stdout.contains("fixture-valid-pass"));
+}
+
+/// Legacy child: explicit empty password clears a valid passfile fallback
+/// (trust-authentication) without logging the entry.
+#[test]
+fn legacy_explicit_empty_clears_passfile_child() {
+    if std::env::var("CUTOVER_LEGACY_CLEAR_PROBE").is_err() {
+        return;
+    }
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let options = two_bot_cutover::legacy_copy::options::guarded_target(
+            "postgres://operator:@live.invalid:5432/bot",
+            true,
+        )
+        .unwrap();
+        let debug = format!("{options:?}");
+        assert!(
+            debug.contains("password: Some(\"\")"),
+            "explicit empty password did not clear passfile fallback"
+        );
+        assert!(
+            !debug.contains("fixture-valid-pass"),
+            "passfile fallback was not cleared"
+        );
+        tracing::warn!("capture remains active");
+    });
+    let text = capture.text();
+    assert!(text.contains("capture remains active"));
+    assert!(!text.contains("fixture-valid-pass"));
+    assert!(!text.contains("Malformed line in pgpass file"));
+}
+
+/// Parent: prove the legacy trust-auth override with a synthetic valid
+/// passfile that would otherwise supply a password.
+#[test]
+fn legacy_explicit_empty_clears_valid_passfile_fallback() {
+    if std::env::var("CUTOVER_LEGACY_CLEAR_PROBE").is_ok() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "two-bot-legacy-clear-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("probe scratch dir");
+    let passfile = dir.join("pgpass");
+    std::fs::write(
+        &passfile,
+        "live.invalid:5432:bot:operator:fixture-valid-pass\n",
+    )
+    .expect("write synthetic passfile fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&passfile, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only passfile fixture");
+    }
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).expect("empty probe HOME");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "legacy_explicit_empty_clears_passfile_child",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("CUTOVER_LEGACY_CLEAR_PROBE", "1")
+        .env("PGPASSFILE", &passfile)
+        .env("HOME", &home)
+        .env_remove("PGPASSWORD")
+        .env_remove("PGOPTIONS")
+        .env_remove("PGHOST")
+        .env_remove("PGHOSTADDR")
+        .env_remove("PGPORT")
+        .env_remove("PGUSER")
+        .env_remove("PGDATABASE")
+        .output()
+        .expect("run isolated legacy-clear probe");
+    std::fs::remove_dir_all(&dir).ok();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "legacy-clear probe failed: {stderr}"
+    );
+    assert!(!stderr.contains("fixture-valid-pass"));
+    assert!(!stdout.contains("fixture-valid-pass"));
+}
+
+/// Legacy child: a malformed synthetic passfile line never reaches WARN logs
+/// through the fenced explicit-connection parse.
+#[test]
+fn legacy_malformed_passfile_child() {
+    if std::env::var("CUTOVER_LEGACY_MALFORMED_PROBE").is_err() {
+        return;
+    }
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let options = two_bot_cutover::legacy_copy::options::guarded_target(
+            "postgres://operator:@live.invalid:5432/bot",
+            true,
+        )
+        .unwrap();
+        let debug = format!("{options:?}");
+        assert!(
+            debug.contains("password: Some(\"\")"),
+            "explicit empty password did not clear after malformed passfile"
+        );
+        tracing::warn!("capture remains active");
+    });
+    let text = capture.text();
+    assert!(text.contains("capture remains active"));
+    assert!(!text.contains("fixture-pgpass-secret"));
+    assert!(!text.contains("Malformed line in pgpass file"));
+}
+
+/// Parent: run the legacy malformed-passfile probe with a synthetic truncated
+/// line and an empty HOME, never the host's real passfile.
+#[test]
+fn legacy_malformed_passfile_never_reaches_warn_logs() {
+    if std::env::var("CUTOVER_LEGACY_MALFORMED_PROBE").is_ok() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "two-bot-legacy-malformed-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("probe scratch dir");
+    let passfile = dir.join("pgpass");
+    std::fs::write(&passfile, "live.invalid:5432:bot:fixture-pgpass-secret\n")
+        .expect("write synthetic passfile fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&passfile, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only passfile fixture");
+    }
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).expect("empty probe HOME");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["legacy_malformed_passfile_child", "--exact", "--nocapture"])
+        .env("CUTOVER_LEGACY_MALFORMED_PROBE", "1")
+        .env("PGPASSFILE", &passfile)
+        .env("HOME", &home)
+        .env_remove("PGPASSWORD")
+        .env_remove("PGOPTIONS")
+        .env_remove("PGHOST")
+        .env_remove("PGHOSTADDR")
+        .env_remove("PGPORT")
+        .env_remove("PGUSER")
+        .env_remove("PGDATABASE")
+        .output()
+        .expect("run isolated legacy-malformed probe");
+    std::fs::remove_dir_all(&dir).ok();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "legacy-malformed probe failed: {stderr}"
+    );
+    assert!(!stderr.contains("fixture-pgpass-secret"));
+    assert!(!stdout.contains("fixture-pgpass-secret"));
+}
+
 /// Threat-model F6 refusals happen before SQLx parses the URL or opens a
 /// socket: the error is a fixed string and no URL part reaches any log level.
 #[test]

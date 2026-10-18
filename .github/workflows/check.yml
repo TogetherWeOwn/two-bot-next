@@ -236,6 +236,8 @@ jobs:
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_probe.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_redirect_refusal.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_history_redirect_refusal.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_voice_synthetic_redirect_refusal.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_token_redirect_gate.py' -v
 
       - name: soak evidence parser (offline, fixtures only)
         run: |
@@ -278,7 +280,7 @@ jobs:
       - name: Install Rust toolchain
         id: toolchain
         if: needs.job-inputs.outputs.rust != 'false'
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -551,7 +553,7 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -908,7 +910,7 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -1247,7 +1249,7 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -1494,7 +1496,7 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         if: needs.job-inputs.outputs.rust != 'false'
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
@@ -1594,7 +1596,7 @@ jobs:
           fetch-depth: 1
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
         # Continue so the retry below can reinstall the same pin; it fails closed.
@@ -1854,7 +1856,7 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
@@ -1928,7 +1930,7 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
@@ -1998,7 +2000,7 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
         # Continue so the retry below can reinstall the same pin; it fails closed.
@@ -2059,7 +2061,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "nightly-2026-10-01" # Pinned nightly for libFuzzer; stable pin stays in rust-toolchain.toml.
           components: rust-src
