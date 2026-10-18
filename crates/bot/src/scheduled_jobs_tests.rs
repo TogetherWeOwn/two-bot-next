@@ -611,6 +611,173 @@ async fn definition_replaced_mid_post_surfaces_a_timed_out_orphan_delete() {
     fixture.close().await.unwrap();
 }
 
+/// Seed a due row with a caller-chosen body, stored verbatim exactly as
+/// a row written before any validate-side screen would already sit in
+/// the table. The ticker — the post boundary — is what must keep such a
+/// stored body from ambushing the channel.
+async fn seed_body(pool: &PgPool, id: &str, due_at: u64, body: &str) {
+    let at = format_iso_ms(T0 - 3_600_000);
+    let stored = put_scheduled(
+        pool,
+        &ScheduledWrite {
+            id: id.to_owned(),
+            guild_id: GUILD.to_owned(),
+            channel_id: CHANNEL.to_owned(),
+            body: body.to_owned(),
+            next_run_at: format_iso_ms(due_at),
+            interval_seconds: None,
+            enabled: true,
+            created_by: "5555".to_owned(),
+            created_at: at.clone(),
+            updated_by: "5555".to_owned(),
+            updated_at: at,
+        },
+    )
+    .await
+    .expect("seed scheduled row with body");
+    assert!(stored);
+}
+
+/// Inert on the wire: nothing left for the shared mention neutralizer
+/// to rewrite (raw and zero-width-split mass mentions alike) and no
+/// contiguous invite host Discord would linkify. A property of the
+/// captured output, not a pinned neutralization spelling — and never
+/// satisfied by a raw repost of the stored body.
+fn assert_posted_inert(sent: &Value) {
+    let content = sent["content"].as_str().expect("posted content text");
+    assert!(
+        !two_bot_core::message_safety::contains_mass_mention(content),
+        "posted content still carries a mass mention: {content:?}"
+    );
+    assert!(
+        !content.contains("@everyone") && !content.contains("@here"),
+        "posted content still contains a pingable mass mention: {content:?}"
+    );
+    assert!(
+        !content.to_lowercase().contains("discord.gg"),
+        "posted content still contains a linkable invite host: {content:?}"
+    );
+    // Mention pills render as text only while parsing stays closed:
+    // nothing in any posted body may actually notify a user or role.
+    assert_eq!(
+        sent["allowed_mentions"],
+        json!({"parse": [], "roles": [], "users": [], "replied_user": false}),
+        "ticker posts must keep the closed legacy mention policy"
+    );
+}
+
+/// Acceptance: hostile bodies already in storage (written before any
+/// validate-side screen, or by any other writer) never reach the
+/// channel as pingable or linkable output. Each hostile row may be
+/// defused or not posted at all; the benign control row in the same
+/// tick proves the ticker really ran, and every hostile post that does
+/// go out must be inert while keeping the announcement around the
+/// payload.
+#[tokio::test]
+async fn hostile_stored_bodies_never_post_pingable_or_linkable_output() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool();
+    let hostile = [
+        "Game night @everyone bring snacks",
+        "Game night @here bring snacks",
+        "Game night @e\u{200b}v\u{200b}e\u{200b}r\u{200b}y\u{200b}o\u{200b}n\u{200b}e bring snacks",
+        "Game night @he\u{200d}re bring snacks",
+        "Game night discord.gg/free-nitro bring snacks",
+        "Game night https://DISCORD.GG/FREE-NITRO bring snacks",
+        "Game night www.discord.gg/free-nitro bring snacks",
+        "Game night @here claim at discord.gg/free-nitro <@&123> <@456> bring snacks",
+    ];
+    for (index, body) in hostile.iter().enumerate() {
+        seed_body(
+            pool,
+            &format!("hostile-{index}"),
+            T0 - 10_000 + index as u64 * 100,
+            body,
+        )
+        .await;
+    }
+    seed_body(pool, "control", T0 - 1_000, "Game night Friday at 19:00").await;
+    let mock = MockRest::start(Vec::new(), posted()).await;
+    let rest = executor(&mock);
+
+    tick(pool, &rest, GUILD, || T0).await.expect("tick");
+
+    let sent = posts(&mock);
+    let control = sent
+        .iter()
+        .find(|post| post["content"] == "Game night Friday at 19:00")
+        .expect("the benign control posts in the same tick, byte-identical");
+    assert_posted_inert(control);
+    assert!(
+        sent.len() <= hostile.len() + 1,
+        "no stored body may post more than once, got {} posts",
+        sent.len()
+    );
+    for post in &sent {
+        assert_posted_inert(post);
+        let content = post["content"].as_str().expect("posted content text");
+        assert!(
+            content.contains("Game night"),
+            "defusing must keep the announcement, not replace it: {content:?}"
+        );
+        if content != "Game night Friday at 19:00" {
+            assert!(
+                content.contains("bring snacks"),
+                "defusing must keep the text after the payload: {content:?}"
+            );
+        }
+    }
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+/// Acceptance: benign stored bodies post byte-identical — markdown,
+/// newlines, dotted non-links and legitimate Unicode joiners are
+/// announcement text, not an ambush, and the safety screen must not
+/// rewrite them on the way to the channel.
+#[tokio::test]
+async fn benign_stored_bodies_post_byte_identical() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool();
+    let benign = [
+        "Game night Friday at 19:00 — bring snacks!",
+        "Line one\nLine two with **bold** and a `code` span",
+        "Reminder: update to v1.2 and check notes.txt, می\u{200c}روم \u{1f469}\u{200d}\u{1f4bb}",
+    ];
+    for (index, body) in benign.iter().enumerate() {
+        seed_body(
+            pool,
+            &format!("benign-{index}"),
+            T0 - 10_000 + index as u64 * 100,
+            body,
+        )
+        .await;
+    }
+    let mock = MockRest::start(Vec::new(), posted()).await;
+    let rest = executor(&mock);
+
+    tick(pool, &rest, GUILD, || T0).await.expect("tick");
+
+    let sent = posts(&mock);
+    let contents: Vec<&str> = sent
+        .iter()
+        .map(|post| post["content"].as_str().expect("posted content text"))
+        .collect();
+    assert_eq!(
+        contents, benign,
+        "benign bodies reach the channel byte-identical, in due order"
+    );
+    for post in &sent {
+        assert_posted_inert(post);
+    }
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn supervised_runs_reach_the_metrics_endpoint() {
     use axum::{
