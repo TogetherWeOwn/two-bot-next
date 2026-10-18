@@ -223,24 +223,15 @@ fn expiry_failure_line(logs: &str) -> &str {
 }
 
 /// The classified token for an injected database error (`RAISE EXCEPTION`
-/// or a missing table both classify as `database`), under any of the
-/// field names the logging contract uses for classified causes. The raw
-/// database error text itself must never appear in the log line.
+/// or a missing table both classify as `database`) under the house `reason`
+/// field. The raw database error text itself must never appear in the log
+/// line.
 fn assert_classified_db_error(line: &str) {
-    let classified = [
-        "reason=database",
-        "reason=\"database\"",
-        "class=database",
-        "cause=database",
-        "chain=database",
-        "error_class=database",
-        "db_class=database",
-        "failure=database",
-    ];
+    let classified = ["reason=database", "reason=\"database\""];
     assert!(
         line.split_whitespace()
             .any(|part| classified.contains(&part)),
-        "failure line must carry the classified database error, not discard it: {line}"
+        "failure line must carry reason=database, not discard it: {line}"
     );
 }
 
