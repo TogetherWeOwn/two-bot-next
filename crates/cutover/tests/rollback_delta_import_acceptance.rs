@@ -572,9 +572,10 @@ async fn import_rerun_is_idempotent() -> TestResult {
     }
     let (source, export_file, _lines) = exported_source().await?;
     let target = TestDb::new("rerun").await?;
+    let file_arg = export_file.arg();
     let args = [
         "--file",
-        export_file.arg().as_str(),
+        file_arg.as_str(),
         "--apply",
         "--allow-live-target",
     ];

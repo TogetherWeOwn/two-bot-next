@@ -9,7 +9,7 @@ tests.
 
 | File | SHA-256 |
 | --- | --- |
-| `crates/cutover/tests/rollback_delta_import_acceptance.rs` | `cb7ffbcb7d1e77a2da25e8dff195e9a69852b4d6da1749528055c40b8673fa5e` |
+| `crates/cutover/tests/rollback_delta_import_acceptance.rs` | `23984797119c1f882fdca0b5fe367b14f353da7a382e36e3e84906f994bb7d1d` |
 | `crates/cutover/tests/fixtures/rollback_import_valid.ndjson` | `a3b055d32d4d5ab952de9ec812ede2954cfb55235493b0162d6599cd618d73b0` |
 | `crates/cutover/tests/fixtures/rollback_import_malformed.ndjson` | `f49813e642931df1959423adc9fe67c1057256aaa5f4ba86ee270e9b5e77c47c` |
 | `crates/cutover/tests/fixtures/rollback_import_unknown_table.ndjson` | `7ece3ab430bc81a7a1051c0c35f524f4ec47493a9aed6e757b1ffc6e1789340e` |
