@@ -113,6 +113,7 @@ import {
   sanitizeRemediationState,
   type RemediationState,
 } from "./remediation.ts";
+import { applyStagingFaultInjection } from "./staging-fault.ts";
 import { parseRelease, releaseTag, workerVersionTag } from "./error-events.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
 import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
@@ -207,6 +208,13 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
    * Container on an explicit fenced line below, never flag-forwarded. The
    * TWO_DEPLOY_ENV marker it is fenced by rides FORWARDED_FLAGS. */
   TWO_GATEWAY_READINESS_FAIL_INJECTION?: string;
+  /** Staging remediation-drill switches (staging fault injector): Worker-only
+   * trigger input for the guarded auto-remediation soak. Set only in the
+   * generated staging deploy config by a manual deploy-staging dispatch,
+   * never a committed var (check-env-bindings.py). Never forwarded to the
+   * Container (NOT_FORWARDED in container-env.ts) and never logged. */
+  TWO_VOICE_STALL_FAULT_INJECTION?: string;
+  TWO_GATEWAY_UNPAIRED_FAULT_INJECTION?: string;
   /** Operator-set Worker secrets for the private receiver. Never flag-forwarded. */
   TWO_INTERNAL_ACTIONS?: string;
   TWO_INTERNAL_CALLERS?: string;
@@ -1421,7 +1429,12 @@ export class TwoBotContainer extends Container<Env> {
         await this.ctx.storage.put(METRICS_ALERT_KEY, interruptDispatchDrops(previous));
         return;
       }
-      const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000, gatewayReady);
+      // Staging-only fault injector: synthetic drill input for the
+      // guarded-remediation soak. Dark unless the generated staging deploy
+      // config arms it; production and unarmed staging evaluate the scraped
+      // samples untouched. Never logged: the switches never leave this gate.
+      const faulted = applyStagingFaultInjection(samples, previous, this.env);
+      const { firing, state } = evaluateMetrics(faulted, previous, Date.now() / 1000, gatewayReady);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);
       for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses, context)) {

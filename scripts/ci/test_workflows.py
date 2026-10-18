@@ -206,7 +206,7 @@ def staging_push_filter_errors(name, push):
 
 
 def staging_dispatch_errors(workflow):
-    """The active staging workflow keeps exactly three fenced dispatch inputs.
+    """The active staging workflow keeps exactly five fenced dispatch inputs.
 
     `release_fence` exists on main (TOG-11143) so post-handoff release of an
     uninitialized/parked singleton is explicit and auditable; it defaults to
@@ -216,7 +216,10 @@ def staging_dispatch_errors(workflow):
     dispatch-only expression in staging_gateway_injection_errors.
     `inject_error_rate_spike` is the error-rate rollback-drill switch with
     the same shape, readable only through the pinned dispatch-only
-    expression in staging_error_rate_gate_errors. Anything else in the
+    expression in staging_error_rate_gate_errors. `inject_voice_stall` and
+    `inject_unpaired_disconnect` are the remediation-drill switches with the
+    same shape, readable only through the pinned dispatch-only expressions
+    in staging_fault_injection_errors. Anything else in the
     dispatch block (an arming switch, a deploy flag, a default of
     true) is an unreviewed deploy route outside the pinned shape.
     """
@@ -227,9 +230,9 @@ def staging_dispatch_errors(workflow):
         errors.append(f"{name}: triggers changed")
     errors.extend(staging_push_filter_errors(name, on.get("push")))
     dispatch = on.get("workflow_dispatch") or {}
-    expected = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike"}
+    expected = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike", "inject_voice_stall", "inject_unpaired_disconnect"}
     if set(dispatch) != {"inputs"} or set(dispatch.get("inputs") or {}) != expected:
-        errors.append(f"{name}: workflow_dispatch must carry only the release_fence, inject_gateway_failure and inject_error_rate_spike inputs")
+        errors.append(f"{name}: workflow_dispatch must carry only the release_fence, inject_gateway_failure, inject_error_rate_spike, inject_voice_stall and inject_unpaired_disconnect inputs")
     else:
         for input_name in expected:
             spec = dispatch["inputs"][input_name] or {}
@@ -242,6 +245,16 @@ INJECTION_EXPRESSION = "${{ github.event_name == 'workflow_dispatch' && inputs.i
 INJECTION_MARKERS = (
     "inject_gateway_failure", "INJECT_GATEWAY_FAILURE",
     "TWO_GATEWAY_READINESS_FAIL_INJECTION", "--inject-gateway-failure",
+)
+FAULT_EXPRESSIONS = {
+    "INJECT_VOICE_STALL": "${{ github.event_name == 'workflow_dispatch' && inputs.inject_voice_stall && 'true' || 'false' }}",
+    "INJECT_UNPAIRED_DISCONNECT": "${{ github.event_name == 'workflow_dispatch' && inputs.inject_unpaired_disconnect && 'true' || 'false' }}",
+}
+FAULT_MARKERS = (
+    "inject_voice_stall", "INJECT_VOICE_STALL",
+    "TWO_VOICE_STALL_FAULT_INJECTION", "--inject-voice-stall",
+    "inject_unpaired_disconnect", "INJECT_UNPAIRED_DISCONNECT",
+    "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION", "--inject-unpaired-disconnect",
 )
 
 
@@ -341,6 +354,50 @@ def staging_error_rate_gate_errors(workflows):
     # and the read-back print, which must name the same file.
     if run.count("error-rate-gate.json") != 2:
         errors.append("deploy-staging.yml: error_rate_gate must write and read back the same error-rate-gate.json")
+    return errors
+
+
+def staging_fault_injection_errors(workflows):
+    """The remediation-drill switches are dispatch-only, staging-only plumbing.
+
+    Same shape as the gateway-failure injection above: each switch is read by
+    exactly one pinned dispatch-only expression in exactly one staging step,
+    the step hands only the prepare flags to the generated staging deploy
+    config, and every other workflow — deploy-production above all — must not
+    mention any fault marker at all, so no route can forward a drill to
+    production.
+    """
+    errors = []
+    for name, workflow in workflows.items():
+        if name == "deploy-staging.yml":
+            continue
+        text = str(workflow)
+        for marker in FAULT_MARKERS:
+            if marker in text:
+                errors.append(f"{name}: remediation-fault marker {marker} outside deploy-staging")
+    staging = workflows.get("deploy-staging.yml") or {}
+    text = str(staging)
+    for input_name in ("inject_voice_stall", "inject_unpaired_disconnect"):
+        if text.count(f"inputs.{input_name}") != 1:
+            errors.append(f"deploy-staging.yml: {input_name} must be read exactly once")
+    steps = ((staging.get("jobs") or {}).get("deploy") or {}).get("steps") or []
+    armed = [step for step in steps
+             if isinstance(step, dict) and ("INJECT_VOICE_STALL" in str(step)
+                                            or "INJECT_UNPAIRED_DISCONNECT" in str(step))]
+    if len(armed) != 1:
+        errors.append("deploy-staging.yml: exactly one deploy step may carry the fault switches")
+        return errors
+    step = armed[0]
+    env = step.get("env") or {}
+    for var, expression in FAULT_EXPRESSIONS.items():
+        if env.get(var) != expression:
+            errors.append(f"deploy-staging.yml: {var} must use the pinned dispatch-only expression")
+    run = str(step.get("run") or "")
+    for needle in ("--inject-voice-stall", "--inject-unpaired-disconnect",
+                   '[ "$INJECT_VOICE_STALL" = "true" ]',
+                   '[ "$INJECT_UNPAIRED_DISCONNECT" = "true" ]'):
+        if run.count(needle) != 1:
+            errors.append(f"deploy-staging.yml: fault step must contain exactly one {needle}")
     return errors
 
 
@@ -1687,6 +1744,7 @@ def workflow_policy_errors(workflows):
     errors = []
     errors.extend(staging_gateway_injection_errors(workflows))
     errors.extend(staging_error_rate_gate_errors(workflows))
+    errors.extend(staging_fault_injection_errors(workflows))
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
     if set(workflows) != set(JOB_INVENTORY):
@@ -2339,6 +2397,48 @@ class WorkflowTests(unittest.TestCase):
                 job = next(iter(changed[name]["jobs"].values()))
                 job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_error_rate_spike }}"
                 self.assertTrue(staging_error_rate_gate_errors(changed))
+                self.assertTrue(workflow_policy_errors(changed))
+
+    def test_remediation_fault_injection_is_dispatch_only_and_never_forwarded(self):
+        workflows = self.workflows
+        self.assertEqual(staging_fault_injection_errors(workflows), [])
+        self.assertEqual(staging_dispatch_errors(workflows["deploy-staging.yml"]), [])
+        steps = workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        armed = [s for s in steps if "INJECT_VOICE_STALL" in str(s)]
+        self.assertEqual(len(armed), 1)
+        index = steps.index(armed[0])
+        mutations = {
+            # Push could read it / default armed.
+            "expression without dispatch guard": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
+                .__setitem__("INJECT_VOICE_STALL", "${{ inputs.inject_voice_stall }}"),
+            "expression constant true": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
+                .__setitem__("INJECT_UNPAIRED_DISCONNECT", "true"),
+            "prepare flag unconditional": lambda w: w["jobs"]["deploy"]["steps"][index]
+                .__setitem__("run", "python3 ../scripts/staging_rollout.py prepare --inject-voice-stall"),
+            "input defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["inject_voice_stall"]
+                .__setitem__("default", True),
+            "input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("inject_unpaired_disconnect"),
+            "second reader step": lambda w: w["jobs"]["deploy"]["steps"][0]
+                .setdefault("env", {}).__setitem__("INJECT_VOICE_STALL", "true"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(
+                    staging_fault_injection_errors(changed)
+                    or staging_dispatch_errors(changed["deploy-staging.yml"]),
+                    label,
+                )
+                self.assertTrue(workflow_policy_errors(changed), label)
+        # Production (or any other workflow) mentioning any fault marker at
+        # all is a forwarding route, whatever the surrounding shape.
+        for name in ("deploy-production.yml", "check.yml"):
+            with self.subTest(forwarded=name):
+                changed = deepcopy(workflows)
+                job = next(iter(changed[name]["jobs"].values()))
+                job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_voice_stall }}"
+                self.assertTrue(staging_fault_injection_errors(changed))
                 self.assertTrue(workflow_policy_errors(changed))
 
     def test_docs_only_push_skips_staging_but_runtime_paths_deploy(self):
