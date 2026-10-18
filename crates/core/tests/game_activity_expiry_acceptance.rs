@@ -129,8 +129,8 @@ async fn old_rows_expire_per_guild_while_fresh_rows_survive() {
     )
     .await
     .expect("seed flush");
-    backdate(pool, "guild-a", "Apex", 100);
-    backdate(pool, "guild-b", "Apex", 100);
+    backdate(pool, "guild-a", "Apex", 100).await;
+    backdate(pool, "guild-b", "Apex", 100).await;
 
     // Dry-run preview names only the stale guilds with their stale counts.
     assert_eq!(
@@ -242,7 +242,7 @@ async fn expiry_leaves_opt_out_filtering_unchanged() {
     upsert_guild_aggregates(pool, &[row("guild-b", Some("Apex"), 5 * MIN_MS, 0, 1)])
         .await
         .expect("seed other guild");
-    backdate(pool, "guild-a", "Apex", 100);
+    backdate(pool, "guild-a", "Apex", 100).await;
 
     assert_eq!(
         expire_stale_guild_aggregates(pool, "guild-a", 90)
