@@ -31,6 +31,7 @@ committed diff carries none of the contiguous literals it scans for.
 
 import argparse
 import fnmatch
+import importlib.util
 import re
 import shlex
 import subprocess
@@ -40,6 +41,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CONSTRAINTS = "CONSTRAINTS.md"
+
+# Reuse the coverage gate's exact Git header decoding, including C quotes
+# and the trailing TAB Git emits for spaced paths.
+_COVERAGE_SPEC = importlib.util.spec_from_file_location(
+    "patch_coverage", Path(__file__).with_name("check-patch-coverage.py")
+)
+coverage = importlib.util.module_from_spec(_COVERAGE_SPEC)
+_COVERAGE_SPEC.loader.exec_module(coverage)
 
 
 class NoMergeBase(Exception):
@@ -91,7 +100,9 @@ PYTHON_TEST_SKIP = re.compile(r"pytest\.mark\.skip")
 GO_TEST_SKIP = re.compile(r"t\.Skip\s*\(")
 
 TEST_PATH = re.compile(r"\.test\.|_tests?\.|/tests?/|_tests/|/tests?\.rs$|test_")
-ASSERTS = re.compile(r"\bassert(_\w+)?!?|\bexpect\s*\(|\bshould\b")
+ASSERTS = re.compile(
+    r"\bdebug_assert(?:_\w+)?\s*!|\bassert(_\w+)?!?|\bexpect\s*\(|\bshould\b"
+)
 SECTION = re.compile(r"^##\s+(.+?)\s*$")
 
 
@@ -525,28 +536,84 @@ def _show(root, ref, path):
     return shown.stdout if shown.returncode == 0 else None
 
 
+def _parse_old_file_header(raw):
+    """Normalize the A-side prefix, then use the same decoder as the B side."""
+    target = raw[len("--- "):]
+    if target.startswith('"a/'):
+        target = '"b/' + target[3:]
+    elif target.startswith("a/"):
+        target = "b/" + target[2:]
+    return coverage._parse_new_file_header("+++ " + target)
+
+
 def collect(root, base, head_ref="HEAD"):
     """Collect (added, removed, deleted) from the base-to-head diff."""
-    diff = _git(root, "diff", "--unified=0", "--no-color", base, head_ref, "--")
+    diff = _git(
+        root, "diff", "--unified=0", "--no-color", "--find-renames",
+        "--src-prefix=a/", "--dst-prefix=b/", base, head_ref, "--",
+    )
+    if diff.returncode != 0:
+        raise ValueError(f"git diff failed with exit code {diff.returncode}")
     added, removed = [], []
-    path = ""
+    old_path, new_path, in_hunk = None, None, False
     for line in diff.stdout.splitlines():
-        if line.startswith("+++ "):
-            path = line[6:].removeprefix("b/")
-        elif line.startswith("+") and not line.startswith("+++"):
-            added.append((path, line[1:]))
-        elif line.startswith("-") and not line.startswith("---"):
-            removed.append((path, line[1:]))
+        if line.startswith("diff --git "):
+            old_path, new_path, in_hunk = None, None, False
+        elif not in_hunk and line.startswith("--- "):
+            old_path = _parse_old_file_header(line)
+        elif not in_hunk and line.startswith("+++ "):
+            new_path = coverage._parse_new_file_header(line)
+        elif line.startswith("@@ "):
+            in_hunk = True
+        elif in_hunk and line.startswith("+") and new_path is not None:
+            added.append((new_path, line[1:]))
+        elif in_hunk and line.startswith("-") and old_path is not None:
+            removed.append((old_path, line[1:]))
 
-    status = _git(root, "diff", "--name-status", base, head_ref, "--")
-    deleted = [
-        line.split("\t", 1)[1]
-        for line in status.stdout.splitlines()
-        if line.startswith("D\t")
-    ]
+    status = _git(
+        root, "diff", "--name-status", "-z", "--find-renames", base, head_ref, "--"
+    )
+    if status.returncode != 0:
+        raise ValueError(f"git diff --name-status failed with exit code {status.returncode}")
+    deleted = []
+    changes = iter(status.stdout.rstrip("\0").split("\0"))
+    for change in changes:
+        if not change:
+            continue
+        old_path = next(changes)
+        if change[:1] in ("R", "C"):
+            new_path = next(changes)
+            # Test-to-test moves preserve the test; moving out of test scope
+            # deletes it even when Git reports an intact R100 rename. A rename
+            # inside tests/ to a non-runnable file type (markdown or a
+            # different suffix) also deletes the test. Moving a Rust integration
+            # target into src/ deletes that target even if the destination's
+            # name still looks like a test. Copies never delete the source.
+            if (
+                change[0] == "R"
+                and TEST_PATH.search(old_path)
+                and (
+                    not TEST_PATH.search(new_path)
+                    or _is_markdown(new_path)
+                    or Path(old_path).suffix != Path(new_path).suffix
+                    or (
+                        INTEGRATION_TARGET.match(old_path)
+                        and not INTEGRATION_TARGET.match(new_path)
+                    )
+                )
+            ):
+                deleted.append(old_path)
+        elif change == "D":
+            deleted.append(old_path)
 
-    others = _git(root, "ls-files", "--others", "--exclude-standard")
-    for name in others.stdout.split():
+    others = _git(root, "ls-files", "--others", "--exclude-standard", "-z")
+    if others.returncode != 0:
+        raise ValueError(
+            f"git ls-files failed with exit code {others.returncode}"
+        )
+    for name in others.stdout.split("\0"):
+        if not name:
+            continue
         try:
             text = (root / name).read_text(errors="replace")
         except OSError:
@@ -582,7 +649,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         errors = check(args.root, args.base_ref, args.head_ref)
-    except NoMergeBase as exc:
+    except (NoMergeBase, ValueError) as exc:
         print(f"floor-guard: {exc}", file=sys.stderr)
         raise SystemExit(2)
     for error in errors:
