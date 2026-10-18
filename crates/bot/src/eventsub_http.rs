@@ -2,8 +2,11 @@
 //! router into the health socket. Verification (`twitch_eventsub::verify_delivery`)
 //! precedes any JSON parsing; known deterministic classification errors are
 //! acknowledged with 2xx so Twitch does not retry them. Unknown/future errors
-//! fail closed with retryable 503. No Helix client and no durable ledger here
-//! (separate slices).
+//! fail closed with retryable 503. A verified `stream.online` runs the
+//! durable claim → send → settle flow (`stream_live_store::deliver_go_live`)
+//! only when delivery dependencies were injected at bind time
+//! (`eventsub_delivery`); with none, it is acknowledged without side
+//! effects, so the route stays dark for posting until provisioning lands.
 //!
 //! Logging carries only scalar `event`/`status`/`error_class` plus the bounded
 //! `message_type` (refusals) and `reason` (revocation ack) scalars: no header
@@ -30,8 +33,11 @@ use tokio::{net::TcpListener, sync::Semaphore};
 use tracing::Instrument;
 use two_bot_core::{
     eventsub_receiver_config::EventsubReceiverConfig,
+    stream_live_store::deliver_go_live,
     twitch_eventsub::{classify, verify_delivery, Delivery, DeliveryHeaders, EventSubError},
 };
+
+use crate::eventsub_delivery::{post_metric_counts, DeliveryDeps};
 
 /// Exact callback path; mirrors `wrangler/src/eventsub.ts` (`EVENTSUB_PATH`).
 pub const EVENTSUB_PATH: &str = "/hooks/twitch";
@@ -43,15 +49,23 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 struct ReceiverState {
     secret: RwLock<two_bot_core::twitch_eventsub::WebhookSecret>,
     capacity: Arc<Semaphore>,
+    /// Go-live delivery dependencies, injected at bind time. `None` keeps
+    /// verified notifications side-effect free (acknowledge only).
+    delivery: Option<Arc<DeliveryDeps>>,
 }
 
 impl ReceiverState {
     fn new(config: &EventsubReceiverConfig) -> Self {
+        Self::with_delivery(config, None)
+    }
+
+    fn with_delivery(config: &EventsubReceiverConfig, delivery: Option<DeliveryDeps>) -> Self {
         Self {
             // Keep one atomic secret snapshot in the state; handlers never
             // re-read the environment or observe partially replaced material.
             secret: RwLock::new(config.secret().clone()),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
+            delivery: delivery.map(Arc::new),
         }
     }
 }
@@ -64,10 +78,24 @@ pub struct BoundEventsubReceiver {
 }
 
 pub async fn bind(config: EventsubReceiverConfig) -> std::io::Result<BoundEventsubReceiver> {
+    bind_with_delivery(config, None).await
+}
+
+/// Bind with go-live delivery dependencies: verified notifications then run
+/// the durable ledger flow instead of ack-only. Boot passes `None` until a
+/// configuration slice provisions the channel/invite inputs.
+pub async fn bind_with_delivery(
+    config: EventsubReceiverConfig,
+    delivery: Option<DeliveryDeps>,
+) -> std::io::Result<BoundEventsubReceiver> {
     let listener = TcpListener::bind(config.listen_addr()).await?;
+    let state = match delivery {
+        Some(deps) => ReceiverState::with_delivery(&config, Some(deps)),
+        None => ReceiverState::new(&config),
+    };
     Ok(BoundEventsubReceiver {
         listener,
-        state: Arc::new(ReceiverState::new(&config)),
+        state: Arc::new(state),
     })
 }
 
@@ -204,6 +232,84 @@ async fn receive_with_timeout(
             id,
             "unknown",
         ),
+    }
+}
+
+/// One verified `stream.online`: with no delivery dependencies this is the
+/// historical ack-only behavior; with them, run the durable claim → send →
+/// settle flow and answer its disposition — 200 acknowledges (posted,
+/// duplicate, or not ours), a retryable 503 asks Twitch to redeliver after
+/// a transient ledger/send failure. The claim fences make that redelivery
+/// safe: it can never double-post (see `deliver_go_live`). Delivery runs in
+/// a spawned task so the 20 s request timeout cannot cancel it after
+/// `mark_started` commits but before the send settles; the task keeps
+/// running to settle even if the request times out, and the Twitch retry is
+/// then answered as a duplicate instead of losing the announcement.
+async fn handle_notification(
+    state: &Arc<ReceiverState>,
+    stream: &two_bot_core::stream_funnel::StreamOnline,
+    id: &str,
+) -> Response {
+    let Some(deps) = &state.delivery else {
+        tracing::info!(
+            event = "eventsub_receiver",
+            status = 200,
+            "notification acknowledged"
+        );
+        return ack(id);
+    };
+    let task_deps = Arc::clone(deps);
+    let task_stream = (*stream).clone();
+    let delivery = match tokio::spawn(async move {
+        deliver_go_live(
+            task_deps.ledger.as_ref(),
+            task_deps.sender.as_ref(),
+            &task_deps.config,
+            &task_stream,
+        )
+        .await
+    })
+    .await
+    {
+        Ok(delivery) => delivery,
+        Err(_) => {
+            return refuse(
+                state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                true,
+                id,
+                bounded_message_type("notification"),
+            );
+        }
+    };
+    let metrics = two_bot_core::metrics::global();
+    let (attempted, succeeded, failed) = post_metric_counts(&delivery.outcome);
+    if attempted {
+        metrics.eventsub_post("attempted");
+    }
+    if succeeded {
+        metrics.eventsub_post("succeeded");
+    }
+    if failed {
+        metrics.eventsub_post("failed");
+    }
+    if delivery.disposition.status == 200 {
+        tracing::info!(
+            event = "eventsub_receiver",
+            status = 200,
+            "notification acknowledged"
+        );
+        ack(id)
+    } else {
+        refuse(
+            state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            true,
+            id,
+            bounded_message_type("notification"),
+        )
     }
 }
 
@@ -380,16 +486,9 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             response
         }
-        Ok(Delivery::Notification(_)) => {
+        Ok(Delivery::Notification(stream)) => {
             two_bot_core::metrics::global().eventsub_classified("notification");
-            // No send and no ledger in this slice: acknowledge so Twitch does
-            // not retry; the follow-up wires the durable claim plus post.
-            tracing::info!(
-                event = "eventsub_receiver",
-                status = 200,
-                "notification acknowledged"
-            );
-            ack(id)
+            handle_notification(state, &stream, id).await
         }
         Ok(Delivery::Revocation { reason, .. }) => {
             two_bot_core::metrics::global().eventsub_classified("revocation");
@@ -759,6 +858,195 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // --- Injected go-live delivery (durable ledger glue) ---
+
+    use std::collections::{HashMap, VecDeque};
+    use two_bot_core::stream_live_store::{
+        ClaimOutcome, LedgerFuture, LiveClaim, LiveDeliveryConfig, LiveLedger, LiveSendError,
+        LiveSender, SendFuture,
+    };
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FakeRow {
+        Started,
+        Delivered,
+    }
+
+    /// Scripted in-memory ledger: first claim wins, a started/delivered row
+    /// dedupes, release frees only a started row. SQL fences are pinned by
+    /// the core store integration tests; here only the receiver's use of
+    /// the trait outcomes matters.
+    #[derive(Default)]
+    struct FakeLedger {
+        rows: Mutex<HashMap<String, FakeRow>>,
+    }
+
+    impl LiveLedger for FakeLedger {
+        fn claim<'a>(&'a self, claim: &'a LiveClaim) -> LedgerFuture<'a, ClaimOutcome> {
+            Box::pin(async move {
+                let mut rows = self.rows.lock().unwrap();
+                Ok(if rows.contains_key(&claim.dedup_key) {
+                    ClaimOutcome::Duplicate
+                } else {
+                    rows.insert(claim.dedup_key.clone(), FakeRow::Started);
+                    ClaimOutcome::Claimed(two_bot_core::Secret::new("fake-token".to_owned()))
+                })
+            })
+        }
+
+        fn mark_started<'a>(
+            &'a self,
+            _dedup_key: &'a str,
+            _claim_token: &'a str,
+        ) -> LedgerFuture<'a, bool> {
+            Box::pin(async move { Ok(true) })
+        }
+
+        fn mark_delivered<'a>(
+            &'a self,
+            dedup_key: &'a str,
+            _claim_token: &'a str,
+            _message_id: &'a str,
+        ) -> LedgerFuture<'a, bool> {
+            Box::pin(async move {
+                self.rows
+                    .lock()
+                    .unwrap()
+                    .insert(dedup_key.to_owned(), FakeRow::Delivered);
+                Ok(true)
+            })
+        }
+
+        fn release_started<'a>(
+            &'a self,
+            dedup_key: &'a str,
+            _claim_token: &'a str,
+        ) -> LedgerFuture<'a, bool> {
+            Box::pin(async move {
+                let mut rows = self.rows.lock().unwrap();
+                Ok(rows.remove(dedup_key) == Some(FakeRow::Started))
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeSender {
+        calls: Mutex<Vec<String>>,
+        script: Mutex<VecDeque<Result<String, LiveSendError>>>,
+    }
+
+    impl FakeSender {
+        fn scripted(answers: Vec<Result<String, LiveSendError>>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                script: Mutex::new(answers.into()),
+            })
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl LiveSender for FakeSender {
+        fn send_live<'a>(&'a self, _channel_id: &'a str, content: &'a str) -> SendFuture<'a> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(content.to_owned());
+                self.script
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("script must answer every send")
+            })
+        }
+    }
+
+    fn notification_body() -> &'static str {
+        r#"{"subscription":{"id":"synthetic-sub-0020","status":"enabled","type":"stream.online","version":"1","condition":{"broadcaster_user_id":"123456"},"transport":{"method":"webhook","callback":"https://example.com/hooks/twitch"},"created_at":"2026-10-13T00:00:00Z"},"event":{"id":"synthetic-stream-0020","broadcaster_user_id":"123456","broadcaster_user_login":"ourgamenight","broadcaster_user_name":"OurGameNight","type":"live","started_at":"2026-10-13T20:00:00Z"}}"#
+    }
+
+    fn delivery_app(sender: Arc<FakeSender>, broadcasters: Vec<String>) -> Router {
+        let deps = DeliveryDeps {
+            ledger: Arc::new(FakeLedger::default()),
+            sender,
+            config: LiveDeliveryConfig {
+                broadcasters,
+                invite_url: "https://discord.gg/example".to_owned(),
+                channel_id: "777".to_owned(),
+            },
+        };
+        router(Arc::new(ReceiverState::with_delivery(
+            &config(),
+            Some(deps),
+        )))
+    }
+
+    async fn post_notification(app: Router, message_id: &str) -> axum::response::Response {
+        let body = notification_body();
+        let timestamp = fresh_timestamp();
+        let signature = sign(message_id, &timestamp, body.as_bytes());
+        app.oneshot(request(
+            "POST",
+            EVENTSUB_PATH,
+            Some(message_id),
+            Some(&timestamp),
+            Some(&signature),
+            Some("notification"),
+            body,
+        ))
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn notification_posts_once_and_dedupes_the_retry() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let sender = FakeSender::scripted(vec![Ok("msg-1".to_owned())]);
+        let app = delivery_app(Arc::clone(&sender), vec!["123456".to_owned()]);
+        let first = post_notification(app.clone(), "synthetic-delivery-0020").await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let retry = post_notification(app, "synthetic-delivery-0021").await;
+        assert_eq!(retry.status(), StatusCode::OK);
+        let calls = sender.calls();
+        assert_eq!(calls.len(), 1, "the Twitch retry must not double-post");
+        assert!(calls[0].contains("https://www.twitch.tv/ourgamenight"));
+    }
+
+    #[tokio::test]
+    async fn notification_proven_no_send_is_retryable_then_posts() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let sender = FakeSender::scripted(vec![
+            Err(LiveSendError::ProvenNoSend),
+            Ok("msg-2".to_owned()),
+        ]);
+        let app = delivery_app(Arc::clone(&sender), vec!["123456".to_owned()]);
+        let first = post_notification(app.clone(), "synthetic-delivery-0022").await;
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(first.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["retryable"], true);
+        let retry = post_notification(app, "synthetic-delivery-0023").await;
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(sender.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn notification_for_unlisted_broadcaster_never_sends() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let sender = FakeSender::scripted(vec![]);
+        let app = delivery_app(Arc::clone(&sender), vec!["999".to_owned()]);
+        let response = post_notification(app, "synthetic-delivery-0024").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(sender.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_without_delivery_deps_still_acknowledges() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        // Default bind (no injected delivery): ack-only, as before this slice.
+        let response = post_notification(app(), "synthetic-delivery-0025").await;
         assert_eq!(response.status(), StatusCode::OK);
     }
 

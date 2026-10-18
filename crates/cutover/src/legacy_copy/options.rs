@@ -3,7 +3,7 @@
 use super::{mapping, Table};
 use sqlx::postgres::PgConnectOptions;
 use sqlx::ConnectOptions;
-use std::str::FromStr;
+use two_bot_core::database_url;
 
 #[derive(Default)]
 pub struct Options {
@@ -126,7 +126,11 @@ fn explicit_connection(url: &str) -> Result<PgConnectOptions, &'static str> {
     if user.is_empty() || endpoint.split('/').next().is_none_or(str::is_empty) {
         return Err("explicit host and user required");
     }
-    let options = PgConnectOptions::from_str(url).map_err(|_| "invalid Postgres URL")?;
+    // Fail-closed query fence before any driver parsing, with the passfile
+    // diagnostic target suppressed during the synchronous parse. The shared
+    // parser validates the allowlist and strips `channel_binding`; the
+    // explicit database/socket/options checks below still apply.
+    let options = database_url::connect_options(url).map_err(|_| "invalid Postgres URL")?;
     if options.get_database().is_none_or(str::is_empty)
         || options.get_socket().is_some()
         || options.get_options().is_some()
@@ -174,7 +178,6 @@ mod tests {
     fn parse(args: &[&str]) -> Result<Options, &'static str> {
         Options::parse(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
     }
-
     #[test]
     fn default_dry_run_and_strict_flags() {
         let options = parse(&[]).unwrap();
@@ -239,5 +242,103 @@ mod tests {
             .tables()
             .unwrap_err()
             .contains("pending group tickets"));
+    }
+
+    /// Thread-local log capture for the fail-closed query fence: hostile
+    /// keys/values must never reach SQLx WARN diagnostics.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl Capture {
+        fn text(&self) -> String {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct CaptureFields<'a>(&'a mut String);
+
+    impl tracing::field::Visit for CaptureFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            write!(self.0, " {}={value:?}", field.name()).unwrap();
+        }
+    }
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::DEBUG
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            use std::fmt::Write as _;
+            let mut text = self.0.lock().unwrap();
+            write!(
+                text,
+                "{} {}",
+                event.metadata().level(),
+                event.metadata().target()
+            )
+            .unwrap();
+            event.record(&mut CaptureFields(&mut text));
+            text.push('\n');
+        }
+    }
+
+    #[test]
+    fn hostile_query_keys_rejected_before_driver_parse() {
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            // Uppercase and percent-encoded hostile keys: `query_pairs`
+            // decodes `%5F` to `_`, so the decoded key is still unknown.
+            for query in [
+                "API_KEY=fixture-query-secret",
+                "Api_Key=fixture-query-secret",
+                "SSLMODE=require",
+                "api%5Fkey=fixture-query-secret",
+                "API%5FKEY=fixture-query-secret",
+                "api%5fkey=fixture-query-secret",
+                "sslmode=require&API_KEY=fixture-query-secret",
+            ] {
+                let url = format!("postgres://operator:explicit@live.invalid:5432/bot?{query}");
+                for result in [
+                    explicit_connection(&url).map(|_| ()),
+                    guarded_target(&url, true).map(|_| ()),
+                ] {
+                    let error = result.unwrap_err();
+                    assert!(
+                        !error.contains("fixture"),
+                        "rejection echoed the query value for {query}"
+                    );
+                }
+            }
+            tracing::warn!("capture remains active");
+        });
+        let text = capture.text();
+        assert!(text.contains("capture remains active"));
+        assert!(
+            !text.contains("fixture-query-secret"),
+            "hostile query value reached logs"
+        );
+        assert!(!text.contains("API_KEY"));
+        assert!(!text.contains("api_key"));
+        assert!(!text.contains("ignoring unrecognized connect parameter"));
+    }
+
+    #[test]
+    fn valid_operator_query_behavior_preserved() {
+        let live = "postgres://operator:explicit@live.invalid:5432/bot";
+        assert!(explicit_connection(live).is_ok());
+        assert!(guarded_target(live, true).is_ok());
+        assert!(explicit_connection(&format!("{live}?sslmode=require")).is_ok());
+        assert!(guarded_target(&format!("{live}?sslmode=require"), true).is_ok());
     }
 }
