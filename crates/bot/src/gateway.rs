@@ -3093,8 +3093,12 @@ mod tests {
             ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
         ]);
         let command_config =
-            crate::gateway_commands::GatewayCommandConfig::from_map(42, &command_vars)
-                .expect("test command config");
+            crate::gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                42,
+                &command_vars,
+                true,
+            )
+            .expect("test command config");
         runtime.initialize_custom_commands_for_test(command_config);
         let handle = tokio::runtime::Handle::current();
         let message_event = |id: &str, guild: &str| {
