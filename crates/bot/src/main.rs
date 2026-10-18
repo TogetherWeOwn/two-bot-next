@@ -492,33 +492,23 @@ async fn run(cli_args: &[String]) {
                         )
                     });
                     if let Some(runtime) = &runtime {
-                        // Mirror CommandRuntime: a denied Moderation capability
-                        // never reaches moderation validation, so a stale
-                        // comma-space protected-role value cannot fail boot on
-                        // live identities. Permitted staging still validates
-                        // the strict verbatim list and parks on invalid.
                         let vars: std::collections::HashMap<String, String> =
                             std::env::vars().collect();
-                        let vars = if activation
-                            .permitted(two_bot_core::activation::LiveCapability::Moderation)
-                        {
-                            vars
-                        } else {
-                            let mut sanitized = vars;
-                            sanitized.remove("TWO_MODERATION");
-                            sanitized.remove("TWO_MODERATION_PROTECTED_ROLE_IDS");
-                            sanitized.remove("TWO_OWEN_USER_ID");
-                            sanitized
-                        };
                         let config =
-                            gateway_commands::GatewayCommandConfig::from_map(guild_id, &vars)
-                                .map_err(|error| {
-                                    step_failure(
-                                        FailureClass::CustomCommandsInitFailed,
-                                        "custom_commands_config",
-                                        error,
-                                    )
-                                })?;
+                            gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                                guild_id,
+                                &vars,
+                                activation.permitted(
+                                    two_bot_core::activation::LiveCapability::Moderation,
+                                ),
+                            )
+                            .map_err(|error| {
+                                step_failure(
+                                    FailureClass::CustomCommandsInitFailed,
+                                    "custom_commands_config",
+                                    error,
+                                )
+                            })?;
                         runtime
                             .initialize_custom_commands(config)
                             .await
