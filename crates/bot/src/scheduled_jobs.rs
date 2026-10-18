@@ -41,6 +41,10 @@ const ORPHAN_REASON: &str = "Scheduled message run was not recorded";
 #[path = "scheduled_jobs_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "scheduled_stale_audit_acceptance_tests.rs"]
+mod acceptance_tests;
+
 /// The supervised ticker for the configured guild, or `None` while
 /// `TWO_AUTOMATIONS` is off (legacy only started the scheduler when automations
 /// were enabled, and a disabled scheduler fired zero jobs) or the boot
