@@ -375,6 +375,9 @@ fn error_text(err: MemberError) -> String {
         MemberError::Discord(MemberDiscordError::Rejected(detail)) => {
             format!("Discord refused the request: {detail}")
         }
+        MemberError::Discord(MemberDiscordError::RateLimited) => {
+            "Discord rate-limited the request; nothing was applied. Try again shortly.".to_owned()
+        }
         MemberError::Discord(_) => UNCERTAIN_REPLY.to_owned(),
         MemberError::Store(_) | MemberError::BotIdentityUnknown => FAILURE_REPLY.to_owned(),
     }
@@ -597,5 +600,17 @@ mod tests {
         assert_eq!(cooldowns.actors.len(), ACTOR_COOLDOWN_CAPACITY);
         assert!(cooldowns.admit("overflow", 1, now + ACTOR_COOLDOWN));
         assert_eq!(cooldowns.actors.len(), 1);
+    }
+
+    #[test]
+    fn rate_limited_reply_is_retry_safe_while_uncertain_stays_fenced() {
+        assert_eq!(
+            error_text(MemberError::Discord(MemberDiscordError::RateLimited)),
+            "Discord rate-limited the request; nothing was applied. Try again shortly."
+        );
+        assert_eq!(
+            error_text(MemberError::Discord(MemberDiscordError::Timeout)),
+            UNCERTAIN_REPLY
+        );
     }
 }
