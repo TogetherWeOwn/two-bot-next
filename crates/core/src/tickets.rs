@@ -97,6 +97,8 @@ pub enum TicketError {
     MissingChannel,
     #[error("This ticket cannot be closed until the bot's channel history access is restored")]
     MissingHistoryAccess,
+    #[error("This ticket cannot be closed until the opener's channel access is restored")]
+    MissingOpenerAccess,
     #[error("This ticket close was already recovered or completed")]
     StaleClose,
 }
