@@ -192,10 +192,16 @@ impl Occurrence<'_> {
     async fn run(&self, audit_failed: &mut bool) -> Result<Step, ErrorClass> {
         // Defuse rows written before any validate-side screen on the way to
         // the channel; benign bodies pass through byte-identical and the
-        // shared send path keeps the closed mention policy.
+        // shared send path keeps the closed mention policy. The neutralized
+        // body is truncated to the message ceiling (surrogate-safe) so a
+        // legacy row at the old pre-neutralize limit still posts instead of
+        // failing permanent on the send-path length check.
         let call = ChannelCall::PostMessage {
             channel_id: self.row.channel_id.clone(),
-            content: neutralize_scheduled_body(&self.row.body),
+            content: two_bot_core::message_safety::truncate(
+                &neutralize_scheduled_body(&self.row.body),
+                two_bot_core::message_safety::CONTENT_LIMIT,
+            ),
             nonce: self.row.occurrence_nonce.clone(),
         };
         let posted = match self.rest.execute_channel(&call).await {

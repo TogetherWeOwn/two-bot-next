@@ -97,58 +97,74 @@ pub enum ScheduleError {
 ///
 /// Mass mentions (`@everyone`/`@here`, including zero-width-split
 /// obfuscation) are broken with the shared mention neutralizer; every
-/// case-insensitive `discord.gg` invite host is split with a zero-width
-/// space (`discord.\u{200b}gg`) so Discord never linkifies it. Plain text
-/// without either pattern passes through byte-identical, and the transform
-/// is idempotent: already-neutralized text is returned unchanged.
+/// case-insensitive invite host (`discord.gg`, `discord.com/invite`,
+/// `discordapp.com/invite` — the same three hosts as the automod invite
+/// policy) is split with a zero-width space after its dot
+/// (`discord.\u{200b}gg`) so Discord never linkifies it. Plain text
+/// without any of these patterns passes through byte-identical, and the
+/// transform is idempotent: already-neutralized text is returned unchanged.
 ///
 /// Applied at the validate boundary (stored bodies leave neutralized) and
 /// again at the ticker post boundary (rows written before any validate-side
-/// screen are defused on the way to the channel).
+/// screen are defused on the way to the channel; the ticker additionally
+/// truncates to the message ceiling so neutralization growth on legacy rows
+/// cannot turn a post into a permanent failure).
 #[must_use]
 pub fn neutralize_scheduled_body(body: &str) -> String {
     split_invite_host(&crate::message_safety::neutralize_mentions(body))
 }
 
-/// Split the dot of every case-insensitive `discord.gg` host with a
-/// zero-width space so Discord does not linkify it. Original casing is
-/// preserved (`DISCORD.GG` becomes `DISCORD.\u{200b}GG`); text without the
-/// host passes through byte-identical.
+/// Split the dot of every case-insensitive invite host with a zero-width
+/// space so Discord does not linkify it. Covers the same three hosts as the
+/// automod invite policy: `discord.gg`, `discord.com/invite`, and
+/// `discordapp.com/invite`. Original casing is preserved (`DISCORD.GG`
+/// becomes `DISCORD.\u{200b}GG`); text without an invite host passes through
+/// byte-identical. Longest host wins at each position so
+/// `discordapp.com/invite` is never partially matched.
 fn split_invite_host(text: &str) -> String {
-    const NEEDLE_LEN: usize = 10; // `discord.gg`
-    const DOT_OFFSET: usize = 8; // `discord.` prefix length
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while rest.len() >= NEEDLE_LEN {
-        let Some(pos) = find_invite_host(rest) else {
-            break;
-        };
+    while let Some((pos, needle_len, dot_len)) = find_invite_host(rest) {
         let (head, tail) = rest.split_at(pos);
         out.push_str(head);
-        out.push_str(&tail[..DOT_OFFSET]);
+        out.push_str(&tail[..dot_len]);
         out.push('\u{200b}');
-        out.push_str(&tail[DOT_OFFSET..NEEDLE_LEN]);
-        rest = &tail[NEEDLE_LEN..];
+        out.push_str(&tail[dot_len..needle_len]);
+        rest = &tail[needle_len..];
     }
     out.push_str(rest);
     out
 }
 
-/// Byte offset of a case-insensitive `discord.gg` in `text`, if any. The
-/// needle is pure ASCII, so every match starts and ends on a character
-/// boundary.
-fn find_invite_host(text: &str) -> Option<usize> {
-    text.as_bytes().windows(10).position(|w| {
-        w[0].eq_ignore_ascii_case(&b'd')
-            && w[1].eq_ignore_ascii_case(&b'i')
-            && w[2].eq_ignore_ascii_case(&b's')
-            && w[3].eq_ignore_ascii_case(&b'c')
-            && w[4].eq_ignore_ascii_case(&b'o')
-            && w[5].eq_ignore_ascii_case(&b'r')
-            && w[6].eq_ignore_ascii_case(&b'd')
-            && w[7] == b'.'
-            && w[8].eq_ignore_ascii_case(&b'g')
-            && w[9].eq_ignore_ascii_case(&b'g')
+/// Byte offset, needle length and dot-prefix length of the earliest
+/// case-insensitive invite host in `text`, if any. All needles are pure
+/// ASCII, so every match starts and ends on a character boundary.
+fn find_invite_host(text: &str) -> Option<(usize, usize, usize)> {
+    const HOSTS: [(&[u8], usize, usize); 3] = [
+        (b"discordapp.com/invite", 21, 11), // `discordapp.` prefix length
+        (b"discord.com/invite", 18, 8),     // `discord.` prefix length
+        (b"discord.gg", 10, 8),             // `discord.` prefix length
+    ];
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().find_map(|(pos, _)| {
+        // Mid-char byte positions can never start an all-ASCII match;
+        // skip them so `split_at` below only sees char boundaries.
+        if !text.is_char_boundary(pos) {
+            return None;
+        }
+        HOSTS.iter().find_map(|(needle, len, dot)| {
+            if bytes.len() - pos < *len {
+                return None;
+            }
+            let matches = needle.iter().enumerate().all(|(i, b)| {
+                if *b == b'.' || *b == b'/' {
+                    bytes[pos + i] == *b
+                } else {
+                    bytes[pos + i].eq_ignore_ascii_case(b)
+                }
+            });
+            matches.then_some((pos, *len, *dot))
+        })
     })
 }
 
@@ -759,6 +775,66 @@ mod tests {
                 body
             );
         }
+    }
+
+    #[test]
+    fn neutralize_splits_every_invite_host_and_stays_idempotent() {
+        // Same three hosts as the automod invite policy; casing preserved.
+        for (hostile, broken) in [
+            ("join discord.gg/abc", "join discord.\u{200b}gg/abc"),
+            ("see DISCORD.GG/abc", "see DISCORD.\u{200b}GG/abc"),
+            (
+                "see https://discord.com/invite/xyz",
+                "see https://discord.\u{200b}com/invite/xyz",
+            ),
+            (
+                "see https://DISCORDAPP.COM/INVITE/xyz",
+                "see https://DISCORDAPP.\u{200b}COM/INVITE/xyz",
+            ),
+            ("@everyone party", "@\u{200b}everyone party"),
+        ] {
+            let safe = neutralize_scheduled_body(hostile);
+            assert_eq!(safe, broken, "{hostile:?}");
+            assert_eq!(
+                neutralize_scheduled_body(&safe),
+                safe,
+                "replay must be idempotent: {hostile:?}"
+            );
+        }
+        // Benign bodies pass through byte-identical.
+        for benign in [
+            "hello world",
+            "game night bring snacks",
+            "Meeting at 5pm",
+            "plain discord chat with no link",
+        ] {
+            assert_eq!(neutralize_scheduled_body(benign), benign);
+        }
+        // Multibyte text around a host never panics and still defuses.
+        let mixed = format!("{}discord.gg/abc{}", "界".repeat(10), "😀".repeat(5));
+        let safe = neutralize_scheduled_body(&mixed);
+        assert!(safe.contains("discord.\u{200b}gg"));
+        assert_eq!(neutralize_scheduled_body(&safe), safe);
+    }
+
+    #[test]
+    fn neutralize_growth_can_be_truncated_back_to_the_ceiling() {
+        // A legacy row at the old pre-neutralize limit grows by one unit per
+        // mass mention; the ticker's truncate-then-post keeps it sendable.
+        let body = format!("{} @everyone", "x".repeat(1990));
+        assert_eq!(crate::message_safety::text_len(&body), MAX_BODY_CHARS);
+        let neutralized = neutralize_scheduled_body(&body);
+        assert_eq!(
+            crate::message_safety::text_len(&neutralized),
+            MAX_BODY_CHARS + 1
+        );
+        let posted =
+            crate::message_safety::truncate(&neutralized, crate::message_safety::CONTENT_LIMIT);
+        assert_eq!(
+            crate::message_safety::text_len(&posted),
+            crate::message_safety::CONTENT_LIMIT
+        );
+        assert!(!posted.contains("@everyone"));
     }
 
     #[test]
