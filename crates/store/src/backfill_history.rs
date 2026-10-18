@@ -267,19 +267,18 @@ mod tests {
             (None, Some("2"), Some("3")),
             (Some("1"), Some("2"), Some("3")),
         ] {
-            // `expect_err` keeps the test free of explicit panics so the
-            // rust-panic-in-prod gate stays quiet for inline test modules.
+            // `expect_err` plus a non-constant `matches!` keeps the test free
+            // of `panic!` literals (rust-panic-in-prod gate) and of
+            // `assert!(false, ..)` (clippy::assertions-on-constants).
             let err = history_messages_path("123", 2, before, after, around)
                 .expect_err("expected typed Invalid cursor error");
-            match err {
-                BackfillHistoryError::Invalid(reason) => assert!(
-                    reason.contains("cursor"),
-                    "error reason must name the cursor problem, got: {reason:?}"
+            assert!(
+                matches!(
+                    err,
+                    BackfillHistoryError::Invalid(reason) if reason.contains("cursor")
                 ),
-                BackfillHistoryError::Db(_) => {
-                    assert!(false, "expected Invalid cursor error, got Db error")
-                }
-            }
+                "error reason must name the cursor problem, got: {err:?}"
+            );
         }
     }
 }
