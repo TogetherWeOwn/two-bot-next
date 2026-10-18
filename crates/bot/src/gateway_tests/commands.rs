@@ -35,7 +35,8 @@ async fn bootstrap(
     rest: &MockRest,
     vars: &HashMap<String, String>,
 ) -> Arc<crate::command_runtime::CommandRuntime> {
-    let config = GatewayCommandConfig::from_map(2222, vars).expect("command config");
+    let config =
+        GatewayCommandConfig::from_map_for_activation(2222, vars, true).expect("command config");
     let executor = ActionExecutor::with_proxy(TOKEN.into(), Some(rest.origin())).unwrap();
     let commands = tokio::time::timeout(
         BOUND,

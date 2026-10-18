@@ -1040,3 +1040,42 @@ async fn sink_channel_delete_merges_a_missing_creator_row() {
     })
     .await;
 }
+
+/// A nickname change renders into `@@owner@@` rooms: the gateway sink must
+/// forward it as a display update so the worker's name directory (which the
+/// background custom-name re-render reads) learns the fresh nickname.
+#[tokio::test(start_paused = true)]
+async fn member_nick_update_reaches_the_worker_name_directory() {
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    let _ = status(&runtime).await;
+    feed(
+        &runtime,
+        &pipeline,
+        Event::MemberUpdate(Box::new(
+            serde_json::from_value(json!({
+                "guild_id": GUILD.to_string(), "roles": [],
+                "nick": "Bob",
+                "user": {"id": MEMBER.to_string(), "username": "alex", "discriminator": "0"}
+            }))
+            .unwrap(),
+        )),
+    );
+    let mut directory = None;
+    for _ in 0..50 {
+        let probed = tokio::time::timeout(Duration::from_secs(5), runtime.naming_probe(GUILD))
+            .await
+            .expect("probe deadline")
+            .expect("actor exists")
+            .1;
+        if format!("{probed:?}").contains("Bob") {
+            directory = Some(probed);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let directory = directory.expect("worker directory must learn Bob from the nick update");
+    assert!(directory.knows(MEMBER));
+}
