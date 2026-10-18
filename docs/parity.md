@@ -33,7 +33,7 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 16 | `/command-list` | none | `ManageGuild` | **S4** |
 | 17 | `/schedule` | `body` req ≤2000; `in-minutes` 1–525600 opt; `every-minutes` 60–525600 opt (one required) | `ManageGuild`, runs in invoking channel | **S4** |
 | 18 | `/schedule-remove` | non-empty `id` prefix req ≤128 | `ManageGuild` | **S4** |
-| 19 | `/schedule-list` | none | `ManageGuild` | **S4** |
+| 19 | `/schedule-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 | 20 | `/sticky` | `body` req ≤2000, `debounce` 1–300 default 5 opt | `ManageGuild`, current channel | **S4** |
 | 21 | `/sticky-remove` | none (current channel) | `ManageGuild` | **S4** |
 | 22 | `/<custom>` (dynamic, DB-backed via `/command`) | none (template render) | everyone while automations enabled; refused when disabled | **S4** |
@@ -95,6 +95,7 @@ golden exception or a claim of whole-baseline registry parity.
 | `lfg-close` | docs/parity.md §1 #27 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |
 | `feed-add` | docs/parity.md §1 #28 caps | Advertise only `max_length` 2048 on `source`, matching the server-side byte bound enforced before URL parsing. |
 | `feed-remove` | docs/parity.md §1 #29 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |
+| `schedule-list` | docs/parity.md §1 #19 page | Add the Next-only optional integer `page` (`min_value` 1, default 1) so every configured id stays discoverable within Discord's 2,000-unit cap; command name, description and permissions stay legacy-identical. |
 
 These are the complete registry exceptions, mirrored by the test allowlist.
 Only equivalent guild-API representation defaults are canonicalized: omitted
