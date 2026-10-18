@@ -1089,13 +1089,13 @@ async fn cmd_guild_config_snapshot() -> i32 {
 
     let upload_raw =
         env_var("TWO_GUILD_CONFIG_UPLOAD_CMD").or_else(|| env_var("TWO_BACKUP_UPLOAD_CMD"));
-    if s3::build_upload_argv(upload_raw.as_deref(), &snapshot_path.to_string_lossy()).is_none() {
-        eprintln!("guild-config-snapshot: TWO_GUILD_CONFIG_UPLOAD_CMD (or TWO_BACKUP_UPLOAD_CMD) is required; refusing a local-only snapshot");
-        return 2;
-    }
     for path in [&snapshot_path, &drift_path] {
-        let (cmd, upload_args) =
-            s3::build_upload_argv(upload_raw.as_deref(), &path.to_string_lossy()).expect("checked");
+        let Some((cmd, upload_args)) =
+            s3::build_upload_argv(upload_raw.as_deref(), &path.to_string_lossy())
+        else {
+            eprintln!("guild-config-snapshot: TWO_GUILD_CONFIG_UPLOAD_CMD (or TWO_BACKUP_UPLOAD_CMD) is required; refusing a local-only snapshot");
+            return 2;
+        };
         match run_upload_command(&cmd, &upload_args, UPLOAD_COMMAND_TIMEOUT).await {
             UploadOutcome::Success => {}
             outcome => {
