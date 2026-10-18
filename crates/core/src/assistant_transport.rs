@@ -754,14 +754,8 @@ mod tests {
             format!("{request:#?}"),
             format!("{response:#?}"),
         ] {
-            assert!(
-                !rendered.contains("hunter2"),
-                "leaked into {rendered:?}"
-            );
-            assert!(
-                !rendered.contains(endpoint),
-                "leaked into {rendered:?}"
-            );
+            assert!(!rendered.contains("hunter2"), "leaked into {rendered:?}");
+            assert!(!rendered.contains(endpoint), "leaked into {rendered:?}");
         }
     }
 }
