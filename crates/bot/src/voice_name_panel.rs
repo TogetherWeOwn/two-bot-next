@@ -534,10 +534,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// whenever the facts it depends on change (creation, joins and leaves,
     /// owner handoff, limit) and propose the result on the rename lane, which
     /// coalesces to one pending name per channel within Discord's rename
-    /// budget. Rooms with a `/name` override re-render the stored override
-    /// through the same sanitizer and filter instead of the creator template
-    /// (see `refresh_custom_name`); a blank template keeps the room's current
-    /// name; a render the name filter blocks is skipped.
+    /// budget. Rooms with a `/name` override under a creator with a name
+    /// template re-render the stored override through the same sanitizer and
+    /// filter instead of the creator template (see `refresh_custom_name`);
+    /// under a blank template the room stays manually managed, override or
+    /// not. A blank template keeps the room's current name; a render the
+    /// name filter blocks is skipped.
     pub(super) fn refresh_template_names(&mut self, now_ms: u64) {
         let (ready, generation) = {
             let live = self.live.read_state();
@@ -601,16 +603,22 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // The status line follows the room whatever its name does: a
             // `/name` override, a blank name template or a name wait.
             self.refresh_voice_status(&room, &command);
-            if let Some(stored) = self.custom_names.get(&room_id).cloned() {
-                self.refresh_custom_name(&room, &command, &facts, &stored, now_ms);
-                continue;
-            }
-            let Some(template) = self
+            let template = self
                 .creators
                 .get(&room.creator_channel_id)
                 .map(|creator| creator.name_template.clone())
-                .filter(|template| !template.trim().is_empty())
-            else {
+                .filter(|template| !template.trim().is_empty());
+            if let Some(stored) = self.custom_names.get(&room_id).cloned() {
+                // Automatic re-renders run only where automatic naming runs:
+                // under a blank creator template the room stays manually
+                // managed (override or not), so a status-only room never
+                // spends a rename and a `/name` submit keeps its own render.
+                if template.is_some() {
+                    self.refresh_custom_name(&room, &command, &facts, &stored, now_ms);
+                }
+                continue;
+            }
+            let Some(template) = template else {
                 continue;
             };
             // A person whose display name is unknown would render as
@@ -716,8 +724,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// V5 recalculation for a room holding a `/name` override: render the
     /// stored override against the room's live facts and propose the result on
     /// the rename lane, which keeps one pending name per channel within
-    /// Discord's rename budget. Template-named rooms are untouched by this
-    /// path. A render the name filter blocks keeps the last proposed name and
+    /// Discord's rename budget. Runs only under a creator with a name
+    /// template; template-named rooms are untouched by this path. A render
+    /// the name filter blocks keeps the last proposed name and
     /// the stored override. The stored text is never written back, so
     /// `name_touched_at` keeps measuring set/restore, not recalculation.
     fn refresh_custom_name(
