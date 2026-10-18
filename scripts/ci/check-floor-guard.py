@@ -552,6 +552,8 @@ def collect(root, base, head_ref="HEAD"):
         root, "diff", "--unified=0", "--no-color", "--find-renames",
         "--src-prefix=a/", "--dst-prefix=b/", base, head_ref, "--",
     )
+    if diff.returncode != 0:
+        raise ValueError(f"git diff failed with exit code {diff.returncode}")
     added, removed = [], []
     old_path, new_path, in_hunk = None, None, False
     for line in diff.stdout.splitlines():
@@ -571,6 +573,8 @@ def collect(root, base, head_ref="HEAD"):
     status = _git(
         root, "diff", "--name-status", "-z", "--find-renames", base, head_ref, "--"
     )
+    if status.returncode != 0:
+        raise ValueError(f"git diff --name-status failed with exit code {status.returncode}")
     deleted = []
     changes = iter(status.stdout.rstrip("\0").split("\0"))
     for change in changes:
@@ -582,8 +586,9 @@ def collect(root, base, head_ref="HEAD"):
             # Test-to-test moves preserve the test; moving out of test scope
             # deletes it even when Git reports an intact R100 rename. A rename
             # inside tests/ to a non-runnable file type (markdown or a
-            # different suffix) also deletes the test: cargo only compiles
-            # tests/*.rs. Copies never delete: the source file remains.
+            # different suffix) also deletes the test. Moving a Rust integration
+            # target into src/ deletes that target even if the destination's
+            # name still looks like a test. Copies never delete the source.
             if (
                 change[0] == "R"
                 and TEST_PATH.search(old_path)
@@ -591,6 +596,10 @@ def collect(root, base, head_ref="HEAD"):
                     not TEST_PATH.search(new_path)
                     or _is_markdown(new_path)
                     or Path(old_path).suffix != Path(new_path).suffix
+                    or (
+                        INTEGRATION_TARGET.match(old_path)
+                        and not INTEGRATION_TARGET.match(new_path)
+                    )
                 )
             ):
                 deleted.append(old_path)
