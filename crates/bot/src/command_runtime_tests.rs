@@ -929,9 +929,13 @@ fn activation_boot_call_sites_narrow_refused_guards() {
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("1 passed"));
+        // The marker goes to stderr (`print_stdout` is denied workspace-wide):
+        // its presence proves the child ran this case's arm instead of
+        // early-returning with the env var unset.
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stdout.contains(&format!("CALL_SITE {expected}")),
-            "fixture {expected} must print its summary line"
+            stderr.contains("CALL_SITE") && stderr.contains(expected),
+            "fixture {expected} must emit its summary line"
         );
     }
 }
@@ -1082,7 +1086,9 @@ async fn activation_boot_call_site_fixture() {
         }
         other => panic!("unknown call-site expectation {other}"),
     }
-    println!("CALL_SITE {expected} self_permitted={self_permitted} automod_permitted={automod_permitted}");
+    // `eprintln!`: `clippy::print_stdout` is denied workspace-wide, and the
+    // parent reads this marker from the child's stderr.
+    eprintln!("CALL_SITE {expected} self_permitted={self_permitted} automod_permitted={automod_permitted}");
 }
 
 #[test]
