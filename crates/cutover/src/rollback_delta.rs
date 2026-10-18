@@ -333,6 +333,16 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "xp_cooldowns", measure: TableMeasure::Columns(&["last_awarded_at"]) },
 ];
 
+/// Tables the exporter emits only as parents of exported rows, never via a
+/// timestamp predicate. `lfg_roles` has no timestamp column, but an exported
+/// post-freeze `lfg_posts` row is unusable without its roles: `lfg_signups`
+/// references `(lfg_id, role_key)`, so the signup insert aborts the whole
+/// transaction on the missing parent. [`export_delta`] therefore emits the
+/// roles of every exported post alongside the measured rows; [`crate::rollback_import`]
+/// accepts these tables even though [`report`] still lists them as
+/// `unmeasurable` (no timestamp column to measure).
+pub const PARENT_JOINED_TABLES: &[&str] = &["lfg_roles"];
+
 /// Feed tables predate the role-matrix assertion; they are measured here and
 /// the coverage test names them explicitly so a future matrix addition cannot
 /// hide behind this list.
@@ -545,8 +555,10 @@ async fn report_at(
 }
 
 /// Export every measured post-`T_f` row as NDJSON (`{"table": ..., "row": ...}`
-/// per line) into the caller's read-only snapshot. Refuses when any table
-/// exceeds [`MAX_EXPORT_ROWS_PER_TABLE`] rather than silently truncating.
+/// per line) into the caller's read-only snapshot, plus the [`PARENT_JOINED_TABLES`]
+/// rows of every exported `lfg_posts` row (parent join, not a timestamp
+/// predicate). Refuses when any table exceeds [`MAX_EXPORT_ROWS_PER_TABLE`]
+/// rather than silently truncating.
 pub async fn export_delta(
     pool: &PgPool,
     since: &str,
@@ -560,6 +572,7 @@ pub async fn export_delta(
             other => DeltaError::Usage(other.to_string()),
         })?;
     let mut exported: u64 = 0;
+    let mut exported_post_ids: Vec<String> = Vec::new();
     for spec in TABLE_SPECS {
         let TableMeasure::Columns(_) = spec.measure else {
             continue;
@@ -590,9 +603,50 @@ pub async fn export_delta(
             .fetch_all(&mut *tx)
             .await?;
         for row in rows {
-            let line = serde_json::json!({"table": spec.table, "row": serde_json::from_str::<serde_json::Value>(&row).unwrap_or(serde_json::Value::Null)}).to_string();
+            let value: serde_json::Value =
+                serde_json::from_str(&row).unwrap_or(serde_json::Value::Null);
+            if spec.table == "lfg_posts" {
+                if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
+                    exported_post_ids.push(id.to_owned());
+                }
+            }
+            let line = serde_json::json!({"table": spec.table, "row": value}).to_string();
             writer(line)?;
             exported += 1;
+        }
+    }
+    // Parent join: the roles of every exported post round-trip with the post
+    // and its signups, so the `(lfg_id, role_key)` FK never aborts the import
+    // on a missing parent. Roles carry no timestamp, hence no recency
+    // predicate: membership in this set is by exported post id.
+    if !exported_post_ids.is_empty() {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass('lfg_roles') IS NOT NULL")
+            .fetch_one(&mut *tx)
+            .await?;
+        if exists {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM lfg_roles WHERE lfg_id = ANY($1)")
+                    .bind(&exported_post_ids)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if count as u64 > MAX_EXPORT_ROWS_PER_TABLE {
+                return Err(DeltaError::ExportCap("lfg_roles".to_owned()));
+            }
+            if count > 0 {
+                let rows: Vec<String> = sqlx::query_scalar(
+                    "SELECT to_jsonb(t.*)::text FROM lfg_roles t WHERE lfg_id = ANY($1)",
+                )
+                .bind(&exported_post_ids)
+                .fetch_all(&mut *tx)
+                .await?;
+                for row in rows {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&row).unwrap_or(serde_json::Value::Null);
+                    let line = serde_json::json!({"table": "lfg_roles", "row": value}).to_string();
+                    writer(line)?;
+                    exported += 1;
+                }
+            }
         }
     }
     tx.rollback().await?;

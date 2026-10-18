@@ -9,7 +9,7 @@ use two_bot_cutover::{
 };
 
 const IMPORT_HELP: &str =
-    "Usage: rollback-delta import --file <export.ndjson> [--apply] [--allow-live-target]
+    "Usage: rollback-delta import --file <export.ndjson> [--apply] [--allow-live-target] [--acknowledge-divergent]
 
 Replay a `rollback-delta --export` file into the target from
 TWO_DATABASE_URL. Default is a dry run: the file is validated offline
@@ -19,10 +19,14 @@ before mutating, then replays the rows inside one transaction;
 re-running an identical import changes nothing. `--apply` requires
 `--allow-live-target` before any connection attempt. Malformed lines,
 unknown tables and per-table row-cap overruns refuse with exit 2 before
-any write. Rows replay parent-first; the apply reports inserted vs
-already-present rows (pre-existing rows keep their values, so divergent
-updates need manual reconciliation) and advances owned sequences past the
-imported maxima. No migrations are applied.";
+any write. Rows replay parent-first; `lfg_roles` rows travel as a parent
+join with their exported post, so a post-freeze post imports with its
+roles and signups. The apply reports inserted vs already-present rows per
+table (pre-existing rows keep their values) and advances owned sequences
+past the imported maxima. Skipped rows with no identical match are
+divergent: the first run that drops updates is reported with its table:key
+entries and exits 3 unless `--acknowledge-divergent` is passed. A failed
+insert names its table and constraint. No migrations are applied.";
 
 #[tokio::main]
 async fn main() {
@@ -85,17 +89,18 @@ async fn run(args: Args) -> Result<(), String> {
 
 /// Replay an `--export` file. Exit 2 (refusal, empty stdout) for argument,
 /// file-validation and live-target-guard failures; exit 1 for connection or
-/// apply failures after the plan was printed; exit 0 on success.
+/// apply failures after the plan was printed; exit 3 when divergent rows were
+/// dropped (unless `--acknowledge-divergent`); exit 0 on success.
 async fn run_import(args: Args) -> i32 {
     if args.positionals.len() != 1
         || args
             .flags
             .iter()
-            .any(|f| f != "apply" && f != "allow-live-target")
+            .any(|f| f != "apply" && f != "allow-live-target" && f != "acknowledge-divergent")
         || args
             .values
             .keys()
-            .any(|k| k != "file" && k != "allow-live-target")
+            .any(|k| k != "file" && k != "allow-live-target" && k != "acknowledge-divergent")
     {
         eprintln!("rollback-delta import: unknown or malformed argument");
         return 2;
@@ -103,6 +108,12 @@ async fn run_import(args: Args) -> i32 {
     if args.values.contains_key("allow-live-target") {
         eprintln!(
             "rollback-delta import: --allow-live-target is a bare opt-in and does not accept a value"
+        );
+        return 2;
+    }
+    if args.values.contains_key("acknowledge-divergent") {
+        eprintln!(
+            "rollback-delta import: --acknowledge-divergent is a bare opt-in and does not accept a value"
         );
         return 2;
     }
@@ -171,15 +182,50 @@ async fn run_import(args: Args) -> i32 {
             return 1;
         }
     };
+    let acknowledged = args.flags.contains("acknowledge-divergent");
     let outcome = match apply_import(db.pool(), &rows).await {
         Ok(outcome) => {
             eprintln!(
-                "rollback-delta import: applied {} of {} rows ({} already present)",
+                "rollback-delta import: applied {} of {} rows ({} already present, {} divergent)",
                 outcome.inserted,
                 outcome.total(),
-                outcome.skipped
+                outcome.skipped,
+                outcome.divergent
             );
-            0
+            for table in &outcome.per_table {
+                eprintln!(
+                    "rollback-delta import: table {}: inserted {} already present {} divergent {}",
+                    table.table, table.inserted, table.skipped, table.divergent
+                );
+            }
+            if outcome.divergent > 0 {
+                for key in outcome.divergent_keys.iter().take(50) {
+                    eprintln!("rollback-delta import: divergent {key}");
+                }
+                if acknowledged {
+                    eprintln!(
+                        "rollback-delta import: divergent rows acknowledged; target values kept"
+                    );
+                    0
+                } else {
+                    eprintln!(
+                        "rollback-delta import: {} divergent rows need manual reconciliation; re-run with --acknowledge-divergent once reconciled",
+                        outcome.divergent
+                    );
+                    3
+                }
+            } else {
+                0
+            }
+        }
+        Err(two_bot_cutover::rollback_import::ImportApplyError::ConstraintViolation {
+            table,
+            constraint,
+        }) => {
+            eprintln!(
+                "rollback-delta import: import into '{table}' violates {constraint} (parent row missing or already changed; see docs/cutover.md)"
+            );
+            1
         }
         Err(_) => {
             eprintln!("rollback-delta import: database error (details omitted)");
@@ -239,6 +285,35 @@ mod tests {
         assert_eq!(
             run_import(args(&["import", "--allow-live-target=x", "--file", "x"])).await,
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledge_divergent_with_a_value_refuses() {
+        assert_eq!(
+            run_import(args(&[
+                "import",
+                "--acknowledge-divergent=x",
+                "--file",
+                "x"
+            ]))
+            .await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_accepts_acknowledge_divergent_and_succeeds() {
+        let file = fixture("rollback_import_valid.ndjson");
+        assert_eq!(
+            run_import(args(&[
+                "import",
+                "--file",
+                file.as_str(),
+                "--acknowledge-divergent"
+            ]))
+            .await,
+            0
         );
     }
 

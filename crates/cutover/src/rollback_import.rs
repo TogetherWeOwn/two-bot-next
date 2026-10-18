@@ -24,11 +24,15 @@
 //! identical import is idempotent: conflicting rows keep their existing
 //! values and are reported as skipped, never silently applied. Owned serial
 //! sequences for imported tables advance past the imported maxima in the same
-//! transaction. Divergent-value conflicts (a pre-existing row with different
-//! values) keep the target values; the operator reconciles them by hand.
-//! `lfg_roles` has no timestamp column so a post-freeze role row is never
-//! exported: signups for a post-freeze post refuse on the missing parent (the
-//! transaction rolls back) instead of half-importing.
+//! transaction. Skipped rows are classified by containment (`target @>
+//! incoming`): an identical row is an idempotent re-run, while a skipped row
+//! with no identical match is divergent (a pre-existing row with different
+//! values keeps the target values). Divergent rows are reported per table with
+//! their keys and fail the CLI (exit 3) unless `--acknowledge-divergent` is
+//! passed. `lfg_roles` has no timestamp column but round-trips as a parent
+//! join: the exporter emits the roles of every exported `lfg_posts` row, so a
+//! post-freeze post imports with its roles and signups instead of aborting on
+//! the missing parent.
 
 use std::collections::BTreeMap;
 
@@ -36,7 +40,9 @@ use sqlx::PgPool;
 use thiserror::Error;
 use two_bot_core::backup::DUMP_TABLES;
 
-use crate::rollback_delta::{TableMeasure, MAX_EXPORT_ROWS_PER_TABLE, TABLE_SPECS};
+use crate::rollback_delta::{
+    TableMeasure, MAX_EXPORT_ROWS_PER_TABLE, PARENT_JOINED_TABLES, TABLE_SPECS,
+};
 
 /// Plan format version, bumped only for breaking JSON changes.
 pub const IMPORT_PLAN_VERSION: u32 = 1;
@@ -64,19 +70,27 @@ pub enum ImportError {
 }
 
 /// Apply-time failure. Database details are withheld; the CLI prints only
-/// these redacted messages.
+/// these redacted messages. The constraint variant names only the failing
+/// table and constraint (both static database identifiers), never URLs or row
+/// values, so the operator can bisect the NDJSON without a blind retry.
 #[derive(Debug, Error)]
 pub enum ImportApplyError {
     #[error("database error (details omitted)")]
     Database(#[from] sqlx::Error),
+    #[error("import into '{table}' violates {constraint} (parent row missing or already changed; see docs/cutover.md)")]
+    ConstraintViolation { table: String, constraint: String },
     #[error("invalid table name in validated import")]
     InvalidTable(String),
 }
 
 /// True when the exporter can emit rows for `table`: a measured table (one
-/// with timestamp columns), never an unmeasurable or absent one.
+/// with timestamp columns) or a [`PARENT_JOINED_TABLES`] parent (emitted only
+/// alongside its exported parent), never any other unmeasurable or absent one.
 #[must_use]
 pub fn is_exportable_table(table: &str) -> bool {
+    if PARENT_JOINED_TABLES.contains(&table) {
+        return true;
+    }
     TABLE_SPECS
         .iter()
         .any(|spec| spec.table == table && matches!(spec.measure, TableMeasure::Columns(_)))
@@ -169,14 +183,34 @@ pub fn import_plan(mode: &str, rows: &[ImportRow]) -> serde_json::Value {
     })
 }
 
+/// Per-table apply counts, in first-seen apply order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableOutcome {
+    pub table: String,
+    pub inserted: u64,
+    pub skipped: u64,
+    pub divergent: u64,
+}
+
 /// Outcome of [`apply_import`]: rows actually inserted vs rows skipped as
 /// already present (`ON CONFLICT DO NOTHING`). `inserted + skipped` is always
-/// the number of import rows processed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// the number of import rows processed. `divergent` is the subset of skipped
+/// rows with no identical match in the target (`target @> incoming` fails):
+/// a first run that drops updates vs an identical re-run. `divergent_keys`
+/// names up to [`MAX_DIVERGENT_KEYS`] `table:key` entries for the runbook's
+/// manual-reconciliation list.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
     pub inserted: u64,
     pub skipped: u64,
+    pub divergent: u64,
+    pub per_table: Vec<TableOutcome>,
+    pub divergent_keys: Vec<String>,
 }
+
+/// Cap on reported divergent keys: the count is always exact, only the key
+/// list is bounded so a wide rollback cannot flood operator output.
+pub const MAX_DIVERGENT_KEYS: usize = 50;
 
 impl ApplyOutcome {
     /// Total rows processed.
@@ -184,6 +218,42 @@ impl ApplyOutcome {
     pub fn total(&self) -> u64 {
         self.inserted + self.skipped
     }
+}
+
+/// Best-effort human key for a divergent row: stable identifiers first, then a
+/// truncated JSON snapshot. Only static column names and row values the
+/// operator already holds in the export file; never connection details.
+#[must_use]
+pub fn row_key_hint(row: &serde_json::Value) -> String {
+    let str_field = |name: &str| row.get(name).and_then(serde_json::Value::as_str);
+    if let Some(id) = str_field("id") {
+        return format!("id={id}");
+    }
+    match (
+        str_field("lfg_id"),
+        str_field("user_id"),
+        str_field("role_key"),
+    ) {
+        (Some(lfg), Some(user), _) => return format!("lfg_id={lfg} user_id={user}"),
+        (Some(lfg), None, Some(role)) => return format!("lfg_id={lfg} role_key={role}"),
+        _ => {}
+    }
+    if let (Some(g), Some(m)) = (str_field("guild_id"), str_field("member_id")) {
+        return format!("guild_id={g} member_id={m}");
+    }
+    if let Some(ticket) = str_field("ticket_id") {
+        return format!("ticket_id={ticket}");
+    }
+    if let (Some(g), Some(c)) = (str_field("guild_id"), str_field("channel_id")) {
+        return format!("guild_id={g} channel_id={c}");
+    }
+    if let Some(g) = str_field("guild_id") {
+        return format!("guild_id={g}");
+    }
+    let flat = serde_json::to_string(row).unwrap_or_default();
+    let mut flat: String = flat.chars().filter(|c| !c.is_whitespace()).collect();
+    flat.truncate(80);
+    flat
 }
 
 /// Restore rank of an exportable table: its position in the backup
@@ -246,8 +316,10 @@ async fn advance_owned_sequences(
 /// mapped back onto its table's columns with `jsonb_populate_record` and
 /// inserted with bare `ON CONFLICT DO NOTHING`, so an identical re-run
 /// changes nothing. Rows apply in [`DUMP_TABLES`] parent-first order.
-/// Returns the inserted vs skipped counts: skipped rows already existed and
-/// keep their target values.
+/// Returns inserted vs skipped counts plus the divergent subset: skipped rows
+/// with no identical match (`target @> incoming` fails) keep the target
+/// values and must be reconciled by hand. A failed insert names its table and
+/// constraint instead of a redacted generic.
 pub async fn apply_import(
     pool: &PgPool,
     rows: &[ImportRow],
@@ -269,17 +341,71 @@ pub async fn apply_import(
         }
     }
     let mut inserted: u64 = 0;
+    let mut skipped: u64 = 0;
+    let mut divergent: u64 = 0;
+    let mut per_table: Vec<TableOutcome> = Vec::new();
+    let mut divergent_keys: Vec<String> = Vec::new();
     for row in &ordered {
         let table = quote(&row.table)?;
         // Table names are validated statics; only the row document is bound.
         let sql = format!(
             "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table}, $1) ON CONFLICT DO NOTHING"
         );
-        inserted += sqlx::query(sqlx::AssertSqlSafe(sql))
+        let affected = match sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&row.row)
             .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            .await
+        {
+            Ok(done) => done.rows_affected(),
+            Err(sqlx::Error::Database(db_err)) => {
+                let constraint = db_err
+                    .constraint()
+                    .unwrap_or("unknown constraint")
+                    .to_owned();
+                let table_name = db_err.table().unwrap_or(row.table.as_str()).to_owned();
+                return Err(ImportApplyError::ConstraintViolation {
+                    table: table_name,
+                    constraint,
+                });
+            }
+            Err(other) => return Err(ImportApplyError::Database(other)),
+        };
+        let entry = match per_table.iter_mut().find(|e| e.table == row.table) {
+            Some(entry) => entry,
+            None => {
+                per_table.push(TableOutcome {
+                    table: row.table.clone(),
+                    inserted: 0,
+                    skipped: 0,
+                    divergent: 0,
+                });
+                per_table.last_mut().expect("just pushed")
+            }
+        };
+        if affected > 0 {
+            inserted += affected;
+            entry.inserted += affected;
+        } else {
+            skipped += 1;
+            entry.skipped += 1;
+            // Containment classifies the skip: an identical row present means
+            // an idempotent re-run; no identical match means the conflicting
+            // row differs and the update was dropped.
+            let identical_sql = format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE to_jsonb({table}.*) @> $1::jsonb)"
+            );
+            let identical: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(identical_sql))
+                .bind(&row.row)
+                .fetch_one(&mut *tx)
+                .await?;
+            if !identical {
+                divergent += 1;
+                entry.divergent += 1;
+                if divergent_keys.len() < MAX_DIVERGENT_KEYS {
+                    divergent_keys.push(format!("{}:{}", row.table, row_key_hint(&row.row)));
+                }
+            }
+        }
     }
     let mut seen: Vec<&str> = Vec::new();
     for row in &ordered {
@@ -289,10 +415,12 @@ pub async fn apply_import(
     }
     advance_owned_sequences(&mut tx, &seen).await?;
     tx.commit().await?;
-    let total = rows.len() as u64;
     Ok(ApplyOutcome {
         inserted,
-        skipped: total.saturating_sub(inserted),
+        skipped,
+        divergent,
+        per_table,
+        divergent_keys,
     })
 }
 
@@ -512,7 +640,49 @@ mod tests {
         let outcome = ApplyOutcome {
             inserted: 2,
             skipped: 1,
+            divergent: 1,
+            per_table: vec![TableOutcome {
+                table: "member_levels".to_owned(),
+                inserted: 2,
+                skipped: 1,
+                divergent: 1,
+            }],
+            divergent_keys: vec!["member_levels:guild_id=g member_id=m".to_owned()],
         };
         assert_eq!(outcome.total(), 3);
+        assert!(outcome.divergent <= outcome.skipped);
+    }
+
+    #[test]
+    fn row_key_hint_prefers_stable_identifiers() {
+        assert_eq!(
+            row_key_hint(&serde_json::json!({"id": "t-1", "guild_id": "g"})),
+            "id=t-1"
+        );
+        assert_eq!(
+            row_key_hint(&serde_json::json!({"lfg_id": "p", "user_id": "u", "role_key": "r"})),
+            "lfg_id=p user_id=u"
+        );
+        assert_eq!(
+            row_key_hint(&serde_json::json!({"lfg_id": "p", "role_key": "r"})),
+            "lfg_id=p role_key=r"
+        );
+        assert_eq!(
+            row_key_hint(&serde_json::json!({"guild_id": "g", "member_id": "m"})),
+            "guild_id=g member_id=m"
+        );
+        assert_eq!(
+            row_key_hint(&serde_json::json!({"ticket_id": "t", "guild_id": "g"})),
+            "ticket_id=t"
+        );
+    }
+
+    #[test]
+    fn lfg_roles_is_exportable_as_a_parent_join() {
+        assert!(is_exportable_table("lfg_posts"));
+        assert!(is_exportable_table("lfg_roles"));
+        assert!(is_exportable_table("lfg_signups"));
+        assert!(!is_exportable_table("rank_ladder"));
+        assert!(!is_exportable_table("no_such_table"));
     }
 }
