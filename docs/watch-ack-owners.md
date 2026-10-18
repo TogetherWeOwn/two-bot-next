@@ -38,6 +38,7 @@ the `RESOLVED` line before closing the incident
 | `voice_failures` | on-call operator | 15 min from the page |
 | `gateway_missed_events` | on-call operator | 15 min from the page |
 | `gateway_unpaired_disconnect` | on-call operator | 15 min from the page |
+| `gateway_not_ready` | on-call operator | 15 min from the page |
 | `ticker_stale:<job>` | on-call operator | 15 min from the page |
 | `receiver_refusals:<family>` | on-call operator | 15 min from the page |
 | `gateway_checkpoint_failures` | on-call operator | 15 min from the page |

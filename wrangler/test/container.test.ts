@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { setImmediate } from "node:timers/promises";
-import worker, { TwoBotContainer, type Env } from "../src/index.ts";
+import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
 import { EMPTY_STATE, type MetricsAlertState } from "../src/alert-rules.ts";
 import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
@@ -621,6 +621,46 @@ test("metrics alert lines carry the keepalive release and worker version", async
     assert.equal(alert.worker_version, ID);
   }
   assert.match(alerts[0].content, /last error class: database/);
+});
+
+test("gateway component parsing reads only the ready/starting/down vocabulary", () => {
+  assert.equal(gatewayComponentReady([["process", "ready"], ["gateway", "ready"]]), true);
+  assert.equal(gatewayComponentReady([["process", "ready"], ["gateway", "starting"]]), false);
+  assert.equal(gatewayComponentReady([["process", "ready"], ["gateway", "down"]]), false);
+  assert.equal(gatewayComponentReady([["process", "ready"], ["gateway", "down"], ["token_invalid", "down"]]), false);
+  // Anything else holds the stuck-gateway rule instead of guessing.
+  assert.equal(gatewayComponentReady([["process", "ready"]]), undefined);
+  assert.equal(gatewayComponentReady([["process", "ready"], ["gateway", "restarting"]]), undefined);
+  assert.equal(gatewayComponentReady([["process", "ready"], ["gateway", 7]]), undefined);
+  assert.equal(gatewayComponentReady([["process", "ready"], "gateway"]), undefined);
+  assert.equal(gatewayComponentReady({ gateway: "down" }), undefined);
+  assert.equal(gatewayComponentReady(undefined), undefined);
+});
+
+test("keepalive pages gateway_not_ready on the third tick with the gateway component down", async (t) => {
+  const h = await harness(t);
+  let gatewayStatus = "down";
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") return new Response(metricsBody(0));
+    return new Response(JSON.stringify({
+      components: [["process", "ready"], ["gateway", gatewayStatus]],
+      build_revision: RELEASE_SHA, build_id: "123-1",
+    }), { status: gatewayStatus === "ready" ? 200 : 503, headers: { "content-type": "application/json" } });
+  });
+  const metricsAlerts = () => h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line))
+    .filter((event) => event.event === "metrics_alert").map((event) => event.content as string);
+  await tickKeepalive(h.bot);
+  await tickKeepalive(h.bot);
+  assert.ok(metricsAlerts().every((content) => !content.includes("gateway_not_ready")), "no page before the third sample");
+  await tickKeepalive(h.bot);
+  assert.ok(metricsAlerts().some((content) => content.includes("two-bot-next ALERT gateway_not_ready")),
+    `expected a gateway_not_ready page, got: ${JSON.stringify(metricsAlerts())}`);
+  // Recovery clears on the first ready sample.
+  gatewayStatus = "ready";
+  await tickKeepalive(h.bot);
+  assert.ok(metricsAlerts().some((content) => content.includes("two-bot-next RESOLVED gateway_not_ready")),
+    `expected a gateway_not_ready resolution, got: ${JSON.stringify(metricsAlerts())}`);
 });
 
 test("keepalive ignores a gateway failure in a non-bot (text) probe answer", async (t) => {

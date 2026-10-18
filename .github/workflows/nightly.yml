@@ -261,6 +261,7 @@ jobs:
           --skip started_claim_is_never_reclaimed_even_when_stale
           --skip started_send_that_provably_failed_releases_for_the_retry
           --skip reclaiming_a_missing_key_claims_it_fresh
+          --skip delivered_rows_expire_only_past_the_horizon_with_the_fence_intact
           --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
           --skip mock_delivery_crash_reconciliation_restart_and_overflow
           --skip parity_mismatch_cursor_and_read_only_acceptance
