@@ -288,9 +288,11 @@ async fn per_route_bucket_headers_gate_same_bucket_without_hardcoded_limits() {
 
     let seen = mock.requests();
     assert_eq!(seen.len(), 2);
+    // The executor targets the versioned Discord API path; the test route is
+    // the suffix.
     assert!(seen
         .iter()
-        .all(|r| r.method == "GET" && r.path == format!("/api/v10{path}")));
+        .all(|r| r.method == "GET" && r.path.ends_with(path)));
     let gap = seen[1].received_at.duration_since(seen[0].received_at);
     assert!(
         gap >= Duration::from_millis(1900),
@@ -412,13 +414,15 @@ async fn reset_after_header_drives_sleep_then_retry_with_no_request_during_pause
 
 // (4) 401/403/429 responses spend the invalid-request budget (small threshold
 // keeps this fast; the real cutoff is 10k/10min per the docs, 2026-10-12),
-// while a `shared`-scope 429 is not tallied against the bot. Counters stay
-// low-cardinality: the snapshot carries no token, route or body.
+// while a `shared`-scope 429 is not tallied against the bot. A bot-token 401
+// additionally latches `token_invalid`, so the 401 probe runs on its own
+// guard after the breaker probe. Counters stay low-cardinality: the snapshot
+// carries no token, route or body.
 #[tokio::test]
 async fn shared_scope_429_does_not_spend_invalid_budget_while_others_do() {
     let mock = FakeRest::start(
         vec![
-            FakeResponse::status(401),
+            FakeResponse::status(403),
             FakeResponse::status(403),
             FakeResponse::json(429, serde_json::json!({"retry_after": 0.0, "global": true})),
         ],
@@ -432,12 +436,12 @@ async fn shared_scope_429_does_not_spend_invalid_budget_while_others_do() {
     assert!(exec
         .get_json_observed(path)
         .await
-        .expect("401 read")
+        .expect("403 read")
         .is_none());
     assert!(exec
         .get_json_observed(path)
         .await
-        .expect("403 read")
+        .expect("second 403 read")
         .is_none());
     let (recovered, _) = exec
         .get_json_observed(path)
@@ -471,6 +475,39 @@ async fn shared_scope_429_does_not_spend_invalid_budget_while_others_do() {
             "guard snapshot carries high-cardinality detail"
         );
     }
+    mock.shutdown().await;
+
+    // A bot-token 401 tallies and latches `token_invalid`: later reads refuse
+    // without reaching the wire.
+    let mock = FakeRest::start(
+        vec![FakeResponse::status(401)],
+        FakeResponse::json(200, serde_json::json!({"ok": true})),
+    )
+    .await;
+    let guard = small_guard(3);
+    let exec = executor(&mock.origin(), &guard);
+    assert!(exec
+        .get_json_observed(path)
+        .await
+        .expect("401 read")
+        .is_none());
+    assert_eq!(guard.snapshot().invalid_requests_total, 1);
+    assert!(guard.snapshot().token_invalid);
+    let before = mock.requests().len();
+    let refused = exec
+        .get_json_observed(path)
+        .await
+        .expect_err("invalid token refuses");
+    assert!(
+        refused.contains("token_invalid"),
+        "unexpected refusal: {refused}"
+    );
+    assert_eq!(
+        mock.requests().len(),
+        before,
+        "refused read reached the wire"
+    );
+    assert_eq!(guard.snapshot().rejected_requests_total, 1);
     mock.shutdown().await;
 
     let mock = FakeRest::start(
