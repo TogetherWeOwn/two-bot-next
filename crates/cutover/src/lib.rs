@@ -41,6 +41,7 @@ pub mod reengagement;
 pub mod rest;
 pub mod retention;
 pub mod rollback_delta;
+pub mod rollback_import;
 pub mod self_role_store;
 pub mod settings;
 pub mod staging_migrate;
