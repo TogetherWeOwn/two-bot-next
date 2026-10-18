@@ -142,7 +142,7 @@ jobs:
       - name: Guarded fixture routing and doc references (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
       - name: Cache cargo
@@ -303,11 +303,6 @@ jobs:
           --skip invite_rows_hold_metadata_only
           --skip onboarding_rows_hold_ids_enums_metadata_only
           --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
-          --skip per_route_bucket_headers_gate_same_bucket_without_hardcoded_limits
-          --skip independent_workers_share_global_pacing
-          --skip reset_after_header_drives_sleep_then_retry_with_no_request_during_pause
-          --skip shared_scope_429_does_not_spend_invalid_budget_while_others_do
-          --skip header_absent_responses_keep_conservative_spacing
           --skip event_store_s8_stage_lifecycle_persists_ids_and_privacy_enum_only
           --skip event_store_s8_interaction_create_observes_ids_and_command_enums_only
           --skip event_store_s8_audit_log_entry_persists_ids_and_action_enum_only

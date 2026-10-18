@@ -247,6 +247,13 @@ pub struct CutoverDb {
 }
 
 impl CutoverDb {
+    /// Wrap an already-open pool (gateway runtimes own their pool; the
+    /// privacy service borrows it for one call, no new connections).
+    #[must_use]
+    pub fn from_pool(pool: Pool<Postgres>) -> Self {
+        Self { pool }
+    }
+
     #[must_use]
     pub fn pool(&self) -> &Pool<Postgres> {
         &self.pool

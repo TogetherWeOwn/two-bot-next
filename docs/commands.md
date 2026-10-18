@@ -19,7 +19,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+Built-in commands: 51.
 
 ## `/access`
 
@@ -345,6 +345,19 @@ Set where new rooms appear and the first room number
 | `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
 | `position` | string | false | — | — | — | Above = `"above"`; Below = `"below"` | New rooms go above or below the creator channel |
 | `first-number` | integer | false | 1 | 4294967295 | — | — | First room number (numbering starts here) |
+
+## `/privacy`
+
+Manage your analytics privacy for this server.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `opt-out` | subcommand | false | — | — | — | — | Delete your stored activity for this server and stop future analytics persistence. |
+| `opt-in` | subcommand | false | — | — | — | — | Resume analytics persistence for this server (already-deleted rows are not restored). |
+| `status` | subcommand | false | — | — | — | — | Show whether you are opted out and this server's analytics switches. |
 
 ## `/private`
 
