@@ -467,6 +467,10 @@ async fn missing_rejoin_cancel_grant_holds_cursor_but_delete_insert_commits() {
 
 #[tokio::test]
 async fn missing_queue_insert_grant_skips_real_delete_and_gateway_continues() {
+    // A 42501 on a real removal is a schema-gap skip: it advances the
+    // global replay-needed signal, so hold the serial lock to keep a
+    // sibling delta-measurement exact.
+    let _replay_serial = replay_needed_serial().lock().await;
     // The mirror of the rejoin hold above: a 42501 on a real GUILD_DELETE
     // (INSERT denied) is still a schema-gap skip — the dispatch checkpoints,
     // the gateway keeps running, and the Operator replay in docs/privacy.md
@@ -495,6 +499,10 @@ async fn missing_queue_insert_grant_skips_real_delete_and_gateway_continues() {
 
 #[tokio::test]
 async fn missing_retention_tables_do_not_stop_the_gateway() {
+    // The dropped queue turns the real removal below into a purge-skip,
+    // which advances the global replay-needed signal: hold the serial
+    // lock so a sibling delta-measurement stays exact.
+    let _replay_serial = replay_needed_serial().lock().await;
     // TOG-25067 staging reproduction: the 0438 retention queues are absent
     // (an unapplied migration), so every queue/cancel write fails with 42P01.
     // The gateway must skip the auxiliary write and commit the dispatch
@@ -534,6 +542,10 @@ fn schema_gap_capture() -> &'static crate::tracing_capture::Capture {
 
 #[tokio::test]
 async fn schema_gapped_real_delete_survives_and_operator_replay_restores_purge() {
+    // The dropped queue turns the real removal below into a purge-skip,
+    // which advances the global replay-needed signal: hold the serial
+    // lock so a sibling delta-measurement stays exact.
+    let _replay_serial = replay_needed_serial().lock().await;
     // Paperclip Review on #978: acking a schema-gapped real GUILD_DELETE must
     // not silently drop the purge obligation. The gateway survives (the
     // sequence advances), the skip is pinned at error level with the guild and
@@ -904,11 +916,23 @@ async fn blocked_cancel_write_obeys_checkpoint_deadline() {
 // - `docs/privacy.md` points operators at the signal by name while keeping
 //   the manual replay insert.
 //
-// The two database tests read process-global counter deltas. The gateway
-// suite's CI lane runs `--test-threads=1`, which is what makes an exact
-// delta meaningful; run this battery in that lane (or filtered) locally.
+// The database tests below share the process-global counter, and `cargo
+// test` / nextest run them on parallel threads. An exact delta is only
+// meaningful when no sibling test advances the signal mid-measurement, so
+// every test that can advance it (each real-removal purge-skip) and every
+// test that reads its delta holds `replay_needed_serial` for its whole
+// body. A `tokio::sync::Mutex` (not `std`) because the guard is held
+// across `.await`s.
 
 const REPLAY_NEEDED_TOKEN: &str = "retention_replay_needed";
+
+/// Process-wide serialiser for the global `retention_replay_needed`
+/// counter: holders run their purge-skip / delta-measurement alone, so a
+/// parallel sibling cannot pollute an exact-delta assertion.
+fn replay_needed_serial() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 /// Sum of every rendered sample whose metric name contains the token.
 /// `None` when no such sample exists at all (signal not implemented).
@@ -969,6 +993,10 @@ fn retention_replay_needed_signal_is_pollable_and_renders_zero_when_fresh() {
 
 #[tokio::test]
 async fn retention_replay_needed_skip_path_increments_exactly_once() {
+    // The delta below is read from the process-global counter, so hold
+    // the serial lock for the whole measurement: a parallel sibling
+    // purge-skip would otherwise pollute the exact increment.
+    let _replay_serial = replay_needed_serial().lock().await;
     // Forced purge-skip: the queue table is missing (42P01), so the real
     // delete drops its purge obligation. That one skip must advance the
     // pollable signal by exactly one; the following rejoin-cancel skip
@@ -1003,6 +1031,10 @@ async fn retention_replay_needed_skip_path_increments_exactly_once() {
 
 #[tokio::test]
 async fn retention_replay_needed_successful_purge_queue_leaves_signal_at_zero() {
+    // The delta below is read from the process-global counter, so hold
+    // the serial lock for the whole measurement: a parallel sibling
+    // purge-skip would otherwise look like movement on this path.
+    let _replay_serial = replay_needed_serial().lock().await;
     // Successful path: the queue table exists, the real delete queues its
     // purge, and the signal must not move.
     let Some(db) = database().await else { return };
