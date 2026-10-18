@@ -171,6 +171,21 @@ pub(crate) async fn schedule_create(
             .await;
         }
         Err(QuotaWriteError::Capacity(quota)) => {
+            // Quota refusal audits exactly like a validation rejection: one
+            // `scheduled.create`/`rejected` row with reason `quota`, naming
+            // the fresh attempt id. Every refusal audits its own row
+            // (1 refusal = 1 audit); nothing here dedupes or suppresses.
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.create",
+                &id,
+                "rejected",
+                Some("quota"),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, quota.to_string()).await;
         }
         Err(err) => {
