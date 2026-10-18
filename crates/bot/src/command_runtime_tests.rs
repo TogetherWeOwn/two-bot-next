@@ -4452,7 +4452,16 @@ async fn automation_quota_refusals_reply_with_a_remedy_and_write_no_rows_or_audi
     );
     assert_eq!(db.schedule_rows().await.len(), 25);
     assert_eq!(db.feed_rows().await.len(), 25);
-    assert!(db.schedule_audits().await.is_empty());
+    // Schedule capacity refusal audits one `scheduled.create`/`rejected` row
+    // (reason `quota`); feed capacity refusal still audits nothing.
+    let schedule_audits = db.schedule_audits().await;
+    assert_eq!(
+        schedule_audits.len(),
+        1,
+        "schedule capacity refusal audits one row: {schedule_audits:?}"
+    );
+    assert_eq!(schedule_audits[0].0, "scheduled.create");
+    assert_eq!(schedule_audits[0].2, "rejected");
     assert!(db.feed_audits().await.is_empty());
     assert!(!mock
         .requests()
@@ -4855,6 +4864,278 @@ async fn schedule_create_rejects_invalid_input_and_audits_rejected() {
             .iter()
             .all(|(action, _, outcome)| action == "scheduled.create" && outcome == "rejected"),
         "validation failures audit scheduled.create/rejected: {audits:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+// --- acceptance: quota-capacity refusal audits like other refusals --------
+//
+// Locked contract: one capacity refusal writes exactly one audit row with
+// action `scheduled.create`, outcome `rejected` and reason `quota`, in the
+// same shape as a validation rejection (fresh attempt id as `target_key`,
+// invoking member as `actor_id`). A repeated refusal is a new refusal: it
+// writes its own single row and no extra row (`1 refusal = 1 audit` parity).
+
+/// (action, target_key, outcome, reason, actor_id) for this guild's rows in
+/// the shared automation audit log.
+async fn schedule_audit_rows(
+    db: &TestDb,
+) -> Vec<(
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+)> {
+    sqlx::query_as(
+        "SELECT action, target_key, outcome, reason, actor_id
+           FROM automation_audit_log
+          WHERE guild_id = $1 ORDER BY created_at, id",
+    )
+    .bind(GUILD_S)
+    .fetch_all(&db.pool)
+    .await
+    .expect("automation audit rows with reasons")
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_quota_capacity_refusal_audits_one_rejected_row() {
+    use two_bot_core::automation_quota::AutomationQuota;
+
+    let db = TestDb::new().await;
+    let limit = AutomationQuota::Schedules.limit();
+    for n in 0..limit {
+        db.seed_schedule(GUILD_S, &format!("schedule-{n}")).await;
+    }
+    let seeded: Vec<String> = db
+        .schedule_rows()
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(seeded.len() as i64, limit, "guild starts at capacity");
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(30)),
+            ],
+        ))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        AutomationQuota::Schedules.to_string(),
+        "capacity refusal keeps its existing reply text"
+    );
+    assert!(
+        !mock
+            .requests()
+            .iter()
+            .any(|request| request.path.starts_with("/api/v10/channels/")),
+        "refusal posts nothing to a channel"
+    );
+    assert_eq!(
+        db.schedule_rows()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        seeded,
+        "refusal writes no schedule row"
+    );
+
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one capacity refusal writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_eq!(action, "scheduled.create");
+    assert_eq!(outcome, "rejected");
+    assert_eq!(reason.as_deref(), Some("quota"));
+    assert_eq!(
+        actor_id.as_deref(),
+        Some("88"),
+        "audit names the invoking member, like a validation rejection"
+    );
+    let target = target_key
+        .as_deref()
+        .expect("audit names the attempted schedule id");
+    assert!(
+        !target.is_empty() && !seeded.iter().any(|id| id == target),
+        "target is the fresh attempt id, not a seeded row: {target}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_refusals_audit_one_row_each_across_kinds() {
+    use two_bot_core::automation_quota::AutomationQuota;
+
+    let db = TestDb::new().await;
+    for n in 0..AutomationQuota::Schedules.limit() {
+        db.seed_schedule(GUILD_S, &format!("schedule-{n}")).await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+    let valid = || {
+        slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(30)),
+            ],
+        )
+    };
+
+    // Validation refusal (no timing), capacity refusal, the identical
+    // capacity refusal again, then another validation refusal.
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![option(
+                "body",
+                CommandOptionValue::String("hello".to_owned()),
+            )],
+        ))
+        .await;
+    runtime.on_interaction(&valid()).await;
+    runtime.on_interaction(&valid()).await;
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(0)),
+            ],
+        ))
+        .await;
+
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), 4, "every refusal still completes the defer");
+    let replies: Vec<String> = edits
+        .iter()
+        .map(|edit| {
+            let json: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+            json["content"].as_str().expect("reply text").to_owned()
+        })
+        .collect();
+    assert_eq!(
+        replies,
+        vec![
+            "Give either in-minutes (one-shot) or every-minutes (recurring).".to_owned(),
+            AutomationQuota::Schedules.to_string(),
+            AutomationQuota::Schedules.to_string(),
+            "in-minutes must be between 1 and 525600, got 0.".to_owned(),
+        ],
+        "refusal reply texts are unchanged"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len() as i64,
+        AutomationQuota::Schedules.limit(),
+        "no refusal writes a schedule row"
+    );
+
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        4,
+        "each refusal writes exactly one audit row, no refusal writes an \
+         extra row: {audits:?}"
+    );
+    assert!(
+        audits.iter().all(|(action, _, outcome, _, actor_id)| {
+            action == "scheduled.create"
+                && outcome == "rejected"
+                && actor_id.as_deref() == Some("88")
+        }),
+        "all four refusals share the rejected shape: {audits:?}"
+    );
+    let mut reasons: Vec<Option<String>> = audits
+        .iter()
+        .map(|(_, _, _, reason, _)| reason.clone())
+        .collect();
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        vec![
+            Some("Give either in-minutes (one-shot) or every-minutes (recurring).".to_owned()),
+            Some("in-minutes must be between 1 and 525600, got 0.".to_owned()),
+            Some("quota".to_owned()),
+            Some("quota".to_owned()),
+        ],
+        "validation reasons keep their error text; capacity reasons are quota"
+    );
+    let targets: std::collections::BTreeSet<Option<String>> = audits
+        .iter()
+        .map(|(_, target_key, _, _, _)| target_key.clone())
+        .collect();
+    assert_eq!(
+        targets.len(),
+        4,
+        "each refusal audits its own fresh attempt id: {audits:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_quota_capacity_refusal_audit_behavior_is_unchanged() {
+    use two_bot_core::automation_quota::AutomationQuota;
+
+    let db = TestDb::new().await;
+    for n in 0..AutomationQuota::Feeds.limit() {
+        db.seed_feed(GUILD_S, &format!("feed-{n}"), "rss").await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "feed-add",
+            Some(CHANNEL),
+            vec![
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option(
+                    "source",
+                    CommandOptionValue::String("https://example.com/new.xml".to_owned()),
+                ),
+            ],
+        ))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        AutomationQuota::Feeds.to_string()
+    );
+    assert_eq!(
+        db.feed_rows().await.len() as i64,
+        AutomationQuota::Feeds.limit(),
+        "refusal writes no feed row"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "feed capacity refusal audit behavior is unchanged"
+    );
+    assert!(
+        schedule_audit_rows(&db).await.is_empty(),
+        "feed capacity refusal writes no automation audit row"
     );
     mock.shutdown().await;
     db.close().await;
