@@ -25,8 +25,10 @@ roles and signups. The apply reports inserted vs already-present rows per
 table (pre-existing rows keep their values) and advances owned sequences
 past the imported maxima. Skipped rows with no identical match are
 divergent: the first run that drops updates is reported with its table:key
-entries and exits 3 unless `--acknowledge-divergent` is passed. A failed
-insert names its table and constraint. No migrations are applied.";
+entries and exits 3 unless `--acknowledge-divergent` is passed. The check is
+primary-keyed inside a UTC-pinned transaction. A failed insert names its
+table and constraint for integrity violations; other server errors stay
+redacted. No migrations are applied.";
 
 #[tokio::main]
 async fn main() {

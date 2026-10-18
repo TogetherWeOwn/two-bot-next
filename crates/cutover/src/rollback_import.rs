@@ -24,10 +24,11 @@
 //! identical import is idempotent: conflicting rows keep their existing
 //! values and are reported as skipped, never silently applied. Owned serial
 //! sequences for imported tables advance past the imported maxima in the same
-//! transaction. Skipped rows are classified by containment (`target @>
-//! incoming`): an identical row is an idempotent re-run, while a skipped row
-//! with no identical match is divergent (a pre-existing row with different
-//! values keeps the target values). Divergent rows are reported per table with
+//! transaction. Skipped rows are classified by a primary-keyed containment
+//! check (`target @> incoming` on the conflicting row only, inside a
+//! UTC-pinned transaction): an identical row is an idempotent re-run, while a
+//! skipped row with no identical match is divergent (a pre-existing row with
+//! different values keeps the target values). Divergent rows are reported per table with
 //! their keys and fail the CLI (exit 3) unless `--acknowledge-divergent` is
 //! passed. `lfg_roles` has no timestamp column but round-trips as a parent
 //! join: the exporter emits the roles of every exported `lfg_posts` row, so a
@@ -36,7 +37,7 @@
 
 use std::collections::BTreeMap;
 
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool};
 use thiserror::Error;
 use two_bot_core::backup::DUMP_TABLES;
 
@@ -226,8 +227,15 @@ impl ApplyOutcome {
 #[must_use]
 pub fn row_key_hint(row: &serde_json::Value) -> String {
     let str_field = |name: &str| row.get(name).and_then(serde_json::Value::as_str);
-    if let Some(id) = str_field("id") {
-        return format!("id={id}");
+    // `id` is TEXT on most tables but a JSON number on BIGSERIAL ones
+    // (`xp_awards`, `level_import_runs`): accept both so the hint names the row.
+    if let Some(field) = row.get("id") {
+        if let Some(id) = field.as_str() {
+            return format!("id={id}");
+        }
+        if field.is_number() {
+            return format!("id={field}");
+        }
     }
     match (
         str_field("lfg_id"),
@@ -251,9 +259,9 @@ pub fn row_key_hint(row: &serde_json::Value) -> String {
         return format!("guild_id={g}");
     }
     let flat = serde_json::to_string(row).unwrap_or_default();
-    let mut flat: String = flat.chars().filter(|c| !c.is_whitespace()).collect();
-    flat.truncate(80);
-    flat
+    let flat: String = flat.chars().filter(|c| !c.is_whitespace()).collect();
+    // Char-boundary safe: byte `truncate` would panic on a multibyte split.
+    flat.chars().take(80).collect()
 }
 
 /// Restore rank of an exportable table: its position in the backup
@@ -274,6 +282,87 @@ pub fn ordered_rows(rows: &[ImportRow]) -> Vec<&ImportRow> {
     let mut ordered: Vec<&ImportRow> = rows.iter().collect();
     ordered.sort_by_key(|row| import_table_order(&row.table));
     ordered
+}
+
+/// Primary-key columns of `table` in index order, via `pg_index`. Empty when
+/// the table has no primary key or is absent from a partially migrated target.
+/// Both pools and transaction connections implement `Executor`, so the apply
+/// path passes `&mut *tx` (same snapshot) while tests pass `&pool`.
+pub async fn primary_key_columns<'e>(
+    executor: impl Executor<'e, Database = sqlx::Postgres>,
+    table: &str,
+) -> Result<Vec<String>, ImportApplyError> {
+    let cols: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname::text FROM pg_index i \
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+         WHERE i.indrelid = to_regclass($1) AND i.indisprimary \
+         ORDER BY array_position(i.indkey, a.attnum)",
+    )
+    .bind(table)
+    .fetch_all(executor)
+    .await?;
+    // Defense in depth: only static-quoted names ever reach SQL.
+    for col in &cols {
+        quote(col)?;
+    }
+    Ok(cols)
+}
+
+/// Containment check restricted to the conflicting row: the `to_jsonb`
+/// comparison runs on the single primary-keyed row instead of scanning the
+/// whole table, so classifying N skipped rows costs N index lookups, not N
+/// sequential scans. A missing incoming key compares NULL and never matches,
+/// which conservatively reports divergent. Tables without a primary key fall
+/// back to the whole-table scan; every exportable table has one, so that path
+/// is exceptional, never the common case.
+#[must_use = "building the SQL performs no I/O"]
+pub fn divergence_check_sql(
+    table: &str,
+    pk_columns: &[String],
+) -> Result<String, ImportApplyError> {
+    let table_q = quote(table)?;
+    if pk_columns.is_empty() {
+        return Ok(format!(
+            "SELECT EXISTS(SELECT 1 FROM {table_q} WHERE to_jsonb({table_q}.*) @> $1::jsonb)"
+        ));
+    }
+    let mut keys = Vec::with_capacity(pk_columns.len());
+    let mut pops = Vec::with_capacity(pk_columns.len());
+    for col in pk_columns {
+        let col_q = quote(col)?;
+        keys.push(col_q.clone());
+        pops.push(format!(
+            "(jsonb_populate_record(NULL::{table_q}, $1)).{col_q}"
+        ));
+    }
+    let (lhs, rhs) = if keys.len() == 1 {
+        (keys.join(","), pops.join(","))
+    } else {
+        (
+            format!("({})", keys.join(",")),
+            format!("({})", pops.join(",")),
+        )
+    };
+    Ok(format!(
+        "SELECT EXISTS(SELECT 1 FROM {table_q} WHERE {lhs} = {rhs} AND to_jsonb({table_q}.*) @> $1::jsonb)"
+    ))
+}
+
+/// Name the integrity violation when the server names one: a `Some` label for
+/// constraint violations (named constraint, or class-23 SQLSTATE such as a
+/// NOT NULL breach with no constraint name), `None` for every other server
+/// error (timeout, undefined table, ...), which stays a redacted database
+/// error instead of a misleading parent-row hint.
+fn integrity_violation_label(code: Option<&str>, constraint: Option<&str>) -> Option<String> {
+    if let Some(name) = constraint {
+        return Some(name.to_owned());
+    }
+    if let Some(code) = code {
+        if code.starts_with("23") {
+            return Some(format!("SQLSTATE {code}"));
+        }
+    }
+    None
 }
 
 /// Advance every sequence owned by one of `tables` past its column maximum,
@@ -315,17 +404,29 @@ async fn advance_owned_sequences(
 /// Replay validated rows into the target inside one transaction. Each row is
 /// mapped back onto its table's columns with `jsonb_populate_record` and
 /// inserted with bare `ON CONFLICT DO NOTHING`, so an identical re-run
-/// changes nothing. Rows apply in [`DUMP_TABLES`] parent-first order.
+/// changes nothing. Rows apply in [`DUMP_TABLES`] parent-first order. The
+/// transaction pins `TIME ZONE 'UTC'` (like the exporter) so timestamptz
+/// comparison is session-independent.
 /// Returns inserted vs skipped counts plus the divergent subset: skipped rows
-/// with no identical match (`target @> incoming` fails) keep the target
-/// values and must be reconciled by hand. A failed insert names its table and
-/// constraint instead of a redacted generic.
+/// with no identical match (primary-keyed `target @> incoming` fails) keep
+/// the target values and must be reconciled by hand. A failed insert names
+/// its table and constraint for integrity violations; other server errors
+/// stay redacted database errors.
 pub async fn apply_import(
     pool: &PgPool,
     rows: &[ImportRow],
 ) -> Result<ApplyOutcome, ImportApplyError> {
     let ordered = ordered_rows(rows);
     let mut tx = pool.begin().await?;
+    // The exporter pins UTC (`legacy_verify::read_only_transaction`); pin it
+    // here too so `to_jsonb` renders timestamptz identically and an identical
+    // re-run is not misclassified on non-UTC targets.
+    sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL DateStyle TO 'ISO, YMD'")
+        .execute(&mut *tx)
+        .await?;
     // Serial writers behind this import read `events_id_seq`; hold the table
     // while its rows land so the post-insert reconciliation sees a stable
     // maximum. Only when the file carries events rows and the target has the
@@ -345,6 +446,7 @@ pub async fn apply_import(
     let mut divergent: u64 = 0;
     let mut per_table: Vec<TableOutcome> = Vec::new();
     let mut divergent_keys: Vec<String> = Vec::new();
+    let mut divergence_sql_cache: BTreeMap<String, String> = BTreeMap::new();
     for row in &ordered {
         let table = quote(&row.table)?;
         // Table names are validated statics; only the row document is bound.
@@ -358,15 +460,16 @@ pub async fn apply_import(
         {
             Ok(done) => done.rows_affected(),
             Err(sqlx::Error::Database(db_err)) => {
-                let constraint = db_err
-                    .constraint()
-                    .unwrap_or("unknown constraint")
-                    .to_owned();
-                let table_name = db_err.table().unwrap_or(row.table.as_str()).to_owned();
-                return Err(ImportApplyError::ConstraintViolation {
-                    table: table_name,
-                    constraint,
-                });
+                match integrity_violation_label(db_err.code().as_deref(), db_err.constraint()) {
+                    Some(constraint) => {
+                        let table_name = db_err.table().unwrap_or(row.table.as_str()).to_owned();
+                        return Err(ImportApplyError::ConstraintViolation {
+                            table: table_name,
+                            constraint,
+                        });
+                    }
+                    None => return Err(ImportApplyError::Database(sqlx::Error::Database(db_err))),
+                }
             }
             Err(other) => return Err(ImportApplyError::Database(other)),
         };
@@ -390,11 +493,18 @@ pub async fn apply_import(
             entry.skipped += 1;
             // Containment classifies the skip: an identical row present means
             // an idempotent re-run; no identical match means the conflicting
-            // row differs and the update was dropped.
-            let identical_sql = format!(
-                "SELECT EXISTS(SELECT 1 FROM {table} WHERE to_jsonb({table}.*) @> $1::jsonb)"
-            );
-            let identical: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(identical_sql))
+            // row differs and the update was dropped. Keyed by primary key
+            // (one catalog lookup per table, cached) so N skips cost N index
+            // lookups, not N sequential scans.
+            if !divergence_sql_cache.contains_key(row.table.as_str()) {
+                let pk_cols = primary_key_columns(&mut *tx, row.table.as_str()).await?;
+                let sql = divergence_check_sql(row.table.as_str(), &pk_cols)?;
+                divergence_sql_cache.insert(row.table.clone(), sql);
+            }
+            let identical_sql = divergence_sql_cache
+                .get(row.table.as_str())
+                .expect("just cached");
+            let identical: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(identical_sql.clone()))
                 .bind(&row.row)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -675,6 +785,97 @@ mod tests {
             row_key_hint(&serde_json::json!({"ticket_id": "t", "guild_id": "g"})),
             "ticket_id=t"
         );
+    }
+
+    #[test]
+    fn row_key_hint_accepts_numeric_ids() {
+        // BIGSERIAL tables (`xp_awards`) serialize `id` as a JSON number.
+        assert_eq!(row_key_hint(&serde_json::json!({"id": 1})), "id=1");
+        assert_eq!(
+            row_key_hint(&serde_json::json!({
+                "id": 5000,
+                "guild_id": "g",
+                "member_id": "m",
+            })),
+            "id=5000"
+        );
+        // String ids keep working.
+        assert_eq!(row_key_hint(&serde_json::json!({"id": "t-1"})), "id=t-1");
+    }
+
+    #[test]
+    fn row_key_hint_truncation_never_panics_on_multibyte_rows() {
+        let wide = "é".repeat(200);
+        let hint = row_key_hint(&serde_json::json!({"note": wide}));
+        assert!(hint.chars().count() <= 80, "hint is bounded");
+    }
+
+    #[test]
+    fn divergence_check_sql_is_keyed_by_primary_key() {
+        let single =
+            divergence_check_sql("xp_awards", &["id".to_owned()]).expect("valid keyed sql");
+        assert!(
+            single.contains("\"id\" = (jsonb_populate_record(NULL::\"xp_awards\", $1)).\"id\""),
+            "single-column key restricts the row: {single}"
+        );
+        assert!(single.contains("@> $1::jsonb"), "still a containment check");
+        assert!(
+            !single.contains("SELECT 1 FROM \"xp_awards\" WHERE to_jsonb("),
+            "no bare scan"
+        );
+
+        let composite = divergence_check_sql(
+            "member_levels",
+            &["guild_id".to_owned(), "member_id".to_owned()],
+        )
+        .expect("valid composite sql");
+        assert!(
+            composite.contains("(\"guild_id\",\"member_id\") = ("),
+            "composite key compares as a row: {composite}"
+        );
+        assert!(
+            composite.contains("(jsonb_populate_record(NULL::\"member_levels\", $1)).\"guild_id\""),
+            "incoming values come from the import document: {composite}"
+        );
+
+        let fallback = divergence_check_sql("member_levels", &[]).expect("fallback sql");
+        assert!(
+            fallback.contains("WHERE to_jsonb("),
+            "keyless tables keep the whole-table check: {fallback}"
+        );
+
+        assert!(divergence_check_sql("Members", &["id".to_owned()]).is_err());
+        assert!(divergence_check_sql("member_levels", &["Member_Id".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn integrity_violation_label_routes_only_constraint_errors() {
+        assert_eq!(
+            integrity_violation_label(Some("23505"), Some("tickets_pkey")),
+            Some("tickets_pkey".to_owned()),
+            "named constraint wins"
+        );
+        assert_eq!(
+            integrity_violation_label(Some("23502"), None),
+            Some("SQLSTATE 23502".to_owned()),
+            "class-23 without a name still names the SQLSTATE"
+        );
+        assert_eq!(
+            integrity_violation_label(Some("23503"), None),
+            Some("SQLSTATE 23503".to_owned()),
+            "foreign-key violations without a name stay violations"
+        );
+        assert_eq!(
+            integrity_violation_label(Some("57014"), None),
+            None,
+            "statement timeout is a database error, not a constraint hint"
+        );
+        assert_eq!(
+            integrity_violation_label(Some("42P01"), None),
+            None,
+            "undefined table is a database error, not a constraint hint"
+        );
+        assert_eq!(integrity_violation_label(None, None), None);
     }
 
     #[test]

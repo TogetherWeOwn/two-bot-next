@@ -10,8 +10,10 @@
 //! advance past imported maxima, files without `events` rows never touch
 //! an `events` table, LFG posts round-trip with their parent-joined roles
 //! and signups, divergent updates are reported per table with keys instead
-//! of silently dropped, and every live FK between exportable tables respects
-//! the parent-first apply order.
+//! of silently dropped, the divergence check is primary-keyed (index lookup,
+//! not a table scan) inside a UTC-pinned transaction, identical re-runs stay
+//! clean on non-UTC targets, and every live FK between exportable tables
+//! respects the parent-first apply order.
 //!
 //! Same disposable-database pattern as the protected acceptance file: one
 //! owned database per test on `agent-testdb`, never staging or production.
@@ -25,7 +27,8 @@ use sqlx::PgPool;
 use two_bot_cutover::legacy_copy::options::guarded_target;
 use two_bot_cutover::rollback_delta::export_delta;
 use two_bot_cutover::rollback_import::{
-    apply_import, import_table_order, is_exportable_table, parse_import,
+    apply_import, divergence_check_sql, import_table_order, is_exportable_table, parse_import,
+    primary_key_columns,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -630,6 +633,148 @@ async fn import_table_order_respects_live_foreign_keys() -> TestResult {
         assert!(
             checked >= 8,
             "expected the exportable FK graph to be covered, checked only {checked}: {edges:?}"
+        );
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    let cleaned = db.cleanup().await;
+    result.and(cleaned)
+}
+
+/// An identical re-run reports zero divergent rows even when the target
+/// session defaults to a non-UTC zone: the apply transaction pins UTC like
+/// the exporter, so `to_jsonb` renders timestamptz identically. A genuinely
+/// changed row through the same session still reports divergent, so the pin
+/// does not neuter the signal.
+#[tokio::test]
+async fn apply_import_identical_rerun_stable_under_non_utc_timezone() -> TestResult {
+    if !db_opted_in() {
+        return Ok(());
+    }
+    let db = TestDb::new("nonutc", &[include_str!("../migrations/0002_leveling.sql")]).await?;
+    let result = async {
+        let row = member_level_row("m-tz", 17);
+        let contents = format!("{}\n", line("member_levels", &row));
+        let rows = parse_import(&contents).expect("valid tz fixture");
+        let first = apply_import(&db.pool, &rows).await.expect("tz import");
+        assert_eq!(
+            (first.inserted, first.skipped, first.divergent),
+            (1, 0, 0),
+            "fresh row lands"
+        );
+        // A session whose default zone is New York: without the UTC pin the
+        // re-run would render `updated_at` with a -04:00 offset and report a
+        // false divergent row. `after_connect` sets the hostile default at
+        // session scope (connect options cannot: sqlx pins `TimeZone: UTC` in
+        // every startup packet), and the single connection keeps this test
+        // deterministic.
+        use sqlx::Executor as _;
+        let ny_options = guarded_target(
+            &format!("postgres://agent_test:@agent-testdb:5432/{}", db.name),
+            false,
+        )
+        .map_err(|refused| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("test database refused: {refused}").into()
+        })?
+        .ssl_mode(PgSslMode::Disable);
+        let ny_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    conn.execute("SET TIME ZONE 'America/New_York'").await?;
+                    Ok(())
+                })
+            })
+            .connect_with(ny_options)
+            .await?;
+        let zone: String = sqlx::query_scalar("SHOW TIMEZONE")
+            .fetch_one(&ny_pool)
+            .await?;
+        assert_ne!(zone, "UTC", "test session really runs non-UTC: {zone}");
+        let rerun = apply_import(&ny_pool, &rows).await.expect("tz rerun");
+        let changed_contents =
+            format!("{}\n", line("member_levels", &member_level_row("m-tz", 42)));
+        let changed_rows = parse_import(&changed_contents).expect("valid changed fixture");
+        let changed = apply_import(&ny_pool, &changed_rows)
+            .await
+            .expect("tz changed import");
+        ny_pool.close().await;
+        assert_eq!(
+            (rerun.inserted, rerun.skipped, rerun.divergent),
+            (0, 1, 0),
+            "identical re-run under a non-UTC session is not divergent"
+        );
+        assert_eq!(
+            (changed.inserted, changed.skipped, changed.divergent),
+            (0, 1, 1),
+            "a dropped update still reports divergent under a non-UTC session"
+        );
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    let cleaned = db.cleanup().await;
+    result.and(cleaned)
+}
+
+/// One changed row in a table with thousands of existing rows classifies via
+/// the primary key: the divergence query apply_import runs plans as an index
+/// lookup, not a sequential scan.
+#[tokio::test]
+async fn apply_import_divergence_check_uses_primary_key() -> TestResult {
+    if !db_opted_in() {
+        return Ok(());
+    }
+    let db = TestDb::new("pkdiv", &[include_str!("../migrations/0002_leveling.sql")]).await?;
+    let result = async {
+        sqlx::query(
+            "INSERT INTO member_levels (guild_id, member_id, xp, message_xp, voice_xp, imported_xp, updated_at) \
+             SELECT 'g', 'bulk-' || g, 0, 0, 0, 0, '2026-09-01T12:00:00+00:00' \
+             FROM generate_series(1, 3000) g",
+        )
+        .execute(&db.pool)
+        .await?;
+        // One post-freeze update among thousands of untouched rows.
+        let changed = member_level_row("bulk-1500", 17);
+        let contents = format!("{}\n", line("member_levels", &changed));
+        let rows = parse_import(&contents).expect("valid keyed fixture");
+        let outcome = apply_import(&db.pool, &rows)
+            .await
+            .expect("keyed divergent import");
+        assert_eq!(
+            (outcome.inserted, outcome.skipped, outcome.divergent),
+            (0, 1, 1),
+            "the single changed row classifies divergent"
+        );
+        assert!(
+            outcome
+                .divergent_keys
+                .iter()
+                .any(|k| k.contains("member_levels") && k.contains("bulk-1500")),
+            "divergent key names the row: {:?}",
+            outcome.divergent_keys
+        );
+        // The check apply_import ran is the builder's keyed SQL, and it plans
+        // as a primary-key lookup.
+        let pk = primary_key_columns(&db.pool, "member_levels").await?;
+        assert_eq!(
+            pk,
+            vec!["guild_id".to_owned(), "member_id".to_owned()],
+            "composite PK in index order"
+        );
+        let sql = divergence_check_sql("member_levels", &pk)?;
+        let plan_rows: Vec<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN {sql}")))
+                .bind(&changed)
+                .fetch_all(&db.pool)
+                .await?;
+        let plan = plan_rows.join("\n");
+        assert!(
+            plan.contains("Index"),
+            "divergence check uses the PK index: {plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan"),
+            "divergence check never sequentially scans: {plan}"
         );
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     }
