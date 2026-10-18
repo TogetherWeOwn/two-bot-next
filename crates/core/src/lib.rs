@@ -9,6 +9,7 @@ pub mod action_outcomes;
 pub mod activation;
 pub mod analytics_family;
 pub mod anchor_event;
+pub mod assistant_transport;
 pub mod audit;
 pub mod audit_mirror;
 #[cfg(feature = "db")]
