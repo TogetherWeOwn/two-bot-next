@@ -180,6 +180,22 @@ body, broadcaster, subscription or secret data reaches any label.
 | `two_bot_eventsub_reconcile_actions_total{action}` | Successful reconcile mutations by bounded action; `action` is `create` or `delete`; 409 already-exists confirmations fold into the pass outcome |
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | Reconcile failure sites by bounded log `error_class`; `error_class` is `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed` or `other`; no status, body or response bytes in labels |
 
+## Moderation enforcement series
+
+Counters emitted by the moderation enforcement render. Unknown outcomes
+collapse to `other` (unknown verbs collapse to the trailing verb slot,
+`unlock`, until the verb allowlist grows), and no member ID, reason text
+or message content reaches any label. Verbs are the bounded `ModerationAction`
+command vocabulary (`ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`,
+`slowmode`, `lockdown`, `unlock`); outcomes are `success`, `refused`,
+`discord_error`, `storage_error` and `other`. Each terminal member or
+channel enforcement counts once; retries and rate-limit backoffs are not
+outcomes. See `docs/metrics.md` for the full label table.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_moderation_enforcements_total{verb,outcome}` | Terminal moderation enforcements by bounded verb and outcome |
+
 ## Scheduled job labels
 
 Each label owns independent `two_bot_job_runs_total{job,outcome}`,

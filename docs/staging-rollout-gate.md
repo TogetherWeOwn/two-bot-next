@@ -7,9 +7,19 @@ successful Wrangler deployment (the `deploy` job was re-enabled by
 `verify`. `preflight` and `deployment-takeover` live outside
 `staging_rollout.py`. Readiness cannot be proven before the takeover, because a
 fenced or non-owner singleton refuses `/readyz`; the Wrangler receipt is local
-and is therefore accepted before ownership moves. A red `verify` leaves the owner
-`active` on a Worker whose receipt was already accepted but whose rollout was not
-confirmed; the next push may hand off again. The gate does not
+and is therefore accepted before ownership moves. Any failed step after a
+successful deploy triggers a conditional automatic
+rollback attempt by the workflow: `deploy-staging.yml` runs
+`scripts/worker_container_rollback.py rollback` when both the `deploy`
+and `snapshot` steps succeeded and a later step fails (receipt validation,
+ownership takeover, `verify`, or the error-rate gate);
+`scripts/staging_rollout.py` itself performs
+no rollback. On success the pre-deploy Worker version **and** container image
+are restored (with takeover, which releases an intentional fence onto the
+restored version after a fenced takeover refusal), and the run still stays red — the restore
+recovers service, it never certifies the failed build. Without a successful
+deploy and snapshot there is nothing to restore, so no rollback is attempted.
+The gate does not
 accept a health response from an old singleton. This is a **staging-only** gate,
 not production authorization or a migration tool.
 
@@ -29,10 +39,25 @@ not production authorization or a migration tool.
 4. `verify` (steps 5-7) needs an owning singleton: a parked singleton answers
    `/readyz` 503 by design, so rollout convergence and runtime readiness cannot be
    checked before takeover. `verify` repeats the receipt checks first.
-5. If `verify` goes red, staging stays owned by the already-serving version and the
-   job is red on `main`. There is deliberately **no automatic fence**: a fence would
-   park every later push deploy until a manual `release_fence` dispatch. Re-run the
-   deploy (or dispatch it) after fixing the cause; production deploys are separate,
+5. If any step after a successful deploy with a
+   successful snapshot fails (receipt validation, ownership takeover,
+   `verify`, or the error-rate gate), the workflow attempts an automatic rollback to the pre-deploy
+   snapshot (Worker version **and** container image, with takeover) via
+   `scripts/worker_container_rollback.py`; `scripts/staging_rollout.py` only reports
+   the failure. After a fenced takeover refusal the rollback's own takeover
+   releases the fence onto the restored version. A restored deployment still leaves the job red on `main`: the rollback
+   restores service, it never certifies the failed build. There is deliberately **no
+   automatic permanent fence**: a successful restore ends with takeover (`active`), so
+   the next push can hand off again without a manual `release_fence` dispatch. When
+   the `deploy` or `snapshot` step did not succeed there is nothing to restore, so no
+   rollback is attempted and staging stays owned by whatever version holds it. When the
+   rollback step itself fails or its stable gate never verifies, treat staging as
+   unverified — it may still serve the failed build or sit fenced. A red downstream
+   `voice-synthetic` job is separate: it runs after the deploy job and never triggers
+   a rollback. Before re-running the deploy (or dispatching it), inspect the
+   `auto-rollback-evidence.json` in the `staging-rollout-evidence` artifact plus the
+   current Worker identity (`/health` version header), `/readyz` readiness and
+   ownership status, then fix the cause; production deploys are separate,
    manual and cutover-owned.
 
 ## Provenance chain
@@ -220,7 +245,8 @@ next-cursor/ordering contract, so a saturated page fails with
 `rollout_snapshot_truncated` rather than pretending the baseline is complete.
 First-deploy/bootstrap and no-new-rollout cases also fail; they are not evidence
 that a new revision was rolled out. No automatic rollback or secret mutation is
-performed by this script.
+performed by `scripts/staging_rollout.py` itself; rollback is a workflow step that
+invokes `scripts/worker_container_rollback.py`.
 
 On success the job prints an allowlisted receipt: application/rollout/Worker
 version, target application version, immutable image digest, build revision/ID and
