@@ -236,8 +236,9 @@ fn assert_classified_db_error(line: &str) {
 }
 
 /// A tick whose aggregate expiry failed must not leave behind the plain
-/// success line: the report either moves after the expiry (so it never
-/// prints) or degrades to the partial-work warning.
+/// success line: the committed report still prints once, with distinct text
+/// (`retention run committed; aggregate expiry failed`), so the counters are
+/// never dropped.
 fn assert_no_completed_line(logs: &str) {
     assert!(
         !logs
@@ -281,6 +282,15 @@ async fn game_aggregate_expiry_denied_delete_identifies_guild_horizon_mode_and_c
         "failure line must classify the database error, never log it raw: {failure}"
     );
     assert_no_completed_line(&logs);
+    let committed = report_line(&logs);
+    assert!(
+        committed.contains("mode=Execute") || committed.contains("mode=\"Execute\""),
+        "committed report must tag the mode on a failed expiry: {committed}"
+    );
+    assert!(
+        committed.contains("aggregate expiry failed"),
+        "committed report must use distinct text, not the plain success line: {committed}"
+    );
     let kept: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM game_activity_guild_aggregates WHERE guild_id = $1",
     )
@@ -333,6 +343,15 @@ async fn game_aggregate_expiry_listing_failure_identifies_horizon_mode_and_cause
         "failure line must classify the database error, never log it raw: {failure}"
     );
     assert_no_completed_line(&logs);
+    let committed = report_line(&logs);
+    assert!(
+        committed.contains("mode=DryRun") || committed.contains("mode=\"DryRun\""),
+        "committed report must tag the mode on a failed listing: {committed}"
+    );
+    assert!(
+        committed.contains("aggregate expiry failed"),
+        "committed report must use distinct text, not the plain success line: {committed}"
+    );
     sqlx::query("ALTER TABLE game_activity_guild_aggregates_hidden RENAME TO game_activity_guild_aggregates")
         .execute(pool).await.unwrap();
     let (result, _logs) = tick(pool, mode_from_setting(None).unwrap().unwrap()).await;

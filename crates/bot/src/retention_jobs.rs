@@ -112,10 +112,33 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                 // row. Execute deletes; drier modes count the same rows and
                 // log them under the same event, so the dry run previews
                 // exactly what execute will delete. The expiry runs before the
-                // report log below so a failed tick never leaves behind the
-                // plain success line: the report only prints after the expiry
-                // has settled.
-                expire_stale_game_aggregates(&pool, mode).await?;
+                // success report below so a failed tick never leaves behind the
+                // plain success line. When the expiry fails after `run_retention`
+                // has already committed, the committed counters still get one
+                // structured `retention_run` WARN with distinct text before
+                // returning, so the report is never dropped.
+                if let Err(expiry) = expire_stale_game_aggregates(&pool, mode).await {
+                    tracing::warn!(
+                        message = "retention_run",
+                        mode = ?mode,
+                        presence_raw_deleted = report.presence_raw_deleted,
+                        voice_raw_deleted = report.voice_raw_deleted,
+                        audit_cache_deleted = report.audit_cache_deleted,
+                        stream_live_delivered_expired = report.stream_live_delivered_expired,
+                        guild_rows_purged = report.guild_rows_purged,
+                        guild_purges_failed = report.guild_purges_failed,
+                        guild_purges_deferred = report.guild_purges_deferred,
+                        guild_purges_deferred_oldest_secs =
+                            report.guild_purges_deferred_oldest_secs,
+                        deletions_completed = report.deletions_completed,
+                        deletions_deferred = report.deletions_deferred,
+                        schema_gap_deferrals = report.schema_gap_deferrals,
+                        deletions_overdue = report.deletions_overdue,
+                        duration_ms = report.duration_ms,
+                        "retention run committed; aggregate expiry failed",
+                    );
+                    return Err(expiry);
+                }
                 let partial = report.guild_purges_failed > 0
                     || report.guild_purges_deferred > 0
                     || report.deletions_deferred > 0
