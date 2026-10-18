@@ -168,12 +168,53 @@ async fn record_async(
     .bind(&key)
     .fetch_optional(&mut *tx)
     .await?;
-    if inserted.is_none() {
+    let Some((event_row_id,)) = inserted else {
         let outcome = advance_duplicate(&mut tx, event, &key, observed_at).await?;
         tx.commit().await?;
+        // Duplicates write no event row, so they journal nothing.
         return Ok(outcome);
-    }
+    };
     project_event(&mut tx, event, &guild_id).await?;
+    // First rollback-journal writer, `PgFunnelStore` seam only (not yet the
+    // production gateway batch writer in `cutover::gateway_session`, which
+    // needs its own slice): each `PgFunnelStore` funnel append leaves one
+    // `events` insert entry naming the inserted row, journaled inside the
+    // primary transaction under a savepoint so the row and its evidence
+    // commit atomically — no crash window between a primary commit and a
+    // second journal transaction can leave a committed row unjournaled.
+    // Evidence-only and best-effort: only journal statement errors are
+    // isolated by rolling back the savepoint; they never fail or alter the
+    // primary write.
+    let entry = crate::journal::JournalEntry {
+        table_name: "events".to_owned(),
+        row_identity: event_row_id.to_string(),
+        op: crate::journal::JournalOp::Insert,
+        pre_image: None,
+    };
+    sqlx::query("SAVEPOINT funnel_journal")
+        .execute(&mut *tx)
+        .await?;
+    match crate::journal::record_in(&mut tx, &entry).await {
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT funnel_journal")
+                .execute(&mut *tx)
+                .await?;
+        }
+        Err(journal_error) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT funnel_journal")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT funnel_journal")
+                .execute(&mut *tx)
+                .await?;
+            tracing::warn!(
+                table = "events",
+                row_identity = %entry.row_identity,
+                error = %journal_error,
+                "rollback_journal record failed; primary funnel append kept",
+            );
+        }
+    }
     tx.commit().await?;
     Ok(RecordOutcome { inserted: true })
 }

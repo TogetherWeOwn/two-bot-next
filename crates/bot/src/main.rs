@@ -15,6 +15,8 @@ mod automod_gateway;
 mod backfill_error_chain_acceptance_tests;
 mod backfill_retention_chains;
 mod backup_cli;
+#[cfg(test)]
+mod backup_cli_pool_open_tests;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.
 #[allow(dead_code)]
 mod burn_rate;
@@ -44,6 +46,8 @@ mod eventsub_reconcile;
 mod fast_burn_page_tests;
 mod feed_jobs;
 mod gateway;
+#[cfg(test)]
+mod slow_burn_ticket_tests;
 // Bounded reconnect schedule and runner: no runtime caller yet. Test-only
 // until the gateway loop adopts it, so it lives in test builds instead of
 // shipping dead code to the container.
@@ -494,17 +498,23 @@ async fn run(cli_args: &[String]) {
                         )
                     });
                     if let Some(runtime) = &runtime {
-                        let config = gateway_commands::GatewayCommandConfig::from_map(
-                            guild_id,
-                            &std::env::vars().collect(),
-                        )
-                        .map_err(|error| {
-                            step_failure(
-                                FailureClass::CustomCommandsInitFailed,
-                                "custom_commands_config",
-                                error,
+                        let vars: std::collections::HashMap<String, String> =
+                            std::env::vars().collect();
+                        let config =
+                            gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                                guild_id,
+                                &vars,
+                                activation.permitted(
+                                    two_bot_core::activation::LiveCapability::Moderation,
+                                ),
                             )
-                        })?;
+                            .map_err(|error| {
+                                step_failure(
+                                    FailureClass::CustomCommandsInitFailed,
+                                    "custom_commands_config",
+                                    error,
+                                )
+                            })?;
                         runtime
                             .initialize_custom_commands(config)
                             .await

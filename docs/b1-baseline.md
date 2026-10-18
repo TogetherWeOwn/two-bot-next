@@ -156,7 +156,7 @@ tripwire without wedging ordinary code changes. A later event-executors head
 measured 15,770,928 bytes (15.04 MiB) in the [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38062362788/job/114254309361),
 42,288 bytes above the former ceiling. The internal-actions families (event
 executors plus channel-moderation union) measured 15,741,344 bytes (15.01 MiB).
-The 16 MiB working tripwire leaves 1,006,288 bytes (0.96 MiB, 6.4%) above the
+The then-current 16 MiB working tripwire left 1,006,288 bytes (0.96 MiB, 6.4%) above the
 event-executors measurement. No new dependencies or release-profile changes;
 revisit if the binary approaches the limit. The 112 MiB image ceiling is
 unchanged.

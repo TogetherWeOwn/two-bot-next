@@ -238,6 +238,15 @@ Full catalogue: legacy `src/core/settingsCatalog.ts` (~90 keys in `env_only`/`co
 
 ## 8. Observable behaviours
 
+Seasonal `/leaderboard` divergence: the routed board reads `member_season_xp`
+for the current season with an explicit season header and an honest empty
+reply, never lifetime totals. This intentionally diverges from the frozen
+legacy lifetime board. The seasonal projection fills only from awards made
+after the seasonal mirror shipped, so the first partial quarter omits
+earlier XP; the 2026-Q4 board header itself carries the partial marker so
+members see the gap, and the remaining historical repair belongs to a
+backfill, not this read path.
+
 | Behaviour | Detail | Map |
 |---|---|---|
 | Structured JSON logs (`{ts,level,msg,…}`, `debug/info/error`, `LOG_LEVEL`) | ~208 line names: lifecycle, funnel, onboarding, audit mirror, alerts, automod/moderation, rota, REST/backoff | **S2+** ([stable lifecycle log contract](logging.md); remaining feature names port with their slices) |

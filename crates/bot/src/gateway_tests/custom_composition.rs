@@ -156,7 +156,9 @@ async fn spawn_governed_with_commands(
         true,
     );
     commands
-        .initialize_custom_commands(GatewayCommandConfig::from_map(2222, &vars()).unwrap())
+        .initialize_custom_commands(
+            GatewayCommandConfig::from_map_for_activation(2222, &vars(), true).unwrap(),
+        )
         .await
         .expect("custom-command bootstrap");
     let saved = load_boot_session(&db.store).await.unwrap();
