@@ -499,6 +499,113 @@ pub fn schedule_list_pages(lines: &[String]) -> Vec<String> {
     }
 }
 
+/// `/schedule-list` continuation hint for the last page of the first capped
+/// window when hidden rows follow: names the next (global) page explicitly,
+/// so the local `Page F of F` footer never reads as the end of the list. A
+/// separate content line after the rows, leaving the byte-pinned
+/// [`schedule_list_overflow_line`] untouched; the page indicator stays the
+/// final line, as on every multi-page reply.
+#[must_use]
+pub fn schedule_list_continuation_hint(next_page: i64) -> String {
+    format!("Continued on page {next_page}.")
+}
+
+/// Pack the first capped window when hidden rows may follow (`has_hidden`).
+/// Behaves exactly like [`schedule_list_pages`] for single-page windows —
+/// no indicator, no hint — because the `(truncated, …)` overflow line
+/// already signals continuation there (that shape is acceptance-pinned).
+/// A multi-page window instead names the next page on its last page (see
+/// [`schedule_list_continuation_hint`]): the local `Page F of F` footer would
+/// otherwise claim the list ends while hidden rows sit on page `F + 1`. The
+/// hint is the final content line and participates in packing — repacked
+/// until the page count settles — so the reply still fits
+/// [`SCHEDULE_LIST_MESSAGE_LIMIT`]. Appending one line only ever touches the
+/// last page, so the count is non-decreasing and bounded by one page per
+/// line: the loop always converges.
+#[must_use]
+pub fn schedule_list_first_pages(lines: &[String], has_hidden: bool) -> Vec<String> {
+    let plain = schedule_list_pages(lines);
+    if !has_hidden || plain.len() <= 1 {
+        return plain;
+    }
+    let mut total = plain.len() as i64;
+    loop {
+        let mut hinted = lines.to_vec();
+        hinted.push(schedule_list_continuation_hint(total + 1));
+        let repacked = schedule_list_pages(&hinted);
+        if repacked.len() as i64 == total {
+            return repacked;
+        }
+        total = repacked.len() as i64;
+    }
+}
+
+/// Pack hidden-window rows with global page numbers continuing from
+/// `page_offset` (the first window's page count): page `k` of this window
+/// reads `Page <offset + k> of <offset + n>`. A zero offset behaves exactly
+/// like [`schedule_list_pages`]. A single page carries no indicator (the
+/// legacy shape, acceptance-pinned for the short-id hidden windows); every
+/// page of a multi-page hidden window ends with
+/// [`schedule_list_page_indicator`]. Packing reserves the widest global
+/// footer up front, so renumbered pages still fit
+/// [`SCHEDULE_LIST_MESSAGE_LIMIT`].
+#[must_use]
+pub fn schedule_list_pages_global(lines: &[String], page_offset: i64) -> Vec<String> {
+    if page_offset <= 0 {
+        return schedule_list_pages(lines);
+    }
+    if lines.is_empty() {
+        return vec!["Nothing scheduled.".to_owned()];
+    }
+    // Converge like `schedule_list_pages`, but the footer width is driven by
+    // the largest global number (`offset + total`), not the local one. At
+    // most 25 rows plus an overflow line, so this settles in one or two
+    // passes like the plain pack.
+    let mut total_guess: usize = 1;
+    loop {
+        let overhead = if total_guess <= 1 {
+            0
+        } else {
+            let widest = format!(
+                "\n{}",
+                schedule_list_page_indicator(
+                    page_offset + total_guess as i64,
+                    page_offset + total_guess as i64
+                )
+            );
+            crate::message_safety::text_len(&widest)
+        };
+        let rows_budget = SCHEDULE_LIST_MESSAGE_LIMIT.saturating_sub(overhead);
+        let packed = pack_schedule_rows(lines, rows_budget);
+        if packed.len() == total_guess {
+            if packed.len() == 1 {
+                return vec![packed[0]
+                    .iter()
+                    .map(|s| (*s).as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")];
+            }
+            let total = page_offset + packed.len() as i64;
+            return packed
+                .into_iter()
+                .enumerate()
+                .map(|(index, rows)| {
+                    let current = page_offset + index as i64 + 1;
+                    format!(
+                        "{}\n{}",
+                        rows.iter()
+                            .map(|s| (*s).as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        schedule_list_page_indicator(current, total)
+                    )
+                })
+                .collect();
+        }
+        total_guess = packed.len().max(1);
+    }
+}
+
 /// Render one 1-based page of whole-row lines. Omitting the option means page
 /// 1; callers pass the parsed `page` (default 1) straight through.
 #[must_use]
@@ -900,6 +1007,121 @@ mod tests {
         );
         assert_eq!(schedule_list_overflow_for_count(Some(25), 25), None);
         assert_eq!(schedule_list_overflow_for_count(Some(3), 25), None);
+    }
+
+    /// One 32-hex-id fixture-shaped row (~84 UTF-16 units): thirty of these
+    /// always need more than one 2,000-unit page, so the multi-page pager
+    /// branches stay covered without a database.
+    fn long_list_row(n: u32) -> String {
+        schedule_list_line(
+            &format!("a1b2c3d4e5f60718293a4b5c{n:08x}"),
+            "1234567890123456789",
+            "2030-01-01T00:00:00.000Z",
+            None,
+            true,
+        )
+    }
+
+    #[test]
+    fn continuation_hint_names_the_next_page() {
+        assert_eq!(schedule_list_continuation_hint(3), "Continued on page 3.");
+        assert_eq!(schedule_list_continuation_hint(11), "Continued on page 11.");
+    }
+
+    #[test]
+    fn global_pages_continue_numbering_from_the_first_window() {
+        let rows: Vec<String> = (0..30).map(long_list_row).collect();
+        let pages = schedule_list_pages_global(&rows, 2);
+        assert!(
+            pages.len() >= 2,
+            "thirty eighty-four-unit rows need several pages"
+        );
+        let total = 2 + pages.len() as i64;
+        for (index, page) in pages.iter().enumerate() {
+            let current = 2 + index as i64 + 1;
+            assert!(
+                page.ends_with(&format!("\nPage {current} of {total}")),
+                "hidden page carries its global number: {page}"
+            );
+            assert!(
+                crate::message_safety::text_len(page) <= SCHEDULE_LIST_MESSAGE_LIMIT,
+                "renumbered page still fits the message ceiling"
+            );
+        }
+        // Every row listed exactly once, in order, none split or dropped.
+        let listed: Vec<&str> = pages
+            .iter()
+            .flat_map(|page| page.lines().filter(|line| line.starts_with('`')))
+            .collect();
+        assert_eq!(listed, rows.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn global_pages_leave_a_single_page_unlabelled() {
+        // Acceptance-pinned: short-id hidden windows render bare, and an
+        // empty window keeps the legacy empty-guild text.
+        let rows = vec![
+            "`cap-25` `<#3333>` 2030-01-26T00:00:00.000Z".to_owned(),
+            "`cap-26` `<#3333>` 2030-01-27T00:00:00.000Z".to_owned(),
+        ];
+        assert_eq!(schedule_list_pages_global(&rows, 1), vec![rows.join("\n")]);
+        assert_eq!(
+            schedule_list_pages_global(&[], 1),
+            vec!["Nothing scheduled.".to_owned()]
+        );
+    }
+
+    #[test]
+    fn global_pages_without_an_offset_match_the_plain_pack() {
+        let rows: Vec<String> = (0..30).map(long_list_row).collect();
+        assert_eq!(
+            schedule_list_pages_global(&rows, 0),
+            schedule_list_pages(&rows)
+        );
+    }
+
+    #[test]
+    fn first_pages_pass_through_single_page_and_unhidden_windows() {
+        // Single-page windows keep the acceptance-pinned shape even with
+        // hidden rows behind them; unhidden windows never gain a hint.
+        let multi: Vec<String> = (0..30).map(long_list_row).collect();
+        assert_eq!(
+            schedule_list_first_pages(&multi, false),
+            schedule_list_pages(&multi)
+        );
+        let single = vec!["`a` `<#1>` 2030-01-01T00:00:00.000Z".to_owned()];
+        assert_eq!(
+            schedule_list_first_pages(&single, true),
+            schedule_list_pages(&single)
+        );
+    }
+
+    #[test]
+    fn first_pages_point_past_a_multi_page_window() {
+        // Twenty-six rows pack to two plain pages with a small last page, so
+        // the hint fits without growing the count.
+        let rows: Vec<String> = (0..26).map(long_list_row).collect();
+        let plain = schedule_list_pages(&rows);
+        assert!(plain.len() >= 2, "twenty-six rows need several pages");
+        let pages = schedule_list_first_pages(&rows, true);
+        assert_eq!(pages.len(), plain.len(), "the hint fits the last page");
+        assert_eq!(pages[0], plain[0], "earlier pages are untouched");
+        let total = pages.len() as i64;
+        assert!(
+            pages.last().expect("at least one page").ends_with(&format!(
+                "\n{}\n{}",
+                schedule_list_continuation_hint(total + 1),
+                schedule_list_page_indicator(total, total)
+            )),
+            "last first-window page names the next page: {}",
+            pages.last().expect("at least one page")
+        );
+        for page in &pages {
+            assert!(
+                crate::message_safety::text_len(page) <= SCHEDULE_LIST_MESSAGE_LIMIT,
+                "hinted page still fits the message ceiling"
+            );
+        }
     }
 
     #[test]

@@ -79,11 +79,17 @@ no row is claimed, posted or audited; the `/readyz` status map lists
    more)` line with N = total minus 25, or `(truncated)` when the overflow
    count itself fails, so a cut is never silent. `page` past the first
    window's packed pages reads one bounded hidden window
-   (`list_scheduled_window`, `OFFSET 25 LIMIT 25`), so rows past the cap
-   stay discoverable on higher pages and every reply stays bounded; the
-   hidden window carries its own overflow line when still more remain.
-   Rows past the cap keep their order and keep firing via `claim_due`.
-   At/under-cap guilds render exactly as before.
+   (`list_scheduled_window`, `OFFSET 25 LIMIT 25`), so rows through the
+   first 50 stay discoverable on higher pages and every reply stays
+   bounded; the hidden window carries its own overflow line when still
+   more remain. Hidden pages carry continuing global numbers (never
+   restarted), and the last first-window page of a multi-page window names
+   the next page (`Continued on page N.`), so no footer reads as the end
+   of the list. A failed hidden-window or overflow-count read fails closed
+   ("Schedule command failed; try again.") instead of reporting a
+   possibly-false out-of-range page. Rows past the cap keep their order
+   and keep firing via `claim_due`. At/under-cap guilds render exactly as
+   before.
 
 ## Out of scope
 

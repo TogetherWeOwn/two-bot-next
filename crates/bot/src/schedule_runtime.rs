@@ -24,10 +24,11 @@ use two_bot_core::{
     funnel::now_millis_for_test,
     scheduled::{
         format_iso_ms, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
-        schedule_cancelled_text, schedule_confirm_text, schedule_list_line,
-        schedule_list_overflow_for_count, schedule_list_overflow_line, schedule_list_page,
-        schedule_list_page_out_of_range_text, schedule_list_page_underflow_text,
-        schedule_list_pages, validate_schedule, ScheduleInput,
+        schedule_cancelled_text, schedule_confirm_text, schedule_list_first_pages,
+        schedule_list_line, schedule_list_overflow_for_count, schedule_list_overflow_line,
+        schedule_list_page, schedule_list_page_out_of_range_text,
+        schedule_list_page_underflow_text, schedule_list_pages, schedule_list_pages_global,
+        validate_schedule, ScheduleInput,
     },
     scheduled_store::{
         audit_scheduled, count_scheduled, delete_scheduled, get_scheduled, list_scheduled,
@@ -269,10 +270,12 @@ pub(crate) async fn schedule_remove(
 /// `(truncated)` when the overflow count itself fails, so a cut is never
 /// silent. Rows are ordered by (`next_run_at`, `id`). Over-cap guilds page
 /// past the first window: `page` past the first window's packed pages reads
-/// one bounded hidden window (`LIMIT/OFFSET`, still 25 rows) so every id
-/// stays discoverable without reopening an unbounded read (see
-/// `docs/schedule-queue-order.md`). Writes no audit row and never writes
-/// schedule rows.
+/// one bounded hidden window (`LIMIT/OFFSET`, still 25 rows) so ids through
+/// the first 50 rows stay discoverable without reopening an unbounded read
+/// (see `docs/schedule-queue-order.md`). A failed
+/// hidden-window or overflow-count read fails closed with
+/// `STORE_FAILURE_REPLY` instead of reporting a possibly-false out-of-range
+/// page. Writes no audit row and never writes schedule rows.
 pub(crate) async fn schedule_list(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
@@ -318,11 +321,14 @@ pub(crate) async fn schedule_list(
                     lines.push(overflow);
                 }
                 // Known overflow: pages past the first window's packed pages
-                // read one bounded hidden window, so rows past the cap stay
-                // reachable. Page 1 never pays for the extra query.
+                // read one bounded hidden window, so rows through the first
+                // 50 stay reachable. Page 1 never pays for the extra query.
+                // The first window's last page names the next page, and the
+                // hidden window carries continuing global page numbers, so
+                // no footer reads as the end of the list.
                 if matches!(total_opt, Some(total) if total > SCHEDULE_LIST_CAP) {
                     let total = total_opt.expect("guarded by the known-overflow match above");
-                    let first_pages = schedule_list_pages(&lines);
+                    let first_pages = schedule_list_first_pages(&lines, true);
                     let first_total = first_pages.len() as i64;
                     if page > first_total {
                         match list_scheduled_window(
@@ -358,7 +364,8 @@ pub(crate) async fn schedule_list(
                                         .await;
                                     return;
                                 }
-                                let hidden_pages = schedule_list_pages(&hidden_lines);
+                                let hidden_pages =
+                                    schedule_list_pages_global(&hidden_lines, first_total);
                                 let hidden_total = hidden_pages.len() as i64;
                                 let hidden_page = page - first_total;
                                 if hidden_page <= hidden_total {
@@ -382,12 +389,37 @@ pub(crate) async fn schedule_list(
                                 return;
                             }
                             Err(err) => {
+                                // Fail closed: the hidden rows may exist, so a
+                                // failed window read must not report them as
+                                // out of range. Mirrors the list-read failure
+                                // path below.
                                 tracing::warn!(
                                     reason = db_class(&err),
                                     "schedule list hidden window failed"
                                 );
+                                finish(executor, interaction, STORE_FAILURE_REPLY).await;
+                                return;
                             }
                         }
+                    }
+                    finish(
+                        executor,
+                        interaction,
+                        first_pages[(page - 1) as usize].clone(),
+                    )
+                    .await;
+                    return;
+                }
+                if total_opt.is_none() {
+                    // The overflow count failed, so the true page total is
+                    // unknown: a page past the packed first window may or may
+                    // not exist. Fail closed instead of reporting a
+                    // possibly-false out-of-range. Mirrors the list-read
+                    // failure path below.
+                    let first_total = schedule_list_pages(&lines).len() as i64;
+                    if page > first_total {
+                        finish(executor, interaction, STORE_FAILURE_REPLY).await;
+                        return;
                     }
                 }
             }
