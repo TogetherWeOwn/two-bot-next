@@ -475,7 +475,11 @@ windows without full history — never closes the card, and a lost ring
 rebuilds instead of firing. The five-minute cadence is load-bearing for
 the six-hour baseline: GitHub runs `*/5` best-effort, so when the newest
 ring entry is 600 s or older the run emits a `::warning::` instead of
-reading green-with-unknown. The tracker needs the `slow-burn-tracker` environment
+reading green-with-unknown. Entry age alone cannot prove coverage — sub-600 s
+spacings can also leave the baseline window empty — so the tracker records
+the most recent covered moment beside the ring and warns again once the slow
+windows go ~6.5 h uncovered: while coverage is gone genuine burns go unfiled
+and open cards stay unclosed. The tracker needs the `slow-burn-tracker` environment
 bearer for `/ops/metrics`; without it the run warns and stays green. Prove
 the path by dispatching the workflow with the fire and clear fixtures: they
 run the real verdict and the real issue calls under the `slow-burn-test`

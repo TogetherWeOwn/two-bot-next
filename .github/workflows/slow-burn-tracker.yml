@@ -15,6 +15,9 @@ name: slow-burn-tracker
 # behind the previous scrape, so a coarser cadence prunes its own baseline.
 # GitHub runs `*/5` on a best-effort cadence, so a ring gap of 600 s or more
 # emits a ::warning:: instead of reading as a clean bill of burn health.
+# Entry age alone cannot prove coverage (sub-600 s spacings can also leave the
+# baseline window empty), so the tracker records the most recent covered
+# moment beside the ring and warns once the slow windows go ~6.5 h uncovered.
 #
 # Bindings: the `slow-burn-tracker` environment holds the secret
 # METRICS_SCRAPE_TOKEN (the same bearer the Worker serves /ops/metrics with;
@@ -68,10 +71,12 @@ jobs:
           node-version: '24'
       # Restore-only: a full actions/cache step would save the stale ring in
       # its post phase and could restore over the tracker's fresh ring.
-      - name: Restore the burn ring
+      - name: Restore the burn ring and coverage
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: slow-burn-ring.json
+          path: |
+            slow-burn-ring.json
+            slow-burn-coverage.json
           key: slow-burn-ring-v1-${{ github.run_id }}
           restore-keys: |
             slow-burn-ring-v1-
@@ -82,12 +87,13 @@ jobs:
           METRICS_SCRAPE_TOKEN: ${{ secrets.METRICS_SCRAPE_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RING_PATH: slow-burn-ring.json
+          COVERAGE_PATH: slow-burn-coverage.json
           TRACKER_FIXTURE: ${{ github.event.inputs.fixture || 'live' }}
           TRACKER_DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           set -euo pipefail
           fixture="$TRACKER_FIXTURE"
-          args=(--ring "$RING_PATH" --evidence-out slow-burn-tracker-evidence.json --exposition-out slow-burn-exposition.prom)
+          args=(--ring "$RING_PATH" --coverage-path "$COVERAGE_PATH" --evidence-out slow-burn-tracker-evidence.json --exposition-out slow-burn-exposition.prom)
           if [ "$fixture" != "live" ]; then
             args+=(--fixture "$fixture" --label slow-burn-test --title-prefix '[slow-burn-test]')
           fi
@@ -98,11 +104,13 @@ jobs:
           echo "fixture=$fixture" >> "$GITHUB_OUTPUT"
       # Save-only without restore-keys: restoring here would overwrite the
       # tracker's fresh ring with the stale cached copy before the save.
-      - name: Save the burn ring
+      - name: Save the burn ring and coverage
         if: ${{ !cancelled() && steps.track.outputs.fixture != 'fire' && steps.track.outputs.fixture != 'clear' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: slow-burn-ring.json
+          path: |
+            slow-burn-ring.json
+            slow-burn-coverage.json
           key: slow-burn-ring-v1-${{ github.run_id }}
       - name: Upload the tracker evidence
         if: always()
