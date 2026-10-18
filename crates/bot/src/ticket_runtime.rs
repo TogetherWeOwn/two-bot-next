@@ -1104,3 +1104,7 @@ mod panels_isolation_tests;
 #[cfg(test)]
 #[path = "ticket_no_work_acceptance_tests.rs"]
 mod no_work_acceptance_tests;
+
+#[cfg(test)]
+#[path = "ticket_failure_class_tests.rs"]
+mod failure_class_tests;
