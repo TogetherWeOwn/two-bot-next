@@ -1074,7 +1074,7 @@ async fn settled_decisions_reach_the_global_outcome_counters() {
     let first = activation.process(create("8001", "blocked"), AT).await;
     assert_eq!(first.outcome, completed(true, CompletionKind::Deleted));
     assert!(
-        decisions("deleted") >= deleted_base + 1,
+        decisions("deleted") > deleted_base,
         "a settled delete records one deleted decision"
     );
     // Its redelivery is a replay: same Duplicate outcome, no resend.
@@ -1102,7 +1102,7 @@ async fn settled_decisions_reach_the_global_outcome_counters() {
     let dry = preview.process(create("8002", "blocked"), AT).await;
     assert_eq!(dry.outcome, completed(false, CompletionKind::DryRun));
     assert!(
-        decisions("dry_run") >= dry_base + 1,
+        decisions("dry_run") > dry_base,
         "a settled dry-run records one dry-run decision"
     );
     assert!(
@@ -1133,7 +1133,7 @@ async fn settled_decisions_reach_the_global_outcome_counters() {
         completed(false, CompletionKind::SanctionRefused)
     );
     assert!(
-        decisions("sanction_refused") >= refused_base + 1,
+        decisions("sanction_refused") > refused_base,
         "a settled sanction refusal records one sanction-refused decision"
     );
     assert_eq!(
