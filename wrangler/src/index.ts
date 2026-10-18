@@ -127,6 +127,8 @@ import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts
 import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
 import { handleMcp } from "./mcp.ts";
 import {
+  DASHBOARD_CLIENT_ID_HEADER,
+  DASHBOARD_CLIENT_SECRET_HEADER,
   OPS_DASHBOARD_PATH,
   MIN_DASHBOARD_CLIENT_ID_LENGTH,
   MIN_DASHBOARD_SECRET_LENGTH,
@@ -1971,17 +1973,20 @@ export default {
       }
       return dashboardPageResponse();
     }
-    // Read-only ops summary (TOG-22860 + TOG-22861): the roll-up serves two
-    // operator audiences, so either credential opens it — the metrics scrape
-    // bearer or the dashboard service-token pair (Cloudflare Access service
-    // tokens: both CF-Access-Client-Id and CF-Access-Client-Secret on every
-    // summary request, strict mode — no cookies or sessions). The scrape
-    // gate is consulted first and its 429 is a hard fence, never bypassed
-    // via the other gate; a non-throttled scrape refusal falls through to
-    // the dashboard gate. Non-GET and doubly-unconfigured still 404 (the
-    // route does not exist); otherwise a failed attempt is 401 with the
-    // Bearer challenge. Each gate throttles on its own budget before any
-    // comparison, so guessing at one cannot throttle the other.
+    // Read-only ops summary (TOG-22860 + TOG-22861, dual-gate budget
+    // TOG-29408): the roll-up serves two operator audiences, so either
+    // credential opens it — the metrics scrape bearer or the dashboard
+    // service-token pair (Cloudflare Access service tokens: both
+    // CF-Access-Client-Id and CF-Access-Client-Secret on every summary
+    // request, strict mode — no cookies or sessions). Each credential spends
+    // only its own per-caller budget: the scrape gate runs only when an
+    // Authorization header is presented, and the dashboard gate only when a
+    // dashboard header is presented. Guessing at one therefore cannot
+    // throttle the other. For a bearer-presenting request the scrape gate
+    // runs first and its 429 is a hard fence, never bypassed via the other
+    // gate; a non-throttled scrape refusal falls through to the dashboard
+    // gate. Non-GET and doubly-unconfigured still 404 (the route does not
+    // exist); otherwise a failed attempt is 401 with the Bearer challenge.
     if (url.pathname === OPS_SUMMARY_PATH) {
       if (request.method !== "GET") {
         return new Response("not found", { status: 404, headers: withSecurityHeaders() });
@@ -1997,7 +2002,11 @@ export default {
       };
       const scrapeConfigured = !!env.METRICS_SCRAPE_TOKEN
         && env.METRICS_SCRAPE_TOKEN.length >= MIN_SCRAPE_TOKEN_LENGTH;
-      if (scrapeConfigured) {
+      // Only a bearer-presenting request is evaluated by (and spends) the
+      // scrape budget; a dashboard-only request skips this gate entirely so
+      // a spent scrape bucket cannot refuse it.
+      const hasScrapeAttempt = request.headers.has("authorization");
+      if (scrapeConfigured && hasScrapeAttempt) {
         const refusal = await opsReadRefusal(request, env);
         if (refusal === null) return forwardSummary();
         if (refusal.status === 429) return refusal;
@@ -2007,7 +2016,11 @@ export default {
         && env.OPS_DASHBOARD_CLIENT_ID.length >= MIN_DASHBOARD_CLIENT_ID_LENGTH
         && !!env.OPS_DASHBOARD_CLIENT_SECRET
         && env.OPS_DASHBOARD_CLIENT_SECRET.length >= MIN_DASHBOARD_SECRET_LENGTH;
-      if (dashboardConfigured) {
+      // Only a dashboard-presenting request is evaluated by (and spends) the
+      // dashboard budget; a bearer-only guess never touches it.
+      const hasDashboardAttempt = request.headers.has(DASHBOARD_CLIENT_ID_HEADER)
+        || request.headers.has(DASHBOARD_CLIENT_SECRET_HEADER);
+      if (dashboardConfigured && hasDashboardAttempt) {
         const verdict = dashboardAuthBuckets.take(caller);
         if (!verdict.allowed && !dashboardAuthBuckets.peek(caller).allowed) {
           return new Response("slow down\n", {
