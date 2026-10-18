@@ -168,13 +168,31 @@ async fn record_async(
     .bind(&key)
     .fetch_optional(&mut *tx)
     .await?;
-    if inserted.is_none() {
+    let Some((event_row_id,)) = inserted else {
         let outcome = advance_duplicate(&mut tx, event, &key, observed_at).await?;
         tx.commit().await?;
+        // Duplicates write no event row, so they journal nothing.
         return Ok(outcome);
-    }
+    };
     project_event(&mut tx, event, &guild_id).await?;
     tx.commit().await?;
+    // First rollback-journal writer: each committed funnel append leaves one
+    // `events` insert entry naming the inserted row. Evidence-only and
+    // best-effort — journal failure never fails or alters the primary write.
+    let entry = crate::journal::JournalEntry {
+        table_name: "events".to_owned(),
+        row_identity: event_row_id.to_string(),
+        op: crate::journal::JournalOp::Insert,
+        pre_image: None,
+    };
+    if let Err(journal_error) = crate::journal::record(pool, &entry).await {
+        tracing::warn!(
+            table = "events",
+            row_identity = %entry.row_identity,
+            error = %journal_error,
+            "rollback_journal record failed; primary funnel append kept",
+        );
+    }
     Ok(RecordOutcome { inserted: true })
 }
 

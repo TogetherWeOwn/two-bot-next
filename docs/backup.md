@@ -122,8 +122,9 @@ Three application tables are excluded, each with its reason inline in
 target cooldowns), `discord_send_admission` (per-credential lane state that a
 recovered process re-learns) and `gateway_onboarding_jobs` (a restart-recovery
 queue bound to a gateway session). The store chain's `rollback_journal` and
-`rollback_watermarks` are excluded too: the journal is unwired append-only
-cutover evidence (no writer calls `record` yet, and its rows are re-capturable
+`rollback_watermarks` are excluded too: the journal is append-only
+cutover evidence (the funnel append journals each committed `events` insert
+best-effort via `journal::record`, and its rows stay re-capturable
 during the watch window), and restoring pre-backup watermarks could mark
 post-backup writes as already journaled, silently breaking rollback coverage.
 Migration ledgers (`_sqlx_migrations`, `schema_migrations` and the store
