@@ -115,7 +115,9 @@ import {
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
 import {
+  buildRemediationGuardReceipt,
   evaluateRemediation,
+  remediationTriggerFiring,
   sanitizeRemediationState,
   type RemediationState,
 } from "./remediation.ts";
@@ -1581,6 +1583,48 @@ export class TwoBotContainer extends Container<Env> {
             log_url: LOG_QUERY_URL,
           }));
           await this.postWebhookText(content);
+        }
+        // Staging-only persisted guard receipt: read back the guard just
+        // written and log the allowlisted counters/timestamps/phases with
+        // evaluation time, firing trigger keys, decision and build correlation.
+        // Exactly one receipt per keepalive tick in staging, none in production.
+        // No endpoint, permission, dump, or storage mutation beyond the
+        // evaluator persistence above; thresholds and state-machine semantics
+        // are untouched.
+        if (this.env.TWO_DEPLOY_ENV === "staging") {
+          try {
+            const persisted = await this.ctx.storage.get<RemediationState>(REMEDIATION_KEY);
+            const receipt = buildRemediationGuardReceipt({
+              persisted,
+              expected: remediation.state,
+              firing,
+              messages: remediation.messages,
+              nowSeconds,
+              buildRevision: context?.buildRevision ?? "unknown",
+              release: releaseTag(this.lastRelease),
+              workerVersion: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+            });
+            console.warn(JSON.stringify({
+              event: "remediation_guard_receipt",
+              service: "two-bot-next",
+              ...receipt,
+              log_url: LOG_QUERY_URL,
+            }));
+          } catch {
+            console.warn(JSON.stringify({
+              event: "remediation_guard_receipt",
+              service: "two-bot-next",
+              ok: false,
+              deploy_env: "staging",
+              evaluated_at_seconds: nowSeconds,
+              firing: remediationTriggerFiring(firing),
+              reason: "readback_failed",
+              build_revision: context?.buildRevision ?? "unknown",
+              release: releaseTag(this.lastRelease),
+              worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+              log_url: LOG_QUERY_URL,
+            }));
+          }
         }
       } catch {
         console.warn("two-bot remediation guard failed; alerts already delivered");

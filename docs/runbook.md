@@ -918,6 +918,68 @@ flags (or any plain push deploy) disarms the drill: the triggers resolve on
 their own rules and the guards reset. Rollback is disarm-by-redeploy; the
 Worker recommends only, so nothing executes from this path.
 
+#### Staging guard receipts (persisted remediation evidence)
+
+Each keepalive tick writes the evaluator guard to DO storage at
+`two-bot:remediation`, reads it back, and — in staging only
+(`TWO_DEPLOY_ENV` exactly `"staging"`) — logs one structured receipt proving
+what was persisted. Production emits none. No endpoint, permission, dump, or
+storage mutation beyond the existing evaluator write; thresholds and the
+state machine are untouched.
+
+Log query (staging Worker logs): filter for the receipt event, then narrow by
+decision or firing key. In Cloudflare dashboard open Workers & Pages →
+`two-bot-next-staging` → Observability → Logs and query
+`event = "remediation_guard_receipt"` (JSON: `{"event":"remediation_guard_receipt"}`).
+Narrow with `decision = "recommend"` (R1/R2), `decision = "ceo-page"`
+(STOP), `decision = "suppressed-quiet"` (quiet after two failures),
+`decision = "held-cooldown"` (inside the 1800 s window),
+`decision = "clear-hold"` (sustained-clear hold-down), or `decision = "idle"`
+(pre-drill baseline / reset). Correlate a tick with its alert by matching
+`firing` to the same tick's `metrics_alert` line and `build_revision` /
+`release` / `worker_version` to the keepalive probe.
+
+Capture schema (allowlist only; no tokens, webhooks, or arbitrary storage):
+
+```json
+{
+  "event": "remediation_guard_receipt",
+  "service": "two-bot-next",
+  "ok": true,
+  "deploy_env": "staging",
+  "evaluated_at_seconds": 1760001860,
+  "firing": ["voice_creator_map_stale"],
+  "decision": "recommend",
+  "action": "creator-map-reload",
+  "guard": {
+    "lastRecommendedAtSeconds": 1760001860,
+    "scopes": {
+      "voice-stall": { "phase": "reload-recommended", "consecutiveFailures": 0, "suppressed": false, "clearSinceSeconds": 0 },
+      "crash-loop": { "phase": "idle", "consecutiveFailures": 0, "suppressed": false, "clearSinceSeconds": 0 }
+    }
+  },
+  "build_revision": "abc1234",
+  "release": "abc1234",
+  "worker_version": "deployment-A",
+  "log_url": "https://developers.cloudflare.com/workers/observability/logs/workers-logs/"
+}
+```
+
+A storage failure never yields `ok: true`: a failed write keeps the existing
+`two-bot remediation guard failed` line with no success receipt, and a failed
+or mismatched read-back yields `ok: false` with `reason` of
+`readback_failed`, `mismatch`, or `invalid_persisted` (same correlation
+fields, no guard). At most one receipt per 60 s keepalive tick.
+
+Truthful limits: staging runs with `OPS_ALERT_FORWARDING=off`, so the STOP
+(`ceo-page`) decision is log-only — there is no external CEO-page delivery to
+capture. The full clean-start R1/R2/STOP/clear sequence takes more than 30
+minutes (R1 at first firing, R2 one 1800 s window later, STOP another window
+later, then a full 1800 s quiet window to reset; typically about 90 minutes),
+so a short soak can only prove the prefix it covers. The receipt proves the
+guard persisted, not that any remediation executed — the Worker recommends
+only.
+
 ### Event-store capture gaps and lag
 
 This is operator guidance, not a metrics alert: no rule in
