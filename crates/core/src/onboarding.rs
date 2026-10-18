@@ -1727,7 +1727,7 @@ mod tests {
     fn welcome_effects_post_the_renderer_bytes_unchanged() {
         // The adjudicated Post content is the renderer output verbatim —
         // no wrapper, no footer, no truncation.
-        match adjudicate_welcome(
+        let legacy = adjudicate_welcome(
             OnboardingMode::Legacy,
             MEMBER,
             Some("111"),
@@ -1735,11 +1735,15 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post { content, .. } => assert_eq!(content, legacy_welcome_text(MEMBER)),
-            WelcomeEffect::Skip { .. } => panic!("legacy with a channel posts"),
+        );
+        assert!(
+            matches!(&legacy, WelcomeEffect::Post { .. }),
+            "legacy with a channel posts"
+        );
+        if let WelcomeEffect::Post { content, .. } = legacy {
+            assert_eq!(content, legacy_welcome_text(MEMBER));
         }
-        match adjudicate_welcome(
+        let session = adjudicate_welcome(
             OnboardingMode::Session,
             MEMBER,
             Some("222"),
@@ -1747,13 +1751,15 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post { content, .. } => {
-                assert_eq!(content, session_welcome_text(MEMBER))
-            }
-            WelcomeEffect::Skip { .. } => panic!("session with a channel posts"),
+        );
+        assert!(
+            matches!(&session, WelcomeEffect::Post { .. }),
+            "session with a channel posts"
+        );
+        if let WelcomeEffect::Post { content, .. } = session {
+            assert_eq!(content, session_welcome_text(MEMBER));
         }
-        match adjudicate_welcome(
+        let anchor = adjudicate_welcome(
             OnboardingMode::Anchor,
             MEMBER,
             None,
@@ -1761,12 +1767,16 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post { content, .. } => assert_eq!(
+        );
+        assert!(
+            matches!(&anchor, WelcomeEffect::Post { .. }),
+            "anchor always posts"
+        );
+        if let WelcomeEffect::Post { content, .. } = anchor {
+            assert_eq!(
                 content,
                 anchor_welcome_text(MEMBER, BEFORE_RUN_1, SUNDAY_SQUAD)
-            ),
-            WelcomeEffect::Skip { .. } => panic!("anchor always posts"),
+            );
         }
     }
 
@@ -2004,7 +2014,7 @@ mod tests {
 
     #[test]
     fn welcome_posts_picker_per_mode_and_skips_without_a_channel() {
-        match adjudicate_welcome(
+        let legacy = adjudicate_welcome(
             OnboardingMode::Legacy,
             MEMBER,
             Some("111"),
@@ -2012,20 +2022,23 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post {
-                channel_id,
-                picker,
-                mention_user_id,
-                ..
-            } => {
-                assert_eq!(channel_id, "111");
-                assert_eq!(picker, Some(PickerKind::Games));
-                assert_eq!(mention_user_id, MEMBER);
-            }
-            WelcomeEffect::Skip { .. } => panic!("legacy with a channel posts"),
+        );
+        assert!(
+            matches!(&legacy, WelcomeEffect::Post { .. }),
+            "legacy with a channel posts"
+        );
+        if let WelcomeEffect::Post {
+            channel_id,
+            picker,
+            mention_user_id,
+            ..
+        } = legacy
+        {
+            assert_eq!(channel_id, "111");
+            assert_eq!(picker, Some(PickerKind::Games));
+            assert_eq!(mention_user_id, MEMBER);
         }
-        match adjudicate_welcome(
+        let session = adjudicate_welcome(
             OnboardingMode::Session,
             MEMBER,
             Some("222"),
@@ -2033,17 +2046,20 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post {
-                picker, content, ..
-            } => {
-                assert_eq!(picker, Some(PickerKind::Session));
-                assert!(content.contains("whole application"));
-            }
-            WelcomeEffect::Skip { .. } => panic!("session with a channel posts"),
+        );
+        assert!(
+            matches!(&session, WelcomeEffect::Post { .. }),
+            "session with a channel posts"
+        );
+        if let WelcomeEffect::Post {
+            picker, content, ..
+        } = session
+        {
+            assert_eq!(picker, Some(PickerKind::Session));
+            assert!(content.contains("whole application"));
         }
         // Anchor posts the one message with no picker, channel config aside.
-        match adjudicate_welcome(
+        let anchor = adjudicate_welcome(
             OnboardingMode::Anchor,
             MEMBER,
             None,
@@ -2051,18 +2067,21 @@ mod tests {
             BEFORE_RUN_1,
             SUNDAY_SQUAD,
             false,
-        ) {
-            WelcomeEffect::Post {
-                channel_id,
-                picker,
-                content,
-                ..
-            } => {
-                assert_eq!(channel_id, ANCHOR_CHANNEL_ID);
-                assert_eq!(picker, None);
-                assert!(content.contains("Sunday Squad"));
-            }
-            WelcomeEffect::Skip { .. } => panic!("anchor always posts"),
+        );
+        assert!(
+            matches!(&anchor, WelcomeEffect::Post { .. }),
+            "anchor always posts"
+        );
+        if let WelcomeEffect::Post {
+            channel_id,
+            picker,
+            content,
+            ..
+        } = anchor
+        {
+            assert_eq!(channel_id, ANCHOR_CHANNEL_ID);
+            assert_eq!(picker, None);
+            assert!(content.contains("Sunday Squad"));
         }
         assert!(matches!(
             adjudicate_welcome(
@@ -2166,17 +2185,21 @@ mod tests {
             adjudicate_goodbye(OnboardingMode::Anchor, "dave", Some(3), Some("999"), false),
             None
         );
-        match adjudicate_goodbye(OnboardingMode::Session, "dave", Some(3), Some("999"), false) {
-            Some(GoodbyeEffect::Post {
-                channel_id,
-                content,
-                mentions,
-            }) => {
-                assert_eq!(mentions, MentionPolicy::None);
-                assert_eq!(channel_id, "999");
-                assert!(content.starts_with("**dave** left the server (was here 3 days)."));
-            }
-            _ => panic!("session with a channel posts the goodbye"),
+        let goodbye =
+            adjudicate_goodbye(OnboardingMode::Session, "dave", Some(3), Some("999"), false);
+        assert!(
+            matches!(&goodbye, Some(GoodbyeEffect::Post { .. })),
+            "session with a channel posts the goodbye"
+        );
+        if let Some(GoodbyeEffect::Post {
+            channel_id,
+            content,
+            mentions,
+        }) = goodbye
+        {
+            assert_eq!(mentions, MentionPolicy::None);
+            assert_eq!(channel_id, "999");
+            assert!(content.starts_with("**dave** left the server (was here 3 days)."));
         }
         // GoodbyeEffect::Post uses explicit MentionPolicy::None — the
         // executor renders allowedMentions { parse: [] }.

@@ -29,8 +29,10 @@ IMAGE_MAX_BYTES = 112 * MIB
 # hot-reload head measured 15,730,600 bytes (15.00 MiB), also below this
 # limit. This branch's automation-only head measured 15,769,872 bytes
 # (15.04 MiB) before the event-executor merge; the combined-head
-# measurement comes from hosted CI on the merged head. 16 MiB restores a
-# working tripwire with headroom; revisit if the binary approaches it.
+# measurement comes from hosted CI on the merged head. The game-activity
+# aggregate-expiry slice measured 16,782,608 bytes (16.01 MiB) on hosted CI,
+# 5,392 bytes over the 16 MiB budget with no new dependencies: the store
+# expiry plus its per-guild stale listing and the retention-cadence driver.
 # 2026-10-17 recalibration: hosted CI measured ~16.00 MiB, over the 16 MiB
 # ceiling (main tip 89503f71: 16,776,096 bytes, 1,120 bytes of headroom; PR
 # merge ref 16,777,376 bytes, byte-identical on main HEAD 89c859b and the
