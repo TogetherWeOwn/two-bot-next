@@ -950,6 +950,33 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("rest_429_rate", "2026-10-09T20:11:06Z"), "evidence-rest_429_rate-2026-10-09T20-11-06Z.json");
 });
 
+test("eventsub post failures accumulate across low-volume samples until the floor", () => {
+  const posts = (attempted: number, succeeded: number, failed: number, other: number) => [
+    `two_bot_eventsub_posts_total{outcome="attempted"} ${attempted}`,
+    `two_bot_eventsub_posts_total{outcome="succeeded"} ${succeeded}`,
+    `two_bot_eventsub_posts_total{outcome="failed"} ${failed}`,
+    `two_bot_eventsub_posts_total{outcome="other"} ${other}`,
+  ];
+  // One failed post per sample: every window is sub-floor, so nothing fires
+  // while attempts accumulate toward the 10-attempt floor.
+  let state = ev(posts(10, 9, 1, 0)).state;
+  for (let n = 11; n <= 18; n++) {
+    const next = ev(posts(n, 9, n - 9, 0), state);
+    assert.deepEqual(next.firing, [], `one failure per sample stays quiet with ${n - 10} accumulated`);
+    state = next.state;
+  }
+  // The tenth accumulated attempt reaches the floor at a 100% share: fires.
+  const fired = ev(posts(20, 9, 11, 0), state);
+  assert.deepEqual(fired.firing, ["eventsub_post_failed_share"]);
+  // The judged window rebaselines: one more failure starts a new quiet
+  // accumulation instead of staying hot.
+  assert.deepEqual(ev(posts(21, 9, 12, 0), fired.state).firing, []);
+  // A healthy accumulation (floor met, share at the line) rebaselines quietly.
+  let healthy = ev(posts(0, 0, 0, 0)).state;
+  for (let n = 1; n <= 9; n++) healthy = ev(posts(n, n, 0, 0), healthy).state;
+  assert.deepEqual(ev(posts(10, 10, 0, 0), healthy).firing, []);
+});
+
 test("every rule links to an existing runbook heading", () => {
   const slugs = docAnchors("runbook.md");
   for (const rule of RULES) {

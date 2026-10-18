@@ -613,12 +613,18 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   if (hasRest5xxBaseline && !reset5xx && dTotal >= REST_5XX_MIN_REQUESTS && d5xx / dTotal > REST_5XX_RATIO) firing.push("rest_5xx_rate");
 
   // Failed share of go-live announcement posts: failed delta over attempted
-  // delta (mirroring `rest_5xx_rate`) raises one ticket; low-volume windows
-  // stay quiet. The first valid sample is baseline only; missing/invalid
-  // samples preserve firing and baseline; any backwards counter (restart)
-  // rebaselines. Valid windows recompute, so flat or sub-floor windows
-  // resolve. Unknown outcomes are ignored, never subjects; no broadcaster,
-  // body, token or free-text label ever reaches firing keys or messages.
+  // delta (mirroring `rest_5xx_rate`) raises one ticket. Announcement traffic
+  // is low-volume (about one post per go-live per keepalive window), so a
+  // strict per-sample window with a 10-attempt floor would stay silent
+  // through a sustained total outage: sub-floor valid windows therefore hold
+  // the baseline and accumulate attempts across consecutive valid samples,
+  // and only a window reaching the floor is judged and rebaselines.
+  // Low-volume windows stay quiet. The first valid sample is baseline only;
+  // missing/invalid samples preserve firing and baseline; any backwards
+  // counter (restart) rebaselines. Judged windows recompute, so a judged
+  // healthy window resolves, and flat or sub-floor windows resolve too.
+  // Unknown outcomes are ignored, never subjects; no broadcaster, body,
+  // token or free-text label ever reaches firing keys or messages.
   const eventsubWasFiring = prev.firing.includes("eventsub_post_failed_share");
   const eventsubCounts = eventsubPostCounts(gauge("two_bot_eventsub_posts_total"));
   let eventsubPosts: Record<string, number>;
@@ -645,11 +651,18 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
       } else {
         const dAttempted = (eventsubCounts["attempted"] as number) - (prevCounts["attempted"] as number);
         const dFailed = (eventsubCounts["failed"] as number) - (prevCounts["failed"] as number);
-        if (dAttempted >= EVENTSUB_POST_FAILED_SHARE_MIN_ATTEMPTED && dFailed / dAttempted > EVENTSUB_POST_FAILED_SHARE_RATIO) {
-          firing.push("eventsub_post_failed_share");
+        if (dAttempted >= EVENTSUB_POST_FAILED_SHARE_MIN_ATTEMPTED) {
+          if (dFailed / dAttempted > EVENTSUB_POST_FAILED_SHARE_RATIO) {
+            firing.push("eventsub_post_failed_share");
+          }
+          eventsubPosts = { ...eventsubCounts };
+          eventsubPostsSeen = true;
+        } else {
+          // Sub-floor windows stay quiet and hold the baseline so attempts
+          // accumulate toward the floor across consecutive valid samples.
+          eventsubPosts = prev.eventsubPosts ?? {};
+          eventsubPostsSeen = true;
         }
-        eventsubPosts = { ...eventsubCounts };
-        eventsubPostsSeen = true;
       }
     }
   }

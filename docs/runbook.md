@@ -764,19 +764,24 @@ triage path. No new webhook, production activation or live load test is authoriz
 
 #### Alert: EventSub post failed share
 
-`two_bot_eventsub_posts_total{outcome}` failed share between two keepalive
+`two_bot_eventsub_posts_total{outcome}` failed share across keepalive
 samples: failed posts exceed 10% of attempted posts in the window, with at
 least 10 attempted posts. `eventsub_post_failed_share` is a **ticket, not a
 page**. The denominator is attempted posts, not succeeded plus failed: growth
 in `succeeded` from earlier attempts or in `other` never counts as delivery
-failure. Low-volume windows (fewer than 10 attempted) stay quiet at any share,
-and a valid window at or below the 10% line stays quiet. The first valid sample
+failure. Announcement traffic is low-volume, so windows below the floor hold
+the baseline and accumulate attempts across consecutive valid samples until the
+floor is met; only the judged window rebaselines. Low-volume windows (fewer
+than 10 attempted) stay quiet at any share, and a judged window at or below
+the 10% line stays quiet. The first valid sample
 is baseline only, even when every post so far failed. Missing or invalid samples
 preserve the active ticket and the baseline; a counter reset (any outcome
 moving backwards, including a process restart) rebaselines without firing. Each
-valid window recomputes the share, so a valid flat or sub-floor window resolves
-the ticket. Recovery is a healthy full-volume window with the failed share back
-at or below the line; the resolve transition fires exactly once.
+judged window recomputes the share, so a valid flat or sub-floor window resolves
+the ticket too. Recovery is a healthy window with the failed share back
+at or below the line; a quiet window also resolves without proving delivery,
+so confirm live delivery separately before closing out. The resolve transition
+fires exactly once.
 
 First response: read-only diagnosis only. Read the attempted/failed counters
 through the existing authorized `/ops/metrics` path and correlate the window
