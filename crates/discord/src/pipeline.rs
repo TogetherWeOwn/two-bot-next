@@ -752,6 +752,18 @@ impl<
                     return; // DMs dropped.
                 };
                 let channel_id = msg.channel_id.get();
+                // Minimal transient shape for the short-message rule: the
+                // trimmed scalar count plus an embed/attachment bit. The body
+                // itself is dropped with this statement and never persisted
+                // or logged. Lengths are measured only when MESSAGE_CONTENT
+                // was subscribed: without it Discord delivers content solely
+                // for bot mentions, whose lengths would be a biased sample.
+                // `None` is unknown shape (existing award preserved); `Some`
+                // includes zero for a known empty message.
+                let has_embed_or_attachment = !msg.attachments.is_empty() || !msg.embeds.is_empty();
+                let content_length = self
+                    .content_delivered()
+                    .then(|| msg.content.trim().chars().count());
                 let input = MessageInput {
                     guild_id,
                     member_id: msg.author.id.get(),
@@ -763,16 +775,8 @@ impl<
                     channel_class: self.classifier.classify(channel_id),
                     capture_only: eligibility.capture_only,
                     occurred_at: Some(legacy_stamp(msg.timestamp)),
-                    // Measured here, where the content is already in hand;
-                    // the content itself is dropped with this statement and
-                    // only the scalar count is threaded onward. Measured
-                    // only when `MESSAGE_CONTENT` was subscribed: without
-                    // it, Discord delivers content solely for bot mentions,
-                    // whose lengths would be a biased sample.
-                    content_length: self
-                        .content_delivered()
-                        .then(|| msg.content.chars().count())
-                        .filter(|n| *n > 0),
+                    content_length,
+                    has_embed_or_attachment,
                 };
                 self.cache.update(event);
                 if deliver {

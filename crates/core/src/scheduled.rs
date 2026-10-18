@@ -379,6 +379,128 @@ pub fn schedule_list_line(
     line
 }
 
+/// Discord's message ceiling in UTF-16 units: every `/schedule-list` reply
+/// must fit, holding only whole rows so no configured id is ever split or
+/// silently dropped.
+pub const SCHEDULE_LIST_MESSAGE_LIMIT: usize = 2000;
+
+/// `/schedule-list` page indicator (`Page <current> of <total>`): every page
+/// of a multi-page list carries it so staff can walk the pages and enumerate
+/// every configured id exactly once.
+#[must_use]
+pub fn schedule_list_page_indicator(current: i64, total: i64) -> String {
+    format!("Page {current} of {total}")
+}
+
+/// `/schedule-list` refusal for `page < 1` (Discord's registry minimum is 1,
+/// but the runtime still refuses a bypassed value with this exact text).
+#[must_use]
+pub fn schedule_list_page_underflow_text() -> &'static str {
+    "Page must be at least 1."
+}
+
+/// `/schedule-list` refusal for `page > total`. Lists no rows and never
+/// overflows on extreme page values.
+#[must_use]
+pub fn schedule_list_page_out_of_range_text(page: i64, total: i64) -> String {
+    format!("Page {page} is out of range: this server has {total} page(s) of schedules.")
+}
+
+/// Split whole-row lines into bounded pages, ordered as given. Each page
+/// holds as many whole rows as fit in [`SCHEDULE_LIST_MESSAGE_LIMIT`]
+/// UTF-16 units; no id is ever split or dropped. An empty guild yields one
+/// page (`Nothing scheduled.`). A single page carries no indicator (the
+/// legacy shape); every page of a multi-page list ends with
+/// [`schedule_list_page_indicator`].
+#[must_use]
+pub fn schedule_list_pages(lines: &[String]) -> Vec<String> {
+    if lines.is_empty() {
+        return vec!["Nothing scheduled.".to_owned()];
+    }
+    // Converge on the page count: the indicator length depends on the total,
+    // and the total depends on the indicator length. At most 25 rows, so this
+    // settles in one or two passes.
+    let mut total_guess: usize = 1;
+    loop {
+        let overhead = if total_guess <= 1 {
+            0
+        } else {
+            let widest = format!(
+                "\n{}",
+                schedule_list_page_indicator(total_guess as i64, total_guess as i64)
+            );
+            crate::message_safety::text_len(&widest)
+        };
+        let rows_budget = SCHEDULE_LIST_MESSAGE_LIMIT.saturating_sub(overhead);
+        let packed = pack_schedule_rows(lines, rows_budget);
+        if packed.len() == total_guess {
+            if packed.len() == 1 {
+                return vec![packed[0]
+                    .iter()
+                    .map(|s| (*s).as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")];
+            }
+            let total = packed.len() as i64;
+            return packed
+                .into_iter()
+                .enumerate()
+                .map(|(index, rows)| {
+                    let current = index as i64 + 1;
+                    format!(
+                        "{}\n{}",
+                        rows.iter()
+                            .map(|s| (*s).as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        schedule_list_page_indicator(current, total)
+                    )
+                })
+                .collect();
+        }
+        total_guess = packed.len().max(1);
+    }
+}
+
+/// Render one 1-based page of whole-row lines. Omitting the option means page
+/// 1; callers pass the parsed `page` (default 1) straight through.
+#[must_use]
+pub fn schedule_list_page(lines: &[String], page: i64) -> String {
+    if page < 1 {
+        return schedule_list_page_underflow_text().to_owned();
+    }
+    let pages = schedule_list_pages(lines);
+    let total = pages.len() as i64;
+    if page > total {
+        return schedule_list_page_out_of_range_text(page, total);
+    }
+    pages[(page - 1) as usize].clone()
+}
+
+/// Greedily pack row lines into page buckets whose joined (`\n`) UTF-16
+/// length fits `rows_budget`. A single row always fits on its own page (rows
+/// are bounded far below the message ceiling); rows are never split.
+fn pack_schedule_rows(lines: &[String], rows_budget: usize) -> Vec<Vec<&String>> {
+    let mut pages: Vec<Vec<&String>> = vec![Vec::new()];
+    let mut current_len: usize = 0;
+    for line in lines {
+        let line_len = crate::message_safety::text_len(line);
+        let add = if pages.last().expect("at least one page").is_empty() {
+            line_len
+        } else {
+            1 + line_len
+        };
+        if current_len + add > rows_budget && !pages.last().expect("at least one page").is_empty() {
+            pages.push(vec![line]);
+            current_len = line_len;
+        } else {
+            pages.last_mut().expect("at least one page").push(line);
+            current_len += add;
+        }
+    }
+    pages
+}
+
 /// `/schedule-list` body for a guild's rows (legacy: `Nothing scheduled.`
 /// when empty; callers cap the joined text at 2000 chars like every reply).
 #[must_use]
