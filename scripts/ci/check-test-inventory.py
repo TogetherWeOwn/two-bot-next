@@ -277,7 +277,14 @@ def check(root=ROOT):
     except OSError as exc:
         return [f"workflows unreadable: {exc}"]
     routed, executable_texts = routed_targets(check_yml, nightly_yml)
-    blanket_routed = bool(_BLANKET_RE.search(executable_texts[0]))
+    # Lane-presence markers must be executable `run:` text, not a mention
+    # elsewhere in the workflow YAML (comment, step/job name, env value,
+    # echo/printf print). Reuse the same executable texts the routing
+    # analysis already computes so a stripped mention cannot keep the gate
+    # green while the lane no longer runs.
+    check_exec = executable_texts[0]
+    nightly_exec = executable_texts[1] if len(executable_texts) > 1 else ""
+    blanket_routed = bool(_BLANKET_RE.search(check_exec))
 
     for path in sorted(root.glob("crates/*/tests/*.rs")):
         name = path.stem
@@ -302,14 +309,14 @@ def check(root=ROOT):
     for name in bins:
         if not (root / "fuzz" / "fuzz_targets" / f"{name}.rs").is_file():
             errors.append(f"fuzz target {name} has no fuzz/fuzz_targets/{name}.rs")
-    if FUZZ_BUILD not in check_yml:
+    if FUZZ_BUILD not in check_exec:
         errors.append("fuzz-compile job does not build all fuzz targets "
                       f"(expected {FUZZ_BUILD!r})")
 
     for marker, label in ((WORKSPACE_LIB_BINS, "workspace lib/bins unit run"),
                           (WORKSPACE_DOC, "workspace doc-test run"),
                           ("--all-targets", "all-targets build (examples)")):
-        if marker not in check_yml and marker not in nightly_yml:
+        if marker not in check_exec and marker not in nightly_exec:
             errors.append(f"missing {label} ({marker!r} not found in check/nightly)")
     return errors
 
