@@ -1,5 +1,8 @@
 //! Combined shared-router/REST and isolated agent-testdb acceptance. No live inputs.
 #![allow(dead_code)]
+
+#[path = "onboarding_connect_acceptance_tests.rs"]
+mod connect_acceptance;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
