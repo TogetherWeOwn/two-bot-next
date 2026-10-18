@@ -248,6 +248,13 @@ Full catalogue: legacy `src/core/settingsCatalog.ts` (~90 keys in `env_only`/`co
 | Onboarding modes (`legacy` catalog + hub routing / `session` roleless two-pick LIVE / anchor Sunday-Squad one-message) | no-DM, idempotent `onboarding_prompted`, dry-run aware | **S4** |
 | Operator scripts (82 files) | schedule/backfill/migration one-shots → **[TOG-9882](/TOG/issues/TOG-9882)** (MEE6 XP, rewards, history backfill, dedupe, message-milestone scan, join capture); backup/restore/snapshot → [TOG-9881](/TOG/issues/TOG-9881); read-only reports (funnel, gate, attribution, roster, dashboard, scorecard, presence-trend, growth-review) → **DROP** as runtime (query Postgres/`web_v1` on demand); manual raid-list/raid-remove → [TOG-10867](/TOG/issues/TOG-10867) ([runbook](raid-response.md)), not scheduled runtime; staging provision/verify/reset + e2e harness → **DROP** (replaced by mock-discord acceptance + **S6** cutover plan); `reconcile` → **DROP** (absent/broken upstream); guild-config snapshot/restore → [TOG-9881](/TOG/issues/TOG-9881); temp-voice runtime shipped → [TOG-10091](/TOG/issues/TOG-10091) and voice acceptance [TOG-10119](/TOG/issues/TOG-10119); voice/leave-gap integrity reports are retained on [TOG-11152](/TOG/issues/TOG-11152), unlike the other runtime report drops | **S6**, [TOG-9881](/TOG/issues/TOG-9881), [TOG-9882](/TOG/issues/TOG-9882), [TOG-10867](/TOG/issues/TOG-10867) (mapped one-shots, manual raid tools plus retained voice runtime/integrity checks; other report runtimes dropped above) |
 
+Seasonal `/leaderboard` divergence: the routed board reads `member_season_xp`
+for the current season with an explicit season header and an honest empty
+reply, never lifetime totals. This intentionally diverges from the frozen
+legacy lifetime board. The seasonal projection fills only from awards made
+after the seasonal mirror shipped, so the first partial quarter omits
+earlier XP; that historical gap belongs to a backfill, not this read path.
+
 ## 9. Drops (not ported, with reason)
 
 1. Rota measurement stack (observer, notice delivery, `/rota-acknowledge`, 0028–0033 migrations, 60s ticker) — staging-only experiment, never prod-enabled.
