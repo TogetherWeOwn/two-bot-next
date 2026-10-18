@@ -777,11 +777,12 @@ the 10% line stays quiet. The first valid sample
 is baseline only, even when every post so far failed. Missing or invalid samples
 preserve the active ticket and the baseline; a counter reset (any outcome
 moving backwards, including a process restart) rebaselines without firing. Each
-judged window recomputes the share, so a valid flat or sub-floor window resolves
-the ticket too. Recovery is a healthy window with the failed share back
-at or below the line; a quiet window also resolves without proving delivery,
-so confirm live delivery separately before closing out. The resolve transition
-fires exactly once.
+each judged window recomputes the share, so only a judged window at or below
+the line resolves the ticket. Flat or sub-floor windows hold an active ticket
+until that judged window clears it, so a sustained outage stays one ALERT
+instead of flapping. Recovery is a healthy judged window with the failed share
+back at or below the line; confirm live delivery separately before closing out.
+The resolve transition fires exactly once.
 
 First response: read-only diagnosis only. Read the attempted/failed counters
 through the existing authorized `/ops/metrics` path and correlate the window

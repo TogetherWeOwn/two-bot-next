@@ -19,10 +19,10 @@ import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
  * failed delta > 10% of attempted delta with at least 10 attempted raises
  * one **ticket**; low-volume windows never raise. The first valid sample is
  * baseline only. Missing/invalid samples preserve state and baseline.
- * Resets rebaseline. Each valid window recomputes the rate, so a valid
- * window at or below the line (including flat or sub-floor windows) is not
- * firing. No broadcaster, body, token or free-text label ever becomes a
- * subject or message content.
+ * Resets rebaseline. Only a judged window (floor met) at or below the line
+ * resolves: flat or sub-floor windows keep an active ticket so a sustained
+ * outage stays one ALERT instead of flapping. No broadcaster, body, token
+ * or free-text label ever becomes a subject or message content.
  *
  * Forwarding off is rule-agnostic sender behavior pinned by the metrics
  * sender harness in container.test.ts ("keeps monitoring durable and
@@ -137,16 +137,42 @@ test("a healthy full-volume window recovers exactly once", () => {
   assert.deepEqual(transitionMessages(recovered.firing, quiet.firing), [], "recovery is not repeated");
 });
 
-test("a valid flat or sub-floor window is not firing (rate windows recompute)", () => {
+test("flat or sub-floor windows hold an active ticket but never raise one", () => {
   const firing = firingState();
-  // No new attempts: this valid window shows no bad rate.
-  assert.deepEqual(ev(posts(120, 90, 25, 5), firing).firing, []);
-  // Three new attempts, all failed, is a low-volume window: quiet by the
-  // same floor that keeps it from raising in the first place.
-  assert.deepEqual(ev(posts(123, 90, 28, 5), firing).firing, []);
+  // No new attempts: the ticket stays open until a judged window clears it.
+  assert.deepEqual(ev(posts(120, 90, 25, 5), firing).firing, [KEY]);
+  // Three new attempts, all failed, is a low-volume window: it holds the
+  // ticket instead of resolving it one sample after it fired.
+  const held = ev(posts(123, 90, 28, 5), firing);
+  assert.deepEqual(held.firing, [KEY]);
+  assert.deepEqual(transitionMessages(firing.firing, held.firing), [], "holding is not a new ALERT");
   // Not firing stays not firing through the same windows.
   const baseline = ev(posts(100, 90, 5, 5)).state;
   assert.deepEqual(ev(posts(100, 90, 5, 5), baseline).firing, []);
+  assert.deepEqual(ev(posts(103, 90, 8, 5), baseline).firing, []);
+});
+
+test("one failed post per sample over 30 samples is one ALERT and zero RESOLVED", () => {
+  // A sustained total outage at go-live volume: every window is sub-floor
+  // until attempts accumulate to the 10-attempt floor, then the judged
+  // window fires and later judged windows stay hot. The ticket must never
+  // resolve mid-outage.
+  let state = ev(posts(10, 9, 1, 0)).state;
+  let prevFiring: string[] = [];
+  let alerts = 0;
+  let resolved = 0;
+  for (let n = 11; n <= 40; n++) {
+    const next = ev(posts(n, 9, n - 9, 0), state);
+    for (const message of transitionMessages(prevFiring, next.firing)) {
+      if (message.includes(`ALERT ${KEY} (ticket):`)) alerts += 1;
+      if (message.includes(`RESOLVED ${KEY}`)) resolved += 1;
+    }
+    prevFiring = next.firing;
+    state = next.state;
+  }
+  assert.deepEqual(state.firing, [KEY], "still failing at sample 30: still firing");
+  assert.equal(alerts, 1, "one ALERT for the whole outage");
+  assert.equal(resolved, 0, "no RESOLVED mid-outage");
 });
 
 test("counter resets rebaseline without fabricating a window", () => {

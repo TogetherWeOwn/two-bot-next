@@ -968,9 +968,11 @@ test("eventsub post failures accumulate across low-volume samples until the floo
   // The tenth accumulated attempt reaches the floor at a 100% share: fires.
   const fired = ev(posts(20, 9, 11, 0), state);
   assert.deepEqual(fired.firing, ["eventsub_post_failed_share"]);
-  // The judged window rebaselines: one more failure starts a new quiet
-  // accumulation instead of staying hot.
-  assert.deepEqual(ev(posts(21, 9, 12, 0), fired.state).firing, []);
+  // The judged window rebaselines but the ticket holds: the next sub-floor
+  // window accumulates toward the next floor instead of resolving.
+  const held = ev(posts(21, 9, 12, 0), fired.state);
+  assert.deepEqual(held.firing, ["eventsub_post_failed_share"]);
+  assert.deepEqual(transitionMessages(fired.firing, held.firing), [], "holding is not a new ALERT");
   // A healthy accumulation (floor met, share at the line) rebaselines quietly.
   let healthy = ev(posts(0, 0, 0, 0)).state;
   for (let n = 1; n <= 9; n++) healthy = ev(posts(n, n, 0, 0), healthy).state;

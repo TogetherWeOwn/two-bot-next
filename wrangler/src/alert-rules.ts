@@ -621,8 +621,9 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // and only a window reaching the floor is judged and rebaselines.
   // Low-volume windows stay quiet. The first valid sample is baseline only;
   // missing/invalid samples preserve firing and baseline; any backwards
-  // counter (restart) rebaselines. Judged windows recompute, so a judged
-  // healthy window resolves, and flat or sub-floor windows resolve too.
+  // counter (restart) rebaselines. Only a judged window (floor met) at or
+  // below the line resolves; flat or sub-floor windows hold an active ticket
+  // so a sustained outage stays one ALERT instead of flapping ALERT/RESOLVED.
   // Unknown outcomes are ignored, never subjects; no broadcaster, body,
   // token or free-text label ever reaches firing keys or messages.
   const eventsubWasFiring = prev.firing.includes("eventsub_post_failed_share");
@@ -660,8 +661,11 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
         } else {
           // Sub-floor windows stay quiet and hold the baseline so attempts
           // accumulate toward the floor across consecutive valid samples.
+          // An active ticket survives them: only a judged window clears it,
+          // otherwise a sustained outage flaps ALERT/RESOLVED every window.
           eventsubPosts = prev.eventsubPosts ?? {};
           eventsubPostsSeen = true;
+          if (eventsubWasFiring) firing.push("eventsub_post_failed_share");
         }
       }
     }
