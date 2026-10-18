@@ -159,9 +159,11 @@ fn raw_get(addr: SocketAddr, path: &str, headers: &[(&str, String)]) -> std::io:
     }
     request.push_str("\r\n");
     stream.write_all(request.as_bytes())?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    Ok(response)
+    // Read bytes (not `read_to_string`): a truncated or non-UTF-8 write still
+    // yields a diagnostic body instead of an `InvalidData` transport error.
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn status_code(response: &str) -> Option<u16> {
@@ -172,6 +174,50 @@ fn status_code(response: &str) -> Option<u16> {
         .nth(1)?
         .parse()
         .ok()
+}
+
+/// One-line diagnostic for assertion context: length plus an escaped preview
+/// so an empty read (closed without a status line) or garbage bytes are
+/// visible in the failure output instead of a bare `None`.
+fn describe_response(response: &str) -> String {
+    let preview: String = response.chars().take(300).collect();
+    format!("len {} preview {preview:?}", response.len())
+}
+
+/// Bounded retry for the transient empty-read flake: the listener accepted
+/// the connection and then closed it without a status line, so `status_code`
+/// is `None`. Each attempt mints fresh headers (fresh timestamp/nonce, so no
+/// replay) and only unparseable/transport failures retry; a parseable status
+/// — even a wrong one — returns immediately so a real auth regression still
+/// fails instead of being retried away.
+fn get_with_fresh_headers(
+    addr: SocketAddr,
+    path: &str,
+    make_headers: impl Fn() -> Vec<(&'static str, String)>,
+) -> String {
+    const ATTEMPTS: usize = 3;
+    let mut last_response = String::new();
+    let mut last_note = String::from("no attempts");
+    for attempt in 0..ATTEMPTS {
+        let headers = make_headers();
+        match raw_get(addr, path, &headers) {
+            Ok(response) if status_code(&response).is_some() => return response,
+            Ok(response) => {
+                last_note = describe_response(&response);
+                last_response = response;
+            }
+            Err(error) => {
+                last_note = format!("transport error: {error}");
+            }
+        }
+        if attempt + 1 < ATTEMPTS {
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    if status_code(&last_response).is_some() || !last_response.is_empty() {
+        return last_response;
+    }
+    panic!("backfill read got no parseable status after {ATTEMPTS} attempts: {last_note}");
 }
 
 fn body_json(response: &str) -> Value {
@@ -204,9 +250,9 @@ fn backfill_auth_headers(key_id: &str, secret: &str) -> Vec<(&'static str, Strin
 }
 
 fn signed_get(addr: SocketAddr) -> String {
-    let headers = backfill_auth_headers(FIXTURE_KEY_ID, &fixture_secret());
-    let refs: Vec<(&str, String)> = headers;
-    raw_get(addr, BACKFILL_PATH, &refs).expect("signed backfill read")
+    get_with_fresh_headers(addr, BACKFILL_PATH, || {
+        backfill_auth_headers(FIXTURE_KEY_ID, &fixture_secret())
+    })
 }
 
 fn families_of(body: &Value) -> &serde_json::Map<String, Value> {
@@ -263,7 +309,8 @@ fn signed_backfill_read_reports_per_family_progress_and_eta() {
     assert_eq!(
         status_code(&response),
         Some(200),
-        "authorized backfill read must succeed"
+        "authorized backfill read must succeed: {}",
+        describe_response(&response)
     );
     let body = body_json(&response);
     let families = families_of(&body);
@@ -312,18 +359,21 @@ fn unsigned_and_mistaken_backfill_callers_share_one_401_refusal() {
     // 401, carrying the shared failure message and no key, cursor or
     // progress material.
     let (_bot, addr) = spawn_bot();
-    let bare = raw_get(addr, BACKFILL_PATH, &[]).expect("bare backfill read");
+    let bare = get_with_fresh_headers(addr, BACKFILL_PATH, Vec::new);
     assert_eq!(
         status_code(&bare),
         Some(401),
-        "credential-less backfill read must be refused"
+        "credential-less backfill read must be refused: {}",
+        describe_response(&bare)
     );
-    let wrong_headers = backfill_auth_headers("fixture-unknown-key", &fixture_secret());
-    let wrong = raw_get(addr, BACKFILL_PATH, &wrong_headers).expect("wrong-key backfill read");
+    let wrong = get_with_fresh_headers(addr, BACKFILL_PATH, || {
+        backfill_auth_headers("fixture-unknown-key", &fixture_secret())
+    });
     assert_eq!(
         status_code(&wrong),
         Some(401),
-        "unknown-key backfill read must be refused"
+        "unknown-key backfill read must be refused: {}",
+        describe_response(&wrong)
     );
     let bare_error = body_json(&bare)["error"].clone();
     let wrong_error = body_json(&wrong)["error"].clone();
@@ -357,13 +407,15 @@ fn backfill_exposition_keeps_fixed_cardinality() {
     assert_eq!(
         status_code(&first_raw),
         Some(200),
-        "authorized backfill read must succeed"
+        "authorized backfill read must succeed: {}",
+        describe_response(&first_raw)
     );
     let second_raw = signed_get(addr);
     assert_eq!(
         status_code(&second_raw),
         Some(200),
-        "authorized backfill read must succeed"
+        "authorized backfill read must succeed: {}",
+        describe_response(&second_raw)
     );
     let first = body_json(&first_raw);
     let second = body_json(&second_raw);
@@ -407,7 +459,8 @@ fn backfill_body_carries_ids_and_counts_only() {
     assert_eq!(
         status_code(&raw),
         Some(200),
-        "authorized backfill read must succeed"
+        "authorized backfill read must succeed: {}",
+        describe_response(&raw)
     );
     let body = body_json(&raw);
     let mut keys = Vec::new();
