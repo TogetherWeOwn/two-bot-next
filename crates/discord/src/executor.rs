@@ -58,8 +58,8 @@ use twilight_model::id::marker::{
 use twilight_model::id::Id;
 use two_bot_core::{
     backoff_ms, classify_kick_status, pace_wait_ms, parse_retry_after_secs, plan_purge,
-    retry_after_ms, utf16_len, ActionOutcome, KickOutcome, KickResult, KickStatus,
-    ModerationExecution, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
+    retry_after_ms, retry_after_ms_unclamped, utf16_len, ActionOutcome, KickOutcome, KickResult,
+    KickStatus, ModerationExecution, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
 };
 
 /// Minimum gap between paced requests, ms (legacy `rest.ts` default).
@@ -315,6 +315,7 @@ impl RawResponse {
 
     /// Legacy 429 wait: body wins, then header, default 1 s; +250 ms pad;
     /// clamped so a bad header cannot park a run (legacy `retryAfterMs`).
+    /// Kick/publish lanes and registry reads keep this clamp.
     #[must_use]
     pub fn retry_after_wait_ms(&self) -> u64 {
         let header = self
@@ -322,6 +323,20 @@ impl RawResponse {
             .as_deref()
             .and_then(|s| parse_retry_after_secs(Some(s)));
         retry_after_ms(header, self.body_retry_after_secs())
+    }
+
+    /// Backfill-read 429 wait: same header/body/padding policy without the
+    /// 60 s clamp, so a long per-route `Retry-After` is waited out in one
+    /// sleep instead of retry-storming past it. Only the paced backfill reads
+    /// (`get_json_observed`, `read_json`) use this; every other lane keeps
+    /// [`Self::retry_after_wait_ms`].
+    #[must_use]
+    pub fn retry_after_wait_ms_unclamped(&self) -> u64 {
+        let header = self
+            .retry_after_header
+            .as_deref()
+            .and_then(|s| parse_retry_after_secs(Some(s)));
+        retry_after_ms_unclamped(header, self.body_retry_after_secs())
     }
 }
 
@@ -1911,11 +1926,17 @@ impl ActionExecutor {
                     // parking the read until a separate guard refuses it. The
                     // retry re-admits as essential (see `admitted_retry`):
                     // no request leaves during the wait or a shared pause.
+                    // Backfill reads wait out a long per-route Retry-After
+                    // unclamped: waking early only earns another 429 and burns
+                    // another try. Kick/publish keep the 60 s clamp.
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return Ok(None);
                     }
                     if !global {
-                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                        tokio::time::sleep(Duration::from_millis(
+                            res.retry_after_wait_ms_unclamped(),
+                        ))
+                        .await;
                     }
                     // A global 429 already installed the shared pause at
                     // headers receipt, anchored to that instant: sleeping
@@ -2026,7 +2047,8 @@ impl ActionExecutor {
                     // the fixed transient-exhaustion error for checked reads
                     // (absence for unchecked ones), never an open-ended park.
                     // The retry re-admits as essential after sleeping out
-                    // a route-local wait; a shared pause rides admission.
+                    // a route-local wait unclamped, like the observed read;
+                    // a shared pause rides admission.
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return if checked {
                             Err("Discord evidence unavailable".to_owned())
@@ -2035,7 +2057,10 @@ impl ActionExecutor {
                         };
                     }
                     if !global {
-                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                        tokio::time::sleep(Duration::from_millis(
+                            res.retry_after_wait_ms_unclamped(),
+                        ))
+                        .await;
                     }
                     // Global: no local sleep — the shared pause is anchored
                     // at headers receipt and the essential re-admission
@@ -4351,6 +4376,27 @@ mod tests {
             completion: None,
         };
         assert_eq!(clamped.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
+    }
+
+    #[test]
+    fn backfill_read_waits_out_long_header_unclamped() {
+        let long = RawResponse {
+            status: 429,
+            retry_after_header: Some("75".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        // Backfill reads honor the 75 s header in one wait; the kick/publish
+        // clamp stays pinned at 60 s for the same response.
+        assert_eq!(long.retry_after_wait_ms_unclamped(), 75_250);
+        assert_eq!(long.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
+        let short = RawResponse {
+            status: 429,
+            retry_after_header: Some("2".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        assert_eq!(short.retry_after_wait_ms_unclamped(), 2250);
     }
 
     #[test]
