@@ -244,8 +244,10 @@ Startup `error_class` values logged before fatal exits (see
 
 ## Voice structured fields (gateway sink, adjacent)
 
-`voice_event` fields in `crates/bot/src/voice_rooms.rs`; no channel,
-member, token, body or ID leaves the process. Included because the voice
+`voice_event` fields in `crates/bot/src/voice_rooms.rs`; guild and channel
+IDs are emitted as strings (notably `guild` on every `voice_join_received`
+line and `channel` on every refused line), but no member, token, body, name
+or presence content leaves the process. Included because the voice
 sink attaches to the gateway writer on the cutover path.
 
 | Field value | Callsite (stable anchor) | Meaning |
@@ -263,7 +265,12 @@ sink attaches to the gateway writer on the cutover path.
 Field names and Rust types per `voice_event` value, verified against the
 emitter in `crates/bot/src/voice_rooms.rs` (callsite = enclosing function,
 never a line number). JSON keys match the field names; the message string is
-the last argument to the log macro.
+the last argument to the log macro. In the JSON line these fields are
+flattened at the root next to the envelope keys `ts`, `level`, `msg`,
+`target`, `build_sha`, `release` and `spans` (`docs/logging.md`). None of
+these lines sets `msg` and none of their messages is snake_case, so `msg` is
+always `"tracing_event"` and the text above sits under `message`. Match on
+`voice_event` or `message`, never `msg`.
 
 | `voice_event` value | Fields (name: Rust type) | Emitter | Level / message |
 | --- | --- | --- | --- |
@@ -345,7 +352,7 @@ this fails.
 
 ## Verification notes (all three TBDs resolved 2026-10-17)
 
-- Session-commit search re-run 2026-10-17: `grep -rn 'tracing::\(info\|warn\|error\)' crates/ --include='*.rs'` (pinned fully-qualified form) plus an offline extractor mirror over the six scoped sources that also covers bare `info!` / `warn!` / `error!` / `debug!` / `trace!` (same rule as the conformance suite: last string literal is the event name). Result: 84 unique messages, identical to the pinned catalog set (20 gateway + 9 main traced + 2 main drain strings + 5 server + 2 shutdown + 1 jobs + 16 voice catalog + 14 main adjacent + 16 voice adjacent + 1 test-only, counting the drain strings separately). Added: none. Removed: none. Sources: the six scoped sources named in Method plus the conformance pin in `crates/bot/src/observability_event_conformance_tests.rs`.
+- Session-commit search re-run 2026-10-17: `grep -rn 'tracing::\(info\|warn\|error\)' crates/ --include='*.rs'` (pinned fully-qualified form) plus an offline extractor mirror over the six scoped sources that also covers bare `info!` / `warn!` / `error!` / `debug!` / `trace!` (same rule as the conformance suite: last string literal is the event name). Result: 84 unique messages, identical to the pinned catalog set (20 gateway + 9 main traced + 5 server + 2 shutdown + 1 jobs + 16 voice catalog + 14 main adjacent + 16 voice adjacent + 1 test-only). The two main drain strings are checked separately for presence and are not included in this total. Added: none. Removed: none. Sources: the six `SCOPED_SOURCES` files (`gateway.rs`, `main.rs`, `server.rs`, `shutdown.rs`, `jobs.rs`, `voice_rooms.rs`) plus the conformance pin in `crates/bot/src/observability_event_conformance_tests.rs`.
 - `voice_event` JSON field shapes recorded 2026-10-17 from the emitters (names + Rust types; no live log paste): see the `voice_event` JSON field shapes table above. Verified against `JoinTiming::finish`, `observe_voice_operation`, `observe_voice_respace`, `reconcile`, `mark_failed_observed`, `execute_create` and `accept_join_received` in `crates/bot/src/voice_rooms.rs`; refusal vocabulary cross-checked against the bounded allowlist in `crates/core/src/metrics.rs` (`VOICE_JOIN_REFUSAL_REASONS`), where unknown reasons fold to `other`. JSON formatting ownership stays separate; only shapes are pinned here.
 - Worker-side `container_gateway_failure` spelling cross-checked 2026-10-17: the keepalive tick in `wrangler/src/index.ts` (`keepalive`) emits `event: "container_gateway_failure"` with keys `event`, `phase`, `class`, `failed_step`, `error_code`, `build_revision`, `release`, `worker_version`, `log_url`. Spelling matches `docs/startup-diagnostics.md`, which records the abbreviated shape with placeholders for `phase`, `class`, `release` and `worker_version`; the four extra keys (`failed_step`, `error_code`, `build_revision`, `log_url`) are keepalive-tick context, not a spelling drift. Verified: event name identical, shared keys identical.
 
