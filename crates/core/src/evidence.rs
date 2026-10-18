@@ -58,7 +58,7 @@ pub const SOAK_LEDGER_RULE_ID: &str = "soak_expected_committed";
 /// derives its fired-packet names from the same spellings via `ruleFor`, so
 /// this list must stay identical to `RULES` in `wrangler/src/alert-rules.ts`;
 /// the table test below and the Worker test both pin every spelling.
-pub const ALERT_RULE_IDS: [&str; 22] = [
+pub const ALERT_RULE_IDS: [&str; 23] = [
     "job_stale",
     "job_consecutive_failures",
     "rest_429_rate",
@@ -80,6 +80,7 @@ pub const ALERT_RULE_IDS: [&str; 22] = [
     "voice_creator_map_stale",
     "community_facts_drain_failures",
     "error_budget_fast_burn",
+    "error_budget_slow_burn",
     "eventsub_tampered",
 ];
 
@@ -973,6 +974,7 @@ mod tests {
                 "voice_creator_map_stale",
                 "community_facts_drain_failures",
                 "error_budget_fast_burn",
+                "error_budget_slow_burn",
                 "eventsub_tampered",
             ]
         );
@@ -1131,6 +1133,7 @@ mod tests {
             capture_only: false,
             occurred_at: Some(T_MSG.to_owned()),
             content_length: None,
+            has_embed_or_attachment: false,
         });
         let voice_start_out = handlers.on_voice_join(VoiceInput {
             guild_id: G,

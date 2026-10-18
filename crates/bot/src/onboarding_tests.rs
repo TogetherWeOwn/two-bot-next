@@ -1,5 +1,8 @@
 //! Combined shared-router/REST and isolated agent-testdb acceptance. No live inputs.
 #![allow(dead_code)]
+
+#[path = "onboarding_connect_acceptance_tests.rs"]
+mod connect_acceptance;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -140,7 +143,7 @@ async fn discord(state: Arc<Mutex<DiscordState>>) -> MockRest {
         match (request.method.as_str(), path) {
             ("GET", "/guilds/22") => ScriptedResponse::json(200, json!({"id":"22","owner_id":"888"})),
             ("GET", "/guilds/22/roles") => {
-                let mut roles = vec![json!({"id":"22","permissions":"3072"}), json!({"id":"77","permissions":"0"})];
+                let mut roles = vec![json!({"id":"22","permissions":"1051648"}), json!({"id":"77","permissions":"0"})];
                 roles.extend(GAME_PICKS.iter().chain(PLATFORM_PICKS.iter()).map(|pick| json!({"id":pick.role_id,"permissions":"0"})));
                 ScriptedResponse::json(200, Value::Array(roles))
             }
