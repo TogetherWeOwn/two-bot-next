@@ -171,7 +171,34 @@ impl InternalChannelExecutor {
     /// resolver.actor), NEVER built from caller-supplied roles/permissions. IDs,
     /// policy and enablement are checked before claiming or making any wire call.
     /// request_id/time are server-generated, not website body values.
+    ///
+    /// Records one `two_bot_moderation_enforcements_total` sample per terminal
+    /// call (TOG-28482): `success` for completed enforcements including
+    /// idempotent replays, otherwise the bounded
+    /// `ActionError::enforcement_outcome` class. The verb is the request's
+    /// `ModerationAction::command_name`; no user id, reason text or free-form
+    /// detail ever becomes a label.
     pub async fn execute(
+        &self,
+        request: &InternalChannelRequest,
+        actor: &ModerationActor,
+        request_id: &str,
+        idempotency_key: &str,
+        now: &str,
+    ) -> Result<InternalChannelResult, ActionError> {
+        let result = self
+            .execute_inner(request, actor, request_id, idempotency_key, now)
+            .await;
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(err) => err.enforcement_outcome(),
+        };
+        two_bot_core::metrics::global()
+            .moderation_enforcement(request.action.command_name(), outcome);
+        result
+    }
+
+    async fn execute_inner(
         &self,
         request: &InternalChannelRequest,
         actor: &ModerationActor,
