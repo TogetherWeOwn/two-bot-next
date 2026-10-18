@@ -204,7 +204,7 @@ python3 scripts/ci/check-src-snowflakes.py
 python3 scripts/ci/verify-codeowners.py
 ```
 
-The snowflake gate scans `crates/*/src/**/*.rs` for decimal literals/strings with
+The snowflake gate scans `crates/*/src/**/*.rs` alongside `src/**/*.rs` for decimal literals/strings with
 17–20 digits, including numeric separators and raw strings. Comments and exact
 `#[cfg(test)]` inline modules are excluded. External test modules must start with
 an explicit `#![cfg(test)]`; filenames alone do not exempt source. Integration-test

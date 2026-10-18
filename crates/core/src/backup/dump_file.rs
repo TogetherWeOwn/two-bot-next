@@ -25,7 +25,7 @@
 //! JSON-looking TEXT stays unchanged; native JSON cells are serialized only
 //! for a JSON/JSONB target. Unsupported composite cells refuse, never become NULL.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
 
@@ -787,6 +787,9 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
     let decoder = GzDecoder::new(input);
     let mut reader = std::io::BufReader::new(decoder);
     let mut manifest: Option<DumpManifest> = None;
+    // Per-table manifest-column membership sets, built once when the manifest
+    // validates so the row arm below stays O(row keys) per row.
+    let mut column_sets: BTreeMap<String, HashSet<String>> = BTreeMap::new();
     let mut saw_end = false;
     let mut declared_rows: u64 = 0;
     let mut buffers: BTreeMap<String, Vec<Map<String, Value>>> = BTreeMap::new();
@@ -831,7 +834,21 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
-                manifest = Some(validate_manifest(&obj)?);
+                let validated = validate_manifest(&obj)?;
+                // Build the membership sets once (O(total columns)): testing
+                // each row key against them is O(row keys), while a linear
+                // `columns.contains` per key would be O(keys x columns) per
+                // row and let a hostile archive hang inspect inside the byte
+                // caps of docs/backup.md.
+                let mut sets = BTreeMap::new();
+                for table in &validated.tables {
+                    sets.insert(
+                        table.name.clone(),
+                        table.columns.iter().cloned().collect::<HashSet<String>>(),
+                    );
+                }
+                column_sets = sets;
+                manifest = Some(validated);
             }
             "row" => {
                 let Some(m) = manifest.as_ref() else {
@@ -857,6 +874,27 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     Some(Value::Object(data)) => data,
                     _ => return Err(refuse("dump row has no data object")),
                 };
+                // The manifest column list gates unknown keys here, before any
+                // publish/restore or `--dry-run` success: a row key it never
+                // declared refuses. This check does not verify column
+                // completeness: a row carrying a subset stays valid at
+                // inspect, while restore refuses a row with a missing cell
+                // (`missing cell`, dump.rs). The message is fixed vocabulary:
+                // it never echoes the hostile key.
+                // Membership is tested against the per-table set built with the
+                // manifest, so the per-row cost is O(row keys). The fallback
+                // linear scan is unreachable (the set is built from the same
+                // manifest `info` came from) and only preserves the refusal if
+                // that invariant ever breaks.
+                let has_outside_key = match column_sets.get(&table) {
+                    Some(known) => data.keys().any(|key| !known.contains(key)),
+                    None => data.keys().any(|key| !info.columns.contains(key)),
+                };
+                if has_outside_key {
+                    return Err(refuse(format!(
+                        "{table} row on line {line_no} has a column outside the manifest"
+                    )));
+                }
                 // Frozen v3 has native driver-decoded cells and no type metadata.
                 // This port's text-output encoding must remain strings/nulls.
                 if !info.column_types.is_empty() {
@@ -1022,6 +1060,27 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             return Err(refuse(format!(
                 "manifest table {name} has an invalid column list"
             )));
+        }
+        // `column_types` is parallel to `columns`: when present and non-empty
+        // its length must match, or the restore cast for some column is
+        // ambiguous. Absent or empty stays legacy-readable (frozen v3 omits it
+        // entirely). Fixed vocabulary: never echo the hostile type entries.
+        if let Some(types) = row.get("column_types") {
+            let types = types.as_array().ok_or_else(|| {
+                refuse(format!(
+                    "manifest table {name} has a malformed column type list"
+                ))
+            })?;
+            if types.iter().any(|t| !t.is_string()) {
+                return Err(refuse(format!(
+                    "manifest table {name} has a malformed column type list"
+                )));
+            }
+            if !types.is_empty() && types.len() != columns.len() {
+                return Err(refuse(format!(
+                    "manifest table {name} has a column/column_types length mismatch"
+                )));
+            }
         }
         let count = row
             .get("count")
@@ -2362,5 +2421,205 @@ mod tests {
         ]);
         let err = inspect_bytes(&bytes).expect_err("row before manifest");
         assert!(err.to_string().contains("before the manifest"), "{err}");
+    }
+
+    // Acceptance corpus: dump-inspect refusal shapes. The duplicate/missing/
+    // undeclared/non-object cases pin refusals the reader already makes; the
+    // column-parity and row-key cases are the new inspect checks. Every
+    // refusal must use fixed vocabulary: a sentinel string that only exists
+    // inside the hostile archive must never appear in the error, so an
+    // archive cannot smuggle its own contents into operator output.
+    const ECHO_SENTINEL: &str = "sentinel_archive_echo_7c1d";
+
+    fn acceptance_refusal(objs: &[Value]) -> String {
+        inspect_bytes(&gzip_lines(objs)).unwrap_err().to_string()
+    }
+
+    fn acceptance_table_mut<'a>(manifest: &'a mut Value, name: &str) -> &'a mut Value {
+        manifest["tables"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|table| table.get("name").and_then(Value::as_str) == Some(name))
+            .unwrap()
+    }
+
+    #[test]
+    fn acceptance_dump_inspect_refuses_duplicate_manifest_line() {
+        let mut objs = empty_dump();
+        let mut second = objs[0].clone();
+        second[ECHO_SENTINEL] = serde_json::json!(ECHO_SENTINEL);
+        objs.insert(1, second);
+        let err = acceptance_refusal(&objs);
+        assert!(err.contains("more than one manifest"), "{err}");
+        assert!(!err.contains(ECHO_SENTINEL), "{err}");
+    }
+
+    #[test]
+    fn acceptance_dump_inspect_refuses_duplicated_manifest_table() {
+        let mut objs = empty_dump();
+        let mut duplicate = objs[0]["tables"][0].clone();
+        duplicate["columns"] = serde_json::json!([ECHO_SENTINEL]);
+        objs[0]["tables"].as_array_mut().unwrap().push(duplicate);
+        let err = acceptance_refusal(&objs);
+        assert!(err.contains("is duplicated"), "{err}");
+        assert!(!err.contains(ECHO_SENTINEL), "{err}");
+    }
+
+    #[test]
+    fn acceptance_dump_inspect_refuses_missing_manifest() {
+        // An end marker alone and a wholly empty archive both lack the one
+        // line every other check keys off.
+        for objs in [vec![serde_json::json!({"kind":"end","rows":0})], Vec::new()] {
+            let err = acceptance_refusal(&objs);
+            assert!(err.contains("no manifest"), "{err}");
+            assert!(!err.contains(ECHO_SENTINEL), "{err}");
+        }
+    }
+
+    #[test]
+    fn acceptance_dump_inspect_refuses_row_for_undeclared_table() {
+        // A v5 manifest legitimately omits event_store, so a row naming it
+        // is a row for a real dump table this manifest never declared.
+        let mut objs = good_dump();
+        objs[0]["version"] = serde_json::json!(5);
+        objs[0]["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|table| table.get("name").and_then(Value::as_str) != Some("event_store"));
+        objs.insert(
+            2,
+            serde_json::json!({
+                "kind": "row",
+                "table": "event_store",
+                "data": {"id": ECHO_SENTINEL},
+            }),
+        );
+        let err = acceptance_refusal(&objs);
+        assert!(err.contains("not declared in the manifest"), "{err}");
+        assert!(!err.contains(ECHO_SENTINEL), "{err}");
+    }
+
+    #[test]
+    fn acceptance_dump_inspect_refuses_non_object_tables_entry() {
+        for entry in [
+            serde_json::json!(ECHO_SENTINEL),
+            serde_json::json!(7),
+            serde_json::json!([]),
+            serde_json::json!(true),
+            Value::Null,
+        ] {
+            let mut objs = empty_dump();
+            objs[0]["tables"][0] = entry.clone();
+            let err = acceptance_refusal(&objs);
+            assert!(
+                err.contains("manifest table is not an object"),
+                "{entry}: {err}"
+            );
+            assert!(!err.contains(ECHO_SENTINEL), "{entry}: {err}");
+        }
+    }
+
+    #[test]
+    fn acceptance_dump_inspect_refuses_column_types_length_mismatch() {
+        // column_types is parallel to columns: a non-empty type list whose
+        // length differs (either direction, including types for no columns)
+        // leaves the restore cast for some column ambiguous.
+        for (columns, types) in [
+            (vec!["id", "guild_id"], vec!["text"]),
+            (vec!["id", "guild_id"], vec!["text", "text", ECHO_SENTINEL]),
+            (vec!["id"], vec!["text", ECHO_SENTINEL]),
+            (Vec::new(), vec![ECHO_SENTINEL]),
+        ] {
+            let mut objs = empty_dump();
+            let events = acceptance_table_mut(&mut objs[0], "events");
+            events["columns"] = serde_json::json!(columns);
+            events["column_types"] = serde_json::json!(types);
+            let err = acceptance_refusal(&objs);
+            assert!(err.to_lowercase().contains("column"), "{err}");
+            assert!(!err.contains(ECHO_SENTINEL), "{err}");
+        }
+    }
+
+    #[test]
+    fn acceptance_dump_inspect_refuses_row_keys_outside_manifest_columns() {
+        // The manifest column list is the restore contract: a row key it
+        // never declared must refuse at inspect, typed or legacy-untyped.
+        for strip_types in [false, true] {
+            let mut objs = good_dump();
+            if strip_types {
+                for table in objs[0]["tables"].as_array_mut().unwrap() {
+                    table.as_object_mut().unwrap().shift_remove("column_types");
+                }
+            }
+            objs[1]["data"][ECHO_SENTINEL] = serde_json::json!(ECHO_SENTINEL);
+            let err = acceptance_refusal(&objs);
+            assert!(err.to_lowercase().contains("column"), "{err}");
+            assert!(!err.contains(ECHO_SENTINEL), "{err}");
+        }
+    }
+
+    #[test]
+    fn acceptance_dump_inspect_accepts_valid_archive_unchanged() {
+        let objs = good_dump();
+        let contents = inspect_bytes(&gzip_lines(&objs)).unwrap();
+        assert_eq!(contents.rows, 1);
+        assert_eq!(
+            serde_json::to_value(&contents.manifest).unwrap(),
+            objs[0],
+            "a valid manifest must round-trip byte-identically in value terms"
+        );
+        assert_eq!(contents.buffers.len(), 1);
+        assert_eq!(
+            contents.buffers["events"],
+            vec![{
+                let mut row = Map::new();
+                row.insert("id".to_owned(), serde_json::json!("1"));
+                row.insert("guild_id".to_owned(), serde_json::json!("g"));
+                row
+            }]
+        );
+        // A row carrying only a subset of the declared columns stays valid:
+        // only keys outside the manifest refuse, never missing ones.
+        let mut subset = good_dump();
+        subset[1]["data"]
+            .as_object_mut()
+            .unwrap()
+            .shift_remove("guild_id");
+        let contents = inspect_bytes(&gzip_lines(&subset)).unwrap();
+        assert_eq!(contents.rows, 1);
+        assert_eq!(contents.buffers["events"][0].len(), 1);
+    }
+
+    #[test]
+    fn acceptance_dump_inspect_accepts_legacy_v3_without_column_types() {
+        // Frozen v3 has declared columns but no column_types at all, and its
+        // cells are native JSON scalars; parity checks must not refuse it.
+        let mut objs = good_dump();
+        objs[0]["version"] = serde_json::json!(3);
+        for table in objs[0]["tables"].as_array_mut().unwrap() {
+            table.as_object_mut().unwrap().shift_remove("column_types");
+        }
+        objs[1]["data"] = serde_json::json!({"id": 1, "guild_id": "g"});
+        let contents = inspect_bytes(&gzip_lines(&objs)).unwrap();
+        assert_eq!(contents.manifest.version, 3);
+        assert_eq!(contents.rows, 1);
+        assert!(contents
+            .manifest
+            .tables
+            .iter()
+            .all(|table| table.column_types.is_empty()));
+        let events = contents
+            .manifest
+            .tables
+            .iter()
+            .find(|table| table.name == "events")
+            .unwrap();
+        assert_eq!(events.columns, ["id", "guild_id"]);
+        assert_eq!(contents.buffers["events"][0]["id"], serde_json::json!(1));
+        assert_eq!(
+            contents.buffers["events"][0]["guild_id"],
+            serde_json::json!("g")
+        );
     }
 }

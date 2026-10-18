@@ -41,9 +41,11 @@ fn pending_refusal_precedes_any_url_or_connection_attempt() {
 
 #[test]
 fn live_target_refusal_precedes_source_connection_and_withholds_credentials() {
+    // TLS-compliant URLs (required policy needs sslmode): the live-target
+    // fence must still refuse before any source connection attempt.
     let output = run(&[
-        "--source-url=postgres://fake:source-secret@source.invalid:5432/source",
-        "--target-url=postgres://fake:target-secret@live.invalid:5432/target",
+        "--source-url=postgres://fake:source-secret@source.invalid:5432/source?sslmode=require",
+        "--target-url=postgres://fake:target-secret@live.invalid:5432/target?sslmode=require",
         "--apply",
     ]);
     assert_eq!(output.status.code(), Some(2));
