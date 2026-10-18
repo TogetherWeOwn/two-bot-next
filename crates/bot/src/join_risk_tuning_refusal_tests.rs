@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Acceptance tests: raid (join-risk) scoring refuses present-but-unusable
 //! tuning instead of silently running on shipped defaults.
 //!
