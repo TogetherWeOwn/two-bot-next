@@ -44,13 +44,19 @@ pub const THREAD_CHANNEL_TYPES: [u8; 3] = [10, 11, 12];
 /// `status`) stay conversation, while `mod-log`, `audit-log`/`audit-logs`,
 /// `bot-logs`/`wick-logs`/`server-log`, bare `log`/`logs`, `modmail`, and
 /// the full `network-status` phrase (including `network-status-updates`)
-/// still skip. Matching is case-insensitive via lowercasing first.
+/// still skip. Compound bot-output names without a separator (`modlogs`,
+/// `auditlog`, `botlogs`, `serverlogs`, `logging`, `mod-logging`,
+/// `modmails`, `audits`) still skip via the compound-suffix rule below.
+/// Matching is case-insensitive via lowercasing first.
 fn is_loggy(name: &str) -> bool {
     let lower = name.to_lowercase();
     for needle in ["log", "logs", "wick", "audit", "modmail", "network-status"] {
         if contains_token(&lower, needle) {
             return true;
         }
+    }
+    if has_compound_log_suffix(&lower) {
+        return true;
     }
     // `^\d+-[a-z]`: starts with digits, dash, then a lowercase letter.
     let bytes = lower.as_bytes();
@@ -87,6 +93,46 @@ fn contains_token(haystack: &str, needle: &str) -> bool {
         }
     }
     false
+}
+
+/// Known innocent English words that end in `log`/`logs`: member
+/// conversation, not bot output. Narrow by design: only words that would
+/// otherwise match the compound-suffix rule are listed (`catalog`, `blog`,
+/// `dialog` plus plurals). Words like `catalogue`, `dialogue`, `logic`,
+/// `login` and `prologue` need no listing: they never end a segment with a
+/// bot-output suffix, so the rule below already leaves them alone.
+const INNOCENT_LOG_SUFFIX_WORDS: [&str; 6] =
+    ["catalog", "catalogs", "blog", "blogs", "dialog", "dialogs"];
+
+/// True when a separator-delimited segment of already-lowercased `name`
+/// ends with a bot-output suffix (`log`, `logs`, `logging`, `audit`,
+/// `audits`, `auditing`, `modmail`, `modmails`, `modmailing`). This keeps
+/// the legacy substring behavior for compound bot-output names without a
+/// separator (`modlogs`, `auditlog`, `botlogs`, `serverlogs`, `messagelogs`,
+/// `joinlogs`, `wicklogs`, `logging`, `mod-logging`, `modmails`, `audits`,
+/// `changelog` and emoji-prefixed variants), while mid-word occurrences
+/// (`logic`, `login`, `dialogue`, `prologue`, `auditions`, `auditorium`,
+/// `wicked`, `candlewick`) never end a segment with one of these suffixes
+/// and stay conversation.
+fn has_compound_log_suffix(lower: &str) -> bool {
+    const SUFFIXES: [&str; 9] = [
+        "log",
+        "logs",
+        "logging",
+        "audit",
+        "audits",
+        "auditing",
+        "modmail",
+        "modmails",
+        "modmailing",
+    ];
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|seg| !seg.is_empty())
+        .any(|seg| {
+            !INNOCENT_LOG_SUFFIX_WORDS.contains(&seg)
+                && SUFFIXES.iter().any(|suf| seg.ends_with(suf))
+        })
 }
 
 /// True when a channel holds member conversation rather than bot output

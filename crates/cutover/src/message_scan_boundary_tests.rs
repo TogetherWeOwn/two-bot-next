@@ -103,6 +103,56 @@ fn true_log_tokens_still_skip() {
 }
 
 #[test]
+fn compound_log_names_still_skip() {
+    // Regression: the legacy substring matcher skipped compound bot-output
+    // names without a separator, and the token-boundary fix must not start
+    // scanning these high-volume channels as conversation.
+    for name in [
+        "modlogs",
+        "modlog",
+        "auditlog",
+        "auditlogs",
+        "botlogs",
+        "botlog",
+        "serverlogs",
+        "serverlog",
+        "messagelogs",
+        "joinlogs",
+        "wicklogs",
+        "logging",
+        "mod-logging",
+        "modmails",
+        "audits",
+        "changelog",
+        "MODLOGS",
+        "AuditLog",
+    ] {
+        assert!(is_loggy(name), "{name} must still be loggy");
+        assert!(
+            is_log_channel(name, "Community"),
+            "{name} must still be a log channel"
+        );
+        assert!(
+            !is_conversation_channel(name, "Community", 0),
+            "{name} must still skip conversation"
+        );
+    }
+}
+
+#[test]
+fn innocent_suffix_words_stay_conversation() {
+    // `catalog`, `blog` and `dialog` end a segment with `log`/`logs` but
+    // are member conversation; the compound-suffix rule carves them out.
+    for name in ["catalog", "catalogs", "blog", "blogs", "dialog", "dialogs"] {
+        assert!(!is_loggy(name), "{name} must not be loggy");
+        assert!(
+            is_conversation_channel(name, "Community", 0),
+            "{name} must route to conversation"
+        );
+    }
+}
+
+#[test]
 fn partial_network_status_words_are_conversation() {
     // Only the full `network-status` phrase is a bot-output token; its
     // halves on their own must not be broadened into needles.
