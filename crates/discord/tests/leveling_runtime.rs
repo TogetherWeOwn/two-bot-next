@@ -854,7 +854,7 @@ fn delivered_pipeline(pool: PgPool, mock: &MockRest) -> OrderedLevelingPipeline<
     pipeline
 }
 
-async fn message_award_rows(pool: &PgPool) -> Vec<(i64, Option<String>)> {
+async fn message_award_rows(pool: &PgPool) -> Vec<(i32, Option<String>)> {
     sqlx::query_as("SELECT xp, decision FROM xp_awards WHERE source = 'message' ORDER BY id")
         .fetch_all(pool)
         .await
