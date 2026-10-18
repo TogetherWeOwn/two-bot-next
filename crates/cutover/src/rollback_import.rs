@@ -100,7 +100,7 @@ fn quote(name: &str) -> Result<String, ImportApplyError> {
 /// physical 1-based file lines. Returns the rows in file order.
 pub fn parse_import(contents: &str) -> Result<Vec<ImportRow>, ImportError> {
     let mut rows = Vec::new();
-    let mut per_table: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut per_table: BTreeMap<String, u64> = BTreeMap::new();
     for (index, line) in contents.lines().enumerate() {
         let line_no = index + 1;
         if line.trim().is_empty() {
@@ -121,7 +121,7 @@ pub fn parse_import(contents: &str) -> Result<Vec<ImportRow>, ImportError> {
                 table: table.to_owned(),
             });
         }
-        let count = per_table.entry(table).or_insert(0);
+        let count = per_table.entry(table.to_owned()).or_insert(0);
         *count += 1;
         if *count > MAX_EXPORT_ROWS_PER_TABLE {
             return Err(ImportError::RowCap {
