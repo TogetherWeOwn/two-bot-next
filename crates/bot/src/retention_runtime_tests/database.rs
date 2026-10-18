@@ -199,6 +199,210 @@ async fn game_aggregate_expiry_counts_in_dry_run_and_deletes_in_execute() {
     db.close().await.unwrap();
 }
 
+fn field_str(line: &str, name: &str, expected: &str) {
+    let plain = format!("{name}={expected}");
+    let quoted = format!("{name}=\"{expected}\"");
+    assert!(
+        line.split_whitespace()
+            .any(|part| part == plain || part == quoted),
+        "missing exact report field {plain}: {line}"
+    );
+}
+
+fn expiry_failure_line(logs: &str) -> &str {
+    let failures: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("game_activity_aggregate_expiry_failed"))
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "one aggregate expiry failure event per failed tick: {logs}"
+    );
+    failures[0]
+}
+
+/// The classified token for an injected database error (`RAISE EXCEPTION`
+/// or a missing table both classify as `database`) under the house `reason`
+/// field. The raw database error text itself must never appear in the log
+/// line.
+fn assert_classified_db_error(line: &str) {
+    let classified = ["reason=database", "reason=\"database\""];
+    assert!(
+        line.split_whitespace()
+            .any(|part| classified.contains(&part)),
+        "failure line must carry reason=database, not discard it: {line}"
+    );
+}
+
+/// A tick whose aggregate expiry failed must not leave behind the plain
+/// success line: the committed report still prints once, with distinct text
+/// (`retention run committed; aggregate expiry failed`), so the counters are
+/// never dropped.
+fn assert_no_completed_line(logs: &str) {
+    assert!(
+        !logs
+            .lines()
+            .any(|line| line.trim_end().ends_with("retention run completed")),
+        "failed tick must not log a plain completed line: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn game_aggregate_expiry_denied_delete_identifies_guild_horizon_mode_and_cause() {
+    let _serial = RUNTIME_LOCK.lock().await;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    const DENIED_GUILD: &str = "555555555555555555";
+    sqlx::query("INSERT INTO game_activity_guild_aggregates (guild_id, game, total_play_ms, in_voice_ms, session_count) VALUES ($1, 'Apex', 600000, 0, 2)")
+        .bind(DENIED_GUILD).execute(pool).await.unwrap();
+    sqlx::query("UPDATE game_activity_guild_aggregates SET updated_at = now() - make_interval(days => 100) WHERE guild_id = $1")
+        .bind(DENIED_GUILD).execute(pool).await.unwrap();
+    sqlx::raw_sql("CREATE FUNCTION aggregate_expiry_refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic aggregate expiry refusal'; END $$; CREATE TRIGGER aggregate_expiry_refuse BEFORE DELETE ON game_activity_guild_aggregates FOR EACH ROW EXECUTE FUNCTION aggregate_expiry_refuse();").execute(pool).await.unwrap();
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    assert_eq!(
+        result,
+        Err(ErrorClass::Database),
+        "a denied aggregate delete stays a retryable database failure: {logs}"
+    );
+    let failure = expiry_failure_line(&logs);
+    assert!(
+        failure.starts_with("WARN ") || failure.starts_with("ERROR "),
+        "expiry failure must log above info level: {failure}"
+    );
+    field_str(failure, "guild_id", DENIED_GUILD);
+    field(failure, "horizon_days", 90);
+    assert!(
+        failure.contains("mode=Execute") || failure.contains("mode=\"Execute\""),
+        "failure line must tag the mode that attempted the delete: {failure}"
+    );
+    assert_classified_db_error(failure);
+    assert!(
+        !failure.contains("synthetic aggregate expiry refusal"),
+        "failure line must classify the database error, never log it raw: {failure}"
+    );
+    assert_no_completed_line(&logs);
+    let committed = report_line(&logs);
+    assert!(
+        committed.contains("mode=Execute") || committed.contains("mode=\"Execute\""),
+        "committed report must tag the mode on a failed expiry: {committed}"
+    );
+    assert!(
+        committed.contains("aggregate expiry failed"),
+        "committed report must use distinct text, not the plain success line: {committed}"
+    );
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM game_activity_guild_aggregates WHERE guild_id = $1",
+    )
+    .bind(DENIED_GUILD)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(kept, 1, "a denied delete removes nothing");
+    // Once the refusal is gone the same stale row sweeps on the next tick.
+    sqlx::raw_sql("DROP TRIGGER aggregate_expiry_refuse ON game_activity_guild_aggregates; DROP FUNCTION aggregate_expiry_refuse();").execute(pool).await.unwrap();
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    result.unwrap();
+    field(expiry_line(&logs), "stale_rows", 1);
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM game_activity_guild_aggregates WHERE guild_id = $1",
+    )
+    .bind(DENIED_GUILD)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(kept, 0, "the settled tick deletes the stale row");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn game_aggregate_expiry_listing_failure_identifies_horizon_mode_and_cause() {
+    let _serial = RUNTIME_LOCK.lock().await;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    // Hiding the aggregate table fails the stale-guild listing itself,
+    // before any guild is known: the failure line still owes the horizon,
+    // the mode and the classified cause.
+    sqlx::query("ALTER TABLE game_activity_guild_aggregates RENAME TO game_activity_guild_aggregates_hidden")
+        .execute(pool).await.unwrap();
+    let (result, logs) = tick(pool, mode_from_setting(None).unwrap().unwrap()).await;
+    assert_eq!(
+        result,
+        Err(ErrorClass::Database),
+        "a failed stale-guild listing stays a retryable database failure: {logs}"
+    );
+    let failure = expiry_failure_line(&logs);
+    field(failure, "horizon_days", 90);
+    assert!(
+        failure.contains("mode=DryRun") || failure.contains("mode=\"DryRun\""),
+        "listing failure must tag the mode that attempted the sweep: {failure}"
+    );
+    assert_classified_db_error(failure);
+    assert!(
+        !failure.contains("does not exist"),
+        "failure line must classify the database error, never log it raw: {failure}"
+    );
+    assert_no_completed_line(&logs);
+    let committed = report_line(&logs);
+    assert!(
+        committed.contains("mode=DryRun") || committed.contains("mode=\"DryRun\""),
+        "committed report must tag the mode on a failed listing: {committed}"
+    );
+    assert!(
+        committed.contains("aggregate expiry failed"),
+        "committed report must use distinct text, not the plain success line: {committed}"
+    );
+    sqlx::query("ALTER TABLE game_activity_guild_aggregates_hidden RENAME TO game_activity_guild_aggregates")
+        .execute(pool).await.unwrap();
+    let (result, _logs) = tick(pool, mode_from_setting(None).unwrap().unwrap()).await;
+    result.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn game_aggregate_expiry_zero_stale_ticks_emit_a_swept_clean_event() {
+    let _serial = RUNTIME_LOCK.lock().await;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    const FRESH_GUILD: &str = "666666666666666666";
+    sqlx::query("INSERT INTO game_activity_guild_aggregates (guild_id, game, total_play_ms, in_voice_ms, session_count) VALUES ($1, 'Valorant', 600000, 0, 1)")
+        .bind(FRESH_GUILD).execute(pool).await.unwrap();
+    // A tick that ran and found nothing stale must say so in both modes:
+    // `stale_rows=0` on the sweep event is what separates "swept clean"
+    // from "expiry never ran".
+    let (result, logs) = tick(pool, mode_from_setting(None).unwrap().unwrap()).await;
+    result.unwrap();
+    let preview = expiry_line(&logs);
+    field(preview, "stale_rows", 0);
+    field(preview, "horizon_days", 90);
+    assert!(
+        preview.contains("mode=DryRun") || preview.contains("mode=\"DryRun\""),
+        "zero-stale dry run must tag its preview: {preview}"
+    );
+    assert!(
+        !preview.contains("skip"),
+        "zero-stale event must read as a sweep, not a skip: {preview}"
+    );
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    result.unwrap();
+    let swept = expiry_line(&logs);
+    field(swept, "stale_rows", 0);
+    field(swept, "horizon_days", 90);
+    assert!(
+        swept.contains("mode=Execute") || swept.contains("mode=\"Execute\""),
+        "zero-stale execute must tag its sweep: {swept}"
+    );
+    let games: Vec<String> = sqlx::query_scalar(
+        "SELECT game FROM game_activity_guild_aggregates WHERE guild_id = $1 ORDER BY game ASC",
+    )
+    .bind(FRESH_GUILD)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(games, vec!["Valorant".to_owned()], "fresh rows survive");
+    db.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn dry_run_reports_candidates_and_preserves_raw_queue_requests_and_receipts() {
     let _serial = RUNTIME_LOCK.lock().await;

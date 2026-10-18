@@ -119,11 +119,14 @@ import {
   sanitizeRemediationState,
   type RemediationState,
 } from "./remediation.ts";
+import { applyStagingFaultInjection } from "./staging-fault.ts";
 import { parseRelease, releaseTag, workerVersionTag } from "./error-events.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
 import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
 import { handleMcp } from "./mcp.ts";
 import {
+  DASHBOARD_CLIENT_ID_HEADER,
+  DASHBOARD_CLIENT_SECRET_HEADER,
   OPS_DASHBOARD_PATH,
   MIN_DASHBOARD_CLIENT_ID_LENGTH,
   MIN_DASHBOARD_SECRET_LENGTH,
@@ -213,6 +216,13 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
    * Container on an explicit fenced line below, never flag-forwarded. The
    * TWO_DEPLOY_ENV marker it is fenced by rides FORWARDED_FLAGS. */
   TWO_GATEWAY_READINESS_FAIL_INJECTION?: string;
+  /** Staging remediation-drill switches (staging fault injector): Worker-only
+   * trigger input for the guarded auto-remediation soak. Set only in the
+   * generated staging deploy config by a manual deploy-staging dispatch,
+   * never a committed var (check-env-bindings.py). Never forwarded to the
+   * Container (NOT_FORWARDED in container-env.ts) and never logged. */
+  TWO_VOICE_STALL_FAULT_INJECTION?: string;
+  TWO_GATEWAY_UNPAIRED_FAULT_INJECTION?: string;
   /** Operator-set Worker secrets for the private receiver. Never flag-forwarded. */
   TWO_INTERNAL_ACTIONS?: string;
   TWO_INTERNAL_CALLERS?: string;
@@ -1511,7 +1521,12 @@ export class TwoBotContainer extends Container<Env> {
         }
         return;
       }
-      const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000, gatewayReady);
+      // Staging-only fault injector: synthetic drill input for the
+      // guarded-remediation soak. Dark unless the generated staging deploy
+      // config arms it; production and unarmed staging evaluate the scraped
+      // samples untouched. Never logged: the switches never leave this gate.
+      const faulted = applyStagingFaultInjection(samples, previous, this.env);
+      const { firing, state } = evaluateMetrics(faulted, previous, Date.now() / 1000, gatewayReady);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);
       for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses, context)) {
@@ -1907,17 +1922,20 @@ export default {
       }
       return dashboardPageResponse();
     }
-    // Read-only ops summary (TOG-22860 + TOG-22861): the roll-up serves two
-    // operator audiences, so either credential opens it — the metrics scrape
-    // bearer or the dashboard service-token pair (Cloudflare Access service
-    // tokens: both CF-Access-Client-Id and CF-Access-Client-Secret on every
-    // summary request, strict mode — no cookies or sessions). The scrape
-    // gate is consulted first and its 429 is a hard fence, never bypassed
-    // via the other gate; a non-throttled scrape refusal falls through to
-    // the dashboard gate. Non-GET and doubly-unconfigured still 404 (the
-    // route does not exist); otherwise a failed attempt is 401 with the
-    // Bearer challenge. Each gate throttles on its own budget before any
-    // comparison, so guessing at one cannot throttle the other.
+    // Read-only ops summary (TOG-22860 + TOG-22861, dual-gate budget
+    // TOG-29408): the roll-up serves two operator audiences, so either
+    // credential opens it — the metrics scrape bearer or the dashboard
+    // service-token pair (Cloudflare Access service tokens: both
+    // CF-Access-Client-Id and CF-Access-Client-Secret on every summary
+    // request, strict mode — no cookies or sessions). Each credential spends
+    // only its own per-caller budget: the scrape gate runs only when an
+    // Authorization header is presented, and the dashboard gate only when a
+    // dashboard header is presented. Guessing at one therefore cannot
+    // throttle the other. For a bearer-presenting request the scrape gate
+    // runs first and its 429 is a hard fence, never bypassed via the other
+    // gate; a non-throttled scrape refusal falls through to the dashboard
+    // gate. Non-GET and doubly-unconfigured still 404 (the route does not
+    // exist); otherwise a failed attempt is 401 with the Bearer challenge.
     if (url.pathname === OPS_SUMMARY_PATH) {
       if (request.method !== "GET") {
         return new Response("not found", { status: 404, headers: withSecurityHeaders() });
@@ -1933,7 +1951,11 @@ export default {
       };
       const scrapeConfigured = !!env.METRICS_SCRAPE_TOKEN
         && env.METRICS_SCRAPE_TOKEN.length >= MIN_SCRAPE_TOKEN_LENGTH;
-      if (scrapeConfigured) {
+      // Only a bearer-presenting request is evaluated by (and spends) the
+      // scrape budget; a dashboard-only request skips this gate entirely so
+      // a spent scrape bucket cannot refuse it.
+      const hasScrapeAttempt = request.headers.has("authorization");
+      if (scrapeConfigured && hasScrapeAttempt) {
         const refusal = await opsReadRefusal(request, env);
         if (refusal === null) return forwardSummary();
         if (refusal.status === 429) return refusal;
@@ -1943,7 +1965,11 @@ export default {
         && env.OPS_DASHBOARD_CLIENT_ID.length >= MIN_DASHBOARD_CLIENT_ID_LENGTH
         && !!env.OPS_DASHBOARD_CLIENT_SECRET
         && env.OPS_DASHBOARD_CLIENT_SECRET.length >= MIN_DASHBOARD_SECRET_LENGTH;
-      if (dashboardConfigured) {
+      // Only a dashboard-presenting request is evaluated by (and spends) the
+      // dashboard budget; a bearer-only guess never touches it.
+      const hasDashboardAttempt = request.headers.has(DASHBOARD_CLIENT_ID_HEADER)
+        || request.headers.has(DASHBOARD_CLIENT_SECRET_HEADER);
+      if (dashboardConfigured && hasDashboardAttempt) {
         const verdict = dashboardAuthBuckets.take(caller);
         if (!verdict.allowed && !dashboardAuthBuckets.peek(caller).allowed) {
           return new Response("slow down\n", {
