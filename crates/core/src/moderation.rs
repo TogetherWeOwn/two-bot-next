@@ -605,15 +605,18 @@ mod tests {
     fn full_registry_merges_without_collision() {
         let merged = merge_commands(&[feature_commands(), moderation_commands()], &[])
             .expect("slices 1-3 merge cleanly");
-        // 3 core + 16 slice-2 + 9 moderation.
-        assert_eq!(merged.len(), 28);
+        // 4 core + 16 slice-2 + 9 moderation.
+        assert_eq!(merged.len(), 29);
         let names: Vec<_> = merged.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(&names[..4], ["rank", "leaderboard", "help", "attendance"]);
         assert_eq!(
-            &names[19..24],
+            &names[..5],
+            ["rank", "leaderboard", "help", "privacy", "attendance"]
+        );
+        assert_eq!(
+            &names[20..25],
             ["ban", "tempban", "kick", "timeout", "warn"]
         );
-        assert_eq!(&names[24..], ["purge", "slowmode", "lockdown", "unlock"]);
+        assert_eq!(&names[25..], ["purge", "slowmode", "lockdown", "unlock"]);
         assert!(merged.iter().all(|d| !d.dm_permission));
     }
 
