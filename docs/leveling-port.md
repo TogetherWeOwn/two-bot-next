@@ -35,8 +35,9 @@ and [`discord.ts`](https://github.com/TogetherWeOwn/two-bot/blob/d5d11793/src/le
   offset/cursor paging or page components; none are invented here. This
   intentionally diverges from the frozen legacy lifetime board: the seasonal
   projection fills only from awards made after the seasonal mirror shipped,
-  so the first partial quarter omits earlier XP and a backfill owns that
-  historical gap.
+  so the first partial quarter omits earlier XP and the 2026-Q4 board header
+  itself carries ` — partial: early-season XP not counted` until a backfill
+  lands or the quarter rolls over.
 - Legacy level-up processing grants earned roles but posts **no channel
   announcement**. The reply/effect types intentionally do not add one.
 - Reward grants skip already-held roles. Session onboarding suppresses all

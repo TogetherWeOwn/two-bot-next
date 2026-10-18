@@ -471,9 +471,23 @@ pub fn leaderboard_reply(entries: &[LeaderboardEntry]) -> LeaderboardReply {
     }
 }
 
+/// First season served by the seasonal board. The seasonal mirror shipped
+/// mid-quarter (2026-Q4 opened 2026-10-05, the mirror landed 2026-10-13),
+/// so 2026-Q4 omits XP earned before the mirror. The board marks it partial
+/// until a backfill lands or the quarter rolls over; later quarters track
+/// from their first day and render the plain header.
+pub const FIRST_PARTIAL_SEASON: &str = "2026-Q4";
+/// Partial-season marker for the first quarter. Kept inside the header line
+/// so the top-10 shape (header plus 10 rows) is unchanged while Discord
+/// members see the gap, not just operators reading docs.
+pub const PARTIAL_SEASON_NOTE: &str = " — partial: early-season XP not counted";
+
 /// Build the seasonal `/leaderboard` reply (AC3): same 1–25 clamp and top-10
 /// public shape as [`leaderboard_reply`], scoped to one season. Lifetime
-/// stays behind an explicit flag owned by a later slice.
+/// stays behind an explicit flag owned by a later slice. The first partial
+/// quarter renders the partial marker inside its header; an empty first
+/// quarter keeps the marker on its header plus the honest empty body, never
+/// lifetime totals.
 #[must_use]
 pub fn leaderboard_reply_for_season(
     entries: &[LeaderboardEntry],
@@ -488,8 +502,13 @@ pub fn leaderboard_reply_for_season(
     } else {
         rows.join("\n")
     };
+    let header = if season_id == FIRST_PARTIAL_SEASON {
+        format!("**TWO XP Leaderboard ({season_id}{PARTIAL_SEASON_NOTE})**")
+    } else {
+        format!("**TWO XP Leaderboard ({season_id})**")
+    };
     LeaderboardReply {
-        content: format!("**TWO XP Leaderboard ({season_id})**\n{body}"),
+        content: format!("{header}\n{body}"),
         suppress_mentions: true,
     }
 }
@@ -944,6 +963,44 @@ mod tests {
         assert_eq!(leaderboard_text(&[]), "No XP has been earned yet.");
         let text = leaderboard_text(&[leaderboard_line(1, 20, 5, 1200)]);
         assert!(text.starts_with("**TWO XP Leaderboard**\n**1.** <@20>"));
+    }
+
+    #[test]
+    fn seasonal_board_marks_first_partial_quarter_in_header() {
+        let entries = [LeaderboardEntry {
+            member_id: "100000000000000001".to_owned(),
+            xp: 1200,
+            level: 5,
+            rank: 1,
+        }];
+        let partial = leaderboard_reply_for_season(&entries, FIRST_PARTIAL_SEASON);
+        assert!(
+            partial.content.starts_with(
+                "**TWO XP Leaderboard (2026-Q4 — partial: early-season XP not counted)**\n"
+            ),
+            "2026-Q4 members must see the partial gap in the board header"
+        );
+        assert_eq!(
+            partial.content.lines().count(),
+            2,
+            "partial marker stays inside the header line, not an extra row"
+        );
+        assert!(partial.suppress_mentions);
+        let empty_partial = leaderboard_reply_for_season(&[], FIRST_PARTIAL_SEASON);
+        assert!(
+            empty_partial
+                .content
+                .contains("partial: early-season XP not counted")
+                && empty_partial.content.contains("No XP has been earned yet."),
+            "empty first quarter stays honest and marked, never lifetime"
+        );
+        let later = leaderboard_reply_for_season(&entries, "2027-Q1");
+        assert!(
+            later
+                .content
+                .starts_with("**TWO XP Leaderboard (2027-Q1)**\n"),
+            "later quarters render the plain header once tracking is whole"
+        );
     }
 
     #[test]

@@ -242,7 +242,9 @@ for the current season with an explicit season header and an honest empty
 reply, never lifetime totals. This intentionally diverges from the frozen
 legacy lifetime board. The seasonal projection fills only from awards made
 after the seasonal mirror shipped, so the first partial quarter omits
-earlier XP; that historical gap belongs to a backfill, not this read path.
+earlier XP; the 2026-Q4 board header itself carries the partial marker so
+members see the gap, and the remaining historical repair belongs to a
+backfill, not this read path.
 
 | Behaviour | Detail | Map |
 |---|---|---|
