@@ -897,18 +897,36 @@ export class TwoBotContainer extends Container<Env> {
           return this.proxyOpsBody(`http://c${url.pathname}`, OPS_JSON_CONTENT_TYPE, "ops unavailable\n", signed);
         }
         // Bound the entire probe, including auto-start, below the 30s DO gate.
-        const probe = new Request(request, { signal: AbortSignal.timeout(6000) });
+        // The deadline covers the fetch AND rejected-body consumption: a
+        // sub-cap stall cannot extend caller settlement, and late or
+        // abort-shaped bodies are released best-effort without replacing
+        // the fixed refusal.
+        const probeSignal = AbortSignal.timeout(6000);
+        const probe = new Request(request, { signal: probeSignal });
+        let probeResponse: Response;
         try {
-          const response = await this.containerFetch(probe);
+          probeResponse = await deadlineFetch(this.containerFetch(probe), probeSignal);
+        } catch {
+          return containerUnavailable();
+        }
+        if (probeSignal.aborted) {
+          releaseBody(probeResponse);
+          return containerUnavailable();
+        }
+        try {
           // SDK startup failures arrive as responses rather than rejections.
           // Bound the discard like the keepalive read: small error text drains
           // so the SDK proxy pipe settles, oversize cancels via the reader.
-          if (!isBotProbeResponse(response)) {
-            await readBoundedText(response, MAX_PROBE_BODY_BYTES).catch(() => null);
+          if (!isBotProbeResponse(probeResponse)) {
+            await readBoundedText(probeResponse, MAX_PROBE_BODY_BYTES, probeSignal).catch(() => null);
+            return containerUnavailable();
+          }
+          if (probeSignal.aborted) {
+            releaseBody(probeResponse);
             return containerUnavailable();
           }
           await this.armKeepalive();
-          return response;
+          return probeResponse;
         } catch {
           return containerUnavailable();
         }
@@ -1792,9 +1810,10 @@ export default {
         const upstream = await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         // SDK startup failures arrive as responses rather than rejections.
         // Cancel without reading: a huge non-bot body must not bypass the
-        // probe cap by being drained here.
+        // probe cap by being drained here. Best-effort: a stalling cancel
+        // hook must not hold the fixed refusal.
         if (!isBotProbeResponse(upstream)) {
-          await upstream.body?.cancel().catch(() => {});
+          releaseBody(upstream);
           response = containerUnavailable();
         } else {
           response = upstream;
