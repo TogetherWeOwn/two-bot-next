@@ -154,8 +154,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-18: 19 — `/schedule-list`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /schedule-list before and after creation/removal of the fixture schedule, and as an unprivileged actor.
-- **Expected:** Only guild-scoped schedules listed to permitted actor, with matching IDs/cadences.
+- **Action:** Invoke /schedule-list before and after creation/removal of the fixture schedule, and as an unprivileged actor; walk page:1 and an out-of-range page.
+- **Expected:** Only guild-scoped schedules listed to permitted actor, with matching IDs/cadences; every page fits Discord limits with a page indicator and out-of-range pages are refused.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-19: 20 — `/sticky`
@@ -1237,7 +1237,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 - **Method:** `automated` (not an execution verdict).
 - **Action:** Run the voice publish pins: the router merge and yield tests in `crates/core/src/router.rs`, the staging manifest drift tests in `crates/core/tests/staging_publish_manifest.rs`, and the generated command reference check in `crates/core/tests/reference_docs.rs`.
-- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 28 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` only with the assistant gate too, names and default permissions equal the manifest, and none publish with the gate off.
+- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 29 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` only with the assistant gate too, names and default permissions equal the manifest, and none publish with the gate off.
 - **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only. Deployed `/voice` registry read-back and the temp-voice staging scenario stay on [TOG-10119](/TOG/issues/TOG-10119) and are not covered by this row.
 - **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
 - **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::voice && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::templateassistant && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs committed_references_match_compiled_metadata

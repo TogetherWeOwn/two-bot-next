@@ -265,6 +265,8 @@ const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not t
 /** Every other `TWO_*` name in crates/, with why it stays out of the Container. */
 export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_GATEWAY_READINESS_FAIL_INJECTION: "staging rollback-drill switch; reaches the Container only through an explicit containerEnvVars line while TWO_DEPLOY_ENV is exactly \"staging\" (index.ts), never this flag allowlist, and never a committed wrangler.toml var (check-env-bindings.py)",
+  TWO_VOICE_STALL_FAULT_INJECTION: "staging remediation-drill switch; Worker-only trigger input for the fault injector (staging-fault.ts), never forwarded to the Container, and never a committed wrangler.toml var (check-env-bindings.py)",
+  TWO_GATEWAY_UNPAIRED_FAULT_INJECTION: "staging remediation-drill switch; Worker-only trigger input for the fault injector (staging-fault.ts), never forwarded to the Container, and never a committed wrangler.toml var (check-env-bindings.py)",
   TWO_EVENTSUB: "EventSub gate; the Worker reads it for the public ingress and forwards exactly \"1\" alongside the secret on explicit containerEnvVars lines for the private receiver only while both are set, never this flag allowlist",
   TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID: "go-live delivery destination channel; reaches the Container only through an explicit containerEnvVars line while the EventSub receiver is forwarded and the delivery gate is exactly \"1\", never this flag allowlist",
   TWO_EVENTSUB_DELIVERY: "go-live delivery gate; reaches the Container only as exactly \"1\" on an explicit containerEnvVars line while the EventSub receiver is forwarded, never this flag allowlist",
