@@ -200,10 +200,15 @@ permission, channel, tuning or runtime changes.
   observes after each start logs `raid_watch_enabled` with the target in force
   at that moment (`crates/bot/src/raid_runtime.rs:190-198`, reached only via
   `handle` at `:322-339`; `start`/`start_from_env` log nothing) — a quiet
-  guild logs nothing until a join arrives, and later hot channel changes are
-  not logged (only tuning changes emit `setting_changed`). Read the
-  settings-store row for the live value instead of treating that line as a
-  boot line.
+  guild logs nothing from the raid worker until a join arrives, and
+  `raid_watch_enabled` is not logged again when the channel changes. A hot
+  change to the channel (set, change or delete) is logged separately by the
+  settings poll job within one 15 s poll: `settings_applied` (key names only)
+  plus `setting_changed` with `key=DISCORD_STAFF_ALERT_CHANNEL_ID`,
+  `guild_id`, `from` and `to` (`crates/bot/src/settings_jobs.rs:192-207`).
+  Search for that line to see when an override or delete took effect; fall
+  back to the settings-store row for the live value only if the log line is
+  unavailable.
 - Delivery requirements. Every post needs all three: a usable channel value
   (unusable falls back to log-only, `RaidSettings::from_vars`), a guild text
   channel the bot can View and Send in (`MemberAccess::load` plus
