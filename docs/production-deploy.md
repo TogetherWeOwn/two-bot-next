@@ -82,8 +82,9 @@ and refuses a new build when either the cutover or store migration chain is
 ahead of its production ledger (`pending_before` or `pending_store_before`).
 Apply the named pending versions through the manual `production-migrate`
 apply dispatch (reviewed plan required), then re-dispatch. A rollback and a
-live-SHA takeover redeploy serve no new schema and waive the ledger check
-(recorded in the run, never a silent skip), so recovery never waits on it.
+live-SHA takeover redeploy serve no new schema and skip this gate job
+(guard-validated modes only; the production job accepts exactly those),
+so recovery never waits on it.
 
 Before step 2, a role gate also runs the read-only `two-bot db roles verify`
 on the same `production-migrate-plan` binding and refuses a new build whose
@@ -93,7 +94,7 @@ plan, the runtime role lacked grants on the new tables (SQLSTATE 42501), and
 the gateway crash-looped while the schema gate stayed green. After every
 `production-migrate` apply, the operator reapplies the full role plan
 (`two-bot db roles plan`) and `verify` must read 0; the gate enforces it.
-Rollback and live-SHA redeploy waive the findings check the same way (they
+Rollback and live-SHA redeploy skip this gate job the same way (they
 serve no new-table grants), so recovery never waits on it either. Applying
 the role plan stays an operator/host action; the gate is read-only.
 
@@ -172,7 +173,7 @@ render` reads the checked-in `wrangler/wrangler.toml`, makes its paths absolute
 because the rendered file lives outside `wrangler/`, and sets `image_vars` on the
 single production container. Nothing else changes, and
 `scripts/test-deploy-production.py` pins that diff. The lockfile's Wrangler
-(4.149.0) runs the deploy: `wrangler-action` uses the installed version when
+(4.151.0) runs the deploy: `wrangler-action` uses the installed version when
 `wranglerVersion` is omitted, and the job runs `npm ci` first.
 
 The gate polls `/readyz` every 10 seconds for up to 30 attempts. In deploy
@@ -185,8 +186,8 @@ only, because the serving version was built by an older run.
 | `/readyz` answer | Result |
 |---|---|
 | 200 with gateway `ready`, revision is the SHA, `build_id` is this run's (deploy) or any stamped id (rollback), held for 18 consecutive polls (~3 min) | Pass: gateway ready and stable |
-| 503 with the SHA and a passing build id (same rule) | Keep polling, then fail and auto-roll back: a parked gateway never certifies a build |
-| 200 with gateway `starting` or `down` | Keep polling, then fail and auto-roll back |
+| 503 with the SHA and a passing build id (same rule) | Keep polling, then fail (auto-rollback only after a takeover; see below): a parked gateway never certifies a build |
+| 200 with gateway `starting` or `down` | Keep polling, then fail (auto-rollback only after a takeover; see below) |
 | 503 `{"error":"ownership_fenced"}` with no build fields | Keep polling; fail at the end. The fence releases at cutover step 3.5, so the identity match is established only after the takeover |
 | Revision is the SHA but `build_id` is another run's (deploy mode) | Keep polling; fail at the end: the previous container still serves this SHA |
 | `build_revision` is another SHA | Keep polling; fail at the end |
@@ -195,6 +196,18 @@ only, because the serving version was built by an older run.
 | `build_revision` or `build_id` is missing or not a string, or the body is not a JSON object | Keep polling; fail at the end |
 | JSON repeats an object key, nests past the depth bound, or `build_revision`/`build_id` has an unexpected shape | Keep polling; fail at the end with a fixed single-line reason that echoes no remote value |
 | Any other status, including `000` (no answer) | Keep polling; fail at the end |
+
+A single 503 (gateway `starting`) poll never passes the gate — the 10-15
+deploy passed on one such poll ~10 s after rollout while already
+crash-looping (see the detection gap in
+[production-incident-2026-10-15-postmortem.md](production-incident-2026-10-15-postmortem.md)).
+Green requires the follow-up ready observation in the first table row: the
+200-ready answer held for 18 consecutive polls (~3 min). A nonpassing answer
+resets the stability streak, but the gate keeps polling and can still pass on
+a later 18-consecutive-poll 200-ready window within the 60-poll stability
+budget (~10 min); if no such window completes, the gate fails. After a takeover, a failed gate rolls back
+automatically when the deploy and pre-deploy snapshot succeeded; without a
+takeover or snapshot the run just fails (see below).
 
 A failed gate after a takeover rolls back automatically
 (`scripts/worker_container_rollback.py`): the job restores the pre-deploy

@@ -1,0 +1,1 @@
+[{"command":"faq","response":"Read {server} rules"},{"command":"FAQ","response":"second faq"},{"command":"welcome","description":"says hi","response":"hi {user}"},""]
