@@ -105,6 +105,11 @@ export const FORWARDED_FLAGS = [
   // `dry-run`/`execute`/`off`, missing defaults to dry run. Non-secret
   // runtime flag read from the process environment.
   "TWO_RETENTION_MODE",
+  // Game-activity aggregate expiry horizon in days
+  // (game_activity_store.rs AGGREGATE_RETENTION_DAYS_SETTING): read on the
+  // retention cadence, defaulting to 90 when unset. Non-secret runtime flag
+  // read from the process environment.
+  "TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS",
   // Deployment-environment marker (server.rs drill fence): committed only
   // in [env.staging.vars] as exactly "staging" (check-env-bindings.py
   // denies it top-level and in production), so the container can refuse
