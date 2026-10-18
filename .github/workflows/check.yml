@@ -237,6 +237,7 @@ jobs:
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_redirect_refusal.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert_history_redirect_refusal.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_voice_synthetic_redirect_refusal.py' -v
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_token_redirect_gate.py' -v
 
       - name: soak evidence parser (offline, fixtures only)
         run: |
@@ -279,7 +280,7 @@ jobs:
       - name: Install Rust toolchain
         id: toolchain
         if: needs.job-inputs.outputs.rust != 'false'
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -552,7 +553,7 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -700,7 +701,7 @@ jobs:
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
         # The publication regression has its own guarded DB and actual binary
         # in the dedicated step below; never feed it the round-trip fixture URL.
-        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump --skip per_route_bucket_headers_gate_same_bucket_without_hardcoded_limits --skip independent_workers_share_global_pacing --skip reset_after_header_drives_sleep_then_retry_with_no_request_during_pause --skip shared_scope_429_does_not_spend_invalid_budget_while_others_do --skip header_absent_responses_keep_conservative_spacing --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
+        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
 
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).
@@ -909,7 +910,7 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -1248,7 +1249,7 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -1495,7 +1496,7 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         if: needs.job-inputs.outputs.rust != 'false'
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
@@ -1595,7 +1596,7 @@ jobs:
           fetch-depth: 1
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
         # Continue so the retry below can reinstall the same pin; it fails closed.
@@ -1855,7 +1856,7 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
@@ -1929,7 +1930,7 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
@@ -1999,7 +2000,7 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
         # Continue so the retry below can reinstall the same pin; it fails closed.
@@ -2060,7 +2061,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "nightly-2026-10-01" # Pinned nightly for libFuzzer; stable pin stays in rust-toolchain.toml.
           components: rust-src
@@ -2079,7 +2080,7 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Builds all sixteen libFuzzer targets. No campaign or generated corpus
+      # Builds all twenty libFuzzer targets. No campaign or generated corpus
       # output; the existing weekly run replays only the bounded eventsub_delivery
       # seeds below. Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
@@ -2094,7 +2095,7 @@ jobs:
       # and exits without fuzzing. A signing-key drift between the harness
       # and production, or seed misrouting, panics an assertion here instead
       # of passing a compile-only gate. Compile stays the only gate for the
-      # other fifteen targets.
+      # other nineteen targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048

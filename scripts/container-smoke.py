@@ -37,7 +37,11 @@ IMAGE_MAX_BYTES = 112 * MIB
 # measured the identical 16,777,376 bytes (run 39061090833). The stream
 # retention-expiry slice (ac8fd66, fence-preserving expiry of delivered
 # go-live dedup rows) tipped the full 16 MiB budget with no new
-# dependencies and no release-profile change. The game-activity
+# dependencies and no release-profile change.
+# Revisited: main at d7774644 measured 16,768,848 bytes (15.99 MiB), and
+# the backfill rate-limit client head measured 16,780,912 bytes
+# (16.00 MiB) on hosted CI — the guard's bucket/pacing code, no new
+# dependencies, release profile already minimal. The game-activity
 # aggregate-expiry slice measured 16,782,608 bytes (16.01 MiB) on hosted CI,
 # 5,392 bytes over the 16 MiB budget with no new dependencies: the store
 # expiry plus its per-guild stale listing and the retention-cadence driver.
