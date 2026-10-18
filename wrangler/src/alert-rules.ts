@@ -118,6 +118,15 @@ export const RECEIVER_REFUSAL_SAMPLES = 3;
 export const EVENTSUB_TAMPERED_SAMPLES = 3;
 /** Consecutive unpaired gateway samples before the page; bound justified in the runbook. */
 export const GATEWAY_UNPAIRED_SAMPLES = 3;
+/**
+ * Consecutive valid samples with the scraped /readyz gateway component
+ * non-ready before the page; bound justified in the runbook. Same 3-sample
+ * bound as the sibling unpaired rule: samples arrive about every 60 s, so a
+ * gateway that stays starting/down/parked with no disconnect edge pages about
+ * two to three minutes after the outage starts, while a clean boot (which
+ * reports Connected within about a minute) never reaches the third sample.
+ */
+export const GATEWAY_NOT_READY_SAMPLES = 3;
 /** Voice failures must exceed this share of room operations between two samples... */
 export const VOICE_FAILURE_RATIO = 0.05;
 /** ...and the window must hold at least this many operations. */
@@ -167,6 +176,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_failures", summary: `voice room lifecycle failures exceed ${VOICE_FAILURE_RATIO * 100}% of operations (min ${VOICE_FAILURE_MIN_OPS} ops), or new dead-letters/orphans`, runbook: "runbook.md#alert-voice-failures" },
   { id: "gateway_missed_events", summary: `gateway missed events increased between samples`, runbook: "runbook.md#alert-gateway-missed-events" },
   { id: "gateway_unpaired_disconnect", summary: `gateway disconnect with no RESUMED or fresh READY for ${GATEWAY_UNPAIRED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-gateway-unpaired-disconnect" },
+  { id: "gateway_not_ready", summary: `/readyz gateway component non-ready for ${GATEWAY_NOT_READY_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-gateway-not-ready" },
   { id: "ticker_stale", summary: `15 s ticker has no success for more than ${TICKER_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-ticker-stale" },
   { id: "receiver_refusals", summary: `website-action receiver refusals for ${RECEIVER_REFUSAL_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-receiver-refusals" },
   { id: "dispatch_drops", summary: `dispatch-lane drops grew for ${DISPATCH_DROP_SAMPLES} consecutive sample windows (reactions include fairness refusals; not proof of gateway packet loss)`, runbook: "runbook.md#alert-dispatch-drops", severity: "ticket" },
@@ -265,6 +275,10 @@ export interface MetricsAlertState {
   gatewayUnpaired: number;
   /** Consecutive completed samples with an unpaired disconnect outstanding. */
   gatewayUnpairedStreak: number;
+  /** False until the first valid gateway-readiness sample: the first sample never fires. */
+  gatewayNotReadySeen: boolean;
+  /** Consecutive valid samples with the /readyz gateway component non-ready. */
+  gatewayNotReadyStreak: number;
   /** Per-lane baseline; absent after a missing/invalid sample or in legacy storage. */
   dispatchDrops?: Record<string, number>;
   /** Consecutive positive deltas, capped at DISPATCH_DROP_SAMPLES. */
@@ -286,7 +300,7 @@ export interface JoinBurnSnapshot {
   fastMoves: number;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0 };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0 };
 
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
@@ -332,7 +346,7 @@ function gatewayCounter(matches: Sample[], event?: string): number | undefined {
 }
 
 /** Pairs disconnects with RESUMED plus fresh READY; invalid samples hold, restarts re-baseline. */
-function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { firing: boolean; fields: GatewayPairingFields } {
+function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { firing: boolean; fields: GatewayPairingFields; restarted: boolean } {
   const carried: GatewayPairingFields = {
     gatewayDisconnects: prev.gatewayDisconnects ?? 0,
     gatewayRecoveries: prev.gatewayRecoveries ?? 0,
@@ -346,7 +360,7 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
   const resumes = gatewayCounter(gauge("two_bot_gateway_resumes_total"));
   const ready = gatewayCounter(gauge("two_bot_gateway_events_total"), "READY");
   if (disconnects === undefined || resumes === undefined || ready === undefined) {
-    return { firing: wasFiring, fields: carried };
+    return { firing: wasFiring, fields: carried, restarted: false };
   }
   const recoveries = resumes + ready;
   const baseline: GatewayPairingFields = {
@@ -356,9 +370,9 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
     gatewayUnpaired: 0,
     gatewayUnpairedStreak: 0,
   };
-  if (!carried.gatewayUnpairedSeen) return { firing: false, fields: baseline };
+  if (!carried.gatewayUnpairedSeen) return { firing: false, fields: baseline, restarted: false };
   if (disconnects < carried.gatewayDisconnects || recoveries < carried.gatewayRecoveries) {
-    return { firing: wasFiring, fields: baseline };
+    return { firing: wasFiring, fields: baseline, restarted: true };
   }
   // Any recovery growth means the gateway came back: a RESUMED or fresh READY
   // landed since the previous sample. It always clears the outstanding loss,
@@ -379,6 +393,7 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
         gatewayUnpaired: 0,
         gatewayUnpairedStreak: 0,
       },
+      restarted: false,
     };
   }
   // No recovery since the previous sample: new disconnect growth opens an
@@ -396,6 +411,7 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
       gatewayUnpaired: outstanding ? 1 : 0,
       gatewayUnpairedStreak: streak,
     },
+    restarted: false,
   };
 }
 
@@ -493,7 +509,7 @@ export interface Evaluation {
   state: MetricsAlertState;
 }
 
-export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowSeconds: number): Evaluation {
+export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowSeconds: number, gatewayReady?: boolean): Evaluation {
   const firing: string[] = [];
   const gauge = (name: string) => samples.filter((s) => s.name === name);
 
@@ -694,6 +710,56 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const unpaired = pairGatewayDisconnects(samples, prev);
   if (unpaired.firing) firing.push(GATEWAY_UNPAIRED_RULE);
 
+  // Gateway stuck not-ready with no disconnect edge: the scraped /readyz
+  // gateway component stayed non-ready (`starting` while Armed, `down` while
+  // Unconfigured or Draining in crates/bot/src/gateway.rs) for
+  // GATEWAY_NOT_READY_SAMPLES consecutive valid samples. The component
+  // breakdown lives only in the /readyz JSON body
+  // (crates/core/src/health.rs), never in the /metrics exposition, so the
+  // keepalive passes the parsed component in as `gatewayReady` instead of a
+  // Sample series: true is Connected, false is starting/down, undefined is an
+  // invalid sample (probe failed or body unparsable) that changes nothing and
+  // holds the current state. `gateway_failure.failed_step` cannot serve here:
+  // it is absent until a failure is recorded, so a shard stuck starting with
+  // no recorded failure has no step to read. The first valid sample only
+  // stores the baseline and never fires; a process restart (gateway pairing
+  // counters went backwards, detected above) re-baselines the streak even
+  // when this sample's readiness is invalid, and holds a firing non-ready or
+  // invalid alert rather than clearing it; any ready sample clears at once,
+  // even across a restart. A failed /metrics scrape never reaches this
+  // evaluation: the caller
+  // preserves the whole state, so the rule also needs consecutive ticks where
+  // both the probe parsed and the scrape succeeded.
+  const GATEWAY_NOT_READY_RULE = "gateway_not_ready";
+  const notReadyWasFiring = prev.firing.includes(GATEWAY_NOT_READY_RULE);
+  const notReadySeen = prev.gatewayNotReadySeen ?? false;
+  const notReadyStreakPrev = prev.gatewayNotReadyStreak ?? 0;
+  let gatewayNotReadySeen = notReadySeen;
+  let gatewayNotReadyStreak = notReadyStreakPrev;
+  let gatewayNotReadyFiring = notReadyWasFiring;
+  if (gatewayReady !== undefined && !notReadySeen) {
+    gatewayNotReadySeen = true;
+    gatewayNotReadyStreak = gatewayReady ? 0 : 1;
+    gatewayNotReadyFiring = notReadyWasFiring;
+  } else if (gatewayReady === true) {
+    // A valid ready sample clears at once, even across a restart: a restart
+    // that lands on ready means the new process came up connected.
+    gatewayNotReadyStreak = 0;
+    gatewayNotReadyFiring = false;
+  } else if (unpaired.restarted && notReadySeen) {
+    // A process restart re-baselines the streak even when this sample's
+    // readiness is invalid: the pre-restart streak is stale, so the next valid
+    // non-ready sample recounts from 1 instead of firing off it. Firing still
+    // holds for non-ready or invalid samples (a restart never resolves those),
+    // matching the sibling unpaired rule.
+    gatewayNotReadyStreak = gatewayReady === false ? 1 : 0;
+    gatewayNotReadyFiring = notReadyWasFiring;
+  } else if (gatewayReady === false) {
+    gatewayNotReadyStreak = notReadyStreakPrev + 1;
+    gatewayNotReadyFiring = gatewayNotReadyStreak >= GATEWAY_NOT_READY_SAMPLES || notReadyWasFiring;
+  }
+  if (gatewayNotReadyFiring) firing.push(GATEWAY_NOT_READY_RULE);
+
   // Gateway checkpoint commit failures (every failure stops the dispatch
   // worker, so there is no benign singleton): any increase between two
   // samples pages. The first sample only stores the baseline and never
@@ -837,7 +903,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak } };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
