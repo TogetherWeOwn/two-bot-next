@@ -2839,9 +2839,11 @@ mod tests {
         // (TWO_TWITCH_BROADCASTERS, TWO_TWITCH_CALLBACK_URL). The delivery
         // provisioning slice adds three env-only keys (TWO_EVENTSUB_DELIVERY,
         // TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID, TWO_EVENTSUB_INVITE_URL).
+        // TOG-29862 moves TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS from cold to hot,
+        // shifting one entry between those classes.
         for (class, expected) in [
-            (SettingClass::Hot, 42),
-            (SettingClass::Cold, 27),
+            (SettingClass::Hot, 43),
+            (SettingClass::Cold, 26),
             (SettingClass::EnvOnly, 64),
         ] {
             assert_eq!(

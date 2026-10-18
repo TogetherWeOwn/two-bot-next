@@ -352,6 +352,9 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_INTERNAL_FUTURE_GATE: TEST,
   TWO_INTERNAL_NEW_GATE: TEST,
   TWO_INTERNALISED_GREETING: TEST,
+  // Deliberate unknown-key fixtures in settings_map_hostile.rs, not runtime inputs.
+  TWO_ASSISTANT_ENDPOINTS: TEST,
+  TWO_OWEN_USER_IDS: TEST,
   TWO_NEW_GATE: TEST,
   TWO_NEVER_EXISTED: TEST,
   TWO_SOMETHING_NEW: TEST,
