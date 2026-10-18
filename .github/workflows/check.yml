@@ -2090,15 +2090,19 @@ jobs:
       - name: Compile-only fuzz build (no execution)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz build
-      # Bounded seed replay, eventsub_delivery only: `-runs=0` executes each
-      # committed corpus seed exactly once (plus the target's fixed matrix)
-      # and exits without fuzzing. A signing-key drift between the harness
-      # and production, or seed misrouting, panics an assertion here instead
-      # of passing a compile-only gate. Compile stays the only gate for the
-      # other fifteen targets.
+      # Bounded seed replay, eventsub_delivery and helix_token: `-runs=0`
+      # executes each committed corpus seed exactly once (plus the target's
+      # fixed matrix) and exits without fuzzing. A signing-key drift between
+      # the harness and production, a token-contract drift between the
+      # helix_token oracle and the parser, or seed misrouting panics an
+      # assertion here instead of passing a compile-only gate. Compile stays
+      # the only gate for the other fifteen targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
+      - name: Seed replay for helix_token (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run helix_token -- -runs=0 -timeout=10 -rss_limit_mb=2048
 
   worker:
     name: worker check
