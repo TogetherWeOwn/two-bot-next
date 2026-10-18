@@ -57,6 +57,7 @@ pub struct TableSpec {
 /// documented feed tables).
 pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "announcements_audit_log", measure: TableMeasure::Columns(&["created_at"]) },
+    TableSpec { table: "assistant_monthly_builds", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "audit_kill_switch", measure: TableMeasure::Columns(&["engaged_at"]) },
     TableSpec { table: "automation_audit_log", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "automation_commands", measure: TableMeasure::Columns(&["updated_at"]) },

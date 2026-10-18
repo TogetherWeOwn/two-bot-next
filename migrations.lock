@@ -417,6 +417,10 @@
       "sha256": "8b7d50d4c332178adb67ee88a0de6c9c071fd3aaceacb48c94e806209f229844",
       "justification": "Stale-claim recovery fence for the Twitch go-live ledger: send_started_at marker committed before the first Discord POST plus a claim_token ownership fence (generated on claim, rotated on takeover, required to start/stamp/release) so atomic takeover reclaims only never-sent stale claims and ambiguous started/delivered rows stay fenced. Renumbered 0441 to 0443 after main claimed 0441/0442 for game-activity aggregates; never merged under 0441."
     },
+    "crates/cutover/migrations/0445_assistant_monthly_builds.sql": {
+      "sha256": "50d0ed6e9ed37af7f45fdd506f70711b35dbc081f806af60d5568cd46811352e",
+      "justification": "Per-guild template-assistant monthly-cap ledger (no member columns): one row per guild with month_key plus build_count and a nonnegativity check; cutover chain copy, IF NOT EXISTS. Numbered 0445 because the store chain owns 0444; global migration numbers remain unique across both chains."
+    },
     "crates/store/migrations/0442_game_activity_guild_aggregates.sql": {
       "sha256": "1fccfea2ca41d6047c4ac2af17b955c3f76b2fa108bfe648f6e22dc8845a6f60",
       "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; store chain copy, IF NOT EXISTS. Renumbered 0441 to 0442 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
