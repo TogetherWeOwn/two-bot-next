@@ -12,7 +12,8 @@
 //! never from interaction input or dashboard settings (both keys are
 //! [`crate::settings::SettingClass::EnvOnly`] and the published command offers
 //! only the `request` option). SSRF is closed in three places: construction
-//! refuses userinfo, plaintext, unapproved ports, `localhost` and IP literals
+//! refuses userinfo (including an empty username), empty authorities,
+//! plaintext, unapproved ports, `localhost` and IP literals
 //! outside globally-routable unicast space; [`AssistantTransport::post`]
 //! re-resolves the configured host on every request and refuses empty,
 //! failed or non-public answers as a whole before any egress call; any 3xx
@@ -20,7 +21,8 @@
 //! request and no resolution of the redirect target. Any caller-supplied
 //! destination goes through [`AssistantTransport::post_to`], which always
 //! refuses, so overrides have nowhere to be plumbed. Error text is static:
-//! endpoints and bodies never echo into errors, logs or replies.
+//! endpoints and bodies never echo into errors, logs or replies, and redacted
+//! `Debug` keeps them out of formatted diagnostics too.
 //!
 //! The address predicate is shared with the feed-fetch seam
 //! ([`crate::feeds_http::is_public_address`]) so the two outbound paths
@@ -69,24 +71,49 @@ pub enum AssistantTransportError {
 /// Validated, environment-fixed assistant destination. `None` from
 /// [`AssistantTransportConfig::from_assistant_config`] means the path is
 /// disabled before any resolution or request is attempted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is redacted: the endpoint URL can carry credential-bearing path or
+/// query data, so only the host and port render.
+#[derive(Clone, PartialEq, Eq)]
 pub struct AssistantTransportConfig {
     endpoint: String,
     host: String,
     port: u16,
 }
 
+impl std::fmt::Debug for AssistantTransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssistantTransportConfig")
+            .field("endpoint", &"[REDACTED]")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .finish()
+    }
+}
+
 impl AssistantTransportConfig {
     /// Validate an [`AssistantConfig`] as a transport destination. Returns
-    /// `None` — disabled — unless the endpoint is `https://`, carries no
-    /// userinfo, uses no port other than 443, has a non-empty host, and the
-    /// host is neither `localhost` nor an IP literal outside
-    /// globally-routable unicast space.
+    /// `None` — disabled — unless the endpoint is `https://` with a non-empty
+    /// authority, carries no userinfo, uses no port other than 443, has a
+    /// non-empty host, and the host is neither `localhost` nor an IP literal
+    /// outside globally-routable unicast space.
     #[must_use]
     pub fn from_assistant_config(config: &AssistantConfig) -> Option<Self> {
         let endpoint = config.endpoint();
         let url = Url::parse(endpoint).ok()?;
         if url.scheme() != "https" {
+            return None;
+        }
+        // WHATWG parsing recovers a host from an empty authority
+        // (`https:///v1` parses with host `v1`) and tolerates an empty
+        // username before `@`, so check the raw authority first: it must be
+        // non-empty and carry no userinfo. The `8` skips past the `https://`
+        // prefix; a missing prefix fails closed here rather than panicking.
+        let authority = endpoint
+            .get(8..)
+            .and_then(|rest| rest.split(['/', '?', '#']).next())
+            .unwrap_or("");
+        if authority.is_empty() || authority.contains('@') {
             return None;
         }
         if !url.username().is_empty() || url.password().is_some() {
@@ -178,7 +205,10 @@ pub trait AssistantEgress {
 
 /// One assistant HTTPS exchange. The `resolved_addresses` are the validated
 /// addresses the real transport must connect to.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is redacted: the URL and the body never render, only the host,
+/// port, validated addresses and body length.
+#[derive(Clone)]
 pub struct AssistantRequest {
     /// The configured endpoint URL, verbatim.
     pub url: String,
@@ -193,8 +223,23 @@ pub struct AssistantRequest {
     pub body: Vec<u8>,
 }
 
+impl std::fmt::Debug for AssistantRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssistantRequest")
+            .field("url", &"[REDACTED]")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("resolved_addresses", &self.resolved_addresses)
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
 /// A buffered assistant HTTPS answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` renders the status, the recorded redirect target and the body
+/// length; the body itself never renders.
+#[derive(Clone, PartialEq, Eq)]
 pub struct AssistantResponse {
     /// Answer status. Any 3xx becomes
     /// [`AssistantTransportError::RedirectRefused`]; all other statuses pass
@@ -204,6 +249,16 @@ pub struct AssistantResponse {
     pub location: Option<String>,
     /// Full body.
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for AssistantResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssistantResponse")
+            .field("status", &self.status)
+            .field("location", &self.location)
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 /// The gated transport: a validated config plus an injected resolver and
@@ -459,6 +514,7 @@ mod tests {
             "http://assistant.example.com/v1",
             "https://user@assistant.example.com/v1",
             "https://assistant.example.com@evil.example.com/v1",
+            "https://@evil.example.com/v1",
             "https://assistant.example.com:8443/v1",
             "https://localhost/v1",
             "https://localhost:443/v1",
@@ -666,6 +722,44 @@ mod tests {
             assert!(!rendered.contains(endpoint), "leaked into {rendered:?}");
             assert!(
                 !rendered.contains(str::from_utf8(body).expect("fixture body is UTF-8")),
+                "leaked into {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_never_exposes_endpoint_or_bodies() {
+        let endpoint = "https://assistant.example.com/hunter2-path?token=hunter2";
+        let validated = AssistantTransportConfig::from_assistant_config(
+            &assistant_config(endpoint).expect("fixture endpoint must parse"),
+        )
+        .expect("fixture endpoint must enable the transport");
+        let request = AssistantRequest {
+            url: endpoint.to_owned(),
+            host: validated.host().to_owned(),
+            port: validated.port(),
+            resolved_addresses: vec![public_v4()],
+            body: b"hunter2-body".to_vec(),
+        };
+        let response = AssistantResponse {
+            status: 200,
+            location: Some("https://assistant.example.com/next".to_string()),
+            body: b"hunter2-response".to_vec(),
+        };
+        for rendered in [
+            format!("{validated:?}"),
+            format!("{request:?}"),
+            format!("{response:?}"),
+            format!("{validated:#?}"),
+            format!("{request:#?}"),
+            format!("{response:#?}"),
+        ] {
+            assert!(
+                !rendered.contains("hunter2"),
+                "leaked into {rendered:?}"
+            );
+            assert!(
+                !rendered.contains(endpoint),
                 "leaked into {rendered:?}"
             );
         }
