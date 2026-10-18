@@ -1,18 +1,26 @@
 # Container scan and release SBOMs
 
-`check.yml` calls the same read-only `sbom.yml` used by releases. (The
+`check.yml` calls the same read-only `sbom.yml` used by releases, through
+the `supply-chain` job ([`check.yml`](../.github/workflows/check.yml),
+`supply-chain` job, `if: needs.job-inputs.outputs.supply != 'false'`). (The
 reusable SBOM workflow was renamed from `supply-chain.yml` because main's
 TOG-11810 fold uses that filename for the native pr-lint + gitleaks gate,
 which has no `workflow_call` trigger.) It
-builds the Dockerfile on `[self-hosted, two-selfhosted]`, without registry push or deployment,
+builds the Dockerfile on GitHub-hosted `ubuntu-latest` in this public
+repository (runner routing in [`sbom.yml`](../.github/workflows/sbom.yml)
+and the `check` note in `check.yml`: a public repo never takes the
+`[self-hosted, two-selfhosted]` label, which would queue forever), without
+registry push or deployment,
 then inventories the exact image and all packages in the workspace Cargo.lock
 (including workspace, optional and development dependencies). The Rust BOM is
 not a claim that every locked package is linked into the runtime executable.
 The image BOM inventories OS/image packages; Rust binaries are not reliably
 recoverable by image analysis, so the separate lockfile scan is intentional.
 
-Both gates run in the `image` job and use SHA-pinned Trivy Action 0.35.0 with
-Trivy v0.69.3. They fail on HIGH/CRITICAL in OS and library dependencies,
+Both gates run in the `image` job and use SHA-pinned Trivy Action 0.36.0 with
+Trivy v0.69.3 (see the `uses: aquasecurity/trivy-action@... # 0.36.0` pins
+and `version: v0.69.3` in [`sbom.yml`](../.github/workflows/sbom.yml)). They
+fail on HIGH/CRITICAL in OS and library dependencies,
 **including unfixed findings**. A fresh vulnerability DB is downloaded by Trivy
 on every run. No shared cache is written or read: the BuildKit GitHub-Actions
 cache is disabled and every Trivy step sets `cache: false`, so a poisoned
@@ -20,9 +28,33 @@ cross-run DB or layer cache cannot make the gate pass. Scanner errors also
 fail; no `continue-on-error` or blanket `ignore-unfixed` is allowed. The
 `verify` job validates the handed-off BOMs and retains SBOMs and JSON findings
 in the `supply-chain` Actions artifact for 14 days, including on a
-vulnerability failure. The existing required `check` depends on this scan job
-and explicitly rejects failed, skipped or cancelled results, so scan failure
-cannot leave that merge check green.
+vulnerability failure. The required `ci-ok` aggregate (`check.yml`, `ci-ok`
+job) accepts a skipped `supply-chain` job only when the selector deselected
+it (`supply=false`); a selected job that failed, was cancelled, or skipped
+unexpectedly fails `ci-ok`, so scan failure cannot leave that merge check
+green.
+
+## Selection and `ci-ok` (selector is authoritative)
+
+The `supply` output of `scripts/job-inputs.py` (the `job-inputs` job in
+`check.yml`) decides whether the `supply-chain` job runs on a pull request.
+Push to `main`, the weekly schedule, manual dispatch, any undecidable diff
+(missing SHAs, classifier error) and any non-PR event fail closed to full
+jobs, so release-candidate and staging validation always get the scan.
+On PRs the scan is selected by Rust code, dependency manifests
+(`Cargo.toml`, `Cargo.lock`, `deny.toml`), the runtime image inputs
+(`Dockerfile`, `.dockerignore`), any `.github/**` change (workflow edits
+revalidate everything), and the selectors or their regression suites
+themselves; `supply` additionally follows `rust` because Rust changes alter
+the shipped binary the scan inventories. Docs-only and worker-UI-only PRs
+skip it.
+
+Not every Markdown change deselects the scan: docs whose content is read by
+PR-run code (for example `docs/parity.md`, `docs/cutover.md`,
+`docs/commands.md`, `docs/configuration.md`, `docs/voice-rooms.md`,
+`docs/metrics.md`, `docs/startup-diagnostics.md` and the other pinned inputs
+listed in `scripts/job-inputs.py`) select `rust` (and therefore `supply`) or
+`worker` as their readers require. Any deletion forces full jobs.
 
 No job both checks out the untrusted `inputs.ref` and executes a local script
 afterwards (CodeQL cache-poisoning gate). The `image` job runs the offline
