@@ -1593,6 +1593,13 @@ export class TwoBotContainer extends Container<Env> {
         // are untouched.
         if (this.env.TWO_DEPLOY_ENV === "staging") {
           try {
+            // Flush the just-written guard before the read-back: DO storage
+            // serves recent writes from its in-memory cache/write buffer and
+            // put() resolves before the flush, so without sync() the get()
+            // below always repeats the in-memory value and can never prove
+            // durability. A failed flush throws here and lands in the
+            // readback_failed branch below.
+            await this.ctx.storage.sync();
             const persisted = await this.ctx.storage.get<RemediationState>(REMEDIATION_KEY);
             const receipt = buildRemediationGuardReceipt({
               persisted,

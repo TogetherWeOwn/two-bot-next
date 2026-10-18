@@ -289,8 +289,9 @@ export function evaluateRemediation(
 /**
  * Staging-only persisted guard receipt (TOG-30294 evidence, not authority).
  *
- * The keepalive tick writes the evaluator state to DO storage, reads it back,
- * and logs exactly one receipt per tick in staging. The receipt carries only
+ * The keepalive tick writes the evaluator state to DO storage, flushes it via
+ * storage.sync(), reads it back, and logs exactly one receipt per tick in
+ * staging. The receipt carries only
  * the allowlisted fields below — guard counters/timestamps/phases, evaluation
  * time, firing trigger keys, decision category, and build/version correlation
  * — so it can prove cooldown, R1→R2, STOP/quiet, sustained-clear/reset and the

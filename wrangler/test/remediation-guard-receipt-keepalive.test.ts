@@ -45,7 +45,7 @@ async function receiptHarness(
   t: TestContext,
   env: Record<string, unknown>,
   metrics: () => string,
-  storage?: { getThrows?: boolean; getMismatch?: boolean; putThrows?: boolean },
+  storage?: { getThrows?: boolean; getMismatch?: boolean; putThrows?: boolean; syncThrows?: boolean },
 ) {
   const database = new DatabaseSync(":memory:");
   t.after(() => database.close());
@@ -58,6 +58,12 @@ async function receiptHarness(
   const values = new Map<string, unknown>([[OWNER_KEY, ACTIVE_OWNER]]);
   const gates: Promise<unknown>[] = [];
   let remediationPuts = 0;
+  // The container base also calls storage.sync() for its own schedule
+  // bookkeeping, so a receipt-flush failure must not break setup or the
+  // tick's reschedule: fail only the first sync after setup (the receipt
+  // flush, which runs before the tick's reschedule).
+  let setupComplete = false;
+  let receiptSyncFailed = false;
   const ctx = {
     exports: { ContainerProxy: () => ({ fetch: () => { throw new Error("unexpected outbound"); } }) },
     id: { toString: () => "synthetic-do-id" },
@@ -105,7 +111,12 @@ async function receiptHarness(
       },
       setAlarm: async () => {},
       deleteAlarm: async () => {},
-      sync: async () => {},
+      sync: async () => {
+        if (storage?.syncThrows && setupComplete && !receiptSyncFailed) {
+          receiptSyncFailed = true;
+          throw new Error("synthetic storage sync failure");
+        }
+      },
     },
     blockConcurrencyWhile<T>(callback: () => Promise<T>) {
       const promise = callback();
@@ -128,6 +139,7 @@ async function receiptHarness(
   });
   t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 204 }));
   await bot.onStart();
+  setupComplete = true;
   const tick = async () => {
     const [pending] = await bot.listSchedules<{ startedAt: number }>("keepalive");
     assert.ok(pending);
@@ -190,6 +202,15 @@ test("storage read failure emits no success receipt", async (t) => {
   const h = await receiptHarness(t, { TWO_DEPLOY_ENV: "staging" }, () => metricsBody(), { getThrows: true });
   await h.tick();
   assert.ok(h.receipts().every((receipt) => receipt.ok !== true), "no false success on read-back failure");
+});
+
+test("storage sync failure emits a readback_failed receipt, never a success", async (t) => {
+  const h = await receiptHarness(t, { TWO_DEPLOY_ENV: "staging" }, () => metricsBody(), { syncThrows: true });
+  await h.tick();
+  const receipts = h.receipts();
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].ok, false);
+  assert.equal(receipts[0].reason, "readback_failed");
 });
 
 test("mismatched read-back is a failure receipt, never a success", async (t) => {

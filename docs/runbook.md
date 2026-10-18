@@ -921,11 +921,13 @@ Worker recommends only, so nothing executes from this path.
 #### Staging guard receipts (persisted remediation evidence)
 
 Each keepalive tick writes the evaluator guard to DO storage at
-`two-bot:remediation`, reads it back, and — in staging only
-(`TWO_DEPLOY_ENV` exactly `"staging"`) — logs one structured receipt proving
-what was persisted. Production emits none. No endpoint, permission, dump, or
-storage mutation beyond the existing evaluator write; thresholds and the
-state machine are untouched.
+`two-bot:remediation`, flushes it with `storage.sync()`, reads it back, and —
+in staging only (`TWO_DEPLOY_ENV` exactly `"staging"`) — logs one structured
+receipt proving what was persisted. The flush matters: without it the
+read-back is served from the DO in-memory cache/write buffer and always
+repeats the just-written value. Production emits none. No endpoint,
+permission, dump, or storage mutation beyond the existing evaluator write;
+thresholds and the state machine are untouched.
 
 Log query (staging Worker logs): filter for the receipt event, then narrow by
 decision or firing key. In Cloudflare dashboard open Workers & Pages →
@@ -967,9 +969,10 @@ Capture schema (allowlist only; no tokens, webhooks, or arbitrary storage):
 
 A storage failure never yields `ok: true`: a failed write keeps the existing
 `two-bot remediation guard failed` line with no success receipt, and a failed
-or mismatched read-back yields `ok: false` with `reason` of
-`readback_failed`, `mismatch`, or `invalid_persisted` (same correlation
-fields, no guard). At most one receipt per 60 s keepalive tick.
+flush (`storage.sync()`), failed read-back, or mismatched read-back yields
+`ok: false` with `reason` of `readback_failed`, `mismatch`, or
+`invalid_persisted` (same correlation fields, no guard). At most one receipt
+per 60 s keepalive tick.
 
 Truthful limits: staging runs with `OPS_ALERT_FORWARDING=off`, so the STOP
 (`ceo-page`) decision is log-only — there is no external CEO-page delivery to
@@ -978,7 +981,11 @@ minutes (R1 at first firing, R2 one 1800 s window later, STOP another window
 later, then a full 1800 s quiet window to reset; typically about 90 minutes),
 so a short soak can only prove the prefix it covers. The receipt proves the
 guard persisted, not that any remediation executed — the Worker recommends
-only.
+only. This receipt is application-level evidence through the Worker's own
+authorized guard-storage path: a provider storage query can return transport
+HTTP 200 / `success=true` while its nested result is still a denial (for
+example `access to _cf_KV.key is prohibited: SQLITE_AUTH` with no rows), so
+provider HTTP success alone is not guard evidence.
 
 ### Event-store capture gaps and lag
 
