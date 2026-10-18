@@ -1155,3 +1155,55 @@ export function transitionMessages(
   }
   return out;
 }
+
+/**
+ * Sustained loss of the metrics scrape (the observer going blind).
+ *
+ * This is a synthetic Worker-side incident, not a metric rule: it never enters
+ * `evaluateMetrics` or `RULES` (those stay pinned to the Rust exposition
+ * contract), and its streak lives under its own storage key so failed scrapes
+ * can neither resolve metric incidents nor disturb their baselines. Three
+ * consecutive failed scheduled scrapes ticket once; the first complete valid
+ * scrape afterwards resolves once. Timeout, non-OK, oversized and invalid
+ * exposition all count as failure; bodies never reach logs or notifications.
+ */
+export const SCRAPE_LOSS_THRESHOLD = 3;
+/** Synthetic firing key for sustained scrape loss; never a `RULES` id. */
+export const SCRAPE_LOSS_RULE_ID = "metrics_scrape_lost";
+/** Runbook anchor for the scrape-loss ticket (`docs/runbook.md` heading slug). */
+export const SCRAPE_LOSS_RUNBOOK = "runbook.md#alert-metrics-scrape-lost";
+/** Summary line for the scrape-loss ticket. */
+export const SCRAPE_LOSS_SUMMARY =
+  `metrics scrape lost for ${SCRAPE_LOSS_THRESHOLD} consecutive scheduled scrapes`;
+
+/** Observer-loss state, stored independently of metric-rule state. */
+export interface ScrapeLossState {
+  /** Consecutive failed scheduled scrapes, capped at `SCRAPE_LOSS_THRESHOLD`. */
+  streak: number;
+  /** Whether the sustained-loss incident is currently firing. */
+  firing: boolean;
+}
+
+export const EMPTY_SCRAPE_LOSS: ScrapeLossState = { streak: 0, firing: false };
+
+/** Coerce stored observer-loss state; legacy or corrupt storage stays quiet. */
+export function sanitizeScrapeLossState(stored: unknown): ScrapeLossState {
+  if (typeof stored !== "object" || stored === null) return { ...EMPTY_SCRAPE_LOSS };
+  const record = stored as Record<string, unknown>;
+  const streak = typeof record["streak"] === "number"
+    && Number.isSafeInteger(record["streak"])
+    && (record["streak"] as number) >= 0
+    ? Math.min(record["streak"] as number, SCRAPE_LOSS_THRESHOLD)
+    : 0;
+  return { streak, firing: record["firing"] === true };
+}
+
+/** Firing line for the scrape-loss ticket; no mentions, no secrets, no bodies. */
+export function scrapeLossFiringMessage(context?: AlertContext): string {
+  return `two-bot-next ALERT ${SCRAPE_LOSS_RULE_ID} (ticket): ${SCRAPE_LOSS_SUMMARY}. Runbook: ${RUNBOOK_BASE_URL}${SCRAPE_LOSS_RUNBOOK}.${alertContextSuffix(context)}`;
+}
+
+/** Recovery line for the scrape-loss ticket; no mentions, no secrets, no bodies. */
+export function scrapeLossResolvedMessage(context?: AlertContext): string {
+  return `two-bot-next RESOLVED ${SCRAPE_LOSS_RULE_ID}.${alertContextSuffix(context)}`;
+}

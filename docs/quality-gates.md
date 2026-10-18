@@ -53,10 +53,16 @@ existing disposable Postgres service, rather than the lint-only `check` lane.
   only, no registry) fails the PR on newly added `todo!`/`unimplemented!`,
   empty `.expect("")`, `panic!` in non-test code or `process::exit` in
   library code. Pre-existing hits are grandfathered below, not deleted.
-  Known gap: an empty `.expect("")` inside a macro body (for example
-  `vec![x.expect("")]`) is not matched by the `$X.expect("")` pattern, for
-  the same macro-token-tree reason as the unwrap gate; there are no such
-  hits in the tree today, so the gap is documented rather than gated.
+  Empty `.expect("")` is covered twice: `rust-empty-expect` for direct calls
+  plus `rust-empty-expect-in-macros` (text regex, for `.expect("")` inside
+  macro token trees such as `vec![x.expect("")]`, which the base pattern
+  cannot see); the gate reports the macro hit on the call end line and drops
+  it when the base rule already covers the line, so there are no double
+  reports. Because the macro rule scans source text, it ignores comment-only
+  `//` and `///` lines via an anchored `pattern-not-regex`; a trailing `//`
+  on a code line can still match, as can `/* */` block comments and raw
+  strings, which is the accepted tradeoff of covering macro token trees.
+  There are no such hits in the tree today.
 - Squawk migration lint (HARD; `dropping-object` WARN):
   `scripts/ci/check-squawk-migrations.py` flags risky statements in changed
   migration files only. `adding-required-field`, `creating-index`,

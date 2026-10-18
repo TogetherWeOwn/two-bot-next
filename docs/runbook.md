@@ -791,6 +791,14 @@ as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
 
+#### Alert: metrics scrape lost
+
+The Container DO failed the container-internal `/metrics` scrape on 3 consecutive scheduled keepalive ticks. This is a **ticket, not a page**: the observer itself is blind, so every metric-rule alert is missing evidence while this fires. One failed scrape stays quiet and three consecutive failures ticket exactly once; further failures do not re-ticket while the incident fires.
+
+First response: read the scrape through the existing authorized `/ops/metrics` path, check container `/readyz` and Worker/container logs for `two-bot metrics scrape failed`. Timeouts (6 s deadline), non-OK status, oversized bodies (64 KiB cap) and invalid exposition all count as failure; the deadline and cap are unchanged by this alert. Notifications and logs carry only this runbook link and build context, never response bodies.
+
+A lost scrape never resolves any metric-rule incident: missing evidence is not recovery evidence, so previously firing alerts stay firing through the loss, and the existing dispatch-drop interruption still applies. The first complete valid scrape after the incident resolves only the scrape-loss ticket; metric rules re-evaluate on that same scrape and resolve only on their own evidence. A valid scrape before the third failure silently resets the streak with no resolve.
+
 #### Alert: eventsub reconcile failed
 
 `two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rose between two
@@ -1867,7 +1875,8 @@ publicly. Preserve sanitized evidence, not URLs or unredacted SQL errors.
    available; pause manual/operator writes and investigate the specific writer.
 4. Check the **deployed** redirect wiring before treating Hyperdrive as an
    active dependency. If `REDIRECT_DB` is present, separate a failed live lookup
-   (which may serve snapshot fallback) from a failed click insert. If absent,
+   (which serves the configured fallback invite, or 503 when none is valid:
+   never the mappings snapshot) from a failed click insert. If absent,
    record snapshot-only/no-live-attribution as the configured boundary rather
    than an outage. In neither branch is redirect `/healthz` gateway-DB proof.
    Do not manufacture a campaign click to exercise a production DB.
