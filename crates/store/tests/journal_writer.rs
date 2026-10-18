@@ -90,7 +90,7 @@ impl Fixture {
         self.admin.close().await;
     }
 
-    async fn count(&self, sql: &str) -> i64 {
+    async fn count(&self, sql: &'static str) -> i64 {
         sqlx::query_scalar(sql).fetch_one(&self.pool).await.unwrap()
     }
 
