@@ -527,10 +527,13 @@ and the last 15 minutes. This is the ticket-severity companion to the
 fast-burn page above: a moderate but sustained degradation — a slow leak of
 `5xx` or `transport` errors — that never spikes hard enough to page. Each
 window needs at least 10 eligible requests and two budget errors; quiet
-traffic and one bad event stay silent. After startup or restart, the ticket
-waits for a full 2 h of history; a counter reset rebuilds the ring instead
-of firing. A scrape gap or missing series holds a firing ticket, and only a
-covered quiet 15 min window resolves it. Window edges land on whole
+traffic and one bad event stay silent. After startup the ticket waits for a
+full 2 h of history; a counter reset (process restart) rebuilds the ring
+instead of firing and holds a firing ticket instead of resolving it, so a
+deploy never posts a spurious RESOLVED. A scrape gap or missing series
+holds a firing ticket, and a covered quiet or below-threshold 15 min window
+resolves it even while the 2 h window is still unknown. Window edges land
+on whole
 keepalive scrapes, so the comparison carries the same ~1% allowance as the
 fast rule.
 

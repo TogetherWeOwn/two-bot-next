@@ -370,9 +370,11 @@ interface ErrorBudgetBurnResult {
  * window and the 15 min short window burn faster than
  * `ERROR_BUDGET_SLOW_BURN`, less the same allowance. `held` is true when the
  * REST series are absent or malformed and the ring is carried unchanged (both
- * rules hold); `slowHeld` tracks unknown slow-window coverage separately. A
- * backwards counter (process restart) rebuilds the ring from this sample
- * and fires nothing. Otherwise the sample is appended, entries older than
+ * rules hold); `slowHeld` tracks unknown slow-window coverage separately,
+ * holding only while neither slow window is covered below its threshold. A
+ * backwards counter (process restart) rebuilds the ring from this sample,
+ * fires nothing, and holds a firing slow ticket across the restart.
+ * Otherwise the sample is appended, entries older than
  * the 2 h slow window plus margin are pruned but the newest pre-cutoff
  * snapshot is always kept as the window anchor, and each window burns as
  * errors / (requests x budget) against its threshold. A window fires only
@@ -381,8 +383,10 @@ interface ErrorBudgetBurnResult {
  * and at least two budget errors, so fresh rings, quiet traffic and one bad
  * minute stay silent. A window without coverage is unknown rather than
  * quiet: the caller holds an existing firing state instead of resolving a
- * page or ticket on missing history, and only full coverage below threshold
- * resolves.
+ * page or ticket on missing history. A fast page resolves only on full
+ * coverage below threshold; a slow ticket already resolves when either
+ * slow window is covered quiet or below threshold, even while the other
+ * window is still unknown.
  */
 function errorBudgetBurnEvaluation(
   samples: Sample[],
@@ -410,7 +414,12 @@ function errorBudgetBurnEvaluation(
   const snapshot: ErrorBudgetBurnSnapshot = { t: nowSeconds, total, errors };
   const last = ring[ring.length - 1];
   if (last !== undefined && (total < last.total || errors < last.errors)) {
-    return { fast: false, slow: false, held: false, slowHeld: false, ring: [snapshot] };
+    // A backwards counter (process restart) rebuilds the ring from this
+    // sample and fires nothing, but a firing slow ticket survives the
+    // restart: the fresh ring covers neither slow window, so resolving here
+    // would post a meaningless RESOLVED and blind the rule for a full 2 h.
+    // A covered quiet or below-threshold 15 min window still resolves it.
+    return { fast: false, slow: false, held: false, slowHeld: true, ring: [snapshot] };
   }
   const cutoff = nowSeconds - ERROR_BUDGET_SLOW_LONG_SECONDS - ERROR_BUDGET_FAST_HISTORY_MARGIN_SECONDS;
   const keep = ring.filter((s) => s.t > cutoff && s.t <= nowSeconds);
@@ -486,7 +495,19 @@ function errorBudgetBurnEvaluation(
       slowLong.rate >= slowThreshold &&
       slowShort.rate >= slowThreshold,
     held: "unknown" in fastLong || "unknown" in fastShort,
-    slowHeld: "unknown" in slowLong || "unknown" in slowShort,
+    // An unknown slow window holds a firing ticket only while the other
+    // window can still meet its threshold. A covered quiet or
+    // below-threshold window resolves the ticket even while the other
+    // window is still unknown (for example a quiet 15 min window after a
+    // restart or a scrape gap that aged the 2 h baseline out of tolerance).
+    slowHeld:
+      ("unknown" in slowLong || "unknown" in slowShort) &&
+      !(
+        "quiet" in slowLong ||
+        "quiet" in slowShort ||
+        ("rate" in slowLong && slowLong.rate < slowThreshold) ||
+        ("rate" in slowShort && slowShort.rate < slowThreshold)
+      ),
     ring: next,
   };
 }
@@ -787,7 +808,10 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // pages when both the 15 min and 2 min windows burn faster than 12x; the
   // slow rule tickets when both the 2 h and 15 min windows burn faster than
   // 3x. One bad window alone never fires. A window without coverage holds an
-  // existing firing state; only full coverage below threshold resolves.
+  // existing firing state; a fast page resolves only on full coverage below
+  // threshold, while a slow ticket also resolves when either slow window is
+  // covered quiet or below threshold. A counter reset holds a firing slow
+  // ticket instead of resolving it.
   const errorBudgetBurn = errorBudgetBurnEvaluation(samples, prev.errorBudgetBurn ?? [], nowSeconds);
   if (errorBudgetBurn.fast) firing.push("error_budget_fast_burn");
   else if (prev.firing.includes("error_budget_fast_burn") && errorBudgetBurn.held) firing.push("error_budget_fast_burn");

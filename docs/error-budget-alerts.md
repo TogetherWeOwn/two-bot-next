@@ -147,9 +147,9 @@ identity-paired evidence leaves the combined budget unknown.
 
 ## Related immediate alerts (not burn)
 
-Unlike the slow-burn ticket above (still manual) and the installed fast-burn
-page, these five **installed Worker rules** evaluate keepalive samples
-independently of the burn math.
+Unlike the slow-burn ticket and fast-burn page above (both installed
+automatic rules), these five **installed Worker rules** evaluate keepalive
+samples independently of the burn math.
 They fire on their own conditions; notification additionally requires the
 configured [alert-forwarding path](metrics.md#off-container-scrape-and-alert-rules).
 An installed rule is not proof that a page was delivered:
