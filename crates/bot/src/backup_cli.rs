@@ -82,6 +82,18 @@ async fn open_pool_with_tls(
         .map_err(|_| "cannot connect; database details redacted")
 }
 
+/// Typed restore pool-open: `None` is a fixed, non-echoing `&'static str`
+/// failure in the same type as [`open_pool`], never a panic. `Some` delegates
+/// to [`open_pool`] unchanged (same constants, TLS policy, connection
+/// behavior). Defense in depth behind the exit-2 `TWO_RESTORE_URL` guard in
+/// `cmd_restore`.
+pub(crate) async fn open_restore_pool(url: Option<&str>) -> Result<sqlx::PgPool, &'static str> {
+    let Some(url) = url else {
+        return Err("missing restore database URL");
+    };
+    open_pool(url).await
+}
+
 /// Only an absent credential permits the deliberate environment fallback.
 /// Inject the directory and lazy fallback so tests never mutate process env.
 fn load_staging_token(
@@ -517,9 +529,9 @@ async fn cmd_restore(args: &[String]) -> i32 {
         return cmd_restore_dry_run(&file, url.as_deref()).await;
     }
 
-    // Every failure is a bounded constant from `open_pool`: the URL and its
-    // query secrets never reach logs or CLI output.
-    let pool = match open_pool(url.as_ref().expect("checked")).await {
+    // Every failure is a bounded constant from `open_restore_pool`: the URL and
+    // its query secrets never reach logs or CLI output.
+    let pool = match open_restore_pool(url.as_deref()).await {
         Ok(pool) => pool,
         Err(detail) => {
             eprintln!("restore: {detail}");
