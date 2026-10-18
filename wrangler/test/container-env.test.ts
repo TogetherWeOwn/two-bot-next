@@ -104,6 +104,18 @@ test("unlisted names, secrets and non-string values are dropped", () => {
   assert.deepEqual(forwardedFlagVars(env), { TWO_ANNOUNCEMENTS: "1" });
 });
 
+test("hostile settings-map typo keys stay test-only and never reach the Container", () => {
+  const env = {
+    TWO_ASSISTANT_ENDPOINTS: "https://fixture.invalid/not-a-runtime-endpoint",
+    TWO_OWEN_USER_IDS: "123456789012345678",
+  };
+  for (const name of Object.keys(env)) {
+    assert.match(NOT_FORWARDED[name] ?? "", /test-only/, name);
+  }
+  assert.deepEqual(forwardedFlagVars(env), {});
+  assert.deepEqual(containerEnv(env), { LISTEN_ADDR: "0.0.0.0:8080" });
+});
+
 test("the existing 4 Container vars are unchanged and cannot be overridden", () => {
   const base = {
     DISCORD_TOKEN: "synthetic-discord-token",
@@ -148,6 +160,22 @@ test("gateway readiness failure injection forwards only under the staging marker
   const armed = containerEnv({ [key]: "1", TWO_DEPLOY_ENV: "staging" });
   assert.equal(armed[key], "1");
   assert.equal(armed["TWO_DEPLOY_ENV"], "staging");
+});
+
+test("remediation-drill switches never reach the Container: Worker-only trigger input", () => {
+  for (const key of ["TWO_VOICE_STALL_FAULT_INJECTION", "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"]) {
+    // Never on the generic flag allowlist, even armed.
+    assert.equal(forwardedFlagVars({ [key]: "1", TWO_DEPLOY_ENV: "staging" })[key], undefined, key);
+    // No Worker shape forwards them: the fault injector reads them in the
+    // keepalive tick, so the Container must never see them.
+    for (const env of [
+      { [key]: "1" },
+      { [key]: "1", TWO_DEPLOY_ENV: "staging" },
+      { [key]: "1", TWO_DEPLOY_ENV: "production" },
+    ]) {
+      assert.equal(containerEnv(env)[key], undefined, `${key} ${JSON.stringify(env)}`);
+    }
+  }
 });
 
 test("eventsub reconcile inputs and Helix credentials reach the Container on explicit lines while forwarded", () => {

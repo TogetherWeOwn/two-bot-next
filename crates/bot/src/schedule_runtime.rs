@@ -22,11 +22,10 @@ use two_bot_core::{
     automation_quota::QuotaWriteError,
     commands::MAX_RESOURCE_ID_CHARS,
     funnel::now_millis_for_test,
-    message_safety,
     scheduled::{
         format_iso_ms, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
-        schedule_cancelled_text, schedule_confirm_text, schedule_list_line, schedule_list_text,
-        validate_schedule, ScheduleInput,
+        schedule_cancelled_text, schedule_confirm_text, schedule_list_line, schedule_list_page,
+        schedule_list_page_underflow_text, validate_schedule, ScheduleInput,
     },
     scheduled_store::{
         audit_scheduled, delete_scheduled, get_scheduled, list_scheduled, put_scheduled,
@@ -172,6 +171,21 @@ pub(crate) async fn schedule_create(
             .await;
         }
         Err(QuotaWriteError::Capacity(quota)) => {
+            // Quota refusal audits exactly like a validation rejection: one
+            // `scheduled.create`/`rejected` row with reason `quota`, naming
+            // the fresh attempt id. Every refusal audits its own row
+            // (1 refusal = 1 audit); nothing here dedupes or suppresses.
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.create",
+                &id,
+                "rejected",
+                Some("quota"),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, quota.to_string()).await;
         }
         Err(err) => {
@@ -261,16 +275,24 @@ pub(crate) async fn schedule_remove(
     }
 }
 
-/// `/schedule-list`: guild-scoped list → ephemeral text. Legacy lists every
-/// row for the guild and writes no audit row.
+/// `/schedule-list`: guild-scoped list → ephemeral text. Rows are ordered
+/// by (`next_run_at`, `id`) and rendered as bounded whole-row pages so every
+/// configured id stays discoverable; writes no audit row and never writes
+/// schedule rows.
 pub(crate) async fn schedule_list(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
     guild_id: &str,
     interaction: &Interaction,
 ) {
+    let page = schedule_list_page_option(interaction).unwrap_or(1);
+    if page < 1 {
+        finish(executor, interaction, schedule_list_page_underflow_text()).await;
+        return;
+    }
     match list_scheduled(pool, guild_id).await {
-        Ok(rows) => {
+        Ok(mut rows) => {
+            rows.sort_by(|a, b| (&a.next_run_at, &a.id).cmp(&(&b.next_run_at, &b.id)));
             let lines: Vec<String> = rows
                 .iter()
                 .map(|row| {
@@ -283,12 +305,7 @@ pub(crate) async fn schedule_list(
                     )
                 })
                 .collect();
-            finish(
-                executor,
-                interaction,
-                message_safety::truncate(&schedule_list_text(&lines), 2000),
-            )
-            .await;
+            finish(executor, interaction, schedule_list_page(&lines, page)).await;
         }
         Err(err) => {
             tracing::warn!(reason = db_class(&err), "schedule list failed");
@@ -396,6 +413,21 @@ pub(crate) fn schedule_remove_option(interaction: &Interaction) -> Option<String
         .iter()
         .find_map(|option| match (option.name.as_str(), &option.value) {
             ("id", CommandOptionValue::String(value)) => Some(value.clone()),
+            _ => None,
+        })
+}
+
+/// `/schedule-list`'s optional 1-based `page` option; absent means page 1.
+/// A mismatched wire type decodes to absent (page 1) rather than refusing,
+/// so existing invocations keep working.
+pub(crate) fn schedule_list_page_option(interaction: &Interaction) -> Option<i64> {
+    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
+        return None;
+    };
+    data.options
+        .iter()
+        .find_map(|option| match (option.name.as_str(), &option.value) {
+            ("page", CommandOptionValue::Integer(value)) => Some(*value),
             _ => None,
         })
 }

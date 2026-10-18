@@ -775,6 +775,7 @@ jobs:
           cov_run "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --test feeds_store --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test legacy_verify_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test legacy_tls_fence --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test staging_migrate_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           # Suites pinned to the agent_test database under the empty-password
           # URL form, plus the member-moderation suite behind MEMBER_TESTDB.
@@ -1062,6 +1063,16 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime -- --ignored --test-threads=1
 
+      - name: seasonal leaderboard command boundary (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test leveling_seasonal_leaderboard_acceptance -- --ignored --test-threads=1
+
+      - name: seasonal leaderboard quarter boundary (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test leveling_seasonal_leaderboard_boundary_acceptance -- --ignored --test-threads=1
+
       - name: community voice fact round trip (CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
@@ -1083,7 +1094,7 @@ jobs:
       - name: Store Postgres integration (isolated CI schemas)
         env:
           TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
-        run: cargo test -p two-bot-store --locked --test postgres --test journal --test membership_pg --test backfill_cursors --test backfill_history --test backfill_audit_log --test backfill_event_users_reactions_pins --test backfill_bans_invites_onboarding --test explain_seqscan -- --ignored --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window --skip audit_log_requests_ride_rate_limit_client_never_direct_rest --skip audit_cursor_persists_per_window_and_resumes_mid_window --skip audit_rows_hold_ids_timestamps_enums_only --skip audit_429_retry_after_pauses_without_losing_place --skip event_users_paginate_through_rate_limit_client_with_max_100 --skip reaction_users_paginate_through_rate_limit_client --skip pins_list_through_rate_limit_client_persists_metadata_only --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting --skip persisted_rows_hold_ids_timestamps_enums_only --skip resume_continues_from_persisted_cursors_per_family --skip bans_fetch_applies_blocklist_and_counts_everyone --skip invite_rows_hold_metadata_only --skip onboarding_rows_hold_ids_enums_metadata_only --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
+        run: cargo test -p two-bot-store --locked --test postgres --test journal --test journal_writer --test membership_pg --test backfill_cursors --test backfill_history --test backfill_audit_log --test backfill_event_users_reactions_pins --test backfill_bans_invites_onboarding --test explain_seqscan -- --ignored --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window --skip audit_log_requests_ride_rate_limit_client_never_direct_rest --skip audit_cursor_persists_per_window_and_resumes_mid_window --skip audit_rows_hold_ids_timestamps_enums_only --skip audit_429_retry_after_pauses_without_losing_place --skip event_users_paginate_through_rate_limit_client_with_max_100 --skip reaction_users_paginate_through_rate_limit_client --skip pins_list_through_rate_limit_client_persists_metadata_only --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting --skip persisted_rows_hold_ids_timestamps_enums_only --skip resume_continues_from_persisted_cursors_per_family --skip bans_fetch_applies_blocklist_and_counts_everyone --skip invite_rows_hold_metadata_only --skip onboarding_rows_hold_ids_enums_metadata_only --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
 
       - name: sticky live store regressions (CI service container only)
         run: cargo test -p two-bot-core --features db --locked --test sticky_store_live -- --ignored
@@ -1409,6 +1420,11 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-cutover --test legacy_verify_db --locked -- --ignored
+
+      - name: Legacy TLS fence acceptance (binaries honor the TLS policy)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: cargo test -p two-bot-cutover --test legacy_tls_fence --locked -- --ignored
 
       - name: Staging migration runner acceptance (real SQLx, disposable CI database)
         env:
@@ -1850,7 +1866,7 @@ jobs:
           --health-cmd "pg_isready -U agent_test -d postgres"
           --health-interval 10s --health-timeout 5s --health-retries 5
     env:
-      TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/postgres
+      TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1889,6 +1905,19 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
+      # The presence fixtures now route through the shared disposable-database
+      # guard, which accepts only the explicit-empty-password bootstrap URL
+      # naming a two_bot_test_* database. Create that bootstrap here; the
+      # legacy bespoke helpers in the sibling stores accept the same URL
+      # (they check host and principal only), so one URL serves all four
+      # suites below. The rust:bookworm job container ships no PostgreSQL
+      # client, so install it first like the other DB jobs do.
+      - name: Prepare isolated test database
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
+          rm -rf /var/lib/apt/lists/*
+          createdb -h agent-testdb -U agent_test two_bot_test_ci
       - name: Check feature-gated community stores
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - name: Test presence, scorecard and inactivity ledgers on ephemeral Postgres
@@ -2081,9 +2110,10 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Builds all nineteen libFuzzer targets. No campaign or generated corpus
-      # output; the existing weekly run replays only the bounded eventsub_delivery
-      # seeds below. Bounded vote_kick and helix_token smokes are manual (README).
+      # Builds all twenty-one libFuzzer targets. No campaign or generated corpus
+      # output; the existing weekly run replays the bounded eventsub_delivery
+      # and helix_token seeds below. Bounded vote_kick and helix_token smokes
+      # are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -2091,15 +2121,19 @@ jobs:
       - name: Compile-only fuzz build (no execution)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz build
-      # Bounded seed replay, eventsub_delivery only: `-runs=0` executes each
-      # committed corpus seed exactly once (plus the target's fixed matrix)
-      # and exits without fuzzing. A signing-key drift between the harness
-      # and production, or seed misrouting, panics an assertion here instead
-      # of passing a compile-only gate. Compile stays the only gate for the
-      # other eighteen targets.
+      # Bounded seed replay, eventsub_delivery and helix_token: `-runs=0`
+      # executes each committed corpus seed exactly once (plus the target's
+      # fixed matrix) and exits without fuzzing. A signing-key drift between
+      # the harness and production, a token-contract drift between the
+      # helix_token oracle and the parser, or seed misrouting panics an
+      # assertion here instead of passing a compile-only gate. Compile stays
+      # the only gate for the other nineteen targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
+      - name: Seed replay for helix_token (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run helix_token -- -runs=0 -timeout=10 -rss_limit_mb=2048
 
   worker:
     name: worker check

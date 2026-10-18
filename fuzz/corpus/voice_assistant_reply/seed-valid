@@ -1,0 +1,1 @@
+{"choices": [{"finish_reason": "stop", "index": 0, "message": {"content": "{\"suggestions\":[{\"explanation\":\"Shows the game.\",\"template\":\"@@game_name@@ ## <<solo/squad>>\"}]}", "role": "assistant"}}], "id": "reply-1", "object": "chat.completion"}

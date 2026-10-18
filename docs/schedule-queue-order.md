@@ -20,7 +20,7 @@ predicates in memory:
 
 | Store call | SQL predicate | Test model |
 | --- | --- | --- |
-| `list_scheduled` | `ORDER BY next_run_at` | sort rows by the ISO string |
+| `list_scheduled` | `ORDER BY next_run_at, id` | sort rows by the ISO string, ties by id |
 | `claim_due` | `enabled AND next_run_at <= now ORDER BY next_run_at, id LIMIT 1`, then park at `lease_until_ms(now)` | `Queue::claim` |
 | `complete_run` | recurring rows advance from the run instant; one-shot rows disable | `Queue::complete` |
 | `retry_scheduled` | re-queue at `now + clamp_retry_delay_ms(hint)` | `Queue::fail` on a retryable status |
@@ -38,12 +38,14 @@ no row is claimed, posted or audited; the `/readyz` status map lists
 
 ## Acceptance
 
-1. **List order.** `/schedule-list` rows come back in ascending `next_run_at`
-   order. Lexicographic order of the fixed-width strings equals instant
-   order across millisecond carries and day, month, year and leap-day
-   rollovers. `schedule_list_line`/`schedule_list_text` keep that order. The
-   claim order breaks ties by `id`, and one tick takes at most the 10
-   earliest due rows.
+1. **List order.** `/schedule-list` rows come back in ascending
+   (`next_run_at`, `id`) order. Lexicographic order of the fixed-width strings
+   equals instant order across millisecond carries and day, month, year and
+   leap-day rollovers, with tied instants ordered by id.
+   `schedule_list_line`/`schedule_list_text` keep that order, and the paged
+   list (`schedule_list_pages`/`schedule_list_page` with the optional `page`
+   option) preserves it across bounded whole-row pages. The claim order breaks
+   ties by `id`, and one tick takes at most the 10 earliest due rows.
 2. **No catch-up burst.** In the test, an hourly row is five intervals overdue
    when the bot resumes. It posts once. `advance_next_run_ms` sets the next run
    one interval after the run time, not after the missed schedule slot, so no

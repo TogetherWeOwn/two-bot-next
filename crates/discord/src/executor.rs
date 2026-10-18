@@ -58,8 +58,8 @@ use twilight_model::id::marker::{
 use twilight_model::id::Id;
 use two_bot_core::{
     backoff_ms, classify_kick_status, pace_wait_ms, parse_retry_after_secs, plan_purge,
-    retry_after_ms, utf16_len, ActionOutcome, KickOutcome, KickResult, KickStatus,
-    ModerationExecution, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
+    retry_after_ms, retry_after_ms_unclamped, utf16_len, ActionOutcome, KickOutcome, KickResult,
+    KickStatus, ModerationExecution, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
 };
 
 /// Minimum gap between paced requests, ms (legacy `rest.ts` default).
@@ -315,6 +315,7 @@ impl RawResponse {
 
     /// Legacy 429 wait: body wins, then header, default 1 s; +250 ms pad;
     /// clamped so a bad header cannot park a run (legacy `retryAfterMs`).
+    /// Kick/publish lanes and registry reads keep this clamp.
     #[must_use]
     pub fn retry_after_wait_ms(&self) -> u64 {
         let header = self
@@ -322,6 +323,23 @@ impl RawResponse {
             .as_deref()
             .and_then(|s| parse_retry_after_secs(Some(s)));
         retry_after_ms(header, self.body_retry_after_secs())
+    }
+
+    /// Backfill-read 429 wait: same header/body/padding policy without the
+    /// 60 s clamp, so a long per-route `Retry-After` is waited out in one
+    /// sleep instead of retry-storming past it — but still bounded by the
+    /// 5 min backfill ceiling, so a malformed or hostile value cannot park a
+    /// caller. Only the paced backfill reads (`get_json_observed`,
+    /// `get_json_checked` via `read_json`) use this; every other lane
+    /// (including the general `get_json` read) keeps
+    /// [`Self::retry_after_wait_ms`].
+    #[must_use]
+    pub fn retry_after_wait_ms_unclamped(&self) -> u64 {
+        let header = self
+            .retry_after_header
+            .as_deref()
+            .and_then(|s| parse_retry_after_secs(Some(s)));
+        retry_after_ms_unclamped(header, self.body_retry_after_secs())
     }
 }
 
@@ -1831,9 +1849,12 @@ impl ActionExecutor {
     }
 
     /// Paced GET: 110 ms lane, 403/404 → `None`, 429 sleeps-then-retries under
-    /// the same admission (`retry-after`/`reset-after` + 250 ms; a global 429
-    /// additionally rides out the shared pause) within the same 5-try budget
-    /// as 5xx/transport, other statuses → `None` (legacy `DiscordRest::get`).
+    /// the same admission (`retry-after`/`reset-after` + 250 ms, clamped at
+    /// 60 s like kick/publish; a global 429 additionally rides out the shared
+    /// pause) within the same 5-try budget as 5xx/transport, other statuses →
+    /// `None` (legacy `DiscordRest::get`). This is the general interactive
+    /// read (containment snapshot, website jobs, onboarding probe): it keeps
+    /// the clamp so a long per-route wait cannot park a serialized worker.
     /// Supported paths cover the
     /// parity §6 reads —
     /// guild, guild members (+`after`/`limit`), guild scheduled-events
@@ -1841,22 +1862,40 @@ impl ActionExecutor {
     /// (+`after`/`around`/`before`/`limit`). Anything else is a caller bug and
     /// is refused without I/O, never silently rewritten (finding 2).
     pub async fn get_json(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
-        Ok(self.get_json_observed(path).await?.map(|(data, _)| data))
+        Ok(self
+            .get_json_observed_inner(path, false)
+            .await?
+            .map(|(data, _)| data))
     }
 
     /// Permission evidence must distinguish denied/absent (403/404) from an
     /// unavailable or unreadable response. Keep the shared paced read policy,
     /// but never let a transient failure look like a proven delivery skip.
+    /// Shares the backfill evidence-read wait policy with
+    /// [`Self::get_json_observed`] (unclamped, 5 min ceiling).
     pub async fn get_json_checked(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
-        self.read_json(path, true).await
+        self.read_json(path, true, true).await
     }
 
     /// Membership evidence is bounded by the successful attempt's request
     /// start, after pacing, never by headers/body completion or an earlier
     /// failed attempt. Ordinary `get_json` keeps its data-only contract.
+    /// This is the backfill evidence read (driven by the store backfill): a
+    /// long per-route 429 is waited out unclamped (5 min ceiling per wait)
+    /// instead of retry-storming past it.
     pub async fn get_json_observed(
         &self,
         path: &str,
+    ) -> Result<Option<(serde_json::Value, String)>, String> {
+        self.get_json_observed_inner(path, true).await
+    }
+
+    /// Shared observed-read loop: `backfill_wait` selects the unclamped
+    /// backfill 429 wait; the general read keeps the 60 s clamp.
+    async fn get_json_observed_inner(
+        &self,
+        path: &str,
+        backfill_wait: bool,
     ) -> Result<Option<(serde_json::Value, String)>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
@@ -1911,11 +1950,20 @@ impl ActionExecutor {
                     // parking the read until a separate guard refuses it. The
                     // retry re-admits as essential (see `admitted_retry`):
                     // no request leaves during the wait or a shared pause.
+                    // Backfill evidence reads wait out a long per-route
+                    // Retry-After unclamped (5 min ceiling per wait): waking
+                    // early only earns another 429 and burns another try.
+                    // The general read and kick/publish keep the 60 s clamp.
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return Ok(None);
                     }
                     if !global {
-                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                        let wait_ms = if backfill_wait {
+                            res.retry_after_wait_ms_unclamped()
+                        } else {
+                            res.retry_after_wait_ms()
+                        };
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     }
                     // A global 429 already installed the shared pause at
                     // headers receipt, anchored to that instant: sleeping
@@ -1975,10 +2023,14 @@ impl ActionExecutor {
         }
     }
 
+    /// `backfill_wait` selects the unclamped backfill 429 wait (5 min ceiling
+    /// per wait); callers outside the backfill evidence reads keep the clamp
+    /// by passing `false`.
     async fn read_json(
         &self,
         path: &str,
         checked: bool,
+        backfill_wait: bool,
     ) -> Result<Option<serde_json::Value>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
@@ -2026,7 +2078,9 @@ impl ActionExecutor {
                     // the fixed transient-exhaustion error for checked reads
                     // (absence for unchecked ones), never an open-ended park.
                     // The retry re-admits as essential after sleeping out
-                    // a route-local wait; a shared pause rides admission.
+                    // a route-local wait — unclamped (5 min ceiling) for the
+                    // backfill evidence reads, clamped otherwise, like the
+                    // observed read; a shared pause rides admission.
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return if checked {
                             Err("Discord evidence unavailable".to_owned())
@@ -2035,7 +2089,12 @@ impl ActionExecutor {
                         };
                     }
                     if !global {
-                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                        let wait_ms = if backfill_wait {
+                            res.retry_after_wait_ms_unclamped()
+                        } else {
+                            res.retry_after_wait_ms()
+                        };
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     }
                     // Global: no local sleep — the shared pause is anchored
                     // at headers receipt and the essential re-admission
@@ -4050,6 +4109,7 @@ mod tests {
     use two_bot_core::send_admission::{
         AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, TokenKey,
     };
+    use two_bot_core::MAX_BACKFILL_RETRY_AFTER_MS;
 
     #[derive(Debug)]
     struct NeverSendAdmission(TokenKey);
@@ -4351,6 +4411,40 @@ mod tests {
             completion: None,
         };
         assert_eq!(clamped.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
+    }
+
+    #[test]
+    fn backfill_read_waits_out_long_header_unclamped() {
+        let long = RawResponse {
+            status: 429,
+            retry_after_header: Some("75".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        // Backfill reads honor the 75 s header in one wait; the kick/publish
+        // clamp stays pinned at 60 s for the same response.
+        assert_eq!(long.retry_after_wait_ms_unclamped(), 75_250);
+        assert_eq!(long.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
+        let short = RawResponse {
+            status: 429,
+            retry_after_header: Some("2".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        assert_eq!(short.retry_after_wait_ms_unclamped(), 2250);
+        // A huge header stops at the 5 min backfill ceiling instead of
+        // parking the caller, while the clamped wait is untouched.
+        let huge = RawResponse {
+            status: 429,
+            retry_after_header: Some("86400".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        assert_eq!(
+            huge.retry_after_wait_ms_unclamped(),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+        assert_eq!(huge.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
     }
 
     #[test]

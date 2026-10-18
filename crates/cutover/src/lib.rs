@@ -18,6 +18,7 @@ pub mod backfill_plan;
 pub mod cli;
 pub mod db;
 pub mod dedupe;
+pub mod deletion_intake;
 pub mod gateway_session;
 pub mod ghost_cleanup;
 pub mod internal_settings;
