@@ -181,3 +181,112 @@ async fn run_import(args: Args) -> i32 {
     db.close().await;
     outcome
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(argv: &[&str]) -> Args {
+        Args::parse(
+            &argv
+                .iter()
+                .map(|item| (*item).to_owned())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn scratch_path(tag: &str) -> std::path::PathBuf {
+        let base = std::env::var_os("PAPERCLIP_RUN_SCRATCH_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("PAPERCLIP_SCRATCH_DIR").map(std::path::PathBuf::from))
+            .unwrap_or_else(std::env::temp_dir);
+        let _ = std::fs::create_dir_all(&base);
+        base.join(format!(
+            "rollback-delta-bin-{}-{tag}.ndjson",
+            std::process::id()
+        ))
+    }
+
+    fn fixture(name: &str) -> String {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[tokio::test]
+    async fn unknown_arguments_refuse() {
+        assert_eq!(run_import(args(&["import", "extra"])).await, 2);
+        assert_eq!(run_import(args(&["import", "--bogus"])).await, 2);
+        assert_eq!(
+            run_import(args(&["import", "--file", "x", "--bogus", "y"])).await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn live_target_opt_in_with_a_value_refuses() {
+        assert_eq!(
+            run_import(args(&["import", "--allow-live-target=x", "--file", "x"])).await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_file_flag_refuses() {
+        assert_eq!(run_import(args(&["import"])).await, 2);
+        assert_eq!(run_import(args(&["import", "--file", "   "])).await, 2);
+    }
+
+    #[tokio::test]
+    async fn unreadable_file_refuses() {
+        let missing = scratch_path("absent").to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(
+            run_import(args(&["import", "--file", missing.as_str()])).await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_and_unknown_table_files_refuse() {
+        let malformed = scratch_path("malformed");
+        std::fs::write(&malformed, "{broken\n").unwrap();
+        let path = malformed.to_string_lossy().into_owned();
+        assert_eq!(
+            run_import(args(&["import", "--file", path.as_str()])).await,
+            2
+        );
+
+        let unknown = scratch_path("unknown-table");
+        std::fs::write(&unknown, "{\"table\":\"no_such_table\",\"row\":{}}\n").unwrap();
+        let path = unknown.to_string_lossy().into_owned();
+        assert_eq!(
+            run_import(args(&["import", "--file", path.as_str()])).await,
+            2
+        );
+
+        let _ = std::fs::remove_file(&malformed);
+        let _ = std::fs::remove_file(&unknown);
+    }
+
+    #[tokio::test]
+    async fn apply_without_live_target_opt_in_refuses() {
+        let file = fixture("rollback_import_valid.ndjson");
+        assert_eq!(
+            run_import(args(&["import", "--file", file.as_str(), "--apply"])).await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_validates_offline_and_succeeds() {
+        let file = fixture("rollback_import_valid.ndjson");
+        assert_eq!(
+            run_import(args(&["import", "--file", file.as_str()])).await,
+            0
+        );
+    }
+}
