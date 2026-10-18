@@ -760,11 +760,16 @@ jobs:
           # share tables and locks, so parallel runs race and
           # --ignore-run-fail would then drop their coverage silently.
           # The reference-docs regen never runs in CI: it rewrites committed docs.
+          # channel_moderation_store is skipped here: its exact-URL guard
+          # rejects the bootstrap URL by design, so running it here only
+          # prints FAILED lines that look like regressions. It is re-run
+          # below with its accepted URL, which also collects its coverage.
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail --no-report
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail \
-            --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs
+            --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs \
+            --skip channel_moderation_store
           # Guarded suites accept only the exact agent_test URL (no password
           # segment). Under the bootstrap URL above their guards panic, so
           # re-run them here with their accepted URL; profiles merge below.
