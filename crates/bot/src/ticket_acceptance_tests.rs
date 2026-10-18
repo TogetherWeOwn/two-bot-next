@@ -1094,29 +1094,38 @@ async fn ticket_copy_success_confirmation_claim_and_close_are_pinned() {
     )
     .await;
     let runtime = runtime(db.pool.clone(), &mock);
-    let open_reply = runtime
+    let open_reply = match runtime
         .execute(
             &button(TicketAction::Open, "100", "500", vec![], 0),
             TicketAction::Open,
         )
         .await
-        .expect("open succeeds");
+    {
+        Ok(reply) => reply,
+        Err(error) => panic!("open succeeds: {}", error.reply()),
+    };
     assert_eq!(open_reply, "Your ticket is ready: <#600>.");
-    let claim_reply = runtime
+    let claim_reply = match runtime
         .execute(
             &button(TicketAction::Claim, "100", "501", vec!["300"], 0),
             TicketAction::Claim,
         )
         .await
-        .expect("claim succeeds");
+    {
+        Ok(reply) => reply,
+        Err(error) => panic!("claim succeeds: {}", error.reply()),
+    };
     assert_eq!(claim_reply, "Ticket claimed.");
-    let close_reply = runtime
+    let close_reply = match runtime
         .execute(
             &button(TicketAction::Close, "100", "501", vec!["300"], 0),
             TicketAction::Close,
         )
         .await
-        .expect("close succeeds");
+    {
+        Ok(reply) => reply,
+        Err(error) => panic!("close succeeds: {}", error.reply()),
+    };
     assert_eq!(
         close_reply,
         "Ticket closed; transcript saved for up to 90 days."
@@ -1154,13 +1163,16 @@ async fn ticket_copy_duplicate_and_cooldown_refusals_are_pinned() {
     let runtime = runtime(db.pool.clone(), &mock);
     // Existing open ticket with a channel: the duplicate names it.
     active(&runtime, "dup-open").await;
-    let duplicate = runtime
+    let duplicate = match runtime
         .execute(
             &button(TicketAction::Open, "100", "500", vec![], 0),
             TicketAction::Open,
         )
         .await
-        .expect("duplicate refusal is Ok");
+    {
+        Ok(reply) => reply,
+        Err(error) => panic!("duplicate refusal is Ok: {}", error.reply()),
+    };
     assert_eq!(duplicate, "You already have a ticket: <#600>.");
     // Creating reservation without a channel yet: recovery is still working.
     runtime
@@ -1168,13 +1180,16 @@ async fn ticket_copy_duplicate_and_cooldown_refusals_are_pinned() {
         .reserve("creating-1", "501", now_millis_for_test(), 0)
         .await
         .unwrap();
-    let creating = runtime
+    let creating = match runtime
         .execute(
             &button(TicketAction::Open, "100", "501", vec![], 0),
             TicketAction::Open,
         )
         .await
-        .expect("creating refusal is Ok");
+    {
+        Ok(reply) => reply,
+        Err(error) => panic!("creating refusal is Ok: {}", error.reply()),
+    };
     assert_eq!(creating, "Your ticket is still being created or recovered.");
     // Closed ticket created moments ago: the cooldown still applies.
     let now = now_millis_for_test();
@@ -1213,13 +1228,16 @@ async fn ticket_copy_duplicate_and_cooldown_refusals_are_pinned() {
         .finish_cleanup("cool-closed", now + 3)
         .await
         .unwrap();
-    let cooldown = runtime
+    let cooldown = match runtime
         .execute(
             &button(TicketAction::Open, "100", "502", vec![], 0),
             TicketAction::Open,
         )
         .await
-        .expect("cooldown refusal is Ok");
+    {
+        Ok(reply) => reply,
+        Err(error) => panic!("cooldown refusal is Ok: {}", error.reply()),
+    };
     assert_eq!(cooldown, "Please wait before opening another ticket.");
     assert_eq!(mock.requests().len(), 3);
     mock.shutdown().await;
@@ -1234,14 +1252,14 @@ async fn ticket_copy_duplicate_and_cooldown_refusals_are_pinned() {
 async fn ticket_copy_generic_failure_fallback_is_pinned() {
     const FALLBACK: &str =
         "Ticket action failed; recovery will retry unfinished work. Try again later.";
-    let db = TestDb::new().await;
-    let mock = MockRest::start(
+    let open_db = TestDb::new().await;
+    let open_mock = MockRest::start(
         vec![ScriptedResponse::status(500)],
         ScriptedResponse::status(500),
     )
     .await;
-    let runtime = runtime(db.pool.clone(), &mock);
-    let open_error = runtime
+    let open_runtime = runtime(open_db.pool.clone(), &open_mock);
+    let open_error = open_runtime
         .execute(
             &button(TicketAction::Open, "100", "500", vec![], 0),
             TicketAction::Open,
@@ -1249,19 +1267,19 @@ async fn ticket_copy_generic_failure_fallback_is_pinned() {
         .await
         .expect_err("failed category fetch errors");
     assert_eq!(open_error.reply(), FALLBACK);
-    assert!(runtime.store.recoverable().await.unwrap().is_empty());
-    mock.shutdown().await;
-    db.close().await;
+    assert!(open_runtime.store.recoverable().await.unwrap().is_empty());
+    open_mock.shutdown().await;
+    open_db.close().await;
 
-    let db = TestDb::new().await;
-    let mock = MockRest::start(
+    let close_db = TestDb::new().await;
+    let close_mock = MockRest::start(
         vec![ScriptedResponse::status(500)],
         ScriptedResponse::status(500),
     )
     .await;
-    let runtime = runtime(db.pool.clone(), &mock);
-    active(&runtime, "failing-close").await;
-    let close_error = runtime
+    let close_runtime = runtime(close_db.pool.clone(), &close_mock);
+    active(&close_runtime, "failing-close").await;
+    let close_error = close_runtime
         .execute(
             &button(TicketAction::Close, "100", "501", vec!["300"], 0),
             TicketAction::Close,
@@ -1269,12 +1287,12 @@ async fn ticket_copy_generic_failure_fallback_is_pinned() {
         .await
         .expect_err("failed channel fetch errors");
     assert_eq!(close_error.reply(), FALLBACK);
-    assert!(mock.requests().iter().all(|r| r.method != "DELETE"));
-    assert!(!runtime
+    assert!(close_mock.requests().iter().all(|r| r.method != "DELETE"));
+    assert!(!close_runtime
         .store
         .transcript_exists("failing-close")
         .await
         .unwrap());
-    mock.shutdown().await;
-    db.close().await;
+    close_mock.shutdown().await;
+    close_db.close().await;
 }
