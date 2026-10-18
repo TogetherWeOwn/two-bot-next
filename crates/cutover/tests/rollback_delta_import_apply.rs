@@ -11,9 +11,12 @@
 //! an `events` table, LFG posts round-trip with their parent-joined roles
 //! and signups, divergent updates are reported per table with keys instead
 //! of silently dropped, the divergence check is primary-keyed (index lookup,
-//! not a table scan) inside a UTC-pinned transaction, identical re-runs stay
-//! clean on non-UTC targets, and every live FK between exportable tables
-//! respects the parent-first apply order.
+//! not a table scan) inside a UTC-pinned transaction with destination-owned
+//! columns excluded, identical re-runs stay clean on non-UTC targets, every
+//! live FK between exportable tables respects the parent-first apply order,
+//! the keyless `member_erasure_audit` never duplicates on re-run, and
+//! `guild_settings` re-runs ignore the target-allocated `cas_version` while
+//! still flagging genuinely changed values.
 //!
 //! Same disposable-database pattern as the protected acceptance file: one
 //! owned database per test on `agent-testdb`, never staging or production.
@@ -775,6 +778,143 @@ async fn apply_import_divergence_check_uses_primary_key() -> TestResult {
         assert!(
             !plan.contains("Seq Scan"),
             "divergence check never sequentially scans: {plan}"
+        );
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    let cleaned = db.cleanup().await;
+    result.and(cleaned)
+}
+
+/// The keyless `member_erasure_audit` has no primary or unique key, so bare
+/// `ON CONFLICT DO NOTHING` can never skip: the import inserts only when no
+/// identical row exists, and an identical re-run stays a clean skip.
+#[tokio::test]
+async fn apply_import_keyless_table_rerun_does_not_duplicate() -> TestResult {
+    if !db_opted_in() {
+        return Ok(());
+    }
+    let db = TestDb::new(
+        "keyless",
+        &[include_str!("../migrations/0410_member_erasure_audit.sql")],
+    )
+    .await?;
+    let result = async {
+        let row = serde_json::json!({
+            "actor": "op1",
+            "erased_at": "2026-10-01T12:00:00+00:00",
+        });
+        let contents = format!("{}\n", line("member_erasure_audit", &row));
+        let rows = parse_import(&contents).expect("valid erasure fixture");
+        let first = apply_import(&db.pool, &rows).await.expect("first import");
+        assert_eq!(
+            (first.inserted, first.skipped, first.divergent),
+            (1, 0, 0),
+            "fresh erasure receipt lands"
+        );
+        let second = apply_import(&db.pool, &rows).await.expect("rerun import");
+        assert_eq!(
+            (second.inserted, second.skipped, second.divergent),
+            (0, 1, 0),
+            "identical re-run skips without divergence"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM member_erasure_audit")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(count, 1, "re-run duplicates nothing");
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    let cleaned = db.cleanup().await;
+    result.and(cleaned)
+}
+
+fn guild_settings_row(value_text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "guild_id": "g",
+        "key": "WELCOME_MESSAGE",
+        "value": {"text": value_text},
+        "version": 1,
+        // The exporter emits Next's token; the target trigger replaces it
+        // with its own allocation on every insert.
+        "cas_version": -77,
+        "updated_at": "2026-10-01T12:00:00+00:00",
+        "updated_by": "tester",
+    })
+}
+
+/// `guild_settings.cas_version` is destination-owned: the row trigger replaces
+/// any supplied token, so an identical re-run must ignore it (divergent 0),
+/// while a genuinely changed value still reports divergent.
+#[tokio::test]
+async fn apply_import_guild_settings_ignores_destination_owned_cas() -> TestResult {
+    if !db_opted_in() {
+        return Ok(());
+    }
+    let db = TestDb::new(
+        "gscas",
+        &[
+            include_str!("../migrations/0330_guild_settings.sql"),
+            include_str!("../migrations/0331_guild_settings_versions.sql"),
+            include_str!("../migrations/0332_guild_settings_allocator.sql"),
+            include_str!("../migrations/0333_guild_settings_revision.sql"),
+            include_str!("../migrations/0334_guild_settings_cas.sql"),
+        ],
+    )
+    .await?;
+    let result = async {
+        let contents = format!("{}\n", line("guild_settings", &guild_settings_row("hi")));
+        let rows = parse_import(&contents).expect("valid settings fixture");
+        let first = apply_import(&db.pool, &rows).await.expect("first import");
+        assert_eq!(
+            (first.inserted, first.skipped, first.divergent),
+            (1, 0, 0),
+            "fresh settings row lands"
+        );
+        let stored_cas: i64 = sqlx::query_scalar(
+            "SELECT cas_version FROM guild_settings WHERE guild_id = 'g' AND key = 'WELCOME_MESSAGE'",
+        )
+        .fetch_one(&db.pool)
+        .await?;
+        assert_ne!(
+            stored_cas, -77,
+            "target allocates its own token, ignoring the export: {stored_cas}"
+        );
+        let rerun = apply_import(&db.pool, &rows).await.expect("rerun import");
+        assert_eq!(
+            (rerun.inserted, rerun.skipped, rerun.divergent),
+            (0, 1, 0),
+            "identical re-run ignores the owned token"
+        );
+        // A changed value through the same path still reports divergent and
+        // keeps the target values.
+        let changed_contents = format!("{}\n", line("guild_settings", &guild_settings_row("bye")));
+        let changed_rows = parse_import(&changed_contents).expect("changed fixture");
+        let changed = apply_import(&db.pool, &changed_rows)
+            .await
+            .expect("changed import");
+        assert_eq!(
+            (changed.inserted, changed.skipped, changed.divergent),
+            (0, 1, 1),
+            "a dropped settings update still reports divergent"
+        );
+        assert!(
+            changed
+                .divergent_keys
+                .iter()
+                .any(|k| k.contains("guild_settings")),
+            "divergent key names the table: {:?}",
+            changed.divergent_keys
+        );
+        let stored_value: serde_json::Value = sqlx::query_scalar(
+            "SELECT value FROM guild_settings WHERE guild_id = 'g' AND key = 'WELCOME_MESSAGE'",
+        )
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            stored_value,
+            serde_json::json!({"text": "hi"}),
+            "target values kept"
         );
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     }

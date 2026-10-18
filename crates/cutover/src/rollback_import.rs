@@ -20,15 +20,20 @@
 //! ignored, missing keys become NULL). Rows replay in backup
 //! [`two_bot_core::backup::DUMP_TABLES`] restore order (parents before
 //! children), stably, so a file listing a child before its parent still
-//! applies. Inserts use bare `ON CONFLICT DO NOTHING`, so re-running an
+//! applies. Keyed inserts use bare `ON CONFLICT DO NOTHING`, so re-running an
 //! identical import is idempotent: conflicting rows keep their existing
-//! values and are reported as skipped, never silently applied. Owned serial
-//! sequences for imported tables advance past the imported maxima in the same
-//! transaction. Skipped rows are classified by a primary-keyed containment
-//! check (`target @> incoming` on the conflicting row only, inside a
-//! UTC-pinned transaction): an identical row is an idempotent re-run, while a
-//! skipped row with no identical match is divergent (a pre-existing row with
-//! different values keeps the target values). Divergent rows are reported per table with
+//! values and are reported as skipped, never silently applied. The one keyless
+//! exportable table (`member_erasure_audit`, no primary or unique key, so
+//! `ON CONFLICT` can never fire) inserts only when no identical row exists
+//! (`WHERE NOT EXISTS` on the full row), so its re-run is a skip, not a
+//! duplicate. Owned serial sequences for imported tables advance past the
+//! imported maxima in the same transaction. Skipped rows are classified by a
+//! primary-keyed containment check (`target @> incoming` on the conflicting
+//! row only, inside a UTC-pinned transaction, destination-owned columns such
+//! as `guild_settings.cas_version` excluded from both sides): an identical
+//! row is an idempotent re-run, while a skipped row with no identical match
+//! is divergent (a pre-existing row with different values keeps the target
+//! values). Divergent rows are reported per table with
 //! their keys and fail the CLI (exit 3) unless `--acknowledge-divergent` is
 //! passed. `lfg_roles` has no timestamp column but round-trips as a parent
 //! join: the exporter emits the roles of every exported `lfg_posts` row, so a
@@ -39,6 +44,7 @@ use std::collections::BTreeMap;
 
 use sqlx::{Executor, PgPool};
 use thiserror::Error;
+use two_bot_core::backup::dump_file::DESTINATION_OWNED_COLUMNS;
 use two_bot_core::backup::DUMP_TABLES;
 
 use crate::rollback_delta::{
@@ -194,9 +200,11 @@ pub struct TableOutcome {
 }
 
 /// Outcome of [`apply_import`]: rows actually inserted vs rows skipped as
-/// already present (`ON CONFLICT DO NOTHING`). `inserted + skipped` is always
+/// already present (keyed `ON CONFLICT DO NOTHING`, keyless `WHERE NOT EXISTS`
+/// on the identical row). `inserted + skipped` is always
 /// the number of import rows processed. `divergent` is the subset of skipped
-/// rows with no identical match in the target (`target @> incoming` fails):
+/// rows with no identical match in the target (`target @> incoming` fails,
+/// destination-owned columns excluded):
 /// a first run that drops updates vs an identical re-run. `divergent_keys`
 /// names up to [`MAX_DIVERGENT_KEYS`] `table:key` entries for the runbook's
 /// manual-reconciliation list.
@@ -308,22 +316,75 @@ pub async fn primary_key_columns<'e>(
     Ok(cols)
 }
 
+/// Destination-owned columns for `table`: values the target allocates itself
+/// on every write (see [`DESTINATION_OWNED_COLUMNS`]), never restored. Today
+/// only `guild_settings.cas_version`, whose row trigger replaces any supplied
+/// token with the target's own sequence value.
+#[must_use]
+pub fn destination_owned_columns(table: &str) -> Vec<&'static str> {
+    DESTINATION_OWNED_COLUMNS
+        .iter()
+        .filter(|(owned_table, _)| *owned_table == table)
+        .map(|(_, owned_column)| *owned_column)
+        .collect()
+}
+
 /// Containment check restricted to the conflicting row: the `to_jsonb`
 /// comparison runs on the single primary-keyed row instead of scanning the
 /// whole table, so classifying N skipped rows costs N index lookups, not N
 /// sequential scans. A missing incoming key compares NULL and never matches,
-/// which conservatively reports divergent. Tables without a primary key fall
-/// back to the whole-table scan; every exportable table has one, so that path
-/// is exceptional, never the common case.
+/// which conservatively reports divergent. Destination-owned columns are
+/// excluded from both sides of the comparison, so a target-allocated token
+/// (e.g. `guild_settings.cas_version`) never marks an identical re-run
+/// divergent. Tables without a primary key fall back to the whole-table scan;
+/// the only such exportable table is `member_erasure_audit`, so that path is
+/// exceptional, never the common case.
 #[must_use = "building the SQL performs no I/O"]
 pub fn divergence_check_sql(
     table: &str,
     pk_columns: &[String],
 ) -> Result<String, ImportApplyError> {
     let table_q = quote(table)?;
+    let owned = destination_owned_columns(table);
+    let mut strip = String::new();
+    for col in &owned {
+        // Static column names from `DESTINATION_OWNED_COLUMNS`; the `-`
+        // operator takes a text key, never an identifier, so no quoting.
+        strip.push_str(&format!(" - '{col}'"));
+    }
+    // Without owned columns keep the historical SQL verbatim.
+    if owned.is_empty() {
+        if pk_columns.is_empty() {
+            return Ok(format!(
+                "SELECT EXISTS(SELECT 1 FROM {table_q} WHERE to_jsonb({table_q}.*) @> $1::jsonb)"
+            ));
+        }
+        let mut keys = Vec::with_capacity(pk_columns.len());
+        let mut pops = Vec::with_capacity(pk_columns.len());
+        for col in pk_columns {
+            let col_q = quote(col)?;
+            keys.push(col_q.clone());
+            pops.push(format!(
+                "(jsonb_populate_record(NULL::{table_q}, $1)).{col_q}"
+            ));
+        }
+        let (lhs, rhs) = if keys.len() == 1 {
+            (keys.join(","), pops.join(","))
+        } else {
+            (
+                format!("({})", keys.join(",")),
+                format!("({})", pops.join(",")),
+            )
+        };
+        return Ok(format!(
+            "SELECT EXISTS(SELECT 1 FROM {table_q} WHERE {lhs} = {rhs} AND to_jsonb({table_q}.*) @> $1::jsonb)"
+        ));
+    }
+    let stored = format!("(to_jsonb({table_q}.*){strip})");
+    let incoming = format!("($1::jsonb{strip})");
     if pk_columns.is_empty() {
         return Ok(format!(
-            "SELECT EXISTS(SELECT 1 FROM {table_q} WHERE to_jsonb({table_q}.*) @> $1::jsonb)"
+            "SELECT EXISTS(SELECT 1 FROM {table_q} WHERE {stored} @> {incoming})"
         ));
     }
     let mut keys = Vec::with_capacity(pk_columns.len());
@@ -344,7 +405,35 @@ pub fn divergence_check_sql(
         )
     };
     Ok(format!(
-        "SELECT EXISTS(SELECT 1 FROM {table_q} WHERE {lhs} = {rhs} AND to_jsonb({table_q}.*) @> $1::jsonb)"
+        "SELECT EXISTS(SELECT 1 FROM {table_q} WHERE {lhs} = {rhs} AND {stored} @> {incoming})"
+    ))
+}
+
+/// Insert for one validated row. Keyed tables use bare `ON CONFLICT DO
+/// NOTHING` (any unique or exclusion conflict skips). Keyless tables have no
+/// arbiter for `ON CONFLICT` to fire on, so they insert only when no
+/// identical row exists; the 0-row result counts as skipped-identical.
+/// Destination-owned columns are excluded from the identity comparison, so a
+/// target-allocated token never forces a duplicate.
+#[must_use = "building the SQL performs no I/O"]
+pub fn insert_sql(table: &str, pk_columns: &[String]) -> Result<String, ImportApplyError> {
+    let table_q = quote(table)?;
+    if !pk_columns.is_empty() {
+        return Ok(format!(
+            "INSERT INTO {table_q} SELECT * FROM jsonb_populate_record(NULL::{table_q}, $1) ON CONFLICT DO NOTHING"
+        ));
+    }
+    let owned = destination_owned_columns(table);
+    let mut strip = String::new();
+    for col in &owned {
+        strip.push_str(&format!(" - '{col}'"));
+    }
+    let stored = format!("(to_jsonb({table_q}.*){strip})");
+    // `_r` is the incoming record; `to_jsonb(_r)` renders its row value.
+    let incoming = format!("(to_jsonb(_r){strip})");
+    Ok(format!(
+        "INSERT INTO {table_q} SELECT _r.* FROM jsonb_populate_record(NULL::{table_q}, $1) AS _r \
+         WHERE NOT EXISTS (SELECT 1 FROM {table_q} WHERE {stored} = {incoming})"
     ))
 }
 
@@ -402,13 +491,15 @@ async fn advance_owned_sequences(
 }
 
 /// Replay validated rows into the target inside one transaction. Each row is
-/// mapped back onto its table's columns with `jsonb_populate_record` and
-/// inserted with bare `ON CONFLICT DO NOTHING`, so an identical re-run
-/// changes nothing. Rows apply in [`DUMP_TABLES`] parent-first order. The
-/// transaction pins `TIME ZONE 'UTC'` (like the exporter) so timestamptz
-/// comparison is session-independent.
+/// mapped back onto its table's columns with `jsonb_populate_record`: keyed
+/// tables insert with bare `ON CONFLICT DO NOTHING`, while the keyless
+/// `member_erasure_audit` inserts only when no identical row exists, so an
+/// identical re-run changes nothing either way. Rows apply in [`DUMP_TABLES`]
+/// parent-first order. The transaction pins `TIME ZONE 'UTC'` (like the
+/// exporter) so timestamptz comparison is session-independent.
 /// Returns inserted vs skipped counts plus the divergent subset: skipped rows
-/// with no identical match (primary-keyed `target @> incoming` fails) keep
+/// with no identical match (primary-keyed `target @> incoming` fails,
+/// destination-owned columns excluded) keep
 /// the target values and must be reconciled by hand. A failed insert names
 /// its table and constraint for integrity violations; other server errors
 /// stay redacted database errors.
@@ -447,12 +538,23 @@ pub async fn apply_import(
     let mut per_table: Vec<TableOutcome> = Vec::new();
     let mut divergent_keys: Vec<String> = Vec::new();
     let mut divergence_sql_cache: BTreeMap<String, String> = BTreeMap::new();
+    let mut insert_sql_cache: BTreeMap<String, String> = BTreeMap::new();
     for row in &ordered {
-        let table = quote(&row.table)?;
+        // The primary key is looked up before the first insert for each
+        // table (one catalog query per table, cached): keyless tables need
+        // the conditional insert, and the divergence check needs the same key.
+        if !divergence_sql_cache.contains_key(row.table.as_str()) {
+            let pk_cols = primary_key_columns(&mut *tx, row.table.as_str()).await?;
+            let divergence_sql = divergence_check_sql(row.table.as_str(), &pk_cols)?;
+            let row_insert_sql = insert_sql(row.table.as_str(), &pk_cols)?;
+            divergence_sql_cache.insert(row.table.clone(), divergence_sql);
+            insert_sql_cache.insert(row.table.clone(), row_insert_sql);
+        }
         // Table names are validated statics; only the row document is bound.
-        let sql = format!(
-            "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table}, $1) ON CONFLICT DO NOTHING"
-        );
+        let sql = insert_sql_cache
+            .get(row.table.as_str())
+            .expect("just cached")
+            .clone();
         let affected = match sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&row.row)
             .execute(&mut *tx)
@@ -494,13 +596,7 @@ pub async fn apply_import(
             // Containment classifies the skip: an identical row present means
             // an idempotent re-run; no identical match means the conflicting
             // row differs and the update was dropped. Keyed by primary key
-            // (one catalog lookup per table, cached) so N skips cost N index
-            // lookups, not N sequential scans.
-            if !divergence_sql_cache.contains_key(row.table.as_str()) {
-                let pk_cols = primary_key_columns(&mut *tx, row.table.as_str()).await?;
-                let sql = divergence_check_sql(row.table.as_str(), &pk_cols)?;
-                divergence_sql_cache.insert(row.table.clone(), sql);
-            }
+            // so N skips cost N index lookups, not N sequential scans.
             let identical_sql = divergence_sql_cache
                 .get(row.table.as_str())
                 .expect("just cached");
@@ -846,6 +942,62 @@ mod tests {
 
         assert!(divergence_check_sql("Members", &["id".to_owned()]).is_err());
         assert!(divergence_check_sql("member_levels", &["Member_Id".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn divergence_check_sql_excludes_destination_owned_columns() {
+        // `guild_settings.cas_version` is allocated by the target trigger, so
+        // both sides of the containment drop it: an identical re-run matches
+        // despite the stored token differing from the exported one.
+        let sql =
+            divergence_check_sql("guild_settings", &["guild_id".to_owned(), "key".to_owned()])
+                .expect("valid guild_settings sql");
+        assert!(
+            sql.contains("(to_jsonb(\"guild_settings\".*) - 'cas_version')"),
+            "stored side strips the owned token: {sql}"
+        );
+        assert!(
+            sql.contains("($1::jsonb - 'cas_version')"),
+            "incoming side strips the owned token: {sql}"
+        );
+        assert!(
+            sql.contains("(\"guild_id\",\"key\") = ("),
+            "still keyed by the primary key: {sql}"
+        );
+        // Tables without owned columns keep the historical shape.
+        let plain =
+            divergence_check_sql("member_levels", &["guild_id".to_owned()]).expect("plain sql");
+        assert!(
+            !plain.contains("cas_version"),
+            "unrelated tables strip nothing: {plain}"
+        );
+    }
+
+    #[test]
+    fn insert_sql_is_conditional_only_without_a_primary_key() {
+        let keyed = insert_sql("tickets", &["id".to_owned()]).expect("valid keyed insert");
+        assert!(
+            keyed.contains("ON CONFLICT DO NOTHING"),
+            "keyed tables skip on conflict: {keyed}"
+        );
+        assert!(
+            !keyed.contains("NOT EXISTS"),
+            "keyed tables need no identity scan: {keyed}"
+        );
+
+        // The only keyless exportable table: no arbiter exists for
+        // `ON CONFLICT` to fire on, so the insert is conditional.
+        let keyless = insert_sql("member_erasure_audit", &[]).expect("keyless insert");
+        assert!(
+            keyless.contains("WHERE NOT EXISTS"),
+            "keyless tables insert only when no identical row exists: {keyless}"
+        );
+        assert!(
+            !keyless.contains("ON CONFLICT"),
+            "ON CONFLICT can never fire without a key: {keyless}"
+        );
+
+        assert!(insert_sql("Members", &["id".to_owned()]).is_err());
     }
 
     #[test]
