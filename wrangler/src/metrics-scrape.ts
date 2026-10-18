@@ -45,6 +45,7 @@ export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly
   two_bot_job_last_error_class: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"], class: ["database", "rest", "configuration", "timeout", "panic", "feed", "recovery_required"] },
   two_bot_voice_creator_map_generation: {},
   two_bot_voice_creator_map_age_seconds: {},
+  two_bot_event_store_consumer_lag_seconds: {},
 };
 
 /** Every series the validator checks: required plus optional-when-present. */
@@ -100,7 +101,10 @@ export function parseAlertScrape(text: string): Sample[] | null {
     seen.add(key);
     if (Object.hasOwn(VALIDATED_INPUT_LABELS, name)) {
       const axes = VALIDATED_INPUT_LABELS[name]!;
-      if (Object.keys(labels).length !== Object.keys(axes).length
+      if (name === "two_bot_event_store_consumer_lag_seconds") {
+        if (Object.keys(labels).length !== 0
+          || !Number.isFinite(value) || value < 0 || value > 18446744073709551615) return null;
+      } else if (Object.keys(labels).length !== Object.keys(axes).length
         || Object.keys(axes).some((axis) => !labels[axis])
         || !Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > 18446744073709551615
         || (name === "two_bot_db_pool_configured" && value !== 0 && value !== 1)) return null;
