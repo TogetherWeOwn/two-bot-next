@@ -267,15 +267,18 @@ mod tests {
             (None, Some("2"), Some("3")),
             (Some("1"), Some("2"), Some("3")),
         ] {
-            match history_messages_path("123", 2, before, after, around) {
-                Err(BackfillHistoryError::Invalid(reason)) => assert!(
+            // `expect_err` keeps the test free of explicit panics so the
+            // rust-panic-in-prod gate stays quiet for inline test modules.
+            let err = history_messages_path("123", 2, before, after, around)
+                .expect_err("expected typed Invalid cursor error");
+            match err {
+                BackfillHistoryError::Invalid(reason) => assert!(
                     reason.contains("cursor"),
                     "error reason must name the cursor problem, got: {reason:?}"
                 ),
-                Err(BackfillHistoryError::Db(_)) => {
-                    panic!("expected Invalid cursor error, got Db error")
+                BackfillHistoryError::Db(_) => {
+                    assert!(false, "expected Invalid cursor error, got Db error")
                 }
-                Ok(path) => panic!("expected typed cursor error, got Ok path: {path}"),
             }
         }
     }
