@@ -32,7 +32,8 @@
 //!
 //! What this module is not: the rollback procedure itself (that stays in the
 //! runbook), and wiring into every writer (follow-up slices call [`record`]
-//! from their own write paths). Pre-images are TEXT JSON blobs, matching the
+//! for standalone writes, or [`record_in`] from inside their own write
+//! transaction, from their own write paths). Pre-images are TEXT JSON blobs, matching the
 //! funnel `events.metadata` convention — the journal is a restore source,
 //! not a query index, so there is no JSONB and no secondary parsing.
 
@@ -223,6 +224,21 @@ pub enum JournalError {
 pub async fn record(pool: &Pool<Postgres>, entry: &JournalEntry) -> Result<i64, JournalError> {
     entry.validate()?;
     let mut tx = pool.begin().await?;
+    let id = record_in(&mut tx, entry).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Append `entry` and advance its table watermark inside the caller's
+/// transaction. Same inserts as [`record`], but the caller owns the commit:
+/// writers journaling inside their primary transaction call this under a
+/// savepoint, so the row and its evidence commit atomically and a journal
+/// failure rolls back only the savepoint.
+pub async fn record_in(
+    tx: &mut Transaction<'_, Postgres>,
+    entry: &JournalEntry,
+) -> Result<i64, JournalError> {
+    entry.validate()?;
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO rollback_journal (table_name, row_identity, op, pre_image)
          VALUES ($1, $2, $3, $4)
@@ -232,10 +248,9 @@ pub async fn record(pool: &Pool<Postgres>, entry: &JournalEntry) -> Result<i64, 
     .bind(&entry.row_identity)
     .bind(entry.op.as_str())
     .bind(entry.pre_image.as_deref())
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
-    advance_in(&mut tx, &entry.table_name, id).await?;
-    tx.commit().await?;
+    advance_in(&mut *tx, &entry.table_name, id).await?;
     Ok(id)
 }
 
