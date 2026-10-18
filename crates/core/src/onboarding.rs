@@ -516,6 +516,10 @@ pub const PICKER_DRY_RUN_REPLY: &str = "Dry run: no roles were changed.";
 /// Cleared-selection reply (legacy empty-`roleIds` branch).
 pub const PICKER_CLEARED_REPLY: &str =
     "Cleared your game roles. Open the menu again whenever you like.";
+/// Stale-menu reply: the submission named choices but none matched the
+/// catalog (a replaced/retired menu). Roles are preserved and nothing is
+/// recorded; the member retries from a fresh menu.
+pub const PICKER_STALE_REPLY: &str = "That menu looks stale - I did not recognize those choices.\nNothing was changed. Open the picker again and choose afresh.";
 
 /// Game-picker outcome for the executor (from `handleGameSelect`):
 /// add/remove roles to match the menu exactly, ephemeral reply, funnel writes
@@ -547,8 +551,9 @@ pub struct GamePickerOutcome {
 impl GamePickerOutcome {
     /// Finalize a successful role selection using refreshed member visibility.
     /// The executor must call this after role writes and before replying or
-    /// recording funnel events. Dry runs and clears retain their special reply
-    /// and record no events. Role deltas and unknown-key diagnostics survive.
+    /// recording funnel events. Dry runs, clears and stale-menu answers retain
+    /// their special reply and record no events. Role deltas and unknown-key
+    /// diagnostics survive.
     #[must_use]
     pub fn finalize_after_grant(mut self, visible: &dyn Fn(&str) -> bool, guild_id: u64) -> Self {
         if !self.record_selected {
@@ -597,8 +602,10 @@ pub fn game_picker_reply(plan: &GameSelection, guild_id: u64) -> String {
 
 /// Adjudicate one game-picker submission. `member_role_ids` is the member's
 /// current role set; unticked game roles they hold are removed so roles never
-/// drift from the declared answer. Unknown keys are logged by the caller, not
-/// shown to the member.
+/// drift from the declared answer. Only a raw empty submission clears: a
+/// nonempty submission with no recognized keys is a stale menu, which
+/// preserves every role and records nothing. Unknown keys are logged by the
+/// caller; the stale subset of a mixed submission is still reported.
 pub fn adjudicate_game_select(
     mode: OnboardingMode,
     selected_keys: &[&str],
@@ -623,9 +630,11 @@ pub fn adjudicate_game_select(
         });
     }
     let plan = plan_game_selection(selected_keys, visible);
-    if plan.role_ids.is_empty() {
+    if selected_keys.is_empty() {
         // The clear branch replies and returns before either recorder call —
-        // roles are removed but no funnel rows are written.
+        // roles are removed but no funnel rows are written. Only a raw empty
+        // submission clears; wholly unrecognized input falls through to the
+        // stale branch below and preserves every role.
         return Some(GamePickerOutcome {
             add_role_ids: Vec::new(),
             remove_role_ids: GAME_PICKS
@@ -634,6 +643,20 @@ pub fn adjudicate_game_select(
                 .filter(|r| member_role_ids.contains(&r.as_str()))
                 .collect(),
             reply: PICKER_CLEARED_REPLY.to_owned(),
+            ephemeral: true,
+            record_selected: false,
+            record_routed: false,
+            routed: plan,
+        });
+    }
+    if plan.role_ids.is_empty() {
+        // Stale menu: the member answered, but no key matched the catalog.
+        // Preserve every role, record nothing, and invite a retry from a
+        // fresh menu. Mixed known/stale input still takes the normal branch.
+        return Some(GamePickerOutcome {
+            add_role_ids: Vec::new(),
+            remove_role_ids: Vec::new(),
+            reply: PICKER_STALE_REPLY.to_owned(),
             ephemeral: true,
             record_selected: false,
             record_routed: false,
