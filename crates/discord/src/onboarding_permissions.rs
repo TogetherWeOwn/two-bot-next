@@ -198,6 +198,10 @@ impl MemberAccess {
 }
 
 #[cfg(test)]
+#[path = "onboarding_permissions_connect_acceptance_tests.rs"]
+mod connect_acceptance_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
