@@ -137,6 +137,68 @@ fn field(line: &str, name: &str, expected: u64) {
     );
 }
 
+fn expiry_line(logs: &str) -> &str {
+    let events: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("game_activity_aggregate_expiry"))
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "one aggregate expiry event per sweep with stale rows: {logs}"
+    );
+    events[0]
+}
+
+#[tokio::test]
+async fn game_aggregate_expiry_counts_in_dry_run_and_deletes_in_execute() {
+    let _serial = RUNTIME_LOCK.lock().await;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    const AGGREGATE_GUILD: &str = "444444444444444444";
+    sqlx::query("INSERT INTO game_activity_guild_aggregates (guild_id, game, total_play_ms, in_voice_ms, session_count) VALUES ($1, 'Apex', 600000, 0, 2), ($1, 'Valorant', 600000, 0, 1)")
+        .bind(AGGREGATE_GUILD).execute(pool).await.unwrap();
+    sqlx::query("UPDATE game_activity_guild_aggregates SET updated_at = now() - make_interval(days => 100) WHERE guild_id = $1 AND game = 'Apex'")
+        .bind(AGGREGATE_GUILD).execute(pool).await.unwrap();
+    // Dry run previews the same stale row execute will delete, and deletes
+    // nothing: both rows survive.
+    let (result, logs) = tick(pool, mode_from_setting(None).unwrap().unwrap()).await;
+    result.unwrap();
+    let preview = expiry_line(&logs);
+    field(preview, "stale_rows", 1);
+    field(preview, "horizon_days", 90);
+    assert!(
+        preview.contains("mode=DryRun") || preview.contains("mode=\"DryRun\""),
+        "dry run must tag its preview: {preview}"
+    );
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM game_activity_guild_aggregates WHERE guild_id = $1",
+    )
+    .bind(AGGREGATE_GUILD)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(kept, 2, "dry run deletes nothing");
+    // Execute deletes the stale row and keeps the fresh one.
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    result.unwrap();
+    let swept = expiry_line(&logs);
+    field(swept, "stale_rows", 1);
+    assert!(
+        swept.contains("mode=Execute") || swept.contains("mode=\"Execute\""),
+        "execute must tag its sweep: {swept}"
+    );
+    let games: Vec<String> = sqlx::query_scalar(
+        "SELECT game FROM game_activity_guild_aggregates WHERE guild_id = $1 ORDER BY game ASC",
+    )
+    .bind(AGGREGATE_GUILD)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(games, vec!["Valorant".to_owned()]);
+    db.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn dry_run_reports_candidates_and_preserves_raw_queue_requests_and_receipts() {
     let _serial = RUNTIME_LOCK.lock().await;

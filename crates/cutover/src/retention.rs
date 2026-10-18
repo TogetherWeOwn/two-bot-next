@@ -378,6 +378,7 @@ async fn run_retention_inner(
                 presence_raw_deleted = report.presence_raw_deleted,
                 voice_raw_deleted = report.voice_raw_deleted,
                 audit_cache_deleted = report.audit_cache_deleted,
+                stream_live_delivered_expired = report.stream_live_delivered_expired,
                 guild_rows_purged = report.guild_rows_purged,
                 guild_purges_failed = report.guild_purges_failed,
                 guild_purges_deferred = report.guild_purges_deferred,
@@ -1945,13 +1946,17 @@ mod ledger_tests {
         // guild-purged table has a dry-run projection exclusion with the same
         // retention window, and no other table grows a stray exclusion that
         // would hide rows from the projection.
-        let (events_condition, events_days) = guild_projection_time_exclusion("events", 2)
+        let (events_condition, events_days) = guild_projection_time_exclusions("events", 2)
+            .into_iter()
+            .next()
             .expect("events needs a projection exclusion");
         assert!(events_condition.contains("$2"), "{events_condition}");
         assert_eq!(events_days, VOICE_RAW_RETENTION_DAYS);
 
         let (audit_condition, audit_days) =
-            guild_projection_time_exclusion("operational_audit_log", 2)
+            guild_projection_time_exclusions("operational_audit_log", 2)
+                .into_iter()
+                .next()
                 .expect("operational_audit_log needs a projection exclusion");
         assert!(audit_condition.contains("$2"), "{audit_condition}");
         assert_eq!(audit_days, AUDIT_CACHE_RETENTION_DAYS);
@@ -1967,7 +1972,7 @@ mod ledger_tests {
                 continue;
             }
             assert!(
-                guild_projection_time_exclusion(&table, 2).is_none(),
+                guild_projection_time_exclusions(&table, 2).is_empty(),
                 "{table} must not grow a projection exclusion"
             );
         }
@@ -1977,7 +1982,9 @@ mod ledger_tests {
     fn projection_placeholders_track_caller_numbering() {
         // The exclusion binds the caller's placeholder, so stacked user
         // exclusions keep numbering without collision.
-        let (condition, days) = guild_projection_time_exclusion("events", 4)
+        let (condition, days) = guild_projection_time_exclusions("events", 4)
+            .into_iter()
+            .next()
             .expect("events needs a projection exclusion");
         assert!(condition.contains("$4"), "{condition}");
         assert!(!condition.contains("$2"), "{condition}");

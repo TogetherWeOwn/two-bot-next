@@ -12009,7 +12009,23 @@ async fn a_game_or_stream_change_rerenders_the_room_name() {
     );
     assert_eq!(room, Some(500));
     worker.room_facts_changed(500, 1);
-    worker.refresh_template_names(1);
+    tracing_capture::global();
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || worker.refresh_template_names(1));
+    let decision_log = capture.text();
+    // The decision line carries counts and booleans only: the detected
+    // game title and the rendered name are member-derived text and must
+    // never reach the logs.
+    assert!(!decision_log.contains("Apex"), "{decision_log}");
+    assert!(decision_log.contains("playing_members=1"), "{decision_log}");
+    assert!(
+        decision_log.contains("activity_detected=true"),
+        "{decision_log}"
+    );
+    assert!(
+        decision_log.contains("decision=\"queued\""),
+        "{decision_log}"
+    );
     assert_eq!(worker.desired_names[&500], "Apex Legends");
     // Going live through Discord adds the live marker on the next render.
     assert_eq!(worker.live.set_self_stream(MEMBER, true), Some(500));
@@ -12022,6 +12038,246 @@ async fn a_game_or_stream_change_rerenders_the_room_name() {
         *trace.lock().unwrap(),
         ["rename:500:Hangout", "rename:500:Apex Legends 🔴"]
     );
+}
+
+#[test]
+fn rename_decision_logs_carry_bounded_fields_at_each_level() {
+    fn line<'a>(log: &'a str, decision: &str) -> &'a str {
+        log.lines()
+            .find(|line| line.contains(&format!("decision=\"{decision}\"")))
+            .unwrap_or_else(|| panic!("missing decision {decision} in:\n{log}"))
+    }
+    tracing_capture::global();
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        log_rename_decision(GUILD, 500, "attempted", "", 0, false);
+        log_rename_decision(
+            GUILD,
+            500,
+            "permission_denied",
+            "rename_no_access",
+            0,
+            false,
+        );
+        log_rename_decision(GUILD, 500, "rate_limited", "", 1_500, true);
+        log_template_name_decision(GUILD, 500, 2, "queued");
+        log_template_name_decision(GUILD, 500, 0, "channel_unseen");
+        log_template_name_decision(GUILD, 500, 1, "template_blocked");
+    });
+    let log = capture.text();
+    let attempted = line(&log, "attempted");
+    assert!(attempted.starts_with("INFO "), "{attempted}");
+    assert!(attempted.contains("guild=100 channel=500"), "{attempted}");
+    let denied = line(&log, "permission_denied");
+    assert!(denied.starts_with("INFO "), "{denied}");
+    assert!(denied.contains("reason=\"rename_no_access\""), "{denied}");
+    let limited = line(&log, "rate_limited");
+    assert!(limited.starts_with("WARN "), "{limited}");
+    assert!(limited.contains("retry_after_ms=1500"), "{limited}");
+    let queued = line(&log, "queued");
+    assert!(queued.starts_with("INFO "), "{queued}");
+    assert!(
+        queued.contains("playing_members=2 activity_detected=true"),
+        "{queued}"
+    );
+    let unseen = line(&log, "channel_unseen");
+    assert!(unseen.starts_with("DEBUG "), "{unseen}");
+    assert!(
+        unseen.contains("playing_members=0 activity_detected=false"),
+        "{unseen}"
+    );
+    let blocked = line(&log, "template_blocked");
+    assert!(blocked.starts_with("INFO "), "{blocked}");
+    assert!(
+        blocked.contains("playing_members=1 activity_detected=true"),
+        "{blocked}"
+    );
+}
+
+#[tokio::test]
+async fn unseen_template_channel_logs_channel_unseen_at_debug() {
+    let (live, store, http, _trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    // No live channel 500: the snapshot cannot see it yet, so the naming
+    // pass retries on a later pass.
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    tracing_capture::global();
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || worker.refresh_template_names(0));
+    let decision_log = capture.text();
+    assert!(decision_log.contains("DEBUG "), "{decision_log}");
+    assert!(
+        decision_log.contains("decision=\"channel_unseen\""),
+        "{decision_log}"
+    );
+    assert!(!decision_log.contains("Alex"), "{decision_log}");
+    assert!(worker.name_inputs.is_none());
+}
+
+#[tokio::test]
+async fn blocked_template_logs_template_blocked_without_member_text() {
+    let (live, store, http, _trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "nasty den".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http)
+        .await
+        .unwrap()
+        .with_name_policy(Arc::new(fixture_policy(&["nasty"])));
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    tracing_capture::global();
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || worker.refresh_template_names(0));
+    let decision_log = capture.text();
+    assert!(
+        decision_log.contains("decision=\"template_blocked\""),
+        "{decision_log}"
+    );
+    assert!(!decision_log.contains("Alex"), "{decision_log}");
+    assert!(worker.name_signatures.contains_key(&500));
+}
+
+#[tokio::test]
+async fn unchanged_template_name_logs_unchanged() {
+    let (live, store, http, _trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template =
+        "{{PLAYING ?? @@game_name@@ // Hangout}}".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker
+        .live
+        .write_state()
+        .channels
+        .get_mut(&500)
+        .unwrap()
+        .name = Some("Hangout".to_owned());
+    tracing_capture::global();
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || worker.refresh_template_names(0));
+    let decision_log = capture.text();
+    assert!(
+        decision_log.contains("decision=\"unchanged\""),
+        "{decision_log}"
+    );
+    assert!(!decision_log.contains("Alex"), "{decision_log}");
+    assert_eq!(worker.desired_names[&500], "Hangout");
+}
+
+#[tokio::test]
+async fn rename_without_access_logs_permission_denied() {
+    let (live, store, http, trace) = fixture();
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.live.upsert_channel(channel_with_overwrites(
+        700,
+        2,
+        Some(CATEGORY),
+        json!([everyone_overwrite(Permissions::MANAGE_CHANNELS)]),
+    ));
+    worker.desired_names.insert(700, "B".to_owned());
+    worker.queue.enqueue(
+        GUILD,
+        RoomAction::RenameRoom {
+            channel_id: 700,
+            name: "B".to_owned(),
+        },
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    dispatch(&mut worker, 0).await;
+    let decision_log = global.text()[before..].to_owned();
+    assert!(
+        decision_log.contains("decision=\"permission_denied\""),
+        "{decision_log}"
+    );
+    assert!(
+        decision_log.contains("reason=\"rename_no_access\""),
+        "{decision_log}"
+    );
+    assert!(renames_sent(&trace).is_empty());
+}
+
+#[tokio::test]
+async fn inline_rename_errors_log_warn_decisions() {
+    for (error, decision, extra) in [
+        (
+            RoomHttpError::RateLimited {
+                retry_after_ms: 5_000,
+                global: false,
+            },
+            "rate_limited",
+            "retry_after_ms=5000",
+        ),
+        (RoomHttpError::RenameDeferred, "outcome_deferred", ""),
+        (RoomHttpError::UnknownOutcome, "outcome_unknown", ""),
+        (RoomHttpError::AccessDenied, "permission_denied", ""),
+        (RoomHttpError::Unauthorized, "discord_error", ""),
+    ] {
+        let (live, store, http, trace) = fixture();
+        slow_rename_room(&live, &store);
+        http.rename_errors.lock().unwrap().push_back(error);
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        worker.propose_name(700, "B", 0);
+        let global = tracing_capture::global();
+        let before = global.text().len();
+        dispatch(&mut worker, 0).await;
+        let decision_log = global.text()[before..].to_owned();
+        let expected = format!("decision=\"{decision}\"");
+        assert!(decision_log.contains(&expected), "{decision_log}");
+        let line = decision_log
+            .lines()
+            .find(|line| line.contains(&expected))
+            .unwrap();
+        assert!(line.starts_with("WARN "), "{line}");
+        if !extra.is_empty() {
+            assert!(line.contains(extra), "{line}");
+        }
+        assert_eq!(renames_sent(&trace), ["rename:700:B"]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn detached_rename_errors_log_warn_decisions_on_collect() {
+    for (error, decision) in [
+        (
+            RoomHttpError::RateLimited {
+                retry_after_ms: 5_000,
+                global: false,
+            },
+            "rate_limited",
+        ),
+        (RoomHttpError::UnknownOutcome, "outcome_unknown"),
+        (RoomHttpError::AccessDenied, "permission_denied"),
+        (RoomHttpError::Unauthorized, "discord_error"),
+    ] {
+        let (live, store, http, trace) = fixture();
+        slow_rename_room(&live, &store);
+        *http.slow_renames.lock().unwrap() = Some(5_000);
+        http.rename_errors.lock().unwrap().push_back(error);
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        worker.propose_name(700, "B", 0);
+        dispatch(&mut worker, 0).await;
+        finish_detached_after(Duration::from_secs(5)).await;
+        let global = tracing_capture::global();
+        let before = global.text().len();
+        worker.dispatch_one(6_000).await;
+        let decision_log = global.text()[before..].to_owned();
+        let expected = format!("decision=\"{decision}\"");
+        assert!(decision_log.contains(&expected), "{decision_log}");
+        let line = decision_log
+            .lines()
+            .find(|line| line.contains(&expected))
+            .unwrap();
+        assert!(line.starts_with("WARN "), "{line}");
+        assert_eq!(renames_sent(&trace), ["rename:700:B"]);
+    }
 }
 
 #[tokio::test]

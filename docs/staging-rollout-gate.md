@@ -55,7 +55,7 @@ not production authorization or a migration tool.
    successfully. Every Wrangler invocation appends its own `wrangler-session`
    record, and `wrangler-action` runs `wrangler --version` before deploying, so
    the file holds several sessions. Require at least one session, all pinned to
-   4.149.0 with record version 1, exactly one `deploy` invocation and every other
+   4.151.0 with record version 1, exactly one `deploy` invocation and every other
    session exactly `--version` or `-v`, and exactly one staging deploy record
    with the expected Worker name, fresh timestamp and concrete Worker version.
    The `receipt` step runs this check **before** `deployment-takeover`, so
@@ -177,6 +177,31 @@ post-rollback `/readyz` is not 200 (staging may be fenced — diagnose from
 the artifact first, never release the fence to force a rerun); never
 dispatch `deploy-production` as part of the drill.
 
+## Rollback drill: rehearsal error-rate spike (staging only)
+
+The error-rate gate proves its own fail-to-rollback chain the same way,
+without live traffic and without a new secret:
+
+```sh
+gh workflow run deploy-staging.yml --ref main -f inject_error_rate_spike=true
+```
+
+`inject_error_rate_spike` is a `workflow_dispatch`-only boolean (default
+false; a push cannot set it, and `deploy-production` never reads it). It
+reaches only the `error_rate_gate` step's `INJECT_ERROR_RATE_SPIKE` env
+through the pinned dispatch-only expression: the step passes
+`--rehearsal-firing '["rest_5xx_rate"]'` to
+`wrangler/scripts/promotion-error-gate.mjs`, which judges it through the
+real `evaluatePromotionGate` helper and exits non-zero, so the existing
+auto-rollback step restores the pre-deploy Worker version **and**
+container image. The run stays red by design, exactly like the gateway
+drill. Capture `error-rate-gate.json` (mode `rehearsal`, verdict `fail`)
+from the `staging-rollout-evidence` artifact alongside the rollback
+evidence above. This rehearsal proves the gate-to-rollback wiring; it is
+not proof of live 5xx enforcement, which additionally needs the
+`STAGING_METRICS_SCRAPE_TOKEN` secret (see
+[runbook-observability](runbook-observability.md)).
+
 ## Bounds and fail-closed cases
 
 The verification phase has a five-minute deadline, ten-second network socket
@@ -213,8 +238,8 @@ must pass the actual staging job; production cutover remains separately gated.
 
 Pinned source contracts:
 
-- [ApplicationRollout](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.149.0/packages/containers-shared/src/client/models/ApplicationRollout.ts)
-- [RolloutsService](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.149.0/packages/containers-shared/src/client/services/RolloutsService.ts)
-- [Wrangler image build/push](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.149.0/packages/containers-shared/src/build.ts)
-- [Structured output](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.149.0/packages/workers-utils/src/output.ts)
+- [ApplicationRollout](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.151.0/packages/containers-shared/src/client/models/ApplicationRollout.ts)
+- [RolloutsService](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.151.0/packages/containers-shared/src/client/services/RolloutsService.ts)
+- [Wrangler image build/push](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.151.0/packages/containers-shared/src/build.ts)
+- [Structured output](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.151.0/packages/workers-utils/src/output.ts)
 - [Worker version metadata](https://developers.cloudflare.com/workers/runtime-apis/bindings/version-metadata/)
