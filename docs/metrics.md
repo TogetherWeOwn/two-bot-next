@@ -609,6 +609,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `voice_join_slow_burn` | **ticket**, not page: same budget burning faster than 6x in both the 6 h and 30 min windows, with the same per-window volume and bad-move floors (sustained grind the fast rule never catches) | [voice join slow burn](runbook.md#alert-voice-join-slow-burn) |
 | `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` > 600 (two missed 5 min refreshes) with `two_bot_voice_creator_map_generation` > 0; generation 0 (never merged) never fires, missing gauges on older containers hold the previous state | [voice creator-map stale](runbook.md#alert-voice-creator-map-stale) |
 | `community_facts_drain_failures` | **ticket**, not page: summed `two_bot_community_facts_drain_failures_total{reason}` growth in 3 consecutive completed windows; first sample is baseline, flat/reset clears, missing/invalid retains active tickets | [community facts drain failures](runbook.md#alert-community-facts-drain-failures) |
+| `error_budget_fast_burn` | REST error budget (99.9% success over 48 h) burning faster than 12x in both the 15 min and 2 min windows; each window needs at least 10 eligible requests and two budget errors (`5xx` plus `transport`); incomplete post-restart windows stay inactive and missing inputs hold the previous state | [error budget fast burn](runbook.md#alert-error-budget-fast-burn) |
 
 `dispatch_drops` covers `messages`, `interactions`, `registry`, `privileged`,
 `busy` and `reactions` independently (the Worker allowlist is pinned to Rust).

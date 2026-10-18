@@ -46,6 +46,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `voice_join_slow_burn` | **ticket**: genuine creator joins burn the 99.5% move-within-5s budget faster than 6x in both the 6 h and 30 min windows (each uses the same volume and bad-move floors) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-join-slow-burn) |
 | `voice_creator_map_stale` | creator-map age past 600 s (two missed 5 min refreshes) after at least one merge; generation 0 never fires, older containers without the gauges hold state | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-creator-map-stale) |
 | `community_facts_drain_failures` | **ticket**: summed community-facts drain failures grow in 3 consecutive windows after a baseline; single bursts stay silent, flat/reset resolves | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-community-facts-drain-failures) |
+| `error_budget_fast_burn` | **page**: REST error budget burns faster than 12x in both the 15 min and 2 min windows (each needs at least 10 requests and two budget errors; incomplete startup/restart windows stay inactive) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-error-budget-fast-burn) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via
