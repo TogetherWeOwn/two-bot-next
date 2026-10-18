@@ -760,8 +760,14 @@ jobs:
           # share tables and locks, so parallel runs race and
           # --ignore-run-fail would then drop their coverage silently.
           # The reference-docs regen never runs in CI: it rewrites committed docs.
+          # The publication regression and the game-report acceptance have
+          # their own guarded DBs (dedicated step below / agent_test re-run);
+          # never feed them the round-trip/bootstrap URL here, mirroring the
+          # integration step's skips so their guards don't fail the sweep.
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
-            --features two-bot-core/db --locked --ignore-run-fail --no-report
+            --features two-bot-core/db --locked --ignore-run-fail --no-report -- \
+            --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump \
+            --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail \
             --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs
