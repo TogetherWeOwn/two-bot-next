@@ -129,7 +129,27 @@ jobs:
               sha = staged[0]["head_sha"].strip().lower()
               print(f"Promoting the latest successful staging deploy: {sha}")
           if not re.fullmatch(r"[0-9a-f]{40}", sha):
-              refuse("sha must be a full 40-character hex commit SHA")
+              # Accept an unambiguous 7-39 character hex prefix: resolve it to
+              # the full commit via the commits API, then run every downstream
+              # gate on that full SHA. An ambiguous/unknown prefix refuses with
+              # the exact accepted format (10-15 incident: short SHAs refused).
+              accepted = ("sha must be a full 40-character hex commit SHA "
+                          "or an unambiguous 7-40 character hex prefix")
+              if not re.fullmatch(r"[0-9a-f]{7,39}", sha):
+                  refuse(accepted)
+              short = sha
+              try:
+                  commit = json.loads(subprocess.check_output(
+                      ["gh", "api", "--method", "GET", f"repos/{repo}/commits/{short}"],
+                      text=True,
+                  ))
+              except (subprocess.CalledProcessError, ValueError):
+                  refuse(accepted)
+              raw = commit.get("sha", "") if isinstance(commit, dict) else ""
+              full = raw.strip().lower() if isinstance(raw, str) else ""
+              if not re.fullmatch(r"[0-9a-f]{40}", full) or not full.startswith(short):
+                  refuse(accepted)
+              sha = full
           if version and not re.fullmatch(
               r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", version
           ):
