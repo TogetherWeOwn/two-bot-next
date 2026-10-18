@@ -5142,6 +5142,96 @@ async fn schedule_list_at_cap_shows_every_row_without_an_overflow_line() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_over_cap_second_page_lists_hidden_rows() {
+    let db = TestDb::new().await;
+    // Same 27-row over-cap guild as the page-1 acceptance test: page 2 must
+    // reach the bounded hidden window instead of re-paging the first 25.
+    for n in (0..27u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("cap-{n:02}"),
+            &format!("2030-01-{:02}T00:00:00.000Z", n + 1),
+            None,
+            true,
+        )
+        .await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(2)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 1);
+    assert_eq!(
+        contents[0],
+        "`cap-25` `<#3333>` 2030-01-26T00:00:00.000Z\n\
+         `cap-26` `<#3333>` 2030-01-27T00:00:00.000Z",
+        "page 2 lists exactly the rows past the capped first window"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_far_over_cap_second_page_names_remaining_overflow() {
+    let db = TestDb::new().await;
+    // 52 rows: the hidden window itself fills (25 rows) with 2 more behind
+    // it, so page 2 carries its own overflow line; minute-spaced stamps keep
+    // (next_run_at, id) order aligned with id order.
+    for n in (0..52u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("big-{n:02}"),
+            &format!("2030-03-01T{:02}:{:02}:00.000Z", n / 60, n % 60),
+            None,
+            true,
+        )
+        .await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(99)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 2);
+    let mut expected_lines: Vec<String> = (25..50u32)
+        .map(|n| {
+            format!(
+                "`big-{n:02}` `<#3333>` 2030-03-01T{:02}:{:02}:00.000Z",
+                n / 60,
+                n % 60
+            )
+        })
+        .collect();
+    expected_lines.push("(truncated, 2 more)".to_owned());
+    assert_eq!(
+        contents[0],
+        expected_lines.join("\n"),
+        "page 2 lists the full hidden window plus its own overflow line"
+    );
+    assert!(
+        !contents[0].contains("big-50") && !contents[0].contains("big-51"),
+        "rows past the hidden window are counted, not listed: {}",
+        contents[0]
+    );
+    assert_eq!(
+        contents[1], "Page 99 is out of range: this server has 2 page(s) of schedules.",
+        "pages past both windows refuse with the combined page total"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn schedule_list_under_cap_renders_byte_identical_to_before() {
     let db = TestDb::new().await;
     db.seed_schedule_row(
