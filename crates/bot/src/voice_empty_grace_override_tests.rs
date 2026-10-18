@@ -216,7 +216,7 @@ async fn sweep_worker(grace: Duration) -> (GuildRoomWorker<Store, Http>, Trace) 
     let (live, store, http, trace) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
     live.upsert_channel(channel(500, 2, Some(CATEGORY)));
-    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     worker.live.set_empty_grace(grace);
     (worker, trace)
 }

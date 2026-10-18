@@ -12517,8 +12517,4 @@ use join_requests::{
 
 #[cfg(test)]
 #[path = "voice_rooms_tests.rs"]
-// The immutable acceptance companion (`voice_empty_grace_override_tests.rs`)
-// carries an unnecessary `mut` that clippy flags once the seam compiles;
-// the Builder must not edit that file, so the allowance lives here.
-#[allow(unused_mut)]
 mod tests;
