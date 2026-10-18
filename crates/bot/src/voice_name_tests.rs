@@ -1303,3 +1303,79 @@ async fn occupancy_only_override_does_not_wait_for_an_unknown_owner() {
     assert!(worker.dispatch_one(0).await);
     assert_eq!(*trace.lock().unwrap(), ["rename:500:2 here".to_owned()]);
 }
+
+// --- custom-name re-render regression pins (review round 3, PR #1232) --------
+// These pin the remainder of the same list: the blank-template gate, the
+// override name wait, and the original-creator sync. They live here (not in
+// voice_name_rerender_tests.rs, which must stay verbatim). Each fails under
+// its own mutant and passes on the fixed head.
+
+/// Under a blank creator template the room stays manually managed, override
+/// or not: a tokened override must never spend a rename. Kills the
+/// `(true || template.is_some())` mutant at the re-render gate.
+#[tokio::test]
+async fn blank_template_with_a_tokened_override_is_never_rerendered() {
+    let (mut worker, trace) = setup().await;
+    // The fixture creator template is blank by default: keep it blank so the
+    // room is manually managed even though the override reads facts.
+    assert!(
+        worker.creators[&CREATOR].name_template.trim().is_empty(),
+        "fixture creator must start blank"
+    );
+    worker.custom_names.insert(ROOM, "@@num@@ here".to_owned());
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    worker.live.voice_update(302, Some(ROOM), Some(false));
+    worker.refresh_template_names(1);
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+/// An `@@owner@@` override with an unknown owner must wait for the name
+/// instead of renaming the room to "member's den". Kills the
+/// force-`unknown`-to-false mutant in `refresh_custom_name`.
+#[tokio::test]
+async fn owner_override_with_an_unknown_owner_waits_for_the_name() {
+    let (mut worker, trace) = setup().await;
+    worker.creators.get_mut(&CREATOR).unwrap().name_template = "Template @@num@@".to_owned();
+    // The worker knows nobody: setup loads with an empty directory, so the
+    // owner display name is unknown.
+    worker
+        .custom_names
+        .insert(ROOM, "@@owner@@'s den".to_owned());
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    assert!(
+        worker.name_waits.contains_key(&ROOM),
+        "the room must wait for its owner name"
+    );
+    worker.name_directory.insert(OWNER, "Alex".to_owned());
+    worker.refresh_template_names(1);
+    drain(&mut worker).await;
+    assert_eq!(*trace.lock().unwrap(), ["rename:500:Alex's den".to_owned()]);
+}
+
+/// A `/name` submit must sync the fresh original-creator name (not just the
+/// owner), so a later join keeps the promised render when the two differ.
+/// Kills the `[owner_id, original_creator_id] -> [owner_id, owner_id]`
+/// mutants on the submit/restore copy loops.
+#[tokio::test]
+async fn submit_syncs_differing_original_creator_name_so_a_later_join_keeps_it() {
+    let (mut worker, trace) = setup().await;
+    worker.creators.get_mut(&CREATOR).unwrap().name_template = "Template @@num@@".to_owned();
+    worker.rooms.get_mut(&ROOM).unwrap().original_creator_id = GUEST;
+    // The worker still holds a stale nickname for the original creator,
+    // while the submit sees the fresh one (`directory()` maps GUEST to Ben).
+    worker.name_directory.insert(GUEST, "Stale".to_owned());
+    let text = applied(worker.apply_name(
+        command(OWNER, false, submit("@@original_creator@@'s den")),
+        0,
+    ));
+    assert!(text.contains("Ben's den"), "{text}");
+    drain(&mut worker).await;
+    trace.lock().unwrap().clear();
+
+    worker.live.voice_update(302, Some(ROOM), Some(false));
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&ROOM], "Ben's den");
+}
