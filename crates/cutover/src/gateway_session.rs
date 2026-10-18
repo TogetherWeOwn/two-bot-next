@@ -6,13 +6,12 @@
 use std::collections::HashSet;
 
 use sqlx::{PgConnection, PgPool};
+use two_bot_core::analytics_family::{category_of_event, AnalyticsCategory};
 use two_bot_core::gateway_funnel::{FunnelBatch, SnapshotWrite};
 use two_bot_core::gateway_session::{
     dispatch_action, BootDirective, DispatchAction, GatewaySession,
 };
-use two_bot_core::privacy::{
-    category_of_event, inviter_in_metadata, scrubbed_member_join_metadata, AnalyticsCategory,
-};
+use two_bot_core::privacy::{inviter_in_metadata, scrubbed_member_join_metadata};
 use two_bot_core::{format_iso_millis, idempotency_key, EventType, FunnelEvent};
 
 use crate::db::{project_event, FunnelWrite};
@@ -398,20 +397,33 @@ impl GatewaySessionStore {
                 project_event(&mut tx, &write).await?;
             }
         }
-        for (guild_id, member_id, at) in batch.activity {
-            if guild_id.to_string() != self.guild_id {
+        for touch in batch.activity {
+            if touch.guild_id.to_string() != self.guild_id {
                 return Err(sqlx::Error::InvalidArgument(
                     "gateway activity belongs to another guild".into(),
                 ));
             }
-            if suppressed.contains(member_id.to_string().as_str()) {
+            if suppressed.contains(touch.member_id.to_string().as_str()) {
+                continue;
+            }
+            // The timestamp carries its originating family through the
+            // buffer, so a disabled family's touch advances nothing: the
+            // gate runs in this same transaction, before the monotonic
+            // upsert, and a newer disabled stamp can never replace the
+            // allowed family's timestamp.
+            let touch_off = match touch.family {
+                AnalyticsCategory::Presence => !presence_on,
+                AnalyticsCategory::Activity => !activity_on,
+                AnalyticsCategory::Voice => !voice_on,
+            };
+            if touch_off {
                 continue;
             }
             sqlx::query(
                 "INSERT INTO members (guild_id, member_id, last_active_at) VALUES ($1, $2, $3::timestamptz)
                  ON CONFLICT (guild_id, member_id) DO UPDATE SET last_active_at = EXCLUDED.last_active_at
                  WHERE members.last_active_at IS NULL OR members.last_active_at < EXCLUDED.last_active_at",
-            ).bind(&self.guild_id).bind(member_id.to_string()).bind(&at).execute(&mut *tx).await?;
+            ).bind(&self.guild_id).bind(touch.member_id.to_string()).bind(&touch.at).execute(&mut *tx).await?;
         }
         for snapshot in batch.invite_snapshots {
             if snapshot.guild_id.to_string() != self.guild_id {

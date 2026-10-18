@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use crate::analytics_family::AnalyticsCategory;
 use crate::{
     EventType, FunnelEvent, FunnelStore, InviteSnapshotStore, InviteState, MemStore, RecordOutcome,
     Snowflake,
@@ -24,10 +25,22 @@ pub struct InviteSnapshotWrite {
     pub replace_all: bool,
 }
 
+/// One timestamp-buffer entry plus the analytics family of the touch that
+/// staged it. The commit gate needs the origin: a voice-only touch must not
+/// advance `last_active_at` while the guild's voice family is disabled, even
+/// though the entry itself carries no event row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityTouch {
+    pub guild_id: Snowflake,
+    pub member_id: Snowflake,
+    pub at: String,
+    pub family: AnalyticsCategory,
+}
+
 #[derive(Default)]
 pub struct FunnelBatch {
     pub events: Vec<FunnelEvent>,
-    pub activity: Vec<(Snowflake, Snowflake, String)>,
+    pub activity: Vec<ActivityTouch>,
     pub bots: Vec<(Snowflake, Snowflake)>,
     pub snapshots: Vec<SnapshotWrite>,
     pub invite_snapshots: Vec<InviteSnapshotWrite>,
@@ -123,12 +136,23 @@ impl FunnelStore for GatewayFunnelBuffer {
         RecordOutcome { inserted: true }
     }
 
-    fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str) {
-        self.pending.lock().expect("funnel buffer").activity.push((
-            guild_id,
-            member_id,
-            at.to_owned(),
-        ));
+    fn touch_activity(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        at: &str,
+        family: AnalyticsCategory,
+    ) {
+        self.pending
+            .lock()
+            .expect("funnel buffer")
+            .activity
+            .push(ActivityTouch {
+                guild_id,
+                member_id,
+                at: at.to_owned(),
+                family,
+            });
     }
 
     fn next_message_rung(
