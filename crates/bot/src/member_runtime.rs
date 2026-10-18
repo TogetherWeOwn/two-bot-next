@@ -599,4 +599,24 @@ mod tests {
         assert!(cooldowns.admit("overflow", 1, now + ACTOR_COOLDOWN));
         assert_eq!(cooldowns.actors.len(), 1);
     }
+
+    #[test]
+    fn ban_success_confirmation_copy_is_pinned() {
+        // Reply layer only: `MemberResult` carries no member data, so the
+        // pinned copy cannot paste any.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Banned,
+                replayed: false,
+            }),
+            "Banned."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Banned,
+                replayed: true,
+            }),
+            "Banned. Already applied."
+        );
+    }
 }
