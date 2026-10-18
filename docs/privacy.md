@@ -111,7 +111,11 @@ are outside this implementation's scope.
   presence on, play aggregates still persist while voice-derived `in_voice_ms`
   stays 0 (voice spans drain and drop). The table is not a replay fence and
   holds no fence rows; member erasure and opt-out purges have no row to delete
-  there.
+  there. Stale rows do expire by age on the retention cadence (see
+  [Retention](#retention-and-explicit-exceptions)): aggregates whose
+  `updated_at` is older than the horizon are deleted per guild.
+  Operators read these rows through the [game-activity aggregate
+  report](game-activity-report.md).
 
 The authoritative, ordered deletion manifest is
 [`member_erasure_plan.json`](../crates/cutover/src/member_erasure_plan.json).
@@ -183,7 +187,14 @@ complete in under 72 hours with a receipt unless a replay guard is unresolved,
 in which case the request stays pending with no receipt and is reported as
 deferred (with overdue requests older than 72 hours counted separately).
 Long-term aggregates (counts,
-streaks) are never time-purged, and a departed guild's rows go only through
+streaks) are never time-purged, with one exception: game-activity guild
+aggregates (`game_activity_guild_aggregates`) expire by `updated_at` age on
+the retention cadence (default 90 days, `TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`
+accepts 1..=36,500 days and any missing, malformed, or out-of-range value
+falls back to 90 days, only when `TWO_RETENTION_MODE` is exactly
+`execute`; dry runs count and log the same rows without deleting). After
+expiry a returning game's totals restart from zero with no marker. Apart
+from that window, a departed guild's rows go only through
 the guild-purge queue keyed on a true guild removal (a rejoin cancels the
 queued purge). The live gateway invokes the queue/cancel paths on real
 `GUILD_DELETE`/`GUILD_CREATE` dispatches (outage payloads never queue; an
@@ -282,9 +293,17 @@ never recreates the purged `member_inactive` row). Every gated writer serializes
 with concurrent opt-outs (a shared table lock, so a write that passes the
 gate can never land after the purge), and `member_join` rows strip a
 suppressed inviter's `inviterId` from metadata while keeping the joiner's
-own row. Under a disabled toggle `touch_activity` / `mark_bot` may still
-refresh `last_active_at` for non-suppressed members, which is a known
-residual for a follow-up, not silent per-user analytics. Duplicate
+own row. Gateway activity timestamps carry their originating family
+(message/activity versus voice) through the timestamp buffer, and the
+batch commit applies the matching guild toggle inside the same
+transaction before the monotonic `last_active_at` upsert, so a disabled
+family's touch creates or advances nothing and a newer disabled stamp
+can never replace the allowed family's timestamp; the runtime funnel
+store's `touch_activity` honors the same toggle. The standalone
+`cutover::db::{touch_activity, mark_bot}` helpers and the backfill
+binaries that call them stay suppression-only (they carry no family
+signal), which is the remaining residual for a follow-up, not silent
+per-user analytics. Duplicate
 reconfirmations for suppressed pairs advance nothing: the gate runs before
 the observation-maximum path too.
 

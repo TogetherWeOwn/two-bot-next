@@ -108,6 +108,11 @@ import {
   type MetricsAlertState,
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
+import {
+  evaluateRemediation,
+  sanitizeRemediationState,
+  type RemediationState,
+} from "./remediation.ts";
 import { parseRelease, releaseTag, workerVersionTag } from "./error-events.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
 import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
@@ -334,6 +339,7 @@ const DEFAULT_KEEPALIVE_SECONDS = 60;
 const DEFAULT_UNREADY_SECONDS = 120;
 const READINESS_KEY = "two-bot:readiness";
 const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
+const REMEDIATION_KEY = "two-bot:remediation";
 const OPS_METRICS_PATH = "/ops/metrics";
 // Read-only operator roll-ups (TOG-22860), served by the container as JSON.
 // Gateway/backfill stay on the scrape bearer like /ops/metrics; the summary
@@ -539,6 +545,37 @@ export interface ProbeDetail {
   failure: { phase: string; class: string; failedStep?: string; errorCode?: string } | null;
   buildRevision?: string;
   buildId?: string;
+  /**
+   * The /readyz gateway component: true is `ready` (Connected), false is
+   * `starting` (Armed) or `down` (Unconfigured/Draining). Absent unless the
+   * body parsed as a bot report naming the gateway component; the stuck-
+   * gateway rule holds on an absent value, never guessing.
+   */
+  gatewayReady?: boolean;
+}
+
+/**
+ * The /readyz gateway component status (`readiness_report` in
+ * crates/bot/src/server.rs emits `components` as `[name, status]` pairs with
+ * the `ready`/`starting`/`down` vocabulary from crates/core/src/health.rs),
+ * or undefined when the value is not a parseable bot report naming the
+ * gateway component. Only `ready` counts as ready; unknown vocabulary holds
+ * rather than resolving or firing the stuck-gateway rule, so a future status
+ * never silently flips it.
+ */
+export function gatewayComponentReady(components: unknown): boolean | undefined {
+  if (!Array.isArray(components)) return undefined;
+  for (const entry of components) {
+    if (!Array.isArray(entry) || entry.length !== 2) return undefined;
+    const [name, status] = entry;
+    if (typeof name !== "string" || typeof status !== "string") return undefined;
+    if (name === "gateway") {
+      if (status === "ready") return true;
+      if (status === "starting" || status === "down") return false;
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 function probeDetail(body: string): ProbeDetail {
@@ -565,6 +602,8 @@ function probeDetail(body: string): ProbeDetail {
       }
     }
     const detail: ProbeDetail = { failure };
+    const gatewayReady = gatewayComponentReady((report as { components?: unknown } | null)?.components);
+    if (gatewayReady !== undefined) detail.gatewayReady = gatewayReady;
     if (typeof report?.build_revision === "string" && BUILD_TOKEN.test(report.build_revision)) {
       detail.buildRevision = report.build_revision;
     }
@@ -1276,7 +1315,7 @@ export class TwoBotContainer extends Container<Env> {
             errorCode: probe.failure?.errorCode,
           };
           await this.recordReadiness(status, context);
-          await this.evaluateMetricsAlerts(context);
+          await this.evaluateMetricsAlerts(context, probe.gatewayReady);
         } finally {
           // Collapse duplicate chains, preserving unrelated SDK schedules.
           // No takeover can interleave with this owned callback's I/O.
@@ -1351,7 +1390,7 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   /** Pull /metrics, evaluate rules, notify on transitions. Never throws. */
-  private async evaluateMetricsAlerts(context?: AlertContext): Promise<void> {
+  private async evaluateMetricsAlerts(context?: AlertContext, gatewayReady?: boolean): Promise<void> {
     try {
       const previous = (await this.ctx.storage.get<MetricsAlertState>(METRICS_ALERT_KEY)) ?? EMPTY_STATE;
       let samples;
@@ -1382,7 +1421,7 @@ export class TwoBotContainer extends Container<Env> {
         await this.ctx.storage.put(METRICS_ALERT_KEY, interruptDispatchDrops(previous));
         return;
       }
-      const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000);
+      const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000, gatewayReady);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);
       for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses, context)) {
@@ -1396,6 +1435,30 @@ export class TwoBotContainer extends Container<Env> {
           log_url: LOG_QUERY_URL,
         }));
         await this.postWebhookText(content);
+      }
+      // Guarded remediation recommendations ride the same alert path: one
+      // line per recommendation, only while its trigger key fires. A corrupt
+      // guard record restarts the guard rather than blocking alerts.
+      try {
+        const stored = await this.ctx.storage.get<RemediationState>(REMEDIATION_KEY);
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const remediation = evaluateRemediation(firing, sanitizeRemediationState(stored, nowSeconds), nowSeconds);
+        await this.ctx.storage.put(REMEDIATION_KEY, remediation.state);
+        for (const message of remediation.messages) {
+          const content = `${message.text}.${alertContextSuffix(context)}`;
+          console.warn(JSON.stringify({
+            event: "remediation_recommendation",
+            service: "two-bot-next",
+            content,
+            build_revision: context?.buildRevision ?? "unknown",
+            release: releaseTag(this.lastRelease),
+            worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+            log_url: LOG_QUERY_URL,
+          }));
+          await this.postWebhookText(content);
+        }
+      } catch {
+        console.warn("two-bot remediation guard failed; alerts already delivered");
       }
     } catch {
       console.warn("two-bot metrics scrape failed");
