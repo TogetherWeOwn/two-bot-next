@@ -3,7 +3,6 @@
 //! member role, and write no successful selection/routing facts. Explicit
 //! empty (clear), mixed known/stale, known-only and dry-run submissions are
 //! the passing controls. Isolated agent-testdb only; no live Discord.
-#![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
