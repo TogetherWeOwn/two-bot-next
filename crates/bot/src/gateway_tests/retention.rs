@@ -879,3 +879,232 @@ async fn blocked_queue_write_obeys_checkpoint_deadline() {
 async fn blocked_cancel_write_obeys_checkpoint_deadline() {
     blocked_lifecycle_obeys_checkpoint_deadline(true).await;
 }
+
+// --- Retention replay-needed pollable signal (acceptance battery) ---
+//
+// Contract for the implementing change, stated here so no assertion below is
+// a hidden trap:
+// - The pollable surface is the existing `/metrics` render
+//   (`two_bot_core::metrics::Metrics::render`, served by
+//   `metrics_http::scrape`). A fresh `Metrics` renders the signal at zero;
+//   no new endpoint, file, or environment variable is the signal.
+// - The rendered metric name contains `retention_replay_needed` (the repo
+//   convention prefixes `two_bot_`; counter or gauge type is the
+//   implementer's choice). Labelled samples are summed by the parser below.
+// - Exactly the forced purge-skip path advances it: a real guild removal
+//   whose queue write hits the schema gap (the `42P01` error line pinned by
+//   `schema_gapped_real_delete_survives_and_operator_replay_restores_purge`).
+//   The rejoin-cancel skip ("nothing to cancel") and successful queue
+//   writes must not advance it.
+// - The increment call site in `gateway.rs` textually references
+//   `retention_replay_needed` (method or constant named after the metric,
+//   as `set_audit_delivery_halt` mirrors `two_bot_audit_delivery_halt`) and
+//   lives inside the function that emits the skip line, so confinement can
+//   be checked offline.
+// - `docs/privacy.md` points operators at the signal by name while keeping
+//   the manual replay insert.
+//
+// The two database tests read process-global counter deltas. The gateway
+// suite's CI lane runs `--test-threads=1`, which is what makes an exact
+// delta meaningful; run this battery in that lane (or filtered) locally.
+
+const REPLAY_NEEDED_TOKEN: &str = "retention_replay_needed";
+
+/// Sum of every rendered sample whose metric name contains the token.
+/// `None` when no such sample exists at all (signal not implemented).
+fn replay_needed_value(rendered: &str) -> Option<u64> {
+    let mut total: Option<f64> = None;
+    for line in rendered.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        let metric = name.split('{').next().unwrap_or(name);
+        if !metric.contains(REPLAY_NEEDED_TOKEN) {
+            continue;
+        }
+        let parsed: f64 = value
+            .parse()
+            .unwrap_or_else(|_| panic!("replay-needed sample must be numeric: {line}"));
+        total = Some(total.unwrap_or(0.0) + parsed);
+    }
+    total.map(|value| {
+        assert!(
+            value.fract() == 0.0 && value >= 0.0,
+            "replay-needed signal must be a whole count, got {value}"
+        );
+        value as u64
+    })
+}
+
+fn global_replay_needed() -> u64 {
+    let rendered = two_bot_core::metrics::global().render(None);
+    replay_needed_value(&rendered).expect(
+        "global /metrics render must expose a retention_replay_needed sample; \
+         the purge-skip path currently emits only a log line",
+    )
+}
+
+#[test]
+fn retention_replay_needed_signal_is_pollable_and_renders_zero_when_fresh() {
+    let rendered = two_bot_core::metrics::Metrics::default().render(None);
+    assert!(
+        rendered.lines().any(|line| line.starts_with("# TYPE ")
+            && line
+                .split_whitespace()
+                .nth(2)
+                .is_some_and(|name| name.contains(REPLAY_NEEDED_TOKEN))
+            && (line.ends_with(" counter") || line.ends_with(" gauge"))),
+        "fresh metrics must declare a retention_replay_needed counter/gauge \
+         in the pollable render, got:\n{rendered}"
+    );
+    assert_eq!(
+        replay_needed_value(&rendered),
+        Some(0),
+        "a fresh process with no skipped purge must render the signal at zero"
+    );
+}
+
+#[tokio::test]
+async fn retention_replay_needed_skip_path_increments_exactly_once() {
+    // Forced purge-skip: the queue table is missing (42P01), so the real
+    // delete drops its purge obligation. That one skip must advance the
+    // pollable signal by exactly one; the following rejoin-cancel skip
+    // ("nothing to cancel") must not advance it again.
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    sqlx::query("DROP TABLE retention_guild_purge_queue")
+        .execute(pool)
+        .await
+        .unwrap();
+    let before = global_replay_needed();
+    let mut peer = Peer::new().await;
+    let (store, stop, task, _) = runner(pool, &mut peer, None).await;
+    peer.send(delete(2, None)).await;
+    wait_sequence(&store, 2).await;
+    peer.send(create(3, false)).await;
+    wait_sequence(&store, 3).await;
+    assert!(
+        !task.is_finished(),
+        "schema-gapped real delete must not stop the gateway"
+    );
+    assert_eq!(
+        global_replay_needed() - before,
+        1,
+        "one forced purge-skip must increment retention_replay_needed exactly \
+         once, and the rejoin-cancel skip must not increment it"
+    );
+    stop_runner(stop, task).await;
+    peer.close().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn retention_replay_needed_successful_purge_queue_leaves_signal_at_zero() {
+    // Successful path: the queue table exists, the real delete queues its
+    // purge, and the signal must not move.
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    let before = global_replay_needed();
+    let mut peer = Peer::new().await;
+    let (store, stop, task, _) = runner(pool, &mut peer, None).await;
+    peer.send(delete(2, None)).await;
+    wait_sequence(&store, 2).await;
+    assert_eq!(
+        queued(pool).await,
+        1,
+        "the successful delete must queue its purge (precondition)"
+    );
+    assert_eq!(
+        global_replay_needed() - before,
+        0,
+        "a successful purge queue write must leave retention_replay_needed \n         unchanged"
+    );
+    stop_runner(stop, task).await;
+    peer.close().await;
+    db.close().await.unwrap();
+}
+
+fn repo_text(relative: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
+/// Line range (inclusive) of the top-level function enclosing `anchor`.
+fn enclosing_fn_lines(lines: &[&str], anchor: &str) -> (usize, usize) {
+    let is_fn_start = |line: &str| {
+        line.starts_with("fn ")
+            || line.starts_with("pub fn ")
+            || line.starts_with("pub(crate) fn ")
+            || line.starts_with("async fn ")
+            || line.starts_with("pub async fn ")
+            || line.starts_with("pub(crate) async fn ")
+    };
+    let anchor_idx = lines
+        .iter()
+        .position(|line| line.contains(anchor))
+        .unwrap_or_else(|| panic!("anchor not found: {anchor}"));
+    let start = (0..=anchor_idx)
+        .rev()
+        .find(|&idx| is_fn_start(lines[idx]))
+        .expect("anchor must sit inside a top-level function");
+    let end = ((anchor_idx + 1)..lines.len())
+        .find(|&idx| is_fn_start(lines[idx]))
+        .map_or(lines.len() - 1, |idx| idx - 1);
+    (start, end)
+}
+
+#[test]
+fn retention_replay_needed_increment_is_confined_to_the_purge_skip_path() {
+    let gateway = repo_text("src/gateway.rs");
+    let lines: Vec<&str> = gateway.lines().collect();
+    let (start, end) = enclosing_fn_lines(
+        &lines,
+        "retention purge skipped; schema gap, operator replay required",
+    );
+    let token_lines: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(REPLAY_NEEDED_TOKEN))
+        .map(|(idx, _)| idx)
+        .collect();
+    assert!(
+        !token_lines.is_empty(),
+        "gateway.rs must reference retention_replay_needed at the purge-skip \
+         increment site; the skip is currently a bare log line"
+    );
+    assert!(
+        token_lines
+            .iter()
+            .all(|idx| (start..=end).contains(idx)),
+        "every retention_replay_needed reference in gateway.rs must sit \n         inside the function emitting the purge-skip line (lines {}..={}), \n         found at lines {:?}",
+        start + 1,
+        end + 1,
+        token_lines.iter().map(|idx| idx + 1).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn retention_replay_needed_metric_name_is_declared_in_core_metrics() {
+    let metrics = repo_text("../core/src/metrics.rs");
+    assert!(
+        metrics.contains(REPLAY_NEEDED_TOKEN),
+        "crates/core/src/metrics.rs must declare/render the \n         retention_replay_needed metric so /metrics polls it"
+    );
+}
+
+#[test]
+fn retention_replay_needed_runbook_points_at_the_signal() {
+    let privacy = repo_text("../../docs/privacy.md");
+    assert!(
+        privacy.contains(REPLAY_NEEDED_TOKEN),
+        "docs/privacy.md must point operators at retention_replay_needed \n         instead of only the log line"
+    );
+    assert!(
+        privacy.contains("INSERT INTO retention_guild_purge_queue"),
+        "docs/privacy.md must keep the manual Operator replay insert"
+    );
+}
