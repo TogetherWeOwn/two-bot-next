@@ -45,7 +45,7 @@ use twilight_model::oauth::{ApplicationFlags, ApplicationIntegrationMap, Partial
 use twilight_model::user::{CurrentUser, User};
 use twilight_model::util::Timestamp;
 use two_bot_core::funnel::now_millis_for_test;
-use two_bot_core::sticky::{store, ActivityOutcome};
+use two_bot_core::sticky::{store, ActivityOutcome, PutSticky};
 use two_bot_core::{
     RouterGates, RouterRefusal, ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY,
     MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY,
@@ -3417,6 +3417,28 @@ impl TestDb {
         .expect("seed scheduled message");
     }
 
+    /// Seed one scheduled message with caller-chosen channel, timing,
+    /// recurrence and enabled state (full-quota list fixtures need rows
+    /// whose rendered lines carry realistic lengths and state markers).
+    async fn seed_schedule_row(&self, guild_id: &str, row: &ScheduleListFixtureRow) {
+        sqlx::query(
+            "INSERT INTO scheduled_messages
+               (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                created_by, created_at, updated_by, updated_at)
+             VALUES ($1, $2, $3, 'remember this', $4, $5, $6,
+                     '77', '2026-09-30T12:00:00.000Z', '77', '2026-09-30T12:00:00.000Z')",
+        )
+        .bind(&row.id)
+        .bind(guild_id)
+        .bind(&row.channel_id)
+        .bind(&row.next_run_at)
+        .bind(row.interval_seconds)
+        .bind(row.enabled)
+        .execute(&self.pool)
+        .await
+        .expect("seed scheduled message row");
+    }
+
     /// (id, channel_id) for this guild's scheduled messages, in list order.
     async fn schedule_rows(&self) -> Vec<(String, String)> {
         sqlx::query_as(
@@ -4038,6 +4060,236 @@ async fn post_failure_releases_claim_and_audits_post_failed() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn obsolete_post_after_admin_update_preserves_admin_state() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000010"), 120_000, 5).await;
+    // Hold the accepted POST open so the administrator update lands between
+    // the wire post and the store record. The mock delay is the hold; the
+    // POST-arrival poll is the deterministic sync (no blind sleeps).
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 200,
+            body: None,
+            delay: Duration::from_millis(1000),
+        }],
+    )
+    .await;
+    let msg = message(30, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "replacement POST entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim but
+        // preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v2",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(outcome, ActivityOutcome::Held, "lost claim reports held");
+
+    // The orphan replacement is deleted exactly once; the previous sticky is
+    // never retired through the lost-claim branch.
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "one orphan cleanup: {deletes:?}");
+    assert_eq!(
+        deletes[0].path, "/api/v10/channels/3333/messages/9000000000000000000",
+        "orphan id from the held POST",
+    );
+    assert!(
+        !deletes[0].path.ends_with("8000000000000000010"),
+        "previous sticky untouched",
+    );
+
+    // Administrator state wins: new body, previous post columns, no claim,
+    // and no success audit from the obsolete completion.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v2");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000010"),
+        "obsolete record cannot overwrite the live post",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; record recreates none"
+    );
+    assert!(
+        db.audits().await.is_empty(),
+        "lost claim writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn obsolete_post_after_admin_remove_preserves_absence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000011"), 120_000, 5).await;
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 200,
+            body: None,
+            delay: Duration::from_millis(1000),
+        }],
+    )
+    .await;
+    let msg = message(31, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "replacement POST entered",
+        )
+        .await;
+        let removed = store::delete_sticky(&db.pool, GUILD_S, CHANNEL_S)
+            .await
+            .expect("admin remove");
+        assert!(
+            matches!(removed, two_bot_core::sticky::RemoveOutcome::Removed { .. }),
+            "seed row removed",
+        );
+    });
+    assert_eq!(outcome, ActivityOutcome::Held, "lost claim reports held");
+
+    // Exactly the orphan goes; the removed previous id is never re-deleted
+    // through this branch, and the row stays absent.
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "one orphan cleanup: {deletes:?}");
+    assert_eq!(
+        deletes[0].path,
+        "/api/v10/channels/3333/messages/9000000000000000000",
+    );
+    assert!(
+        db.row().await.is_none(),
+        "obsolete record cannot recreate administrator-removed state",
+    );
+    assert!(
+        db.audits().await.is_empty(),
+        "lost claim writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn completion_db_failure_audits_post_failed_and_preserves_newer_claim() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000012"), 120_000, 5).await;
+    // Scoped completion-only fault: the trigger rejects only the record that
+    // carries this test's orphan id. The claim (no post columns) and the
+    // release (post columns untouched) pass through.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION sticky_test_fail_orphan() RETURNS trigger AS $$
+         BEGIN
+           IF NEW.last_message_id = '9000000000000000000' THEN
+             RAISE EXCEPTION 'scoped completion-only failure';
+           END IF;
+           RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install fault function");
+    sqlx::query("DROP TRIGGER IF EXISTS sticky_test_fail_orphan_trg ON sticky_messages")
+        .execute(&db.pool)
+        .await
+        .expect("drop stale fault trigger");
+    sqlx::query(
+        "CREATE TRIGGER sticky_test_fail_orphan_trg
+           BEFORE UPDATE ON sticky_messages FOR EACH ROW
+           EXECUTE FUNCTION sticky_test_fail_orphan()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install fault trigger");
+
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+    let outcome = runtime
+        .on_message(&message(32, CHANNEL, false, Some(GUILD)))
+        .await;
+    assert_eq!(outcome, ActivityOutcome::Held);
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+    );
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "orphan cleaned up: {deletes:?}");
+    assert_eq!(
+        deletes[0].path,
+        "/api/v10/channels/3333/messages/9000000000000000000",
+    );
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "remember this");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000012"),
+        "failed record leaves the live post",
+    );
+    assert_eq!(claim, None, "own claim released for the next activity");
+
+    sqlx::query("DROP TRIGGER IF EXISTS sticky_test_fail_orphan_trg ON sticky_messages")
+        .execute(&db.pool)
+        .await
+        .expect("remove fault trigger");
+    sqlx::query("DROP FUNCTION IF EXISTS sticky_test_fail_orphan()")
+        .execute(&db.pool)
+        .await
+        .expect("remove fault function");
+
+    // Claim ownership: releasing a stale unrelated token cannot clear a newer
+    // claim — the property the post_failed rollback relies on.
+    let grant = store::claim_sticky_post(
+        &db.pool,
+        GUILD_S,
+        CHANNEL_S,
+        "newer-claim",
+        now_millis_for_test(),
+    )
+    .await
+    .expect("newer claim")
+    .expect("window free after release");
+    assert_eq!(grant.body, "remember this");
+    store::release_sticky_post(&db.pool, GUILD_S, CHANNEL_S, "stale-unrelated")
+        .await
+        .expect("stale release");
+    let (_, _, claim) = db.row().await.expect("row exists");
+    assert_eq!(
+        claim.as_deref(),
+        Some("newer-claim"),
+        "stale release preserves the newer claim",
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn sticky_remove_clears_state_and_deletes_the_message() {
     let db = TestDb::new().await;
     db.seed(Some("8000000000000000005"), 120_000, 5).await;
@@ -4200,7 +4452,16 @@ async fn automation_quota_refusals_reply_with_a_remedy_and_write_no_rows_or_audi
     );
     assert_eq!(db.schedule_rows().await.len(), 25);
     assert_eq!(db.feed_rows().await.len(), 25);
-    assert!(db.schedule_audits().await.is_empty());
+    // Schedule capacity refusal audits one `scheduled.create`/`rejected` row
+    // (reason `quota`); feed capacity refusal still audits nothing.
+    let schedule_audits = db.schedule_audits().await;
+    assert_eq!(
+        schedule_audits.len(),
+        1,
+        "schedule capacity refusal audits one row: {schedule_audits:?}"
+    );
+    assert_eq!(schedule_audits[0].0, "scheduled.create");
+    assert_eq!(schedule_audits[0].2, "rejected");
     assert!(db.feed_audits().await.is_empty());
     assert!(!mock
         .requests()
@@ -4608,6 +4869,278 @@ async fn schedule_create_rejects_invalid_input_and_audits_rejected() {
     db.close().await;
 }
 
+// --- acceptance: quota-capacity refusal audits like other refusals --------
+//
+// Locked contract: one capacity refusal writes exactly one audit row with
+// action `scheduled.create`, outcome `rejected` and reason `quota`, in the
+// same shape as a validation rejection (fresh attempt id as `target_key`,
+// invoking member as `actor_id`). A repeated refusal is a new refusal: it
+// writes its own single row and no extra row (`1 refusal = 1 audit` parity).
+
+/// (action, target_key, outcome, reason, actor_id) for this guild's rows in
+/// the shared automation audit log.
+async fn schedule_audit_rows(
+    db: &TestDb,
+) -> Vec<(
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+)> {
+    sqlx::query_as(
+        "SELECT action, target_key, outcome, reason, actor_id
+           FROM automation_audit_log
+          WHERE guild_id = $1 ORDER BY created_at, id",
+    )
+    .bind(GUILD_S)
+    .fetch_all(&db.pool)
+    .await
+    .expect("automation audit rows with reasons")
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_quota_capacity_refusal_audits_one_rejected_row() {
+    use two_bot_core::automation_quota::AutomationQuota;
+
+    let db = TestDb::new().await;
+    let limit = AutomationQuota::Schedules.limit();
+    for n in 0..limit {
+        db.seed_schedule(GUILD_S, &format!("schedule-{n}")).await;
+    }
+    let seeded: Vec<String> = db
+        .schedule_rows()
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(seeded.len() as i64, limit, "guild starts at capacity");
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(30)),
+            ],
+        ))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        AutomationQuota::Schedules.to_string(),
+        "capacity refusal keeps its existing reply text"
+    );
+    assert!(
+        !mock
+            .requests()
+            .iter()
+            .any(|request| request.path.starts_with("/api/v10/channels/")),
+        "refusal posts nothing to a channel"
+    );
+    assert_eq!(
+        db.schedule_rows()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        seeded,
+        "refusal writes no schedule row"
+    );
+
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one capacity refusal writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_eq!(action, "scheduled.create");
+    assert_eq!(outcome, "rejected");
+    assert_eq!(reason.as_deref(), Some("quota"));
+    assert_eq!(
+        actor_id.as_deref(),
+        Some("88"),
+        "audit names the invoking member, like a validation rejection"
+    );
+    let target = target_key
+        .as_deref()
+        .expect("audit names the attempted schedule id");
+    assert!(
+        !target.is_empty() && !seeded.iter().any(|id| id == target),
+        "target is the fresh attempt id, not a seeded row: {target}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_refusals_audit_one_row_each_across_kinds() {
+    use two_bot_core::automation_quota::AutomationQuota;
+
+    let db = TestDb::new().await;
+    for n in 0..AutomationQuota::Schedules.limit() {
+        db.seed_schedule(GUILD_S, &format!("schedule-{n}")).await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+    let valid = || {
+        slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(30)),
+            ],
+        )
+    };
+
+    // Validation refusal (no timing), capacity refusal, the identical
+    // capacity refusal again, then another validation refusal.
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![option(
+                "body",
+                CommandOptionValue::String("hello".to_owned()),
+            )],
+        ))
+        .await;
+    runtime.on_interaction(&valid()).await;
+    runtime.on_interaction(&valid()).await;
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(0)),
+            ],
+        ))
+        .await;
+
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), 4, "every refusal still completes the defer");
+    let replies: Vec<String> = edits
+        .iter()
+        .map(|edit| {
+            let json: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+            json["content"].as_str().expect("reply text").to_owned()
+        })
+        .collect();
+    assert_eq!(
+        replies,
+        vec![
+            "Give either in-minutes (one-shot) or every-minutes (recurring).".to_owned(),
+            AutomationQuota::Schedules.to_string(),
+            AutomationQuota::Schedules.to_string(),
+            "in-minutes must be between 1 and 525600, got 0.".to_owned(),
+        ],
+        "refusal reply texts are unchanged"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len() as i64,
+        AutomationQuota::Schedules.limit(),
+        "no refusal writes a schedule row"
+    );
+
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        4,
+        "each refusal writes exactly one audit row, no refusal writes an \
+         extra row: {audits:?}"
+    );
+    assert!(
+        audits.iter().all(|(action, _, outcome, _, actor_id)| {
+            action == "scheduled.create"
+                && outcome == "rejected"
+                && actor_id.as_deref() == Some("88")
+        }),
+        "all four refusals share the rejected shape: {audits:?}"
+    );
+    let mut reasons: Vec<Option<String>> = audits
+        .iter()
+        .map(|(_, _, _, reason, _)| reason.clone())
+        .collect();
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        vec![
+            Some("Give either in-minutes (one-shot) or every-minutes (recurring).".to_owned()),
+            Some("in-minutes must be between 1 and 525600, got 0.".to_owned()),
+            Some("quota".to_owned()),
+            Some("quota".to_owned()),
+        ],
+        "validation reasons keep their error text; capacity reasons are quota"
+    );
+    let targets: std::collections::BTreeSet<Option<String>> = audits
+        .iter()
+        .map(|(_, target_key, _, _, _)| target_key.clone())
+        .collect();
+    assert_eq!(
+        targets.len(),
+        4,
+        "each refusal audits its own fresh attempt id: {audits:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_quota_capacity_refusal_audit_behavior_is_unchanged() {
+    use two_bot_core::automation_quota::AutomationQuota;
+
+    let db = TestDb::new().await;
+    for n in 0..AutomationQuota::Feeds.limit() {
+        db.seed_feed(GUILD_S, &format!("feed-{n}"), "rss").await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "feed-add",
+            Some(CHANNEL),
+            vec![
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option(
+                    "source",
+                    CommandOptionValue::String("https://example.com/new.xml".to_owned()),
+                ),
+            ],
+        ))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        AutomationQuota::Feeds.to_string()
+    );
+    assert_eq!(
+        db.feed_rows().await.len() as i64,
+        AutomationQuota::Feeds.limit(),
+        "refusal writes no feed row"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "feed capacity refusal audit behavior is unchanged"
+    );
+    assert!(
+        schedule_audit_rows(&db).await.is_empty(),
+        "feed capacity refusal writes no automation audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn schedule_list_is_scoped_to_the_configured_guild_and_audits_nothing() {
@@ -4630,6 +5163,373 @@ async fn schedule_list_is_scoped_to_the_configured_guild_and_audits_nothing() {
     assert!(
         db.schedule_audits().await.is_empty(),
         "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+// --- schedule-list pagination: every configured id stays discoverable -----
+//
+// Locked contract for the builder (test-author handoff; do not edit these
+// tests to fit an implementation):
+//
+// - `/schedule-list` gains ONE optional integer option, `page` (1-based,
+//   minimum 1 in the published registry). Omitting it means page 1.
+// - Each reply holds only whole rows in the existing row format
+//   (`schedule_list_line`), ordered by (`next_run_at`, `id`), and never
+//   exceeds 2,000 UTF-16 units. No id is ever split or silently dropped.
+// - Whenever the guild's rows need more than one page, every page's reply
+//   carries the indicator `Page <current> of <total>` (exact substring), so
+//   staff can walk the pages and enumerate every configured id exactly once.
+//   A single-page reply may or may not carry `Page 1 of 1`.
+// - Empty guild: page 1 (or no page) replies `Nothing scheduled.`; any
+//   higher page is out of range against a total of 1 page.
+// - `page < 1` replies exactly `Page must be at least 1.`
+// - `page > total` replies exactly
+//   `Page <page> is out of range: this server has <total> page(s) of schedules.`
+//   Refusals list no rows and must not overflow on extreme page values.
+// - Listing stays guild-scoped, ephemeral, audit-free and write-free, and
+//   keeps disabled/recurring markers visible on each row.
+
+/// One full-quota fixture row: a realistic 32-hex id, a 19-digit channel
+/// snowflake and a full ISO timestamp, so 25 rendered rows cannot fit in a
+/// single 2,000-unit message (each row is at least ~84 units before state
+/// markers).
+struct ScheduleListFixtureRow {
+    id: String,
+    channel_id: String,
+    next_run_at: String,
+    interval_seconds: Option<i64>,
+    enabled: bool,
+}
+
+/// The 25-row guild quota (`AutomationQuota::Schedules`), in the order the
+/// list must return them: ascending (`next_run_at`, `id`). Rows 10 and 11
+/// share a `next_run_at` so the `id` tie-break is load-bearing; every third
+/// row recurs every 90 minutes; every fifth row is disabled.
+fn schedule_list_fixture_rows() -> Vec<ScheduleListFixtureRow> {
+    (0..25)
+        .map(|n| {
+            let minute = if n == 11 { 10 } else { n };
+            ScheduleListFixtureRow {
+                id: format!("a1b2c3d4e5f60718293a4b5c{n:08x}"),
+                channel_id: format!("123456789012345{:04}", 6000 + n),
+                next_run_at: format!("2030-01-01T00:{minute:02}:00.000Z"),
+                interval_seconds: (n % 3 == 0).then_some(5400),
+                enabled: n % 5 != 4,
+            }
+        })
+        .collect()
+}
+
+/// Parse the `Page <current> of <total>` indicator out of a list reply.
+fn schedule_list_page_indicator(content: &str) -> Option<(i64, i64)> {
+    let rest = content.split("Page ").nth(1)?;
+    let (current, rest) = rest.split_once(" of ")?;
+    let total: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some((current.trim().parse().ok()?, total.parse().ok()?))
+}
+
+/// The schedule rows in a list reply: lines in the row format, which start
+/// with a backticked id. Page indicators and refusals are not rows.
+fn schedule_list_row_lines(content: &str) -> Vec<&str> {
+    content
+        .lines()
+        .filter(|line| line.starts_with('`'))
+        .collect()
+}
+
+/// The complete id a row line leads with (between the first backticks).
+fn schedule_list_row_id(line: &str) -> &str {
+    line.trim_start_matches('`')
+        .split('`')
+        .next()
+        .expect("row line leads with a backticked id")
+}
+
+/// Invoke `/schedule-list` through the shared runtime, optionally with the
+/// `page` option.
+async fn invoke_schedule_list(runtime: &Arc<CommandRuntime>, page: Option<i64>) {
+    let options = page
+        .map(|page| vec![option("page", CommandOptionValue::Integer(page))])
+        .unwrap_or_default();
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), options))
+        .await;
+}
+
+/// Every deferred-reply completion body (`content`), in invocation order.
+/// Also pins the transport shape shared by every page: one ephemeral defer
+/// (type 5, flags 64) and one completion edit per invocation, nothing else.
+fn schedule_list_reply_contents(mock: &MockRest, invocations: usize) -> Vec<String> {
+    let requests = mock.requests();
+    let callbacks: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/callback"))
+        .collect();
+    assert_eq!(
+        callbacks.len(),
+        invocations,
+        "one ephemeral defer per list invocation"
+    );
+    for callback in &callbacks {
+        let json: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("callback json");
+        assert_eq!(json["type"], 5, "deferred reply");
+        assert_eq!(json["data"]["flags"], 64, "ephemeral defer");
+    }
+    let edits: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(
+        edits.len(),
+        invocations,
+        "one completion edit per list invocation, no extra messages"
+    );
+    assert_eq!(
+        requests.len(),
+        invocations * 2,
+        "listing makes no REST calls beyond defer + completion"
+    );
+    edits
+        .iter()
+        .map(|edit| {
+            let json: serde_json::Value =
+                serde_json::from_slice(&edit.body).expect("completion json");
+            json["content"]
+                .as_str()
+                .expect("list content is text")
+                .to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_full_quota_enumerates_every_id_across_pages() {
+    let db = TestDb::new().await;
+    let fixture = schedule_list_fixture_rows();
+    assert_eq!(fixture.len(), 25, "the per-guild schedule quota");
+    // Seed in reverse order: neither insertion order nor a bare
+    // `next_run_at` sort may decide the tied pair's order.
+    for row in fixture.iter().rev() {
+        db.seed_schedule_row(GUILD_S, row).await;
+    }
+    db.seed_schedule("9999", "sched-foreign-full").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    // Page 1 by default, then explicitly: the two must agree byte for byte.
+    invoke_schedule_list(&runtime, None).await;
+    invoke_schedule_list(&runtime, Some(1)).await;
+    let first_two = schedule_list_reply_contents(&mock, 2);
+    assert_eq!(
+        first_two[0], first_two[1],
+        "omitting page means page 1 exactly"
+    );
+    let first = &first_two[0];
+    assert!(
+        first.encode_utf16().count() <= 2000,
+        "page 1 stays within Discord's 2,000 UTF-16 unit cap: {} units",
+        first.encode_utf16().count()
+    );
+    let (current, total_pages) = schedule_list_page_indicator(first)
+        .unwrap_or_else(|| panic!("a full-quota list must announce `Page 1 of <total>`: {first}"));
+    assert_eq!(current, 1, "the first reply is page 1");
+    assert!(
+        (2..=25).contains(&total_pages),
+        "25 whole rows cannot fit one capped message, so pages must continue: \
+         indicator claims {total_pages} page(s)"
+    );
+
+    for page in 2..=total_pages {
+        invoke_schedule_list(&runtime, Some(page)).await;
+    }
+    let contents = schedule_list_reply_contents(&mock, 1 + total_pages as usize);
+    // contents[1] repeats page 1 (checked above); walk 1, 2, ..= total.
+    let mut pages: Vec<&str> = vec![contents[0].as_str()];
+    pages.extend(contents.iter().skip(2).map(String::as_str));
+
+    let mut listed: Vec<&ScheduleListFixtureRow> = Vec::new();
+    for (index, content) in pages.iter().enumerate() {
+        let page = index as i64 + 1;
+        assert!(
+            content.encode_utf16().count() <= 2000,
+            "page {page} stays within the 2,000 UTF-16 unit cap: {} units",
+            content.encode_utf16().count()
+        );
+        assert_eq!(
+            schedule_list_page_indicator(content),
+            Some((page, total_pages)),
+            "every page announces its position: {content}"
+        );
+        assert!(
+            !content.contains("sched-foreign-full"),
+            "another guild's schedule never leaks into page {page}: {content}"
+        );
+        let lines = schedule_list_row_lines(content);
+        assert!(!lines.is_empty(), "page {page} carries at least one row");
+        for line in lines {
+            let id = schedule_list_row_id(line);
+            let row = fixture
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap_or_else(|| panic!("row leads with a complete configured id: {line}"));
+            assert!(
+                line.contains(&format!("<#{}>", row.channel_id)),
+                "row keeps its whole channel mention: {line}"
+            );
+            assert!(
+                line.contains(&row.next_run_at),
+                "row keeps its whole next-run timestamp: {line}"
+            );
+            if row.interval_seconds.is_some() {
+                assert!(
+                    line.contains(" every 90m"),
+                    "recurring row keeps its interval marker: {line}"
+                );
+            } else {
+                assert!(
+                    !line.contains(" every "),
+                    "one-shot row carries no interval marker: {line}"
+                );
+            }
+            if row.enabled {
+                assert!(
+                    !line.contains("(disabled)"),
+                    "enabled row carries no disabled marker: {line}"
+                );
+            } else {
+                assert!(
+                    line.contains(" (disabled)"),
+                    "disabled row keeps its disabled marker: {line}"
+                );
+            }
+            listed.push(row);
+        }
+    }
+
+    let listed_ids: Vec<&str> = listed.iter().map(|row| row.id.as_str()).collect();
+    let expected_ids: Vec<&str> = fixture.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(
+        listed_ids, expected_ids,
+        "walking every page enumerates each configured id exactly once, in \
+         (next_run_at, id) order, with no tail silently dropped"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "listing writes no audit rows on any page"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len(),
+        25,
+        "listing never writes schedule rows"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_empty_guild_pages_are_defined() {
+    let db = TestDb::new().await;
+    // Only another guild has schedules: this guild's list is empty on every
+    // page, and the foreign id must never surface.
+    db.seed_schedule("9999", "sched-foreign-only").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, None).await;
+    invoke_schedule_list(&runtime, Some(1)).await;
+    invoke_schedule_list(&runtime, Some(2)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 3);
+    assert_eq!(contents[0], "Nothing scheduled.");
+    assert_eq!(
+        contents[1], "Nothing scheduled.",
+        "explicit page 1 matches the default on an empty guild"
+    );
+    assert_eq!(
+        contents[2], "Page 2 is out of range: this server has 1 page(s) of schedules.",
+        "an empty guild has exactly one (empty) page"
+    );
+    for content in &contents {
+        assert!(
+            !content.contains("sched-foreign-only"),
+            "foreign rows never surface: {content}"
+        );
+        assert!(content.encode_utf16().count() <= 2000);
+    }
+    assert!(db.schedule_audits().await.is_empty());
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_invalid_and_out_of_range_pages_refuse_without_writes() {
+    let db = TestDb::new().await;
+    let fixture = schedule_list_fixture_rows();
+    for row in fixture.iter().take(3) {
+        db.seed_schedule_row(GUILD_S, row).await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(1)).await;
+    invoke_schedule_list(&runtime, Some(0)).await;
+    invoke_schedule_list(&runtime, Some(-1)).await;
+    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(i64::MAX)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 5);
+    let single_page = &contents[0];
+    assert!(single_page.encode_utf16().count() <= 2000);
+    assert!(
+        matches!(
+            schedule_list_page_indicator(single_page),
+            None | Some((1, 1))
+        ),
+        "a single-page list announces at most `Page 1 of 1`: {single_page}"
+    );
+    let single_ids: Vec<&str> = schedule_list_row_lines(single_page)
+        .iter()
+        .map(|line| schedule_list_row_id(line))
+        .collect();
+    assert_eq!(
+        single_ids,
+        fixture
+            .iter()
+            .take(3)
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        "page 1 lists the whole small guild in order"
+    );
+    assert_eq!(contents[1], "Page must be at least 1.");
+    assert_eq!(contents[2], "Page must be at least 1.");
+    assert_eq!(
+        contents[3],
+        "Page 2 is out of range: this server has 1 page(s) of schedules."
+    );
+    assert_eq!(
+        contents[4],
+        format!(
+            "Page {} is out of range: this server has 1 page(s) of schedules.",
+            i64::MAX
+        ),
+        "extreme page values refuse cleanly instead of overflowing page math"
+    );
+    for refusal in &contents[1..] {
+        for row in fixture.iter().take(3) {
+            assert!(
+                !refusal.contains(&row.id),
+                "a refused page lists no rows: {refusal}"
+            );
+        }
+    }
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "refused pages write no audit rows"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len(),
+        3,
+        "refused pages never write schedule rows"
     );
     mock.shutdown().await;
     db.close().await;
@@ -4708,6 +5608,292 @@ async fn schedule_remove_deletes_by_unique_prefix_and_refuses_ambiguous() {
             "ok".to_owned()
         )]
     );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// `/schedule-remove` invalid ids refuse before any store access (TOG-29645,
+/// IN-03 schedule-remove half): empty and over-128-UTF-16-unit ASCII and
+/// multibyte ids through the real router against a never-usable lazy pool.
+/// A store touch would fail the refused pool and reply with the generic store
+/// failure; the documented refusal instead proves the handler guard returned
+/// first. Only the permitted defer (POST /callback) + completion edit (PATCH)
+/// are recorded — no Discord mutation beyond the acknowledgement.
+#[tokio::test]
+async fn schedule_remove_invalid_ids_refuse_before_database_access() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+
+    // Lengths are UTF-16 units (the guard's unit), not bytes: `é` is one
+    // unit, `😀` is two (a surrogate pair).
+    let ascii_over = "x".repeat(129);
+    let multibyte_over = "é".repeat(129);
+    let surrogate_over = "😀".repeat(65);
+    let hostile_over = format!("{}@everyone{}", "a".repeat(120), "b".repeat(20));
+    assert_eq!(ascii_over.encode_utf16().count(), 129);
+    assert_eq!(multibyte_over.encode_utf16().count(), 129);
+    assert_eq!(surrogate_over.encode_utf16().count(), 65 * 2);
+    assert!(hostile_over.encode_utf16().count() > 128);
+
+    let empty_reply =
+        "No unique scheduled message matches ``. Use the full id from /schedule-list.";
+    let overlong_reply =
+        "No unique scheduled message matches that id. Use the full id from /schedule-list.";
+    let store_failure = "Schedule command failed; try again.";
+
+    // Missing option and empty string both hit the empty guard.
+    let cases: Vec<(Vec<CommandDataOption>, &str)> = vec![
+        (Vec::new(), empty_reply),
+        (
+            vec![option("id", CommandOptionValue::String(String::new()))],
+            empty_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(ascii_over))],
+            overlong_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(multibyte_over))],
+            overlong_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(surrogate_over))],
+            overlong_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(hostile_over))],
+            overlong_reply,
+        ),
+    ];
+    let expected: Vec<String> = cases.iter().map(|(_, reply)| reply.to_string()).collect();
+    for (options, _) in &cases {
+        runtime
+            .on_interaction(&slash("schedule-remove", Some(CHANNEL), options.clone()))
+            .await;
+    }
+
+    let requests = mock.requests();
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 6, "one permitted defer per refusal");
+    let edits: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(edits.len(), 6, "one permitted completion edit per refusal");
+    assert_eq!(
+        requests.len(),
+        12,
+        "permitted defer+edit only, no other Discord call: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.method == "POST" || r.method == "PATCH"),
+        "no DELETE/PUT/message post on refusal: {requests:?}"
+    );
+    for (edit, want) in edits.iter().zip(expected.iter()) {
+        let reply: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+        assert_eq!(&reply["content"], want);
+        assert_ne!(
+            &reply["content"], store_failure,
+            "guard ran before any store access"
+        );
+        assert_eq!(reply["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+    // The overlong reply is a hard-coded literal: hostile input is never echoed.
+    for edit in &edits[2..] {
+        let reply: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+        let content = reply["content"].as_str().expect("string reply");
+        assert_eq!(content, overlong_reply);
+        assert!(
+            !content.contains("@everyone"),
+            "hostile tail must not echo: {content:?}"
+        );
+    }
+    mock.shutdown().await;
+}
+
+/// `/schedule-remove` invalid ids mutate nothing durable (TOG-29645, IN-03
+/// schedule-remove half): the same invalid matrix plus exact-128-unit boundary
+/// and whitespace-only missing-ID controls through the real router against a
+/// disposable database. Stored rows and audit rows are unchanged until the
+/// valid-prefix control deletes exactly one row.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_remove_invalid_ids_leave_store_untouched() {
+    let db = TestDb::new().await;
+    db.seed_schedule(GUILD_S, "keep111").await;
+    db.seed_schedule(GUILD_S, "keep222").await;
+    db.seed_schedule(GUILD_S, "xyz999").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    let ascii_over = "x".repeat(129);
+    let multibyte_over = "é".repeat(129);
+    let surrogate_over = "😀".repeat(65);
+    let hostile_over = format!("{}@everyone{}", "a".repeat(120), "b".repeat(20));
+    let ascii_exact = "x".repeat(128);
+    let multibyte_exact = "é".repeat(128);
+    assert_eq!(ascii_over.encode_utf16().count(), 129);
+    assert_eq!(multibyte_over.encode_utf16().count(), 129);
+    assert_eq!(surrogate_over.encode_utf16().count(), 65 * 2);
+    assert_eq!(ascii_exact.encode_utf16().count(), 128);
+    assert_eq!(multibyte_exact.encode_utf16().count(), 128);
+
+    let empty_reply =
+        "No unique scheduled message matches ``. Use the full id from /schedule-list.";
+    let overlong_reply =
+        "No unique scheduled message matches that id. Use the full id from /schedule-list.";
+    let whitespace_reply =
+        "No unique scheduled message matches `   `. Use the full id from /schedule-list.";
+    let ascii_exact_reply = format!(
+        "No unique scheduled message matches `{ascii_exact}`. Use the full id from /schedule-list."
+    );
+    let multibyte_exact_reply = format!(
+        "No unique scheduled message matches `{multibyte_exact}`. Use the full id from /schedule-list."
+    );
+
+    // Invalid: missing, empty, overlong ASCII / multibyte / surrogate /
+    // hostile. Boundary/missing controls: whitespace-only (a missing-ID
+    // control under current behavior, not a pre-lookup refusal) and the two
+    // exact-128-unit ids (they pass the guard, miss in the store, and echo).
+    let invalid_cases: Vec<(Vec<CommandDataOption>, String)> = vec![
+        (Vec::new(), empty_reply.to_owned()),
+        (
+            vec![option("id", CommandOptionValue::String(String::new()))],
+            empty_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(ascii_over))],
+            overlong_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(multibyte_over))],
+            overlong_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(surrogate_over))],
+            overlong_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(hostile_over))],
+            overlong_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String("   ".to_owned()))],
+            whitespace_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(ascii_exact))],
+            ascii_exact_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(multibyte_exact))],
+            multibyte_exact_reply,
+        ),
+    ];
+    for (options, _) in &invalid_cases {
+        runtime
+            .on_interaction(&slash("schedule-remove", Some(CHANNEL), options.clone()))
+            .await;
+    }
+
+    // Forbidden effects: no row removed, no audit written.
+    let remaining: Vec<String> = db
+        .schedule_rows()
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        remaining,
+        vec![
+            "keep111".to_owned(),
+            "keep222".to_owned(),
+            "xyz999".to_owned()
+        ],
+        "invalid and boundary/missing ids delete nothing"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "refusals write no scheduled.delete audit row"
+    );
+
+    // Permitted vs forbidden Discord effects: one defer + one completion edit
+    // per refusal; no channel post, delete, or registry publish.
+    let requests = mock.requests();
+    assert_eq!(
+        mock.posts_to("/callback").await.len(),
+        9,
+        "one permitted defer per refusal"
+    );
+    let edits: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(edits.len(), 9, "one permitted completion edit per refusal");
+    assert_eq!(
+        requests.len(),
+        18,
+        "permitted defer+edit only on refusal: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.method == "POST" || r.method == "PATCH"),
+        "no DELETE/PUT/message post on refusal: {requests:?}"
+    );
+    assert!(mock.deletes().is_empty(), "no Discord delete on refusal");
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "no channel post on refusal"
+    );
+    for (edit, (_, want)) in edits.iter().zip(invalid_cases.iter()) {
+        let reply: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+        assert_eq!(&reply["content"], want);
+        assert_eq!(reply["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+    let hostile_edit: serde_json::Value =
+        serde_json::from_slice(&edits[5].body).expect("hostile edit json");
+    assert!(
+        !hostile_edit["content"]
+            .as_str()
+            .expect("string reply")
+            .contains("@everyone"),
+        "overlong reply never echoes hostile input"
+    );
+
+    // Valid control: the uniquely-resolving prefix still deletes exactly one
+    // row through the same router, proving the fixture was live and the
+    // invalid inputs left the store usable.
+    runtime
+        .on_interaction(&slash(
+            "schedule-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::String("xyz".to_owned()))],
+        ))
+        .await;
+    let remaining: Vec<String> = db
+        .schedule_rows()
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        remaining,
+        vec!["keep111".to_owned(), "keep222".to_owned()],
+        "valid prefix still deletes its row after the invalid matrix"
+    );
+    assert_eq!(
+        db.schedule_audits().await,
+        vec![(
+            "scheduled.delete".to_owned(),
+            "xyz999".to_owned(),
+            "ok".to_owned()
+        )],
+        "only the valid control audits"
+    );
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), 10, "one completion per interaction");
+    let valid: serde_json::Value = serde_json::from_slice(&edits[9].body).unwrap();
+    assert_eq!(valid["content"], "Cancelled.");
     mock.shutdown().await;
     db.close().await;
 }

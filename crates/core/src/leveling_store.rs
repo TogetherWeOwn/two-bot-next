@@ -206,8 +206,11 @@ async fn seconds_since_last_award(
 /// Today's (UTC day of the award) granted-award count and XP sum for one
 /// source: the daily-counter inputs for the anti-gaming policy (AC2).
 /// Derived from the `xp_awards` audit trail on every award, so no second
-/// table can drift from it. Zero-XP audit rows inflate the count but never
-/// the total, and the ladder is already 0 past ten awards either way.
+/// table can drift from it. `short_message` rows are excluded from the count:
+/// they earn zero while consuming only the cooldown, and must not use up
+/// later ladder rungs. Other zero-XP audit rows (cap/ladder exhaustion)
+/// inflate the count but never the total, and the ladder is already 0 past
+/// ten awards either way, so counting them is harmless.
 async fn day_counters(
     pool: &PgPool,
     guild_id: &str,
@@ -217,7 +220,8 @@ async fn day_counters(
     day_end_iso: &str,
 ) -> Result<(u64, u64), LevelingStoreError> {
     let (count, total): (i64, Option<i64>) = sqlx::query_as(
-        "SELECT COUNT(*), SUM(xp) FROM xp_awards
+        "SELECT COUNT(*) FILTER (WHERE decision IS DISTINCT FROM 'short_message'), SUM(xp)
+         FROM xp_awards
          WHERE guild_id = $1 AND member_id = $2 AND source = $3
            AND occurred_at >= $4::text::timestamptz
            AND occurred_at < $5::text::timestamptz",
@@ -234,7 +238,8 @@ async fn day_counters(
 
 /// Prior message awards from one channel in the trailing 10 minutes (AC2
 /// burst input). `None` channels match only `NULL` rows
-/// (`IS NOT DISTINCT FROM`).
+/// (`IS NOT DISTINCT FROM`). `short_message` rows are excluded: they consume
+/// only the cooldown and must not trigger burst halving for later messages.
 async fn same_channel_recent(
     pool: &PgPool,
     guild_id: &str,
@@ -246,7 +251,8 @@ async fn same_channel_recent(
         "SELECT COUNT(*) FROM xp_awards
          WHERE guild_id = $1 AND member_id = $2 AND source = 'message'
            AND channel_id IS NOT DISTINCT FROM $3
-           AND occurred_at > $4::text::timestamptz",
+           AND occurred_at > $4::text::timestamptz
+           AND decision IS DISTINCT FROM 'short_message'",
     )
     .bind(guild_id)
     .bind(member_id)
@@ -319,24 +325,78 @@ async fn record_capped_attempt(
     current_award(pool, guild_id, member_id).await
 }
 
+/// Leave the decision-marked 0-XP audit row for a short-message attempt while
+/// consuming the message cooldown once (approved participation design:
+/// trimmed < 8 scalars, no embed/attachment). Unlike cap/ladder rows this
+/// claims `xp_cooldowns` in the same transaction, so a quick follow-up stays
+/// blocked and the blocked attempt does not restart the clock. A lost
+/// cooldown race stays silent like legacy (no row, no state).
+async fn record_short_attempt(
+    pool: &PgPool,
+    guild_id: &str,
+    member_id: &str,
+    at_ms: i64,
+    at_norm: &str,
+    channel_id: Option<&str>,
+) -> Result<XpAward, LevelingStoreError> {
+    let mut tx = pool.begin().await?;
+    // Same atomic claim as the granted path: wins only when no row exists or
+    // the stored timestamp is at least a full cooldown old. The loser sees no
+    // RETURNING row and stays silent without a second audit row.
+    let cutoff_iso = format_iso_millis(at_ms - AWARD_COOLDOWN_SECONDS as i64 * 1000);
+    let claimed: Option<(String,)> = sqlx::query_as(
+        "INSERT INTO xp_cooldowns (guild_id, member_id, source, last_awarded_at)
+         VALUES ($1, $2, 'message', $3::text::timestamptz)
+         ON CONFLICT (guild_id, member_id, source) DO UPDATE
+           SET last_awarded_at = excluded.last_awarded_at
+         WHERE xp_cooldowns.last_awarded_at <= $4::text::timestamptz
+         RETURNING last_awarded_at::text",
+    )
+    .bind(guild_id)
+    .bind(member_id)
+    .bind(at_norm)
+    .bind(cutoff_iso)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if claimed.is_none() {
+        tx.rollback().await?;
+        return current_award(pool, guild_id, member_id).await;
+    }
+    sqlx::query(
+        "INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at, channel_id, decision)
+         VALUES ($1, $2, 'message', 0, $3::text::timestamptz, $4, 'short_message')",
+    )
+    .bind(guild_id)
+    .bind(member_id)
+    .bind(at_norm)
+    .bind(channel_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    current_award(pool, guild_id, member_id).await
+}
+
 /// Award message XP (legacy `awardMessage` base [`MESSAGE_XP`]) through the
-/// anti-gaming policy (AC2): the 15/5/0 daily ladder, the 150 XP UTC-day cap
-/// and same-channel burst halving adjudicate every attempt via
-/// [`adjudicate_message_award`]; granted awards mirror into the seasonal
-/// projection (AC3). Lifetime XP, the MEE6 curve and role grants are
-/// unchanged; capped attempts leave a decision-marked 0-XP audit row while
-/// cooldown and ceiling rejections stay silent like legacy.
+/// anti-gaming policy (AC2): the short-message floor, the 15/5/0 daily
+/// ladder, the 150 XP UTC-day cap and same-channel burst halving adjudicate
+/// every attempt via [`adjudicate_message_award`]; granted awards mirror into
+/// the seasonal projection (AC3). Lifetime XP, the MEE6 curve and role grants
+/// are unchanged; short, capped and ladder-exhausted attempts leave a
+/// decision-marked 0-XP audit row while cooldown and ceiling rejections stay
+/// silent like legacy.
 ///
-/// The store carries no message content, so short-message filtering cannot
-/// apply here: attempts arrive as normal-length bodies and the content rule
-/// lives in the pure policy, where the gateway (which owns content) can
-/// supply it.
+/// Only transient shape travels here: the trimmed scalar count (`None` is
+/// unknown shape when MESSAGE_CONTENT is absent and preserves the existing
+/// award) plus the embed/attachment bit. Bodies are never carried, persisted
+/// or logged by this path.
 pub async fn award_message(
     pool: &PgPool,
     guild_id: &str,
     member_id: &str,
     at_iso: &str,
     channel_id: Option<&str>,
+    content_length: Option<usize>,
+    has_embed_or_attachment: bool,
 ) -> Result<XpAward, LevelingStoreError> {
     let at_ms = validate_at(at_iso)?;
     let at_norm = format_iso_millis(at_ms);
@@ -361,13 +421,19 @@ pub async fn award_message(
         &format_iso_millis(at_ms - 600_000),
     )
     .await?;
+    // Unknown shape (MESSAGE_CONTENT absent) preserves the existing award:
+    // feed the floor length so the short rule cannot fire without new intents.
+    // `Some(n)` is the gateway-measured trimmed scalar count, including zero
+    // for a known empty message.
+    let is_short =
+        content_length.is_some_and(|n| n < MESSAGE_SHORT_MIN_LEN) && !has_embed_or_attachment;
     let policy = adjudicate_message_award(MessageAwardInput {
         previous_xp: current.total_xp,
         daily_award_index: day_count as usize,
         day_total_xp: day_total,
         seconds_since_last_award: since,
-        content_len: MESSAGE_SHORT_MIN_LEN,
-        has_embed_or_attachment: false,
+        content_len: content_length.unwrap_or(MESSAGE_SHORT_MIN_LEN),
+        has_embed_or_attachment,
         same_channel_awards_in_10min: channel_recent as usize,
         headroom: MAX_STORED_XP - current.total_xp,
     });
@@ -396,8 +462,8 @@ pub async fn award_message(
         return Ok(out);
     }
     // Policy zero: cooldown and ceiling rejections stay silent like legacy
-    // (no row, no state); cap and ladder exhaustion leave the
-    // decision-marked 0-XP audit row.
+    // (no row, no state); short, cap and ladder exhaustion leave a
+    // decision-marked 0-XP audit row (short also consumes the cooldown once).
     let cooldown_blocked = since.is_some_and(|s| s < AWARD_COOLDOWN_SECONDS);
     let ladder: u64 = if day_count < 5 {
         MESSAGE_XP
@@ -415,9 +481,13 @@ pub async fn award_message(
     if cooldown_blocked || ceiling {
         return current_award(pool, guild_id, member_id).await;
     }
+    // Short-message wins over cap/ladder (pure policy order): a known short
+    // body earns zero while consuming the cooldown once.
+    if is_short {
+        return record_short_attempt(pool, guild_id, member_id, at_ms, &at_norm, channel_id).await;
+    }
     // The only other reachable zeros are the day cap and ladder exhaustion
-    // (short-message cannot fire without content; halving never zeroes a
-    // nonzero ladder rung).
+    // (halving never zeroes a nonzero ladder rung).
     let decision = if day_total >= MESSAGE_DAILY_CAP_XP {
         "daily_cap"
     } else {

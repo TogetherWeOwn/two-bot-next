@@ -212,6 +212,7 @@ const VOICE_RS_ADJACENT: [&str; 17] = [
     "voice halt re-probe: store still refusing",
     "voice worker halt cleared: store credentials healthy",
     "voice worker stuck: queued actions with no progress",
+    "voice live view was not ready on a connected gateway; republished from cache",
 ];
 
 // Test-only emissions inside the scanned files' `#[cfg(test)]` modules. They

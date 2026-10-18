@@ -1,0 +1,1 @@
+{"choices": [{"finish_reason": "stop", "index": 0, "message": {"content": "{\"suggestions\":[{\"explanation\":\"a\",\"template\":\"##\"},{\"explanation\":\"b\",\"template\":\"$#\"},{\"explanation\":\"c\",\"template\":\"+#\"},{\"explanation\":\"d\",\"template\":\"[[Alpha/Beta]]\"}]}", "role": "assistant"}}], "id": "reply-1", "object": "chat.completion"}

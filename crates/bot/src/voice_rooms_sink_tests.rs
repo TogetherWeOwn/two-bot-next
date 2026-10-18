@@ -756,6 +756,152 @@ async fn warm_resume_reopens_voice_span_for_cached_member() {
     );
 }
 
+fn live_ready(runtime: &Runtime) -> bool {
+    runtime
+        .live_actor(GUILD)
+        .expect("guild actor")
+        .live
+        .read_state()
+        .ready
+}
+
+async fn wait_moves(trace: &Trace, member: u64, count: usize) {
+    let prefix = format!("move:{member}:");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.starts_with(&prefix))
+            .count()
+            < count
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("member {member} moved {count} time(s); trace: {trace:?}"));
+}
+
+/// Production regression (build e18e9938, 2026-10-17 22:15Z to 10-18 14:38Z):
+/// once the guild's last voice member left, Twilight dropped the guild's
+/// voice-state set from the cache. The next transport loss cleared `ready`,
+/// and the warm RESUME that followed found no complete cached snapshot, so
+/// nothing was published: the live view stayed `ready == false` and every
+/// later creator join was silently ignored (no accept, no refusal, flat
+/// `two_bot_voice_joins_received_total`) until a restart re-ran
+/// GUILD_CREATE. Every RESUMED must restore the live view and joins must
+/// keep producing tickets, however many RESUMEs the process has seen.
+#[tokio::test]
+async fn warm_resume_after_guild_voice_empties_keeps_moving_creator_joins() {
+    const LAST_LEAVER: u64 = 301;
+    const PLAIN_VOICE: u64 = 700;
+    let (store, http, trace) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[PLAIN_VOICE]);
+    assert!(live_ready(&runtime));
+    // The guild's last voice member leaves; Twilight removes the now-empty
+    // guild entry from its voice-state index (re-created on the next join).
+    feed(
+        &runtime,
+        &pipeline,
+        voice_event(LAST_LEAVER, Some(PLAIN_VOICE)),
+    );
+    feed(&runtime, &pipeline, voice_event(LAST_LEAVER, None));
+    assert!(
+        pipeline
+            .cache()
+            .guild_voice_states(Id::new(GUILD))
+            .is_none(),
+        "fixture precondition: Twilight drops the empty guild voice-state set"
+    );
+    // Production saw ~10 transport losses, each followed by a warm RESUME.
+    for resume in 1..=3 {
+        runtime.disconnect();
+        assert!(!live_ready(&runtime));
+        feed(&runtime, &pipeline, Event::Resumed);
+        assert!(
+            live_ready(&runtime),
+            "live view must be ready again after warm RESUMED #{resume}"
+        );
+    }
+    // The owner joins "Create a Lobby": the join must be ticketed and moved.
+    feed(&runtime, &pipeline, voice_event(MEMBER, Some(CREATOR)));
+    wait_moves(&trace, MEMBER, 1).await;
+}
+
+fn self_heals() -> u64 {
+    let text = two_bot_core::metrics::global().render(None);
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("two_bot_voice_live_self_heal_total "))
+        .expect("self-heal counter rendered");
+    line.rsplit_once(' ').unwrap().1.parse().unwrap()
+}
+
+/// Self-correction: whatever leaves a live view not ready on a connected
+/// gateway (here a RESUMED whose cache cannot build a snapshot), the view
+/// reports its not-ready age for the watchdog, and the next dispatch
+/// republishes from the cache so the join that carries it is still moved.
+#[tokio::test]
+async fn connected_gateway_republishes_a_not_ready_view_and_moves_the_join() {
+    let (store, http, trace) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    let live = runtime.live_actor(GUILD).expect("guild actor").live;
+    let later = |secs| tokio::time::Instant::now() + Duration::from_secs(secs);
+    assert_eq!(live.not_ready_secs(later(90)), 0);
+    runtime.disconnect();
+    // RESUMED handled against a cache that cannot build this guild.
+    let cold = MemPipeline::for_replay();
+    runtime.handle(&Event::Resumed, cold.cache());
+    assert!(!live_ready(&runtime));
+    let stamped = later(90);
+    assert!(
+        live.not_ready_secs(stamped) >= 89,
+        "not ready on a connected gateway must be visible to the watchdog"
+    );
+    // A dispatch whose cache still cannot build the guild keeps the view
+    // not ready, and the retry does not restart the watchdog clock.
+    runtime.handle(&voice_event(301, None), cold.cache());
+    assert!(!live_ready(&runtime));
+    assert!(live.not_ready_secs(stamped) >= 89);
+    let healed = self_heals();
+    // The join's own dispatch heals the view and is still ticketed.
+    feed(&runtime, &pipeline, voice_event(MEMBER, Some(CREATOR)));
+    assert!(live_ready(&runtime));
+    assert_eq!(live.not_ready_secs(later(90)), 0);
+    assert!(self_heals() > healed);
+    wait_moves(&trace, MEMBER, 1).await;
+}
+
+/// The heal is only for a connected gateway: during an outage a not-ready
+/// view is correct (cached occupancy is not authoritative until RESUMED),
+/// so no dispatch republishes it and the watchdog clock stays at zero.
+#[tokio::test]
+async fn transport_down_never_heals_or_counts_the_live_view() {
+    let (store, http, trace) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    let live = runtime.live_actor(GUILD).expect("guild actor").live;
+    runtime.disconnect();
+    feed(&runtime, &pipeline, voice_event(MEMBER, Some(CREATOR)));
+    assert!(!live_ready(&runtime));
+    assert_eq!(
+        live.not_ready_secs(tokio::time::Instant::now() + Duration::from_secs(90)),
+        0
+    );
+    status(&runtime).await;
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry == "create" || entry.starts_with("move:")));
+}
+
 #[test]
 fn guild_delete_drops_unflushed_game_activity_state() {
     let (store, http, _) = fixture();

@@ -52,8 +52,16 @@ async fn message_daily_cap_enforced_inside_tx() -> Result<(), two_bot_core::Leve
     let channel = "200000000000000001";
     // Eleven message awards inside one UTC day (61 s apart, ~11 min span).
     for index in 0..11 {
-        let award =
-            store::award_message(&pool, GUILD, MEMBER, &at(index * 61), Some(channel)).await?;
+        let award = store::award_message(
+            &pool,
+            GUILD,
+            MEMBER,
+            &at(index * 61),
+            Some(channel),
+            None,
+            false,
+        )
+        .await?;
         if index < 10 {
             assert!(award.awarded > 0, "award #{index} inside cap must grant XP");
         } else {
@@ -97,7 +105,16 @@ async fn capped_attempts_leave_zero_xp_audit_row() -> Result<(), two_bot_core::L
     let pool = fixture.pool().clone();
     let channel = "200000000000000001";
     for index in 0..11 {
-        store::award_message(&pool, GUILD, MEMBER, &at(index * 61), Some(channel)).await?;
+        store::award_message(
+            &pool,
+            GUILD,
+            MEMBER,
+            &at(index * 61),
+            Some(channel),
+            None,
+            false,
+        )
+        .await?;
     }
     // Capped attempts must write a 0-XP audit row (decision-marked) instead of
     // vanishing like cooldown rejections, without consuming extra state.
@@ -120,7 +137,16 @@ async fn capped_attempts_leave_zero_xp_audit_row() -> Result<(), two_bot_core::L
 async fn seasonal_upsert_parallels_lifetime() -> Result<(), two_bot_core::LevelingStoreError> {
     let fixture = database().await;
     let pool = fixture.pool().clone();
-    store::award_message(&pool, GUILD, MEMBER, &at(0), Some("200000000000000001")).await?;
+    store::award_message(
+        &pool,
+        GUILD,
+        MEMBER,
+        &at(0),
+        Some("200000000000000001"),
+        None,
+        false,
+    )
+    .await?;
     store::award_voice(
         &pool,
         GUILD,
@@ -157,7 +183,7 @@ async fn decay_job_writes_audit_rows_leaves_lifetime(
 ) -> Result<(), two_bot_core::LevelingStoreError> {
     let fixture = database().await;
     let pool = fixture.pool().clone();
-    let first = store::award_message(&pool, GUILD, MEMBER, &at(0), None).await?;
+    let first = store::award_message(&pool, GUILD, MEMBER, &at(0), None, None, false).await?;
     assert_eq!(first.awarded, 15);
     // The Monday decay tick (seasonal only, 10 %/week past 28 d inactivity)
     // must write `source='decay'` audit rows and never touch lifetime XP.
@@ -197,8 +223,8 @@ async fn concurrent_first_award_race_with_seasonal() -> Result<(), two_bot_core:
     // exactly one wins. The seasonal projection must mirror the winner.
     let instant = at(0);
     let (first, second) = tokio::join!(
-        store::award_message(&pool, GUILD, OTHER, &instant, None),
-        store::award_message(&pool, GUILD, OTHER, &instant, None),
+        store::award_message(&pool, GUILD, OTHER, &instant, None, None, false),
+        store::award_message(&pool, GUILD, OTHER, &instant, None, None, false),
     );
     let (first, second) = (first?, second?);
     assert!(

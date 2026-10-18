@@ -57,6 +57,12 @@ pub struct AwardRequest {
     channel_id: Snowflake,
     at: String,
     duration: Option<u64>,
+    /// Transient short-message shape: `None` is unknown (MESSAGE_CONTENT
+    /// absent, existing award preserved); `Some` is the trimmed scalar count.
+    /// Bodies never travel here, only the count.
+    pub content_length: Option<usize>,
+    /// Whether the gateway message carried an embed or attachment.
+    pub has_embed_or_attachment: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -69,8 +75,9 @@ impl LevelingHook for DeferredLeveling {
         member_id: u64,
         at: &str,
         channel_id: u64,
+        shape: two_bot_core::MessageShape,
     ) -> LevelOutcome {
-        self.push(guild_id, member_id, at, channel_id, None)
+        self.push_message(guild_id, member_id, at, channel_id, shape)
     }
 
     fn award_voice(
@@ -86,6 +93,30 @@ impl LevelingHook for DeferredLeveling {
 }
 
 impl DeferredLeveling {
+    fn push_message(
+        &self,
+        guild_id: u64,
+        member_id: u64,
+        at: &str,
+        channel_id: u64,
+        shape: two_bot_core::MessageShape,
+    ) -> LevelOutcome {
+        self.0.lock().expect("leveling buffer").push(AwardRequest {
+            guild_id,
+            member_id,
+            channel_id,
+            at: at.to_owned(),
+            duration: None,
+            content_length: shape.content_length,
+            has_embed_or_attachment: shape.has_embed_or_attachment,
+        });
+        // Only the awaited store result can report a threshold crossing.
+        LevelOutcome {
+            leveled_up: false,
+            level: 0,
+        }
+    }
+
     fn push(
         &self,
         guild_id: u64,
@@ -100,6 +131,8 @@ impl DeferredLeveling {
             channel_id,
             at: at.to_owned(),
             duration,
+            content_length: None,
+            has_embed_or_attachment: false,
         });
         // Only the awaited store result can report a threshold crossing.
         LevelOutcome {
@@ -508,6 +541,8 @@ impl LevelingRuntime {
                     &member,
                     &request.at,
                     Some(&channel),
+                    request.content_length,
+                    request.has_embed_or_attachment,
                 )
                 .await?
             }
