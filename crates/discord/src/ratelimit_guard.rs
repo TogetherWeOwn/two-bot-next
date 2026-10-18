@@ -1,12 +1,24 @@
-//! Process-wide Discord invalid-request budget and global cooldown.
+//! Process-wide Discord invalid-request budget, global cooldown, per-route
+//! bucket deadlines and shared global pacing for the backfill REST client.
 //!
 //! The mutex covers bookkeeping only, never network I/O or a sleep. Already
 //! in-flight requests may finish after a breaker opens; every new attempt
 //! checks admission again. Clones and independently constructed executors
 //! share [`process_guard`], including callers using an API proxy.
+//!
+//! Rate-limit facts below follow the official rate-limits page
+//! (<https://docs.discord.com/developers/topics/rate-limits>, verified
+//! 2026-10-12): per-route buckets via `X-RateLimit-Bucket`/`Limit`/
+//! `Remaining`/`Reset`/`Reset-After`, bots capped at 50 requests/second
+//! globally, 429-only `X-RateLimit-Global`/`Scope` (`user`/`global`/`shared`)
+//! with `Retry-After`/`retry_after` waits, and 401/403/429 responses counting
+//! toward the 10k-per-10-minute invalid-request cutoff except `shared`-scope
+//! 429s. Every per-route number honored here arrives in a response header;
+//! the only constants are the documented 50/second floor (which no header
+//! carries) and the legacy 250 ms safety pad the 429 path already uses.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -14,6 +26,22 @@ use tokio::time::Instant;
 
 pub const INVALID_REQUEST_WINDOW: Duration = Duration::from_secs(600);
 pub const DEFAULT_INVALID_REQUEST_THRESHOLD: usize = 5_000;
+/// Bot-wide request ceiling, requests/second (official rate-limits page,
+/// verified 2026-10-12). No response header carries it, so the shared pacing
+/// floor below names the documented value instead of inferring one.
+pub const GLOBAL_REQUESTS_PER_SECOND: u64 = 50;
+/// Minimum spacing between admissions on one guard, derived from
+/// [`GLOBAL_REQUESTS_PER_SECOND`] (1000/50): independent executors sharing a
+/// guard spread out instead of bursting past the documented global rate.
+pub const GLOBAL_MIN_INTERVAL: Duration = Duration::from_millis(1000 / GLOBAL_REQUESTS_PER_SECOND);
+/// Extra safety margin folded into each pacing slot (conservative over the
+/// documented floor, never under it): timer wake granularity plus the
+/// post-admission dispatch overhead (request build, lane queue, connection
+/// reuse variance) can otherwise compress the wire spacing a fraction under
+/// the floor — nightly saw 99.99 ms across five 20 ms slots vs the 100 ms
+/// acceptance threshold. Two milliseconds per slot (≈45 req/s) keeps wire
+/// spacing at or above the documented 50/s floor under loaded-runner jitter.
+pub const GLOBAL_PACING_SAFETY_PAD: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Clone, Copy)]
 pub struct GuardConfig {
@@ -77,12 +105,48 @@ impl From<GuardSnapshot> for two_bot_core::metrics::RestGuardSnapshot {
     }
 }
 
+/// Per-route bucket deadlines learned from `X-RateLimit-*` response headers,
+/// keyed by bucket id scoped to the request's top-level resource (or the
+/// request route when the response carries no bucket id). Debug reports the
+/// count only: keys name routes and buckets, and metrics stay low-cardinality
+/// (no tokens, routes, guild IDs or bodies).
+#[derive(Default)]
+struct BucketTable(HashMap<String, Instant>);
+
+impl std::fmt::Debug for BucketTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BucketTable")
+            .field("buckets", &self.0.len())
+            .finish()
+    }
+}
+
+/// Request-route to bucket-id mapping learned alongside [`BucketTable`]: the
+/// admit path knows the request route, the response carries the bucket id.
+#[derive(Default)]
+struct RouteTable(HashMap<String, String>);
+
+impl std::fmt::Debug for RouteTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouteTable")
+            .field("routes", &self.0.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
     invalid: VecDeque<Instant>,
     global_until: Option<Instant>,
     pending_global: Vec<(u64, Instant)>,
     next_global_id: u64,
+    buckets: BucketTable,
+    routes: RouteTable,
+    /// Last shared-pacing release, tagged with the runtime whose clock
+    /// minted it. Instants from another runtime's clock identify nothing on
+    /// this one (the process guard outlives individual test runtimes), so a
+    /// foreign tag simply starts a fresh pacing chain here.
+    last_pace_release: Option<(tokio::runtime::Id, Instant)>,
     counters: GuardSnapshot,
 }
 
@@ -136,50 +200,302 @@ impl RateLimitGuard {
         if state.global_until.is_some_and(|until| until <= now) {
             state.global_until = None;
         }
+        // Expired bucket deadlines leave with the window: routes that still
+        // map to them simply miss on the next admission, so neither table
+        // grows past the live bucket set.
+        state.buckets.0.retain(|_, until| *until > now);
+        let orphaned: Vec<String> = state
+            .routes
+            .0
+            .iter()
+            .filter(|(_, bucket)| !state.buckets.0.contains_key(*bucket))
+            .map(|(route, _)| route.clone())
+            .collect();
+        for route in orphaned {
+            state.routes.0.remove(&route);
+        }
     }
 
     /// Only interaction acknowledgements are essential at the executor seam.
     /// They may bypass the invalid budget, never global pauses or token_invalid.
     pub async fn admit(&self, essential: bool) -> Result<(), GuardError> {
+        self.admit_inner(None, essential, false).await
+    }
+
+    /// Backfill admission for one request route: everything [`Self::admit`]
+    /// enforces, plus the per-route bucket deadline learned from
+    /// `X-RateLimit-*` response headers (see [`Self::observe_bucket`]) and the
+    /// shared [`GLOBAL_MIN_INTERVAL`] pacing floor. Routes without learned
+    /// state admit exactly like [`Self::admit`]. This is the interface every
+    /// backfill endpoint slice reuses. `route` is the shared bucket key the
+    /// executor derives (HTTP method plus path, without the query string);
+    /// admission and observation must use the same key for one request.
+    pub async fn admit_route(&self, route: &str, essential: bool) -> Result<(), GuardError> {
+        self.admit_inner(Some(route), essential, true).await
+    }
+
+    /// Gate wait for one route with no pacing turn: the breaker, pending
+    /// and global pauses and the learned bucket deadline, exactly like
+    /// [`Self::admit_route`]. Lane callers wait here before taking their
+    /// lane lock (and again after a restriction arrives mid-lane), so a
+    /// route-local bucket wait never parks unrelated routes behind a lane.
+    pub(crate) async fn admit_route_recheck(
+        &self,
+        route: &str,
+        essential: bool,
+    ) -> Result<(), GuardError> {
+        self.admit_inner(Some(route), essential, false).await
+    }
+
+    async fn admit_inner(
+        &self,
+        route: Option<&str>,
+        essential: bool,
+        pace: bool,
+    ) -> Result<(), GuardError> {
+        // Take the pacing turn once for this admission, and only on a pass
+        // where every other gate is clear: pacing before a long pause would
+        // stale-date the spacing and release every waiter together when the
+        // pause ends, and refusals must not consume spacing at all. After
+        // the turn, loop back through the gates — a restriction may have
+        // arrived during the (at most one-interval) pacing sleep — but
+        // never pace twice for one admission.
+        let mut paced = false;
+        enum Step {
+            WaitPending,
+            Sleep { until: Option<Instant> },
+        }
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let (until, pending) = {
+            let step = {
                 let mut state = self.state.lock().expect("Discord guard state");
-                self.refresh(&mut state, Instant::now());
-                let error = if state.counters.token_invalid {
-                    Some(GuardError::TokenInvalid)
-                } else if state.counters.breaker_open && !essential {
-                    Some(GuardError::CircuitOpen)
-                } else {
-                    None
-                };
-                if let Some(error) = error {
+                let now = Instant::now();
+                self.refresh(&mut state, now);
+                if state.counters.token_invalid {
                     state.counters.rejected_requests_total += 1;
-                    return Err(error);
+                    return Err(GuardError::TokenInvalid);
                 }
-                (
-                    Self::global_deadline(&state, Instant::now()),
-                    !state.pending_global.is_empty(),
-                )
+                if state.counters.breaker_open && !essential {
+                    state.counters.rejected_requests_total += 1;
+                    return Err(GuardError::CircuitOpen);
+                }
+                if !state.pending_global.is_empty() {
+                    Step::WaitPending
+                } else {
+                    let mut until = Self::global_deadline(&state, now);
+                    if let Some(route) = route {
+                        until = until
+                            .into_iter()
+                            .chain(self.bucket_deadline(&state, route, now))
+                            .max();
+                    }
+                    Step::Sleep { until }
+                }
             };
-            // A short header estimate cannot release admission while the body
-            // may still supply a longer authoritative deadline. Finish/Drop or
-            // a fatal/breaker transition wakes us; timed callers can cancel.
-            if pending {
-                changed.await;
-                continue;
-            }
-            match until {
-                // Another in-flight response may extend the shared pause.
-                Some(until) => tokio::select! {
-                    _ = tokio::time::sleep_until(until) => {},
-                    _ = &mut changed => {},
+            match step {
+                // A short header estimate cannot release admission while the
+                // body may still supply a longer authoritative deadline.
+                // Finish/Drop or a fatal/breaker transition wakes us; timed
+                // callers can cancel.
+                Step::WaitPending => {
+                    changed.await;
+                }
+                Step::Sleep { until } => match until {
+                    // Another in-flight response may extend the shared pause.
+                    Some(until) => tokio::select! {
+                        _ = tokio::time::sleep_until(until) => {},
+                        _ = &mut changed => {},
+                    },
+                    None => {
+                        if pace && !paced {
+                            self.pace_once().await;
+                            paced = true;
+                            continue;
+                        }
+                        return Ok(());
+                    }
                 },
-                None => return Ok(()),
             }
         }
+    }
+
+    /// One shared pacing turn: reserve the next paced slot after the previous
+    /// turn's release on this guard, wait it out, and leave the reservation
+    /// for the next turn. Each slot is [`GLOBAL_MIN_INTERVAL`] plus
+    /// [`GLOBAL_PACING_SAFETY_PAD`]: the pad keeps wire spacing at or above
+    /// the documented floor under timer granularity and post-admission
+    /// dispatch overhead. The reservation is taken under the bookkeeping
+    /// lock and the sleep holds no lock, so a burst of admitters spaces
+    /// itself one interval at a time without ever parking on a shared async
+    /// gate: parallel paused-clock tests share the process guard, and
+    /// parking one runtime on another's turn advances the parked runtime
+    /// to its outer timeout while it makes no progress. A previous release
+    /// minted on another runtime's clock (foreign Instants name nothing on
+    /// this clock) starts a fresh chain here instead of waiting.
+    /// Same-runtime reservations chain behind each other, bounded by the
+    /// live concurrency times one interval.
+    async fn pace_once(&self) {
+        let runtime = tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|handle| handle.id());
+        let wait = {
+            let mut state = self.state.lock().expect("Discord guard state");
+            let now = Instant::now();
+            match (state.last_pace_release, runtime) {
+                (Some((id, last)), Some(mine)) if id == mine => {
+                    let interval = GLOBAL_MIN_INTERVAL + GLOBAL_PACING_SAFETY_PAD;
+                    let earliest = last.checked_add(interval).unwrap_or(now);
+                    let wait = earliest.saturating_duration_since(now);
+                    state.last_pace_release = Some((mine, earliest.max(now)));
+                    wait
+                }
+                _ => {
+                    if let Some(mine) = runtime {
+                        state.last_pace_release = Some((mine, now));
+                    }
+                    Duration::ZERO
+                }
+            }
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// Scope a Discord bucket hash to the request's top-level resource.
+    /// `X-RateLimit-Bucket` is non-inclusive of top-level resources in the path
+    /// (official rate-limits page, verified 2026-10-12): one hash is reused
+    /// across channels, guilds and webhooks whose limits are calculated
+    /// independently. Keying deadlines on the bare hash lets one channel's
+    /// remaining budget delete another channel's live deadline (the next read
+    /// 429s and spends invalid budget) and lets one exhausted channel stall
+    /// every other channel sharing the hash.
+    fn scoped_bucket_key(bucket_hash: &str, route: &str) -> String {
+        format!("{bucket_hash}:{}", Self::top_level_resource(route))
+    }
+
+    /// Top-level resource for one request route (`channels/{id}`,
+    /// `guilds/{id}`, `webhooks/{id}[/{token}]`); the route is the executor's
+    /// bucket key (HTTP method plus path, without the query string), so the
+    /// method prefix and any stray leading slash or query are stripped first.
+    /// Unrecognized shapes fall back to the full path: unrelated routes never
+    /// share a deadline, at the cost of one entry per distinct path.
+    fn top_level_resource(route: &str) -> String {
+        let path = route.split_once(' ').map_or(route, |(_, path)| path);
+        let path = path.strip_prefix('/').unwrap_or(path);
+        let path = path.split('?').next().unwrap_or(path);
+        let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+        let first = segments.next().unwrap_or("");
+        let second = segments.next().unwrap_or("");
+        match first {
+            // `webhooks/{id}/{token}` names the webhook; deeper segments are
+            // message ids under it.
+            "webhooks" => {
+                let third = segments.next().unwrap_or("");
+                if third.is_empty() {
+                    format!("webhooks/{second}")
+                } else {
+                    format!("webhooks/{second}/{third}")
+                }
+            }
+            "channels" | "guilds" => {
+                if second.is_empty() {
+                    first.to_owned()
+                } else {
+                    format!("{first}/{second}")
+                }
+            }
+            _ => path.to_owned(),
+        }
+    }
+
+    /// Deadline for one request route from learned bucket state, if any.
+    fn bucket_deadline(&self, state: &State, route: &str, now: Instant) -> Option<Instant> {
+        let key = state.routes.0.get(route).map_or(route, String::as_str);
+        state
+            .buckets
+            .0
+            .get(key)
+            .copied()
+            .filter(|until| *until > now)
+    }
+
+    /// Learn one response's per-route bucket state from its `X-RateLimit-*`
+    /// headers. Only an exhausted bucket (`Remaining` 0 with a resolvable
+    /// reset) installs a deadline; a response with remaining budget never
+    /// retires a live one. A same-window straggler is indistinguishable from
+    /// a newer window by its reset timing — the earlier-generated reply
+    /// carries the larger `Reset-After` and arrives later, so its computed
+    /// deadline is always at or above the stored one — while a live deadline
+    /// already expires on its own at reset plus the pad (`refresh` prunes it
+    /// before every admission). Every number honored arrives in the headers — the relative
+    /// `Reset-After` wins when present, the absolute `Reset` epoch is measured
+    /// against the wall clock otherwise, and the only constant is the legacy
+    /// 250 ms safety pad the 429 path already uses. Installing a deadline
+    /// never wakes admission (sleepers wait on the deadline itself), and
+    /// nothing here removes one.
+    pub fn observe_bucket(&self, route: &str, headers: &http::HeaderMap) {
+        let observed_at = Instant::now();
+        let value = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        let bucket = match value("x-ratelimit-bucket") {
+            Some(hash) => Self::scoped_bucket_key(hash, route),
+            None => route.to_owned(),
+        };
+        let remaining = value("x-ratelimit-remaining").and_then(|v| v.parse::<u64>().ok());
+        let reset_wait = value("x-ratelimit-reset-after")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|secs| secs.is_finite() && *secs >= 0.0)
+            .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+            .or_else(|| {
+                let epoch = value("x-ratelimit-reset")?
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|secs| secs.is_finite() && *secs >= 0.0)?;
+                let target =
+                    std::time::UNIX_EPOCH.checked_add(Duration::try_from_secs_f64(epoch).ok()?)?;
+                target.duration_since(std::time::SystemTime::now()).ok()
+            });
+        let mut state = self.state.lock().expect("Discord guard state");
+        match (remaining, reset_wait) {
+            (Some(0), Some(wait)) => {
+                let wait = wait
+                    .checked_add(Duration::from_millis(two_bot_core::RETRY_AFTER_PADDING_MS))
+                    .unwrap_or(wait);
+                let until = observed_at
+                    .checked_add(wait)
+                    .unwrap_or(observed_at + self.config.window);
+                // Never shorten a restriction from the same bucket; a changed
+                // bucket id replaces the route mapping instead of extending
+                // the old bucket's deadline.
+                let entry = state.buckets.0.entry(bucket.clone()).or_insert(until);
+                *entry = (*entry).max(until);
+                state.routes.0.insert(route.to_owned(), bucket);
+            }
+            (Some(_), _) => {
+                // A live deadline expires on its own at reset + pad; a reply
+                // with remaining budget cannot be told from a same-window
+                // straggler, so it never retires one.
+                state.routes.0.insert(route.to_owned(), bucket);
+            }
+            (None, _) => {}
+        };
+    }
+
+    /// Withdraw one invalid-request tally (a `shared`-scope 429 whose body
+    /// arrived after its headers were tallied): the window entry leaves and
+    /// the breaker re-evaluates, possibly closing again.
+    pub(crate) fn retract_invalid(&self, at: Instant) {
+        let mut state = self.state.lock().expect("Discord guard state");
+        if let Some(pos) = state.invalid.iter().position(|entry| *entry == at) {
+            state.invalid.remove(pos);
+        }
+        state.counters.invalid_requests_total =
+            state.counters.invalid_requests_total.saturating_sub(1);
+        self.refresh(&mut state, Instant::now());
+        drop(state);
+        self.changed.notify_waiters();
     }
 
     /// A late DB authorization must never be followed by another admission
@@ -200,6 +516,36 @@ impl RateLimitGuard {
         if let Some(error) = error {
             state.counters.rejected_requests_total += 1;
             return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Non-blocking route re-check for lane holders: [`Self::check_now`]
+    /// plus the learned bucket deadline for `route`. A pending global or
+    /// bucket pause reports [`GuardError::GlobalPaused`] without spending
+    /// a rejection — the caller releases its lane and waits the pause out
+    /// through [`Self::admit_route_recheck`], so the pause is a retry, not
+    /// a refusal. Terminal refusals count exactly like admission's.
+    pub(crate) fn check_route_now(&self, route: &str, essential: bool) -> Result<(), GuardError> {
+        let mut state = self.state.lock().expect("Discord guard state");
+        let now = Instant::now();
+        self.refresh(&mut state, now);
+        let terminal = if state.counters.token_invalid {
+            Some(GuardError::TokenInvalid)
+        } else if state.counters.breaker_open && !essential {
+            Some(GuardError::CircuitOpen)
+        } else {
+            None
+        };
+        if let Some(error) = terminal {
+            state.counters.rejected_requests_total += 1;
+            return Err(error);
+        }
+        if !state.pending_global.is_empty()
+            || Self::global_deadline(&state, now).is_some()
+            || self.bucket_deadline(&state, route, now).is_some()
+        {
+            return Err(GuardError::GlobalPaused);
         }
         Ok(())
     }
@@ -350,6 +696,8 @@ pub(crate) struct ResponseAccounting<'a> {
     guard: &'a RateLimitGuard,
     global_header: Option<u64>,
     retry_after_header: Option<f64>,
+    reset_after_header: Option<f64>,
+    invalid_tally: Option<Instant>,
     observed_at: Instant,
 }
 
@@ -365,12 +713,24 @@ impl<'a> ResponseAccounting<'a> {
             && (header("x-ratelimit-global").is_some_and(|v| v.eq_ignore_ascii_case("true"))
                 || header("x-ratelimit-scope").is_some_and(|v| v.eq_ignore_ascii_case("global")));
         let retry_after_header = header("retry-after").and_then(|v| v.parse::<f64>().ok());
+        // Bucket reset hint: the only timing when a 429 carries no
+        // `retry-after` (official rate-limits page, verified 2026-10-12).
+        let reset_after_header =
+            header("x-ratelimit-reset-after").and_then(|v| v.parse::<f64>().ok());
+        // A `shared`-scope 429 is another resource's limit, never the bot's:
+        // it still sleeps-then-retries, but spends no invalid budget
+        // (official rate-limits page, verified 2026-10-12).
+        let shared_scope = status == 429
+            && header("x-ratelimit-scope").is_some_and(|v| v.eq_ignore_ascii_case("shared"));
         let observed_at = Instant::now();
         // Status and the pending restriction are one transition: a notified
         // waiter must never see the invalid response without its global pause.
         // With no usable header timing, Drop commits a full-window fallback.
         let mut state = guard.state.lock().expect("Discord guard state");
-        guard.observe_status_locked(&mut state, status, bot_authenticated, observed_at);
+        let tallied = matches!(status, 401 | 403 | 429) && !shared_scope;
+        if tallied {
+            guard.observe_status_locked(&mut state, status, bot_authenticated, observed_at);
+        }
         let global_header = global_header
             .then(|| guard.begin_global_locked(&mut state, retry_after_header, observed_at));
         drop(state);
@@ -381,6 +741,8 @@ impl<'a> ResponseAccounting<'a> {
             guard,
             global_header,
             retry_after_header,
+            reset_after_header,
+            invalid_tally: tallied.then_some(observed_at),
             observed_at,
         }
     }
@@ -389,6 +751,18 @@ impl<'a> ResponseAccounting<'a> {
     /// rather than a new local delay starting after body completion.
     pub(crate) fn finish(&mut self, response: &crate::executor::RawResponse) -> bool {
         let body: Option<serde_json::Value> = serde_json::from_slice(&response.body).ok();
+        // Header-absent shared scope, learned from the body: withdraw the
+        // tally the headers committed (the header path already exempted the
+        // common case in `new`).
+        if response.status == 429
+            && body
+                .as_ref()
+                .is_some_and(|value| value.get("scope").and_then(|v| v.as_str()) == Some("shared"))
+        {
+            if let Some(at) = self.invalid_tally.take() {
+                self.guard.retract_invalid(at);
+            }
+        }
         let global_body = body.as_ref().is_some_and(|value| {
             value.get("global").and_then(|v| v.as_bool()) == Some(true)
                 || value.get("scope").and_then(|v| v.as_str()) == Some("global")
@@ -398,7 +772,8 @@ impl<'a> ResponseAccounting<'a> {
             let timing = response
                 .body_retry_after_secs()
                 .filter(|secs| *secs >= 0.0)
-                .or(self.retry_after_header);
+                .or(self.retry_after_header)
+                .or(self.reset_after_header);
             let id = self
                 .global_header
                 .take()
@@ -412,8 +787,11 @@ impl<'a> ResponseAccounting<'a> {
 impl Drop for ResponseAccounting<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.global_header.take() {
-            self.guard
-                .finish_global(id, self.retry_after_header, self.observed_at);
+            self.guard.finish_global(
+                id,
+                self.retry_after_header.or(self.reset_after_header),
+                self.observed_at,
+            );
         }
     }
 }
@@ -731,6 +1109,306 @@ mod tests {
         assert_eq!(
             guard.snapshot().global_pause_remaining,
             INVALID_REQUEST_WINDOW
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_and_route_debug_renders_counts_only() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        guard.observe_bucket(
+            "GET /guilds/1/roles",
+            &http::HeaderMap::from_iter([
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-bucket"),
+                    http::HeaderValue::from_static("bucket-fixture"),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-remaining"),
+                    http::HeaderValue::from_static("0"),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-reset-after"),
+                    http::HeaderValue::from_static("200"),
+                ),
+            ]),
+        );
+        let rendered = format!("{guard:?}");
+        assert!(
+            rendered.contains("BucketTable"),
+            "guard debug must name the bucket table: {rendered}"
+        );
+        assert!(
+            rendered.contains("RouteTable"),
+            "guard debug must name the route table: {rendered}"
+        );
+        assert!(
+            !rendered.contains("bucket-fixture"),
+            "debug must not leak bucket ids: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/guilds/1/roles"),
+            "debug must not leak routes: {rendered}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remaining_budget_keeps_a_live_bucket_deadline_and_prunes_orphans() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let bucketed = |remaining: &str| {
+            http::HeaderMap::from_iter([
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-bucket"),
+                    http::HeaderValue::from_static("bucket-live"),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-remaining"),
+                    http::HeaderValue::from_str(remaining).unwrap(),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-reset-after"),
+                    http::HeaderValue::from_static("200"),
+                ),
+            ])
+        };
+        guard.observe_bucket("GET /guilds/1/roles", &bucketed("0"));
+        assert!(
+            guard.check_route_now("GET /guilds/1/roles", false).is_err(),
+            "an exhausted bucket must gate its route"
+        );
+        guard.observe_bucket("GET /guilds/1/roles", &bucketed("5"));
+        assert!(
+            guard.check_route_now("GET /guilds/1/roles", false).is_err(),
+            "remaining budget must not clear the learned deadline"
+        );
+        // A second route learns the same bucket, then outlives it: the next
+        // admission prunes the expired bucket and its orphaned mapping, so a
+        // later response relearns the route instead of riding stale state.
+        guard.observe_bucket("GET /guilds/2/roles", &bucketed("0"));
+        tokio::time::advance(Duration::from_secs(300)).await;
+        guard
+            .admit_route("GET /guilds/2/roles", false)
+            .await
+            .unwrap();
+        guard.observe_bucket("GET /guilds/2/roles", &bucketed("0"));
+        assert!(
+            guard.check_route_now("GET /guilds/2/roles", false).is_err(),
+            "a repruned route must gate again after relearning"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_bucket_hash_scopes_deadlines_per_top_level_resource() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let headers = |bucket: &str, remaining: &str, reset_after: Option<&str>| {
+            let mut headers = http::HeaderMap::from_iter([
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-bucket"),
+                    http::HeaderValue::from_str(bucket).unwrap(),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-remaining"),
+                    http::HeaderValue::from_str(remaining).unwrap(),
+                ),
+            ]);
+            if let Some(reset_after) = reset_after {
+                headers.insert(
+                    "x-ratelimit-reset-after",
+                    http::HeaderValue::from_str(reset_after).unwrap(),
+                );
+            }
+            headers
+        };
+        // One channel exhausts the shared hash: only that channel is gated.
+        guard.observe_bucket(
+            "GET channels/111/messages",
+            &headers("bucket-shared", "0", Some("5")),
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/111/messages", false)
+                .is_err(),
+            "the exhausted channel must wait out its reset"
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/222/messages", false)
+                .is_ok(),
+            "one exhausted channel must not stall another sharing the hash"
+        );
+        // The other channel's remaining budget must not delete the live
+        // deadline: the next channel-111 read would 429 and spend budget.
+        guard.observe_bucket(
+            "GET channels/222/messages",
+            &headers("bucket-shared", "4", Some("5")),
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/111/messages", false)
+                .is_err(),
+            "a sibling channel's remaining budget cleared a live deadline"
+        );
+        // A late, out-of-order same-window straggler must not clear it: the
+        // earlier-generated reply carries the larger Reset-After and arrives
+        // later, so its computed deadline sits above the stored one.
+        tokio::time::advance(Duration::from_millis(30)).await;
+        guard.observe_bucket(
+            "GET channels/111/messages",
+            &headers("bucket-shared", "1", Some("5")),
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/111/messages", false)
+                .is_err(),
+            "a same-window straggler with a larger reset cleared a live deadline"
+        );
+        // An equal Reset-After straggler must not clear it either.
+        guard.observe_bucket(
+            "GET channels/111/messages",
+            &headers("bucket-shared", "1", Some("4.97")),
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/111/messages", false)
+                .is_err(),
+            "a same-window straggler with an equal reset cleared a live deadline"
+        );
+        // A response with remaining budget but no reset timing carries
+        // nothing to order against: the live deadline stands.
+        guard.observe_bucket(
+            "GET channels/111/messages",
+            &headers("bucket-shared", "2", None),
+        );
+        assert!(
+            guard
+                .check_route_now("GET channels/111/messages", false)
+                .is_err(),
+            "an untimed reply cleared a live deadline"
+        );
+        // Webhook tokens scope separately under one hash, and unrecognized
+        // shapes fall back to the full path.
+        guard.observe_bucket(
+            "POST webhooks/1/token-a",
+            &headers("bucket-webhook", "0", Some("5")),
+        );
+        assert!(
+            guard
+                .check_route_now("POST webhooks/1/token-b", false)
+                .is_ok(),
+            "one webhook's exhaustion must not stall another sharing the hash"
+        );
+        guard.observe_bucket("GET webhooks/7", &headers("bucket-webhook", "0", Some("5")));
+        assert!(
+            guard.check_route_now("GET webhooks/7", false).is_err(),
+            "a token-less webhook route must still gate its own scope"
+        );
+        guard.observe_bucket("GET guilds", &headers("bucket-bare", "0", Some("5")));
+        assert!(
+            guard.check_route_now("GET guilds", false).is_err(),
+            "a bare resource route must still gate its own scope"
+        );
+        guard.observe_bucket(
+            "GET interactions/1/abc/callback",
+            &headers("bucket-other", "0", Some("5")),
+        );
+        assert!(
+            guard
+                .check_route_now("GET interactions/2/def/callback", false)
+                .is_ok(),
+            "unrecognized shapes must not share a deadline across paths"
+        );
+        assert!(
+            guard
+                .check_route_now("GET interactions/1/abc/callback", false)
+                .is_err(),
+            "an unrecognized shape must still gate its own path"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absolute_reset_epoch_installs_a_bucket_deadline() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let epoch = std::time::SystemTime::now() + Duration::from_secs(100);
+        let reset = epoch
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            .to_string();
+        guard.observe_bucket(
+            "GET /guilds/3/roles",
+            &http::HeaderMap::from_iter([
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-bucket"),
+                    http::HeaderValue::from_static("bucket-epoch"),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-remaining"),
+                    http::HeaderValue::from_static("0"),
+                ),
+                (
+                    http::header::HeaderName::from_static("x-ratelimit-reset"),
+                    http::HeaderValue::from_str(&reset).unwrap(),
+                ),
+            ]),
+        );
+        assert!(
+            guard.check_route_now("GET /guilds/3/roles", false).is_err(),
+            "an absolute reset must gate its route"
+        );
+        tokio::time::advance(Duration::from_secs(101)).await;
+        assert!(
+            guard.check_route_now("GET /guilds/3/roles", false).is_ok(),
+            "an expired absolute reset must release its route"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_shared_scope_retracts_the_header_tally() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let mut accounting = ResponseAccounting::new(&guard, 429, &http::HeaderMap::new(), true);
+        assert_eq!(
+            guard.snapshot().invalid_requests_total,
+            1,
+            "a header tally without scope spends budget"
+        );
+        let shared = accounting.finish(&crate::executor::RawResponse {
+            status: 429,
+            retry_after_header: None,
+            body: br#"{"scope":"shared"}"#.to_vec(),
+            completion: None,
+        });
+        assert!(!shared, "a shared scope is not a global pause");
+        assert_eq!(
+            guard.snapshot().invalid_requests_total,
+            0,
+            "a body-shared scope must retract the tally"
+        );
+        assert_eq!(
+            guard.snapshot().invalid_requests_in_window,
+            0,
+            "a body-shared scope must leave the window"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_global_scope_installs_a_pause_from_body_timing() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let mut accounting = ResponseAccounting::new(&guard, 429, &http::HeaderMap::new(), true);
+        let global = accounting.finish(&crate::executor::RawResponse {
+            status: 429,
+            retry_after_header: None,
+            body: br#"{"global":true,"retry_after":0.5}"#.to_vec(),
+            completion: None,
+        });
+        assert!(global, "a body global flag must govern the retry");
+        assert_eq!(
+            guard.snapshot().global_pause_remaining,
+            Duration::from_millis(750),
+            "body timing plus the 250 ms pad"
+        );
+        assert_eq!(
+            guard.snapshot().global_pauses_total,
+            1,
+            "one body-learned pause"
         );
     }
 }
