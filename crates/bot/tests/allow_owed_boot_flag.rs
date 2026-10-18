@@ -106,7 +106,7 @@ fn db_url(db: &TestDatabase) -> String {
 /// Full-boot environment: moderation/automation gates default off, a
 /// disposable database is present, and the token is a fixture, so boot
 /// never contacts Discord before the disable guard has run.
-fn boot_env<'a>(url: &'a str) -> [(&'a str, &'a str); 4] {
+fn boot_env(url: &str) -> [(&str, &str); 4] {
     [
         ("DISCORD_TOKEN", "fixture-token"),
         ("DATABASE_URL", url),
