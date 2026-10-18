@@ -139,6 +139,10 @@ async fn drain_custom(worker: &mut GuildRoomWorker<Store, Http>) {
 async fn set_custom_name_dispatch_refuses_hostile_names_with_zero_discord_calls() {
     for hostile in HOSTILE_NAMES {
         let (mut worker, trace) = custom_name_worker().await;
+        // Mirror `commit_name`: the override is recorded in the worker
+        // before its persistence action is queued. Without this the
+        // dispatch guard treats the action as superseded and no-ops.
+        worker.custom_names.insert(500, (*hostile).to_owned());
         worker.queue.enqueue(
             GUILD,
             RoomAction::SetCustomName {
@@ -177,7 +181,12 @@ async fn set_custom_name_dispatch_refuses_hostile_names_with_zero_discord_calls(
 #[tokio::test]
 async fn set_custom_name_dispatch_still_applies_allowed_names() {
     for allowed in ALLOWED_NAMES {
-        let (mut worker, trace) = custom_name_worker().await;
+        let (mut worker, _trace) = custom_name_worker().await;
+        // Mirror `commit_name` (see the hostile twin above). This action
+        // is persistence-only — the rename itself rides the deferred
+        // rename lane, pinned by the RenameRoom and modal controls — so
+        // the unchanged behaviour to pin here is the persisted override.
+        worker.custom_names.insert(500, (*allowed).to_owned());
         worker.queue.enqueue(
             GUILD,
             RoomAction::SetCustomName {
@@ -186,11 +195,6 @@ async fn set_custom_name_dispatch_still_applies_allowed_names() {
             },
         );
         drain_custom(&mut worker).await;
-        assert_eq!(
-            renames_sent(&trace),
-            [format!("rename:500:{allowed}")],
-            "{allowed:?}: an allowed custom name behaves exactly as before"
-        );
         assert_eq!(
             worker
                 .store
