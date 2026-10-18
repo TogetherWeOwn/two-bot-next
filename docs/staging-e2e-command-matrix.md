@@ -9,9 +9,9 @@ the harness slices define HOW it runs. Derived from code, not from a guild:
 The `e2e_matrix_coverage` integration test fails when a command ships without
 a matrix row and when this doc drops one.
 
-Scope: 28 built-in slash commands (core + scorecard + automation +
+Scope: 29 built-in slash commands (core + scorecard + automation +
 announcement + moderation — the commands `docs/commands.md` renders ahead of
-the voice set; with the voice gates on it renders 50). No guild was
+the voice set; with the voice gates on it renders 51). No guild was
 touched, no staging secrets used, no credentials created.
 
 Staging env the live suite needs: `TWO_COMMUNITY_SCORECARD=1`,
@@ -35,6 +35,7 @@ guild.`), all other builtins stay silent (`Ignore`); stale or unknown names
 | 1 | `/rank` | always | Everyone | Ephemeral text with XP, level, server rank | — |
 | 2 | `/leaderboard` | always | Everyone | Public mention-suppressed top ten | — |
 | 31 | `/help` | always | Everyone | Immediate ephemeral list of the live published commands, grouped by audience with permission hints (no defer, no store read) | — |
+| 32 | `/privacy` | always | Everyone | Deferred ephemeral reply; `opt-out` purges the invoker's guild rows plus suppression plus one audit receipt, `opt-in` clears suppression, `status` reports suppression plus guild switches | subcommand required (`opt-out`/`opt-in`/`status`); guild-only |
 | 12 | `/attendance` | `TWO_COMMUNITY_SCORECARD` | ManageEvents | Ephemeral confirmation/refusal; records verified attendee | `ScorecardDisabled`, `ManageEventsRequired`, `event-occurrence` required ≤128, `member` required |
 | 14 | `/command` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name`/`template` required |
 | 15 | `/command-remove` | `TWO_AUTOMATIONS` | ManageGuild | Ephemeral confirmation + audit row | `AutomationsDisabled`, `ManageServerRequired`, `name` required |

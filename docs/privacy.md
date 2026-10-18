@@ -152,7 +152,7 @@ When your opt-out runs, the bot:
    invite keeps the joiner's row but with your inviter field blanked.
    Anonymous aggregate counters keep counting throughout.
 3. Writes exactly one audit receipt: the guild/member scope plus the
-   operator actor label and the database timestamp.
+   actor label and the database timestamp.
 
 Moderation, audit, XP/level, ticket, voice-room and settings rows are not
 part of an opt-out: they serve safety, delivery and accountability, not
@@ -164,11 +164,20 @@ already-purged rows. Afterwards the pair persists exactly as before, and
 the re-enable itself writes no purge receipt (the receipt table records
 purges, one row per purge).
 
-Until the member self-serve slash command lands, an opt-out is executed by
-a server operator through the reviewed `opt_out_member` service with an
-explicit operator actor label, against a disposable/staging binding first
-per the rollout gates. The actor label carries operator attribution only:
-never put a member ID, content, count or secret in it.
+Members run this themselves with `/privacy opt-out` (`opt-in` to resume,
+`status` to check). The command acts only on the invoker in the invoking
+guild and writes the receipt with the fixed `member:self-serve` actor label.
+A server operator can still execute an assisted opt-out through the reviewed
+`opt_out_member` service with an explicit operator actor label, against a
+disposable/staging binding first per the rollout gates. Either actor label
+carries attribution only: never put a member ID, content, count or secret
+in it.
+
+Repeat `/privacy opt-out` taps take no purge lock: an already-suppressed
+pair gets the already-opted-out reply, and a pair with a purge receipt
+younger than 10 minutes gets a cooldown reply. Either early return writes
+no new receipt; only a fresh purge locks, deletes and receipts. Assisted
+operator calls go through the service directly and are unaffected.
 
 **Policy note (verified 2026-10-12):** the live Discord Developer Policy
 now lives on Discord's developer support help center (the old

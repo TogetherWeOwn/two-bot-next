@@ -1372,6 +1372,7 @@ impl CommandRuntime {
         }
         let owner = match name.as_str() {
             "help" => Some(HandlerId::Help),
+            "privacy" => Some(HandlerId::Privacy),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
             }
@@ -1401,6 +1402,10 @@ impl CommandRuntime {
             return;
         }
         match name.as_str() {
+            "privacy" => {
+                crate::privacy_command::privacy_command(&self.pool, &self.executor, interaction)
+                    .await;
+            }
             "sticky" => self.sticky_set(interaction).await,
             "sticky-remove" => self.sticky_remove(interaction).await,
             "feed-add" => self.feed_add(interaction).await,
@@ -2192,6 +2197,9 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     // `/help` discovery is never activation-fenced either: it renders from
     // the live publish set, so gated-off features simply do not appear.
     router.register(Box::new(SliceHandler(HandlerId::Help)));
+    // `/privacy` member self-serve is never activation-fenced either: every
+    // member may opt out of analytics in any guild.
+    router.register(Box::new(SliceHandler(HandlerId::Privacy)));
     router
 }
 
