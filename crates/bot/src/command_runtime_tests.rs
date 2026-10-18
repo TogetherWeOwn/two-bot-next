@@ -45,7 +45,7 @@ use twilight_model::oauth::{ApplicationFlags, ApplicationIntegrationMap, Partial
 use twilight_model::user::{CurrentUser, User};
 use twilight_model::util::Timestamp;
 use two_bot_core::funnel::now_millis_for_test;
-use two_bot_core::sticky::{store, ActivityOutcome};
+use two_bot_core::sticky::{store, ActivityOutcome, PutSticky};
 use two_bot_core::{
     RouterGates, RouterRefusal, ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY,
     MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY,
@@ -4053,6 +4053,236 @@ async fn post_failure_releases_claim_and_audits_post_failed() {
     assert_eq!(
         audits.last().map(|(a, o)| (a.as_str(), o.as_str())),
         Some(("sticky.run", "ok"))
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn obsolete_post_after_admin_update_preserves_admin_state() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000010"), 120_000, 5).await;
+    // Hold the accepted POST open so the administrator update lands between
+    // the wire post and the store record. The mock delay is the hold; the
+    // POST-arrival poll is the deterministic sync (no blind sleeps).
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 200,
+            body: None,
+            delay: Duration::from_millis(1000),
+        }],
+    )
+    .await;
+    let msg = message(30, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "replacement POST entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim but
+        // preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v2",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(outcome, ActivityOutcome::Held, "lost claim reports held");
+
+    // The orphan replacement is deleted exactly once; the previous sticky is
+    // never retired through the lost-claim branch.
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "one orphan cleanup: {deletes:?}");
+    assert_eq!(
+        deletes[0].path, "/api/v10/channels/3333/messages/9000000000000000000",
+        "orphan id from the held POST",
+    );
+    assert!(
+        !deletes[0].path.ends_with("8000000000000000010"),
+        "previous sticky untouched",
+    );
+
+    // Administrator state wins: new body, previous post columns, no claim,
+    // and no success audit from the obsolete completion.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v2");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000010"),
+        "obsolete record cannot overwrite the live post",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; record recreates none"
+    );
+    assert!(
+        db.audits().await.is_empty(),
+        "lost claim writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn obsolete_post_after_admin_remove_preserves_absence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000011"), 120_000, 5).await;
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 200,
+            body: None,
+            delay: Duration::from_millis(1000),
+        }],
+    )
+    .await;
+    let msg = message(31, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "replacement POST entered",
+        )
+        .await;
+        let removed = store::delete_sticky(&db.pool, GUILD_S, CHANNEL_S)
+            .await
+            .expect("admin remove");
+        assert!(
+            matches!(removed, two_bot_core::sticky::RemoveOutcome::Removed { .. }),
+            "seed row removed",
+        );
+    });
+    assert_eq!(outcome, ActivityOutcome::Held, "lost claim reports held");
+
+    // Exactly the orphan goes; the removed previous id is never re-deleted
+    // through this branch, and the row stays absent.
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "one orphan cleanup: {deletes:?}");
+    assert_eq!(
+        deletes[0].path,
+        "/api/v10/channels/3333/messages/9000000000000000000",
+    );
+    assert!(
+        db.row().await.is_none(),
+        "obsolete record cannot recreate administrator-removed state",
+    );
+    assert!(
+        db.audits().await.is_empty(),
+        "lost claim writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn completion_db_failure_audits_post_failed_and_preserves_newer_claim() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000012"), 120_000, 5).await;
+    // Scoped completion-only fault: the trigger rejects only the record that
+    // carries this test's orphan id. The claim (no post columns) and the
+    // release (post columns untouched) pass through.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION sticky_test_fail_orphan() RETURNS trigger AS $$
+         BEGIN
+           IF NEW.last_message_id = '9000000000000000000' THEN
+             RAISE EXCEPTION 'scoped completion-only failure';
+           END IF;
+           RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install fault function");
+    sqlx::query("DROP TRIGGER IF EXISTS sticky_test_fail_orphan_trg ON sticky_messages")
+        .execute(&db.pool)
+        .await
+        .expect("drop stale fault trigger");
+    sqlx::query(
+        "CREATE TRIGGER sticky_test_fail_orphan_trg
+           BEFORE UPDATE ON sticky_messages FOR EACH ROW
+           EXECUTE FUNCTION sticky_test_fail_orphan()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install fault trigger");
+
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+    let outcome = runtime
+        .on_message(&message(32, CHANNEL, false, Some(GUILD)))
+        .await;
+    assert_eq!(outcome, ActivityOutcome::Held);
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+    );
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "orphan cleaned up: {deletes:?}");
+    assert_eq!(
+        deletes[0].path,
+        "/api/v10/channels/3333/messages/9000000000000000000",
+    );
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "remember this");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000012"),
+        "failed record leaves the live post",
+    );
+    assert_eq!(claim, None, "own claim released for the next activity");
+
+    sqlx::query("DROP TRIGGER IF EXISTS sticky_test_fail_orphan_trg ON sticky_messages")
+        .execute(&db.pool)
+        .await
+        .expect("remove fault trigger");
+    sqlx::query("DROP FUNCTION IF EXISTS sticky_test_fail_orphan()")
+        .execute(&db.pool)
+        .await
+        .expect("remove fault function");
+
+    // Claim ownership: releasing a stale unrelated token cannot clear a newer
+    // claim — the property the post_failed rollback relies on.
+    let grant = store::claim_sticky_post(
+        &db.pool,
+        GUILD_S,
+        CHANNEL_S,
+        "newer-claim",
+        now_millis_for_test(),
+    )
+    .await
+    .expect("newer claim")
+    .expect("window free after release");
+    assert_eq!(grant.body, "remember this");
+    store::release_sticky_post(&db.pool, GUILD_S, CHANNEL_S, "stale-unrelated")
+        .await
+        .expect("stale release");
+    let (_, _, claim) = db.row().await.expect("row exists");
+    assert_eq!(
+        claim.as_deref(),
+        Some("newer-claim"),
+        "stale release preserves the newer claim",
     );
     mock.shutdown().await;
     db.close().await;
