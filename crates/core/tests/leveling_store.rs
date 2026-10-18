@@ -671,3 +671,71 @@ async fn audit_and_reward_write_failures_roll_back_everything(
     fixture.close().await.expect("drop test database");
     Ok(())
 }
+
+#[tokio::test]
+async fn short_messages_do_not_consume_daily_ladder_rungs(
+) -> Result<(), two_bot_core::LevelingStoreError> {
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
+    // Six known-short messages (trimmed 2 scalars, no embed/attachment) in
+    // distinct channels so burst halving stays out of the path. Each earns
+    // zero while consuming the cooldown once.
+    for index in 0..6 {
+        let channel = format!("2000000000000000{:02}", 10 + index);
+        let award = store::award_message(
+            &pool,
+            GUILD,
+            A,
+            &at(index * 61),
+            Some(channel.as_str()),
+            Some(2),
+            false,
+        )
+        .await?;
+        assert_eq!(award.awarded, 0, "short #{index} must earn zero");
+    }
+    // The next normal message must still earn the full first rung (15), not
+    // the 5-XP sixth rung short rows would have consumed.
+    let normal = store::award_message(
+        &pool,
+        GUILD,
+        A,
+        &at(6 * 61),
+        Some("200000000000000099"),
+        Some(40),
+        false,
+    )
+    .await?;
+    assert_eq!(normal.awarded, 15);
+    assert_eq!(store::profile(&pool, GUILD, A).await?.message_xp, 15);
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn short_messages_do_not_trigger_burst_halving(
+) -> Result<(), two_bot_core::LevelingStoreError> {
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
+    let channel = "200000000000000099";
+    for index in 0..2 {
+        let award = store::award_message(
+            &pool,
+            GUILD,
+            A,
+            &at(index * 61),
+            Some(channel),
+            Some(2),
+            false,
+        )
+        .await?;
+        assert_eq!(award.awarded, 0, "short #{index} must earn zero");
+    }
+    // Two shorts in the same channel within 10 minutes must not halve the
+    // next normal message there: it still earns 15, not 7.
+    let normal =
+        store::award_message(&pool, GUILD, A, &at(2 * 61), Some(channel), Some(40), false).await?;
+    assert_eq!(normal.awarded, 15);
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}

@@ -206,8 +206,11 @@ async fn seconds_since_last_award(
 /// Today's (UTC day of the award) granted-award count and XP sum for one
 /// source: the daily-counter inputs for the anti-gaming policy (AC2).
 /// Derived from the `xp_awards` audit trail on every award, so no second
-/// table can drift from it. Zero-XP audit rows inflate the count but never
-/// the total, and the ladder is already 0 past ten awards either way.
+/// table can drift from it. `short_message` rows are excluded from the count:
+/// they earn zero while consuming only the cooldown, and must not use up
+/// later ladder rungs. Other zero-XP audit rows (cap/ladder exhaustion)
+/// inflate the count but never the total, and the ladder is already 0 past
+/// ten awards either way, so counting them is harmless.
 async fn day_counters(
     pool: &PgPool,
     guild_id: &str,
@@ -217,7 +220,8 @@ async fn day_counters(
     day_end_iso: &str,
 ) -> Result<(u64, u64), LevelingStoreError> {
     let (count, total): (i64, Option<i64>) = sqlx::query_as(
-        "SELECT COUNT(*), SUM(xp) FROM xp_awards
+        "SELECT COUNT(*) FILTER (WHERE decision IS DISTINCT FROM 'short_message'), SUM(xp)
+         FROM xp_awards
          WHERE guild_id = $1 AND member_id = $2 AND source = $3
            AND occurred_at >= $4::text::timestamptz
            AND occurred_at < $5::text::timestamptz",
@@ -234,7 +238,8 @@ async fn day_counters(
 
 /// Prior message awards from one channel in the trailing 10 minutes (AC2
 /// burst input). `None` channels match only `NULL` rows
-/// (`IS NOT DISTINCT FROM`).
+/// (`IS NOT DISTINCT FROM`). `short_message` rows are excluded: they consume
+/// only the cooldown and must not trigger burst halving for later messages.
 async fn same_channel_recent(
     pool: &PgPool,
     guild_id: &str,
@@ -246,7 +251,8 @@ async fn same_channel_recent(
         "SELECT COUNT(*) FROM xp_awards
          WHERE guild_id = $1 AND member_id = $2 AND source = 'message'
            AND channel_id IS NOT DISTINCT FROM $3
-           AND occurred_at > $4::text::timestamptz",
+           AND occurred_at > $4::text::timestamptz
+           AND decision IS DISTINCT FROM 'short_message'",
     )
     .bind(guild_id)
     .bind(member_id)
