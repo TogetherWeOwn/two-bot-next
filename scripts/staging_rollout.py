@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed staging gate for Wrangler 4.149.0's rolling Containers API.
+"""Fail-closed staging gate for Wrangler 4.151.0's rolling Containers API.
 
 Only allowlisted provenance is persisted/printed. API configurations and error
 bodies can contain secrets: never print them, including in exception messages.
@@ -19,7 +19,7 @@ from urllib.request import Request, HTTPRedirectHandler, build_opener
 WORKER = "two-bot-next-staging"
 APPLICATION = "two-bot-next-twobotcontainer-staging"
 CLASS = "TwoBotContainer"
-WRANGLER = "4.149.0"
+WRANGLER = "4.151.0"
 VERSION_PROBES = (["--version"], ["-v"])
 LIMIT = 100
 MAX_BODY = 2 * 1024 * 1024
@@ -627,6 +627,8 @@ def save(path, value):
 
 DEPLOY_ENV_VAR = "TWO_DEPLOY_ENV"
 GATEWAY_FAIL_INJECTION_VAR = "TWO_GATEWAY_READINESS_FAIL_INJECTION"
+VOICE_STALL_FAULT_VAR = "TWO_VOICE_STALL_FAULT_INJECTION"
+UNPAIRED_FAULT_VAR = "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"
 
 
 def apply_gateway_fail_injection(config, enabled):
@@ -660,6 +662,42 @@ def apply_gateway_fail_injection(config, enabled):
     variables[GATEWAY_FAIL_INJECTION_VAR] = "1"
 
 
+def apply_remediation_fault_injection(config, voice_stall, unpaired_disconnect):
+    """Stage the remediation-drill switches in the GENERATED config only.
+
+    Same fence as the rollback-drill helper above: the committed TOML may
+    never carry either switch (wrangler/scripts/check-env-bindings.py), and
+    this helper refuses such a source again so a hand-generated config cannot
+    smuggle either past CI. When armed, the staging fence marker must already
+    be exactly "staging" and only the staging vars of the generated config
+    gain the requested switches — top-level, production and every other
+    environment stay untouched, and the checked-in file is never modified.
+    When neither drill is requested nothing is added, so a plain push deploy
+    is byte-identical in behavior to before the injector existed.
+    """
+    envs = config.get("env") or {}
+    tables = [("top-level", config.get("vars") or {})]
+    tables += [(name, (env or {}).get("vars") or {}) for name, env in envs.items()]
+    for _name, variables in tables:
+        require(VOICE_STALL_FAULT_VAR not in variables,
+                "remediation_fault_in_source_config")
+        require(UNPAIRED_FAULT_VAR not in variables,
+                "remediation_fault_in_source_config")
+    for name, variables in tables:
+        if name != "staging":
+            require(DEPLOY_ENV_VAR not in variables, "deploy_env_outside_staging")
+    if not voice_stall and not unpaired_disconnect:
+        return
+    staging = mapping(mapping(config.get("env")).get("staging"))
+    variables = staging.get("vars")
+    require(isinstance(variables, dict) and variables.get(DEPLOY_ENV_VAR) == "staging",
+            "remediation_fault_fence_missing")
+    if voice_stall:
+        variables[VOICE_STALL_FAULT_VAR] = "1"
+    if unpaired_disconnect:
+        variables[UNPAIRED_FAULT_VAR] = "1"
+
+
 def prepare(args, client):
     staging_url()
     revision = os.environ.get("GITHUB_SHA", "")
@@ -690,6 +728,10 @@ def prepare(args, client):
     # Rollback drill only: the dispatch-only workflow input reaches the
     # deployed build solely as this flag on the generated staging config.
     apply_gateway_fail_injection(config, bool(getattr(args, "inject_gateway_failure", False)))
+    # Remediation drills only: the dispatch-only workflow inputs reach the
+    # deployed build solely as these flags on the generated staging config.
+    apply_remediation_fault_injection(config, bool(getattr(args, "inject_voice_stall", False)),
+                                      bool(getattr(args, "inject_unpaired_disconnect", False)))
     save(args.deploy_config, config)
     save(args.receipt, {"started": started, "application_id": app["id"],
                         "namespace_id": app["durable_objects"]["namespace_id"],
@@ -938,9 +980,19 @@ def main():
     parser.add_argument("--inject-gateway-failure", action="store_true",
                         help="prepare only: staging rollback drill — the generated "
                              "staging deploy config reports gateway not-ready")
+    parser.add_argument("--inject-voice-stall", action="store_true",
+                        help="prepare only: staging remediation drill — the generated "
+                             "staging deploy config holds a stale creator map")
+    parser.add_argument("--inject-unpaired-disconnect", action="store_true",
+                        help="prepare only: staging remediation drill — the generated "
+                             "staging deploy config holds an unpaired disconnect")
     args = parser.parse_args()
     if args.inject_gateway_failure and args.mode != "prepare":
         parser.error("--inject-gateway-failure is prepare-only")
+    if args.inject_voice_stall and args.mode != "prepare":
+        parser.error("--inject-voice-stall is prepare-only")
+    if args.inject_unpaired_disconnect and args.mode != "prepare":
+        parser.error("--inject-unpaired-disconnect is prepare-only")
     client = None
     try:
         deadline = time.monotonic() + VERIFY_TIMEOUT_SECONDS if args.mode == "verify" else None
