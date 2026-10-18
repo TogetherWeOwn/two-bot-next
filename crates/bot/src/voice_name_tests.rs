@@ -298,6 +298,225 @@ fn clicks_and_submits_parse_and_everything_else_stays_silent() {
 }
 
 #[test]
+fn hostile_name_ids_refuse_through_the_router() {
+    use two_bot_core::voice_custom_id::MAX_VOICE_CUSTOM_ID_CHARS;
+    let click = |id: &str| component_interaction(id, None, OWNER);
+    let modal = |id: &str| modal_interaction(id, labelled_input("Den"));
+    // Valid controls stay green through both the parser and the router.
+    for room_id in [1, ROOM, u64::MAX] {
+        assert_eq!(
+            name_component_action(&click(&name_custom_custom_id(room_id))),
+            Some(NameInteraction::OpenModal { room_id })
+        );
+        assert_eq!(
+            name_component_action(&click(&name_restore_custom_id(room_id))),
+            Some(NameInteraction::Restore { room_id })
+        );
+        assert_eq!(
+            name_component_action(&modal(&name_modal_custom_id(room_id))),
+            Some(submit("Den"))
+        );
+        // A modal id on a button and button ids on a modal stay silent,
+        // even at the largest encodable room.
+        assert_eq!(
+            name_component_action(&click(&name_modal_custom_id(room_id))),
+            None
+        );
+        assert_eq!(
+            name_component_action(&modal_interaction(
+                &name_custom_custom_id(room_id),
+                labelled_input("Den")
+            )),
+            None
+        );
+    }
+    // Forged, truncated, separator-confused, non-numeric, control and
+    // multibyte `two:voice:name-*` ids refuse through the real router on
+    // both the button and the modal paths without panicking.
+    let hostile = [
+        // Forged verbs, prefixes and lookalikes.
+        "two:voice:Name-Custom:500",
+        "two:voice:NAME-CUSTOM:500",
+        "TWO:VOICE:name-custom:500",
+        "two:voice:name_custom:500",
+        "two:voice:name custom:500",
+        "two:voice:name-custom :500",
+        "two:voice:name-custom:500 ",
+        " two:voice:name-custom:500",
+        "two:voice:name-custom:500\n",
+        "two:lfg:name-custom:500",
+        "two:self-role:name-custom:500",
+        "two:voice:name-custom:500\u{200b}",
+        "two:voice:name-restore:500\u{feff}",
+        // Truncated shapes.
+        "two:voice:name-",
+        "two:voice:name-custom",
+        "two:voice:name-restore",
+        "two:voice:name-modal",
+        "two:voice:name-custom:",
+        "two:voice:name-restore:",
+        "two:voice:name-modal:",
+        // Separator confusion.
+        "two:voice:name-custom:500:600",
+        "two:voice:name-restore:500:600",
+        "two:voice:name-modal:500:600",
+        "two:voice:name-custom:500:",
+        "two:voice:name-custom::500",
+        "two:voice:name-custom:500::",
+        "two::voice:name-custom:500",
+        "two:voice::name-custom:500",
+        "two;voice;name-custom;500",
+        "two:voice:name-custom;500",
+        "two:voice:name-custom/500",
+        // Non-numeric, zero and overflow rooms.
+        "two:voice:name-custom:0",
+        "two:voice:name-restore:00",
+        "two:voice:name-modal:000",
+        "two:voice:name-custom:+500",
+        "two:voice:name-custom:-500",
+        "two:voice:name-custom: 500",
+        "two:voice:name-custom:0x1F4",
+        "two:voice:name-custom:1.5",
+        "two:voice:name-custom:NaN",
+        "two:voice:name-custom:abc",
+        "two:voice:name-custom:18446744073709551616",
+        // Control bytes, NUL and non-ASCII rooms.
+        "two:voice:name-custom:\u{0}",
+        "two:voice:name-custom:500\u{0}",
+        "two:voice:name-custom:500\u{7f}",
+        "two:voice:name-restore:500\nmore",
+        "two:voice:name-custom:\u{e9}",
+        "two:voice:name-custom:\u{1f600}",
+        "two:voice:name-custom:\u{ff15}\u{ff10}\u{ff10}",
+        "two:voice:name-modal:\u{200b}",
+    ];
+    for id in hostile {
+        assert_eq!(parse_voice_custom_id(id), None, "{id:?}");
+        assert_eq!(name_component_action(&click(id)), None, "{id:?}");
+        assert_eq!(name_component_action(&modal(id)), None, "{id:?}");
+        assert_eq!(
+            name_component_action(&modal_interaction(id, Vec::new())),
+            None,
+            "{id:?}"
+        );
+    }
+    // Exact-boundary overlong ids refuse on both paths. The 100-byte custom
+    // id is all digits but overflows `u64`; the 101-byte id trips the length
+    // gate first. Lengths are pinned so the boundary cannot drift.
+    let custom_100 = format!("two:voice:name-custom:{}", "1".repeat(78));
+    let custom_101 = format!("two:voice:name-custom:{}", "1".repeat(79));
+    assert_eq!(custom_100.len(), MAX_VOICE_CUSTOM_ID_CHARS);
+    assert_eq!(custom_101.len(), MAX_VOICE_CUSTOM_ID_CHARS + 1);
+    for id in [&custom_100, &custom_101] {
+        assert_eq!(parse_voice_custom_id(id), None, "{id:?}");
+        assert_eq!(name_component_action(&click(id)), None, "{id:?}");
+        assert_eq!(name_component_action(&modal(id)), None, "{id:?}");
+    }
+    // Multibyte boundary: 39 `é` are 78 bytes, so with the 22-byte custom
+    // prefix the id is exactly 100 bytes; 40 `é` are 102 bytes. Both refuse.
+    // One emoji is one char but two UTF-16 units and four bytes.
+    let multi_100 = format!("two:voice:name-custom:{}", "é".repeat(39));
+    let multi_over = format!("two:voice:name-custom:{}", "é".repeat(40));
+    assert_eq!(multi_100.len(), MAX_VOICE_CUSTOM_ID_CHARS);
+    assert!(multi_over.len() > MAX_VOICE_CUSTOM_ID_CHARS);
+    for id in [&multi_100, &multi_over] {
+        assert_eq!(parse_voice_custom_id(id), None, "{id:?}");
+        assert_eq!(name_component_action(&click(id)), None, "{id:?}");
+        assert_eq!(name_component_action(&modal(id)), None, "{id:?}");
+    }
+    let emoji_over = format!("two:voice:name-custom:{}", "\u{1f600}".repeat(25));
+    assert!(emoji_over.len() > MAX_VOICE_CUSTOM_ID_CHARS);
+    assert!(emoji_over.chars().count() < MAX_VOICE_CUSTOM_ID_CHARS);
+    assert_eq!(parse_voice_custom_id(&emoji_over), None);
+    assert_eq!(name_component_action(&click(&emoji_over)), None);
+}
+
+#[tokio::test]
+async fn hostile_clicks_leave_state_machine_and_trace_untouched() {
+    // Hostile button ids never become a `NameInteraction`, so the worker
+    // writes nothing and the next valid step still applies: the state
+    // machine is not confused and hostile input is never echoed.
+    let (mut worker, trace) = setup().await;
+    let overlong = format!("two:voice:name-custom:{}", "1".repeat(79));
+    let hostile: Vec<&str> = vec![
+        "two:voice:Name-Custom:500",
+        "two:voice:name-custom:500:600",
+        "two:voice:name-custom:500:",
+        "two:voice:name-custom::500",
+        "two:voice:name-custom:0",
+        "two:voice:name-custom:+500",
+        "two:voice:name-custom:abc",
+        "two:voice:name-custom:18446744073709551616",
+        "two:voice:name-custom:\u{0}",
+        "two:voice:name-custom:500\u{0}",
+        "two:voice:name-custom:\u{1f600}",
+        "two:voice:name-restore:500\nmore",
+        &overlong,
+    ];
+    for id in hostile.iter().copied() {
+        let click = component_interaction(id, None, OWNER);
+        assert_eq!(name_component_action(&click), None, "{id:?}");
+        let submitted = modal_interaction(id, labelled_input("Den"));
+        assert_eq!(name_component_action(&submitted), None, "{id:?}");
+    }
+    assert!(worker.custom_names.is_empty());
+    drain(&mut worker).await;
+    assert!(trace.lock().unwrap().is_empty());
+    // The valid panel flow still runs after the hostile battery.
+    applied(worker.apply_name(command(OWNER, false, submit("Den")), 0));
+    assert_eq!(
+        worker.custom_names.get(&ROOM).map(String::as_str),
+        Some("Den")
+    );
+    drain(&mut worker).await;
+    let entries = trace.lock().unwrap().clone();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.contains("save_custom_name:500")),
+        "{entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| hostile.iter().any(|id| entry.contains(*id))),
+        "hostile input is never echoed: {entries:?}"
+    );
+}
+
+#[tokio::test]
+async fn hostile_runtime_clicks_are_unowned_and_echo_nothing() {
+    // Through the real runtime, hostile name clicks are not owned and
+    // produce no reply, so hostile bytes never reach a response. A valid
+    // panel click immediately after still owns and answers.
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let names = directory();
+    for id in [
+        "two:voice:Name-Custom:500",
+        "two:voice:name-custom:500:600",
+        "two:voice:name-custom:0",
+        "two:voice:name-custom:500\u{0}",
+        "two:voice:name-custom:\u{1f600}",
+    ] {
+        let click = with_user(component_interaction(id, None, OWNER), OWNER);
+        let (owned, response) = name_capture_full(&runtime, &click, &names).await;
+        assert!(!owned, "{id:?}");
+        assert!(response.is_none(), "{id:?}");
+        let submitted = modal_interaction(id, labelled_input("Den"));
+        let submitted = with_user(submitted, OWNER);
+        let (owned, response) = name_capture_full(&runtime, &submitted, &names).await;
+        assert!(!owned, "{id:?}");
+        assert!(response.is_none(), "{id:?}");
+    }
+    let click = component_interaction(&name_custom_custom_id(500), None, OWNER);
+    let (owned, response) = name_capture_full(&runtime, &click, &names).await;
+    assert!(owned);
+    let modal = response.expect("valid custom button still opens the modal");
+    assert_eq!(modal.kind, InteractionResponseType::Modal);
+}
+
+#[test]
 fn name_is_a_gated_voice_command_named_name() {
     let interaction = voice_interaction(Some(command_data("name", Vec::new())), None, true);
     assert_eq!(parse_voice_command(&interaction), Some(VoiceCommand::Name));
