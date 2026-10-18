@@ -42,9 +42,13 @@ Push to `main`, the weekly schedule, manual dispatch, any undecidable diff
 (missing SHAs, classifier error) and any non-PR event fail closed to full
 jobs, so release-candidate and staging validation always get the scan.
 On PRs the scan is selected by Rust sources (`crates/`, `src/`), `sql/`,
-`.cargo/`, `tests/`, and `scripts/`. Each of those selects `rust` (except
-voice-template-only assets, which no job reads), and `supply` follows `rust`
-because Rust changes alter the shipped binary the scan inventories. It is
+`.cargo/`, `tests/`, and `scripts/`. Each of those selects `rust`, except
+`tests/voice_templates/` coverage and validator-test assets (`coverage.json`,
+`test_validator.py`, plus docs-only `README.md`), which select no matrix job
+and are validated by the check job's always-on voice-template step;
+`corpus.json` and `validate.py` there still select `rust`, and `supply`
+follows `rust` because Rust changes alter the shipped binary the scan
+inventories. It is
 also selected by dependency manifests (`Cargo.toml`, `Cargo.lock`, `deny.toml`,
 `rust-toolchain.toml`, `migrations.lock`), the runtime image inputs
 (`Dockerfile`, `.dockerignore`, which select `supply` directly),
@@ -174,17 +178,17 @@ the tag; require the assets before treating the release as fully delivered.
 # supply-chain job, so there is no supply-chain artifact to download.
 # The 40-minute job has contents: read, no deploy secrets and no publishing path.
 # No release workflow dispatch or pull_request_target is required.
-# On a selected run, inspect the supply-chain artifact: two nonempty
-# CycloneDX BOMs, SHA256SUMS, source SHA/image ID, and both vulnerability
-# reports.
+# On a selected run that completes the handoff and reaches verification,
+# inspect the supply-chain artifact: two nonempty CycloneDX BOMs, SHA256SUMS,
+# source SHA/image ID, and both vulnerability reports.
 gh run download <run-id> -n supply-chain -D <run-owned-scratch-directory>
 # Repair assets on an existing stable release; rebuilds its tag, not current main.
 gh workflow run release.yml --ref main -f release_tag=vX.Y.Z
 ```
 
-On a selected PR, the dry-run inventories the exact PR head SHA, validates
-lockfile coverage and Debian image components, and records
-checksums/provenance before scanning.
+On a selected PR, the dry-run inventories the exact PR head SHA and records
+checksums/provenance before scanning, then validates lockfile coverage and
+Debian image components in `verify` after the image vulnerability gates.
 Image tags include the Actions run ID and attempt. No shared cache exists:
 the image build uses no `cache-from`/`cache-to`, and Trivy caching is off
 (`cache: false`), so per-run state lives only under `runner.temp`.
