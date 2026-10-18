@@ -46,6 +46,7 @@ export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly
   two_bot_voice_creator_map_generation: {},
   two_bot_voice_creator_map_age_seconds: {},
   two_bot_eventsub_posts_total: { outcome: ["attempted", "succeeded", "failed", "other"] },
+  two_bot_eventsub_classified_total: { kind: ["challenge", "notification", "revocation", "tampered", "ignored", "other"] },
 };
 
 /** Every series the validator checks: required plus optional-when-present. */

@@ -247,6 +247,13 @@ pub async fn dispatch(args: &[String]) -> i32 {
         print!("{USAGE}");
         return 0;
     }
+    // Bare-boot owed-release override: the documented `two-bot --allow-owed`
+    // service-start flag falls through to the boot preflight in `run`
+    // (100 = not a backup subcommand). Only the exact single flag; typos,
+    // extra arguments and operator subcommands keep exit 2 below.
+    if args.len() == 1 && args[0] == two_bot_core::disable_preflight::OVERRIDE_FLAG {
+        return 100;
+    }
     match route(&args[0], &args[1..]) {
         Route::Help => {
             print!("{USAGE}");
@@ -1703,6 +1710,34 @@ mod tests {
         // unknown-subcommand refusal.
         for subcommand in ["db", "erase-member", "serve"] {
             assert_eq!(route(subcommand, &strings(&["--help"])), Route::Run);
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_boot_allow_owed_falls_through_to_service_preflight() {
+        // The exact documented service-start flag is not a backup
+        // subcommand: 100 tells `main` to run the boot preflight in `run`.
+        assert_eq!(
+            super::dispatch(&strings(&[two_bot_core::disable_preflight::OVERRIDE_FLAG])).await,
+            100
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_boot_near_misses_and_extra_args_stay_usage_errors() {
+        // Only the exact single flag falls through; typos, unknown flags
+        // and the flag beside another argument keep exit 2 without touching
+        // env, DB or network.
+        for args in [
+            &["--allow-owwed"][..],
+            &["--allow-owed-releases"][..],
+            &["--allow-owed=1"][..],
+            &["--allow_owed"][..],
+            &["--frobnicate"][..],
+            &["--allow-owed", "--frobnicate"][..],
+            &["backup", "--allow-owed"][..],
+        ] {
+            assert_eq!(super::dispatch(&strings(args)).await, 2, "{args:?}");
         }
     }
 
