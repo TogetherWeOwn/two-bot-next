@@ -585,3 +585,233 @@ async fn community_message_fact_capture_round_trip() {
     assert_eq!(bot_class, "bot");
     db.close().await;
 }
+
+// Foreign-guild zero-rows proof: reply silence alone does not prove that a
+// foreign guild left no persistence behind. These tests drive every leveling
+// entry point (`/rank`, `/leaderboard`, message XP, voice XP) from a guild
+// other than the runtime's configured guild and assert the store stays
+// empty, while an own-guild control proves the same composition still
+// writes. A test that would catch a removed guild fence must see rows here.
+const FOREIGN_GUILD: u64 = 1111111111111111111;
+
+async fn leveling_row_counts(pool: &PgPool, guild: u64) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM member_levels WHERE guild_id = $1),
+                (SELECT COUNT(*) FROM xp_awards WHERE guild_id = $1)",
+    )
+    .bind(guild.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn total_leveling_rows(pool: &PgPool) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM member_levels),
+                (SELECT COUNT(*) FROM xp_awards)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn foreign_interaction(name: &str, target: bool) -> Interaction {
+    let mut interaction = interaction(name, target);
+    interaction.guild_id = Some(twilight_model::id::Id::new(FOREIGN_GUILD));
+    interaction
+}
+
+fn foreign_message(seconds: i64) -> Event {
+    let mut event = message(seconds);
+    if let Event::MessageCreate(m) = &mut event {
+        m.guild_id = Some(twilight_model::id::Id::new(FOREIGN_GUILD));
+    }
+    event
+}
+
+fn foreign_voice(channel: Option<u64>) -> Event {
+    let mut event = voice(channel);
+    if let Event::VoiceStateUpdate(v) = &mut event {
+        v.guild_id = Some(twilight_model::id::Id::new(FOREIGN_GUILD));
+    }
+    event
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or credential-free CI service"]
+async fn foreign_guild_rank_and_leaderboard_leave_zero_rows_and_no_reply() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let runtime = runtime(db.pool.clone(), &mock, OnboardingMode::Legacy);
+
+    // Foreign-guild /rank (self and targeted) and /leaderboard, plus a
+    // missing-guild /rank: none is handled, none replies, none writes.
+    for (interaction, handler) in [
+        (foreign_interaction("rank", false), HandlerId::Rank),
+        (foreign_interaction("rank", true), HandlerId::Rank),
+        (
+            foreign_interaction("leaderboard", false),
+            HandlerId::Leaderboard,
+        ),
+    ] {
+        assert!(
+            !runtime
+                .handle_interaction(&interaction, handler)
+                .await
+                .unwrap(),
+            "foreign-guild interaction must not be handled"
+        );
+    }
+    let mut guildless = interaction("rank", false);
+    guildless.guild_id = None;
+    assert!(!runtime
+        .handle_interaction(&guildless, HandlerId::Rank)
+        .await
+        .unwrap());
+    assert!(
+        mock.requests().is_empty(),
+        "foreign-guild interactions send no reply"
+    );
+    assert_eq!(leveling_row_counts(&db.pool, FOREIGN_GUILD).await, (0, 0));
+    assert_eq!(
+        total_leveling_rows(&db.pool).await,
+        (0, 0),
+        "foreign-guild interactions leave zero member_levels/xp_awards rows"
+    );
+
+    // Own-guild control: the same handlers run and reply, and the read paths
+    // themselves still write nothing.
+    assert!(runtime
+        .handle_interaction(&interaction("rank", false), HandlerId::Rank)
+        .await
+        .unwrap());
+    assert!(runtime
+        .handle_interaction(&interaction("leaderboard", false), HandlerId::Leaderboard)
+        .await
+        .unwrap());
+    assert_eq!(mock.requests().len(), 2);
+    assert_eq!(leveling_row_counts(&db.pool, GUILD).await, (0, 0));
+    assert_eq!(total_leveling_rows(&db.pool).await, (0, 0));
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or credential-free CI service"]
+async fn foreign_guild_message_and_voice_xp_leave_zero_rows_own_guild_writes() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let pipeline = OrderedLevelingPipeline::new(
+        MemStore::new(),
+        Some(runtime(db.pool.clone(), &mock, OnboardingMode::Legacy)),
+    );
+
+    // Foreign-guild message XP: no award, no rows.
+    assert!(pipeline
+        .handle_at(&foreign_message(0), &at(0), MessageEligibility::default())
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        total_leveling_rows(&db.pool).await,
+        (0, 0),
+        "foreign-guild message leaves zero rows"
+    );
+
+    // Foreign-guild voice XP: a full ten-minute session awards nothing and
+    // writes nothing.
+    pipeline
+        .handle_at(
+            &foreign_voice(Some(CHANNEL)),
+            &at(60),
+            MessageEligibility::default(),
+        )
+        .await
+        .unwrap();
+    assert!(pipeline
+        .handle_at(
+            &foreign_voice(None),
+            &at(660),
+            MessageEligibility::default()
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(leveling_row_counts(&db.pool, FOREIGN_GUILD).await, (0, 0));
+    assert_eq!(
+        total_leveling_rows(&db.pool).await,
+        (0, 0),
+        "foreign-guild voice session leaves zero rows"
+    );
+
+    // Own-guild control: the same pipeline and runtime do write. One message
+    // (15 XP) and one ten-minute voice session (10 min * 5 XP = 50 XP) land
+    // as one member_levels row and two xp_awards rows.
+    let message_awards = pipeline
+        .handle_at(&message(1200), &at(1200), MessageEligibility::default())
+        .await
+        .unwrap();
+    assert_eq!(message_awards.len(), 1);
+    assert_eq!(message_awards[0].awarded, 15);
+    pipeline
+        .handle_at(
+            &voice(Some(CHANNEL)),
+            &at(1300),
+            MessageEligibility::default(),
+        )
+        .await
+        .unwrap();
+    let voice_awards = pipeline
+        .handle_at(&voice(None), &at(1900), MessageEligibility::default())
+        .await
+        .unwrap();
+    assert_eq!(voice_awards.len(), 1);
+    assert_eq!(voice_awards[0].awarded, 50);
+    assert_eq!(leveling_row_counts(&db.pool, GUILD).await, (1, 2));
+    assert_eq!(total_leveling_rows(&db.pool).await, (1, 2));
+    let own_xp: i64 = sqlx::query_scalar("SELECT xp FROM member_levels WHERE guild_id = $1")
+        .bind(GUILD.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(own_xp, 65);
+
+    // Foreign attempts after the control add nothing and leave the
+    // own-guild row untouched.
+    assert!(pipeline
+        .handle_at(
+            &foreign_message(2000),
+            &at(2000),
+            MessageEligibility::default()
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    pipeline
+        .handle_at(
+            &foreign_voice(Some(CHANNEL)),
+            &at(2100),
+            MessageEligibility::default(),
+        )
+        .await
+        .unwrap();
+    assert!(pipeline
+        .handle_at(
+            &foreign_voice(None),
+            &at(2700),
+            MessageEligibility::default()
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(leveling_row_counts(&db.pool, FOREIGN_GUILD).await, (0, 0));
+    assert_eq!(total_leveling_rows(&db.pool).await, (1, 2));
+    let own_xp_after: i64 = sqlx::query_scalar("SELECT xp FROM member_levels WHERE guild_id = $1")
+        .bind(GUILD.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(own_xp_after, own_xp);
+    mock.shutdown().await;
+    db.close().await;
+}
