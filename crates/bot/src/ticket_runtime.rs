@@ -279,6 +279,7 @@ pub(crate) enum Failure {
     Rest(DiscordError),
     InvalidEvidence,
     Timeout,
+    NoTicket,
 }
 
 impl From<StoreError> for Failure {
@@ -295,6 +296,16 @@ impl Failure {
     pub fn reply(&self) -> String {
         match self {
             Self::Store(StoreError::Domain(error)) => error.to_string(),
+            // Lane admission times out before any store reservation exists, so
+            // no unfinished work was left for recovery to retry. Stay a
+            // truthful retry-later refusal without claiming a recovery job.
+            Self::Timeout => {
+                "Ticket action timed out waiting for another operation. Try again later.".into()
+            }
+            // Claim/close in a channel with no tracked ticket ends before any
+            // operation: name the refusal specifically without promising
+            // recovery or exposing storage details.
+            Self::NoTicket => "This channel is not a ticket.".into(),
             _ => {
                 "Ticket action failed; recovery will retry unfinished work. Try again later.".into()
             }
@@ -304,7 +315,7 @@ impl Failure {
         match self {
             Self::Store(_) => ErrorClass::Database,
             Self::Timeout | Self::Rest(DiscordError::Timeout) => ErrorClass::Timeout,
-            Self::Rest(_) | Self::InvalidEvidence => ErrorClass::Rest,
+            Self::Rest(_) | Self::InvalidEvidence | Self::NoTicket => ErrorClass::Rest,
         }
     }
 }
@@ -528,7 +539,7 @@ impl TicketRuntime {
                     .store
                     .by_channel(&channel)
                     .await?
-                    .ok_or(StoreError::NotFound)?;
+                    .ok_or(Failure::NoTicket)?;
                 match action {
                     TicketAction::Claim => {
                         self.store.claim(&ticket.id, &actor).await?;
@@ -1089,3 +1100,7 @@ mod revision_tests;
 #[cfg(test)]
 #[path = "ticket_panels_isolation_tests.rs"]
 mod panels_isolation_tests;
+
+#[cfg(test)]
+#[path = "ticket_no_work_acceptance_tests.rs"]
+mod no_work_acceptance_tests;
