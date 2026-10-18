@@ -164,6 +164,37 @@ export const CREATOR_MAP_REFRESH_SECONDS = 300;
  * interval never fires. Mirrors the `STALE_INTERVALS` two-interval rule.
  */
 export const CREATOR_MAP_STALE_SECONDS = 2 * CREATOR_MAP_REFRESH_SECONDS;
+/** Error-budget ratio of the 48h watch: 99.9% SLO leaves 0.1% spendable. */
+export const ERROR_BUDGET_RATIO = 0.001;
+/** Fast burn: page when both the 15 min and 2 min windows burn faster than this. */
+export const ERROR_BUDGET_FAST_BURN = 12;
+/** Long window for the error-budget fast-burn rule, seconds. */
+export const ERROR_BUDGET_FAST_LONG_SECONDS = 900;
+/** Short confirmation window for the error-budget fast-burn rule, seconds. */
+export const ERROR_BUDGET_FAST_SHORT_SECONDS = 120;
+/** Burn snapshots older than the long window plus this margin are pruned. */
+export const ERROR_BUDGET_FAST_HISTORY_MARGIN_SECONDS = 120;
+/**
+ * A window baseline older than its boundary plus this tolerance is stale, not
+ * covering: keepalive scrapes land about every 60 s (slower when a probe is
+ * slow), so a baseline up to two nominal intervals past the boundary is still
+ * ordinary scrape alignment, while an older one means a boundary scrape was
+ * missed and the window would sweep errors from outside the claimed span.
+ */
+export const ERROR_BUDGET_FAST_BASELINE_TOLERANCE_SECONDS = 120;
+/** A burn window with fewer eligible REST requests than this never fires. */
+export const ERROR_BUDGET_FAST_MIN_EVENTS = 10;
+/** A burn window with fewer budget errors than this never fires. */
+export const ERROR_BUDGET_FAST_MIN_ERRORS = 2;
+/**
+ * Relative allowance below the nominal fast-burn threshold. Window edges land
+ * on whole ~60 s keepalive scrapes, so a burn sustained exactly at the policy
+ * rate can read up to ~1% low when the edges shave a scrape; the comparison
+ * carries this allowance so threshold-sustained burn still pages instead of
+ * flapping. Healthy traffic (near 1x) and single-window spikes stay silent
+ * with orders of magnitude to spare.
+ */
+export const ERROR_BUDGET_FAST_TOLERANCE = 0.01;
 
 export const RULES: readonly RuleDef[] = [
   { id: "job_stale", summary: `scheduled job has no success for more than ${STALE_INTERVALS} intervals`, runbook: "runbook.md#alert-job-stale" },
@@ -185,6 +216,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_join_fast_burn", summary: `creator-join error budget burning faster than ${JOIN_FAST_BURN}x over 1 h and 5 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-fast-burn" },
   { id: "voice_join_slow_burn", summary: `creator-join error budget burning faster than ${JOIN_SLOW_BURN}x over 6 h and 30 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-slow-burn", severity: "ticket" },
   { id: "voice_creator_map_stale", summary: `voice creator map has not merged for more than ${CREATOR_MAP_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-voice-creator-map-stale" },
+  { id: "error_budget_fast_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_FAST_BURN}x over ${ERROR_BUDGET_FAST_LONG_SECONDS / 60} min and ${ERROR_BUDGET_FAST_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-fast-burn" },
   { id: "audit_delivery_halt", summary: `audit delivery halt engaged for ${AUDIT_HALT_SAMPLES} consecutive valid samples`, runbook: "runbook.md#alert-audit-delivery-halt", severity: "ticket" },
 ];
 
@@ -286,6 +318,14 @@ export interface MetricsAlertState {
    * older Worker versions; the first valid sample only stores a baseline.
    */
   joinBurn?: JoinBurnSnapshot[];
+  /**
+   * Error-budget burn snapshots for the 15 min / 2 min fast-burn windows,
+   * oldest first. Each entry carries the scrape time plus cumulative REST
+   * counters (eligible requests, 5xx plus transport errors). Absent on state
+   * stored by older Worker versions; the first valid sample only stores a
+   * baseline.
+   */
+  errorBudgetBurn?: ErrorBudgetBurnSnapshot[];
 }
 
 /** One cumulative creator-join SLI snapshot feeding the burn-rate windows. */
@@ -294,6 +334,117 @@ export interface JoinBurnSnapshot {
   received: number;
   duplicate: number;
   fastMoves: number;
+}
+
+/** One cumulative REST error-budget snapshot feeding the fast-burn windows. */
+export interface ErrorBudgetBurnSnapshot {
+  t: number;
+  total: number;
+  errors: number;
+}
+
+interface ErrorBudgetBurnResult {
+  fast: boolean;
+  /** Inputs were missing or malformed: the caller retains the previous firing state. */
+  held: boolean;
+  ring: ErrorBudgetBurnSnapshot[];
+}
+
+/**
+ * Multiwindow burn rate over the REST error budget (`docs/error-budget-alerts.md`):
+ * 99.9% of eligible REST requests must succeed over the 48h watch, so every
+ * `two_bot_rest_requests_total` sample is eligible traffic and `5xx` plus
+ * `transport` outcomes spend the budget (`4xx`/`429` are caller or
+ * rate-limit outcomes, not spend). Pages when both the 15 min long window
+ * and the 2 min short window burn faster than `ERROR_BUDGET_FAST_BURN`,
+ * less the scrape-quantization allowance. `held` is true when the REST
+ * series are absent or malformed and the ring is carried unchanged; a
+ * backwards counter (process restart) rebuilds the ring from this sample
+ * and fires nothing. Otherwise the sample is appended, entries older than
+ * the long window plus margin are pruned but the newest pre-cutoff snapshot
+ * is always kept as the long-window anchor, and each window burns as
+ * errors / (requests x budget) against the threshold. A window fires only
+ * with full history coverage (a sample at or before its start and no older
+ * than the boundary plus the baseline tolerance), enough eligible requests,
+ * and at least two budget errors, so fresh rings, quiet traffic and one bad
+ * minute stay silent. A window without coverage is unknown rather than
+ * quiet: the caller holds an existing firing state instead of resolving a
+ * page on missing history, and only full coverage below threshold resolves.
+ */
+function errorBudgetBurnEvaluation(
+  samples: Sample[],
+  ring: ErrorBudgetBurnSnapshot[],
+  nowSeconds: number,
+): ErrorBudgetBurnResult {
+  const rows = samples.filter((s) => s.name === "two_bot_rest_requests_total");
+  if (rows.length === 0) {
+    return { fast: false, held: true, ring };
+  }
+  let total = 0;
+  let errors = 0;
+  for (const s of rows) {
+    if (!Number.isSafeInteger(s.value) || s.value < 0) {
+      return { fast: false, held: true, ring };
+    }
+    total += s.value;
+    if (s.labels["result"] === "5xx" || s.labels["result"] === "transport") {
+      errors += s.value;
+    }
+  }
+  if (!Number.isSafeInteger(total) || !Number.isSafeInteger(errors)) {
+    return { fast: false, held: true, ring };
+  }
+  const snapshot: ErrorBudgetBurnSnapshot = { t: nowSeconds, total, errors };
+  const last = ring[ring.length - 1];
+  if (last !== undefined && (total < last.total || errors < last.errors)) {
+    return { fast: false, held: false, ring: [snapshot] };
+  }
+  const cutoff = nowSeconds - ERROR_BUDGET_FAST_LONG_SECONDS - ERROR_BUDGET_FAST_HISTORY_MARGIN_SECONDS;
+  const keep = ring.filter((s) => s.t > cutoff && s.t <= nowSeconds);
+  // Anchor: always retain the newest pre-cutoff snapshot. A failed scrape
+  // never evaluates, so after a scrape gap the first samples past the gap
+  // have no baseline at or before the long-window start; without the anchor
+  // a still-firing burn reads as uncovered and spuriously resolves, then
+  // re-pages on the next scrape. Counters are cumulative, so the anchored
+  // delta still measures exactly the errors and requests since the anchor.
+  const anchor = [...ring].reverse().find((s) => s.t <= cutoff);
+  const next = [...(anchor ? [anchor] : []), ...keep, snapshot];
+  // A window is a measured rate, an unknown coverage gap, or a covered quiet
+  // window. Unknown holds an existing page; only a covered window below the
+  // volume floors or the threshold resolves one.
+  const burn = (windowSeconds: number): { rate: number } | { unknown: true } | { quiet: true } => {
+    let base: ErrorBudgetBurnSnapshot | undefined;
+    for (const s of next) {
+      if (s.t <= nowSeconds - windowSeconds) base = s;
+    }
+    // No sample at or before the window start means the ring does not yet
+    // cover this full window, so wait for history rather than firing.
+    if (base === undefined) return { unknown: true };
+    // A baseline older than the boundary plus the scrape-alignment tolerance
+    // means a boundary scrape was missed: the window would sweep errors from
+    // outside the claimed span, so treat it as unknown rather than paging on
+    // stale errors.
+    if (nowSeconds - windowSeconds - base.t > ERROR_BUDGET_FAST_BASELINE_TOLERANCE_SECONDS) {
+      return { unknown: true };
+    }
+    const windowTotal = total - base.total;
+    const windowErrors = errors - base.errors;
+    if (windowTotal < ERROR_BUDGET_FAST_MIN_EVENTS) return { quiet: true };
+    if (windowErrors < ERROR_BUDGET_FAST_MIN_ERRORS) return { quiet: true };
+    return { rate: windowErrors / (windowTotal * ERROR_BUDGET_RATIO) };
+  };
+  const threshold = ERROR_BUDGET_FAST_BURN * (1 - ERROR_BUDGET_FAST_TOLERANCE);
+  const longBurn = burn(ERROR_BUDGET_FAST_LONG_SECONDS);
+  const shortBurn = burn(ERROR_BUDGET_FAST_SHORT_SECONDS);
+  return {
+    fast:
+      "rate" in longBurn &&
+      "rate" in shortBurn &&
+      longBurn.rate >= threshold &&
+      shortBurn.rate >= threshold,
+    held: "unknown" in longBurn || "unknown" in shortBurn,
+    ring: next,
+  };
 }
 
 export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
@@ -617,6 +768,13 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const d5xx = rest5xx - prevRest5xx;
   if (hasRest5xxBaseline && !reset5xx && dTotal >= REST_5XX_MIN_REQUESTS && d5xx / dTotal > REST_5XX_RATIO) firing.push("rest_5xx_rate");
 
+  // REST error-budget fast burn (docs/error-budget-alerts.md): the first
+  // automatic fast-burn page. Both the 15 min and 2 min windows must burn
+  // faster than 12x; one bad minute alone never pages.
+  const errorBudgetBurn = errorBudgetBurnEvaluation(samples, prev.errorBudgetBurn ?? [], nowSeconds);
+  if (errorBudgetBurn.fast) firing.push("error_budget_fast_burn");
+  else if (prev.firing.includes("error_budget_fast_burn") && errorBudgetBurn.held) firing.push("error_budget_fast_burn");
+
   const configured = gauge("two_bot_db_pool_configured")[0]?.value === 1;
   const size = gauge("two_bot_db_pool_connections")[0]?.value;
   const max = gauge("two_bot_db_pool_max_connections")[0]?.value;
@@ -886,7 +1044,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, auditHaltStreak, joinBurn: joinBurn.ring } };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, auditHaltStreak, joinBurn: joinBurn.ring, errorBudgetBurn: errorBudgetBurn.ring } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
@@ -964,4 +1122,56 @@ export function transitionMessages(
     out.push(`two-bot-next RESOLVED ${key}${classSuffix}.${suffix}`);
   }
   return out;
+}
+
+/**
+ * Sustained loss of the metrics scrape (the observer going blind).
+ *
+ * This is a synthetic Worker-side incident, not a metric rule: it never enters
+ * `evaluateMetrics` or `RULES` (those stay pinned to the Rust exposition
+ * contract), and its streak lives under its own storage key so failed scrapes
+ * can neither resolve metric incidents nor disturb their baselines. Three
+ * consecutive failed scheduled scrapes ticket once; the first complete valid
+ * scrape afterwards resolves once. Timeout, non-OK, oversized and invalid
+ * exposition all count as failure; bodies never reach logs or notifications.
+ */
+export const SCRAPE_LOSS_THRESHOLD = 3;
+/** Synthetic firing key for sustained scrape loss; never a `RULES` id. */
+export const SCRAPE_LOSS_RULE_ID = "metrics_scrape_lost";
+/** Runbook anchor for the scrape-loss ticket (`docs/runbook.md` heading slug). */
+export const SCRAPE_LOSS_RUNBOOK = "runbook.md#alert-metrics-scrape-lost";
+/** Summary line for the scrape-loss ticket. */
+export const SCRAPE_LOSS_SUMMARY =
+  `metrics scrape lost for ${SCRAPE_LOSS_THRESHOLD} consecutive scheduled scrapes`;
+
+/** Observer-loss state, stored independently of metric-rule state. */
+export interface ScrapeLossState {
+  /** Consecutive failed scheduled scrapes, capped at `SCRAPE_LOSS_THRESHOLD`. */
+  streak: number;
+  /** Whether the sustained-loss incident is currently firing. */
+  firing: boolean;
+}
+
+export const EMPTY_SCRAPE_LOSS: ScrapeLossState = { streak: 0, firing: false };
+
+/** Coerce stored observer-loss state; legacy or corrupt storage stays quiet. */
+export function sanitizeScrapeLossState(stored: unknown): ScrapeLossState {
+  if (typeof stored !== "object" || stored === null) return { ...EMPTY_SCRAPE_LOSS };
+  const record = stored as Record<string, unknown>;
+  const streak = typeof record["streak"] === "number"
+    && Number.isSafeInteger(record["streak"])
+    && (record["streak"] as number) >= 0
+    ? Math.min(record["streak"] as number, SCRAPE_LOSS_THRESHOLD)
+    : 0;
+  return { streak, firing: record["firing"] === true };
+}
+
+/** Firing line for the scrape-loss ticket; no mentions, no secrets, no bodies. */
+export function scrapeLossFiringMessage(context?: AlertContext): string {
+  return `two-bot-next ALERT ${SCRAPE_LOSS_RULE_ID} (ticket): ${SCRAPE_LOSS_SUMMARY}. Runbook: ${RUNBOOK_BASE_URL}${SCRAPE_LOSS_RUNBOOK}.${alertContextSuffix(context)}`;
+}
+
+/** Recovery line for the scrape-loss ticket; no mentions, no secrets, no bodies. */
+export function scrapeLossResolvedMessage(context?: AlertContext): string {
+  return `two-bot-next RESOLVED ${SCRAPE_LOSS_RULE_ID}.${alertContextSuffix(context)}`;
 }
