@@ -140,6 +140,14 @@ All changes go through their own API routes.</p>
 <section id="summary"><p class="muted">No data yet.</p></section>
 <script>
 let timer = null;
+// Connection-generation + request-order guard: every poll captures its
+// generation and sequence number, and a completion that is obsolete (a
+// Disconnect or reconnect moved the generation on) or older than an
+// already-applied result in the same generation never touches the DOM.
+// Bounded O(1) counters only; no credential is stored, logged or rendered.
+let connectGen = 0;
+let pollSeq = 0;
+let lastAppliedSeq = 0;
 function creds() {
   return {
     id: document.getElementById("clientId").value,
@@ -147,15 +155,23 @@ function creds() {
   };
 }
 async function poll() {
+  const gen = connectGen;
+  const seq = ++pollSeq;
   const { id, secret } = creds();
   const el = document.getElementById("summary");
   const status = document.getElementById("status");
+  // A stale completion leaves the DOM untouched, however it finishes.
+  function obsolete() {
+    return gen !== connectGen || seq <= lastAppliedSeq;
+  }
   let res;
   try {
     res = await fetch("/ops/summary", {
       headers: { "cf-access-client-id": id, "cf-access-client-secret": secret },
     });
   } catch (e) {
+    if (obsolete()) return;
+    lastAppliedSeq = seq;
     status.textContent = "fetch failed";
     return;
   }
@@ -163,6 +179,8 @@ async function poll() {
   const isReadinessJson = contentType.indexOf("application/json") !== -1
     && (res.status === 200 || res.status === 503);
   if (!isReadinessJson) {
+    if (obsolete()) return;
+    lastAppliedSeq = seq;
     status.textContent = "summary " + res.status;
     el.innerHTML = '<p class="bad">summary request failed: ' + res.status + '</p>';
     return;
@@ -171,10 +189,15 @@ async function poll() {
   try {
     data = await res.json();
   } catch (e) {
+    if (obsolete()) return;
+    lastAppliedSeq = seq;
     status.textContent = "summary " + res.status;
     el.innerHTML = '<p class="bad">summary request failed: ' + res.status + '</p>';
     return;
   }
+  // Re-check after the second await: the body may arrive after Disconnect,
+  // reconnect, or a newer poll that already rendered.
+  if (obsolete()) return;
   // Validate and render before stamping: a malformed report must replace the
   // previous readiness with an explicit failure state instead of leaving a
   // stale READY on screen as current. render throws on malformed shapes.
@@ -182,10 +205,12 @@ async function poll() {
   try {
     html = render(data, res.status);
   } catch (e) {
+    lastAppliedSeq = seq;
     status.textContent = "summary " + res.status;
     el.innerHTML = '<p class="bad">summary report invalid: ' + res.status + '</p>';
     return;
   }
+  lastAppliedSeq = seq;
   status.textContent = "updated " + new Date().toISOString();
   el.innerHTML = html;
 }
@@ -243,11 +268,19 @@ function render(data, status) {
 }
 document.getElementById("connect").addEventListener("click", () => {
   if (timer) clearInterval(timer);
+  // A (re)connect opens a new generation with fresh ordering: pending
+  // polls from any previous generation can no longer write the DOM, and
+  // exactly one interval keeps polling.
+  connectGen++;
+  lastAppliedSeq = 0;
   poll();
   timer = setInterval(poll, 15000);
 });
 document.getElementById("disconnect").addEventListener("click", () => {
   if (timer) { clearInterval(timer); timer = null; }
+  // Invalidate pending polls so their late completions cannot overwrite
+  // the disconnected status; the status line below stays authoritative.
+  connectGen++;
   document.getElementById("clientId").value = "";
   document.getElementById("clientSecret").value = "";
   document.getElementById("status").textContent = "disconnected";

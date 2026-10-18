@@ -23,6 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / ".semgrep/rust-warn.yml"
 MAX_ANNOTATIONS = 10
+EMPTY_EXPECT_RULES = frozenset({"rust-empty-expect", "rust-empty-expect-in-macros"})
 # Only these scan diagnostics leave coverage intact, so they annotate the PR
 # instead of failing it. Every other `errors` entry (timeouts, partial or
 # failed parses, config errors, unknown types or levels) means a file was not
@@ -102,7 +103,7 @@ def run_semgrep(semgrep):
                 or type(line) is not int or line < 1):
             return None, "semgrep report contains an invalid result"
         rule = check_id.split(".")[-1]
-        if rule == "rust-empty-expect":
+        if rule in EMPTY_EXPECT_RULES:
             end = result.get("end")
             if not isinstance(end, dict):
                 return None, "semgrep report contains an invalid result location"
@@ -110,6 +111,11 @@ def run_semgrep(semgrep):
             if type(line) is not int or line < start.get("line"):
                 return None, "semgrep report contains an invalid result location"
         findings.add((rule, path, line))
+    base_lines = {(path, line) for (rule, path, line) in findings
+                  if rule == "rust-empty-expect"}
+    findings = {finding for finding in findings
+                if finding[0] != "rust-empty-expect-in-macros"
+                or (finding[1], finding[2]) not in base_lines}
     return findings, "\n".join(scan_warnings)
 
 
@@ -134,10 +140,16 @@ def added_lines(base_ref, head_ref):
             path, in_hunk = None, False
             continue
         if not in_hunk and raw.startswith("+++ "):
-            if raw == "+++ /dev/null":
+            # Git terminates the +++ header with a single TAB delimiter when
+            # the path contains a space (see check-patch-coverage.py). Strip
+            # exactly one trailing TAB so spaced names match the scanner's
+            # exact repository-relative filename. A literal tab would arrive
+            # C-escaped, and quoted/malformed headers still fail closed below.
+            header = raw[:-1] if raw.endswith("\t") else raw
+            if header == "+++ /dev/null":
                 path = None
-            elif raw.startswith("+++ b/") and raw[len("+++ b/"):]:
-                path = raw[len("+++ b/"):]
+            elif header.startswith("+++ b/") and header[len("+++ b/"):]:
+                path = header[len("+++ b/"):]
             else:
                 return None, "git diff contains an unrecognized file path header"
             continue
