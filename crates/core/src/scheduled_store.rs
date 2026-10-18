@@ -145,7 +145,8 @@ pub async fn resolve_scheduled_id(
     }
 }
 
-/// One guild's definitions in ticker order (legacy `listScheduled`).
+/// One guild's definitions in list order: ascending (`next_run_at`, `id`),
+/// so tied run times keep a deterministic id order for paged discovery.
 pub async fn list_scheduled(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -154,7 +155,7 @@ pub async fn list_scheduled(
         "SELECT id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
                 last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
                 claim_token, claimed_at, occurrence_nonce
-           FROM scheduled_messages WHERE guild_id = $1 ORDER BY next_run_at",
+           FROM scheduled_messages WHERE guild_id = $1 ORDER BY next_run_at, id",
     )
     .bind(guild_id)
     .fetch_all(pool)

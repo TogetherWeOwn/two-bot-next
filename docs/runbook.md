@@ -21,7 +21,7 @@ separate authorization.
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.149.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.151.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -112,7 +112,7 @@ invocation, unsampled; production traces are off (`wrangler/wrangler.toml`).
 
 `logs` is **Worker/DO tail**, not Rust stdout. Stop it when the bounded incident
 observation is complete. For Rust stdout/stderr, use the affected container's
-logs in the Cloudflare dashboard. Wrangler 4.149.0 has no `containers logs`
+logs in the Cloudflare dashboard. Wrangler 4.151.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
 Container stdout is also in the Workers Observability `containers` dataset, which a
@@ -491,6 +491,35 @@ recommends alongside this alert: the bot's own reload first, then a same-SHA
 takeover card if the alert survives it (see
 [auto-remediation](#auto-remediation-guarded-stall-and-crash-loop-response)).
 
+#### Alert: error budget fast burn
+
+The REST error budget (99.9% success over the 48h watch, `docs/error-budget-alerts.md`)
+is burning faster than 12x in both the last 15 minutes and the last 2 minutes
+(`two_bot_rest_requests_total` eligible requests against `result="5xx"` plus
+`result="transport"` errors; `4xx`/`429` are caller or rate-limit outcomes, not
+spend). Each window needs at least 10 eligible requests and two budget errors;
+one bad minute alone never pages. After startup or restart, a window stays
+inactive until its full history is available; a counter reset rebuilds the
+window history instead of firing. A scrape gap never resolves a firing page by
+itself: a window without coverage holds the existing state, and only full
+coverage below threshold resolves. Window edges land on whole keepalive scrapes,
+so a burn sustained exactly at the policy rate reads up to ~1% low and the
+comparison carries that allowance instead of flapping.
+
+First response: confirm the spike is server-side via the authorized
+`/ops/metrics` scrape — compare `5xx` growth against `transport` growth by
+`route`. `transport` points at timeouts and cancellations before response
+headers (check job timeout classes); `5xx` concentrated on one route after a
+deploy points at a broken request shape from the fresh build (check the page's
+build SHA and the recent-deploy rollback one-pager); `5xx` across routes
+points at the Discord API (check the Discord status page). Then read the
+container logs for the failing route's error lines.
+
+Escalate when the burn persists across windows (the budget exhausts in 4 hours
+at full fast burn), when half the 48h budget is spent, or when the spike
+matches a deploy — the fix belongs to the on-call engineer, not another
+redeploy.
+
 #### Alert: gateway missed events
 
 `two_bot_gateway_missed_events_total` increased between two keepalive
@@ -762,6 +791,14 @@ as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
 
+#### Alert: metrics scrape lost
+
+The Container DO failed the container-internal `/metrics` scrape on 3 consecutive scheduled keepalive ticks. This is a **ticket, not a page**: the observer itself is blind, so every metric-rule alert is missing evidence while this fires. One failed scrape stays quiet and three consecutive failures ticket exactly once; further failures do not re-ticket while the incident fires.
+
+First response: read the scrape through the existing authorized `/ops/metrics` path, check container `/readyz` and Worker/container logs for `two-bot metrics scrape failed`. Timeouts (6 s deadline), non-OK status, oversized bodies (64 KiB cap) and invalid exposition all count as failure; the deadline and cap are unchanged by this alert. Notifications and logs carry only this runbook link and build context, never response bodies.
+
+A lost scrape never resolves any metric-rule incident: missing evidence is not recovery evidence, so previously firing alerts stay firing through the loss, and the existing dispatch-drop interruption still applies. The first complete valid scrape after the incident resolves only the scrape-loss ticket; metric rules re-evaluate on that same scrape and resolve only on their own evidence. A valid scrape before the third failure silently resets the streak with no resolve.
+
 #### Auto-remediation: guarded stall and crash-loop response
 
 Execution-path decision: the Worker cannot restart containers, so remediation
@@ -820,10 +857,30 @@ above. A stuck-gateway rule (non-ready `/readyz` gateway component with no
 disconnect edge) is not a trigger in v1; wiring it into the crash-loop scope
 is follow-up work once that rule lands, not part of this slice. Sustained
 `/readyz` red (`container_unready_alert`) and repeated process restarts stay
-manual. A positive-path staging proof (forcing a real stall) needs an injector
-that does not exist; v1 staging proof is a clean deploy with no spurious
-recommendation lines plus the unit suite below. Forcing these two alerts on
-staging is follow-up work, not a silent gap.
+manual.
+
+#### Staging fault injector drill
+
+Positive-path staging proof uses the staging-only fault injector
+(`wrangler/src/staging-fault.ts`), armed solely through the generated
+staging deploy config by a manual `deploy-staging` dispatch with
+`inject_voice_stall` and/or `inject_unpaired_disconnect` (both default
+false; a push can never arm them, and the switches are never committed
+vars). While armed, the keepalive tick holds
+`two_bot_voice_creator_map_generation` at 1 with age 660 s (past the 600 s
+bound, the 2x300 s refresh) and/or advances
+`two_bot_gateway_disconnects_total` with no recovery so the unpaired rule
+holds an outstanding disconnect; the alert rules and the guard above run
+unmodified, so every recommendation still fires only alongside its trigger.
+Expected timeline at the 60 s keepalive: the stall alert fires on the first
+armed tick, the unpaired alert needs one baseline tick plus three
+outstanding ticks (about 4 min). Observe one full 30-minute cooldown window
+for R1-to-R2 escalation (`creator-map-reload`, no host action, then one
+Operator card for `same-sha-takeover` at the same SHA); a further window
+proves the two-failure CEO page and silence. Re-dispatching without the
+flags (or any plain push deploy) disarms the drill: the triggers resolve on
+their own rules and the guards reset. Rollback is disarm-by-redeploy; the
+Worker recommends only, so nothing executes from this path.
 
 ### Event-store capture gaps and lag
 
@@ -1240,7 +1297,7 @@ npm --prefix wrangler run deployments -- list --env staging
 ```
 
 Read the interactive target and confirm the incident's known-good version.
-Do not add `--yes` or override warnings. Wrangler 4.149 updates Durable Object
+Do not add `--yes` or override warnings. Wrangler 4.151 updates Durable Object
 code with `deferred` mode and a 300 s maximum delay by default, so a bare
 rollback can leave the old code serving for up to five minutes. For a manual
 incident rollback add `--durable-objects-code-update-mode immediate`, and expect
@@ -1793,7 +1850,8 @@ publicly. Preserve sanitized evidence, not URLs or unredacted SQL errors.
    available; pause manual/operator writes and investigate the specific writer.
 4. Check the **deployed** redirect wiring before treating Hyperdrive as an
    active dependency. If `REDIRECT_DB` is present, separate a failed live lookup
-   (which may serve snapshot fallback) from a failed click insert. If absent,
+   (which serves the configured fallback invite, or 503 when none is valid:
+   never the mappings snapshot) from a failed click insert. If absent,
    record snapshot-only/no-live-attribution as the configured boundary rather
    than an outage. In neither branch is redirect `/healthz` gateway-DB proof.
    Do not manufacture a campaign click to exercise a production DB.

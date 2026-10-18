@@ -452,7 +452,9 @@ List scheduled messages for this server
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of the schedule list (1-based) |
 
 ## `/schedule-remove`
 
