@@ -922,6 +922,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "voice_join_fast_burn",
     "voice_join_slow_burn",
     "voice_creator_map_stale",
+    "error_budget_fast_burn",
     "rest_admission_breaker_open",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
@@ -943,6 +944,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("voice_join_fast_burn", window), `evidence-voice_join_fast_burn-${window}.json`);
   assert.equal(packetFilename("voice_join_slow_burn", window), `evidence-voice_join_slow_burn-${window}.json`);
   assert.equal(packetFilename("voice_creator_map_stale", window), `evidence-voice_creator_map_stale-${window}.json`);
+  assert.equal(packetFilename("error_budget_fast_burn", window), `evidence-error_budget_fast_burn-${window}.json`);
   assert.equal(packetFilename("rest_admission_breaker_open", window), `evidence-rest_admission_breaker_open-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
@@ -1060,6 +1062,27 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   burn = evaluateMetrics(parseExposition(body(joinLines(900, 9, 720))), burn.state, burnBase + 3300);
   burn = evaluateMetrics(parseExposition(body(joinLines(1000, 10, 800))), burn.state, burnBase + 3600);
   firing.push(...burn.firing);
+  // Forced REST error-budget burn: ~10k eligible events/hour with 2 budget
+  // errors/min over 16 min burns near 12x in both the 15 min and 2 min
+  // windows and pages exactly once (the per-sample 5xx share stays ~1%, so
+  // rest_5xx_rate stays silent).
+  const restBudget = (total: number, errors5xx: number) => [
+    `two_bot_rest_requests_total{route="other",result="2xx"} ${total - errors5xx}`,
+    `two_bot_rest_requests_total{route="other",result="5xx"} ${errors5xx}`,
+  ];
+  let budget = evaluateMetrics(parseExposition(body(restBudget(100_000, 1_000))), EMPTY_STATE, NOW - 1100);
+  let budgetTotal = 100_000;
+  let budgetErrors = 1_000;
+  for (let minute = 1; minute <= 16; minute += 1) {
+    budgetTotal += 167;
+    budgetErrors += 2;
+    budget = evaluateMetrics(
+      parseExposition(body(restBudget(budgetTotal, budgetErrors))),
+      budget.state,
+      NOW - 1100 + minute * 60,
+    );
+  }
+  firing.push(...budget.firing);
   firing.push(...ev(["two_bot_voice_creator_map_generation 3", "two_bot_voice_creator_map_age_seconds 601"]).firing);
   let breaker = EMPTY_STATE;
   for (let i = 0; i < 3; i++) breaker = ev(["two_bot_rest_guard_breaker_open 1"], breaker).state;

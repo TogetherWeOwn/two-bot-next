@@ -1549,8 +1549,13 @@ test("Worker /ops/backfill/progress: over-budget caller is 429 without reaching 
 async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map<string, unknown>) {
   const h = await harness(t, { KEEPALIVE_SECONDS: "60", ...env }, values);
   let status: number | Error = 503;
-  t.mock.method(h.bot, "containerFetch", async () => {
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     if (status instanceof Error) throw status;
+    // Readiness is the subject here: keep the metrics scrape healthy and
+    // quiet so sustained scrape-loss tickets never ride along. Tests that
+    // exercise scrape failure override this mock with their own /metrics.
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") return new Response(metricsBody());
     return new Response(null, { status });
   });
   await h.bot.onStart();
@@ -1696,7 +1701,10 @@ async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<E
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
     if (path === "/metrics") {
-      if (sender !== "metrics") return new Response("");
+      // The readiness sender keeps a healthy quiet scrape: its subject is
+      // readiness forwarding, and a permanently failed scrape would now
+      // (by design) ticket its own sustained-loss incident mid-test.
+      if (sender !== "metrics") return new Response(metricsBody());
       const rankClass = `two_bot_job_last_error_class{job="rank",class="database"} ${failing ? 1 : 0}`;
       return new Response(metricsBody(failing ? 3 : 0).replace('two_bot_job_last_error_class{job="rank",class="database"} 0', rankClass));
     }
@@ -1741,6 +1749,16 @@ test("real SDK keeps one persistent chain across concurrent health traffic, rest
   assert.deepEqual(first.pending(), [initialTask], "restart must not postpone the pending tick");
 
   const h = await harness(t, env, first.values, first.database);
+  // Chain continuity is the subject here: serve a healthy quiet scrape so the
+  // ticks under test never trip the sustained scrape-loss ticket, while
+  // readiness probes still travel the recorded TCP path below.
+  const containerFetch = h.bot.containerFetch.bind(h.bot);
+  t.mock.method(h.bot, "containerFetch", (...args: Parameters<typeof containerFetch>) => {
+    const input = args[0];
+    const url = typeof input === "string" ? input : input.url;
+    if (new URL(url).pathname === "/metrics") return Promise.resolve(new Response(metricsBody()));
+    return containerFetch(...args);
+  });
   await h.bot.onStart();
   assert.deepEqual(h.pending(), [initialTask], "eviction must reuse the persisted task");
   t.mock.timers.tick(60_000);
