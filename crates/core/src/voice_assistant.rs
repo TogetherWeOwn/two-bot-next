@@ -149,7 +149,6 @@ impl AssistantGateRefusal {
 /// configured assistant at the monthly cap is refused with the cap's limit
 /// and reset instant; only a configured assistant under the cap passes,
 /// returning the config for the caller to send with.
-#[must_use]
 pub fn require_send_allowed(
     config: Option<&AssistantConfig>,
     cap: CapDecision,

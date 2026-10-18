@@ -5,7 +5,7 @@
 //! [`PgAssistantCapLedger`] persists one row per guild in
 //! `assistant_monthly_builds` (migration `0444`) and decides through the pure
 //! V12a core (`two_bot_core::voice_assistant_cap`, limit
-//! [`MONTHLY_BUILD_LIMIT`](two_bot_core::voice_assistant_cap::MONTHLY_BUILD_LIMIT)):
+//! [`MONTHLY_BUILD_LIMIT`]):
 //! under the cap an attempt increments the persisted count and reports the
 //! builds left after this one; at the cap it counts nothing and reports the
 //! limit with the next 1st 00:00 UTC. A stored row from an older month resets
