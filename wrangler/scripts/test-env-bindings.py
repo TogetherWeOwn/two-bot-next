@@ -294,6 +294,34 @@ class AlertBindingTests(unittest.TestCase):
                 )
                 self.assertFalse(any("synthetic-secret" in e for e in errors))
 
+    def test_mcp_token_is_never_a_toml_var(self):
+        # TOG-29201: MCP_TOKEN is an optional Worker secret (docs/mcp.md);
+        # a plain var in any section must be refused without echoing the
+        # synthetic value, while absence stays valid and introduces no
+        # required binding.
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]", f'[{section}]\nMCP_TOKEN = "synthetic-secret"', 1
+                )
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("MCP_TOKEN must be an optional Worker secret" in e for e in errors),
+                    errors,
+                )
+                self.assertFalse(any("synthetic-secret" in e for e in errors))
+        extra = BASE + '\n[env.preview]\nworkers_dev = false\n[env.preview.vars]\nTWO_GUILD_NAME = "Preview"\nMCP_TOKEN = "synthetic-secret"\n'
+        errors = self.check_config(extra)
+        self.assertTrue(
+            any(
+                "[env.preview.vars]: MCP_TOKEN must be an optional Worker secret" in e
+                for e in errors
+            ),
+            errors,
+        )
+        self.assertFalse(any("synthetic-secret" in e for e in errors))
+        self.assertEqual(self.check_config(BASE), [])
+
     def test_receiver_config_is_never_a_toml_var(self):
         for section in ["vars", "env.staging.vars", "env.production.vars"]:
             for key in ["TWO_INTERNAL_KEYS", "TWO_INTERNAL_ACTIONS", "TWO_INTERNAL_BIND", "TWO_INTERNAL_CONTAINER"]:
