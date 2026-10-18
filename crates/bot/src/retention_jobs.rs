@@ -11,7 +11,10 @@
 //! parked. A missing setting defaults to dry run; `off`, invalid values and
 //! a missing database park the job without attempting destructive work.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use sqlx::PgPool;
 use two_bot_core::game_activity_store;
@@ -32,6 +35,24 @@ pub const NAME: &str = "retention";
 const CADENCE: Duration = Duration::from_secs(900);
 /// Per-attempt budget: two minutes, positive and no greater than cadence.
 const TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Bounded aggregate-expiry page: at most this many candidate guilds visited
+/// per pass, so one tick never walks the whole eligible list. Small enough
+/// that a pass of full per-guild batches stays far inside [`TIMEOUT`].
+const AGGREGATE_GUILDS_PER_PASS: u32 = 4;
+/// Bounded per-guild delete batch: at most this many stale rows expired per
+/// visited guild per pass, so an oversized guild drains across passes
+/// without spending the whole attempt budget on one guild.
+const AGGREGATE_ROWS_PER_GUILD_PER_PASS: u32 = 10;
+
+/// Process-local aggregate-expiry continuation: the guild key the previous
+/// pass visited last. The next pass resumes after it, so consecutive ticks
+/// visit later eligible guilds instead of restarting at the first page; the
+/// cursor advances in dry-run mode too, where nothing is deleted and only
+/// the cursor makes progress. A restart begins again at the first page: rows
+/// are never marked expired by the cursor, so at worst a fleet drains from
+/// the top again, never with work silently skipped.
+static AGGREGATE_EXPIRY_CURSOR: Mutex<Option<String>> = Mutex::new(None);
 
 /// Parse the [`MODE_SETTING`] value. Missing means an active dry run (never
 /// destructive); `off` parks the job; anything else but the exact `dry-run`
@@ -153,8 +174,10 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                 // Stale per-guild game-activity aggregates expire on this same
                 // cadence, never on the hourly flush/send path: quiet guilds
                 // stop accumulating rows while active guilds keep every fresh
-                // row. Execute deletes; drier modes count the same rows and
-                // log them under the same event, so the dry run previews
+                // row. Each pass visits a bounded guild page and advances the
+                // cursor, so consecutive ticks sweep later guilds instead of
+                // restarting. Execute deletes; drier modes count the same rows
+                // and log them under the same event, so the dry run previews
                 // exactly what execute will delete. Runs after the report
                 // above so an expiry failure never discards the retention
                 // report unlogged.
@@ -166,14 +189,23 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
 }
 
 /// Delete (execute) or preview (any drier mode) stale per-guild
-/// game-activity aggregates. The listing carries each stale guild's row
-/// count under the same predicate the delete uses, so the dry run sums
-/// exactly what execute deletes with no extra query. Deletes stay one
-/// guild scope at a time, so one guild's failure never rolls back another's;
-/// any failure returns [`ErrorClass::Database`] for a bounded retry.
-/// Expiry is idempotent and the horizon parser only yields values inside
-/// `1..=MAX_AGGREGATE_RETENTION_DAYS`, so a misconfigured setting falls back
-/// to the safe default instead of widening into a wipe.
+/// game-activity aggregates, one bounded page per pass. Each pass visits at
+/// most [`AGGREGATE_GUILDS_PER_PASS`] candidate guilds in stable keyset
+/// order, resuming after [`AGGREGATE_EXPIRY_CURSOR`], and deletes at most
+/// [`AGGREGATE_ROWS_PER_GUILD_PER_PASS`] rows per visited guild. Consecutive
+/// passes advance past already visited guilds — in dry-run mode too, where
+/// nothing is deleted — and an oversized guild drains across passes with its
+/// remaining rows retained. Deletes stay one guild scope at a time, so one
+/// guild's bounded failure retains its rows for a later retry while the pass
+/// moves on to the later guilds instead of starving them; any failure still
+/// returns [`ErrorClass::Database`] for a bounded retry. The sweep carries
+/// `guilds_visited`/`guilds_deferred` counts (no per-guild labels), so a
+/// partial pass is distinguishable from a complete one; `stale_rows` covers
+/// only the visited page. Dry-run totals preview the visited page under the
+/// same predicate, not an exact future-delete promise under concurrent
+/// writes. Expiry is idempotent and the horizon parser only yields values
+/// inside `1..=MAX_AGGREGATE_RETENTION_DAYS`, so a misconfigured setting
+/// falls back to the safe default instead of widening into a wipe.
 async fn expire_stale_game_aggregates(
     pool: &PgPool,
     mode: RetentionMode,
@@ -183,27 +215,85 @@ async fn expire_stale_game_aggregates(
             .ok()
             .as_deref(),
     );
-    let guilds = game_activity_store::list_aggregate_guilds(pool, horizon)
+    let resume_after = AGGREGATE_EXPIRY_CURSOR
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let mut page = game_activity_store::list_aggregate_guild_page(
+        pool,
+        horizon,
+        resume_after.as_deref(),
+        AGGREGATE_GUILDS_PER_PASS,
+    )
+    .await
+    .map_err(|_| aggregate_expiry_failed())?;
+    if page.is_empty() && resume_after.is_some() {
+        // The cursor ran past the end of the eligible list: wrap to the first
+        // page inside this same pass, so every pass with remaining work visits
+        // at least one guild instead of idling one tick per cycle boundary.
+        page = game_activity_store::list_aggregate_guild_page(
+            pool,
+            horizon,
+            None,
+            AGGREGATE_GUILDS_PER_PASS,
+        )
         .await
         .map_err(|_| aggregate_expiry_failed())?;
+    }
+    let Some((last_visited, _)) = page.last() else {
+        // No stale guild holds rows anywhere: nothing to preview or delete,
+        // and (as before) no sweep event.
+        return Ok(());
+    };
+    let last_visited = last_visited.clone();
+    let deferred =
+        game_activity_store::count_stale_aggregate_guilds_after(pool, horizon, Some(&last_visited))
+            .await
+            .map_err(|_| aggregate_expiry_failed())?;
     let mut stale = 0u64;
+    let mut failed = false;
     if mode == RetentionMode::Execute {
-        for (guild_id, _) in &guilds {
-            stale += game_activity_store::expire_stale_guild_aggregates(pool, guild_id, horizon)
-                .await
-                .map_err(|_| aggregate_expiry_failed())?;
+        for (guild_id, _) in &page {
+            match game_activity_store::expire_stale_guild_aggregates_batch(
+                pool,
+                guild_id,
+                horizon,
+                AGGREGATE_ROWS_PER_GUILD_PER_PASS,
+            )
+            .await
+            {
+                Ok(deleted) => stale = stale.saturating_add(deleted),
+                Err(_) => {
+                    aggregate_expiry_failed();
+                    failed = true;
+                }
+            }
         }
     } else {
-        stale = guilds.iter().map(|(_, count)| *count).sum();
+        stale = page.iter().map(|(_, count)| *count).sum();
     }
+    // Advance past the visited page even when a guild failed, and in dry-run
+    // mode where nothing was deleted: a cursor pinned on a persistently
+    // failing first page would starve every later guild. Failed rows stay in
+    // the table, so the next cycle retries them; nothing is ever marked
+    // expired except by an actual delete.
+    AGGREGATE_EXPIRY_CURSOR
+        .lock()
+        .map(|mut guard| *guard = Some(last_visited))
+        .unwrap_or_default();
     if stale > 0 {
         tracing::info!(
             message = "game_activity_aggregate_expiry",
             stale_rows = stale,
             horizon_days = horizon,
             mode = ?mode,
+            guilds_visited = page.len(),
+            guilds_deferred = deferred,
             "sweep",
         );
+    }
+    if failed {
+        return Err(ErrorClass::Database);
     }
     Ok(())
 }
