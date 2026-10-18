@@ -397,11 +397,13 @@ pub use scheduled::{
     advance_next_run_iso, advance_next_run_ms, clamp_retry_delay_ms, format_iso_ms, lease_until_ms,
     next_run_at_ms, no_such_schedule_text, no_unique_match_text, parse_iso_ms,
     post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text, schedule_confirm_text,
-    schedule_list_line, schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome,
-    ScheduleError, ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX,
-    EVERY_MINUTES_MIN, INTERVAL_SECONDS_MAX, INTERVAL_SECONDS_MIN, IN_MINUTES_MAX, IN_MINUTES_MIN,
+    schedule_list_line, schedule_list_page, schedule_list_page_indicator,
+    schedule_list_page_out_of_range_text, schedule_list_page_underflow_text, schedule_list_pages,
+    schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome, ScheduleError,
+    ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX, EVERY_MINUTES_MIN,
+    INTERVAL_SECONDS_MAX, INTERVAL_SECONDS_MIN, IN_MINUTES_MAX, IN_MINUTES_MIN,
     MAX_BODY_CHARS as SCHEDULED_MAX_BODY_CHARS, RETRY_DEFAULT_MS, RETRY_MAX_MS, RETRY_MIN_MS,
-    SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
+    SCHEDULER_TICK_MS, SCHEDULE_LIST_MESSAGE_LIMIT, TICKER_BATCH_LIMIT,
 };
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,

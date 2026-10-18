@@ -18,8 +18,12 @@ No network, no clock reads, no `gh` calls, so the check lane can pin it.
 
 import argparse
 import json
+import math
+import re
 import sys
 from pathlib import Path
+
+PR_NUMBER_RE = re.compile(r"[1-9][0-9]*")
 
 
 def load_json(path):
@@ -52,9 +56,14 @@ def record(ledger_path, pr, minutes, sha):
         value = float(minutes)
     except (TypeError, ValueError):
         raise SystemExit(f"ci minutes: minutes must be numeric, got {minutes!r}")
+    if not math.isfinite(value):
+        raise SystemExit(f"ci minutes: minutes must be finite, got {minutes!r}")
     if value < 0:
         raise SystemExit("ci minutes: minutes must not be negative")
-    row = {"pr": int(pr), "minutes": value, "sha": sha}
+    pr_text = str(pr)
+    if PR_NUMBER_RE.fullmatch(pr_text) is None:
+        raise SystemExit(f"ci minutes: pr must be a positive integer, got {pr!r}")
+    row = {"pr": int(pr_text), "minutes": value, "sha": sha}
     with Path(ledger_path).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, sort_keys=True) + "\n")
     print(f"ci minutes: recorded PR #{pr} {value} min -> {ledger_path}")

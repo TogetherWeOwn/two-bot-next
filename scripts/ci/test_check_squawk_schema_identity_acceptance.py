@@ -1,11 +1,14 @@
 """Acceptance fixtures: schema identity in new-table lint exemptions.
 
-A table created earlier in the same migration file is empty, so a
-non-concurrent index on it needs no CONCURRENTLY. That exemption belongs
-to the exact relation that was created -- schema and table together,
-after Postgres identifier normalisation. Creating ``scratch.items``
-must never exempt an index on ``public.items``: the two relations only
-share a final name, and the second may already hold production data.
+A table created unconditionally earlier in the same migration file is
+empty, so a non-concurrent index on it needs no CONCURRENTLY. That
+exemption belongs to the exact relation that was created -- schema and
+table together, after Postgres identifier normalisation. Creating
+``scratch.items`` must never exempt an index on ``public.items``: the
+two relations only share a final name, and the second may already hold
+production data. ``CREATE TABLE IF NOT EXISTS`` earns no exemption even
+for the exact same relation: when it already exists the statement is a
+no-op.
 
 Offline ``lint_text`` fixtures plus strict/advisory CLI disposition
 only; no database, migration execution, Rust compilation or network.
@@ -141,13 +144,16 @@ class SameQualifiedTableControlTests(unittest.TestCase):
             [],
         )
 
-    def test_same_qualified_if_not_exists_create_is_clean(self):
+    def test_same_qualified_if_not_exists_create_still_flags(self):
+        # Conditional creation proves nothing about emptiness even for the
+        # exact same qualified relation: when scratch.items already exists
+        # the statement is a no-op and the table may hold production data.
         self.assertEqual(
             self.rules(
                 "CREATE TABLE IF NOT EXISTS scratch.items (id bigint);\n"
                 "CREATE INDEX items_idx ON scratch.items (id);\n"
             ),
-            [],
+            ["creating-index"],
         )
 
     def test_same_qualified_only_index_is_clean(self):

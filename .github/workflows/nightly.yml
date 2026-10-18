@@ -265,6 +265,7 @@ jobs:
           --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
           --skip mock_delivery_crash_reconciliation_restart_and_overflow
           --skip parity_mismatch_cursor_and_read_only_acceptance
+          --skip legacy_verify_policy_gates_the_real_test_endpoints
           --skip dump_inspect_restore_round_trip
           --skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected
           --skip list_is_guild_scoped_selector_shaped_and_read_only
@@ -371,6 +372,13 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-cutover --all-features --test legacy_verify_db --locked
+          -- --include-ignored --test-threads=1
+      - name: Legacy TLS fence ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-cutover --all-features --test legacy_tls_fence --locked
           -- --include-ignored --test-threads=1
       - name: Reengagement list ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}

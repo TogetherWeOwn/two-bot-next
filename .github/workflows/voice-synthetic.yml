@@ -70,13 +70,14 @@ jobs:
             echo "::error::TWO_VOICE_SYNTHETIC_BOT_TOKEN missing and the voice gate is required (set VOICE_SYNTHETIC_REQUIRED=false to opt out)"
             exit 1
           fi
-          # One retry absorbs a transient gateway/REST hiccup; two failures fail the run.
-          for attempt in 1 2; do
+          # Two retries absorb a transient gateway/REST hiccup and the documented
+          # 95-139 s per-deploy gateway drop; three failures fail the run.
+          for attempt in 1 2 3; do
             if python3 scripts/staging_voice_synthetic.py --evidence "voice-synthetic-$RUN_ID-$attempt.json"; then
               exit 0
             fi
             echo "::warning::voice synthetic attempt $attempt failed"
-            [ "$attempt" = 2 ] || sleep 30
+            [ "$attempt" = 3 ] || sleep 60
           done
           exit 1
       - name: Upload the evidence
