@@ -108,7 +108,8 @@ async fn aggregate_expiry_cursor_advances_before_deletes_on_cancelled_pass() {
     let action = job(limited.clone(), RetentionMode::Execute).action;
     tokio::time::timeout(Duration::from_secs(30), (action)())
         .await
-        .expect("blocked-guild pass must complete via lock timeout, not hang");
+        .expect("blocked-guild pass must complete via lock timeout, not hang")
+        .expect_err("blocked-guild pass must report the isolated per-guild failure");
     assert_eq!(
         stale_rows_in(&limited, &second).await,
         0,
@@ -126,7 +127,8 @@ async fn aggregate_expiry_cursor_advances_before_deletes_on_cancelled_pass() {
     let retry = job(limited.clone(), RetentionMode::Execute).action;
     tokio::time::timeout(Duration::from_secs(30), (retry)())
         .await
-        .expect("second pass must complete while the lock is held");
+        .expect("second pass must complete while the lock is held")
+        .expect("second pass with no locked guild on its page must succeed");
     pool_still_usable(&limited).await;
 
     // Pass 3 wraps back to the still-locked first guild: it must still
@@ -136,7 +138,8 @@ async fn aggregate_expiry_cursor_advances_before_deletes_on_cancelled_pass() {
     let third = job(limited.clone(), RetentionMode::Execute).action;
     tokio::time::timeout(Duration::from_secs(30), (third)())
         .await
-        .expect("third pass with the lock still held must complete");
+        .expect("third pass with the lock still held must complete")
+        .expect_err("third pass must report the isolated per-guild failure");
     assert_eq!(
         stale_rows_in(&limited, &first).await,
         1,
