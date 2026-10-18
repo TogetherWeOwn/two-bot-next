@@ -293,7 +293,7 @@ export async function handleActionsIngress(
       forwardPromise = forward(sanitized);
     } catch {
       // DO construction/binding failures: never serialize the exception.
-      return refuse(503, "unavailable", true, undefined, requestId);
+      return refuse(503, "unavailable", true, undefined, requestId, release);
     }
     // Hold the slot until the forward settles; observe now so a late
     // rejection after the deadline never surfaces as unhandled.
@@ -318,7 +318,7 @@ export async function handleActionsIngress(
       return upstream;
     } catch {
       // An abort-driven rejection after the deadline is still a timeout.
-      if (signal.aborted) return refuse(504, "upstream_timeout", true, undefined, requestId);
+      if (signal.aborted) return refuse(504, "upstream_timeout", true, undefined, requestId, release);
       // DO construction/binding failures: never serialize the exception.
       return refuse(503, "unavailable", true, undefined, requestId, release);
     } finally {
@@ -426,7 +426,7 @@ export async function relayReceiverResponse(
     for (;;) {
       if (signal?.aborted) {
         releaseReader(reader);
-        return refuse(503, "unavailable", true, undefined, requestId);
+        return refuse(503, "unavailable", true, undefined, requestId, release);
       }
       let step: ReadableStreamReadResult<Uint8Array>;
       try {

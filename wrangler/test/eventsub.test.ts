@@ -662,6 +662,60 @@ test("edge stamps the deploy CONTAINER_RELEASE on eventsub span lines", async (t
   }
 });
 
+// Paperclip Review round 4 (PR #1116): pin the merged-in #1181 refusal sites
+// with an exact SHA. The abort/throw/relay branches arrived from main without
+// the trailing `release` argument and logged `unknown` despite a valid SHA.
+test("abort/throw/relay refusals stamp the SHA (no unknown leak)", async (t) => {
+  const sha = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
+  const lines: string[] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  });
+  resetEventsubIngressLimits();
+  t.after(() => resetEventsubIngressLimits());
+
+  // 1. Synchronous forward throw -> 503 unavailable.
+  const syncThrow = await handleEventsubIngress(
+    post(),
+    "span-release-sync-throw",
+    () => { throw new Error("synthetic binding failure"); },
+    sha,
+  );
+  assert.equal(syncThrow.status, 503);
+  await syncThrow.arrayBuffer();
+
+  // 2. Abort-driven forward rejection -> 504 upstream_timeout.
+  const timeoutMock = t.mock.method(AbortSignal, "timeout", () => AbortSignal.abort());
+  try {
+    const aborted = await handleEventsubIngress(
+      post(),
+      "span-release-abort",
+      async () => { throw new Error("synthetic abort rejection"); },
+      sha,
+    );
+    assert.equal(aborted.status, 504);
+    await aborted.arrayBuffer();
+  } finally {
+    timeoutMock.mock.restore();
+  }
+
+  // 3. Relay with an already-aborted signal -> 503 unavailable.
+  const relayed = await relayEventsubResponse(
+    Response.json({ ok: true }),
+    "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    AbortSignal.abort(),
+    sha,
+  );
+  assert.equal(relayed.status, 503);
+  await relayed.arrayBuffer();
+
+  const span = lines.filter((line) => line.includes("eventsub_ingress"));
+  assert.ok(span.length >= 3, `expected 3 span lines, got: ${JSON.stringify(lines)}`);
+  for (const line of span) {
+    assert.equal((JSON.parse(line) as Record<string, unknown>)["release"], sha, line);
+  }
+});
+
 test("minted request id survives EventSub header filtering and upstream refusal", async (t) => {
   resetEventsubIngressLimits();
   t.after(() => resetEventsubIngressLimits());
