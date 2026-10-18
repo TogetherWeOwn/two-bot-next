@@ -764,13 +764,15 @@ triage path. No new webhook, production activation or live load test is authoriz
 
 #### Alert: event-store consumer lag
 
-`two_bot_event_store_consumer_lag_seconds` stayed positive in three consecutive
-valid keepalive samples. `event_store_consumer_lag` is a **ticket, not a page**:
-any observed positive lag counts (fractional durations count), while `0`
-(unobserved) never fires and a single transient spike stays quiet. Only a valid
-`0` resolves and rebaselines; missing or invalid samples (absent family,
-duplicate, labeled, non-finite, negative) break the streak but preserve a firing
-ticket. A process restart reads `0`, so restarts rebaseline the same way.
+`two_bot_event_store_consumer_lag_seconds` stayed above 60 s (one keepalive
+window) in three consecutive valid keepalive samples. `event_store_consumer_lag`
+is a **ticket, not a page**: only lag above the 60 s threshold counts
+(fractional durations count), while samples at or below it — including `0`
+(unobserved) — never fire and a single transient spike stays quiet. Only a valid
+sample at or below 60 s resolves and rebaselines; missing or invalid samples
+(absent family, duplicate, labeled, non-finite, negative) and failed scrapes
+break the streak but preserve a firing ticket. A process restart reads `0`, so
+restarts rebaseline the same way.
 
 First response: triage within the watch shift through the existing read-only
 paths. Read `two_bot_event_store_consumer_lag_seconds` via the authorized

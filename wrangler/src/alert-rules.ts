@@ -131,8 +131,16 @@ export const VOICE_FAILURE_RATIO = 0.05;
 export const VOICE_FAILURE_MIN_OPS = 10;
 /** Dispatch drops must grow in this many consecutive completed sample windows. */
 export const DISPATCH_DROP_SAMPLES = 3;
-/** Sustained positive event-store consumer lag samples before the ticket. */
+/** Sustained above-threshold event-store consumer lag samples before the ticket. */
 export const EVENT_STORE_LAG_SAMPLES = 3;
+/**
+ * Lag above this many seconds counts toward the ticket; a valid sample at or
+ * below it resolves. 60 s is one keepalive window (`docs/event-store.md`):
+ * a healthy `received_at - event_time` spread is always slightly positive
+ * (insert latency), so a bare `> 0` bar would fire forever once the setter
+ * has a caller.
+ */
+export const EVENT_STORE_LAG_THRESHOLD_SECONDS = 60;
 /** Mirrors the fixed DISPATCH_LANES allowlist in crates/core/src/metrics.rs. */
 export const DISPATCH_LANES: readonly string[] = ["messages", "interactions", "registry", "privileged", "busy", "reactions"];
 /** Creator-join SLO: this share of genuine joins must move within 5 s (99.5%). */
@@ -185,7 +193,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_join_fast_burn", summary: `creator-join error budget burning faster than ${JOIN_FAST_BURN}x over 1 h and 5 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-fast-burn" },
   { id: "voice_join_slow_burn", summary: `creator-join error budget burning faster than ${JOIN_SLOW_BURN}x over 6 h and 30 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-slow-burn", severity: "ticket" },
   { id: "voice_creator_map_stale", summary: `voice creator map has not merged for more than ${CREATOR_MAP_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-voice-creator-map-stale" },
-  { id: "event_store_consumer_lag", summary: `event-store consumer lag sustained for ${EVENT_STORE_LAG_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-event-store-consumer-lag", severity: "ticket" },
+  { id: "event_store_consumer_lag", summary: `event-store consumer lag above ${EVENT_STORE_LAG_THRESHOLD_SECONDS} s sustained for ${EVENT_STORE_LAG_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-event-store-consumer-lag", severity: "ticket" },
 ];
 
 /**
@@ -298,9 +306,9 @@ export interface JoinBurnSnapshot {
 
 export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, eventStoreLagStreak: 0 };
 
-/** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
+/** An unsuccessful scrape breaks the dispatch and lag streaks, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
-  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {} };
+  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, eventStoreLagStreak: 0 };
 }
 
 export function parseExposition(text: string): Sample[] {
@@ -858,12 +866,14 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   }
 
   // Event-store consumer lag is a ticket, not a page. The label-free duration
-  // gauge reads 0 when unobserved; only sustained positive (> 0, fractional
-  // counts) samples across EVENT_STORE_LAG_SAMPLES consecutive valid samples
-  // fire. A valid 0 resets the streak and resolves; missing/invalid samples
-  // (absent, duplicate, labeled, non-finite, negative) break the streak but
-  // preserve a firing ticket, and never let label values reach state or keys.
-  // A process restart reads 0, so restarts rebaseline the same way.
+  // gauge reads 0 when unobserved; only sustained samples above
+  // EVENT_STORE_LAG_THRESHOLD_SECONDS (fractional counts) across
+  // EVENT_STORE_LAG_SAMPLES consecutive valid samples fire. A valid sample
+  // at or below the threshold resets the streak and resolves; missing/invalid
+  // samples (absent, duplicate, labeled, non-finite, negative) break the
+  // streak but preserve a firing ticket, and never let label values reach
+  // state or keys. A process restart reads 0, so restarts rebaseline the
+  // same way. Failed scrapes reset the streak through interruptDispatchDrops.
   const EVENT_STORE_LAG_RULE = "event_store_consumer_lag";
   const wasLagFiring = prev.firing.includes(EVENT_STORE_LAG_RULE);
   const lagRows = gauge("two_bot_event_store_consumer_lag_seconds");
@@ -879,7 +889,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   if (lagValue === undefined) {
     eventStoreLagStreak = 0;
     if (wasLagFiring) firing.push(EVENT_STORE_LAG_RULE);
-  } else if (lagValue === 0) {
+  } else if (lagValue <= EVENT_STORE_LAG_THRESHOLD_SECONDS) {
     eventStoreLagStreak = 0;
   } else {
     eventStoreLagStreak = Math.min(prevLagStreak + 1, EVENT_STORE_LAG_SAMPLES);

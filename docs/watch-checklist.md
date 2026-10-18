@@ -45,7 +45,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `voice_join_fast_burn` | **page**: genuine creator joins burn the 99.5% move-within-5s budget faster than 14.4x in both the 1 h and 5 min windows (each needs at least 10 joins and two bad moves; incomplete startup/restart windows stay inactive) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-join-fast-burn) |
 | `voice_join_slow_burn` | **ticket**: genuine creator joins burn the 99.5% move-within-5s budget faster than 6x in both the 6 h and 30 min windows (each uses the same volume and bad-move floors) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-join-slow-burn) |
 | `voice_creator_map_stale` | creator-map age past 600 s (two missed 5 min refreshes) after at least one merge; generation 0 never fires, older containers without the gauges hold state | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-creator-map-stale) |
-| `event_store_consumer_lag` | **ticket**: positive consumer lag in 3 consecutive valid samples (fractional counts); a valid `0` resolves, missing/invalid samples preserve a firing ticket | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-event-store-consumer-lag) |
+| `event_store_consumer_lag` | **ticket**: consumer lag above 60 s in 3 consecutive valid samples (fractional counts); a valid sample at or below 60 s resolves, missing/invalid samples and failed scrapes preserve a firing ticket | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-event-store-consumer-lag) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via

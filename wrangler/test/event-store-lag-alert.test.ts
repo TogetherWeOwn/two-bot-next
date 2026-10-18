@@ -1,7 +1,10 @@
 /**
  * Acceptance tests: ticket on sustained event-store consumer lag.
  *
- * Contract under test (written blind, before any implementation):
+ * Contract under test (written blind, before any implementation; the `> 0`
+ * bar was corrected to a 60 s threshold in review: a healthy
+ * `received_at - event_time` spread is always slightly positive from insert
+ * latency, so any-positive would fire forever once the setter has a caller):
  * - New Worker alert rule `event_store_consumer_lag`, severity `ticket`,
  *   appended last to `RULES` and to the Rust `ALERT_RULE_IDS` list, with
  *   runbook anchor `runbook.md#alert-event-store-consumer-lag`.
@@ -11,16 +14,19 @@
  *   optional-when-present scrape input, like the creator-map gauges, so a
  *   container old enough to lack it still scrapes. Fractional values are
  *   valid samples (it is a duration gauge, not a counter).
- * - Sustained means positive (`> 0`) in `EVENT_STORE_LAG_SAMPLES` (3)
- *   consecutive valid samples, matching the repo's other sustained rules
+ * - Sustained means above `EVENT_STORE_LAG_THRESHOLD_SECONDS` (60 s, one
+ *   keepalive window per `docs/event-store.md`) in `EVENT_STORE_LAG_SAMPLES`
+ *   (3) consecutive valid samples, matching the repo's other sustained rules
  *   (dispatch drops, pool saturation, receiver refusals). Magnitude and
- *   growth do not matter; any observed positive lag counts.
- * - `0`/unobserved never fires and is the only recovery proof: a valid `0`
- *   resets the streak and resolves a firing ticket (a process restart also
- *   returns the gauge to `0`, so restarts rebaseline the same way).
+ *   growth above the threshold do not matter; any sustained breach counts.
+ * - Samples at or below the threshold (including `0`/unobserved) never fire
+ *   and are the only recovery proof: a valid at-or-below sample resets the
+ *   streak and resolves a firing ticket (a process restart also returns the
+ *   gauge to `0`, so restarts rebaseline the same way).
  * - Missing/invalid samples (absent family, duplicate, labeled, non-finite,
- *   negative) break the streak but never falsely resolve a firing ticket,
- *   and never let label values reach state, firing keys or messages.
+ *   negative) and failed scrapes break the streak but never falsely resolve
+ *   a firing ticket, and never let label values reach state, firing keys or
+ *   messages.
  *
  * New symbols (`EVENT_STORE_LAG_SAMPLES`, the `eventStoreLagStreak` state
  * field) are read through untyped views so this file typechecks before the
@@ -31,7 +37,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import * as alertRules from "../src/alert-rules.ts";
 import {
-  EMPTY_STATE, RULES, evaluateMetrics, packetFilename, parseExposition,
+  EMPTY_STATE, RULES, evaluateMetrics, interruptDispatchDrops, packetFilename, parseExposition,
   ruleFor, transitionMessages, type MetricsAlertState,
 } from "../src/alert-rules.ts";
 import { ALERT_INPUT_LABELS, ALERT_OPTIONAL_INPUT_LABELS, parseAlertScrape } from "../src/metrics-scrape.ts";
@@ -46,11 +52,11 @@ const streakOf = (state: MetricsAlertState): unknown =>
   (state as unknown as Record<string, unknown>)["eventStoreLagStreak"];
 const read = (file: string) => readFileSync(new URL(`../../${file}`, import.meta.url), "utf8");
 
-/** Three consecutive positive samples: the smallest firing state. */
+/** Three consecutive above-threshold samples: the smallest firing state. */
 function firingState(): MetricsAlertState {
-  let state = ev([line(30)]).state;
-  state = ev([line(30)], state).state;
-  const fired = ev([line(30)], state);
+  let state = ev([line(90)]).state;
+  state = ev([line(90)], state).state;
+  const fired = ev([line(90)], state);
   assert.deepEqual(fired.firing, [RULE], "precondition: sustained lag fires");
   return fired.state;
 }
@@ -58,6 +64,8 @@ function firingState(): MetricsAlertState {
 test("rule catalog: lag rule is appended last, ticket severity, shared spelling with Rust", () => {
   const samples = (alertRules as unknown as Record<string, unknown>)["EVENT_STORE_LAG_SAMPLES"];
   assert.equal(samples, 3, "sustained means 3 consecutive valid samples, like the other sustained rules");
+  const threshold = (alertRules as unknown as Record<string, unknown>)["EVENT_STORE_LAG_THRESHOLD_SECONDS"];
+  assert.equal(threshold, 60, "only lag above one keepalive window counts: healthy insert latency is always slightly positive");
   const last = RULES[RULES.length - 1]!;
   assert.equal(last.id, RULE);
   assert.equal(last.severity, "ticket", "sustained lag tickets, never pages");
@@ -134,33 +142,55 @@ test("transient single-sample and two-sample lag stay quiet", () => {
   assert.deepEqual(transitionMessages(state.firing, recovered.firing), [], "no transition noise for a transient");
 });
 
-test("sustained positive lag fires one ticket on the third consecutive valid sample", () => {
-  let state = ev([line(45)]).state;
-  assert.deepEqual(state.firing, [], "first positive sample does not fire");
-  state = ev([line(45)], state).state;
+test("sustained above-threshold lag fires one ticket on the third consecutive valid sample", () => {
+  let state = ev([line(90)]).state;
+  assert.deepEqual(state.firing, [], "first above-threshold sample does not fire");
+  state = ev([line(90)], state).state;
   assert.deepEqual(state.firing, []);
-  const third = ev([line(45)], state);
+  const third = ev([line(90)], state);
   assert.deepEqual(third.firing, [RULE], "exactly the lag ticket, no unrelated keys");
   assert.ok((streakOf(third.state) as number) >= 3);
   const fire = transitionMessages(state.firing, third.firing);
   assert.equal(fire.length, 1, "one transition message per firing");
   assert.match(fire[0]!, new RegExp(`ALERT ${RULE} \\(ticket\\):`));
   assert.ok(fire[0]!.includes("runbook.md#alert-event-store-consumer-lag"), "message links the runbook section");
-  const fourth = ev([line(45)], third.state);
+  const fourth = ev([line(90)], third.state);
   assert.deepEqual(fourth.firing, [RULE], "ongoing lag keeps the ticket");
   assert.deepEqual(transitionMessages(third.firing, fourth.firing), [], "no duplicate alert while it keeps firing");
 });
 
-test("fractional positive lag counts: the bar is observed lag, not whole seconds", () => {
-  let state = ev([line(0.5)]).state;
-  state = ev([line(0.25)], state).state;
-  assert.deepEqual(ev([line(1.5)], state).firing, [RULE]);
+test("at-or-below-threshold samples never fire and resolve a firing ticket", () => {
+  let state = EMPTY_STATE;
+  for (const value of [0, 0.05, 1, 60]) {
+    const result = ev([line(value)], state);
+    assert.deepEqual(result.firing, [], `${value} is at or below the 60 s threshold, not lagging`);
+    state = result.state;
+  }
+  assert.equal(streakOf(state), 0);
+  // A healthy few-second spread (insert latency plus clock skew) stays quiet
+  // however long it lasts: only a full keepalive window of lag counts.
+  let healthy = EMPTY_STATE;
+  for (let i = 0; i < 5; i++) healthy = ev([line(5)], healthy).state;
+  assert.deepEqual(healthy.firing, []);
+  // A firing ticket resolves on the first valid at-or-below sample.
+  const firing = firingState();
+  for (const value of [60, 5, 0]) {
+    const quiet = ev([line(value)], firing);
+    assert.deepEqual(quiet.firing, [], `${value} resolves`);
+    assert.equal(streakOf(quiet.state), 0);
+  }
 });
 
-test("magnitude and direction do not matter, only sustained positivity", () => {
+test("fractional above-threshold lag counts: the bar is the window, not whole seconds", () => {
+  let state = ev([line(60.5)]).state;
+  state = ev([line(61.25)], state).state;
+  assert.deepEqual(ev([line(61.5)], state).firing, [RULE]);
+});
+
+test("magnitude and direction do not matter, only the sustained threshold breach", () => {
   let state = ev([line(3600)]).state;
-  state = ev([line(60)], state).state;
-  assert.deepEqual(ev([line(1)], state).firing, [RULE], "shrinking but still-positive lag is still sustained lag");
+  state = ev([line(120)], state).state;
+  assert.deepEqual(ev([line(61)], state).firing, [RULE], "shrinking but still-above-threshold lag is still sustained lag");
 });
 
 test("recovery: return to zero resolves once, then a fresh sustained run is required", () => {
@@ -174,10 +204,10 @@ test("recovery: return to zero resolves once, then a fresh sustained run is requ
   // Reset/rebaseline: after recovery (or a restart, whose gauge also reads
   // 0) one or two positive samples must not re-fire on the old streak.
   let state = recovered.state;
-  state = ev([line(30)], state).state;
-  state = ev([line(30)], state).state;
+  state = ev([line(90)], state).state;
+  state = ev([line(90)], state).state;
   assert.deepEqual(state.firing, [], "rebaselined: two positives after recovery stay quiet");
-  assert.deepEqual(ev([line(30)], state).firing, [RULE], "the third consecutive positive fires again");
+  assert.deepEqual(ev([line(90)], state).firing, [RULE], "the third consecutive positive fires again");
 });
 
 const invalidSamples: Record<string, string[]> = {
@@ -185,43 +215,67 @@ const invalidSamples: Record<string, string[]> = {
   "NaN": [line("NaN")],
   "infinity": [line("+Inf")],
   "negative": [line(-1)],
-  "duplicate": [line(30), line(30)],
-  "labeled": [`${SERIES}{member="synthetic-member"} 30`],
+  "duplicate": [line(90), line(90)],
+  "labeled": [`${SERIES}{member="synthetic-member"} 90`],
 };
 for (const [name, lines] of Object.entries(invalidSamples)) {
   test(`invalid sample (${name}) breaks the streak but never falsely resolves`, () => {
-    let partial = ev([line(30)]).state;
-    partial = ev([line(30)], partial).state;
+    let partial = ev([line(90)]).state;
+    partial = ev([line(90)], partial).state;
     assert.equal(streakOf(partial), 2);
     const interrupted = ev(lines, partial);
     assert.deepEqual(interrupted.firing, []);
     assert.equal(streakOf(interrupted.state), 0, "the gap breaks consecutiveness");
-    let fresh = ev([line(30)], interrupted.state).state;
+    let fresh = ev([line(90)], interrupted.state).state;
     assert.equal(streakOf(fresh), 1, "first valid sample after the gap restarts the streak");
-    fresh = ev([line(30)], fresh).state;
+    fresh = ev([line(90)], fresh).state;
     assert.deepEqual(fresh.firing, [], "pre-gap positives do not carry across the gap");
-    assert.deepEqual(ev([line(30)], fresh).firing, [RULE]);
+    assert.deepEqual(ev([line(90)], fresh).firing, [RULE]);
 
     const before = firingState();
     const unknown = ev(lines, before);
     assert.deepEqual(unknown.firing, [RULE], "missing/invalid data is not recovery evidence");
     assert.deepEqual(transitionMessages(before.firing, unknown.firing), []);
-    const stillLagging = ev([line(30)], unknown.state);
-    assert.deepEqual(stillLagging.firing, [RULE], "still-positive lag retains the ticket after a gap");
+    const stillLagging = ev([line(90)], unknown.state);
+    assert.deepEqual(stillLagging.firing, [RULE], "still-breaching lag retains the ticket after a gap");
     const quiet = ev([line(0)], stillLagging.state);
-    assert.deepEqual(quiet.firing, [], "only an observed zero resolves");
+    assert.deepEqual(quiet.firing, [], "only an observed at-or-below sample resolves");
   });
 }
 
+test("failed scrapes reset the lag streak but preserve a firing ticket", () => {
+  // Production path: a rejected or timed-out scrape stores
+  // interruptDispatchDrops(previous). Two positives, a failed scrape, then
+  // one positive must not fire: the positives were not consecutive.
+  let partial = ev([line(90)]).state;
+  partial = ev([line(90)], partial).state;
+  assert.equal(streakOf(partial), 2);
+  const interrupted = interruptDispatchDrops({ ...partial, firing: [] });
+  assert.equal(streakOf(interrupted), 0, "the failed scrape breaks consecutiveness");
+  let fresh = ev([line(90)], interrupted).state;
+  assert.equal(streakOf(fresh), 1, "first valid sample after the gap restarts the streak");
+  fresh = ev([line(90)], fresh).state;
+  assert.deepEqual(fresh.firing, [], "pre-gap positives do not carry across the gap");
+  assert.deepEqual(ev([line(90)], fresh).firing, [RULE]);
+
+  // A firing ticket survives the failed scrape: the spread keeps the ticket.
+  const before = firingState();
+  const held = interruptDispatchDrops(before);
+  assert.deepEqual(held.firing, [RULE], "a failed scrape is not recovery evidence");
+  assert.equal(streakOf(held), 0);
+  assert.deepEqual(ev([line(90)], held).firing, [RULE], "still-breaching lag retains the ticket after a gap");
+  assert.deepEqual(ev([line(60)], held).firing, [], "only an observed at-or-below sample resolves");
+});
+
 test("state survives DO reconstruction and legacy storage without the streak field", () => {
-  let state = ev([line(30)], JSON.parse(JSON.stringify(EMPTY_STATE)) as MetricsAlertState).state;
-  state = ev([line(30)], JSON.parse(JSON.stringify(state)) as MetricsAlertState).state;
-  assert.deepEqual(ev([line(30)], JSON.parse(JSON.stringify(state)) as MetricsAlertState).firing, [RULE]);
+  let state = ev([line(90)], JSON.parse(JSON.stringify(EMPTY_STATE)) as MetricsAlertState).state;
+  state = ev([line(90)], JSON.parse(JSON.stringify(state)) as MetricsAlertState).state;
+  assert.deepEqual(ev([line(90)], JSON.parse(JSON.stringify(state)) as MetricsAlertState).firing, [RULE]);
   // Legacy storage predates the field: it must read as a zero streak, so the
   // first positive sample after an upgrade never fires on its own.
   const legacy = { ...EMPTY_STATE } as MetricsAlertState;
   delete (legacy as unknown as Record<string, unknown>)["eventStoreLagStreak"];
-  const first = ev([line(30)], legacy);
+  const first = ev([line(90)], legacy);
   assert.deepEqual(first.firing, []);
   assert.equal(streakOf(first.state), 1);
 });
