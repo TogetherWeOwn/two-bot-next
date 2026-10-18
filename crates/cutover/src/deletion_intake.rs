@@ -23,8 +23,13 @@
 //!   erasure-plan table's guild/member rows — never global erasure. Retained
 //!   control-plane exceptions stay retained and are disclosed on the receipt.
 //! * Live-gateway call sites that invoke the intake on real dispatches are
-//!   follow-up work; the adapter is reachable through the published `/privacy`
-//!   definition returned here and the router that already publishes it.
+//!   follow-up work: the adapter exists but is not invoked on live
+//!   interactions, so members cannot yet submit requests through it. The
+//!   definition returned here is the existing `/privacy` surface reused for
+//!   publication shape only; it carries no dedicated deletion subcommand yet
+//!   (its only "delet…" copy is the narrower opt-out subcommand this adapter
+//!   never routes to). The router that already publishes `/privacy` is reused
+//!   unchanged.
 //! * Voice-raw coverage is pinned to voice-session `events` rows, matching the
 //!   retention module's documented limits.
 
@@ -162,6 +167,8 @@ pub async fn request_member_deletion(
     validate_token_free_id(interaction_id, "invalid deletion interaction")?;
     let request_id = deterministic_request_id(guild_id, requester_id, interaction_id);
 
+    // Fast path: an interaction retry returns the same request without taking
+    // the per-pair lock.
     let existing: Option<(String, String, String)> = sqlx::query_as(
         "SELECT guild_id, user_id, status FROM retention_deletion_requests WHERE request_id = $1",
     )
@@ -175,13 +182,40 @@ pub async fn request_member_deletion(
         return Ok(DeletionAck { request_id, status });
     }
 
+    // Serialize the pending-cap check with the insert under a per-pair
+    // transaction-scoped advisory lock. Without this, concurrent requests with
+    // distinct interaction ids all observe a count below the cap and all
+    // insert. The lock key is namespaced to this intake so it never collides
+    // with other per-pair locks.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("{guild_id}:{requester_id}:deletion-intake"))
+        .execute(&mut *tx)
+        .await?;
+
+    // Re-check inside the lock: a concurrent retry may have inserted the same
+    // request id between the fast path and the lock acquisition.
+    let existing: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT guild_id, user_id, status FROM retention_deletion_requests WHERE request_id = $1",
+    )
+    .bind(&request_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((owner_guild, owner_user, status)) = existing {
+        if owner_guild != guild_id || owner_user != requester_id {
+            return Err(invalid_request("unknown or settled deletion request"));
+        }
+        tx.commit().await?;
+        return Ok(DeletionAck { request_id, status });
+    }
+
     let pending: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM retention_deletion_requests \
          WHERE guild_id = $1 AND user_id = $2 AND status = 'pending'",
     )
     .bind(guild_id)
     .bind(requester_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if pending >= MAX_PENDING_PER_PAIR {
         return Err(invalid_request("deletion request rate limited"));
@@ -194,7 +228,7 @@ pub async fn request_member_deletion(
     .bind(&request_id)
     .bind(guild_id)
     .bind(requester_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     let status: Option<String> = sqlx::query_scalar(
         "SELECT status FROM retention_deletion_requests \
@@ -203,11 +237,12 @@ pub async fn request_member_deletion(
     .bind(&request_id)
     .bind(guild_id)
     .bind(requester_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(status) = status else {
         return Err(invalid_request("unknown or settled deletion request"));
     };
+    tx.commit().await?;
     Ok(DeletionAck { request_id, status })
 }
 
@@ -328,12 +363,19 @@ pub async fn deletion_receipt_for_requester(
     })
 }
 
-/// The member `/privacy` definition that carries the deletion request/status
-/// entrypoint: the live guild-only definition, reused — never replaced or
+/// The existing member `/privacy` definition, reused — never replaced or
 /// duplicated — so registration, publication and gateway dispatch stay on the
 /// one reviewed command surface. It binds the subject to the authenticated
-/// requester (no caller-supplied user/member/target option) and its copy
-/// advertises the deletion request entrypoint.
+/// requester (no caller-supplied user/member/target option).
+///
+/// Not yet a deletion entrypoint: the live definition carries only the
+/// opt-out/opt-in/status subcommands, and its only "delet…" copy is the
+/// narrower opt-out subcommand ("Delete your stored activity…") this adapter
+/// never routes to. A dedicated deletion request/status subcommand and the
+/// live-dispatch call sites that invoke the intake are follow-up work; until
+/// then members cannot submit requests through this surface. The fallback
+/// below preserves the same guild-only shape for test isolation only and
+/// advertises no deletion entrypoint.
 pub fn privacy_deletion_command() -> CommandDefinition {
     if let Some(definition) = two_bot_core::commands::core_commands()
         .into_iter()
@@ -341,8 +383,5 @@ pub fn privacy_deletion_command() -> CommandDefinition {
     {
         return definition;
     }
-    CommandDefinition::new(
-        "privacy",
-        "Manage your analytics privacy for this server; request deletion of your stored data.",
-    )
+    CommandDefinition::new("privacy", "Manage your analytics privacy for this server.")
 }
