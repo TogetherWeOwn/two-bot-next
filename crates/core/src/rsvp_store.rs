@@ -35,6 +35,8 @@ use super::rsvp::{
 pub enum RsvpStoreError {
     #[error("rsvp store database error: {0}")]
     Db(#[from] sqlx::Error),
+    #[error("rsvp required audit write failed: {0}")]
+    AuditDb(sqlx::Error),
     #[error("stored RSVP status {0:?} is not a known response")]
     UnknownStatus(String),
     #[error("event RSVP cap reached")]
@@ -68,6 +70,45 @@ pub async fn put_rsvp(
     record: &RsvpRecord,
 ) -> Result<RsvpTransition, RsvpStoreError> {
     let mut tx = pool.begin().await?;
+    let previous = upsert_rsvp_row(&mut tx, record).await?;
+    tx.commit().await?;
+    finish_transition(previous, record)
+}
+
+/// Upsert one RSVP row and commit its required audit row atomically: the
+/// response upsert and the audit insert share one transaction, so a failed
+/// audit insert rolls the response back with it. A first write then leaves
+/// neither a new response nor a new audit row, and a failed rewrite
+/// preserves the exact preceding response and audit history. The caller
+/// builds `audit` from the same `record` via [`RsvpAudit::for_rsvp`], so the
+/// audit carries this attempt's idempotency id and timestamp. Admission
+/// refusals still precede any row write, and the audit insert runs after the
+/// upsert, so the per-user rate ledger read is unchanged. A retried audit id
+/// still dedupes (`ON CONFLICT DO NOTHING`) exactly as [`write_audit`] does.
+/// An audit-step transport failure surfaces as [`RsvpStoreError::AuditDb`],
+/// distinct from a response-step [`RsvpStoreError::Db`], so the router keeps
+/// the existing audit refusal text for this path.
+pub async fn put_rsvp_with_audit(
+    pool: &Pool<Postgres>,
+    record: &RsvpRecord,
+    audit: &RsvpAudit,
+) -> Result<RsvpTransition, RsvpStoreError> {
+    let mut tx = pool.begin().await?;
+    let previous = upsert_rsvp_row(&mut tx, record).await?;
+    insert_audit_row(&mut *tx, audit)
+        .await
+        .map_err(RsvpStoreError::AuditDb)?;
+    tx.commit().await?;
+    finish_transition(previous, record)
+}
+
+/// The locked read-check-upsert half of an RSVP write, without the commit:
+/// shared by [`put_rsvp`] and [`put_rsvp_with_audit`] so admission order,
+/// lock order and row SQL stay identical on both paths.
+async fn upsert_rsvp_row(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    record: &RsvpRecord,
+) -> Result<Option<(String, sqlx::types::time::OffsetDateTime)>, RsvpStoreError> {
     // Coarser lock first, always in this order: the event lock serializes the
     // admission count below across distinct members, and the identity lock
     // then serializes the read-modify-write on this member's row. Arity
@@ -146,7 +187,16 @@ pub async fn put_rsvp(
     .bind(&record.responded_at)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
+    Ok(previous)
+}
+
+/// Report the transition for a committed RSVP write. The stored-status parse
+/// stays after the commit, exactly as before: a row that bypassed the status
+/// CHECK still surfaces as `UnknownStatus` without rolling the write back.
+fn finish_transition(
+    previous: Option<(String, sqlx::types::time::OffsetDateTime)>,
+    record: &RsvpRecord,
+) -> Result<RsvpTransition, RsvpStoreError> {
     let (previous, previous_responded_at) = previous
         .map(|(s, at)| {
             RsvpStatus::parse(&s)
@@ -205,6 +255,16 @@ pub async fn list_rsvps(
 /// checkin `ON CONFLICT DO NOTHING` pattern), so a transport retry dedupes
 /// instead of failing on the primary key or doubling the audit trail.
 pub async fn write_audit(pool: &Pool<Postgres>, audit: &RsvpAudit) -> Result<bool, RsvpStoreError> {
+    Ok(insert_audit_row(pool, audit).await?)
+}
+
+/// The audit append shared by [`write_audit`] and [`put_rsvp_with_audit`]:
+/// same row SQL and bindings on either a pool or an open transaction, so the
+/// standalone and atomic paths can never drift apart.
+async fn insert_audit_row<'e, E>(exec: E, audit: &RsvpAudit) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
     let inserted: Option<(String,)> = sqlx::query_as(
         "INSERT INTO announcements_audit_log
            (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
@@ -219,7 +279,7 @@ pub async fn write_audit(pool: &Pool<Postgres>, audit: &RsvpAudit) -> Result<boo
     .bind(&audit.outcome)
     .bind(&audit.reason)
     .bind(&audit.created_at)
-    .fetch_optional(pool)
+    .fetch_optional(exec)
     .await?;
     Ok(inserted.is_some())
 }
