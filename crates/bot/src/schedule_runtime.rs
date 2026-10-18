@@ -25,13 +25,14 @@ use two_bot_core::{
     scheduled::{
         format_iso_ms, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
         schedule_cancelled_text, schedule_confirm_text, schedule_list_line,
-        schedule_list_overflow_line, schedule_list_page, schedule_list_page_underflow_text,
-        schedule_list_truncated_text, validate_schedule, ScheduleInput,
+        schedule_list_overflow_for_count, schedule_list_overflow_line, schedule_list_page,
+        schedule_list_page_out_of_range_text, schedule_list_page_underflow_text,
+        schedule_list_pages, validate_schedule, ScheduleInput,
     },
     scheduled_store::{
         audit_scheduled, count_scheduled, delete_scheduled, get_scheduled, list_scheduled,
-        put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store, ScheduledAuditInput,
-        ScheduledWrite, SCHEDULE_LIST_CAP,
+        list_scheduled_window, put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store,
+        ScheduledAuditInput, ScheduledWrite, SCHEDULE_LIST_CAP,
     },
 };
 use two_bot_discord::ActionExecutor;
@@ -262,14 +263,16 @@ pub(crate) async fn schedule_remove(
     }
 }
 
-/// `/schedule-list`: guild-scoped list → ephemeral text. The read is capped
-/// at the earliest [`SCHEDULE_LIST_CAP`] rows; a full read appends an
-/// explicit `(truncated, N more)` overflow line, or `(truncated)` when the
-/// overflow count itself fails, so a cut is never silent. Rows are ordered
-/// by (`next_run_at`, `id`) and the `page` option pages that capped window:
-/// rows past the cap keep firing but list only after earlier rows are
-/// removed (see `docs/schedule-queue-order.md`). Writes no audit row and
-/// never writes schedule rows.
+/// `/schedule-list`: guild-scoped list → ephemeral text. The first read is
+/// capped at the earliest [`SCHEDULE_LIST_CAP`] rows; a full read counts
+/// once and appends an explicit `(truncated, N more)` overflow line, or
+/// `(truncated)` when the overflow count itself fails, so a cut is never
+/// silent. Rows are ordered by (`next_run_at`, `id`). Over-cap guilds page
+/// past the first window: `page` past the first window's packed pages reads
+/// one bounded hidden window (`LIMIT/OFFSET`, still 25 rows) so every id
+/// stays discoverable without reopening an unbounded read (see
+/// `docs/schedule-queue-order.md`). Writes no audit row and never writes
+/// schedule rows.
 pub(crate) async fn schedule_list(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
@@ -296,20 +299,95 @@ pub(crate) async fn schedule_list(
                     )
                 })
                 .collect();
-            // The read is capped at SCHEDULE_LIST_CAP earliest rows. A full
-            // read may hide more: count once and name the cut rows so no id
-            // is silently dropped; a failed count still marks the cut
-            // without a number. Under-cap guilds skip the second query
+            // The first read is capped at SCHEDULE_LIST_CAP earliest rows.
+            // A full read may hide more: count once and name the cut rows
+            // so no id is silently dropped; a failed count still marks the
+            // cut without a number. Under-cap guilds skip the second query
             // and render exactly as before.
             if rows.len() as i64 == SCHEDULE_LIST_CAP {
-                match count_scheduled(pool, guild_id).await {
-                    Ok(total) if total > SCHEDULE_LIST_CAP => {
-                        lines.push(schedule_list_overflow_line(total - SCHEDULE_LIST_CAP));
-                    }
-                    Ok(_) => {}
+                let total_opt = match count_scheduled(pool, guild_id).await {
+                    Ok(total) => Some(total),
                     Err(err) => {
                         tracing::warn!(reason = db_class(&err), "schedule list count failed");
-                        lines.push(schedule_list_truncated_text().to_owned());
+                        None
+                    }
+                };
+                if let Some(overflow) =
+                    schedule_list_overflow_for_count(total_opt, SCHEDULE_LIST_CAP)
+                {
+                    lines.push(overflow);
+                }
+                // Known overflow: pages past the first window's packed pages
+                // read one bounded hidden window, so rows past the cap stay
+                // reachable. Page 1 never pays for the extra query.
+                if matches!(total_opt, Some(total) if total > SCHEDULE_LIST_CAP) {
+                    let total = total_opt.expect("guarded by the known-overflow match above");
+                    let first_pages = schedule_list_pages(&lines);
+                    let first_total = first_pages.len() as i64;
+                    if page > first_total {
+                        match list_scheduled_window(
+                            pool,
+                            guild_id,
+                            SCHEDULE_LIST_CAP,
+                            SCHEDULE_LIST_CAP,
+                        )
+                        .await
+                        {
+                            Ok(mut hidden) => {
+                                hidden.sort_by(|a, b| {
+                                    (&a.next_run_at, &a.id).cmp(&(&b.next_run_at, &b.id))
+                                });
+                                let mut hidden_lines: Vec<String> = hidden
+                                    .iter()
+                                    .map(|row| {
+                                        schedule_list_line(
+                                            &row.id,
+                                            &row.channel_id,
+                                            &row.next_run_at,
+                                            row.interval_seconds,
+                                            row.enabled,
+                                        )
+                                    })
+                                    .collect();
+                                let remaining = total - SCHEDULE_LIST_CAP - hidden.len() as i64;
+                                if remaining > 0 {
+                                    hidden_lines.push(schedule_list_overflow_line(remaining));
+                                }
+                                if hidden_lines.is_empty() {
+                                    finish(executor, interaction, schedule_list_page(&lines, page))
+                                        .await;
+                                    return;
+                                }
+                                let hidden_pages = schedule_list_pages(&hidden_lines);
+                                let hidden_total = hidden_pages.len() as i64;
+                                let hidden_page = page - first_total;
+                                if hidden_page <= hidden_total {
+                                    finish(
+                                        executor,
+                                        interaction,
+                                        hidden_pages[(hidden_page - 1) as usize].clone(),
+                                    )
+                                    .await;
+                                } else {
+                                    finish(
+                                        executor,
+                                        interaction,
+                                        schedule_list_page_out_of_range_text(
+                                            page,
+                                            first_total + hidden_total,
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                return;
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    reason = db_class(&err),
+                                    "schedule list hidden window failed"
+                                );
+                            }
+                        }
                     }
                 }
             }

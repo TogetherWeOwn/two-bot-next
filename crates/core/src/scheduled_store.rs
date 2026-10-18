@@ -183,6 +183,31 @@ pub async fn count_scheduled(pool: &Pool<Postgres>, guild_id: &str) -> Result<i6
         .await
 }
 
+/// One hidden window past the capped read, in the same list order:
+/// ascending (`next_run_at`, `id`). The `/schedule-list` pager calls this
+/// only when the capped read came back full and the count proves more rows
+/// exist, and only for `page` past the first window's packed pages — page 1
+/// never pays for it. `limit` stays bounded (callers pass
+/// [`SCHEDULE_LIST_CAP`]); `offset` is the capped prefix to skip.
+pub async fn list_scheduled_window(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ScheduledMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ScheduledMessageRow>(
+        "SELECT id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
+                claim_token, claimed_at, occurrence_nonce
+           FROM scheduled_messages WHERE guild_id = $1 ORDER BY next_run_at, id LIMIT $2 OFFSET $3",
+    )
+    .bind(guild_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
 /// Atomically lease at most one due occurrence before its outbound post
 /// (legacy `claimDueScheduled`). `SKIP LOCKED` lets a second scheduler take
 /// another row instead of blocking. The ticker loops up to

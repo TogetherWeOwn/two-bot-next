@@ -424,6 +424,23 @@ pub fn schedule_list_truncated_text() -> &'static str {
     "(truncated)"
 }
 
+/// Overflow line for a capped guild read, given the overflow count outcome:
+/// `None` means the count itself failed (fail-safe `(truncated)` marker);
+/// `Some(total)` names the cut when `total` exceeds `cap` and yields nothing
+/// otherwise. The caller only consults this when the capped read came back
+/// full, so under-cap guilds never reach it. Extracted so the failed-count
+/// arm is unit-pinned: deleting the push in the caller breaks the
+/// over-cap acceptance (which expects the counted line), and remapping
+/// `None` here breaks `overflow_for_count_names_a_failed_count`.
+#[must_use]
+pub fn schedule_list_overflow_for_count(total: Option<i64>, cap: i64) -> Option<String> {
+    match total {
+        None => Some(schedule_list_truncated_text().to_owned()),
+        Some(total) if total > cap => Some(schedule_list_overflow_line(total - cap)),
+        Some(_) => None,
+    }
+}
+
 /// Split whole-row lines into bounded pages, ordered as given. Each page
 /// holds as many whole rows as fit in [`SCHEDULE_LIST_MESSAGE_LIMIT`]
 /// UTF-16 units; no id handed to this helper is ever split or dropped
@@ -865,6 +882,24 @@ mod tests {
     fn truncated_marker_names_a_cut_without_a_count() {
         // Fallback for a failed overflow count: static shape, no count.
         assert_eq!(schedule_list_truncated_text(), "(truncated)");
+    }
+
+    #[test]
+    fn overflow_for_count_names_a_failed_count() {
+        // The failed-count arm of the capped read: a full window whose
+        // count query fails still marks the cut. Deleting the caller's
+        // push breaks the over-cap acceptance; remapping None here breaks
+        // this pin.
+        assert_eq!(
+            schedule_list_overflow_for_count(None, 25),
+            Some("(truncated)".to_owned())
+        );
+        assert_eq!(
+            schedule_list_overflow_for_count(Some(27), 25),
+            Some("(truncated, 2 more)".to_owned())
+        );
+        assert_eq!(schedule_list_overflow_for_count(Some(25), 25), None);
+        assert_eq!(schedule_list_overflow_for_count(Some(3), 25), None);
     }
 
     #[test]
