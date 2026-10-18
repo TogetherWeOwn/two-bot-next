@@ -172,7 +172,7 @@ render` reads the checked-in `wrangler/wrangler.toml`, makes its paths absolute
 because the rendered file lives outside `wrangler/`, and sets `image_vars` on the
 single production container. Nothing else changes, and
 `scripts/test-deploy-production.py` pins that diff. The lockfile's Wrangler
-(4.149.0) runs the deploy: `wrangler-action` uses the installed version when
+(4.151.0) runs the deploy: `wrangler-action` uses the installed version when
 `wranglerVersion` is omitted, and the job runs `npm ci` first.
 
 The gate polls `/readyz` every 10 seconds for up to 30 attempts. In deploy
