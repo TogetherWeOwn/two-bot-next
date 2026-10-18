@@ -343,6 +343,27 @@ pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
 /// unrecognised outcome collapses to the last entry (`rejected`) rather than
 /// growing the series vocabulary.
 pub const PRESENCE_CAPTURE_OUTCOMES: &[&str] = &["inserted", "duplicate", "rejected"];
+/// Terminal automod decision outcomes for
+/// `two_bot_automod_decisions_total{outcome}`. Mirrors
+/// `automod_runtime::CompletionKind::as_str` in declaration order: `accepted`
+/// for clean content, `already_processed` for a counted retry, `dry_run` for
+/// a matched dry-run capture, `protected` for an exempt target, `deleted` /
+/// `warned` / `timed_out` for enforced ladders, and `sanction_refused` when
+/// the delete-adjacent sanction could not run. Exactly eight series from
+/// process start; no message text, excerpts or user IDs ever become labels.
+/// Unknown outcomes collapse to the trailing `sanction_refused` slot only
+/// when the allowlist grows; today every caller passes a member, so that
+/// slot stays zero unless hostile input arrives.
+pub const AUTOMOD_DECISION_OUTCOMES: &[&str] = &[
+    "accepted",
+    "already_processed",
+    "dry_run",
+    "protected",
+    "deleted",
+    "warned",
+    "timed_out",
+    "sanction_refused",
+];
 /// Website-action receiver families for
 /// `two_bot_internal_actions_total{family,outcome}` (TOG-20119, roadmap
 /// M4.23). The signed receiver (`crates/bot/src/internal_action_http.rs`)
@@ -553,6 +574,7 @@ struct Values {
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
     presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
+    automod_decisions: [u64; AUTOMOD_DECISION_OUTCOMES.len()],
     last_ready_unix: Option<u64>,
     last_resume_unix: Option<u64>,
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
@@ -665,6 +687,22 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter =
             &mut values.presence_capture[bounded_index(outcome, PRESENCE_CAPTURE_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One terminal automod decision (see [`AUTOMOD_DECISION_OUTCOMES`]).
+    /// Call once per committed [`StoredOutcome`](crate::automod_runtime::StoredOutcome):
+    /// the shared activation settles exactly one receipt per inspection, so
+    /// replays and retained claims never call this. The outcome is the whole
+    /// label vocabulary — no message text, excerpts or user IDs ever become
+    /// labels — and an unrecognised outcome collapses to `sanction_refused`.
+    pub fn automod_decision(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.automod_decisions[bounded_index(outcome, AUTOMOD_DECISION_OUTCOMES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -1319,6 +1357,22 @@ impl Metrics {
             writeln!(
                 out,
                 "two_bot_presence_capture_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_automod_decisions_total",
+            "counter",
+            "Terminal automod inspection outcomes by bounded CompletionKind; fixed eight series.",
+        );
+        for (outcome, count) in AUTOMOD_DECISION_OUTCOMES
+            .iter()
+            .zip(values.automod_decisions)
+        {
+            writeln!(
+                out,
+                "two_bot_automod_decisions_total{{outcome=\"{outcome}\"}} {count}"
             )
             .unwrap();
         }
@@ -2941,6 +2995,93 @@ mod tests {
         assert!(text.contains(&format!("two_bot_gateway_disconnects_total {}\n", u64::MAX)));
         assert!(text.contains(&format!(
             "two_bot_gateway_missed_events_total {}\n",
+            u64::MAX
+        )));
+    }
+
+    #[test]
+    fn automod_decisions_cover_each_completion_kind_without_new_series() {
+        // TOG-28481: one counter per terminal CompletionKind, fixed 8-value
+        // vocabulary. No message text, excerpts or user IDs ever reach labels.
+        use crate::automod_runtime::CompletionKind;
+        let kinds = [
+            CompletionKind::Accepted,
+            CompletionKind::AlreadyProcessed,
+            CompletionKind::DryRun,
+            CompletionKind::Protected,
+            CompletionKind::Deleted,
+            CompletionKind::Warned,
+            CompletionKind::TimedOut,
+            CompletionKind::SanctionRefused,
+        ];
+        assert_eq!(
+            kinds.map(CompletionKind::as_str).as_slice(),
+            AUTOMOD_DECISION_OUTCOMES,
+            "CompletionKind::as_str must mirror the metrics allowlist in order"
+        );
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        for outcome in AUTOMOD_DECISION_OUTCOMES {
+            assert!(text.contains(&format!(
+                "two_bot_automod_decisions_total{{outcome=\"{outcome}\"}} 0\n"
+            )));
+        }
+        for kind in kinds {
+            metrics.automod_decision(kind.as_str());
+        }
+        metrics.automod_decision("deleted");
+        let text = metrics.render(None);
+        for (kind, count) in [
+            (CompletionKind::Accepted, 1),
+            (CompletionKind::AlreadyProcessed, 1),
+            (CompletionKind::DryRun, 1),
+            (CompletionKind::Protected, 1),
+            (CompletionKind::Deleted, 2),
+            (CompletionKind::Warned, 1),
+            (CompletionKind::TimedOut, 1),
+            (CompletionKind::SanctionRefused, 1),
+        ] {
+            assert!(text.contains(&format!(
+                "two_bot_automod_decisions_total{{outcome=\"{}\"}} {count}\n",
+                kind.as_str()
+            )));
+        }
+        // Fixed cardinality: exactly eight series, parseable samples.
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_automod_decisions_total{"))
+            .collect();
+        assert_eq!(series.len(), AUTOMOD_DECISION_OUTCOMES.len());
+        let mut unique = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(unique.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn automod_decision_hostile_labels_collapse_and_saturate() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.automod_decision(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(
+            text.contains("two_bot_automod_decisions_total{outcome=\"sanction_refused\"} 100\n")
+        );
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.automod_decisions = [u64::MAX; AUTOMOD_DECISION_OUTCOMES.len()];
+        }
+        metrics.automod_decision("accepted");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_automod_decisions_total{{outcome=\"accepted\"}} {}\n",
             u64::MAX
         )));
     }
