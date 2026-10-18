@@ -1234,7 +1234,13 @@ fn sanitize_goodbye_name(username: &str) -> String {
         }
         escaped.push(ch);
     }
-    escaped.chars().take(GOODBYE_USERNAME_LIMIT).collect()
+    let mut capped: String = escaped.chars().take(GOODBYE_USERNAME_LIMIT).collect();
+    // A cut mid-escape would leave a lone backslash that eats the closing bold
+    // delimiter, so trim on escape-pair boundaries instead.
+    if capped.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 1 {
+        capped.pop();
+    }
+    capped
 }
 
 /// Goodbye copy (legacy `goodbyeText`). Plain on purpose: no guilt, no
@@ -2232,6 +2238,21 @@ mod tests {
             Some(3)
         );
         assert_eq!(days_in_guild(None, Some(1_787_529_600_000)), None);
+    }
+
+    #[test]
+    fn goodbye_cap_trims_on_escape_pair_boundaries() {
+        // 511 plain chars plus a markdown char escape to 513 chars, so the
+        // 512-char cap would cut mid-escape; the slot must drop the lone
+        // backslash instead of letting it eat the closing bold delimiter.
+        let out = goodbye_text(
+            &format!("{}*", "a".repeat(GOODBYE_USERNAME_LIMIT - 1)),
+            None,
+        );
+        let pos = out.rfind("** left the server").expect("template close");
+        let slot = &out[2..pos];
+        assert_eq!(slot.len(), GOODBYE_USERNAME_LIMIT - 1);
+        assert!(!slot.ends_with('\\'));
     }
 
     #[test]
