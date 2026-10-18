@@ -24,12 +24,14 @@ use two_bot_core::{
     funnel::now_millis_for_test,
     scheduled::{
         format_iso_ms, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
-        schedule_cancelled_text, schedule_confirm_text, schedule_list_line, schedule_list_page,
-        schedule_list_page_underflow_text, validate_schedule, ScheduleInput,
+        schedule_cancelled_text, schedule_confirm_text, schedule_list_line,
+        schedule_list_overflow_line, schedule_list_page, schedule_list_page_underflow_text,
+        validate_schedule, ScheduleInput,
     },
     scheduled_store::{
-        audit_scheduled, delete_scheduled, get_scheduled, list_scheduled, put_scheduled,
-        resolve_scheduled_id as resolve_scheduled_id_store, ScheduledAuditInput, ScheduledWrite,
+        audit_scheduled, count_scheduled, delete_scheduled, get_scheduled, list_scheduled,
+        put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store, ScheduledAuditInput,
+        ScheduledWrite, SCHEDULE_LIST_CAP,
     },
 };
 use two_bot_discord::ActionExecutor;
@@ -260,10 +262,11 @@ pub(crate) async fn schedule_remove(
     }
 }
 
-/// `/schedule-list`: guild-scoped list → ephemeral text. Rows are ordered
-/// by (`next_run_at`, `id`) and rendered as bounded whole-row pages so every
-/// configured id stays discoverable; writes no audit row and never writes
-/// schedule rows.
+/// `/schedule-list`: guild-scoped list → ephemeral text. The read is capped
+/// at the earliest [`SCHEDULE_LIST_CAP`] rows; a full page appends an
+/// explicit `(truncated, N more)` overflow line so no id is silently dropped.
+/// Rows are ordered by (`next_run_at`, `id`) and rendered as bounded
+/// whole-row pages; writes no audit row and never writes schedule rows.
 pub(crate) async fn schedule_list(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
@@ -278,7 +281,7 @@ pub(crate) async fn schedule_list(
     match list_scheduled(pool, guild_id).await {
         Ok(mut rows) => {
             rows.sort_by(|a, b| (&a.next_run_at, &a.id).cmp(&(&b.next_run_at, &b.id)));
-            let lines: Vec<String> = rows
+            let mut lines: Vec<String> = rows
                 .iter()
                 .map(|row| {
                     schedule_list_line(
@@ -290,6 +293,21 @@ pub(crate) async fn schedule_list(
                     )
                 })
                 .collect();
+            // The read is capped at SCHEDULE_LIST_CAP earliest rows. A full
+            // page may hide more: count once and name the cut rows so no id
+            // is silently dropped. Under-cap guilds skip the second query
+            // and render exactly as before.
+            if rows.len() as i64 == SCHEDULE_LIST_CAP {
+                match count_scheduled(pool, guild_id).await {
+                    Ok(total) if total > SCHEDULE_LIST_CAP => {
+                        lines.push(schedule_list_overflow_line(total - SCHEDULE_LIST_CAP));
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(reason = db_class(&err), "schedule list count failed");
+                    }
+                }
+            }
             finish(executor, interaction, schedule_list_page(&lines, page)).await;
         }
         Err(err) => {

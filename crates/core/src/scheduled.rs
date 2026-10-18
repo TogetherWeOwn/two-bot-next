@@ -406,6 +406,15 @@ pub fn schedule_list_page_out_of_range_text(page: i64, total: i64) -> String {
     format!("Page {page} is out of range: this server has {total} page(s) of schedules.")
 }
 
+/// `/schedule-list` overflow line for a guild holding more rows than the
+/// capped read returns: the final line names how many earliest rows were
+/// cut (`remaining = total - cap`, always positive at the call site).
+/// Byte-pinned by acceptance — keep the exact `(truncated, N more)` shape.
+#[must_use]
+pub fn schedule_list_overflow_line(remaining: i64) -> String {
+    format!("(truncated, {remaining} more)")
+}
+
 /// Split whole-row lines into bounded pages, ordered as given. Each page
 /// holds as many whole rows as fit in [`SCHEDULE_LIST_MESSAGE_LIMIT`]
 /// UTF-16 units; no id is ever split or dropped. An empty guild yields one
@@ -832,6 +841,13 @@ mod tests {
             schedule_list_line("id2", "chan9", "2026-01-01T00:10:00.000Z", None, false),
             "`id2` `<#chan9>` 2026-01-01T00:10:00.000Z (disabled)"
         );
+    }
+
+    #[test]
+    fn overflow_line_names_the_cut_row_count() {
+        // Pinned by the bounded-listing acceptance tests: keep byte-exact.
+        assert_eq!(schedule_list_overflow_line(2), "(truncated, 2 more)");
+        assert_eq!(schedule_list_overflow_line(1), "(truncated, 1 more)");
     }
 
     #[test]
