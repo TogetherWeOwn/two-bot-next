@@ -420,6 +420,10 @@
     "crates/store/migrations/0442_game_activity_guild_aggregates.sql": {
       "sha256": "1fccfea2ca41d6047c4ac2af17b955c3f76b2fa108bfe648f6e22dc8845a6f60",
       "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; store chain copy, IF NOT EXISTS. Renumbered 0441 to 0442 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
+    },
+    "crates/store/migrations/0444_assistant_monthly_builds.sql": {
+      "sha256": "9f64b89eb627c06e204cbb4dd09651f833430640d36f3f06ed3eb148f69772f8",
+      "justification": "Per-guild template-assistant monthly-cap ledger (no member columns): one row per guild with month_key plus build_count and a nonnegativity check; store chain copy, IF NOT EXISTS. Numbered 0444 because the cutover chain owns 0443; global migration numbers remain unique across both chains."
     }
   }
 }
