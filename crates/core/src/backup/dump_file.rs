@@ -25,7 +25,7 @@
 //! JSON-looking TEXT stays unchanged; native JSON cells are serialized only
 //! for a JSON/JSONB target. Unsupported composite cells refuse, never become NULL.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
 
@@ -787,6 +787,9 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
     let decoder = GzDecoder::new(input);
     let mut reader = std::io::BufReader::new(decoder);
     let mut manifest: Option<DumpManifest> = None;
+    // Per-table manifest-column membership sets, built once when the manifest
+    // validates so the row arm below stays O(row keys) per row.
+    let mut column_sets: BTreeMap<String, HashSet<String>> = BTreeMap::new();
     let mut saw_end = false;
     let mut declared_rows: u64 = 0;
     let mut buffers: BTreeMap<String, Vec<Map<String, Value>>> = BTreeMap::new();
@@ -831,7 +834,21 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
-                manifest = Some(validate_manifest(&obj)?);
+                let validated = validate_manifest(&obj)?;
+                // Build the membership sets once (O(total columns)): testing
+                // each row key against them is O(row keys), while a linear
+                // `columns.contains` per key would be O(keys x columns) per
+                // row and let a hostile archive hang inspect inside the byte
+                // caps of docs/backup.md.
+                let mut sets = BTreeMap::new();
+                for table in &validated.tables {
+                    sets.insert(
+                        table.name.clone(),
+                        table.columns.iter().cloned().collect::<HashSet<String>>(),
+                    );
+                }
+                column_sets = sets;
+                manifest = Some(validated);
             }
             "row" => {
                 let Some(m) = manifest.as_ref() else {
@@ -862,7 +879,16 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                 // `--dry-run` success. Missing keys stay valid (a row may carry
                 // a subset); only keys outside the manifest refuse. The message
                 // is fixed vocabulary: it never echoes the hostile key.
-                if data.keys().any(|key| !info.columns.contains(key)) {
+                // Membership is tested against the per-table set built with the
+                // manifest, so the per-row cost is O(row keys). The fallback
+                // linear scan is unreachable (the set is built from the same
+                // manifest `info` came from) and only preserves the refusal if
+                // that invariant ever breaks.
+                let has_outside_key = match column_sets.get(&table) {
+                    Some(known) => data.keys().any(|key| !known.contains(key)),
+                    None => data.keys().any(|key| !info.columns.contains(key)),
+                };
+                if has_outside_key {
                     return Err(refuse(format!(
                         "{table} row on line {line_no} has a column outside the manifest"
                     )));
