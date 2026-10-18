@@ -273,8 +273,10 @@ impl Occurrence<'_> {
                 // dedupes against it instead of posting a second copy. The
                 // unrecorded outcome is audited even when the claim was lost
                 // (the re-queue retains nothing): a posted message must never
-                // vanish without an audit row.
-                retry_scheduled(
+                // vanish without an audit row. A lost claim keeps no nonce,
+                // so a surviving orphan has no idempotent retry: report it
+                // as stale, not retry-idempotent.
+                let retained = retry_scheduled(
                     self.pool,
                     &self.row.guild_id,
                     &self.row.id,
@@ -284,12 +286,12 @@ impl Occurrence<'_> {
                 )
                 .await
                 .map_err(database)?;
-                self.audit(
-                    &OccurrenceOutcome::PostedUnrecorded { cleaned },
-                    Some(reason),
-                    audit_failed,
-                )
-                .await;
+                let outcome = if retained || cleaned {
+                    OccurrenceOutcome::PostedUnrecorded { cleaned }
+                } else {
+                    OccurrenceOutcome::StaleCompletion
+                };
+                self.audit(&outcome, Some(reason), audit_failed).await;
                 Ok(Step::Stop)
             }
         }
@@ -316,6 +318,17 @@ impl Occurrence<'_> {
             if retained {
                 self.audit(
                     &OccurrenceOutcome::Retryable { retry_at_ms },
+                    Some(reason),
+                    audit_failed,
+                )
+                .await;
+            } else {
+                // The claim went stale (the definition was replaced or
+                // cancelled while the retryable post was in flight): the
+                // re-queue lands nowhere, so audit the stale completion with
+                // the failure reason instead of vanishing silently.
+                self.audit(
+                    &OccurrenceOutcome::StaleCompletion,
                     Some(reason),
                     audit_failed,
                 )
