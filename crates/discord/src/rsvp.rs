@@ -264,6 +264,16 @@ async fn execute(
     classifier: &ClassifierConfig,
     interaction: &Interaction,
 ) -> Result<String, String> {
+    // Fail closed: only the RSVP handlers execute here. A foreign handler id
+    // (an unregistered or sibling-slice id reaching this dispatcher) refuses
+    // with the existing invalid-payload string before any store or network
+    // work, never a panic.
+    if !matches!(
+        handler,
+        HandlerId::Rsvp | HandlerId::RsvpAttendance | HandlerId::ScorecardAttendance
+    ) {
+        return Err("Invalid command payload.".to_owned());
+    }
     let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref() else {
         return Err("Invalid command payload.".to_owned());
     };
@@ -555,13 +565,50 @@ async fn execute(
                 &resolved.canonical_id,
             ))
         }
-        _ => unreachable!("only RSVP handlers execute here"),
+        _ => return Err("Invalid command payload.".to_owned()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn foreign_handler_id_fails_closed_without_writes_or_panic() {
+        // Real dispatcher (`execute`) with a foreign handler id: must refuse
+        // with the existing invalid-payload string, never panic. The pool is
+        // closed and the executor points at an unroutable loopback, so any
+        // store or network touch would fail differently — the refusal proves
+        // neither was reached.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        pool.close().await;
+        let executor = ActionExecutor::with_proxy(
+            "rsvp-foreign-handler-fixture".into(),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .expect("loopback executor");
+        let classifier = ClassifierConfig::default();
+        let interaction: Interaction = serde_json::from_value(serde_json::json!({
+            "application_id": "1111", "authorizing_integration_owners": {"0": "2222"},
+            "id": "100", "token": "synthetic-secret-token", "type": 2,
+            "version": 1, "guild_id": "2222",
+            "member": {"permissions": "0", "roles": [], "deaf": false, "mute": false,
+                "flags": 0, "user": {"id": "77", "username": "human", "discriminator": "0"}},
+            "data": {"id": "4444", "name": "rsvp", "type": 1, "options": []}
+        }))
+        .expect("wire interaction");
+        for handler in [HandlerId::Rank, HandlerId::Lfg] {
+            let err = execute(handler, &pool, &executor, &classifier, &interaction)
+                .await
+                .expect_err("foreign handler must refuse");
+            assert_eq!(
+                err, "Invalid command payload.",
+                "{handler:?} must fail closed"
+            );
+        }
+    }
 
     #[test]
     fn prepared_debug_names_the_handler_never_the_callback_token() {
