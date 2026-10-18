@@ -255,11 +255,13 @@ jobs:
           --skip claim_is_owned_once_then_in_flight
           --skip failed_send_releases_the_claim_for_the_retry
           --skip delivered_rows_are_never_reclaimed
+          --skip delivered_rows_expire_only_past_the_horizon_with_the_fence_intact
           --skip fresh_claim_cannot_be_reclaimed
           --skip stale_unposted_claim_is_taken_over_atomically
           --skip started_claim_is_never_reclaimed_even_when_stale
           --skip started_send_that_provably_failed_releases_for_the_retry
           --skip reclaiming_a_missing_key_claims_it_fresh
+          --skip delivered_rows_expire_only_past_the_horizon_with_the_fence_intact
           --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
           --skip mock_delivery_crash_reconciliation_restart_and_overflow
           --skip parity_mismatch_cursor_and_read_only_acceptance
