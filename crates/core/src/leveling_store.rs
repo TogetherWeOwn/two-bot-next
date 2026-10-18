@@ -381,15 +381,20 @@ async fn record_capped_attempt(
 /// claims `xp_cooldowns` in the same transaction, so a quick follow-up stays
 /// blocked and the blocked attempt does not restart the clock. A lost
 /// cooldown race stays silent like legacy (no row, no state).
+///
+/// Runs in the caller's serialized award transaction; the caller rolls back
+/// on a lost claim and commits otherwise. Taking `tx` (rather than `pool`)
+/// keeps short awards on one pooled connection: the caller already holds the
+/// advisory and member-row locks in `tx`, so opening a second transaction
+/// here would hold-and-wait on a second connection for every short message.
 async fn record_short_attempt(
-    pool: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     guild_id: &str,
     member_id: &str,
     at_ms: i64,
     at_norm: &str,
     channel_id: Option<&str>,
-) -> Result<XpAward, LevelingStoreError> {
-    let mut tx = pool.begin().await?;
+) -> Result<bool, LevelingStoreError> {
     // Same atomic claim as the granted path: wins only when no row exists or
     // the stored timestamp is at least a full cooldown old. The loser sees no
     // RETURNING row and stays silent without a second audit row.
@@ -406,11 +411,10 @@ async fn record_short_attempt(
     .bind(member_id)
     .bind(at_norm)
     .bind(cutoff_iso)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     if claimed.is_none() {
-        tx.rollback().await?;
-        return current_award(pool, guild_id, member_id).await;
+        return Ok(false);
     }
     sqlx::query(
         "INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at, channel_id, decision)
@@ -420,10 +424,9 @@ async fn record_short_attempt(
     .bind(member_id)
     .bind(at_norm)
     .bind(channel_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    tx.commit().await?;
-    current_award(pool, guild_id, member_id).await
+    Ok(true)
 }
 
 /// Award message XP (legacy `awardMessage` base [`MESSAGE_XP`]) through the
@@ -601,9 +604,17 @@ pub async fn award_message(
         return current_award(pool, guild_id, member_id).await;
     }
     // Short-message wins over cap/ladder (pure policy order): a known short
-    // body earns zero while consuming the cooldown once.
+    // body earns zero while consuming the cooldown once, in the same
+    // serialized transaction as the eligibility reads above.
     if is_short {
-        return record_short_attempt(pool, guild_id, member_id, at_ms, &at_norm, channel_id).await;
+        let claimed =
+            record_short_attempt(&mut tx, guild_id, member_id, at_ms, &at_norm, channel_id).await?;
+        if !claimed {
+            tx.rollback().await?;
+        } else {
+            tx.commit().await?;
+        }
+        return current_award(pool, guild_id, member_id).await;
     }
     // The only other reachable zeros are the day cap and ladder exhaustion
     // (halving never zeroes a nonzero ladder rung).
