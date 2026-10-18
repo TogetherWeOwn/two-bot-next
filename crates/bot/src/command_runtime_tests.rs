@@ -3417,6 +3417,35 @@ impl TestDb {
         .expect("seed scheduled message");
     }
 
+    /// Seed a scheduled message with an explicit run time, interval and
+    /// enabled flag (listing-render fixtures). Direct insert, so a fixture
+    /// can hold more rows than the quota-admission write path allows.
+    async fn seed_schedule_row(
+        &self,
+        guild_id: &str,
+        id: &str,
+        next_run_at: &str,
+        interval_seconds: Option<i64>,
+        enabled: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO scheduled_messages
+               (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                created_by, created_at, updated_by, updated_at)
+             VALUES ($1, $2, $3, 'remember this', $4, $5, $6,
+                     '77', '2026-09-30T12:00:00.000Z', '77', '2026-09-30T12:00:00.000Z')",
+        )
+        .bind(id)
+        .bind(guild_id)
+        .bind(CHANNEL_S)
+        .bind(next_run_at)
+        .bind(interval_seconds)
+        .bind(enabled)
+        .execute(&self.pool)
+        .await
+        .expect("seed scheduled message row");
+    }
+
     /// (id, channel_id) for this guild's scheduled messages, in list order.
     async fn schedule_rows(&self) -> Vec<(String, String)> {
         sqlx::query_as(
@@ -4626,6 +4655,135 @@ async fn schedule_list_is_scoped_to_the_configured_guild_and_audits_nothing() {
     assert!(
         !content.contains("sched-foreign"),
         "other guild's row never listed: {content}"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_over_cap_shows_twenty_five_rows_and_an_overflow_line() {
+    let db = TestDb::new().await;
+    // 27 rows (direct seeds bypass quota admission), inserted newest-first.
+    // The listing cap is pinned at 25: raising it must break this test.
+    for n in (0..27u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("cap-{n:02}"),
+            &format!("2030-01-{:02}T00:00:00.000Z", n + 1),
+            None,
+            true,
+        )
+        .await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    // deferred_reply() already asserts the ephemeral defer (flags 64).
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("list content");
+    let mut expected_lines: Vec<String> = (0..25u32)
+        .map(|n| format!("`cap-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
+        .collect();
+    expected_lines.push("(truncated, 2 more)".to_owned());
+    assert_eq!(
+        content,
+        expected_lines.join("\n"),
+        "over-cap listing: 25 earliest rows, then the overflow line"
+    );
+    assert!(
+        !content.contains("cap-25") && !content.contains("cap-26"),
+        "rows past the cap are counted, not listed: {content}"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_at_cap_shows_every_row_without_an_overflow_line() {
+    let db = TestDb::new().await;
+    for n in (0..25u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("full-{n:02}"),
+            &format!("2030-01-{:02}T00:00:00.000Z", n + 1),
+            None,
+            true,
+        )
+        .await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("list content");
+    let expected_lines: Vec<String> = (0..25u32)
+        .map(|n| format!("`full-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
+        .collect();
+    assert_eq!(
+        content,
+        expected_lines.join("\n"),
+        "exactly at the cap nothing is truncated"
+    );
+    assert!(
+        !content.contains("truncated"),
+        "no overflow line at the cap: {content}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_under_cap_renders_byte_identical_to_before() {
+    let db = TestDb::new().await;
+    db.seed_schedule_row(
+        GUILD_S,
+        "weekly",
+        "2030-02-03T04:05:06.000Z",
+        Some(604_800),
+        true,
+    )
+    .await;
+    db.seed_schedule_row(GUILD_S, "once", "2030-01-01T00:00:00.000Z", None, true)
+        .await;
+    db.seed_schedule_row(
+        GUILD_S,
+        "paused",
+        "2030-01-15T12:30:00.000Z",
+        Some(3_600),
+        false,
+    )
+    .await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    // deferred_reply() already asserts the ephemeral defer (flags 64).
+    let json = mock.deferred_reply();
+    assert_eq!(
+        json["content"],
+        "`once` `<#3333>` 2030-01-01T00:00:00.000Z\n\
+         `paused` `<#3333>` 2030-01-15T12:30:00.000Z every 60m (disabled)\n\
+         `weekly` `<#3333>` 2030-02-03T04:05:06.000Z every 10080m",
+        "under-cap listing must not change a single byte"
     );
     assert!(
         db.schedule_audits().await.is_empty(),

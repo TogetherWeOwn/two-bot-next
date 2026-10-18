@@ -827,6 +827,85 @@ async fn schedule_ids_are_guild_scoped() {
     .await;
 }
 
+/// Seed one row directly, bypassing the quota-admission write path. A
+/// long-lived guild can hold more rows than the current quota admits
+/// (legacy rows, direct repairs); the listing read must stay bounded
+/// anyway.
+async fn seed_row(pool: &PgPool, guild: &str, id: &str, next_run_at: &str) {
+    sqlx::query(
+        "INSERT INTO scheduled_messages
+           (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+            created_by, created_at, updated_by, updated_at)
+         VALUES ($1, $2, 'chan9', 'hello', $3, NULL, TRUE,
+                 'admin1', $4, 'admin1', $4)",
+    )
+    .bind(id)
+    .bind(guild)
+    .bind(next_run_at)
+    .bind(iso(T0))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn list_scheduled_caps_a_long_lived_guild_at_twenty_five_earliest_rows() {
+    with_db(|pool| async move {
+        let pool = &pool;
+        // The pinned listing cap: raising it must break this test. It
+        // matches the per-guild schedule quota, so every guild whose rows
+        // came through the quota-admission write path lists in full.
+        const LIST_CAP: usize = 25;
+
+        // Over cap: 27 rows inserted newest-first.
+        let guild = "sched-list-over-cap";
+        for n in (0..27u64).rev() {
+            seed_row(
+                pool,
+                guild,
+                &format!("cap-{n:02}"),
+                &iso(T0 + n * 3_600_000),
+            )
+            .await;
+        }
+        let rows = list_scheduled(pool, guild).await.unwrap();
+        assert_eq!(rows.len(), LIST_CAP, "guild read must be LIMIT-capped");
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        let expected: Vec<String> = (0..25).map(|n| format!("cap-{n:02}")).collect();
+        assert_eq!(
+            ids,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the earliest rows by next_run_at survive the cap, in order"
+        );
+
+        // Exactly at cap: nothing is cut.
+        let guild = "sched-list-at-cap";
+        for n in 0..25u64 {
+            seed_row(
+                pool,
+                guild,
+                &format!("full-{n:02}"),
+                &iso(T0 + n * 3_600_000),
+            )
+            .await;
+        }
+        let rows = list_scheduled(pool, guild).await.unwrap();
+        assert_eq!(rows.len(), LIST_CAP);
+        assert_eq!(rows.first().unwrap().id, "full-00");
+        assert_eq!(rows.last().unwrap().id, "full-24");
+
+        // Under cap: every row, in next_run_at order, as before.
+        let guild = "sched-list-under-cap";
+        seed_row(pool, guild, "small-late", &iso(T0 + 7_200_000)).await;
+        seed_row(pool, guild, "small-early", &iso(T0)).await;
+        seed_row(pool, guild, "small-mid", &iso(T0 + 3_600_000)).await;
+        let rows = list_scheduled(pool, guild).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["small-early", "small-mid", "small-late"]);
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn audit_rows_record_outcomes() {
     with_db(|pool| async move {
