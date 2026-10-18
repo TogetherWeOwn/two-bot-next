@@ -1793,7 +1793,8 @@ publicly. Preserve sanitized evidence, not URLs or unredacted SQL errors.
    available; pause manual/operator writes and investigate the specific writer.
 4. Check the **deployed** redirect wiring before treating Hyperdrive as an
    active dependency. If `REDIRECT_DB` is present, separate a failed live lookup
-   (which may serve snapshot fallback) from a failed click insert. If absent,
+   (which serves the configured fallback invite, or 503 when none is valid:
+   never the mappings snapshot) from a failed click insert. If absent,
    record snapshot-only/no-live-attribution as the configured boundary rather
    than an outage. In neither branch is redirect `/healthz` gateway-DB proof.
    Do not manufacture a campaign click to exercise a production DB.
