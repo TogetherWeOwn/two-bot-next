@@ -718,8 +718,10 @@ Healthy-only or pending-only growth never fires. Recovery: a flat failed counter
 never recovers, and a verification-pending pass never recovers — only a later
 healthy-pass increase with no failed-pass increase resolves, once. A backwards
 counter in any of the three outcomes means the process restarted: that sample
-re-baselines and holds a firing ticket instead of fabricating an ALERT or a
-RESOLVED. Missing or invalid samples (absent family on older containers,
+re-baselines, firing when the new process already counted a failed pass (the
+startup pass runs before the first scrape, so a failed boot pass is a
+post-restart failure, not a fabricated delta), and otherwise holding a firing
+ticket instead of fabricating a RESOLVED. Missing or invalid samples (absent family on older containers,
 malformed values, extra labels, duplicates) and failed scrapes hold the firing
 state and keep the previous baseline; the next valid failed delta still fires
 and the next valid healthy increase still recovers.

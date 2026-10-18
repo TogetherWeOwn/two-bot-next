@@ -147,11 +147,33 @@ test("counter resets rebaseline without fabricating events", () => {
   assert.deepEqual(recovered.firing, [], "the first post-restart healthy increase recovers");
 });
 
-test("any backwards counter means restart: an overtaken failed count does not fire across it", () => {
+test("a restart sample with failed passes already counted fires (failed startup pass)", () => {
+  // Healthy went backwards, so this window is a rebaseline, not a delta —
+  // but every count in the reset sample happened in the new process (the
+  // Rust reconcile loop runs its startup pass before the first scrape), so
+  // a failed count on the reset sample is a post-restart failure and fires.
   const state = ev(passes(10, 2, 7)).state;
   const restarted = ev(passes(3, 2, 99), state);
-  assert.deepEqual(restarted.firing, [], "healthy went backwards, so this window is a rebaseline, not a delta");
+  assert.deepEqual(restarted.firing, [KEY], "the new process already counted failed passes");
   assert.deepEqual(ev(passes(3, 2, 100), restarted.state).firing, [KEY]);
+});
+
+test("a failed startup pass after a deploy tickets, then a healthy pass resolves it", () => {
+  // The deploy/restart scenario: healthy baseline, then the new process
+  // counts a failed startup pass before its first scrape.
+  let state = ev(passes(25, 0, 0)).state;
+  const restarted = ev(passes(0, 0, 1), state);
+  assert.deepEqual(restarted.firing, [KEY], "the failed boot pass is ticketed, not swallowed");
+  assert.deepEqual(transitionMessages(state.firing, restarted.firing).length, 1);
+  const recovered = ev(passes(1, 0, 1), restarted.state);
+  assert.deepEqual(recovered.firing, [], "the next healthy pass with no new failure resolves");
+});
+
+test("a restart sample with no failed passes holds instead of firing", () => {
+  const state = ev(passes(10, 2, 7)).state;
+  const restarted = ev(passes(3, 2, 0), state);
+  assert.deepEqual(restarted.firing, [], "no failed pass in the new process: rebaseline only");
+  assert.deepEqual(ev(passes(3, 2, 1), restarted.state).firing, [KEY]);
 });
 
 const invalidSamples: Record<string, string[]> = {

@@ -806,8 +806,11 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // fires (even beside a healthy delta); healthy-only or pending-only growth
   // never fires. A flat failed counter never recovers: only a healthy-pass
   // increase with no failed-pass increase resolves, once. Any backwards
-  // counter means the process restarted: that sample re-baselines and holds a
-  // firing ticket instead of fabricating an ALERT or RESOLVED. Missing or
+  // counter means the process restarted: that sample re-baselines, firing
+  // when the new process has already counted a failed pass (the startup pass
+  // runs before the first scrape, so a reset sample with failed > 0 is a
+  // post-restart failure, not a fabricated delta) and otherwise holding a
+  // firing ticket instead of fabricating a RESOLVED. Missing or
   // invalid samples (absent family on older containers, malformed values,
   // extra labels, duplicates) hold the firing state and keep the previous
   // baseline; `??` covers DO storage written before this rule existed.
@@ -837,7 +840,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     reconcilePending = reconcilePendingNow;
     reconcileFailed = reconcileFailedNow;
     reconcileSeen = true;
-    if (wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
+    if (reconcileFailedNow > 0 || wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
   } else {
     const failedGrew = reconcileFailedNow > reconcileFailed;
     const healthyGrew = reconcileHealthyNow > reconcileHealthy;
