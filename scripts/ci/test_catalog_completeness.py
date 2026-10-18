@@ -96,12 +96,6 @@ EXEMPT_SERIES = {
     "two_bot_internal_actions_total": _ALERT_INPUT_REASON + " (receiver_refusals)",
     "two_bot_community_facts_drain_failures_total": _EMITTED_REASON,
     "two_bot_send_admissions_total": _ALERT_INPUT_REASON + " (send_admission_blocked)",
-    # Label-free halt gauge: a manual check, not an alert input. Its catalog
-    # row lands with the change that introduces the gauge.
-    "two_bot_audit_delivery_halt": (
-        "manual check documented in docs/metrics.md, consumed by no alert "
-        "rule; catalog row lands with the halt-gauge change"
-    ),
     # Voice stall-observability remainder (lobby-stall follow-up): backoff cap
     # and in-flight REST age. All rows live in docs/metrics.md; the catalog
     # covers voice_event log fields. (joins_received, dispatch_timeouts,
