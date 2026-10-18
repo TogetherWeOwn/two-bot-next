@@ -47,6 +47,9 @@ JOB_INVENTORY = {
     "staging-events-read.yml": {"read"},
     # Manual read-only authenticated MCP prove-out (TOG-23456); pinned shape below.
     "staging-mcp-proveout.yml": {"proveout"},
+    # Manual gradual-promote proof caller (passive until the synthetic
+    # fixture lands); pinned shape below.
+    "gradual-promote-proof.yml": {"proof"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
@@ -209,7 +212,7 @@ def staging_push_filter_errors(name, push):
 
 
 def staging_dispatch_errors(workflow):
-    """The active staging workflow keeps exactly three fenced dispatch inputs.
+    """The active staging workflow keeps exactly five fenced dispatch inputs.
 
     `release_fence` exists on main (TOG-11143) so post-handoff release of an
     uninitialized/parked singleton is explicit and auditable; it defaults to
@@ -219,7 +222,10 @@ def staging_dispatch_errors(workflow):
     dispatch-only expression in staging_gateway_injection_errors.
     `inject_error_rate_spike` is the error-rate rollback-drill switch with
     the same shape, readable only through the pinned dispatch-only
-    expression in staging_error_rate_gate_errors. Anything else in the
+    expression in staging_error_rate_gate_errors. `inject_voice_stall` and
+    `inject_unpaired_disconnect` are the remediation-drill switches with the
+    same shape, readable only through the pinned dispatch-only expressions
+    in staging_fault_injection_errors. Anything else in the
     dispatch block (an arming switch, a deploy flag, a default of
     true) is an unreviewed deploy route outside the pinned shape.
     """
@@ -230,9 +236,9 @@ def staging_dispatch_errors(workflow):
         errors.append(f"{name}: triggers changed")
     errors.extend(staging_push_filter_errors(name, on.get("push")))
     dispatch = on.get("workflow_dispatch") or {}
-    expected = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike"}
+    expected = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike", "inject_voice_stall", "inject_unpaired_disconnect"}
     if set(dispatch) != {"inputs"} or set(dispatch.get("inputs") or {}) != expected:
-        errors.append(f"{name}: workflow_dispatch must carry only the release_fence, inject_gateway_failure and inject_error_rate_spike inputs")
+        errors.append(f"{name}: workflow_dispatch must carry only the release_fence, inject_gateway_failure, inject_error_rate_spike, inject_voice_stall and inject_unpaired_disconnect inputs")
     else:
         for input_name in expected:
             spec = dispatch["inputs"][input_name] or {}
@@ -245,6 +251,16 @@ INJECTION_EXPRESSION = "${{ github.event_name == 'workflow_dispatch' && inputs.i
 INJECTION_MARKERS = (
     "inject_gateway_failure", "INJECT_GATEWAY_FAILURE",
     "TWO_GATEWAY_READINESS_FAIL_INJECTION", "--inject-gateway-failure",
+)
+FAULT_EXPRESSIONS = {
+    "INJECT_VOICE_STALL": "${{ github.event_name == 'workflow_dispatch' && inputs.inject_voice_stall && 'true' || 'false' }}",
+    "INJECT_UNPAIRED_DISCONNECT": "${{ github.event_name == 'workflow_dispatch' && inputs.inject_unpaired_disconnect && 'true' || 'false' }}",
+}
+FAULT_MARKERS = (
+    "inject_voice_stall", "INJECT_VOICE_STALL",
+    "TWO_VOICE_STALL_FAULT_INJECTION", "--inject-voice-stall",
+    "inject_unpaired_disconnect", "INJECT_UNPAIRED_DISCONNECT",
+    "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION", "--inject-unpaired-disconnect",
 )
 
 
@@ -344,6 +360,50 @@ def staging_error_rate_gate_errors(workflows):
     # and the read-back print, which must name the same file.
     if run.count("error-rate-gate.json") != 2:
         errors.append("deploy-staging.yml: error_rate_gate must write and read back the same error-rate-gate.json")
+    return errors
+
+
+def staging_fault_injection_errors(workflows):
+    """The remediation-drill switches are dispatch-only, staging-only plumbing.
+
+    Same shape as the gateway-failure injection above: each switch is read by
+    exactly one pinned dispatch-only expression in exactly one staging step,
+    the step hands only the prepare flags to the generated staging deploy
+    config, and every other workflow — deploy-production above all — must not
+    mention any fault marker at all, so no route can forward a drill to
+    production.
+    """
+    errors = []
+    for name, workflow in workflows.items():
+        if name == "deploy-staging.yml":
+            continue
+        text = str(workflow)
+        for marker in FAULT_MARKERS:
+            if marker in text:
+                errors.append(f"{name}: remediation-fault marker {marker} outside deploy-staging")
+    staging = workflows.get("deploy-staging.yml") or {}
+    text = str(staging)
+    for input_name in ("inject_voice_stall", "inject_unpaired_disconnect"):
+        if text.count(f"inputs.{input_name}") != 1:
+            errors.append(f"deploy-staging.yml: {input_name} must be read exactly once")
+    steps = ((staging.get("jobs") or {}).get("deploy") or {}).get("steps") or []
+    armed = [step for step in steps
+             if isinstance(step, dict) and ("INJECT_VOICE_STALL" in str(step)
+                                            or "INJECT_UNPAIRED_DISCONNECT" in str(step))]
+    if len(armed) != 1:
+        errors.append("deploy-staging.yml: exactly one deploy step may carry the fault switches")
+        return errors
+    step = armed[0]
+    env = step.get("env") or {}
+    for var, expression in FAULT_EXPRESSIONS.items():
+        if env.get(var) != expression:
+            errors.append(f"deploy-staging.yml: {var} must use the pinned dispatch-only expression")
+    run = str(step.get("run") or "")
+    for needle in ("--inject-voice-stall", "--inject-unpaired-disconnect",
+                   '[ "$INJECT_VOICE_STALL" = "true" ]',
+                   '[ "$INJECT_UNPAIRED_DISCONNECT" = "true" ]'):
+        if run.count(needle) != 1:
+            errors.append(f"deploy-staging.yml: fault step must contain exactly one {needle}")
     return errors
 
 
@@ -1068,6 +1128,156 @@ def staging_mcp_proveout_errors(workflow):
             "path": "staging-mcp-proveout-${{ github.run_id }}.json",
             "if-no-files-found": "error", "retention-days": "14"}:
         errors.append(f"{name}:proveout: must upload only the run's json for 14 days and fail if absent")
+    return errors
+
+
+# Pinned central gradual-promote action (verified 2026-10-18; re-verify HEAD
+# before repinning). Every error-rate input stays explicit so a central
+# default change cannot silently widen the gate.
+GRADUAL_PROOF_ACTION = ("TogetherWeOwn/.github/actions/gradual-promote"
+                        "@89c290be20c0044efaf6916f28341c76e75fff06")
+GRADUAL_PROOF_WORKER = "two-bot-next-gradual-proof"
+GRADUAL_PROOF_WITH = {
+    "worker-name": GRADUAL_PROOF_WORKER,
+    "version-tag": "${{ inputs.candidate_tag }}",
+    "domain": "${{ inputs.domain }}",
+    "api-token": "${{ secrets.CLOUDFLARE_API_TOKEN }}",
+    "account-id": "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}",
+    "allow-indexable": "false",
+    "error-rate-gate": "true",
+    "error-rate-threshold": "0.05",
+    "error-rate-min-requests": "20",
+    "error-rate-window-minutes": "10",
+    "error-rate-soak-seconds": "60",
+}
+
+
+def gradual_promote_proof_errors(workflow):
+    """Manual gradual-promote proof caller (passive until the fixture lands).
+
+    Dispatch-only with exactly the mode, confirm_worker, candidate_tag and
+    domain inputs. One job runs only from main through the `staging`
+    environment (staging credentials only; production secret names never
+    appear), on the routed runner for job `proof`, with its own
+    non-cancelling concurrency group and a 30 minute timeout. Exactly five
+    steps: pinned checkout, pinned setup-node, the target-lock step (which
+    refuses before any Cloudflare call until the synthetic fixture lands),
+    the pinned central action with every error-rate input explicit, and the
+    always() evidence upload. No wrangler, no production path, no `set -x`.
+    """
+    name = "gradual-promote-proof.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    else:
+        dispatch = on.get("workflow_dispatch") or {}
+        inputs = dispatch.get("inputs") or {}
+        if set(dispatch) != {"inputs"} or set(inputs) != {"mode", "confirm_worker", "candidate_tag", "domain"}:
+            errors.append(f"{name}: workflow_dispatch must carry exactly mode, confirm_worker, candidate_tag and domain")
+        else:
+            mode = inputs.get("mode") or {}
+            if (mode.get("type") != "choice"
+                    or set(mode.get("options") or []) != {"success", "rollback"}
+                    or mode.get("default") != "success"):
+                errors.append(f"{name}: mode must be success/rollback defaulting to success")
+            for key in ("confirm_worker", "candidate_tag", "domain"):
+                field = inputs.get(key) or {}
+                if (field.get("type") != "string"
+                        or str(field.get("required")).lower() != "true"
+                        or "default" in field):
+                    errors.append(f"{name}: {key} must be a required string with no default")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "gradual-promote-proof", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own gradual-promote-proof group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"proof"}:
+        errors.append(f"{name}: jobs must be exactly proof")
+        return errors
+    job = jobs["proof"]
+    if job.get("name") != "gradual-promote-proof":
+        errors.append(f"{name}:proof: job name must stay gradual-promote-proof")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:proof: must run only from main")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:proof: must keep contents:read only")
+    if job.get("environment") != "staging":
+        errors.append(f"{name}:proof: must read only the staging Environment binding")
+    if job.get("timeout-minutes") != "30":
+        errors.append(f"{name}:proof: timeout must stay 30 minutes")
+    if not runner_allowed("proof", job.get("runs-on")):
+        errors.append(f"{name}:proof: must use the routed runner expression for job 'proof'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:proof: must not set {key}")
+    steps = job.get("steps") or []
+    if len(steps) != 5:
+        errors.append(f"{name}:proof: must run exactly checkout, setup-node, target lock, the pinned action and the upload")
+        return errors
+    checkout, node, guard, gradual, upload = steps
+    for step, label in ((checkout, "checkout"), (node, "setup-node"),
+                        (guard, "target-lock"), (gradual, "central action")):
+        if "if" in step:
+            errors.append(f"{name}:proof: {label} step must not set if (fail closed)")
+        if "continue-on-error" in step:
+            errors.append(f"{name}:proof: {label} step must not set continue-on-error (fail closed)")
+    if "continue-on-error" in upload:
+        errors.append(f"{name}:proof: upload step must not set continue-on-error (fail closed)")
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
+            or (checkout.get("with") or {}).get("fetch-depth") != "1":
+        errors.append(f"{name}:proof: checkout must be pinned, shallow and must not persist credentials")
+    if not str(node.get("uses", "")).startswith("actions/setup-node@"):
+        errors.append(f"{name}:proof: second step must be the pinned setup-node")
+    guard_env = guard.get("env") or {}
+    if guard_env != {"CONFIRM_WORKER": "${{ inputs.confirm_worker }}",
+                     "CANDIDATE_TAG": "${{ inputs.candidate_tag }}",
+                     "PROOF_DOMAIN": "${{ inputs.domain }}",
+                     "RUN_MODE": "${{ inputs.mode }}"}:
+        errors.append(f"{name}:proof: target-lock step must bind exactly the four dispatch inputs via env")
+    guard_run = str(guard.get("run") or "")
+    if guard.get("shell") != "bash" or "set -euo pipefail" not in guard_run:
+        errors.append(f"{name}:proof: target-lock step must run fail-closed bash")
+    for needle in (GRADUAL_PROOF_WORKER, "passive", "No Cloudflare call",
+                     "${#CANDIDATE_TAG}", "-gt 128",
+                     "two-bot-next-gradual-proof.*.*.workers.dev",
+                     "single-label synthetic host"):
+        if needle not in guard_run:
+            errors.append(f"{name}:proof: target-lock step must pin {needle}")
+    if "${{" in guard_run:
+        errors.append(f"{name}:proof: target-lock step must read inputs via the environment only")
+    if gradual.get("id") != "gradual":
+        errors.append(f"{name}:proof: the central action step must carry id gradual")
+    if gradual.get("uses") != GRADUAL_PROOF_ACTION:
+        errors.append(f"{name}:proof: must call the pinned central gradual-promote action")
+    if (gradual.get("with") or {}) != GRADUAL_PROOF_WITH:
+        errors.append(f"{name}:proof: central action inputs must stay pinned with every error-rate input explicit")
+    if upload.get("if") != "always()":
+        errors.append(f"{name}:proof: upload must run with if: always() so refusals keep their evidence")
+        return errors
+    if not str(upload.get("uses", "")).startswith("actions/upload-artifact@") or upload.get("with") != {
+            "name": "gradual-promote-proof-${{ github.run_id }}-${{ github.run_attempt }}",
+            "path": "proof-evidence/",
+            "if-no-files-found": "warn", "retention-days": "14"}:
+        errors.append(f"{name}:proof: must upload the run evidence artifact for 14 days and warn if absent")
+    text = str(job).lower().replace(" ", "")
+    for marker in ("production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                   "wrangler", "/health", "/readyz"):
+        if marker in text:
+            errors.append(f"{name}:proof: must not contain {marker!r}")
+    # workers.dev appears only as the synthetic host shape in the guard's
+    # domain case pattern (accept plus single-label rejection); anywhere else
+    # it would be a deploy route.
+    if text.count("workers.dev") != 2 \
+            or "two-bot-next-gradual-proof.*.workers.dev" not in guard_run \
+            or "two-bot-next-gradual-proof.*.*.workers.dev" not in guard_run:
+        errors.append(f"{name}:proof: workers.dev may appear only in the guard domain pattern")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"cloudflare_api_token", "cloudflare_account_id"}:
+        errors.append(f"{name}:proof: must read only the staging Cloudflare pair")
     return errors
 
 
@@ -1807,6 +2017,7 @@ def workflow_policy_errors(workflows):
     errors = []
     errors.extend(staging_gateway_injection_errors(workflows))
     errors.extend(staging_error_rate_gate_errors(workflows))
+    errors.extend(staging_fault_injection_errors(workflows))
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
     if set(workflows) != set(JOB_INVENTORY):
@@ -1861,6 +2072,12 @@ def workflow_policy_errors(workflows):
             # above; the generic environment scan below would flag its
             # staging Environment binding.
             errors.extend(staging_mcp_proveout_errors(workflow))
+            continue
+        if name == "gradual-promote-proof.yml":
+            # Manual gradual-promote proof caller (passive until the fixture
+            # lands): pinned shape above; the generic environment/marker
+            # scan below would flag its staging binding and Cloudflare pair.
+            errors.extend(gradual_promote_proof_errors(workflow))
             continue
         if name == "staging-migrate.yml":
             # Manual runner: pinned shape above, not the
@@ -2107,7 +2324,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
         self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 11)
+        self.assertEqual(len(guarded), 12)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -2123,6 +2340,7 @@ class WorkflowTests(unittest.TestCase):
             "--test internal_channel_moderation": True,
             "--test feeds_store": True,
             "--test legacy_verify_db": False,
+            "--test legacy_tls_fence": False,
             "--test staging_migrate_db": False,
             "--test internal_events": True,
             "--test raid_list_db": False,
@@ -2464,6 +2682,48 @@ class WorkflowTests(unittest.TestCase):
                 job = next(iter(changed[name]["jobs"].values()))
                 job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_error_rate_spike }}"
                 self.assertTrue(staging_error_rate_gate_errors(changed))
+                self.assertTrue(workflow_policy_errors(changed))
+
+    def test_remediation_fault_injection_is_dispatch_only_and_never_forwarded(self):
+        workflows = self.workflows
+        self.assertEqual(staging_fault_injection_errors(workflows), [])
+        self.assertEqual(staging_dispatch_errors(workflows["deploy-staging.yml"]), [])
+        steps = workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        armed = [s for s in steps if "INJECT_VOICE_STALL" in str(s)]
+        self.assertEqual(len(armed), 1)
+        index = steps.index(armed[0])
+        mutations = {
+            # Push could read it / default armed.
+            "expression without dispatch guard": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
+                .__setitem__("INJECT_VOICE_STALL", "${{ inputs.inject_voice_stall }}"),
+            "expression constant true": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
+                .__setitem__("INJECT_UNPAIRED_DISCONNECT", "true"),
+            "prepare flag unconditional": lambda w: w["jobs"]["deploy"]["steps"][index]
+                .__setitem__("run", "python3 ../scripts/staging_rollout.py prepare --inject-voice-stall"),
+            "input defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["inject_voice_stall"]
+                .__setitem__("default", True),
+            "input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("inject_unpaired_disconnect"),
+            "second reader step": lambda w: w["jobs"]["deploy"]["steps"][0]
+                .setdefault("env", {}).__setitem__("INJECT_VOICE_STALL", "true"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(
+                    staging_fault_injection_errors(changed)
+                    or staging_dispatch_errors(changed["deploy-staging.yml"]),
+                    label,
+                )
+                self.assertTrue(workflow_policy_errors(changed), label)
+        # Production (or any other workflow) mentioning any fault marker at
+        # all is a forwarding route, whatever the surrounding shape.
+        for name in ("deploy-production.yml", "check.yml"):
+            with self.subTest(forwarded=name):
+                changed = deepcopy(workflows)
+                job = next(iter(changed[name]["jobs"].values()))
+                job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_voice_stall }}"
+                self.assertTrue(staging_fault_injection_errors(changed))
                 self.assertTrue(workflow_policy_errors(changed))
 
     def test_docs_only_push_skips_staging_but_runtime_paths_deploy(self):
@@ -3166,6 +3426,69 @@ class WorkflowTests(unittest.TestCase):
         # The inventory pin fails closed if the workflow disappears or gains a job.
         missing = deepcopy(workflows)
         del missing["staging-events-read.yml"]
+        self.assertTrue(workflow_policy_errors(missing))
+        self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_gradual_promote_proof_shape_is_pinned(self):
+        workflows = self.workflows
+        self.assertEqual(gradual_promote_proof_errors(workflows["gradual-promote-proof.yml"]), [])
+
+        def mutate(change):
+            copy = deepcopy(workflows["gradual-promote-proof.yml"])
+            change(copy)
+            return gradual_promote_proof_errors(copy)
+
+        def job(copy):
+            return copy["jobs"]["proof"]
+
+        changes = {
+            "push trigger": lambda w: w["on"].update({"push": {"branches": ["main"]}}),
+            "rollback-only mode": lambda w: w["on"]["workflow_dispatch"]["inputs"]["mode"].update(
+                {"options": ["rollback"]}),
+            "mode default rollback": lambda w: w["on"]["workflow_dispatch"]["inputs"]["mode"].update(
+                {"default": "rollback"}),
+            "dropped domain input": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("domain"),
+            "extra input": lambda w: w["on"]["workflow_dispatch"]["inputs"].update(
+                {"extra": {"type": "string", "required": "false"}}),
+            "confirm default": lambda w: w["on"]["workflow_dispatch"]["inputs"]["confirm_worker"].update(
+                {"default": "two-bot-next-gradual-proof"}),
+            "top-level permissions": lambda w: w.update({"permissions": {"contents": "read"}}),
+            "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
+            "production environment": lambda w: job(w).update({"environment": "production"}),
+            "no environment": lambda w: job(w).pop("environment"),
+            "branch condition removed": lambda w: job(w).pop("if"),
+            "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
+            "longer timeout": lambda w: job(w).update({"timeout-minutes": "60"}),
+            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
+            "other job's routing": lambda w: job(w).update(
+                {"runs-on": ROUTED_RUNNER.format(job="check")}),
+            "repinned action": lambda w: job(w)["steps"][3].update(
+                {"uses": "TogetherWeOwn/.github/actions/gradual-promote@main"}),
+            "dropped error-rate threshold": lambda w: job(w)["steps"][3]["with"].pop("error-rate-threshold"),
+            "widened allow-indexable": lambda w: job(w)["steps"][3]["with"].update({"allow-indexable": "true"}),
+            "production secret": lambda w: job(w)["steps"][3]["with"].update(
+                {"api-token": "${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}"}),
+            "inline expression": lambda w: job(w)["steps"][2].update(
+                {"run": 'echo "${{ inputs.confirm_worker }}"'}),
+            "upload may be missing": lambda w: job(w)["steps"][4]["with"].update({"if-no-files-found": "error"}),
+            "upload not always": lambda w: job(w)["steps"][4].pop("if"),
+            "checkout conditional": lambda w: job(w)["steps"][0].update({"if": "always()"}),
+            "guard conditional": lambda w: job(w)["steps"][2].update({"if": "always()"}),
+            "gradual continue-on-error": lambda w: job(w)["steps"][3].update({"continue-on-error": "true"}),
+            "guard without length gate": lambda w: job(w)["steps"][2].update(
+                {"run": job(w)["steps"][2]["run"].replace("${#CANDIDATE_TAG}", "CANDIDATE_TAG")}),
+            "guard without single-label rejection": lambda w: job(w)["steps"][2].update(
+                {"run": job(w)["steps"][2]["run"].replace("two-bot-next-gradual-proof.*.*.workers.dev",
+                                                         "two-bot-next-gradual-proof-rejected")}),
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self.assertTrue(mutate(change))
+        # The inventory pin fails closed if the workflow disappears or gains a job.
+        missing = deepcopy(workflows)
+        del missing["gradual-promote-proof.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
