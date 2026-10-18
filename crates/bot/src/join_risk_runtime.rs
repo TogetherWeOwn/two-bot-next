@@ -222,6 +222,22 @@ impl StoreSettings {
         }
     }
 
+    /// Test seam: force the next [`SettingsSource::current`] call to re-read
+    /// instead of returning the cached outcome, so state transitions
+    /// (good to refused, refused to steady refused, tuning changes) are
+    /// coverable without waiting out [`SETTINGS_MAX_AGE`].
+    #[cfg(test)]
+    pub(crate) fn expire_for_tests(&mut self) {
+        self.checked = None;
+    }
+
+    /// Test seam: replace the boot-time deployment values under test, so one
+    /// [`StoreSettings`] can walk through deployment transitions.
+    #[cfg(test)]
+    pub(crate) fn set_deployment_for_tests(&mut self, deployment: HashMap<String, String>) {
+        self.deployment = deployment;
+    }
+
     async fn refresh(&mut self) {
         let store = SettingsStore::new(&self.pool);
         let stale = self.cache.as_ref();
@@ -556,4 +572,86 @@ pub(crate) fn chain_from_env(
         first: raid,
         second: risk,
     })
+}
+
+#[cfg(test)]
+mod store_settings_cache_tests {
+    //! Non-ignored coverage for [`StoreSettings::current`]: the 15 s outcome
+    //! cache must hold good settings and refusals alike, so a misconfigured
+    //! key cannot turn per-join reads into per-join database load. The pool
+    //! below points at a closed loopback port, so [`StoreSettings::refresh`]
+    //! fails fast and the deployment values alone decide each read.
+
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn test_pool() -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool never fails to construct")
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn good_outcome_caches_within_window_and_covers_tuning_branches() {
+        let mut source = StoreSettings::new(
+            test_pool(),
+            22,
+            vars(&[(WINDOW_KEY, "30.5"), (THRESHOLD_KEY, "8")]),
+        );
+        // First read: the Ok arm, the first-enable log arm, store and return.
+        let first = source.current().await.expect("valid deployment reads");
+        assert_eq!(first.tuning.threshold(), 8.0);
+        // Immediate second read: the cached outcome, no re-read.
+        let cached = source.current().await.expect("cached good reads");
+        assert_eq!(cached, first);
+        // Same tuning after expiry: the unchanged-tuning arm.
+        source.expire_for_tests();
+        let same = source.current().await.expect("same tuning reads");
+        assert_eq!(same, first);
+        // Different tuning after expiry: the tuning-changed arm.
+        source.expire_for_tests();
+        source.set_deployment_for_tests(vars(&[(WINDOW_KEY, "30.5"), (THRESHOLD_KEY, "9")]));
+        let changed = source.current().await.expect("changed tuning reads");
+        assert_eq!(changed.tuning.threshold(), 9.0);
+    }
+
+    #[tokio::test]
+    async fn refusal_caches_within_window() {
+        let mut source = StoreSettings::new(test_pool(), 22, vars(&[(THRESHOLD_KEY, "abc")]));
+        // First read: the refusal names the key (error-on-change arm).
+        let refused = source
+            .current()
+            .await
+            .expect_err("unusable threshold refuses");
+        assert_eq!(refused.key(), THRESHOLD_KEY);
+        // Immediate second read: the cached refusal, same key, no re-read.
+        let cached = source.current().await.expect_err("cached refusal refuses");
+        assert_eq!(cached.key(), THRESHOLD_KEY);
+    }
+
+    #[tokio::test]
+    async fn steady_refusal_takes_debug_arm_and_key_change_errors_again() {
+        let mut source = StoreSettings::new(test_pool(), 22, vars(&[(THRESHOLD_KEY, "abc")]));
+        let first = source.current().await.expect_err("first refusal refuses");
+        assert_eq!(first.key(), THRESHOLD_KEY);
+        // Expire the window but keep the same bad key: the steady refused
+        // state takes the debug (not error) arm and returns the same refusal.
+        source.expire_for_tests();
+        let steady = source.current().await.expect_err("steady refusal refuses");
+        assert_eq!(steady.key(), THRESHOLD_KEY);
+        // A different bad key is a state change: the error arm again.
+        source.expire_for_tests();
+        source.set_deployment_for_tests(vars(&[(WINDOW_KEY, "0")]));
+        let changed = source.current().await.expect_err("different key refuses");
+        assert_eq!(changed.key(), WINDOW_KEY);
+    }
 }
