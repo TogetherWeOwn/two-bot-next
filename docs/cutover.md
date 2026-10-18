@@ -227,9 +227,10 @@ paste them into a production shell without the cutover executor's approval:
 | `two-bot commands publish --apply` | Same source: explicit overwrite; default dry-run and `--allow-live-guild` opt-in required. Global snapshot/restore is not implied by a guild tool |
 | `two-bot preflight --json` | `crates/bot/src/preflight.rs:31-40`: read-only REST identity/intents/role/channel checks, FAIL vs WARN |
 | `gateway-force-identify` (separate cutover binary), default dry-run; `--apply --reason`, `--allow-live-guild` | `crates/cutover/src/bin/gateway_force_identify.rs:1-14`: prints guild, shard, checkpoint age and directive, writes nothing; `--apply` arms a one-shot force-fresh IDENTIFY consumed by the next boot. Required for the first production boot ([gateway recovery](gateway-recovery.md#force-fresh-identify-first-production-boot)) |
-| `rollback-delta --since <RFC3339> [--export <path>]` (separate cutover binary) | `crates/cutover/src/bin/rollback_delta.rs:14-52`: read-only delta report; `--export` writes the report to a file. Reverse import is still missing |
+| `rollback-delta --since <RFC3339> [--export <path>]` (separate cutover binary) | `crates/cutover/src/bin/rollback_delta.rs`: read-only delta report; `--export` writes the report to a file |
+| `rollback-delta import --file <export.ndjson> [--apply] [--allow-live-target]` (same binary) | `crates/cutover/src/rollback_import.rs`: replays an `--export` file into `TWO_DATABASE_URL`. Default dry-run prints a row-count plan without opening a database; `--apply` plus the live-target opt-in applies it in one idempotent transaction. Malformed lines, unknown tables and row-cap overruns refuse before any write |
 
-No `commands restore` (registry), database delta reverse-import, or
+No `commands restore` (registry) or
 `--disable-resume` command is established by this baseline (re-checked at
 `bce86a791`: `commands_cli.rs` offers only `diff`/`publish`, no `restore`;
 no `disable-resume`/`RESUME=0` in `crates/bot/src`). Gateway RESUME is

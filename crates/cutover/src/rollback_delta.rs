@@ -2,8 +2,8 @@
 //!
 //! `docs/cutover.md` notes that the forward upsert is not a rollback delta
 //! exporter: rollback needs the full captured Next delta measured from the
-//! `T_f` baseline. This module supplies the read-only measurement. A reverse
-//! import stays out of scope.
+//! `T_f` baseline. This module supplies the read-only measurement. The reverse
+//! import lives in [`crate::rollback_import`] (`rollback-delta import`).
 //!
 //! For every bot-owned table the report counts rows inserted or updated after
 //! `T_f`, using that table's timestamp column(s). Timestamp storage is mixed
