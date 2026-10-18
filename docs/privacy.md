@@ -224,8 +224,12 @@ a skipped true guild removal is logged at error level with the guild id
 (`retention purge skipped; schema gap, operator replay required`), increments
 the pollable `retention_replay_needed` counter on `/metrics`
 (`two_bot_retention_replay_needed_total`), and must be replayed by the
-Operator once the migration lands — poll the counter first instead of
-log-grep, then run the same insert the live path runs:
+Operator once the migration lands — a nonzero counter means at least one
+skip since the last restart and is only an early hint: the counter resets
+on process restart and carries no guild id, so the error log line
+(`operator replay required`) stays the source of truth for which guilds to
+replay. Always search that line over the whole schema-gap window, then run
+the same insert the live path runs:
 `INSERT INTO retention_guild_purge_queue (guild_id)
 VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;`
 Conditional: replay only if no `GUILD_CREATE` for that guild was acked after
