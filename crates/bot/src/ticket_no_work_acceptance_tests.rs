@@ -123,7 +123,13 @@ fn lazy_runtime() -> Arc<TicketRuntime> {
     let pool = PgPoolOptions::new()
         .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
         .unwrap();
-    let executor = ActionExecutor::with_proxy("ticket-test-token".into(), None).unwrap();
+    // A dummy loopback origin: the executor refuses construction without a
+    // proxy, and any real Discord call from these paths fails loudly here.
+    let executor = ActionExecutor::with_proxy(
+        "ticket-test-token".into(),
+        Some("http://127.0.0.1:1".into()),
+    )
+    .unwrap();
     let runtime = Arc::new(
         TicketRuntime::new(pool, executor, config(), std::collections::HashMap::new()).unwrap(),
     );
