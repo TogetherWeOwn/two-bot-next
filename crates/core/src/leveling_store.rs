@@ -13,7 +13,8 @@
 //! never need a Postgres driver or a live database.
 //!
 //! Transaction shape (policy awards): one transaction holding eligibility
-//! serialization (`SELECT … FOR UPDATE` on the member row when present),
+//! serialization (a `pg_advisory_xact_lock` on guild+member, plus `SELECT …
+//! FOR UPDATE` on the member row when present),
 //! the policy reads (cooldown clock, daily counters, burst window), the
 //! atomic cooldown claim (`INSERT … ON CONFLICT DO UPDATE … WHERE
 //! last_awarded_at <= cutoff RETURNING`), then the XP upsert guarded by the
@@ -184,16 +185,22 @@ fn utc_day_bounds(at_ms: i64) -> (i64, i64) {
     (start, start + 86_400_000)
 }
 
-/// Serialize award eligibility for one guild/member: hold the lifetime row
-/// (when it exists) before reading any policy input, so two concurrent
-/// awards cannot both pass eligibility on the same stale counters. Missing
-/// rows carry no lock; first awards serialize on the atomic cooldown claim
-/// inside the same transaction.
+/// Serialize award eligibility for one guild/member: hold a transaction-scoped
+/// advisory lock keyed on guild and member before reading any policy input,
+/// so two concurrent awards cannot both pass eligibility on the same stale
+/// counters — including first awards with no `member_levels` row yet, where
+/// `SELECT … FOR UPDATE` would lock nothing. The row lock below is kept for
+/// existing members; the advisory lock covers the missing-row case.
 async fn lock_member_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     guild_id: &str,
     member_id: &str,
 ) -> Result<(), LevelingStoreError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || $2, 0))")
+        .bind(guild_id)
+        .bind(member_id)
+        .execute(&mut **tx)
+        .await?;
     let _: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 FROM member_levels WHERE guild_id = $1 AND member_id = $2 FOR UPDATE",
     )
