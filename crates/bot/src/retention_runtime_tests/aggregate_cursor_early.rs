@@ -83,7 +83,7 @@ async fn aggregate_expiry_cursor_advances_before_deletes_on_cancelled_pass() {
     let limited = PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(Duration::from_secs(10))
-        .connect_with(pool.connect_options().clone())
+        .connect_with(pool.connect_options().as_ref().clone())
         .await
         .unwrap();
 
