@@ -63,15 +63,18 @@ const AGGREGATE_ROWS_PER_GUILD_PER_PASS: u32 = 500;
 const AGGREGATE_ROWS_PER_GUILD_PER_PASS: u32 = 10;
 
 /// Process-local aggregate-expiry continuation, keyed by database name: the
-/// guild key the previous pass on that database visited last. The next pass
+/// guild key the previous pass on that database attempted last. The next pass
 /// resumes after it, so consecutive ticks visit later eligible guilds instead
 /// of restarting at the first page; the cursor advances in dry-run mode too,
-/// where nothing is deleted and only the cursor makes progress. Keying by
-/// database keeps disposable test databases isolated (each starts at the
-/// first page regardless of test order) while production's single database
-/// keeps one cursor. A restart begins again at the first page: rows are never
-/// marked expired by the cursor, so at worst a fleet drains from the top
-/// again, never with work silently skipped.
+/// where nothing is deleted and only the cursor makes progress. In execute
+/// mode the cursor is written per guild immediately before that guild's
+/// delete, so a hung delete or supervisor timeout that cancels the pass
+/// resumes after the last attempted guild and still reaches the later guilds
+/// on the same page. Keying by database keeps disposable test databases
+/// isolated (each starts at the first page regardless of test order) while
+/// production's single database keeps one cursor. A restart begins again at
+/// the first page: rows are never marked expired by the cursor, so at worst
+/// a fleet drains from the top again, never with work silently skipped.
 static AGGREGATE_EXPIRY_CURSOR: LazyLock<Mutex<HashMap<String, Option<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -102,8 +105,8 @@ fn expiry_cursor_set(pool: &PgPool, last_visited: &str) {
 
 /// Test-only cursor controls: focused regression tests reset to a
 /// deterministic start and read back the cursor to prove a cancelled pass
-/// still advanced past the visited page. Keyed by database like the pass
-/// itself, so resetting clears every database's cursor.
+/// still advanced past the last attempted guild. Keyed by database like the
+/// pass itself, so resetting clears every database's cursor.
 #[cfg(test)]
 pub(crate) fn reset_aggregate_expiry_cursor_for_tests() {
     AGGREGATE_EXPIRY_CURSOR
@@ -287,9 +290,11 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
 /// guild's bounded failure retains its rows for a later retry while the pass
 /// moves on to the later guilds instead of starving them; any failure still
 /// returns [`ErrorClass::Database`] for a bounded retry. The cursor is
-/// written before the per-guild deletes, so a hung delete or a supervisor
-/// timeout that cancels the pass still advances past the visited page instead
-/// of re-blocking on the same first guild forever. The sweep carries
+/// written per guild immediately before that guild's delete, so a hung delete
+/// or a supervisor timeout that cancels the pass still advances past the last
+/// attempted guild instead of re-blocking on the same first guild forever:
+/// the next pass resumes after it and reaches the later guilds on the same
+/// page, even for a single-page fleet. The sweep carries
 /// `guilds_visited`/`guilds_deferred` counts (no per-guild labels), so a
 /// partial pass is distinguishable from a complete one; `stale_rows` covers
 /// only the visited page. `guilds_deferred` counts eligible guilds sorting
@@ -387,19 +392,19 @@ async fn expire_stale_game_aggregates(
         }
         None => (None, 0),
     };
-    // Advance past the visited page BEFORE the per-guild deletes: a hung or
-    // slow delete (row lock with no statement/lock timeout) or a supervisor
-    // timeout that cancels the pass must not pin the cursor on the same first
-    // page forever. Failed rows stay in the table, so the next cycle retries
-    // them; nothing is ever marked expired except by an actual delete. Dry-run
-    // advances here too, where only the cursor makes progress.
-    if let Some(ref last_visited) = last_visited {
-        expiry_cursor_set(pool, last_visited);
-    }
+    // Advance per guild BEFORE that guild's delete: a hung or slow delete
+    // (row lock with no statement/lock timeout) or a supervisor timeout that
+    // cancels the pass must not pin the cursor on the same first guild
+    // forever. The cursor always points at the last attempted guild, so the
+    // next pass resumes after it and reaches the later guilds on the same
+    // page, even when the whole fleet fits on one page. Failed rows stay in
+    // the table, so a later cycle retries them; nothing is ever marked
+    // expired except by an actual delete.
     let mut stale = 0u64;
     let mut failed = false;
     if mode == RetentionMode::Execute {
         for (guild_id, _) in &page {
+            expiry_cursor_set(pool, guild_id);
             match game_activity_store::expire_stale_guild_aggregates_batch(
                 pool,
                 guild_id,
@@ -426,10 +431,17 @@ async fn expire_stale_game_aggregates(
             }
         }
     } else {
+        // Dry-run never blocks (no deletes, only an in-memory sum), so one
+        // page-level write is enough; only the cursor makes progress here.
+        if let Some(ref last_visited) = last_visited {
+            expiry_cursor_set(pool, last_visited);
+        }
         stale = page.iter().map(|(_, count)| *count).sum();
     }
-    // The cursor was already advanced before the deletes above, so a failure
-    // or cancellation below still moves on to later guilds next pass.
+    // In execute mode the cursor already points at the last attempted guild,
+    // so a failure or cancellation above still moves on to later guilds next
+    // pass. In dry-run mode it points at the visited page end for the same
+    // reason.
     // The sweep event always emits, even with zero stale rows, so a clean
     // sweep stays distinguishable from expiry never running.
     // `guilds_visited`/`guilds_deferred` are counts only, never per-guild
