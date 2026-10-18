@@ -1013,3 +1013,7 @@ mod acceptance_tests;
 #[cfg(test)]
 #[path = "ticket_revision_tests.rs"]
 mod revision_tests;
+
+#[cfg(test)]
+#[path = "ticket_no_work_acceptance_tests.rs"]
+mod no_work_acceptance_tests;
