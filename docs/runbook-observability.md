@@ -190,9 +190,13 @@ claim them as shipped acceptance:
   between the two scrapes count. Production has no error-rate gate yet.
 - The shared central gradual-promotion action promotes 5-50-100% with
   per-stage health gates and automatic rollback to the recorded pre-promote
-  version. This repository has no caller wiring to it yet, so do not treat
-  the existing gated readiness check plus manual rollback as proof of a
-  gradual traffic rollout here.
+  version. The caller contract is implemented (`bin/smoke.mjs`, exercised
+  against staging; passive proof caller in `.github/workflows/gradual-promote-proof.yml`
+  with every error-rate input explicit — see `docs/gradual-promote-caller.md`),
+  but no gradual traffic rollout has run here yet: the proof workflow refuses
+  before any Cloudflare call until its isolated synthetic fixture lands, and
+  production has no gradual caller. Do not treat the existing gated readiness
+  check plus manual rollback as proof of a gradual traffic rollout here.
 
 For the full health, metrics, and rollback procedures, see the
 [operations runbook](runbook.md), [metrics reference](metrics.md), and
