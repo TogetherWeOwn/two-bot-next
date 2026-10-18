@@ -185,10 +185,6 @@ pub fn normalize_source(kind: FeedKind, source: &str) -> Result<String, FeedErro
 
 const MAX_FEED_LIST_SOURCE_UNITS: usize = 128;
 
-fn truncate_feed_list_source(source: &str) -> String {
-    truncate_feed_list_source_with_budget(source, MAX_FEED_LIST_SOURCE_UNITS)
-}
-
 fn truncate_feed_list_source_with_budget(source: &str, budget: usize) -> String {
     if budget == 0 {
         return String::new();
