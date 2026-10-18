@@ -24,6 +24,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_missed_events_total` | Dispatches Discord assigned but this process never received (sequence gaps inside one session). Any nonzero increase over the watch window fails the zero-missed-events acceptance |
 | `two_bot_gateway_events_total{event}` | Received dispatches, including replays/duplicates, plus heartbeat ACKs and closes; fixed type allowlist, remainder `other` |
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert). Fixed three series from process start; no user, activity, application or free-text labels |
+| `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels |
 | `two_bot_handler_duration_seconds` | Cumulative histogram over nonduplicate dispatch parse/pipeline/durable commit, including failures; seconds |
 | `two_bot_rest_requests_total{route,result}` | Executor HTTP sends, including retries; result `2xx`, `3xx`, `4xx`, `429`, `5xx` at response headers or `transport` (failure/cancellation/timeout before headers); later body failures do not hide 429/5xx |
 | `two_bot_rest_guard_invalid_requests_total` | Shared guard observations of 401, 403 or 429 response headers, across guarded REST callers |
@@ -77,7 +78,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_event_store_consumer_lag_seconds` | Event-store consumer lag in seconds (`received_at` minus `event_time` for the newest observed capture row); `0` when unobserved. Label-free gauge; S1 exposes the series and its setter contract (last writer wins; non-finite or negative input clears to `0` so exposition stays a finite non-negative duration). The periodic store-read caller lands with the consumer slice, so until then the series reads `0` (unobserved), not "no lag". Manual check, not an alert input: no alert rule consumes this series. No message, channel, user, dedup-key, content or body label ever reaches exposition |
 | `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures. Requests rejected before body intake are not deliveries; label-free counter |
 | `two_bot_eventsub_classified_total{kind}` | EventSub deliveries classified by fixed `kind`: `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`. `ignored` covers known unrecognized or invalid outcomes, including deterministic 2xx acknowledgments, invalid challenges, and non-signature verification failures; `other` marks unknown/future classification errors, which return retryable 503. Only `BadSignature` is `tampered`. No IDs, tokens, headers, body text or secrets become labels |
-| `two_bot_eventsub_posts_total{outcome}` | Go-live post outcomes: `attempted`, `succeeded`, `failed` or `other`. The current receiver slice does not send go-live posts, so these remain zero until the sender is wired; no IDs, content or errors become labels |
+| `two_bot_eventsub_posts_total{outcome}` | Go-live post outcomes: `attempted`, `succeeded`, `failed` or `other`. Counted by the receiver only for deliveries that reach the sender through the durable ledger flow; boot injects no delivery dependencies yet, so these remain zero until channel/invite provisioning lands; no IDs, content or errors become labels |
 | `two_bot_eventsub_reconcile_passes_total{outcome}` | EventSub reconcile passes by fixed `outcome`: `healthy` (every desired broadcaster holds a healthy subscription afterwards), `pending` (re-created but not all verified yet) or `failed` (an action failed or a healthy subscription is missing, including listing failures). Exactly one sample per pass that reaches Helix; parked or refused startup passes (flag dark, invalid config, empty allowlist) never reach Helix and record no sample — they are log-only. Alert when `failed` rises across scrapes (alert rules land separately) |
 | `two_bot_eventsub_reconcile_actions_total{action}` | Successful EventSub reconcile mutations by fixed `action`: `create` (2xx creates) or `delete` (2xx deletes, including already-gone deletes). 409 already-exists confirmations fold into the pass outcome, not into actions; per-subscription labels never reach exposition |
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | EventSub reconcile failure sites by the same fixed `error_class` strings as the `error_class` log field: `reconcile_action_failed` (once per failed plan action), `reconcile_prior_failed` (once per pass that found failed subscriptions), `reconcile_unhealthy` (once per non-converged pass) or `reconcile_failed` (listing or plan failures), plus `other` for unknown classes. No status code, body, broadcaster, subscription id or secret ever becomes a label |
@@ -205,6 +206,15 @@ as dynamic labels.
 - `two_bot_presence_capture_total{outcome}` — `outcome` is one of `inserted`,
   `duplicate`, `rejected`. Exactly three series; unrecognised outcomes collapse
   to `rejected`, never to a new series.
+- `two_bot_automod_decisions_total{outcome}` — `outcome` is one of
+  `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`,
+  `warned`, `timed_out` or `sanction_refused`
+  (`crates/core/src/metrics.rs` `AUTOMOD_DECISION_OUTCOMES`, mirroring
+  `automod_runtime::CompletionKind::as_str`). Recorded once per committed
+  `StoredOutcome` in `crates/discord/src/automod_activation.rs` (`settle`);
+  replays, retained claims, bypassed and unavailable inspections never count.
+  No message text, excerpts or user IDs become labels; unrecognised outcomes
+  collapse to `sanction_refused`, never to a new series.
 - `two_bot_rest_requests_total{route,result}` — `result` is one of `2xx`,
   `3xx`, `4xx`, `429`, `5xx`, `transport`. `route` is one of the fixed
   executor route templates (`GET /channels/:channel`,
