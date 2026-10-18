@@ -11,6 +11,8 @@
 #   hand; see the note above `jobs:` in .github/workflows/check.yml.
 version: 2
 updates:
+  # Any cargo PR that moves sqlx: re-audit crates/core/src/database_url.rs
+  # (allowlist plus suppressed pgpass target) per SECURITY.md before merging.
   - package-ecosystem: cargo
     directory: /
     schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
