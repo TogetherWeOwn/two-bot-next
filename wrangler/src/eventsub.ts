@@ -297,6 +297,53 @@ export async function handleEventsubIngress(
 const RELAYED_RESPONSE_HEADERS = ["content-type", "retry-after"];
 
 /**
+ * Race a body read against the existing receiver deadline (`signal`). No new
+ * budget is created: an already-fired signal settles promptly and a stalled
+ * read cannot hold the caller past the deadline. Cleanup stays with the
+ * caller (best-effort release, never awaited).
+ */
+function boundRead<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  if (signal.aborted) return Promise.reject(new Error("receiver deadline exceeded"));
+  let onAbort = () => {};
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new Error("receiver deadline exceeded"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  return Promise.race([work, aborted]).finally(() => {
+    signal.removeEventListener("abort", onAbort);
+  });
+}
+
+/** Best-effort body release: a stalling cancel hook must not hold the caller. */
+function releaseUpstream(upstream: Response): void {
+  if (!upstream.body) return;
+  try {
+    void upstream.body.cancel().catch(() => {});
+  } catch {
+    // Ignore a synchronously-throwing hook: the fixed refusal below stands.
+  }
+}
+
+/**
+ * Best-effort reader release: cancel is attempted but never awaited, so a
+ * never-settling cancel cannot hold the wrapper critical section. The lock is
+ * dropped where possible; a still-pending read settles on its own.
+ */
+function releaseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    void reader.cancel().catch(() => {});
+  } catch {
+    // Ignore a synchronously-throwing hook: the fixed refusal stands.
+  }
+  try {
+    reader.releaseLock();
+  } catch {
+    // Ignore: a pending read may still hold the lock; it settles on its own.
+  }
+}
+
+/**
  * Only the receiver's own answers may leave. A `200 text/plain` challenge
  * echo relays byte for byte (bounded: the challenge is one short token).
  * JSON envelopes relay with their status. SDK 0.3.7 synthesizes text
@@ -309,10 +356,16 @@ const RELAYED_RESPONSE_HEADERS = ["content-type", "retry-after"];
  * shapes are cancelled without reading a byte. Read errors, oversize and
  * cancel failures all resolve to the same fixed 503 envelope; no exception,
  * wire body or header value ever leaves.
+ *
+ * When `signal` (the existing receiver request deadline) is given, every read
+ * races it: a stalled tail settles the caller at the deadline instead of
+ * holding the wrapper critical section. Cancellation is best-effort and never
+ * awaited, so a never-settling cancel hook cannot hold the caller either.
  */
 export async function relayEventsubResponse(
   upstream: Response,
   requestId: string = newRequestId(),
+  signal?: AbortSignal,
 ): Promise<Response> {
   const media = upstream.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
   const bodyless = upstream.status === 204 || upstream.status === 205 || upstream.status === 304;
@@ -320,13 +373,10 @@ export async function relayEventsubResponse(
   const isChallenge = media === "text/plain" && upstream.status === 200;
   const isEnvelope = media === "application/json";
   if (bodyless || upstream.status < 200 || upstream.status > 599 || (!isChallenge && !isEnvelope)) {
-    if (upstream.body) {
-      try {
-        await upstream.body.cancel();
-      } catch {
-        // Ignore: the fixed refusal below stands.
-      }
-    }
+    // Cancel without reading: a huge or never-ending rejected tail must not
+    // be drained here. The cancel is best-effort and never awaited: a
+    // never-settling hook still yields the fixed refusal promptly.
+    releaseUpstream(upstream);
     return refuse(503, "unavailable", true, undefined, requestId);
   }
   const limit = isChallenge ? MAX_CHALLENGE_BYTES : MAX_RESPONSE_BYTES;
@@ -339,25 +389,21 @@ export async function relayEventsubResponse(
   let total = 0;
   try {
     for (;;) {
+      if (signal?.aborted) {
+        releaseReader(reader);
+        return refuse(503, "unavailable", true, undefined, requestId);
+      }
       let step: ReadableStreamReadResult<Uint8Array>;
       try {
-        step = await reader.read();
+        step = await boundRead(reader.read(), signal);
       } catch {
-        try {
-          await reader.cancel();
-        } catch {
-          // Ignore: the fixed refusal below stands.
-        }
+        releaseReader(reader);
         return refuse(503, "unavailable", true, undefined, requestId);
       }
       if (step.done) break;
       total += step.value.byteLength;
       if (total > limit) {
-        try {
-          await reader.cancel();
-        } catch {
-          // Ignore: the fixed refusal below stands.
-        }
+        releaseReader(reader);
         return refuse(503, "unavailable", true, undefined, requestId);
       }
       chunks.push(step.value);
