@@ -213,7 +213,14 @@ job runs on a bounded schedule: a dry run that deletes nothing unless
 purger is installed: do not claim a live 30/90-day TTL beyond the windows
 this job enforces. Every run reports per-class metrics, with partial runs
 (deferred/overdue deletions, failed guild purges) surfaced as warnings that
-stay retryable. When the database is behind the binary (an unapplied
+stay retryable. Members request erasure through the authenticated intake
+(`two-bot-cutover::deletion_intake`) on the published `/privacy` surface: the
+request binds to the invoker's guild/member pair, acknowledges pending only,
+and persists to the same deletion-request ledger the scheduler drains — never
+the narrower opt-out purge. Status and completion receipts are readable by the
+requester without the interaction token; receipts name the guild/member
+footprint and the retained limits, never global erasure. Live-dispatch call
+sites that invoke the intake on real interactions are follow-up work. When the database is behind the binary (an unapplied
 migration or grant), the gateway acks dispatches whose queue write hits the
 schema gap instead of crash-looping, with one exception: a missing grant
 (`42501`) on an available rejoin holds the cursor (the gateway fails the
