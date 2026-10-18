@@ -124,6 +124,8 @@ fn hostile_labels_collapse_without_new_series_or_secret_capture() {
     let metrics = Metrics::default();
     let before = enforcement_lines(&metrics.render(None)).len();
     let baseline_unlock_success = count_for(&metrics.render(None), "unlock", "success");
+    let baseline_ban_other = count_for(&metrics.render(None), "ban", "other");
+    let baseline_unlock_other = count_for(&metrics.render(None), "unlock", "other");
 
     // Unbounded inputs that must never become labels: snowflake user ids,
     // free-form reason/message text, secrets/tokens, and label-injection
@@ -178,16 +180,24 @@ fn hostile_labels_collapse_without_new_series_or_secret_capture() {
         );
     }
     // Collapse destinations: unknown verbs land on the trailing verb slot,
-    // unknown outcomes on the trailing outcome slot.
-    let expected_unlock_success = baseline_unlock_success + hostile_verbs.len() as u64 + 1;
+    // unknown outcomes on the trailing outcome slot. The dual-hostile pair
+    // lands on exactly one cell (unlock/other), so the single-axis counts
+    // exclude it.
+    let expected_unlock_success = baseline_unlock_success + hostile_verbs.len() as u64;
     assert_eq!(
         count_for(&text, "unlock", "success"),
         expected_unlock_success,
         "unknown verbs collapse to unlock"
     );
-    assert!(
-        count_for(&text, "ban", "other") >= hostile_outcomes.len() as u64 + 1,
+    assert_eq!(
+        count_for(&text, "ban", "other"),
+        baseline_ban_other + hostile_outcomes.len() as u64,
         "unknown outcomes collapse to other"
+    );
+    assert_eq!(
+        count_for(&text, "unlock", "other"),
+        baseline_unlock_other + 1,
+        "a hostile verb with a hostile outcome collapses to unlock/other once"
     );
 }
 
