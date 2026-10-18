@@ -109,63 +109,90 @@ pub(crate) struct JoinRiskSettings {
     pub(crate) staff_channel: Option<String>,
 }
 
-impl JoinRiskSettings {
-    /// A missing or unusable number (zero, negative, non-finite, unparsable)
-    /// falls back to the default rather than disabling scoring, an unusable
-    /// bulk-until falls back to no bulk window, and an unusable channel falls
-    /// back to log-only. Present-but-bad values warn.
-    pub(crate) fn from_vars(vars: &HashMap<String, String>) -> Self {
-        let number = |key: &str, default: f64| match vars.get(key).map(|raw| raw.trim()) {
-            None | Some("") => default,
-            Some(raw) => match raw.parse::<f64>() {
-                Ok(value) if value.is_finite() && value > 0.0 => value,
-                _ => {
-                    warn!(key, "join-risk setting unusable; using the default");
-                    default
-                }
-            },
-        };
-        let tuning = RaidTuning::new(
-            number(WINDOW_KEY, DEFAULT_JOIN_RISK_WINDOW_SECONDS),
-            number(THRESHOLD_KEY, DEFAULT_JOIN_RISK_THRESHOLD),
+/// A present-but-unusable tuning key that refuses scoring and arming.
+///
+/// The refusal names the key family ([`JoinRiskTuningRefusal::key`]), never
+/// the value, so the operator-visible signal identifies the bad key without
+/// echoing a possibly secret value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JoinRiskTuningRefusal {
+    key: &'static str,
+}
+
+impl JoinRiskTuningRefusal {
+    pub(crate) fn key(&self) -> &'static str {
+        self.key
+    }
+}
+
+impl std::fmt::Display for JoinRiskTuningRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "join-risk tuning refused: {} present but unusable; scoring disabled",
+            self.key
         )
-        .unwrap_or_else(|_| {
-            warn!("join-risk tuning rejected; using the shipped defaults");
-            RaidTuning::new(
-                DEFAULT_JOIN_RISK_WINDOW_SECONDS,
-                DEFAULT_JOIN_RISK_THRESHOLD,
-            )
-            .expect("shipped join-risk defaults are valid")
-        });
+    }
+}
+
+impl std::error::Error for JoinRiskTuningRefusal {}
+
+impl JoinRiskSettings {
+    /// Fallible reader for the live settings path. A missing key keeps its
+    /// shipped default (tuning 60 s / 5.0, no bulk window, log-only staff
+    /// channel); so does a present-but-empty value. A present-but-unusable
+    /// value (unparsable, non-finite, non-positive, or a rejected tuning
+    /// pair) refuses the whole read: no default is substituted and no
+    /// settings value is produced.
+    pub(crate) fn try_from_vars(
+        vars: &HashMap<String, String>,
+    ) -> Result<Self, JoinRiskTuningRefusal> {
+        let number = |key: &'static str, default: f64| -> Result<f64, JoinRiskTuningRefusal> {
+            match vars.get(key).map(|raw| raw.trim()) {
+                None | Some("") => Ok(default),
+                Some(raw) => match raw.parse::<f64>() {
+                    Ok(value) if value.is_finite() && value > 0.0 => Ok(value),
+                    _ => Err(JoinRiskTuningRefusal { key }),
+                },
+            }
+        };
+        // Window is evaluated first, as in `RaidTuning::new`: when both
+        // tuning numbers are unusable the window key is named.
+        let window = number(WINDOW_KEY, DEFAULT_JOIN_RISK_WINDOW_SECONDS)?;
+        let threshold = number(THRESHOLD_KEY, DEFAULT_JOIN_RISK_THRESHOLD)?;
+        let tuning = RaidTuning::new(window, threshold)
+            .map_err(|_| JoinRiskTuningRefusal { key: WINDOW_KEY })?;
         let bulk_join_window_until_ms = match vars.get(BULK_UNTIL_KEY).map(|raw| raw.trim()) {
             None | Some("") => None,
             Some(raw) => match raw.parse::<i64>() {
                 Ok(value) if value > 0 => Some(value),
                 _ => {
-                    warn!(key = BULK_UNTIL_KEY, "bulk window unusable; no bulk window");
-                    None
+                    return Err(JoinRiskTuningRefusal {
+                        key: BULK_UNTIL_KEY,
+                    })
                 }
             },
         };
         let staff_channel = match vars.get(CHANNEL_KEY).map(|raw| raw.trim()) {
             None | Some("") => None,
             Some(raw) if is_snowflake(raw) => Some(raw.to_owned()),
-            Some(_) => {
-                warn!(key = CHANNEL_KEY, "staff alert channel unusable; log only");
-                None
-            }
+            Some(_) => return Err(JoinRiskTuningRefusal { key: CHANNEL_KEY }),
         };
-        Self {
+        Ok(Self {
             tuning,
             bulk_join_window_until_ms,
             staff_channel,
-        }
+        })
     }
 }
 
-/// Where the live [`JoinRiskSettings`] come from.
+/// Where the live [`JoinRiskSettings`] come from. A present-but-unusable
+/// key refuses the read; the worker drops the observation with no scoring
+/// side effects.
 pub(crate) trait SettingsSource: Send + 'static {
-    fn current(&mut self) -> impl Future<Output = JoinRiskSettings> + Send;
+    fn current(
+        &mut self,
+    ) -> impl Future<Output = Result<JoinRiskSettings, JoinRiskTuningRefusal>> + Send;
 }
 
 /// Tuning, the bulk window and the staff channel are store-first (hot rows win
@@ -219,10 +246,10 @@ impl StoreSettings {
 }
 
 impl SettingsSource for StoreSettings {
-    async fn current(&mut self) -> JoinRiskSettings {
+    async fn current(&mut self) -> Result<JoinRiskSettings, JoinRiskTuningRefusal> {
         if let (Some(at), Some(last)) = (self.checked, &self.last) {
             if at.elapsed() < self.max_age {
-                return last.clone();
+                return Ok(last.clone());
             }
         }
         self.checked = Some(Instant::now());
@@ -239,7 +266,19 @@ impl SettingsSource for StoreSettings {
                     .filter(|(key, _)| HOT_KEYS.contains(&key.as_str())),
             );
         }
-        let settings = JoinRiskSettings::from_vars(&vars);
+        let settings = match JoinRiskSettings::try_from_vars(&vars) {
+            Ok(settings) => settings,
+            Err(refusal) => {
+                error!(
+                    key = refusal.key(),
+                    "join_risk_tuning_refused: present-but-unusable tuning; scoring disabled"
+                );
+                // Fail closed: never fall back to stale good values or ship
+                // defaults the operator did not ask for.
+                self.last = None;
+                return Err(refusal);
+            }
+        };
         match &self.last {
             Some(previous) if previous.tuning != settings.tuning => info!(
                 from_threshold = previous.tuning.threshold(),
@@ -260,7 +299,7 @@ impl SettingsSource for StoreSettings {
             ),
         }
         self.last = Some(settings.clone());
-        settings
+        Ok(settings)
     }
 }
 
@@ -298,7 +337,20 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         if join.guild_id != self.guild_id {
             return;
         }
-        let settings = self.settings.current().await;
+        // Fail closed on present-but-unusable tuning: drop the observation
+        // with no scoring side effects (no row, no staff post, never a
+        // Discord message). The refusal is already logged at the source.
+        let settings = match self.settings.current().await {
+            Ok(settings) => settings,
+            Err(refusal) => {
+                error!(
+                    key = refusal.key(),
+                    member_id = join.member_id,
+                    "join_risk_tuning_refused: observation dropped; no row claimed, no post attempted"
+                );
+                return;
+            }
+        };
         let policy = match JoinRiskPolicy::new(
             self.guild_id.to_string(),
             settings.tuning.window_seconds(),
