@@ -5,8 +5,10 @@
 //! database, or Discord call is involved. Every hostile case drives the real
 //! dispatch path (`RenameRoom`, `SetCustomName`, and the runtime modal
 //! submit) and must end with a `name_blocked` refusal and zero Discord
-//! rename calls. Allowed controls must keep the exact pre-existing
-//! coalescer/reply behaviour.
+//! rename calls. Hostile `RenameRoom` and `SetCustomName` dispatches must
+//! also strictly increase `two_bot_voice_names_total{outcome="name_blocked"}`;
+//! a log line alone does not satisfy those two paths. Allowed controls must
+//! keep the exact pre-existing coalescer/reply behaviour.
 
 use super::*;
 use twilight_model::application::interaction::modal::{
@@ -96,6 +98,11 @@ async fn rename_room_dispatch_refuses_hostile_names_with_zero_discord_calls() {
             name_blocked_recorded(&worker, &log_text, blocked_before, named_before),
             "{hostile:?}: refusal must be recorded as name_blocked"
         );
+        let named_after = voice_names_outcome("name_blocked");
+        assert!(
+            named_after > named_before,
+            "{hostile:?}: refusal must increment two_bot_voice_names_total outcome=name_blocked, before {named_before}, after {named_after}"
+        );
     }
 }
 
@@ -174,6 +181,11 @@ async fn set_custom_name_dispatch_refuses_hostile_names_with_zero_discord_calls(
         assert!(
             name_blocked_recorded(&worker, &log_text, blocked_before, named_before),
             "{hostile:?}: refusal must be recorded as name_blocked"
+        );
+        let named_after = voice_names_outcome("name_blocked");
+        assert!(
+            named_after > named_before,
+            "{hostile:?}: refusal must increment two_bot_voice_names_total outcome=name_blocked, before {named_before}, after {named_after}"
         );
     }
 }
@@ -315,4 +327,54 @@ async fn custom_name_modal_still_applies_allowed_names_with_the_same_reply() {
         );
         wait_trace(&trace, &format!("rename:500:{allowed}")).await;
     }
+}
+
+/// `name_blocked` is its own voice-name series. An unregistered outcome still
+/// increments only `other` and never opens a series. Counts are exact because
+/// this uses a fresh [`Metrics`], not the process-global registry.
+#[test]
+fn name_blocked_series_is_distinct_from_other_and_unknowns_collapse() {
+    let metrics = two_bot_core::metrics::Metrics::default();
+    metrics.voice_name("name_blocked");
+    let blocked = voice_name_sample(&metrics.render(None));
+    assert_eq!(
+        blocked.get("name_blocked").copied(),
+        Some(1),
+        "name_blocked must render as its own series, not fold into other: {blocked:?}"
+    );
+    assert_eq!(
+        blocked.get("other").copied(),
+        Some(0),
+        "recording name_blocked must not increment other: {blocked:?}"
+    );
+
+    metrics.voice_name("unknown_voice_name_outcome");
+    let after_unknown = voice_name_sample(&metrics.render(None));
+    assert_eq!(
+        after_unknown.get("name_blocked").copied(),
+        Some(1),
+        "an unknown outcome must leave name_blocked unchanged: {after_unknown:?}"
+    );
+    assert_eq!(
+        after_unknown.get("other").copied(),
+        Some(1),
+        "an unknown outcome must increment only other: {after_unknown:?}"
+    );
+    assert!(
+        !after_unknown.contains_key("unknown_voice_name_outcome"),
+        "an unknown outcome must not become its own series: {after_unknown:?}"
+    );
+}
+
+fn voice_name_sample(text: &str) -> std::collections::BTreeMap<String, u64> {
+    text.lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("two_bot_voice_names_total{outcome=\"")?;
+            let (outcome, value) = rest.split_once("\"} ")?;
+            let count = value
+                .parse()
+                .unwrap_or_else(|_| panic!("bad sample: {line}"));
+            Some((outcome.to_owned(), count))
+        })
+        .collect()
 }
