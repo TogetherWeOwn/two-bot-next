@@ -292,6 +292,10 @@ fn start_handshake_spy() -> HandshakeSpy {
         while !thread_stop.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // Accepted streams can inherit the listener's nonblocking
+                    // mode (e.g. on FreeBSD), where the read timeout alone
+                    // does not stop `read_exact` returning `WouldBlock`.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
