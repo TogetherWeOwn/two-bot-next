@@ -462,11 +462,14 @@ class TrackerUnitTests(unittest.TestCase):
     def drive_unknown_loop(self, step, runs, start=1_700_000_000):
         """Drive live unknown runs from an empty ring with no sidecar.
 
-        Mocks the scrape and the verdict (always uncovered) so the loop
-        proves the tracker warning, not the evaluator: the evaluator pins
-        that 420/590 s spacings stay uncovered in the driver tests below.
+        `step` is seconds per run or a function of the run index (for
+        jittered cadences). Mocks the scrape and the verdict (always
+        uncovered) so the loop proves the tracker warning, not the
+        evaluator: the evaluator pins that 420/590 s and jittered spacings
+        stay uncovered in the driver tests below.
         Returns (warn_chunks, last_evidence, ring_path, coverage_path).
         """
+        step_fn = step if callable(step) else lambda index: step
         ring_path = self.dir / "ring.json"
         coverage_path = self.dir / "coverage.json"
         evidence = str(self.dir / "evidence.json")
@@ -485,8 +488,8 @@ class TrackerUnitTests(unittest.TestCase):
         with mock.patch.object(tracker, "scrape_metrics", return_value="expo"):
             with mock.patch.object(tracker, "run_driver",
                                    side_effect=uncovered_driver):
+                tick = start
                 for index in range(runs):
-                    tick = start + index * step
                     with mock.patch.object(tracker.time, "time",
                                             return_value=tick):
                         with mock.patch("sys.stdout") as stdout:
@@ -501,6 +504,7 @@ class TrackerUnitTests(unittest.TestCase):
                                    stdout.write.call_args_list]
                     warn_chunks = [chunk for chunk in last_writes
                                    if "::warning::" in chunk]
+                    tick += step_fn(index)
         stored = json.loads(Path(evidence).read_text())
         return warn_chunks, stored, ring_path, coverage_path
 
@@ -527,6 +531,23 @@ class TrackerUnitTests(unittest.TestCase):
         self.assertTrue(
             any("no covered" in chunk for chunk in warns),
             f"steady 590 s from empty must warn, got {warns!r}")
+        self.assertEqual(stored["verdict"], "unknown")
+        self.assertEqual(stored["cadence"], "coarse")
+        self.assertGreaterEqual(stored["uncovered_seconds"],
+                                tracker.UNCOVERED_WARN_SECONDS)
+        seeded = json.loads(Path(coverage_path).read_text())
+        self.assertEqual(seeded.get("tracking_since"), 1_700_000_000)
+
+    def test_never_covered_alternating_loop_warns_after_warmup(self):
+        # The review repro: jittered 300/560 s spacings average ~430 s, so
+        # no single gap trips the 600 s entry-age check, yet the narrow
+        # baseline window still never holds a snapshot. From an empty ring
+        # the seeded tracking start must still warn once ~6.5 h have passed.
+        warns, stored, _, coverage_path = self.drive_unknown_loop(
+            step=lambda index: 300 if index % 2 == 0 else 560, runs=60)
+        self.assertTrue(
+            any("no covered" in chunk for chunk in warns),
+            f"jittered 300/560 s from empty must warn, got {warns!r}")
         self.assertEqual(stored["verdict"], "unknown")
         self.assertEqual(stored["cadence"], "coarse")
         self.assertGreaterEqual(stored["uncovered_seconds"],
