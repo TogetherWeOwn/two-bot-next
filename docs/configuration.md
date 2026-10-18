@@ -222,7 +222,7 @@ Catalog entries: 130.
 | `TWO_JOIN_RISK_WINDOW_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh | Aggregation window for join-risk decisions. |
 | `TWO_MODERATION` | env_only | `false` | environment only | Enable moderation command publication/routing; enabled mode requires Owen ID. |
 | `TWO_MODERATION_AUDIT_SECRET` | env_only | Not rendered (secret) | environment only | Authentication secret for moderation audit handoff; never rendered. |
-| `TWO_MODERATION_PROTECTED_ROLE_IDS` | env_only | `[]` | environment only | Roles moderation may not target; strict comma-separated 17-20 digit snowflakes with no spaces or empty segments (`,,`, leading/trailing comma and padding are refused); missing or empty means no roles. |
+| `TWO_MODERATION_PROTECTED_ROLE_IDS` | env_only | `[]` | environment only | Roles moderation may not target; strict comma-separated 17-20 digit snowflakes with no spaces or empty segments (empty segments and leading/trailing commas refused, padding refused); missing or empty means no roles. |
 | `TWO_ONBOARDING_DRY_RUN` | hot | `false` | stored, applied live by runtime refresh | Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes. A stored non-0/1 rendering is ignored (deployment wins). |
 | `TWO_ONBOARDING_MODE` | env_only | `"legacy"` | environment only | Onboarding selector: legacy, session or anchor; session suppresses role writes. |
 | `TWO_ONBOARDING_ROTA_MEASUREMENT` | env_only | Not specified in Next | environment only | Dropped staging rota measurement gate; env-only refusal is retained. |
