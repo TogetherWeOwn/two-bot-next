@@ -43,6 +43,11 @@ pub const GLOBAL_MIN_INTERVAL: Duration = Duration::from_millis(1000 / GLOBAL_RE
 /// spacing at or above the documented 50/s floor under loaded-runner jitter.
 pub const GLOBAL_PACING_SAFETY_PAD: Duration = Duration::from_millis(2);
 
+/// Floor installed when an exhausted bucket's absolute `Reset` epoch already
+/// lies in the past (local wall clock and Discord disagree). The raw skew is
+/// never waited out; admission reopens after this plus the legacy pad.
+const EPOCH_SKEW_FLOOR: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone, Copy)]
 pub struct GuardConfig {
     pub invalid_request_threshold: usize,
@@ -432,8 +437,11 @@ impl RateLimitGuard {
     /// already expires on its own at reset plus the pad (`refresh` prunes it
     /// before every admission). Every number honored arrives in the headers — the relative
     /// `Reset-After` wins when present, the absolute `Reset` epoch is measured
-    /// against the wall clock otherwise, and the only constant is the legacy
-    /// 250 ms safety pad the 429 path already uses. Installing a deadline
+    /// against the wall clock otherwise, and the only constants are the legacy
+    /// 250 ms safety pad the 429 path already uses and the 1 s skew floor
+    /// below. Epoch-derived waits clamp to `[0, window]`; a past epoch with
+    /// an exhausted bucket installs the 1 s floor (plus the pad) and logs the
+    /// skew instead of waiting out the clock difference. Installing a deadline
     /// never wakes admission (sleepers wait on the deadline itself), and
     /// nothing here removes one.
     pub fn observe_bucket(&self, route: &str, headers: &http::HeaderMap) {
@@ -444,19 +452,61 @@ impl RateLimitGuard {
             None => route.to_owned(),
         };
         let remaining = value("x-ratelimit-remaining").and_then(|v| v.parse::<u64>().ok());
-        let reset_wait = value("x-ratelimit-reset-after")
+        let reset_after_wait = value("x-ratelimit-reset-after")
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|secs| secs.is_finite() && *secs >= 0.0)
-            .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
-            .or_else(|| {
-                let epoch = value("x-ratelimit-reset")?
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|secs| secs.is_finite() && *secs >= 0.0)?;
-                let target =
-                    std::time::UNIX_EPOCH.checked_add(Duration::try_from_secs_f64(epoch).ok()?)?;
-                target.duration_since(std::time::SystemTime::now()).ok()
-            });
+            .and_then(|secs| Duration::try_from_secs_f64(secs).ok());
+        // Absolute-epoch outcome, resolved only when no `Reset-After` wins.
+        // `Some(Ok(wait))` is a future epoch clamped to `[0, window]` below;
+        // `Some(Err(skew))` is a past epoch whose clock difference is never
+        // waited out (the exhausted-bucket floor applies instead).
+        let epoch_outcome: Option<Result<Duration, Duration>> = (|| {
+            let epoch = value("x-ratelimit-reset")?
+                .parse::<f64>()
+                .ok()
+                .filter(|secs| secs.is_finite() && *secs >= 0.0)?;
+            let target =
+                std::time::UNIX_EPOCH.checked_add(Duration::try_from_secs_f64(epoch).ok()?)?;
+            let now = std::time::SystemTime::now();
+            match target.duration_since(now) {
+                Ok(wait) => Some(Ok(wait)),
+                Err(_) => Some(Err(now.duration_since(target).unwrap_or(Duration::ZERO))),
+            }
+        })();
+        let (reset_wait, skew): (Option<Duration>, Option<Duration>) =
+            if let Some(wait) = reset_after_wait {
+                (Some(wait), None)
+            } else {
+                match epoch_outcome {
+                    Some(Ok(wait)) => (Some(wait.min(self.config.window)), None),
+                    Some(Err(skew)) => (None, Some(skew)),
+                    None => (None, None),
+                }
+            };
+        // The floor is per-bucket state on the observed route only: it
+        // installs a deadline through the same bucket/route tables admission
+        // already scopes, never a guard-wide pause.
+        if remaining == Some(0) && reset_wait.is_none() {
+            if let Some(skew) = skew {
+                tracing::warn!(
+                event = "discord_bucket_reset_skew",
+                skew_ms = skew.as_millis() as u64,
+                floor_ms = EPOCH_SKEW_FLOOR.as_millis() as u64,
+                "Discord bucket reset epoch is in the past (clock skew); installing the exhausted-bucket floor"
+            );
+                let wait = EPOCH_SKEW_FLOOR
+                    .checked_add(Duration::from_millis(two_bot_core::RETRY_AFTER_PADDING_MS))
+                    .unwrap_or(EPOCH_SKEW_FLOOR);
+                let until = observed_at
+                    .checked_add(wait)
+                    .unwrap_or(observed_at + self.config.window);
+                let mut state = self.state.lock().expect("Discord guard state");
+                let entry = state.buckets.0.entry(bucket.clone()).or_insert(until);
+                *entry = (*entry).max(until);
+                state.routes.0.insert(route.to_owned(), bucket);
+                return;
+            }
+        }
         let mut state = self.state.lock().expect("Discord guard state");
         match (remaining, reset_wait) {
             (Some(0), Some(wait)) => {

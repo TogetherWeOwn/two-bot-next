@@ -114,6 +114,8 @@ export const DB_ERROR_MIN_ERRORS = 3;
 export const SEND_BLOCKED_SAMPLES = 3;
 /** Website-action receiver refusals must appear in this many consecutive samples. */
 export const RECEIVER_REFUSAL_SAMPLES = 3;
+/** EventSub tampered-signature deliveries must rise in this many consecutive samples. */
+export const EVENTSUB_TAMPERED_SAMPLES = 3;
 /** Consecutive unpaired gateway samples before the page; bound justified in the runbook. */
 export const GATEWAY_UNPAIRED_SAMPLES = 3;
 /**
@@ -226,6 +228,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_creator_map_stale", summary: `voice creator map has not merged for more than ${CREATOR_MAP_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-voice-creator-map-stale" },
   { id: "error_budget_fast_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_FAST_BURN}x over ${ERROR_BUDGET_FAST_LONG_SECONDS / 60} min and ${ERROR_BUDGET_FAST_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-fast-burn" },
   { id: "error_budget_slow_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_SLOW_BURN}x over ${ERROR_BUDGET_SLOW_LONG_SECONDS / 3600} h and ${ERROR_BUDGET_SLOW_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-slow-burn", severity: "ticket" },
+  { id: "eventsub_tampered", summary: `EventSub tampered-signature deliveries rose in ${EVENTSUB_TAMPERED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-eventsub-tampered" },
 ];
 
 /**
@@ -299,6 +302,12 @@ export interface MetricsAlertState {
   receiverRefusalsSeen: boolean;
   /** Per-family consecutive windows with new refusals (sustained surge, not one probe). */
   receiverRefusalStreaks: Record<string, number>;
+  /** EventSub `tampered` counter at the last valid baseline or window. */
+  eventsubTampered: number;
+  /** False until a valid sample stores the EventSub baseline: the first sample never fires. */
+  eventsubTamperedSeen: boolean;
+  /** Consecutive windows with new tampered deliveries (sustained surge, not one probe). */
+  eventsubTamperedStreak: number;
   /** Gateway disconnect counter at the last valid baseline or window. */
   gatewayDisconnects: number;
   /** RESUMED plus fresh READY counters at the last valid baseline or window. */
@@ -512,7 +521,7 @@ function errorBudgetBurnEvaluation(
   };
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0 };
 
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
@@ -1036,6 +1045,48 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     for (const family of Object.keys(receiverRefusals)) receiverRefusalStreaks[family] = 0;
   }
 
+  // EventSub tampered-signature surge: `two_bot_eventsub_classified_total`
+  // with exactly `kind="tampered"` (only `BadSignature`) must rise in
+  // EVENTSUB_TAMPERED_SAMPLES consecutive windows before paging, so an active
+  // forgery attempt or a broken secret rotation pages while one forged probe
+  // stays quiet. Only the fixed kind label counts: any extra label, any other
+  // kind, a duplicated row, or a non-integer value invalidates the sample.
+  // The first valid sample only stores the baseline and never fires; a
+  // backwards counter means the process restarted and rebaselines without
+  // firing; missing/invalid scrapes preserve a firing alert and never
+  // manufacture recovery; a flat valid window resolves. `??` covers DO
+  // storage written before these fields existed.
+  const TAMPERED_RULE = "eventsub_tampered";
+  const tamperedValue = exactSeries(gauge("two_bot_eventsub_classified_total"), { kind: "tampered" });
+  const prevTampered = prev.eventsubTampered ?? 0;
+  const tamperedSeen = prev.eventsubTamperedSeen ?? false;
+  const prevTamperedStreak = prev.eventsubTamperedStreak ?? 0;
+  const wasTamperedFiring = prev.firing.includes(TAMPERED_RULE);
+  let eventsubTampered = prevTampered;
+  let eventsubTamperedSeen = tamperedSeen;
+  let eventsubTamperedStreak = prevTamperedStreak;
+  if (tamperedValue === undefined) {
+    if (wasTamperedFiring) firing.push(TAMPERED_RULE);
+  } else if (!tamperedSeen) {
+    eventsubTampered = tamperedValue;
+    eventsubTamperedSeen = true;
+    eventsubTamperedStreak = 0;
+  } else if (tamperedValue < prevTampered) {
+    eventsubTampered = tamperedValue;
+    eventsubTamperedSeen = true;
+    eventsubTamperedStreak = 0;
+  } else if (tamperedValue > prevTampered) {
+    const streak = prevTamperedStreak + 1;
+    eventsubTampered = tamperedValue;
+    eventsubTamperedSeen = true;
+    eventsubTamperedStreak = streak;
+    if (streak >= EVENTSUB_TAMPERED_SAMPLES) firing.push(TAMPERED_RULE);
+  } else {
+    eventsubTampered = tamperedValue;
+    eventsubTamperedSeen = true;
+    eventsubTamperedStreak = 0;
+  }
+
   // Dispatch saturation is a ticket, not evidence of gateway sequence loss.
   // Iterate only the fixed lanes: neither storage nor firing keys can acquire
   // member/channel labels from a malformed exposition. Each lane needs one
@@ -1087,7 +1138,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring, errorBudgetBurn: errorBudgetBurn.ring } };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

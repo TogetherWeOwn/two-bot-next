@@ -154,7 +154,24 @@ fn ordinary_messages_without_optional_components_do_not_block_panel_ensure() {
     .ok()
     .expect("ordinary Discord message");
     assert!(panel_needed("400", &messages));
-    assert!(panels(vec![json!({"author":{"id":"500"},"components":{}})]).is_err());
+    let isolated = panels(vec![json!({"author":{"id":"500"},"components":{}})])
+        .ok()
+        .expect("malformed panel message is isolated, batch stays Ok");
+    assert!(isolated.is_empty());
+}
+
+#[test]
+fn malformed_panel_rows_are_counted_without_echoing_content() {
+    let before = panel_isolated_count_for_test();
+    let isolated = panels(vec![
+        json!({"author": {"id": "500"}, "components": {}}),
+        json!({"author": {"id": "400"}, "components": []}),
+    ])
+    .ok()
+    .expect("one malformed row is isolated");
+    assert_eq!(isolated.len(), 1);
+    assert_eq!(isolated[0].author_id, "400");
+    assert!(panel_isolated_count_for_test() > before);
 }
 
 #[tokio::test]

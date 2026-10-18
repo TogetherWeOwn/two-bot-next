@@ -252,34 +252,117 @@ export async function handleActionsIngress(
   if ("refusal" in checked) return checked.refusal;
   if (inFlight >= MAX_IN_FLIGHT) return refuse(429, "rate_limited", true, { "retry-after": "1" }, requestId);
   inFlight++;
+  let forwardPromise: Promise<Response> | undefined;
   try {
     const body = await readBody(request, requestId);
     if ("refusal" in body) return body.refusal;
+    const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const abortController = new AbortController();
+    const abortOrphan = (): void => {
+      try {
+        abortController.abort();
+      } catch {
+        // Ignore: the fixed refusal below stands.
+      }
+    };
+    if (timeoutSignal.aborted) abortOrphan();
+    else timeoutSignal.addEventListener("abort", abortOrphan, { once: true });
+    const signal = AbortSignal.any([timeoutSignal, abortController.signal]);
     const sanitized = forwardRequest(
       `https://worker.invalid${ACTIONS_PATH}`,
       checked.headers,
       body.bytes,
+      signal,
+    );
+    try {
+      forwardPromise = forward(sanitized);
+    } catch {
+      // DO construction/binding failures: never serialize the exception.
+      return refuse(503, "unavailable", true, undefined, requestId);
+    }
+    // Hold the slot until the forward settles; observe now so a late
+    // rejection after the deadline never surfaces as unhandled.
+    void forwardPromise.then(
+      () => {
+        inFlight--;
+      },
+      () => {
+        inFlight--;
+      },
     );
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<"timeout">((resolve) => {
       timer = setTimeout(() => resolve("timeout"), REQUEST_TIMEOUT_MS);
     });
     try {
-      const upstream = await Promise.race([forward(sanitized), deadline]);
-      if (upstream === "timeout") return refuse(504, "upstream_timeout", true, undefined, requestId);
+      const upstream = await Promise.race([forwardPromise, deadline]);
+      if (upstream === "timeout") {
+        abortOrphan();
+        return refuse(504, "upstream_timeout", true, undefined, requestId);
+      }
       return upstream;
     } catch {
+      // An abort-driven rejection after the deadline is still a timeout.
+      if (signal.aborted) return refuse(504, "upstream_timeout", true, undefined, requestId);
       // DO construction/binding failures: never serialize the exception.
       return refuse(503, "unavailable", true, undefined, requestId);
     } finally {
       clearTimeout(timer);
+      timeoutSignal.removeEventListener("abort", abortOrphan);
     }
   } finally {
-    inFlight--;
+    if (forwardPromise === undefined) inFlight--;
   }
 }
 
 const RELAYED_RESPONSE_HEADERS = ["content-type", "idempotent-replay", "retry-after"];
+
+/**
+ * Race a body read against the existing receiver deadline (`signal`). No new
+ * budget is created: an already-fired signal settles promptly and a stalled
+ * read cannot hold the caller past the deadline. Cleanup stays with the
+ * caller (best-effort release, never awaited).
+ */
+function boundRead<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  if (signal.aborted) return Promise.reject(new Error("receiver deadline exceeded"));
+  let onAbort = () => {};
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new Error("receiver deadline exceeded"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  return Promise.race([work, aborted]).finally(() => {
+    signal.removeEventListener("abort", onAbort);
+  });
+}
+
+/** Best-effort body release: a stalling cancel hook must not hold the caller. */
+function releaseUpstream(upstream: Response): void {
+  if (!upstream.body) return;
+  try {
+    void upstream.body.cancel().catch(() => {});
+  } catch {
+    // Ignore a synchronously-throwing hook: the fixed refusal below stands.
+  }
+}
+
+/**
+ * Best-effort reader release: cancel is attempted but never awaited, so a
+ * never-settling cancel cannot hold the wrapper critical section. The lock is
+ * dropped where possible; a still-pending read settles on its own.
+ */
+function releaseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    void reader.cancel().catch(() => {});
+  } catch {
+    // Ignore a synchronously-throwing hook: the fixed refusal stands.
+  }
+  try {
+    reader.releaseLock();
+  } catch {
+    // Ignore: a pending read may still hold the lock; it settles on its own.
+  }
+}
 
 /**
  * Only the receiver's own JSON envelope may leave. SDK 0.3.7 synthesizes text
@@ -293,23 +376,24 @@ const RELAYED_RESPONSE_HEADERS = ["content-type", "idempotent-replay", "retry-af
  * cancelled without reading a byte. Read errors, oversize and cancel failures
  * all resolve to the same fixed 503 envelope; no exception, wire body or
  * header value ever leaves.
+ *
+ * When `signal` (the existing receiver request deadline) is given, every read
+ * races it: a stalled tail settles the caller at the deadline instead of
+ * holding the wrapper critical section. Cancellation is best-effort and never
+ * awaited, so a never-settling cancel hook cannot hold the caller either.
  */
 export async function relayReceiverResponse(
   upstream: Response,
   requestId: string = newRequestId(),
+  signal?: AbortSignal,
 ): Promise<Response> {
   const media = upstream.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
   const bodyless = upstream.status === 204 || upstream.status === 205 || upstream.status === 304;
   if (media !== "application/json" || upstream.status < 200 || upstream.status > 599 || bodyless) {
     // Cancel without reading: a huge or never-ending rejected tail must not
-    // be drained here. A failed cancel still yields the fixed refusal.
-    if (upstream.body) {
-      try {
-        await upstream.body.cancel();
-      } catch {
-        // Ignore: the fixed refusal below stands.
-      }
-    }
+    // be drained here. The cancel is best-effort and never awaited: a
+    // never-settling hook still yields the fixed refusal promptly.
+    releaseUpstream(upstream);
     return refuse(503, "unavailable", true, undefined, requestId);
   }
   const reader = upstream.body?.getReader();
@@ -321,25 +405,21 @@ export async function relayReceiverResponse(
   let total = 0;
   try {
     for (;;) {
+      if (signal?.aborted) {
+        releaseReader(reader);
+        return refuse(503, "unavailable", true, undefined, requestId);
+      }
       let step: ReadableStreamReadResult<Uint8Array>;
       try {
-        step = await reader.read();
+        step = await boundRead(reader.read(), signal);
       } catch {
-        try {
-          await reader.cancel();
-        } catch {
-          // Ignore: the fixed refusal below stands.
-        }
+        releaseReader(reader);
         return refuse(503, "unavailable", true, undefined, requestId);
       }
       if (step.done) break;
       total += step.value.byteLength;
       if (total > MAX_RESPONSE_BYTES) {
-        try {
-          await reader.cancel();
-        } catch {
-          // Ignore: the fixed refusal below stands.
-        }
+        releaseReader(reader);
         return refuse(503, "unavailable", true, undefined, requestId);
       }
       chunks.push(step.value);
