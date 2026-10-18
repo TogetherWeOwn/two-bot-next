@@ -127,10 +127,30 @@ async fn foreign_application_is_ignored_before_callback_or_store() {
     mock.shutdown().await;
 }
 
+async fn connect_schema_pool(url: &str, schema: &str) -> sqlx::PgPool {
+    let search = schema.to_owned();
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .after_connect(move |conn, _| {
+            let search = search.clone();
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('search_path', $1, false)")
+                    .bind(search)
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(url)
+        .await
+        .expect("schema pool")
+}
+
 struct TestDb {
     pool: sqlx::PgPool,
     admin: sqlx::PgPool,
     schema: String,
+    url: String,
 }
 impl TestDb {
     async fn new() -> Self {
@@ -151,22 +171,7 @@ impl TestDb {
             .execute(&admin)
             .await
             .expect("test schema");
-        let search = schema.clone();
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5)
-            .after_connect(move |conn, _| {
-                let search = search.clone();
-                Box::pin(async move {
-                    sqlx::query("SELECT set_config('search_path', $1, false)")
-                        .bind(search)
-                        .execute(conn)
-                        .await?;
-                    Ok(())
-                })
-            })
-            .connect(url)
-            .await
-            .expect("schema pool");
+        let pool = connect_schema_pool(url, &schema).await;
         sqlx::migrate!("../cutover/migrations")
             .run(&pool)
             .await
@@ -175,7 +180,13 @@ impl TestDb {
             pool,
             admin,
             schema,
+            url: url.to_owned(),
         }
+    }
+    /// An independent pool on the same test schema: reads through it prove the
+    /// state under test is durable, not held by the first pool or service.
+    async fn fresh_pool(&self) -> sqlx::PgPool {
+        connect_schema_pool(&self.url, &self.schema).await
     }
     async fn cleanup(self) {
         self.pool.close().await;
@@ -815,5 +826,285 @@ async fn queued_lfg_work_leaves_pool_connections_for_the_gateway() {
         6
     );
     mock.shutdown().await;
+    db.cleanup().await;
+}
+
+// ── Saved-state outcomes when audit or message refresh fails ────────────────
+// Standalone acceptance for the documented non-atomic boundary: store
+// mutations commit through the pool before the separate announcement audit,
+// and the audit is not atomic with the mutation. A rejected audit surfaces
+// as failure (never a false success) with no refresh; a failed refresh keeps
+// the saved mutation and says so. Direct-service replay of an audited signup
+// reuses the saved outcome without duplicating signup/audit rows or
+// resurrecting a member who left. (Routed gateway redelivery is not claimed
+// here: it still requires a valid initial acknowledgement, which Discord
+// rejects with 40060 once answered.) Tests-only: no production behavior,
+// copy, or recovery policy changes.
+
+/// One open post with a posted message id, so executions take the refresh path.
+async fn open_post_with_message(pool: &sqlx::PgPool, post_id: &str, message_id: &str) {
+    let post = lfg::LfgPost {
+        id: post_id.into(),
+        guild_id: GUILD.into(),
+        channel_id: CHANNEL.into(),
+        message_id: Some(message_id.into()),
+        title: "Saved-state raid".into(),
+        starts_at: "2099-09-11T20:00:00Z".into(),
+        status: lfg::LfgStatus::Open,
+        created_by: "3333".into(),
+        created_at: "2026-09-30T00:00:00.000Z".into(),
+        closed_at: None,
+    };
+    let roles = lfg::spec_roles(&post.id, &lfg::parse_role_spec("tank:Tank:1").unwrap());
+    store::put_lfg(pool, &post, &roles, true).await.unwrap();
+}
+
+/// Fixture fault scoped to the required audit INSERT after mutation: the
+/// domain rows stay writable while `lfg.signup`/`lfg.close` audit rows are
+/// rejected. Dropped explicitly at the end of each fault test.
+async fn reject_lfg_audits(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "ALTER TABLE announcements_audit_log
+         ADD CONSTRAINT lfg_saved_state_no_lfg_audit
+         CHECK (action NOT IN ('lfg.signup', 'lfg.close'))",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn allow_lfg_audits(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "ALTER TABLE announcements_audit_log
+         DROP CONSTRAINT lfg_saved_state_no_lfg_audit",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn channel_requests(mock: &MockRest, method: &str) -> usize {
+    mock.requests()
+        .iter()
+        .filter(|r| r.method == method && r.path.starts_with("/api/v10/channels/"))
+        .count()
+}
+
+#[tokio::test]
+#[ignore = "needs agent-testdb or the CI service container"]
+async fn rejected_signup_audit_keeps_mutation_without_refresh_or_success_claim() {
+    let db = TestDb::new().await;
+    let post = "lfg-8101";
+    open_post_with_message(&db.pool, post, "5000").await;
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204)],
+        ScriptedResponse::json(200, json!({"id": "5900"})),
+    )
+    .await;
+    let rt = runtime(db.pool.clone(), &mock, true);
+    reject_lfg_audits(&db.pool).await;
+    assert!(rt.handle(&select(8101, post, 3333, "tank")).await.unwrap());
+    allow_lfg_audits(&db.pool).await;
+    // The durable mutation remains, but the reply never claims audited success.
+    let reply = last_reply(&mock);
+    assert_eq!(
+        reply,
+        "LFG operation failed; check the saved state before retrying."
+    );
+    assert!(!reply.contains("joined"));
+    assert!(!reply.contains("audit"));
+    // An independent pool sees the saved signup and the missing audit.
+    let fresh = db.fresh_pool().await;
+    let signups = store::list_lfg_signups(&fresh, post).await.unwrap();
+    assert_eq!(signups.len(), 1);
+    assert_eq!(signups[0].user_id, "3333");
+    assert_eq!(signups[0].role_key, "tank");
+    let audits: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM announcements_audit_log WHERE target_key = $1")
+            .bind(post)
+            .fetch_one(&fresh)
+            .await
+            .unwrap();
+    assert_eq!(audits, 0);
+    fresh.close().await;
+    // No refresh follows the failed audit: nothing touches the channel.
+    assert_eq!(channel_requests(&mock, "PATCH"), 0);
+    assert_eq!(channel_requests(&mock, "POST"), 0);
+    mock.shutdown().await;
+    drop(rt);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs agent-testdb or the CI service container"]
+async fn rejected_close_audit_keeps_closure_without_refresh_or_success_claim() {
+    let db = TestDb::new().await;
+    let post = "lfg-8201";
+    open_post_with_message(&db.pool, post, "5000").await;
+    store::signup_lfg(
+        &db.pool,
+        GUILD,
+        post,
+        "tank",
+        "3334",
+        "2026-09-30T00:01:00.000Z",
+    )
+    .await
+    .unwrap();
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204)],
+        ScriptedResponse::json(200, json!({"id": "5900"})),
+    )
+    .await;
+    let rt = runtime(db.pool.clone(), &mock, true);
+    reject_lfg_audits(&db.pool).await;
+    assert!(rt
+        .handle(&close(8201, post, PERM_MANAGE_EVENTS))
+        .await
+        .unwrap());
+    allow_lfg_audits(&db.pool).await;
+    let reply = last_reply(&mock);
+    assert_eq!(
+        reply,
+        "LFG operation failed; check the saved state before retrying."
+    );
+    assert!(!reply.contains("closed"));
+    assert!(!reply.contains("audit"));
+    // The durable closure remains, verified through an independent pool.
+    let fresh = db.fresh_pool().await;
+    let stored = store::get_lfg(&fresh, GUILD, post).await.unwrap().unwrap();
+    assert_eq!(stored.status, lfg::LfgStatus::Closed);
+    assert!(stored.closed_at.is_some());
+    let audits: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM announcements_audit_log WHERE target_key = $1")
+            .bind(post)
+            .fetch_one(&fresh)
+            .await
+            .unwrap();
+    assert_eq!(audits, 0);
+    fresh.close().await;
+    assert_eq!(channel_requests(&mock, "PATCH"), 0);
+    assert_eq!(channel_requests(&mock, "POST"), 0);
+    mock.shutdown().await;
+    drop(rt);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs agent-testdb or the CI service container"]
+async fn failed_refresh_patch_keeps_saved_signup_and_audit_with_warning_and_no_post() {
+    let db = TestDb::new().await;
+    let post = "lfg-8301";
+    open_post_with_message(&db.pool, post, "5000").await;
+    // Deferred callback succeeds, the refresh PATCH fails, the final webhook
+    // edit (default) succeeds.
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204), ScriptedResponse::status(500)],
+        ScriptedResponse::json(200, json!({"id": "5900"})),
+    )
+    .await;
+    let rt = runtime(db.pool.clone(), &mock, true);
+    assert!(rt.handle(&select(8301, post, 3333, "tank")).await.unwrap());
+    // The existing saved-state warning is returned unchanged.
+    assert_eq!(
+        last_reply(&mock),
+        "LFG joined. Message refresh failed; the saved state is unchanged."
+    );
+    // Saved signup plus exactly one audit, visible from an independent pool.
+    let fresh = db.fresh_pool().await;
+    let signups = store::list_lfg_signups(&fresh, post).await.unwrap();
+    assert_eq!(signups.len(), 1);
+    assert_eq!(signups[0].user_id, "3333");
+    let audits: Vec<(String, String)> =
+        sqlx::query_as("SELECT action, outcome FROM announcements_audit_log WHERE target_key = $1")
+            .bind(post)
+            .fetch_all(&fresh)
+            .await
+            .unwrap();
+    assert_eq!(audits, vec![("lfg.signup".to_owned(), "joined".to_owned())]);
+    fresh.close().await;
+    // Exactly the one failed refresh PATCH; no replacement message POST.
+    assert_eq!(channel_requests(&mock, "PATCH"), 1);
+    assert_eq!(channel_requests(&mock, "POST"), 0);
+    mock.shutdown().await;
+    drop(rt);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs agent-testdb or the CI service container"]
+async fn direct_replay_retries_refresh_without_duplicating_signup_audit_or_resurrecting_leaver() {
+    let db = TestDb::new().await;
+    let post = "lfg-8401";
+    open_post_with_message(&db.pool, post, "5000").await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(200),
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(200),
+        ],
+        ScriptedResponse::json(200, json!({"id": "5900"})),
+    )
+    .await;
+    let rt = runtime(db.pool.clone(), &mock, true);
+    assert!(rt.handle(&select(8401, post, 3333, "tank")).await.unwrap());
+    assert_eq!(last_reply(&mock), "LFG joined.");
+    assert!(rt
+        .handle(&select(8402, post, 3333, "__leave__"))
+        .await
+        .unwrap());
+    assert_eq!(last_reply(&mock), "LFG left.");
+    assert!(store::list_lfg_signups(&db.pool, post)
+        .await
+        .unwrap()
+        .is_empty());
+    mock.shutdown().await;
+    drop(rt);
+    // Recreated pool, executor double and service: the replay is a
+    // direct-service retry of the same audited interaction, not gateway
+    // redelivery (which still needs a valid initial acknowledgement).
+    let fresh = db.fresh_pool().await;
+    let replay_mock = MockRest::start(
+        vec![ScriptedResponse::status(200)],
+        ScriptedResponse::status(200),
+    )
+    .await;
+    let executor = ActionExecutor::with_proxy("lfg-test-token".into(), Some(replay_mock.origin()))
+        .expect("executor");
+    let service = LfgInteractions::new(fresh.clone());
+    let replayed = service
+        .execute(
+            &executor,
+            LfgRequest::Select(lfg::LfgSelectAction::Signup {
+                post_id: post.into(),
+                role_key: "tank".into(),
+            }),
+            GUILD,
+            "3333",
+            8401,
+            BOT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed, "LFG joined.");
+    // No duplicated signup or audit, and the member who left stays gone.
+    assert!(store::list_lfg_signups(&fresh, post)
+        .await
+        .unwrap()
+        .is_empty());
+    let audits: Vec<(String,)> =
+        sqlx::query_as("SELECT outcome FROM announcements_audit_log WHERE id = $1")
+            .bind("lfg:signup:8401")
+            .fetch_all(&fresh)
+            .await
+            .unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].0, "joined");
+    // The replay retried exactly the refresh, posting nothing new.
+    assert_eq!(channel_requests(&replay_mock, "PATCH"), 1);
+    assert_eq!(channel_requests(&replay_mock, "POST"), 0);
+    replay_mock.shutdown().await;
+    fresh.close().await;
     db.cleanup().await;
 }
