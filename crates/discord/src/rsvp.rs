@@ -12,10 +12,10 @@ use two_bot_core::{
     attendance_totals_text, checkin_duplicate_text, checkin_idempotency_key,
     checkin_occurrence_full_text, checkin_recorded_text, classify, compensate_checkin_write,
     compensate_rsvp_write, list_rsvps, now_iso, parse_attendance_occurrence, partition_rsvps,
-    put_rsvp, record_checkin, require_manage_events, rsvp_event_full_text, rsvp_rate_limited_text,
-    rsvp_saved_text, validate_event_id, validate_occurrence_id, write_audit, AttendanceProof,
-    CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter, RsvpAudit,
-    RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
+    put_rsvp_with_audit, record_checkin, require_manage_events, rsvp_event_full_text,
+    rsvp_rate_limited_text, rsvp_saved_text, validate_event_id, validate_occurrence_id,
+    AttendanceProof, CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter,
+    RsvpAudit, RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
 };
 
 use crate::{
@@ -330,22 +330,29 @@ async fn execute(
                 status,
                 responded_at: now_iso(),
             };
-            let transition = put_rsvp(pool, &record).await.map_err(|err| match err {
-                RsvpStoreError::EventAtCapacity => rsvp_event_full_text(),
-                RsvpStoreError::RsvpRateLimited => rsvp_rate_limited_text(),
-                // Occurrence capacity and retention floors cannot come
-                // out of an RSVP write; transport/parse failures stay
-                // generic. Every variant is mapped: a refused or failed
-                // write is never reported as saved.
-                RsvpStoreError::OccurrenceAtCapacity
-                | RsvpStoreError::CutoffTooRecent
-                | RsvpStoreError::Db(_)
-                | RsvpStoreError::UnknownStatus(_) => "Unable to save RSVP.".to_owned(),
-            })?;
+            // The response and its required audit row commit in one
+            // transaction: a failed audit insert rolls the response back,
+            // so no partial write can survive this path.
             let audit_id = format!("rsvp:{}", interaction.id);
-            write_audit(pool, &RsvpAudit::for_rsvp(&audit_id, &record))
-                .await
-                .map_err(|_| "Unable to audit RSVP.")?;
+            let transition =
+                put_rsvp_with_audit(pool, &record, &RsvpAudit::for_rsvp(&audit_id, &record))
+                    .await
+                    .map_err(|err| match err {
+                        RsvpStoreError::EventAtCapacity => rsvp_event_full_text(),
+                        RsvpStoreError::RsvpRateLimited => rsvp_rate_limited_text(),
+                        // A failed audit insert refuses with the pre-existing
+                        // audit text; response-step failures keep the
+                        // pre-existing save text.
+                        RsvpStoreError::AuditDb(_) => "Unable to audit RSVP.".to_owned(),
+                        // Occurrence capacity and retention floors cannot come
+                        // out of an RSVP write; transport/parse failures stay
+                        // generic. Every variant is mapped: a refused or failed
+                        // write is never reported as saved.
+                        RsvpStoreError::OccurrenceAtCapacity
+                        | RsvpStoreError::CutoffTooRecent
+                        | RsvpStoreError::Db(_)
+                        | RsvpStoreError::UnknownStatus(_) => "Unable to save RSVP.".to_owned(),
+                    })?;
             // RA-03 race fence: the event or membership may have vanished
             // between the pre-write lookups and the commit. Re-read the same
             // evidence; on loss or lookup failure compensate (a first
@@ -522,6 +529,9 @@ async fn execute(
                 | RsvpStoreError::RsvpRateLimited
                 | RsvpStoreError::CutoffTooRecent
                 | RsvpStoreError::Db(_)
+                // Unreachable on the check-in path (`record_checkin` writes
+                // no audit row); mapped only for exhaustiveness.
+                | RsvpStoreError::AuditDb(_)
                 | RsvpStoreError::UnknownStatus(_) => "Attendance was not recorded.".to_owned(),
             })?;
             if !inserted {

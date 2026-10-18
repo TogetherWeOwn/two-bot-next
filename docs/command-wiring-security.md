@@ -78,13 +78,17 @@ by `crates/core/src/rsvp.rs::tests::attendance_occurrence_binds_every_format_to_
 `permissions_gates_and_guild_fence_precede_store_access`,
 `malformed_inputs_and_failed_ack_do_not_write`,
 `non_member_and_unverifiable_targets_refuse_without_writes`), which assert zero
-attendance/audit writes on every refusal. Three refusal paths are exceptions. A
+attendance/audit writes on every refusal. Two refusal paths are exceptions. A
 refusal after post-write revalidation whose compensating delete also fails
 leaves the attempt's rows; `failed_compensation_keeps_refusal_and_emits_one_diagnostic`
-pins them and the `compensation_failed` diagnostic. A failed audit write after a
-committed RSVP refuses without compensation or diagnostic, and the committed RSVP
-row remains; no test pins this path. An unknown stored status after commit does
-the same and needs a row that bypassed the status CHECK; no test pins it either.
+pins them and the `compensation_failed` diagnostic. A required audit write commits
+in the same transaction as its RSVP response, pinned by
+`audit_insert_failure_on_first_rsvp_leaves_no_response_or_audit` and
+`audit_insert_failure_on_rsvp_rewrite_preserves_exact_prior_state`
+(`crates/discord/tests/rsvp_atomic_audit.rs`): a failed audit insert rolls the
+response back and refuses with the existing safe text. An unknown stored status
+after commit still refuses without compensation, leaving the committed row; it
+needs a row that bypassed the status CHECK, and no test pins it either.
 Restricting input further to Discord-derived IDs alone would still require an explicit parity decision, a
 recorded intentional difference and coordinated command reference, fixture and
 regression updates. This checklist grants no such waiver and does not change

@@ -393,7 +393,7 @@ pub use rsvp_conversion::{
 #[cfg(feature = "db")]
 pub use rsvp_store::{
     compensate_checkin_write, compensate_rsvp_write, list_rsvps, prune_rsvp_history, put_rsvp,
-    record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+    put_rsvp_with_audit, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
 };
 pub use scheduled::{
     advance_next_run_iso, advance_next_run_ms, clamp_retry_delay_ms, format_iso_ms, lease_until_ms,
