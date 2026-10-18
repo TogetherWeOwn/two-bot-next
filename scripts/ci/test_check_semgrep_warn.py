@@ -509,7 +509,20 @@ class ConfigTests(unittest.TestCase):
                        if "pattern-not-regex" in p]
         self.assertTrue(not_regexes, "macro rule must exclude // comments")
         self.assertTrue(any(
-            re.search(rx, "/// Never write .expect(\"\")") for rx in not_regexes))
+            re.search(rx, "/// Never write .expect(\"\")", re.M)
+            for rx in not_regexes))
+        self.assertTrue(any(
+            re.search(rx, '    // indented .expect("")', re.M)
+            for rx in not_regexes))
+        code_line = 'format!("https://{}/x", host.expect(""))'
+        expect_at = code_line.index('.expect("")')
+        self.assertTrue(any(re.search(rx, code_line) for rx in regexes))
+        for rx in not_regexes:
+            for m in re.finditer(rx, code_line, re.M):
+                self.assertFalse(
+                    m.start() <= expect_at < m.end(),
+                    f"exclusion {rx!r} must not swallow a real hit after //",
+                )
 
     def test_test_files_are_out_of_scope(self):
         config = yaml.safe_load((ROOT / ".semgrep/rust-warn.yml").read_text())
