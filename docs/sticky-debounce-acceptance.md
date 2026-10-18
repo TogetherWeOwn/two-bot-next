@@ -2,7 +2,9 @@
 
 `crates/core/tests/sticky_debounce_acceptance.rs` pins the public
 `two_bot_core::sticky` decision API (`crates/core/src/sticky.rs`). It is pure
-and offline: no database, no Discord client, no feature flags.
+and offline: no database, no Discord client, no feature flags. This page
+covers that pure suite first, then records where the wired runtime behaviour
+is implemented and tested, so the two are not confused.
 
 ```sh
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --test sticky_debounce_acceptance
@@ -37,13 +39,23 @@ exercise it. In `crates/bot/src/command_runtime.rs`:
   a `sticky.run` audit row. A replacement is only recorded when Discord
   returns a usable non-zero numeric message id. On a post error or an
   unusable id it releases the claim, audits `post_failed` and keeps the
-  previous sticky, so the next eligible activity can retry. If recording
+  previous sticky, so the next eligible activity can retry (a claim that
+  cannot be released still expires after 60 s). If recording
   fails or reports the claim moved on, it deletes the just-posted orphan
   instead of retiring the previous sticky.
 - `/sticky` (`sticky_set`) validates the body and debounce, upserts the row,
-  audits and replies; `/sticky-remove` (`sticky_remove`) deletes the row,
-  best-effort deletes the posted sticky, audits and replies. Rejected
-  `/sticky` input writes no row and audits `rejected`.
+  audits (`sticky.create`/`sticky.update`, `ok` or `rejected`) and replies;
+  `/sticky-remove` (`sticky_remove`) deletes the row,
+  best-effort deletes the posted sticky, audits (`sticky.delete`, `ok` or
+  `absent`) and replies. Both defer ephemerally before I/O and complete by
+  editing the original response; a failed defer mutates nothing. The
+  interaction defer/edit calls use the executor's blocked-retry variants,
+  which is separate from the activity-driven re-post retry above.
+- All state goes through the `two_bot_core::sticky::store` functions over
+  `sticky_messages` and `automation_audit_log`: `get_sticky`, `put_sticky`
+  (conflict update preserves the post columns and clears any claim),
+  `claim_sticky_post`, `record_sticky_post`, `release_sticky_post`,
+  `delete_sticky` and `audit_sticky`.
 
 That behavior is pinned by the database-backed tests in
 `crates/bot/src/command_runtime_tests.rs` — for example
@@ -52,8 +64,10 @@ That behavior is pinned by the database-backed tests in
 `post_failure_releases_claim_and_audits_post_failed`,
 `unconfirmed_replacement_preserves_previous_and_releases_claim`,
 `sticky_set_writes_row_audits_and_confirms`,
-`sticky_set_rejection_audits_rejected_and_still_replies` and
-`sticky_remove_clears_state_and_deletes_the_message`. They are `#[ignore]`d
+`sticky_set_rejection_audits_rejected_and_still_replies`,
+`sticky_remove_clears_state_and_deletes_the_message`,
+`sticky_remove_absent_reports_absent_without_delete` and
+`failed_defer_leaves_set_and_remove_state_untouched`. They are `#[ignore]`d
 locally, run in CI against the test-database service
 (`cargo test -p two-bot --locked command_runtime_tests -- --ignored`), and
 drive a mock Discord REST server — not a live guild.
@@ -71,3 +85,10 @@ drive a mock Discord REST server — not a live guild.
 - Nothing cited here proves live-guild behavior: real Discord permissions,
   delivery and ordering in a staging or production guild remain outside both
   suites.
+- Body-validation bounds, reply text and audit action/outcome strings are
+  pinned by the unit tests in `crates/core/src/sticky.rs`, not by this pure
+  suite.
+- Previous-copy and orphan deletes are best-effort: a failed delete is logged
+  and the flow continues, so removal of the old copy is not guaranteed. The
+  record-failure and claim-moved-on orphan-cleanup branches in `on_message`
+  have code but no dedicated test yet.

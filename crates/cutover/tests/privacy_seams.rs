@@ -10,13 +10,14 @@
 //! `privacy_opt_out.rs`, which this file never duplicates: every test here
 //! targets a seam that file does not touch.
 
+use two_bot_core::analytics_family::AnalyticsCategory;
 use two_bot_core::community::{Classification, ClassifyInput};
 use two_bot_core::community_store::{
     member_join_fact, member_join_metadata, message_fact, record_fact, voice_ended_fact,
     MessageFactInput,
 };
 use two_bot_core::database_tls::TlsPolicy;
-use two_bot_core::gateway_funnel::{FunnelBatch, InviteSnapshotWrite};
+use two_bot_core::gateway_funnel::{ActivityTouch, FunnelBatch, InviteSnapshotWrite};
 use two_bot_core::gateway_session::{DispatchAction, GatewaySession};
 use two_bot_core::inactivity_store::run_sweep;
 use two_bot_core::onboarding::{build_session_picks, plan_game_selection, plan_session};
@@ -431,9 +432,22 @@ async fn gateway_batch_commit_gates_suppression_toggles_and_inviters() {
             ),
             join_by_c,
         ],
+        // Message-origin touches: the suppressed member drops on
+        // suppression, the allowed member persists on the enabled
+        // activity family (voice is disabled in this fixture).
         activity: vec![
-            (guild_u64(), member_u64(MEMBER_A), at.clone()),
-            (guild_u64(), member_u64(MEMBER_B), at.clone()),
+            ActivityTouch {
+                guild_id: guild_u64(),
+                member_id: member_u64(MEMBER_A),
+                at: at.clone(),
+                family: AnalyticsCategory::Activity,
+            },
+            ActivityTouch {
+                guild_id: guild_u64(),
+                member_id: member_u64(MEMBER_B),
+                at: at.clone(),
+                family: AnalyticsCategory::Activity,
+            },
         ],
         bots: vec![
             (guild_u64(), member_u64(MEMBER_A)),

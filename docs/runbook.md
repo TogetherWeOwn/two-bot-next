@@ -21,7 +21,7 @@ separate authorization.
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.149.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.151.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -112,7 +112,7 @@ invocation, unsampled; production traces are off (`wrangler/wrangler.toml`).
 
 `logs` is **Worker/DO tail**, not Rust stdout. Stop it when the bounded incident
 observation is complete. For Rust stdout/stderr, use the affected container's
-logs in the Cloudflare dashboard. Wrangler 4.149.0 has no `containers logs`
+logs in the Cloudflare dashboard. Wrangler 4.151.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
 Container stdout is also in the Workers Observability `containers` dataset, which a
@@ -241,7 +241,8 @@ names, never error text or payloads. Take the first action for the reported clas
 | `feed` | Check the configured feed source's availability and recent fetch status through authorized diagnostics; do not copy response bodies. |
 | `recovery_required` | Preserve feed cursor and pending recovery state; follow the established recovery path before any manual replay or cursor change. |
 
-The streak clears on the next successful completion.
+The streak clears on the next successful completion. For feed delivery
+specifically, follow the [feed supervisor operator guide](feed-supervisor.md).
 
 #### Alert: REST 429
 
@@ -485,7 +486,39 @@ flat generation is this alert becoming member-visible.
 
 Escalate when the store cause is not self-clearing, when `unknown_creator`
 refusals dominate, or when the flat generation survives a restart — the fix
-belongs to the on-call engineer, not another redeploy.
+belongs to the on-call engineer, not another redeploy. Guarded remediation
+recommends alongside this alert: the bot's own reload first, then a same-SHA
+takeover card if the alert survives it (see
+[auto-remediation](#auto-remediation-guarded-stall-and-crash-loop-response)).
+
+#### Alert: error budget fast burn
+
+The REST error budget (99.9% success over the 48h watch, `docs/error-budget-alerts.md`)
+is burning faster than 12x in both the last 15 minutes and the last 2 minutes
+(`two_bot_rest_requests_total` eligible requests against `result="5xx"` plus
+`result="transport"` errors; `4xx`/`429` are caller or rate-limit outcomes, not
+spend). Each window needs at least 10 eligible requests and two budget errors;
+one bad minute alone never pages. After startup or restart, a window stays
+inactive until its full history is available; a counter reset rebuilds the
+window history instead of firing. A scrape gap never resolves a firing page by
+itself: a window without coverage holds the existing state, and only full
+coverage below threshold resolves. Window edges land on whole keepalive scrapes,
+so a burn sustained exactly at the policy rate reads up to ~1% low and the
+comparison carries that allowance instead of flapping.
+
+First response: confirm the spike is server-side via the authorized
+`/ops/metrics` scrape — compare `5xx` growth against `transport` growth by
+`route`. `transport` points at timeouts and cancellations before response
+headers (check job timeout classes); `5xx` concentrated on one route after a
+deploy points at a broken request shape from the fresh build (check the page's
+build SHA and the recent-deploy rollback one-pager); `5xx` across routes
+points at the Discord API (check the Discord status page). Then read the
+container logs for the failing route's error lines.
+
+Escalate when the burn persists across windows (the budget exhausts in 4 hours
+at full fast burn), when half the 48h budget is spent, or when the spike
+matches a deploy — the fix belongs to the on-call engineer, not another
+redeploy.
 
 #### Alert: gateway missed events
 
@@ -555,7 +588,73 @@ the logs show no `gateway ready` after the last disconnect, the gateway is still
 down: escalate to the on-call engineer through the watch escalation path. Do not
 restart the container to clear the alert. A restart re-baselines the counters
 without showing that the gateway came back, so confirm `gateway ready` in the
-new process's logs first.
+new process's logs first. Guarded remediation recommends alongside this alert:
+a same-SHA takeover card, then a CEO page if two takeovers fail (see
+[auto-remediation](#auto-remediation-guarded-stall-and-crash-loop-response)).
+A reload step is skipped here: no in-process reload can fix a gateway that
+never came back.
+
+#### Alert: gateway not ready
+
+The scraped `/readyz` gateway component stayed non-ready (`starting` or
+`down`) for 3 consecutive valid samples. Unlike
+[`gateway_unpaired_disconnect`](#alert-gateway-unpaired-disconnect), this rule
+needs no disconnect edge: it catches a gateway stuck starting (Armed,
+reconnecting but never connecting), parked (Unconfigured, so the shard never
+starts) or draining, where `two_bot_gateway_disconnects_total` never grows
+and the pairing rule stays silent. This is page severity (SEV-1 in the
+[watch escalation path](watch-escalation-path.md)).
+
+The bound is 3 samples. Samples arrive about every 60 s, so the third
+consecutive non-ready sample comes about two to three minutes after the
+gateway stopped being ready. The bound matches the sibling unpaired rule, so
+both gateway pages tell one story, and at the default `UNREADY_ALERT_FAILURES`
+threshold it never fires sooner than the generic
+`container_unready_alert` (about two minutes of failed `/readyz` probes): the
+generic page fires first and this rule attributes the outage to the gateway
+with its own runbook, an order of magnitude inside the 15-minute
+acknowledgement window. (A raised `UNREADY_ALERT_FAILURES` override can invert
+that order; do not rely on generic-first with an override.) At the default
+threshold, any outage long enough to trip this rule already
+tripped the generic unready page a sample earlier, so it adds no new
+false-page class for slow boots; with an override it can page first, so a
+slow boot can page here with no prior generic page.
+
+A non-ready component is read from the `components` breakdown of the
+keepalive `/readyz` probe, not from `gateway_failure.failed_step`: the
+failure field is absent until a failure is recorded, so a shard stuck
+starting with no recorded failure has no step to read, while the component
+entry always names the gateway state. Only `ready` (Connected) counts as
+ready; `starting` and `down` both extend the streak, and unknown vocabulary
+holds rather than guessing. The first valid sample only stores the baseline.
+A failed probe, an unparsable body, or a failed `/metrics` scrape changes
+nothing and holds the current state, so the rule needs consecutive ticks
+where both the probe parsed and the scrape succeeded. A counter reset
+(process restart) re-baselines the streak and holds a firing non-ready or
+invalid alert rather than clearing it. A `ready` sample clears at once,
+even across a restart.
+The firing key is the constant `gateway_not_ready`.
+
+A parked gateway (Unconfigured, for example a missing `DISCORD_TOKEN`) pages
+here too, exactly as it already trips the generic unready page: confirm the
+expected token configuration before touching the bot. The staging
+rollback-drill injection reports this exact shape on purpose, so a drill that
+holds the injection for three consecutive samples trips this rule by design;
+treat a page inside a known drill window as the drill working — the drill
+gate rolls back on the 503 regardless.
+
+First response: scrape `/ops/metrics` as described above and confirm the
+disconnect and recovery counters are flat (flat counters with this page mean
+the gateway never started or never came back without an edge, not an
+unpaired loss). Then read `/readyz` for the full component breakdown: a
+`database` or `token_invalid` down alongside a ready gateway is not this
+alert's territory. Read the container logs for `gateway reconnect failed;
+Twilight will retry` (still retrying) and `gateway ready; checkpoint
+committed` (a recovery). If the logs show no `gateway ready`, the gateway is
+still down: escalate to the on-call engineer through the watch escalation
+path. Do not restart the container to clear the alert. A restart re-baselines
+the streak without showing that the gateway came back, so confirm `gateway
+ready` in the new process's logs first.
 
 #### Alert: ticker stale
 
@@ -691,6 +790,69 @@ integration nor paging escalation: it labels the existing transition delivery
 as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
+
+#### Auto-remediation: guarded stall and crash-loop response
+
+Execution-path decision: the Worker cannot restart containers, so remediation
+is recommendation plus guard state, evaluated in `wrangler/src/remediation.ts`
+on every keepalive tick. Nothing there mutates the container, the ownership
+record, or any deployment. Execution stays inside the existing machine
+contract: the bot's own in-process reload (no host action), then one Operator
+host-action card per host step for a same-SHA deployment-takeover through the
+existing deploy workflow. No new endpoint, credential, spend, or authority.
+
+Trigger table (a recommendation fires only while its trigger key fires):
+
+| Scope | Trigger firing key | R1 (first) | R2 (escalation) |
+|---|---|---|---|
+| `voice-stall` | `voice_creator_map_stale` | `creator-map-reload`: the bot's maintenance tick retries the merge every 5 minutes; no host action | `same-sha-takeover`: one Operator card for a same-SHA takeover via the existing deploy workflow |
+| `crash-loop` | `gateway_unpaired_disconnect` | skipped: no in-process reload can fix a gateway that never came back | `same-sha-takeover`: one Operator card, same path as above |
+
+Guard state (persisted in DO storage next to the alert state):
+
+- At most one recommendation per 30 minutes across all scopes. Triggers are
+  visited in table order and the first eligible one consumes the window, so
+  when both scopes fire at once the table order is the priority and the other
+  scope waits for the next window.
+- A recommendation while a prior one for the same scope did not clear the
+  alert counts as one consecutive failure for that scope.
+- After 2 consecutive failures the scope goes quiet and the Worker pages the
+  CEO card once, on the same best-effort webhook path as the alerts
+  themselves: if forwarding is off or delivery fails, the scope still goes
+  quiet until the alert stays clear for a full cooldown window, so a suppressed
+  scope with no CEO line is a paging gap, not a recovery. No further
+  recommendations until the alert stays clear for one cooldown window.
+- Recovery needs a sustained clear, not one quiet line. A recommended takeover
+  restarts the process, which re-baselines the gateway counters and boots
+  `creator_map_generation` at 0, so the next tick goes quiet even when the
+  fault survives. A quiet tick therefore starts a per-scope hold-down instead
+  of resetting the guard; only a full 30-minute window of silence returns the
+  scope to idle. A refire inside the window keeps the failure count, so a
+  flapping alert still reaches the two-failure stop. A scope that stays silent
+  for the full window with generation pinned at 0 never pages from this guard:
+  the stall rule cannot tell parked from wedged at generation 0, so that case
+  needs its own boot/store-fault signal (follow-up), not another redeploy.
+
+Operator card shape for `same-sha-takeover`: name the firing key, the build
+revision from the alert line, and the deploy workflow run to dispatch at that
+same SHA. File a host-action card only from a `same-sha-takeover` line: the
+first (`creator-map-reload`) line is never card authority. File exactly one
+card per host step; act only while the alert is firing. A repeated takeover
+line for the same still-firing alert is the escalation retry, not a second
+step: file it only after the first card's action completed without clearing
+the alert, never while that action is still in flight. When the CEO page
+lands, the on-call pages the CEO card and stops filing takeover cards for
+that scope until the alert stays clear for one cooldown window.
+
+Known limits of v1: the triggers stay pinned to the two keys in the table
+above. A stuck-gateway rule (non-ready `/readyz` gateway component with no
+disconnect edge) is not a trigger in v1; wiring it into the crash-loop scope
+is follow-up work once that rule lands, not part of this slice. Sustained
+`/readyz` red (`container_unready_alert`) and repeated process restarts stay
+manual. A positive-path staging proof (forcing a real stall) needs an injector
+that does not exist; v1 staging proof is a clean deploy with no spurious
+recommendation lines plus the unit suite below. Forcing these two alerts on
+staging is follow-up work, not a silent gap.
 
 ### Event-store capture gaps and lag
 
@@ -1107,7 +1269,7 @@ npm --prefix wrangler run deployments -- list --env staging
 ```
 
 Read the interactive target and confirm the incident's known-good version.
-Do not add `--yes` or override warnings. Wrangler 4.149 updates Durable Object
+Do not add `--yes` or override warnings. Wrangler 4.151 updates Durable Object
 code with `deferred` mode and a 300 s maximum delay by default, so a bare
 rollback can leave the old code serving for up to five minutes. For a manual
 incident rollback add `--durable-objects-code-update-mode immediate`, and expect
@@ -1294,7 +1456,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 | Control | Ported contract | Current operational boundary |
 |---|---|---|
 | Audit kill switch | Durable `audit_kill_switch`, singleton `id=1`; `engage_halt(actor_id)` / `disengage_halt()` library methods. Halt blocks queue discovery/claim/preparation, not fact recording or an already prepared/in-flight send. | Store exists, delivery service/operator endpoint not wired. No supported command in this binary. Durable DB errors propagate; legacy pure-model read-fail-open is **not** send authorization. See [audit store](audit-store.md). |
-| Automod | Exact `TWO_AUTOMOD=1` enables config. Dry-run by default; exact `TWO_AUTOMOD_ENFORCE=1` selects enforce. | Forwarded and composed into the gateway when activation/configuration permit. Requires valid Owen/protected-role configuration; enforcement can sanction. `TWO_AUTOMOD=1` requests MESSAGE_CONTENT intent. Flags alone do not override identity/permission gates or stop the bot. |
+| Automod | Exact `TWO_AUTOMOD=1` enables config. Dry-run by default; exact `TWO_AUTOMOD_ENFORCE=1` selects enforce. | Forwarded and composed into the gateway when activation/configuration permit. Requires valid Owen/protected-role configuration; enforcement can sanction. `TWO_AUTOMOD=1` requests MESSAGE_CONTENT intent. Flags alone do not override identity/permission gates or stop the bot. Filter/effect semantics, repeat expiry, corpus care and triage: [automod operator guide](automod-operator-guide.md). |
 | Moderation | Exact `TWO_MODERATION=1`; enabled config requires `TWO_OWEN_USER_ID`; protected-role policy applies. | Forwarded; channel handlers `/purge`, `/slowmode`, `/lockdown`, `/unlock` are registered and subject to activation and permission checks. Do not infer every member-moderation builtin executes. No config toggle demonstrated as an emergency stop. |
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Per-feature gates, not operational containment. Verify the affected deployed handler; registry publishing or a periodic job alone does not prove a specific action is active. |
 | Onboarding | `TWO_ONBOARDING_MODE=legacy|session|anchor`, default legacy; `TWO_ONBOARDING_DRY_RUN=1`. | Mode/dry-run contracts are feature-scoped, not bot-wide stop controls. Verify the affected handler and staging evidence; a catalogue value alone is not a runtime activation or reload receipt. |

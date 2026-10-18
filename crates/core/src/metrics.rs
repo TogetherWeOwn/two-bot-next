@@ -343,6 +343,27 @@ pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
 /// unrecognised outcome collapses to the last entry (`rejected`) rather than
 /// growing the series vocabulary.
 pub const PRESENCE_CAPTURE_OUTCOMES: &[&str] = &["inserted", "duplicate", "rejected"];
+/// Terminal automod decision outcomes for
+/// `two_bot_automod_decisions_total{outcome}`. Mirrors
+/// `automod_runtime::CompletionKind::as_str` in declaration order: `accepted`
+/// for clean content, `already_processed` for a counted retry, `dry_run` for
+/// a matched dry-run capture, `protected` for an exempt target, `deleted` /
+/// `warned` / `timed_out` for enforced ladders, and `sanction_refused` when
+/// the delete-adjacent sanction could not run. Exactly eight series from
+/// process start; no message text, excerpts or user IDs ever become labels.
+/// Unknown outcomes collapse to the trailing `sanction_refused` slot only
+/// when the allowlist grows; today every caller passes a member, so that
+/// slot stays zero unless hostile input arrives.
+pub const AUTOMOD_DECISION_OUTCOMES: &[&str] = &[
+    "accepted",
+    "already_processed",
+    "dry_run",
+    "protected",
+    "deleted",
+    "warned",
+    "timed_out",
+    "sanction_refused",
+];
 /// Website-action receiver families for
 /// `two_bot_internal_actions_total{family,outcome}` (TOG-20119, roadmap
 /// M4.23). The signed receiver (`crates/bot/src/internal_action_http.rs`)
@@ -405,6 +426,34 @@ pub const EVENTSUB_DELIVERY_KINDS: [&str; 6] = [
 /// Go-live post attempts by bounded outcome. The outcome vocabulary is fixed;
 /// post identifiers and error details are never retained.
 pub const EVENTSUB_POST_OUTCOMES: [&str; 4] = ["attempted", "succeeded", "failed", "other"];
+/// Outcomes of one EventSub reconcile pass for
+/// `two_bot_eventsub_reconcile_passes_total{outcome}`: `healthy` when every
+/// desired broadcaster holds a healthy subscription afterwards, `pending` when
+/// re-created but not all verified yet, `failed` when an action failed or a
+/// healthy subscription is missing (including listing failures). Exactly these
+/// three series exist; an unrecognised outcome collapses to the trailing
+/// `failed` (fail-closed) rather than growing the series vocabulary.
+pub const EVENTSUB_RECONCILE_OUTCOMES: &[&str] = &["healthy", "pending", "failed"];
+/// Successful reconcile mutations for
+/// `two_bot_eventsub_reconcile_actions_total{action}`: 2xx creates and deletes
+/// (already-gone deletes count). 409 already-exists confirmations fold into the
+/// pass outcome, not into actions. Unknown actions collapse to the trailing
+/// `delete` slot only when the allowlist grows.
+pub const EVENTSUB_RECONCILE_ACTIONS: &[&str] = &["create", "delete"];
+/// Failure sites for `two_bot_eventsub_reconcile_errors_total{error_class}`:
+/// the failure-site `error_class` log strings in `eventsub_reconcile`
+/// (`reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`,
+/// `reconcile_failed`), so those logs and metrics join without response bytes.
+/// `reconcile_pending`, config refusals and parked passes stay log-only. No
+/// status code, body, broadcaster, subscription id or secret ever becomes a
+/// label. Unknown classes collapse to the trailing `other`.
+pub const EVENTSUB_RECONCILE_ERROR_CLASSES: &[&str] = &[
+    "reconcile_action_failed",
+    "reconcile_prior_failed",
+    "reconcile_unhealthy",
+    "reconcile_failed",
+    "other",
+];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -525,6 +574,7 @@ struct Values {
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
     presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
+    automod_decisions: [u64; AUTOMOD_DECISION_OUTCOMES.len()],
     last_ready_unix: Option<u64>,
     last_resume_unix: Option<u64>,
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
@@ -544,6 +594,9 @@ struct Values {
     eventsub_received: u64,
     eventsub_classified: [u64; EVENTSUB_DELIVERY_KINDS.len()],
     eventsub_posts: [u64; EVENTSUB_POST_OUTCOMES.len()],
+    eventsub_reconcile_passes: [u64; EVENTSUB_RECONCILE_OUTCOMES.len()],
+    eventsub_reconcile_actions: [u64; EVENTSUB_RECONCILE_ACTIONS.len()],
+    eventsub_reconcile_errors: [u64; EVENTSUB_RECONCILE_ERROR_CLASSES.len()],
 }
 
 /// Storage is fixed-size, except the per-actor voice stall map, which is
@@ -634,6 +687,22 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter =
             &mut values.presence_capture[bounded_index(outcome, PRESENCE_CAPTURE_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One terminal automod decision (see [`AUTOMOD_DECISION_OUTCOMES`]).
+    /// Call once per committed [`StoredOutcome`](crate::automod_runtime::StoredOutcome):
+    /// the shared activation settles exactly one receipt per inspection, so
+    /// replays and retained claims never call this. The outcome is the whole
+    /// label vocabulary — no message text, excerpts or user IDs ever become
+    /// labels — and an unrecognised outcome collapses to `sanction_refused`.
+    pub fn automod_decision(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.automod_decisions[bounded_index(outcome, AUTOMOD_DECISION_OUTCOMES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -1143,6 +1212,52 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
+    /// One completed EventSub reconcile pass by outcome (see
+    /// [`EVENTSUB_RECONCILE_OUTCOMES`]). Call exactly once per pass from the
+    /// reconcile executor: `healthy`, `pending`, or `failed`. Unknown outcomes
+    /// collapse to `failed`.
+    pub fn eventsub_reconcile_pass(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.eventsub_reconcile_passes
+            [bounded_index(outcome, EVENTSUB_RECONCILE_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// Successful reconcile mutations by bounded action (`create`/`delete`),
+    /// counted from the executed plan outcomes. Call with the per-pass counts;
+    /// zero is a no-op. Unknown actions collapse to `delete` only when the
+    /// allowlist grows. No broadcaster, subscription id or body is retained.
+    pub fn eventsub_reconcile_action(&self, action: &str, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.eventsub_reconcile_actions
+            [bounded_index(action, EVENTSUB_RECONCILE_ACTIONS)];
+        *counter = counter.saturating_add(count);
+    }
+
+    /// One reconcile failure site by log `error_class` (see
+    /// [`EVENTSUB_RECONCILE_ERROR_CLASSES`]). Call once per site per pass,
+    /// except `reconcile_action_failed`, which counts once per failed action.
+    /// Unknown classes collapse to `other`; no status, body or response bytes
+    /// ever become a label.
+    pub fn eventsub_reconcile_error(&self, error_class: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.eventsub_reconcile_errors
+            [bounded_index(error_class, EVENTSUB_RECONCILE_ERROR_CLASSES)];
+        *counter = counter.saturating_add(1);
+    }
+
     /// Current audit mirror delivery-halt state (M4.48): `true` while the
     /// persistent kill switch is engaged, `false` once it is cleared. Call
     /// once per readable `audit_retry` sweep from the store's `delivery_halt`
@@ -1242,6 +1357,22 @@ impl Metrics {
             writeln!(
                 out,
                 "two_bot_presence_capture_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_automod_decisions_total",
+            "counter",
+            "Terminal automod inspection outcomes by bounded CompletionKind; fixed eight series.",
+        );
+        for (outcome, count) in AUTOMOD_DECISION_OUTCOMES
+            .iter()
+            .zip(values.automod_decisions)
+        {
+            writeln!(
+                out,
+                "two_bot_automod_decisions_total{{outcome=\"{outcome}\"}} {count}"
             )
             .unwrap();
         }
@@ -1731,6 +1862,54 @@ impl Metrics {
             writeln!(
                 out,
                 "two_bot_eventsub_posts_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_eventsub_reconcile_passes_total",
+            "counter",
+            "EventSub reconcile passes by bounded outcome; alert when failed rises across scrapes.",
+        );
+        for (outcome, count) in EVENTSUB_RECONCILE_OUTCOMES
+            .iter()
+            .zip(values.eventsub_reconcile_passes)
+        {
+            writeln!(
+                out,
+                "two_bot_eventsub_reconcile_passes_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_eventsub_reconcile_actions_total",
+            "counter",
+            "Successful EventSub reconcile mutations by bounded action.",
+        );
+        for (action, count) in EVENTSUB_RECONCILE_ACTIONS
+            .iter()
+            .zip(values.eventsub_reconcile_actions)
+        {
+            writeln!(
+                out,
+                "two_bot_eventsub_reconcile_actions_total{{action=\"{action}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_eventsub_reconcile_errors_total",
+            "counter",
+            "EventSub reconcile failure sites by bounded log error_class; no response bytes in labels.",
+        );
+        for (error_class, count) in EVENTSUB_RECONCILE_ERROR_CLASSES
+            .iter()
+            .zip(values.eventsub_reconcile_errors)
+        {
+            writeln!(
+                out,
+                "two_bot_eventsub_reconcile_errors_total{{error_class=\"{error_class}\"}} {count}"
             )
             .unwrap();
         }
@@ -2689,6 +2868,111 @@ mod tests {
     }
 
     #[test]
+    fn eventsub_reconcile_signals_stay_bounded_and_saturate() {
+        // Reconcile health: one pass series per outcome, one action series per
+        // mutation kind, one error series per log error_class. Per-subscription
+        // labels never reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"healthy\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"pending\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 0\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 0\n"));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_unhealthy\"} 0\n"
+        ));
+        metrics.eventsub_reconcile_pass("healthy");
+        metrics.eventsub_reconcile_pass("pending");
+        metrics.eventsub_reconcile_pass("failed");
+        metrics.eventsub_reconcile_action("create", 2);
+        metrics.eventsub_reconcile_action("delete", 1);
+        metrics.eventsub_reconcile_action("create", 0);
+        metrics.eventsub_reconcile_error("reconcile_action_failed");
+        metrics.eventsub_reconcile_error("reconcile_prior_failed");
+        metrics.eventsub_reconcile_error("reconcile_unhealthy");
+        metrics.eventsub_reconcile_error("reconcile_failed");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"healthy\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"pending\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 1\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"create\"} 2\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_action_failed\"} 1\n"
+        ));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_prior_failed\"} 1\n"
+        ));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_unhealthy\"} 1\n"
+        ));
+        assert!(text.contains(
+            "two_bot_eventsub_reconcile_errors_total{error_class=\"reconcile_failed\"} 1\n"
+        ));
+        // Fixed cardinality: 3 pass outcomes + 2 actions + 5 error classes.
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_eventsub_reconcile_"))
+            .collect();
+        assert_eq!(
+            series.len(),
+            EVENTSUB_RECONCILE_OUTCOMES.len()
+                + EVENTSUB_RECONCILE_ACTIONS.len()
+                + EVENTSUB_RECONCILE_ERROR_CLASSES.len()
+        );
+        let mut unique = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(unique.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn eventsub_reconcile_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.eventsub_reconcile_pass(&hostile);
+            metrics.eventsub_reconcile_action(&hostile, 1);
+            metrics.eventsub_reconcile_error(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 100\n"));
+        assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 100\n"));
+        assert!(
+            text.contains("two_bot_eventsub_reconcile_errors_total{error_class=\"other\"} 100\n")
+        );
+    }
+
+    #[test]
+    fn eventsub_reconcile_counters_saturate_without_wrapping() {
+        let metrics = Metrics::default();
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.eventsub_reconcile_passes
+                [bounded_index("healthy", EVENTSUB_RECONCILE_OUTCOMES)] = u64::MAX;
+            values.eventsub_reconcile_actions
+                [bounded_index("create", EVENTSUB_RECONCILE_ACTIONS)] = u64::MAX;
+        }
+        metrics.eventsub_reconcile_pass("healthy");
+        metrics.eventsub_reconcile_action("create", 9);
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_eventsub_reconcile_passes_total{{outcome=\"healthy\"}} {}\n",
+            u64::MAX
+        )));
+        assert!(text.contains(&format!(
+            "two_bot_eventsub_reconcile_actions_total{{action=\"create\"}} {}\n",
+            u64::MAX
+        )));
+    }
+
+    #[test]
     fn disconnects_and_missed_events_start_at_zero_and_saturate() {
         let metrics = Metrics::default();
         let text = metrics.render(None);
@@ -2711,6 +2995,93 @@ mod tests {
         assert!(text.contains(&format!("two_bot_gateway_disconnects_total {}\n", u64::MAX)));
         assert!(text.contains(&format!(
             "two_bot_gateway_missed_events_total {}\n",
+            u64::MAX
+        )));
+    }
+
+    #[test]
+    fn automod_decisions_cover_each_completion_kind_without_new_series() {
+        // TOG-28481: one counter per terminal CompletionKind, fixed 8-value
+        // vocabulary. No message text, excerpts or user IDs ever reach labels.
+        use crate::automod_runtime::CompletionKind;
+        let kinds = [
+            CompletionKind::Accepted,
+            CompletionKind::AlreadyProcessed,
+            CompletionKind::DryRun,
+            CompletionKind::Protected,
+            CompletionKind::Deleted,
+            CompletionKind::Warned,
+            CompletionKind::TimedOut,
+            CompletionKind::SanctionRefused,
+        ];
+        assert_eq!(
+            kinds.map(CompletionKind::as_str).as_slice(),
+            AUTOMOD_DECISION_OUTCOMES,
+            "CompletionKind::as_str must mirror the metrics allowlist in order"
+        );
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        for outcome in AUTOMOD_DECISION_OUTCOMES {
+            assert!(text.contains(&format!(
+                "two_bot_automod_decisions_total{{outcome=\"{outcome}\"}} 0\n"
+            )));
+        }
+        for kind in kinds {
+            metrics.automod_decision(kind.as_str());
+        }
+        metrics.automod_decision("deleted");
+        let text = metrics.render(None);
+        for (kind, count) in [
+            (CompletionKind::Accepted, 1),
+            (CompletionKind::AlreadyProcessed, 1),
+            (CompletionKind::DryRun, 1),
+            (CompletionKind::Protected, 1),
+            (CompletionKind::Deleted, 2),
+            (CompletionKind::Warned, 1),
+            (CompletionKind::TimedOut, 1),
+            (CompletionKind::SanctionRefused, 1),
+        ] {
+            assert!(text.contains(&format!(
+                "two_bot_automod_decisions_total{{outcome=\"{}\"}} {count}\n",
+                kind.as_str()
+            )));
+        }
+        // Fixed cardinality: exactly eight series, parseable samples.
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_automod_decisions_total{"))
+            .collect();
+        assert_eq!(series.len(), AUTOMOD_DECISION_OUTCOMES.len());
+        let mut unique = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(unique.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn automod_decision_hostile_labels_collapse_and_saturate() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.automod_decision(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(
+            text.contains("two_bot_automod_decisions_total{outcome=\"sanction_refused\"} 100\n")
+        );
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.automod_decisions = [u64::MAX; AUTOMOD_DECISION_OUTCOMES.len()];
+        }
+        metrics.automod_decision("accepted");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_automod_decisions_total{{outcome=\"accepted\"}} {}\n",
             u64::MAX
         )));
     }

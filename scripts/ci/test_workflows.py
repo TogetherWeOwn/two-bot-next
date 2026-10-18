@@ -1149,10 +1149,10 @@ def staging_active_errors(workflow):
     return errors
 
 
-# Pinned build image shared with the staging-migrate plan job (same runner
-# binary, same toolchain). A digest bump must move both together.
-SCHEMA_GATE_IMAGE = ("rust:bookworm@sha256:"
-                     "93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e")
+# Pinned build image shared with the migration plan jobs (same runner
+# binary, same toolchain). A digest bump must move all consumers together.
+SCHEMA_GATE_IMAGE = ("rust:1.98-trixie@sha256:"
+                     "a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546")
 
 
 def schema_gate_errors(workflow, name="deploy-staging.yml"):

@@ -171,6 +171,7 @@ pub(crate) fn retry_job<M: AuditMirror + Clone + 'static>(
     Job {
         name: JOB,
         cadence: CADENCE,
+        cadence_source: None,
         startup_jitter,
         timeout: TIMEOUT,
         action: Arc::new(move || {
