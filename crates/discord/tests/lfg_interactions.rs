@@ -751,6 +751,274 @@ async fn router_fences_guild_permissions_and_disabled_announcements() {
     db.cleanup().await;
 }
 
+fn close_without_id(id: u64, permissions: u64) -> Interaction {
+    invocation(
+        id,
+        3333,
+        permissions,
+        json!({"id": "1", "name": "lfg-close", "type": 1, "options": []}),
+        2,
+    )
+}
+
+async fn store_counts(pool: &sqlx::PgPool) -> (i64, i64, i64, i64) {
+    let posts: i64 = sqlx::query_scalar("SELECT count(*) FROM lfg_posts")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let roles: i64 = sqlx::query_scalar("SELECT count(*) FROM lfg_roles")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let signups: i64 = sqlx::query_scalar("SELECT count(*) FROM lfg_signups")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM announcements_audit_log")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (posts, roles, signups, audits)
+}
+
+fn channel_requests_any(mock: &MockRest) -> usize {
+    mock.requests()
+        .iter()
+        .filter(|r| r.path.starts_with("/api/v10/channels/"))
+        .count()
+}
+
+#[tokio::test]
+#[ignore = "needs agent-testdb or the CI service container"]
+async fn router_refuses_invalid_close_ids_without_store_or_channel_mutation() {
+    // S3: the /lfg-close interaction-edge guard (lfg_interactions.rs:153-164)
+    // refuses empty and over-128-UTF-16-unit ids before admission, SQL, audit
+    // or channel work. This sends the matrix through the actual router
+    // (InteractionRuntime::handle), not the pure resolver, so deleting the
+    // handler bound lets the stored 129-char post close and the test fails.
+    const REFUSAL: &str = "LFG id must be between 1 and 128 characters.";
+    const MISSING_ROW: &str = "LFG was already closed or missing.";
+    const MISSING_OPTION: &str = "Missing id option.";
+    let db = TestDb::new().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "5900"}))).await;
+    let rt = runtime(db.pool.clone(), &mock, true);
+
+    // One ordinary post plus exact-boundary posts that must stay closable, plus
+    // a stored 129-char post that the guard must leave open. Seeded directly
+    // so the refusal matrix has durable rows to preserve.
+    let main_post = lfg::LfgPost {
+        id: "lfg-7801".into(),
+        guild_id: GUILD.into(),
+        channel_id: CHANNEL.into(),
+        message_id: None,
+        title: "Friday raid".into(),
+        starts_at: "2099-09-11T20:00:00Z".into(),
+        status: lfg::LfgStatus::Open,
+        created_by: "3333".into(),
+        created_at: "2026-09-30T00:00:00.000Z".into(),
+        closed_at: None,
+    };
+    let ascii128 = "a".repeat(128);
+    let emoji64 = "😀".repeat(64); // 64 chars, 128 UTF-16 units (surrogate pairs count 2).
+    let stored129 = "z".repeat(129);
+    for id in [&main_post.id, &ascii128, &emoji64, &stored129] {
+        let post = lfg::LfgPost {
+            id: id.clone(),
+            guild_id: GUILD.into(),
+            channel_id: CHANNEL.into(),
+            message_id: None,
+            title: "Stored title".into(),
+            starts_at: "2099-09-11T20:00:00Z".into(),
+            status: lfg::LfgStatus::Open,
+            created_by: "3333".into(),
+            created_at: "2026-09-30T00:00:00.000Z".into(),
+            closed_at: None,
+        };
+        let roles = lfg::spec_roles(&post.id, &lfg::parse_role_spec("tank:Tank:1").unwrap());
+        store::put_lfg(&db.pool, &post, &roles, true).await.unwrap();
+        store::signup_lfg(
+            &db.pool,
+            GUILD,
+            &post.id,
+            "tank",
+            "3334",
+            "2026-09-30T00:01:00.000Z",
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(ascii128.encode_utf16().count(), 128);
+    assert_eq!(emoji64.encode_utf16().count(), 128);
+    assert_eq!(stored129.encode_utf16().count(), 129);
+    let baseline = store_counts(&db.pool).await;
+    assert_eq!(baseline, (4, 4, 4, 0));
+    let main_signups = store::list_lfg_signups(&db.pool, &main_post.id)
+        .await
+        .unwrap();
+    assert_eq!(main_signups.len(), 1);
+
+    // Refusal matrix: empty, ASCII overlong, multibyte overlong (UTF-16, not
+    // chars or bytes), hostile mention tail, and the stored 129-char row.
+    // The 65-emoji case is 65 chars but 130 UTF-16 units, so a char-counting
+    // bound would wrongly admit it.
+    let emoji65 = "😀".repeat(65);
+    assert_eq!(emoji65.encode_utf16().count(), 130);
+    let long_129 = "é".repeat(129);
+    assert_eq!(long_129.encode_utf16().count(), 129);
+    let hostile = "@everyone".repeat(20);
+    assert!(hostile.encode_utf16().count() > 128);
+    let refusals = [
+        String::new(),
+        "x".repeat(129),
+        "y".repeat(300),
+        emoji65,
+        long_129,
+        hostile,
+        stored129.clone(),
+    ];
+    let mut next_id: u64 = 7801;
+    for post_id in &refusals {
+        let requests_before = mock.requests().len();
+        let channels_before = channel_requests_any(&mock);
+        assert!(rt
+            .handle(&close(next_id, post_id, PERM_MANAGE_EVENTS))
+            .await
+            .unwrap());
+        next_id += 1;
+        assert_eq!(last_reply(&mock), REFUSAL);
+        // Fixed literal: no echo of the hostile tail, mention-safe, bounded.
+        let requests = mock.requests();
+        let reply = body(requests.last().expect("refusal edit"));
+        assert_eq!(reply["content"].as_str().unwrap(), REFUSAL);
+        assert!(!reply["content"].as_str().unwrap().contains("@everyone"));
+        assert_eq!(reply["allowed_mentions"]["parse"], json!([]));
+        assert!(REFUSAL.encode_utf16().count() <= lfg::MAX_MESSAGE_CHARS);
+        // Exactly the deferred ack plus the ephemeral edit; no channel work.
+        assert_eq!(requests.len() - requests_before, 2);
+        assert_eq!(channel_requests_any(&mock) - channels_before, 0);
+        // Sessions, signups, roles and audit rows all unchanged.
+        assert_eq!(store_counts(&db.pool).await, baseline);
+        assert_eq!(
+            store::list_lfg_signups(&db.pool, &main_post.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    // The stored overlong row proves the handler bound: without it the router
+    // would have closed this post instead of refusing.
+    assert_eq!(
+        store::get_lfg(&db.pool, GUILD, &stored129)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        lfg::LfgStatus::Open
+    );
+
+    // Missing-option control: no id option at all. Same no-mutation shape with
+    // its own missing-option text.
+    let requests_before = mock.requests().len();
+    assert!(rt
+        .handle(&close_without_id(next_id, PERM_MANAGE_EVENTS))
+        .await
+        .unwrap());
+    next_id += 1;
+    assert_eq!(last_reply(&mock), MISSING_OPTION);
+    assert_eq!(mock.requests().len() - requests_before, 2);
+    assert_eq!(store_counts(&db.pool).await, baseline);
+
+    // Guard-pass controls: 100 e-acutes are 100 UTF-16 units but 200 bytes, so
+    // a byte-counting bound would wrongly refuse them. They reach the store and
+    // report the existing missing-row outcome with one audit row, like any
+    // unknown id. Whitespace-only keeps that same missing-row behavior.
+    let byte_control = "é".repeat(100);
+    assert_eq!(byte_control.encode_utf16().count(), 100);
+    assert_eq!(byte_control.len(), 200);
+    for (post_id, expected) in [
+        (byte_control, MISSING_ROW),
+        ("no-such-lfg-7800".to_owned(), MISSING_ROW),
+        ("   ".to_owned(), MISSING_ROW),
+    ] {
+        let (posts, roles, signups, audits) = store_counts(&db.pool).await;
+        let requests_before = mock.requests().len();
+        let channels_before = channel_requests_any(&mock);
+        assert!(rt
+            .handle(&close(next_id, &post_id, PERM_MANAGE_EVENTS))
+            .await
+            .unwrap());
+        next_id += 1;
+        assert_eq!(last_reply(&mock), expected);
+        assert_eq!(mock.requests().len() - requests_before, 2);
+        assert_eq!(channel_requests_any(&mock) - channels_before, 0);
+        // No session/signup/role change; exactly one missing-row audit row.
+        let after = store_counts(&db.pool).await;
+        assert_eq!((after.0, after.1, after.2), (posts, roles, signups));
+        assert_eq!(after.3, audits + 1);
+    }
+
+    // Exact-boundary valid controls: 128 ASCII units and 64 emoji (128 units)
+    // close successfully, proving the bound is > 128, not >= 128, in UTF-16.
+    for post_id in [&ascii128, &emoji64] {
+        let (_, _, _, audits) = store_counts(&db.pool).await;
+        assert!(rt
+            .handle(&close(next_id, post_id, PERM_MANAGE_EVENTS))
+            .await
+            .unwrap());
+        next_id += 1;
+        assert_eq!(last_reply(&mock), "LFG closed.");
+        assert_eq!(
+            store::get_lfg(&db.pool, GUILD, post_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            lfg::LfgStatus::Closed
+        );
+        // Closing flips status without dropping signups; one close audit row.
+        assert_eq!(
+            store::list_lfg_signups(&db.pool, post_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let (_, _, _, after_audits) = store_counts(&db.pool).await;
+        assert_eq!(after_audits, audits + 1);
+    }
+
+    // Valid close lifecycle stays green: the ordinary post closes, then a
+    // second close reports the missing-row outcome.
+    assert!(rt
+        .handle(&close(next_id, &main_post.id, PERM_MANAGE_EVENTS))
+        .await
+        .unwrap());
+    next_id += 1;
+    assert_eq!(last_reply(&mock), "LFG closed.");
+    assert_eq!(
+        store::get_lfg(&db.pool, GUILD, &main_post.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        lfg::LfgStatus::Closed
+    );
+    assert!(rt
+        .handle(&close(next_id, &main_post.id, PERM_MANAGE_EVENTS))
+        .await
+        .unwrap());
+    assert_eq!(last_reply(&mock), MISSING_ROW);
+    assert!(
+        channel_requests_any(&mock) == 0,
+        "close with no message id edits nothing"
+    );
+
+    mock.shutdown().await;
+    drop(rt);
+    db.cleanup().await;
+}
+
 #[tokio::test]
 #[ignore = "needs agent-testdb or the CI service container"]
 async fn queued_lfg_work_leaves_pool_connections_for_the_gateway() {

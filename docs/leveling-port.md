@@ -26,9 +26,18 @@ and [`discord.ts`](https://github.com/TogetherWeOwn/two-bot/blob/d5d11793/src/le
   legacy behavior, the current store renders a missing XP row as
   `Rank **Unranked** (no XP recorded)`; an existing zero-XP row retains a numeric
   rank. XP ties use stored member IDs ascending.
-- `/leaderboard`: public top 10, mention parsing suppressed; empty text is
-  `No XP has been earned yet.`. The store supports a limit clamped to 1–25.
-  Legacy has no offset/cursor paging or page components; none are invented here.
+- `/leaderboard`: seasonal public top 10 under `**TWO XP Leaderboard (YYYY-QN)**`
+  (`leaderboard_reply_for_season`, `crates/core/src/leveling.rs:478`), mention
+  parsing suppressed; XP and level derive from `member_season_xp` for the
+  routed season (`seasonal_leaderboard`, `crates/core/src/leveling_store.rs:715`).
+  An empty season renders the header plus `No XP has been earned yet.` with no
+  lifetime fallback. The store supports a limit clamped to 1–25. Legacy has no
+  offset/cursor paging or page components; none are invented here. This
+  intentionally diverges from the frozen legacy lifetime board: the seasonal
+  projection fills only from awards made after the seasonal mirror shipped,
+  so the first partial quarter omits earlier XP and the 2026-Q4 board header
+  itself carries ` — partial: early-season XP not counted` until a backfill
+  lands or the quarter rolls over.
 - Legacy level-up processing grants earned roles but posts **no channel
   announcement**. The reply/effect types intentionally do not add one.
 - Reward grants skip already-held roles. Session onboarding suppresses all

@@ -397,13 +397,17 @@ fix belongs to the on-call engineer, not another redeploy.
 
 Voice room lifecycle failures between two keepalive samples
 (`two_bot_voice_operations_total`, `two_bot_voice_dead_letters_total`,
-`two_bot_voice_orphans_total`). Fires when failed operations exceed 5% of
+`two_bot_voice_orphans_total`, `two_bot_voice_vote_kick_total`). Fires when failed operations exceed 5% of
 room operations with at least 10 operations in the window (the T3 room
 create/move/delete budget in
 [voice-cutover-rollback-triggers.md](voice-cutover-rollback-triggers.md)),
-or when any new dead-letter (a queue write that exhausted 10 attempts) or
+when any new dead-letter (a queue write that exhausted 10 attempts) or
 orphan (an untracked creator-channel orphan needing manual deletion)
-appears — so a low-volume stranded-member failure still pages. Any outcome
+appears — so a low-volume stranded-member failure still pages — or when any
+new vote-kick enforcement failure (`discord_error`, `gave_up` or
+`permission_missing` on `two_bot_voice_vote_kick_total`) appears, so a
+vote-kick path that always fails enforcement pages even while room
+operations look healthy. Any outcome
 other than `success` (`category_full`, `discord`, `persistence`,
 `cancelled`) counts as a failure: the join did not place a room, or the
 move/delete did not complete. `refused` (a room cap or create burst, per
@@ -411,11 +415,18 @@ member or per guild) is admission policy working as designed, so it never
 pages. No installed rule watches it: read it from
 `two_bot_voice_operations_total{outcome="refused"}`, and if joins stop placing
 rooms while it climbs, look for a stuck cap (an unsettled reservation holding a
-slot). A counter reset (process restart) skips the window rather than firing,
-and a slow trickle below threshold stays silent.
+slot). Benign vote-kick outcomes never page either: refusals such as
+`cooldown` are admission policy, and the remaining enforcement codes
+(`connect_denied_and_disconnected`, `connect_denied_target_absent`,
+`skipped_room_gone`, `skipped_target_protected`) are successful or
+already-terminal writes. A counter reset (process restart) skips the window rather than firing,
+and a slow trickle below threshold stays silent. A missing vote-kick family
+(older containers never emitted it) or a malformed sample holds a firing
+alert instead of resolving it.
 
 First response: scope the failing operation from the `op`/`outcome` labels
-on `two_bot_voice_operations_total` via the authorized `/ops/metrics`
+on `two_bot_voice_operations_total` and the `outcome` label on
+`two_bot_voice_vote_kick_total` via the authorized `/ops/metrics`
 scrape; confirm no deploy is in progress; then read the container logs for
 the matching `voice_event="voice_operation"` warn lines (see the lifecycle
 signal inventory in
@@ -528,6 +539,33 @@ Escalate when the burn persists across windows (the budget exhausts in 4 hours
 at full fast burn), when half the 48h budget is spent, or when the spike
 matches a deploy — the fix belongs to the on-call engineer, not another
 redeploy.
+
+#### Alert: error budget slow burn
+
+The same REST error budget is burning faster than 3x in both the last 2 hours
+and the last 15 minutes. This is the ticket-severity companion to the
+fast-burn page above: a moderate but sustained degradation — a slow leak of
+`5xx` or `transport` errors — that never spikes hard enough to page. Each
+window needs at least 10 eligible requests and two budget errors; quiet
+traffic and one bad event stay silent. After startup the ticket waits for a
+full 2 h of history; a counter reset (process restart) rebuilds the ring
+instead of firing and holds a firing ticket instead of resolving it, so a
+deploy never posts a spurious RESOLVED. A scrape gap or missing series
+holds a firing ticket, and a covered quiet or below-threshold 15 min window
+resolves it even while the 2 h window is still unknown. Window edges land
+on whole
+keepalive scrapes, so the comparison carries the same ~1% allowance as the
+fast rule.
+
+First response: same signals as the fast burn — compare `5xx` against
+`transport` growth by `route` via the authorized `/ops/metrics` scrape, then
+read the container logs for the failing route. Triage within the watch
+shift; do not close it as "fast burn resolved": the fast window can clear
+while the slow grind continues.
+
+Escalate to a page when half the 48h budget is spent, when the slow burn
+persists across two consecutive 2 h windows, or when the leak matches a
+deploy — the fix belongs to the on-call engineer, not another redeploy.
 
 #### Alert: gateway missed events
 

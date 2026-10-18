@@ -2,9 +2,17 @@
 # Worker + Durable Object wrapper (ADR 0001: `lite` target, DO-alarm keepalive).
 #
 # Secrets (DISCORD_TOKEN, DATABASE_URL) are set as Worker secrets and passed
-# into the container as env vars — never baked into the image:
-#   wrangler secret put DISCORD_TOKEN
-#   wrangler secret put DATABASE_URL
+# into the container as env vars — never baked into the image. Stamp each
+# secret-change version with the serving SHA so it keeps its rollback receipt
+# (docs/production-deploy.md); a plain `wrangler secret put` publishes an
+# unstamped version that manual rollback refuses. Precheck first: `versions
+# secret put` builds on the newest-created version, not the serving one —
+# confirm the last `wrangler versions list` block (oldest first) equals
+# `wrangler deployments status` serving, else redeploy the intended SHA
+# through the workflow first:
+#   wrangler versions secret put --env <env> DISCORD_TOKEN --message <sha>
+#   wrangler versions secret put --env <env> DATABASE_URL --message <sha>
+#   wrangler versions deploy --env <env>
 
 name = "two-bot-next"
 main = "src/index.ts"
@@ -77,10 +85,20 @@ KEEPALIVE_SECONDS = "60"
 # Staging deploys automatically via deploy-staging.yml; production deploys are
 # manual and owned by B4 (TOG-9699): only the dispatch-only deploy-production.yml,
 # behind the `production` GitHub Environment (docs/production-deploy.md).
-# Secrets per environment (never here):
-#   wrangler secret put --env staging DISCORD_TOKEN      # staging bot token
-#   wrangler secret put --env staging GUILD_ID           # TWO Staging guild
-#   wrangler secret put --env production DISCORD_TOKEN   # B4 only
+# Secrets per environment (never here). Stage each secret on a new version
+# stamped with the serving SHA, then deploy that version, so every serving
+# version keeps its provenance receipt (docs/production-deploy.md). Precheck
+# first: `versions secret put` builds on the newest-created version, not the
+# serving one — confirm the last `wrangler versions list --env <env>` block
+# (oldest first) equals `wrangler deployments status --env <env>` serving,
+# else redeploy the intended
+# SHA through the workflow first:
+#   wrangler versions secret put --env staging DISCORD_TOKEN --message <sha>      # staging bot token
+#   wrangler versions secret put --env staging GUILD_ID --message <sha>           # TWO Staging guild
+#   wrangler versions secret put --env production DISCORD_TOKEN --message <sha>   # B4 only
+#   wrangler versions deploy --env <staging|production>
+# A plain `wrangler secret put` publishes an unstamped version that can never
+# form a receipt, so manual rollback to it refuses.
 [env.staging]
 # Staging break-glass origin for the read-only ops dashboard (TOG-22861).
 workers_dev = true
