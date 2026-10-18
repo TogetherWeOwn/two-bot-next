@@ -39,10 +39,6 @@ pub struct GatewayCommandConfig {
 }
 
 impl GatewayCommandConfig {
-    pub fn from_map(guild_id: u64, vars: &HashMap<String, String>) -> Result<Self, sqlx::Error> {
-        Self::from_map_for_activation(guild_id, vars, true)
-    }
-
     /// Activation-aware constructor mirroring `CommandRuntime::from_env`: a
     /// denied Moderation capability never reaches moderation validation, so a
     /// stale comma-space protected-role value cannot fail boot on live
@@ -399,19 +395,19 @@ mod tests {
     #[test]
     fn command_gates_use_shared_parsers_and_fail_closed() {
         let mut vars = HashMap::new();
-        assert!(GatewayCommandConfig::from_map(0, &vars).is_err());
-        let config = GatewayCommandConfig::from_map(1, &vars).unwrap();
+        assert!(GatewayCommandConfig::from_map_for_activation(0, &vars, true).is_err());
+        let config = GatewayCommandConfig::from_map_for_activation(1, &vars, true).unwrap();
         assert!(!config.gates.automations);
         assert!(!config.text_commands);
         assert!(!config.acceptance.permits_automations());
         vars.insert("TWO_AUTOMATIONS".into(), "1".into());
         vars.insert("TWO_TEXT_COMMANDS".into(), "1".into());
         vars.insert("TWO_AUTOMOD".into(), "0".into());
-        let config = GatewayCommandConfig::from_map(1, &vars).unwrap();
+        let config = GatewayCommandConfig::from_map_for_activation(1, &vars, true).unwrap();
         assert!(config.gates.automations && config.text_commands);
         assert!(config.acceptance.permits_automations());
         vars.insert("TWO_MODERATION".into(), "1".into());
-        assert!(GatewayCommandConfig::from_map(1, &vars).is_err());
+        assert!(GatewayCommandConfig::from_map_for_activation(1, &vars, true).is_err());
     }
 
     #[test]
@@ -550,7 +546,8 @@ mod tests {
             ("TWO_TEXT_COMMANDS".to_owned(), "1".to_owned()),
             ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
         ]);
-        let config = GatewayCommandConfig::from_map(2222, &vars).expect("command config");
+        let config = GatewayCommandConfig::from_map_for_activation(2222, &vars, true)
+            .expect("command config");
         assert_eq!(config.acceptance, AutomationMessageAcceptance::Unavailable);
         assert!(!config.acceptance.permits_automations());
 
