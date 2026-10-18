@@ -534,8 +534,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// whenever the facts it depends on change (creation, joins and leaves,
     /// owner handoff, limit) and propose the result on the rename lane, which
     /// coalesces to one pending name per channel within Discord's rename
-    /// budget. Rooms with a `/name` override keep it; a blank template keeps
-    /// the room's current name; a render the name filter blocks is skipped.
+    /// budget. Rooms with a `/name` override re-render the stored override
+    /// through the same sanitizer and filter instead of the creator template
+    /// (see `refresh_custom_name`); a blank template keeps the room's current
+    /// name; a render the name filter blocks is skipped.
     pub(super) fn refresh_template_names(&mut self, now_ms: u64) {
         let (ready, generation) = {
             let live = self.live.read_state();
@@ -599,7 +601,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // The status line follows the room whatever its name does: a
             // `/name` override, a blank name template or a name wait.
             self.refresh_voice_status(&room, &command);
-            if self.custom_names.contains_key(&room_id) {
+            if let Some(stored) = self.custom_names.get(&room_id).cloned() {
+                self.refresh_custom_name(&room, &command, &facts, &stored, now_ms);
                 continue;
             }
             let Some(template) = self
@@ -708,6 +711,102 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .retain(|room_id, _| rooms.contains_key(room_id));
         self.status_unknown
             .retain(|room_id| rooms.contains_key(room_id));
+    }
+
+    /// V5 recalculation for a room holding a `/name` override: render the
+    /// stored override against the room's live facts and propose the result on
+    /// the rename lane, which keeps one pending name per channel within
+    /// Discord's rename budget. Template-named rooms are untouched by this
+    /// path. A render the name filter blocks keeps the last proposed name and
+    /// the stored override. The stored text is never written back, so
+    /// `name_touched_at` keeps measuring set/restore, not recalculation.
+    fn refresh_custom_name(
+        &mut self,
+        room: &VoiceRoom,
+        command: &NameCommand,
+        facts: &NameFacts,
+        stored: &str,
+        now_ms: u64,
+    ) {
+        let room_id = room.channel_id;
+        // A person whose display name is unknown would render as "member":
+        // wait briefly for the name instead of spending a rename, but never
+        // longer than NAME_WAIT_MS.
+        let uses_original_creator = stored.to_ascii_lowercase().contains("@@original_creator@@");
+        let unknown = !self.name_directory.knows(room.owner_id)
+            || (uses_original_creator && !self.name_directory.knows(room.original_creator_id));
+        if unknown {
+            if !self.name_waits.contains_key(&room_id) {
+                metrics::global().voice_name("waiting_for_name");
+            }
+            let since = *self.name_waits.entry(room_id).or_insert(now_ms);
+            if now_ms.saturating_sub(since) < NAME_WAIT_MS {
+                self.name_inputs = None;
+                return;
+            }
+        } else {
+            self.name_waits.remove(&room_id);
+        }
+        let signature = NameSignature::of(facts);
+        if self.name_signatures.get(&room_id) == Some(&signature) {
+            return;
+        }
+        let checks = NameChecks {
+            policy: &command.policy,
+            filter: &facts.filter,
+            unique_names: false,
+            other_voice_names: &facts.other_names,
+        };
+        let render = RenderFacts {
+            context: &facts.context,
+            conditions: &facts.conditions,
+            fallback_name: &facts.fallback,
+        };
+        match decide_template_name(stored, &render, &checks) {
+            Ok(name) => {
+                // A channel the live snapshot cannot see yet is retried
+                // on a later pass.
+                match self.propose_name(room_id, &name, now_ms) {
+                    Some(outcome) => {
+                        let decision = match outcome {
+                            ProposeOutcome::Unchanged => "unchanged",
+                            ProposeOutcome::Queued { .. } => "queued",
+                        };
+                        log_template_name_decision(
+                            self.live.guild_id,
+                            room_id,
+                            facts.context.members_playing,
+                            decision,
+                        );
+                        metrics::global().voice_name(match outcome {
+                            ProposeOutcome::Unchanged => "unchanged",
+                            ProposeOutcome::Queued { .. } => "proposed",
+                        });
+                        self.name_signatures.insert(room_id, signature);
+                    }
+                    None => {
+                        log_template_name_decision(
+                            self.live.guild_id,
+                            room_id,
+                            facts.context.members_playing,
+                            "channel_unseen",
+                        );
+                        metrics::global().voice_name("channel_unseen");
+                        self.name_inputs = None;
+                    }
+                }
+            }
+            Err(_) => {
+                log_template_name_decision(
+                    self.live.guild_id,
+                    room_id,
+                    facts.context.members_playing,
+                    "template_blocked",
+                );
+                metrics::global().voice_name("blocked");
+                self.name_signatures.insert(room_id, signature);
+            }
+        }
     }
 
     /// Render the room's voice status line and leave it pending when it

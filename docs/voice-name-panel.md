@@ -77,9 +77,21 @@ channel and releases it no faster than Discord's rename limit. Ownership
 changes keep the override; deleting the room drops it with the row. Member
 erasure deletes whole `voice_rooms` rows, so it removes the override too.
 
+## Re-rendering on room changes (V5 recalculation)
+
+A room holding an override re-renders it on the `refresh_template_names`
+pass whenever the facts it reads change (joins and leaves, activity, the
+user limit): the stored text renders through the full template engine
+against the room's live facts and the render passes the same sanitizer and
+filter as a fresh submit. Template-named rooms render from the creator
+template on the same pass, untouched by the override path. Every re-render
+proposes through the existing rename coalescer (one pending name per
+channel, no faster than Discord's rename limit), so a churn burst lands as
+one paced rename. A render the filter blocks keeps the last proposed name
+and the stored override. A re-render never writes the override back, so
+`name_touched_at` keeps measuring set/restore, not recalculation.
+
 ## Not covered here
 
-Re-rendering a custom name when occupancy, activity or the limit changes
-(the V5 recalculation) is not wired into this runtime yet; the name is
-rendered when the owner sets it and when the room is restored. Publishing the
-`name` command is the registry publish change, behind `TWO_VOICE`.
+Publishing the `name` command is the registry publish change, behind
+`TWO_VOICE`.
