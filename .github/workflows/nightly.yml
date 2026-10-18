@@ -286,7 +286,6 @@ jobs:
           --skip store_failure_keeps_committed_cutover_evidence
           --skip connection_count_sees_other_roles_from_plan_login
           --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
-          --skip a_restarted_worker_rediscovers_a_channel_whose_rollback_failed
           --skip blocklisted_members_skip_per_user_rows_but_count_in_aggregates
           --skip persisted_member_rows_hold_ids_timestamps_enums_only
           --skip resume_continues_from_the_persisted_cursor
