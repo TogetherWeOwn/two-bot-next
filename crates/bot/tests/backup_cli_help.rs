@@ -42,13 +42,12 @@ impl Scratch {
         std::fs::read_dir(&self.0)
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|entry| {
+            .find(|entry| {
                 !entry
                     .file_name()
                     .to_str()
                     .is_some_and(|name| name.ends_with(".profraw"))
             })
-            .next()
             .is_none()
     }
 }
