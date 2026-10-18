@@ -164,6 +164,8 @@ actor, guild, channel, member, token or body content ever reaches a label.
 | `two_bot_voice_worker_halted` | None (label-free gauge) | Additional series: accepted but not required by the scrape validator, which pins only the alert-input label sets; read manually from the container exposition or the authenticated pull | Consumed by no alert rule; manual check named in the runbook fast-burn, slow-burn and creator-map-stale first responses | 1 while any current guild actor is halted by a store CredentialRefused or Discord 401, otherwise 0; a healthy guild cannot hide another guild's halt |
 | `two_bot_voice_queue_pending` | Fixed `lane`: `urgent` or `deferred` (exactly two series) | Same additional-series handling as above | Consumed by no alert rule; manual queue-side complement to the join-budget burn rules | Queued (not in-flight) voice actions per lane, saturating-summed across all current guild actors |
 | `two_bot_voice_queue_oldest_age_seconds` | None (label-free gauge) | Same additional-series handling as above | Consumed by no alert rule; manual queue-side complement to the join-budget burn rules | Age in seconds of the oldest queued voice action, the maximum across all current guild actors; 0 when every queue is empty |
+| `two_bot_voice_live_not_ready_seconds` | None (label-free gauge) | Same additional-series handling as above | Consumed by no alert rule yet; the host watchdog reads it directly (alert when it stays above 120 s) | Seconds a guild's live voice view has been not ready while the gateway is connected (READY or RESUMED handled), the maximum across all current guild actors; 0 when every view is ready or the gateway is down. While above 0 that guild's creator joins are dropped without an accept or refusal line |
+| `two_bot_voice_live_self_heal_total` | None (label-free counter) | Same additional-series handling as above | Consumed by no alert rule; any increase means a live view was left not ready on a connected gateway and was republished from the gateway cache | Live voice views republished by the not-ready-while-connected self-heal |
 
 ## EventSub delivery series
 
@@ -242,6 +244,7 @@ is the single shared spelling also pinned in `evidence.rs`
 | `voice_join_slow_burn` | Same inputs as `voice_join_fast_burn` | Ticket, not page: same budget burning faster than 6x in both the 6 h and 30 min windows with the same per-window volume and bad-move floors; catches the sustained grind the fast rule never spikes on; do not close as "fast burn resolved" |
 | `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` with `two_bot_voice_creator_map_generation` | Pages when the age since the last successful creator-map merge passes 600 s (two missed 5 min refreshes) after at least one merge; generation 0 (never merged: boot or voice parked) never fires; the gauges are optional scrape inputs, so older containers hold the previous state |
 | `error_budget_fast_burn` | All `two_bot_rest_requests_total` samples (eligible requests) against `result="5xx"` plus `result="transport"` (budget spend) | Pages when the REST error budget (99.9% success over 48 h) burns faster than 12x in both the 15 min and 2 min windows; each window needs at least 10 eligible requests and two budget errors; incomplete post-restart windows stay inactive; missing or malformed inputs hold the previous state |
+| `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` | Pages when the `tampered` counter (only `BadSignature`) rises in 3 consecutive samples; the first sample only baselines, a flat window resolves, a reset rebaselines, and missing/invalid scrapes hold firing |
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
@@ -339,6 +342,14 @@ one line per 5 minutes, so a burst across guilds names only the first. The
 actor respawns on the next guild snapshot (`publish_snapshot` on
 `GuildCreate`/resumed replay); voice, channel and role events for the guild
 are dropped until then.
+
+`voice live view was not ready on a connected gateway; republished from cache`
+(warn; `heal_not_ready` in `crates/bot/src/voice_rooms.rs`, guild-only field,
+no IDs): READY or RESUMED was handled but a guild's live voice view was still
+not ready, so creator joins in that guild were being dropped before a ticket.
+The next dispatch republished the view from the gateway cache; bumps
+`two_bot_voice_live_self_heal_total`. Rare by design: one line per repair,
+never per VOICE_STATE_UPDATE.
 
 Stall-watchdog actor messages without a `voice_event` field (all in
 `run_actor_with_limits` in `crates/bot/src/voice_rooms.rs`, guild-only fields,

@@ -79,6 +79,8 @@ mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
+#[cfg(test)]
+mod onboarding_unknown_only_acceptance_tests;
 mod ops_backfill;
 mod ops_http;
 mod preflight;
