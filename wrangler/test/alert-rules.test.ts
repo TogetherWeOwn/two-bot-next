@@ -11,7 +11,8 @@ const NOW = 1_000_000;
 function body(extra: string[]): string {
   return ["# HELP x y", "# TYPE x gauge", ...extra, ""].join("\n");
 }
-const ev = (lines: string[], prev = EMPTY_STATE) => evaluateMetrics(parseExposition(body(lines)), prev, NOW);
+const ev = (lines: string[], prev: MetricsAlertState = EMPTY_STATE, gatewayReady?: boolean) =>
+  evaluateMetrics(parseExposition(body(lines)), prev, NOW, gatewayReady);
 
 /** GitHub-style heading slugs for a doc's text; literal underscores survive. */
 function headingAnchors(text: string): Set<string> {
@@ -643,6 +644,127 @@ test("gateway unpaired: missing, duplicated, or non-numeric samples never clear 
   assert.deepEqual(ev(gateway(1, 1), absent.state).firing, []);
 });
 
+const NOT_READY = "gateway_not_ready";
+
+test("gateway not ready pages on the third consecutive non-ready sample and clears on any ready sample", () => {
+  // The first valid sample only stores the baseline, even while non-ready.
+  const one = ev([], EMPTY_STATE, false);
+  assert.deepEqual(one.firing, []);
+  assert.equal(one.state.gatewayNotReadySeen, true);
+  assert.equal(one.state.gatewayNotReadyStreak, 1);
+  const two = ev([], one.state, false);
+  assert.deepEqual(two.firing, []);
+  assert.equal(two.state.gatewayNotReadyStreak, 2);
+  const fire = ev([], two.state, false);
+  assert.deepEqual(fire.firing, [NOT_READY]);
+  // Stays firing while non-ready; starting (Armed) counts, not just down.
+  assert.deepEqual(ev([], fire.state, false).firing, [NOT_READY]);
+  // Any ready sample clears at once.
+  const clear = ev([], fire.state, true);
+  assert.deepEqual(clear.firing, []);
+  assert.equal(clear.state.gatewayNotReadyStreak, 0);
+  // Ready never fires and never starts a streak.
+  const calm = ev([], EMPTY_STATE, true);
+  assert.deepEqual(calm.firing, []);
+  assert.equal(calm.state.gatewayNotReadyStreak, 0);
+});
+
+test("gateway not ready: invalid samples hold the streak and the firing state", () => {
+  let fired = ev([], EMPTY_STATE, false);
+  fired = ev([], fired.state, false);
+  fired = ev([], fired.state, false);
+  assert.deepEqual(fired.firing, [NOT_READY]);
+  // An invalid sample (failed probe or unparsable body) changes nothing.
+  const held = ev([], fired.state, undefined);
+  assert.deepEqual(held.firing, [NOT_READY]);
+  assert.equal(held.state.gatewayNotReadyStreak, fired.state.gatewayNotReadyStreak);
+  // ...and never starts a streak on its own.
+  const fresh = ev([], EMPTY_STATE, undefined);
+  assert.deepEqual(fresh.firing, []);
+  assert.equal(fresh.state.gatewayNotReadySeen, false);
+});
+
+test("gateway not ready restart re-baselines the streak and holds a firing alert", () => {
+  const flat = (disconnects: number, recoveries: number) => [
+    `two_bot_gateway_disconnects_total ${disconnects}`,
+    `two_bot_gateway_resumes_total ${recoveries}`,
+    `two_bot_gateway_events_total{event="READY"} 0`,
+  ];
+  let fired = ev(flat(5, 3), EMPTY_STATE, false);
+  fired = ev(flat(5, 3), fired.state, false);
+  fired = ev(flat(5, 3), fired.state, false);
+  assert.deepEqual(fired.firing, [NOT_READY]);
+  // Counters went backwards: the process restarted. The streak re-baselines
+  // from this sample but the firing alert holds rather than clearing.
+  const restart = ev(flat(0, 0), fired.state, false);
+  assert.deepEqual(restart.firing, [NOT_READY]);
+  assert.equal(restart.state.gatewayNotReadyStreak, 1);
+  // Samples after the restart recount from the new baseline while held.
+  const again = ev(flat(0, 0), restart.state, false);
+  assert.deepEqual(again.firing, [NOT_READY]);
+  assert.equal(again.state.gatewayNotReadyStreak, 2);
+  // A restart that lands on ready clears at once: the new process came up
+  // connected, so readiness resolves even across the restart re-baseline.
+  const restartReady = ev(flat(0, 0), fired.state, true);
+  assert.deepEqual(restartReady.firing, []);
+  assert.equal(restartReady.state.gatewayNotReadyStreak, 0);
+  assert.deepEqual(ev(flat(0, 0), restartReady.state, true).firing, []);
+});
+
+test("gateway not ready restart with an invalid sample re-baselines the streak and holds firing", () => {
+  const flat = (disconnects: number, recoveries: number) => [
+    `two_bot_gateway_disconnects_total ${disconnects}`,
+    `two_bot_gateway_resumes_total ${recoveries}`,
+    `two_bot_gateway_events_total{event="READY"} 0`,
+  ];
+  let fired = ev(flat(5, 3), EMPTY_STATE, false);
+  fired = ev(flat(5, 3), fired.state, false);
+  fired = ev(flat(5, 3), fired.state, false);
+  assert.deepEqual(fired.firing, [NOT_READY]);
+  // Counters went backwards but this sample's readiness is invalid: the stale
+  // streak re-baselines to zero instead of surviving the restart, while the
+  // firing alert holds rather than clearing.
+  const restart = ev(flat(0, 0), fired.state, undefined);
+  assert.deepEqual(restart.firing, [NOT_READY]);
+  assert.equal(restart.state.gatewayNotReadyStreak, 0);
+  // The next valid non-ready sample recounts from 1: it cannot fire off the
+  // pre-restart streak.
+  const one = ev(flat(0, 0), restart.state, false);
+  assert.equal(one.state.gatewayNotReadyStreak, 1);
+  // ...and a sub-threshold streak never pages off a restart either.
+  const pending = ev(flat(5, 3), ev(flat(5, 3), EMPTY_STATE, false).state, false);
+  const stale = ev(flat(0, 0), pending.state, undefined);
+  assert.deepEqual(stale.firing, []);
+  assert.equal(stale.state.gatewayNotReadyStreak, 0);
+  assert.deepEqual(ev(flat(0, 0), stale.state, false).firing, []);
+});
+
+test("gateway not ready restart never pages by itself", () => {
+  const flat = (disconnects: number, recoveries: number) => [
+    `two_bot_gateway_disconnects_total ${disconnects}`,
+    `two_bot_gateway_resumes_total ${recoveries}`,
+    `two_bot_gateway_events_total{event="READY"} 0`,
+  ];
+  const pending = ev(flat(5, 3), ev(flat(5, 3), EMPTY_STATE, false).state, false);
+  const restart = ev(flat(0, 0), pending.state, false);
+  assert.deepEqual(restart.firing, []);
+  assert.equal(restart.state.gatewayNotReadyStreak, 1);
+  const s1 = ev(flat(0, 0), restart.state, false);
+  assert.deepEqual(s1.firing, []);
+});
+
+test("gateway not ready reads Durable Object state written before its fields existed", () => {
+  const legacy = {
+    firing: [] as string[], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0,
+    voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false,
+    receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {},
+  } as MetricsAlertState;
+  const first = ev([], legacy, false);
+  assert.deepEqual(first.firing, []);
+  assert.equal(first.state.gatewayNotReadySeen, true);
+  assert.equal(first.state.gatewayNotReadyStreak, 1);
+});
+
 test("gateway unpaired reads Durable Object state written before its fields existed", () => {
   const legacy = {
     firing: [] as string[], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0,
@@ -832,6 +954,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "voice_failures",
     "gateway_missed_events",
     "gateway_unpaired_disconnect",
+    "gateway_not_ready",
     "ticker_stale",
     "receiver_refusals",
     "dispatch_drops",
@@ -851,6 +974,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("voice_failures", window), `evidence-voice_failures-${window}.json`);
   assert.equal(packetFilename("gateway_missed_events", window), `evidence-gateway_missed_events-${window}.json`);
   assert.equal(packetFilename("gateway_unpaired_disconnect", window), `evidence-gateway_unpaired_disconnect-${window}.json`);
+  assert.equal(packetFilename("gateway_not_ready", window), `evidence-gateway_not_ready-${window}.json`);
   assert.equal(packetFilename("ticker_stale:scheduled_messages", window), `evidence-ticker_stale-${window}.json`);
   assert.equal(packetFilename("receiver_refusals:moderation", window), `evidence-receiver_refusals-${window}.json`);
   assert.equal(packetFilename("dispatch_drops:reactions", window), `evidence-dispatch_drops-${window}.json`);
@@ -943,6 +1067,9 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   let unpaired = ev(gateway(0, 0));
   for (let i = 0; i < 3; i++) unpaired = ev(gateway(1, 0), unpaired.state);
   firing.push(...unpaired.firing);
+  let notReady = ev([], EMPTY_STATE, false);
+  for (let i = 0; i < 2; i++) notReady = ev([], notReady.state, false);
+  firing.push(...notReady.firing);
   firing.push(
     ...ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 601}`]).firing,
   );
