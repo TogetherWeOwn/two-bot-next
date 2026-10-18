@@ -7361,6 +7361,11 @@ where
             };
             let mut worker = worker.with_name_policy(name_policy);
             worker.live_source = live_source;
+            // `load` captures the fallback from the shared live state, which
+            // already holds the stored override here; restore the true boot
+            // value so a later row removal or out-of-range edit falls back
+            // to boot, not to the stale stored grace.
+            worker.empty_grace_fallback = fallback;
             // Apply the stored override at spawn; later stored changes arrive
             // through the maintenance refresh without a restart.
             worker.refresh_empty_grace();

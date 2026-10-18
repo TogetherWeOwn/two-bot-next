@@ -12774,6 +12774,60 @@ fn empty_grace_config_accepts_zero_to_ten_minutes_and_refuses_garbage() {
     assert_eq!(configured_empty_grace(Some("1m")), Err(InvalidEmptyGrace));
 }
 
+/// Regression for the stored-grace fallback bug: a guild that spawns with a
+/// stored `0` must return to the true boot grace once the row is deleted
+/// (the documented undo path), not keep sweeping instantly. Simulates the
+/// fixed `ensure_actor` sequence: pre-load pollution, then the boot fallback
+/// restore before the revision-2 refresh.
+#[tokio::test]
+async fn spawn_with_stored_zero_then_row_removal_restores_boot_grace() {
+    use two_bot_core::settings::{live_channel, SettingsSnapshot};
+
+    let (live, store, http, _trace) = fixture();
+    live.set_empty_grace(Duration::ZERO);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.empty_grace_fallback = EMPTY_ROOM_GRACE;
+    let (mut writer, reader) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![],
+    });
+    worker.refresh_empty_grace_with(Some(&reader));
+    assert_eq!(
+        worker.live.read_state().empty_grace,
+        Some(EMPTY_ROOM_GRACE),
+        "deleting the stored row must restore the boot grace, never a stale zero"
+    );
+}
+
+/// Same fallback bug via the out-of-range path: a stored `0` at spawn
+/// followed by a `601` edit must fail closed to the boot grace.
+#[tokio::test]
+async fn spawn_with_stored_zero_then_out_of_range_restores_boot_grace() {
+    use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+
+    let (live, store, http, _trace) = fixture();
+    live.set_empty_grace(Duration::ZERO);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.empty_grace_fallback = EMPTY_ROOM_GRACE;
+    let (mut writer, reader) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_string(),
+            key: EMPTY_GRACE_KEY.to_owned(),
+            value: json!(601),
+            version: 2,
+        }],
+    });
+    worker.refresh_empty_grace_with(Some(&reader));
+    assert_eq!(
+        worker.live.read_state().empty_grace,
+        Some(EMPTY_ROOM_GRACE),
+        "an out-of-range edit after a stored zero must fail closed to boot"
+    );
+}
+
 #[test]
 fn synthetic_human_config_takes_up_to_four_snowflakes_and_refuses_garbage() {
     assert_eq!(configured_synthetic_humans(None), Ok(HashSet::new()));
