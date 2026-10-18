@@ -265,8 +265,8 @@ pub use funnel::{
 pub use handlers::{
     ChannelClass, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput, HandlerOutcome,
     JoinInput, LevelOutcome, LevelingHook, MemStore, MemberJoinFact, MessageFact, MessageInput,
-    NoopFacts, NoopLeveling, RecordOutcome, RulesAcceptedFact, StoredRow, VoiceEndedFact,
-    VoiceInput, VoiceStartedFact,
+    MessageShape, NoopFacts, NoopLeveling, RecordOutcome, RulesAcceptedFact, StoredRow,
+    VoiceEndedFact, VoiceInput, VoiceStartedFact,
 };
 pub use health::{
     classify_voice_error, ComponentStatus, HealthReport, VoiceComponent, VoiceDiagnostic,
