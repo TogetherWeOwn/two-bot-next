@@ -32,7 +32,8 @@
 //!
 //! What this module is not: the rollback procedure itself (that stays in the
 //! runbook), and wiring into every writer (follow-up slices call [`record`]
-//! from their own write paths). Pre-images are TEXT JSON blobs, matching the
+//! for standalone writes, or [`record_in`] from inside their own write
+//! transaction, from their own write paths). Pre-images are TEXT JSON blobs, matching the
 //! funnel `events.metadata` convention — the journal is a restore source,
 //! not a query index, so there is no JSONB and no secondary parsing.
 
@@ -221,6 +222,7 @@ pub enum JournalError {
 /// a concurrent writer committed a later row first, in which case the
 /// watermark holds that later id and stays monotonic either way.
 pub async fn record(pool: &Pool<Postgres>, entry: &JournalEntry) -> Result<i64, JournalError> {
+    entry.validate()?;
     let mut tx = pool.begin().await?;
     let id = record_in(&mut tx, entry).await?;
     tx.commit().await?;

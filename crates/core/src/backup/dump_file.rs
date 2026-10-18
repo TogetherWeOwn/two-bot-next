@@ -245,10 +245,11 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // onboarding stores, which are archived.
     "gateway_onboarding_jobs",
     // Durable cutover rollback journal and per-table watermarks (store chain
-    // 0406). The journal is append-only cutover evidence: the funnel append
-    // journals each events insert inside the primary transaction under a
-    // savepoint best-effort via journal::record_in, and rows stay
-    // re-capturable during the watch window.
+    // 0406). The journal is append-only cutover evidence: the PgFunnelStore
+    // funnel append (not yet the production gateway batch writer, which needs
+    // its own slice) journals each events insert inside the primary
+    // transaction under a savepoint best-effort via journal::record_in, and
+    // rows stay re-capturable during the watch window.
     // Never replay pre-restore cutover cursors into a recovered process: a
     // restored watermark could mark post-backup writes as already journaled
     // and silently break rollback coverage.

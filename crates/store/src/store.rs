@@ -175,13 +175,16 @@ async fn record_async(
         return Ok(outcome);
     };
     project_event(&mut tx, event, &guild_id).await?;
-    // First rollback-journal writer: each funnel append leaves one `events`
-    // insert entry naming the inserted row, journaled inside the primary
-    // transaction under a savepoint so the row and its evidence commit
-    // atomically — no crash window between a primary commit and a second
-    // journal transaction can leave a committed row unjournaled.
-    // Evidence-only and best-effort: journal failure rolls back only the
-    // savepoint and never fails or alters the primary write.
+    // First rollback-journal writer, `PgFunnelStore` seam only (not yet the
+    // production gateway batch writer in `cutover::gateway_session`, which
+    // needs its own slice): each `PgFunnelStore` funnel append leaves one
+    // `events` insert entry naming the inserted row, journaled inside the
+    // primary transaction under a savepoint so the row and its evidence
+    // commit atomically — no crash window between a primary commit and a
+    // second journal transaction can leave a committed row unjournaled.
+    // Evidence-only and best-effort: only journal statement errors are
+    // isolated by rolling back the savepoint; they never fail or alter the
+    // primary write.
     let entry = crate::journal::JournalEntry {
         table_name: "events".to_owned(),
         row_identity: event_row_id.to_string(),
