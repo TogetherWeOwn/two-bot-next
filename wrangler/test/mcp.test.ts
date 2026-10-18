@@ -638,23 +638,37 @@ test("a Content-Length that understates the body does not lift the cap", async (
   assert.deepEqual(h.forwarded, [], "oversize intake must never reach the container");
 });
 
-test("streamed oversize without Content-Length is cancelled at the cap", async () => {
+test("streamed oversize without Content-Length is cancelled at the cap, far tail unread", async () => {
   const marker = "synthetic-intake-streamed-marker";
   const h = harness(() => Response.json({ synthetic: true }));
   const bytes = encoder.encode(paddedRpcBody(INBOUND_CAP_BYTES + 8192, { marker }));
-  const { stream, state } = trackedChunks([
+  const chunks = [
     bytes.subarray(0, 32 * 1024),
     bytes.subarray(32 * 1024, INBOUND_CAP_BYTES),
     bytes.subarray(INBOUND_CAP_BYTES, INBOUND_CAP_BYTES + 1),
-    bytes.subarray(INBOUND_CAP_BYTES + 1),
-  ]);
+  ];
+  // Split the post-cap tail into small chunks so a delivered count can tell
+  // "stopped at the cap" apart from "drained" without pinning the exact
+  // stopping chunk (see the bound below).
+  for (let off = INBOUND_CAP_BYTES + 1; off < bytes.length; off += 1024) {
+    chunks.push(bytes.subarray(off, off + 1024));
+  }
+  const { stream, state } = trackedChunks(chunks);
   const res = await worker.fetch(rawMcp(stream), h.env, h.ctx);
   await assertIntakeRefusal(res, marker);
-  // Do not pin `state.delivered` here: with the default high-water mark the
-  // runtime prefetches a chunk into the Request buffer during the mandatory
-  // async auth check, so the count measures runtime prefetch, not reads by
-  // the Worker. Cancellation is the implementation-controlled signal: a body
-  // drained to the end closes, and a closed stream never fires cancel.
+  // Do not pin the exact delivered count: with the default high-water mark
+  // the runtime prefetches a chunk into the Request buffer during the
+  // mandatory async auth check, so the precise count measures runtime
+  // prefetch, not reads by the Worker. The far tail is the stable signal:
+  // the post-cap tail spans many chunks, so an implementation that stops
+  // at the cap (a few demand reads plus bounded prefetch) cannot deliver
+  // them all, while one that drains the body would. Cancellation covers
+  // the remaining case: a body drained to the end closes, and a closed
+  // stream never fires cancel.
+  assert.ok(
+    state.delivered < chunks.length,
+    `far tail past cap+1 must stay undelivered (delivered ${state.delivered}/${chunks.length})`,
+  );
   assert.equal(state.cancelled, true, "oversize streamed body must be cancelled, not drained");
   assert.deepEqual(h.names, [], "oversize intake must not resolve the DO");
   assert.deepEqual(h.forwarded, [], "oversize intake must never reach the container");
