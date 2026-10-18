@@ -3,10 +3,10 @@
 This is a separate `cargo-fuzz` workspace, explicitly excluded from the root
 workspace. Normal `cargo build`, workspace tests/clippy, `check` and cargo-deny
 keep their existing members, dependency lockfile and stable toolchain. The required
-`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all twenty targets
+`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all twenty-one targets
 on pinned nightly `nightly-2026-10-01` + `cargo-fuzz 0.13.2` and then replays
 the `eventsub_delivery` seed corpus once (`-runs=0`, no fuzzing). The other
-nineteen targets are compile-only in required CI; bounded manual smokes exist for
+twenty targets are compile-only in required CI; bounded manual smokes exist for
 `vote_kick` and `helix_token`. No scheduled or continuous fuzz campaign exists.
 
 ## Coverage
@@ -33,6 +33,7 @@ nineteen targets are compile-only in required CI; bounded manual smokes exist fo
 | `helix_subscription_listing` | `twitch_helix::validate_subscription_listing_page`, `twitch_eventsub::parse_subscriptions` | NUL-separated arbitrary bytes decode as one JSON listing page each before the production envelope validator; an independent oracle recomputes the expected verdict so widening/narrowing mutants fail. Malformed envelopes must fail with the bounded `BadResponse` static literal (never response bytes); valid pages must parse deterministically into at most their `data` length. Multi-page accumulation mirrors the list path (cursor chaining, repeated-cursor refusal, terminal pages, malformed-later-page rejects the whole listing). Seeds cover valid empty/single/cursor pages, missing/null/scalar/object `data`, array top level, bad/empty cursor types and two multi-page shapes. The target caps each input at 128 KiB, pages per iteration at 8 (the 100-page production limit stays pinned by the offline acceptance test), entries parsed per page at 1024 and total accumulation at 4096; it uses no network, database, credentials or secrets. |
 | `voice_room_name` | `voice_room_name::decide_custom_name`, `decide_template_name`, `is_literal_name` (plus `voice_naming::RoomContext`, `voice_name_filter`, `voice_conditions`, `AutomodPolicy`) | Arbitrary member/game text through the V3 `/name` decision parsers with bounded member-controlled render facts (32-char owner/game slices, 16-char bad word) and fixed base pins (empty/overlong/literal/template-fallback). Decided names hold the name-policy invariants on every input: never empty, at most `MAX_CHANNEL_NAME_CHARS`, no C0 controls or DEL, no `@` or backticks; refusal replies stay short. Seeds cover conditional-blocked, format-only, literal, overlong, token and unicode-fold shapes. No database, Discord client, network or secret. |
 | `automation_transfer_import` | `automation_transfer::parse_import_document`, `max_import_entries` | Arbitrary bytes decode as JSON before the import parser (the decoder's default recursion limit stays enabled); envelope problems fail the whole import, entry-level problems are counted and never fatal, and oversized entry lists fail bounded with the exact count and bound. Determinism and entry accounting (own-format one-for-one, MEE6 upper bound) are asserted on every input. Seeds cover a valid own-format document, MEE6 array/object payloads, bad-version / wrong-shape / bad-overwrite envelopes, hostile entry types and a 200-entry oversized list. No database, Discord client, network or secret. |
+| `self_role_custom_id` | `self_roles::parse_self_role_custom_id`, `self_role_custom_id` | Arbitrary UTF-8 member-controlled component ids through the self-role custom-id parser (invalid UTF-8 discarded, input truncated to 512 chars); an independent oracle recomputes the expected verdict so namespace/key-shape widening mutants fail. The exact `two:self-role:` wire prefix plus one or two colon-separated keys held to `valid_key` (1..=60 bytes, lower/digit start) must parse, and anything else — foreign namespaces, wrong case, multi-colon, empty sides, over-long keys — must refuse; parsing stays deterministic and the builder round-trips the 60/61-byte boundary. Seeds cover valid, panel-only, foreign, over-long, multi-colon, boundary and unicode shapes. No database, Discord client, network or secret. |
 
 All seeds use synthetic IDs/text; no token, environment secret, database,
 Discord client or network is needed at runtime. MEE6's crate currently has SQLx
@@ -69,7 +70,7 @@ set -euo pipefail
 : "${FUZZ_OUTPUT_DIR:?set an absolute non-source output directory}"
 FUZZ_SECONDS=${FUZZ_SECONDS:-300}
 mkdir -p "$FUZZ_OUTPUT_DIR/target" "$FUZZ_OUTPUT_DIR/logs"
-for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp settings_map vote_kick vote_kick_reason slash_input_bounds cutover_parse lfg_select internal_action_validators eventsub_delivery helix_token feeds_http helix_subscription_listing voice_room_name automation_transfer_import; do
+for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp settings_map vote_kick vote_kick_reason slash_input_bounds cutover_parse lfg_select internal_action_validators eventsub_delivery helix_token feeds_http helix_subscription_listing voice_room_name automation_transfer_import self_role_custom_id; do
   mkdir -p "$FUZZ_OUTPUT_DIR/corpus/$target" "$FUZZ_OUTPUT_DIR/artifacts/$target"
   max_len=65536
   if [[ "$target" == helix_token || "$target" == helix_subscription_listing ]]; then max_len=131072; fi
