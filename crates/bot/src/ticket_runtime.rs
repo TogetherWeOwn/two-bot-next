@@ -279,6 +279,7 @@ pub(crate) enum Failure {
     Rest(DiscordError),
     InvalidEvidence,
     Timeout,
+    LaneBusy,
     NoTicket,
 }
 
@@ -299,7 +300,10 @@ impl Failure {
             // Lane admission times out before any store reservation exists, so
             // no unfinished work was left for recovery to retry. Stay a
             // truthful retry-later refusal without claiming a recovery job.
-            Self::Timeout => {
+            // This is deliberately distinct from `Timeout`: the cumulative
+            // deadline wrapping the whole lane-held operation can expire after
+            // `reserve`/`begin_close` stored a state that recovery resumes.
+            Self::LaneBusy => {
                 "Ticket action timed out waiting for another operation. Try again later.".into()
             }
             // Claim/close in a channel with no tracked ticket ends before any
@@ -314,7 +318,9 @@ impl Failure {
     pub fn class(&self) -> ErrorClass {
         match self {
             Self::Store(_) => ErrorClass::Database,
-            Self::Timeout | Self::Rest(DiscordError::Timeout) => ErrorClass::Timeout,
+            Self::Timeout | Self::LaneBusy | Self::Rest(DiscordError::Timeout) => {
+                ErrorClass::Timeout
+            }
             Self::Rest(_) | Self::InvalidEvidence | Self::NoTicket => ErrorClass::Rest,
         }
     }
@@ -520,7 +526,7 @@ impl TicketRuntime {
     ) -> Result<String> {
         let _guard = tokio::time::timeout(LANE_WAIT_TIMEOUT, self.lane.lock())
             .await
-            .map_err(|_| Failure::Timeout)?;
+            .map_err(|_| Failure::LaneBusy)?;
         let user = interaction
             .member
             .as_ref()
