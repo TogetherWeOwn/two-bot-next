@@ -1,0 +1,141 @@
+name: gradual-promote-proof
+
+# Manual proof exercise for the pinned central gradual-promote action.
+# Never runs on a push, PR, schedule, release, or another workflow's
+# completion. Dispatch-only from main, through the `staging` environment
+# (staging Cloudflare credentials only; production secret names never appear).
+# PASSIVE until the isolated synthetic Worker fixture lands (see
+# docs/gradual-promote-caller.md): the target-lock step refuses before any
+# Cloudflare call, so the pinned caller below is documentation of the exact
+# future invocation, not proof of a gradual rollout. Do not claim unwired
+# stages as proof.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "success = healthy candidate sweeps 5-50-100; rollback = failing candidate must auto-restore the captured original"
+        required: true
+        type: choice
+        options: [success, rollback]
+        default: success
+      confirm_worker:
+        description: "Target lock: repeat the exact synthetic Worker name (two-bot-next-gradual-proof)"
+        required: true
+        type: string
+      candidate_tag:
+        description: "Uploaded version tag of the candidate to promote; never latest"
+        required: true
+        type: string
+      domain:
+        description: "Proof domain without a scheme (the synthetic host for the target-locked Worker)"
+        required: true
+        type: string
+
+permissions: {}
+
+# One proof at a time against the single synthetic Worker (target lock);
+# a queued run is never cancelled into a half-promoted split.
+concurrency:
+  group: gradual-promote-proof
+  cancel-in-progress: false
+
+jobs:
+  proof:
+    name: gradual-promote-proof
+    # Only the reviewed harness on main may run; a branch copy can never
+    # dispatch against the synthetic target.
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read # checkout only; Cloudflare calls use the `staging` environment secrets
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'proof') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    environment: staging
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      # Target lock first, Cloudflare never: the fixture is not provisioned
+      # yet, so this step records the passive refusal and exits 1. The pinned
+      # caller below never executes until a follow-up replaces this refusal
+      # with the synthetic fixture upload. Inputs travel through env, never
+      # into the script text.
+      - name: Target lock and passive refusal (no Cloudflare call yet)
+        env:
+          CONFIRM_WORKER: ${{ inputs.confirm_worker }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          PROOF_DOMAIN: ${{ inputs.domain }}
+          RUN_MODE: ${{ inputs.mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p proof-evidence
+          if [ "$CONFIRM_WORKER" != "two-bot-next-gradual-proof" ]; then
+            echo "::error::confirm_worker must repeat two-bot-next-gradual-proof exactly; refusing before any Cloudflare call"
+            exit 1
+          fi
+          case "$CANDIDATE_TAG" in
+            ""|*[!A-Za-z0-9._-]*)
+              echo "::error::candidate_tag must be 1-128 chars of letters, digits, dot, underscore or dash; refusing"
+              exit 1
+              ;;
+          esac
+          if [ "${#CANDIDATE_TAG}" -gt 128 ]; then
+            echo "::error::candidate_tag must be 1-128 chars of letters, digits, dot, underscore or dash; refusing"
+            exit 1
+          fi
+          case "$PROOF_DOMAIN" in
+            two-bot-next-gradual-proof.*.workers.dev)
+              case "$PROOF_DOMAIN" in
+                */*|*..*|two-bot-next-gradual-proof.*.*.workers.dev)
+                  echo "::error::domain must be the single-label synthetic host for two-bot-next-gradual-proof, without a scheme; refusing"
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              echo "::error::domain must be the single-label synthetic host for two-bot-next-gradual-proof, without a scheme; refusing"
+              exit 1
+              ;;
+          esac
+          if [ "$RUN_MODE" != "success" ] && [ "$RUN_MODE" != "rollback" ]; then
+            echo "::error::mode must be success or rollback; refusing"
+            exit 1
+          fi
+          printf '{"passive":true,"reason":"synthetic fixture not yet provisioned; caller is documentation until then"}\n' > proof-evidence/passive-refusal.json
+          echo "::error::passive: the synthetic proof Worker is not provisioned yet, so the pinned caller below is documentation only (see docs/gradual-promote-caller.md). No Cloudflare call was made."
+          exit 1
+      # The pinned central action: 5% -> 50% -> 100% with the real smoke
+      # checker per stage and its own automatic rollback to the version it
+      # records before promoting. Every error-rate input is explicit, so a
+      # central default change cannot silently widen the gate. Currently
+      # unreachable (the step above refuses first); a follow-up enables it
+      # with the synthetic fixture.
+      - name: Gradual promotion via the pinned central action
+        id: gradual
+        uses: TogetherWeOwn/.github/actions/gradual-promote@89c290be20c0044efaf6916f28341c76e75fff06
+        with:
+          worker-name: two-bot-next-gradual-proof
+          version-tag: ${{ inputs.candidate_tag }}
+          domain: ${{ inputs.domain }}
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          allow-indexable: "false"
+          error-rate-gate: "true"
+          error-rate-threshold: "0.05"
+          error-rate-min-requests: "20"
+          error-rate-window-minutes: "10"
+          error-rate-soak-seconds: "60"
+      - name: Upload proof evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gradual-promote-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: proof-evidence/
+          if-no-files-found: warn
+          retention-days: 14
