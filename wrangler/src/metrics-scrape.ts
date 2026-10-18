@@ -41,13 +41,17 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
  * staleness rule held rather than every rule silenced. The EventSub reconcile
  * pass outcomes are optional for the same reason: an older container without
  * the family must still scrape, with the failed-pass ticket held rather than
- * every rule silenced. The evaluator already tolerates their absence.
+ * every rule silenced. The EventSub delivery-kind counters are optional for
+ * the same reason: an older container without them must still scrape, with the
+ * tampered-signature page held rather than every rule silenced. The evaluator
+ * already tolerates their absence.
  */
 export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
   two_bot_job_last_error_class: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"], class: ["database", "rest", "configuration", "timeout", "panic", "feed", "recovery_required"] },
   two_bot_voice_creator_map_generation: {},
   two_bot_voice_creator_map_age_seconds: {},
   two_bot_eventsub_reconcile_passes_total: { outcome: ["healthy", "pending", "failed"] },
+  two_bot_eventsub_classified_total: { kind: ["challenge", "notification", "revocation", "tampered", "ignored", "other"] },
 };
 
 /** Every series the validator checks: required plus optional-when-present. */

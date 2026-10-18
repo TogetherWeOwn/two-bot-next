@@ -141,22 +141,33 @@ export class OwnershipFence {
   }
 }
 
+/** Whole-body deadline mirroring the receiver convention (internal-actions BODY_TIMEOUT_MS). */
+export const CONTROL_BODY_TIMEOUT_MS = 5_000;
+
 /** Bound control input independently of the untrusted Content-Length header. */
 export async function readChange(request: Request): Promise<OwnershipChange | null> {
   const reader = request.body?.getReader();
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
   let size = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), CONTROL_BODY_TIMEOUT_MS);
+  });
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > 1024) {
-        await reader.cancel();
+    for (;;) {
+      const step = await Promise.race([reader.read(), timeout]);
+      if (step === "timeout") {
+        void reader.cancel().catch(() => {});
         return null;
       }
-      chunks.push(value);
+      if (step.done) break;
+      size += step.value.byteLength;
+      if (size > 1024) {
+        void reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(step.value);
     }
     const bytes = new Uint8Array(size);
     let offset = 0;
@@ -164,6 +175,8 @@ export async function readChange(request: Request): Promise<OwnershipChange | nu
     return parseChange(JSON.parse(new TextDecoder().decode(bytes)));
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

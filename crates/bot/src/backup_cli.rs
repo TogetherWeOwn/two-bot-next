@@ -247,6 +247,13 @@ pub async fn dispatch(args: &[String]) -> i32 {
         print!("{USAGE}");
         return 0;
     }
+    // Bare-boot owed-release override: the documented `two-bot --allow-owed`
+    // service-start flag falls through to the boot preflight in `run`
+    // (100 = not a backup subcommand). Only the exact single flag; typos,
+    // extra arguments and operator subcommands keep exit 2 below.
+    if args.len() == 1 && args[0] == two_bot_core::disable_preflight::OVERRIDE_FLAG {
+        return 100;
+    }
     match route(&args[0], &args[1..]) {
         Route::Help => {
             print!("{USAGE}");
@@ -877,6 +884,16 @@ async fn run_upload_command(
     }
 }
 
+/// Parse the `guild-config-snapshot` upload command once for `path`.
+///
+/// Single-parse helper for the snapshot upload loop: exactly one
+/// `s3::build_upload_argv` call per path. Returns `None` when no uploader is
+/// configured, in which case the caller refuses with the existing local-only
+/// message and exit 2; `Some` carries byte-identical upload inputs.
+fn snapshot_upload_argv(upload_raw: Option<&str>, path: &Path) -> Option<(String, Vec<String>)> {
+    s3::build_upload_argv(upload_raw, &path.to_string_lossy())
+}
+
 // ---------------------------------------------------------------------------
 // guild-config-snapshot
 // ---------------------------------------------------------------------------
@@ -1089,13 +1106,11 @@ async fn cmd_guild_config_snapshot() -> i32 {
 
     let upload_raw =
         env_var("TWO_GUILD_CONFIG_UPLOAD_CMD").or_else(|| env_var("TWO_BACKUP_UPLOAD_CMD"));
-    if s3::build_upload_argv(upload_raw.as_deref(), &snapshot_path.to_string_lossy()).is_none() {
-        eprintln!("guild-config-snapshot: TWO_GUILD_CONFIG_UPLOAD_CMD (or TWO_BACKUP_UPLOAD_CMD) is required; refusing a local-only snapshot");
-        return 2;
-    }
     for path in [&snapshot_path, &drift_path] {
-        let (cmd, upload_args) =
-            s3::build_upload_argv(upload_raw.as_deref(), &path.to_string_lossy()).expect("checked");
+        let Some((cmd, upload_args)) = snapshot_upload_argv(upload_raw.as_deref(), path) else {
+            eprintln!("guild-config-snapshot: TWO_GUILD_CONFIG_UPLOAD_CMD (or TWO_BACKUP_UPLOAD_CMD) is required; refusing a local-only snapshot");
+            return 2;
+        };
         match run_upload_command(&cmd, &upload_args, UPLOAD_COMMAND_TIMEOUT).await {
             UploadOutcome::Success => {}
             outcome => {
@@ -1698,6 +1713,34 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bare_boot_allow_owed_falls_through_to_service_preflight() {
+        // The exact documented service-start flag is not a backup
+        // subcommand: 100 tells `main` to run the boot preflight in `run`.
+        assert_eq!(
+            super::dispatch(&strings(&[two_bot_core::disable_preflight::OVERRIDE_FLAG])).await,
+            100
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_boot_near_misses_and_extra_args_stay_usage_errors() {
+        // Only the exact single flag falls through; typos, unknown flags
+        // and the flag beside another argument keep exit 2 without touching
+        // env, DB or network.
+        for args in [
+            &["--allow-owwed"][..],
+            &["--allow-owed-releases"][..],
+            &["--allow-owed=1"][..],
+            &["--allow_owed"][..],
+            &["--frobnicate"][..],
+            &["--allow-owed", "--frobnicate"][..],
+            &["backup", "--allow-owed"][..],
+        ] {
+            assert_eq!(super::dispatch(&strings(args)).await, 2, "{args:?}");
+        }
+    }
+
     #[test]
     fn retention_counts_only_published_archive_names() {
         let dir = Credentials::new();
@@ -1769,6 +1812,41 @@ mod tests {
             super::UPLOAD_COMMAND_TIMEOUT,
             std::time::Duration::from_secs(30 * 60)
         );
+    }
+
+    /// The snapshot upload loop parses once per path: `None` refuses with the
+    /// existing local-only message and exit 2, `Some` keeps byte-identical
+    /// upload inputs with the file appended last.
+    #[test]
+    fn snapshot_upload_argv_parses_once_per_path() {
+        use std::path::PathBuf;
+        let snap = PathBuf::from("two-staging-guild-config-stamp.json");
+        let drift = PathBuf::from("two-staging-guild-config-stamp.drift.json");
+        assert!(super::snapshot_upload_argv(None, &snap).is_none());
+        assert!(super::snapshot_upload_argv(Some("  "), &snap).is_none());
+        assert!(super::snapshot_upload_argv(Some(""), &drift).is_none());
+        let (cmd, args) = super::snapshot_upload_argv(Some("/bin/true"), &snap).unwrap();
+        assert_eq!(cmd, "/bin/true");
+        assert_eq!(args, vec![snap.to_string_lossy().into_owned()]);
+        let (cmd, args) = super::snapshot_upload_argv(Some("cp -t /srv/backups"), &drift).unwrap();
+        assert_eq!(cmd, "cp");
+        assert_eq!(
+            args,
+            vec![
+                "-t".to_owned(),
+                "/srv/backups".to_owned(),
+                drift.to_string_lossy().into_owned()
+            ]
+        );
+        let (_, snap_args) =
+            super::snapshot_upload_argv(Some("cp -t /srv/backups"), &snap).unwrap();
+        let (_, drift_args) =
+            super::snapshot_upload_argv(Some("cp -t /srv/backups"), &drift).unwrap();
+        assert_ne!(snap_args, drift_args);
+        assert!(snap_args.last().unwrap().ends_with(".json"));
+        assert!(drift_args.last().unwrap().ends_with(".drift.json"));
+        assert_eq!(snap_args.len(), 3);
+        assert_eq!(drift_args.len(), 3);
     }
 
     /// Prompt success stays success and produces no failure line.
