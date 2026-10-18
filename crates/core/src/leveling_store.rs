@@ -775,6 +775,44 @@ pub async fn leaderboard(
         .collect())
 }
 
+/// Seasonal leaderboard page (AC3): `seasonal_xp` descending, member id
+/// ascending, 1-based page ranks, scoped to one `(guild_id, season_id)`.
+/// The limit clamps to 1–25 ([`clamp_leaderboard_limit`]), matching the
+/// legacy page shape. An empty season returns an empty page; callers must
+/// render the honest empty seasonal reply and never fall back to lifetime
+/// totals. Each entry's `xp` and `level` derive from `seasonal_xp`, exactly
+/// as [`leaderboard`] derives both from the XP column it reads.
+pub async fn seasonal_leaderboard(
+    pool: &PgPool,
+    guild_id: &str,
+    season_id: &str,
+    limit: u64,
+) -> Result<Vec<LeaderboardEntry>, LevelingStoreError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT member_id, seasonal_xp FROM member_season_xp
+         WHERE guild_id = $1 AND season_id = $2
+         ORDER BY seasonal_xp DESC, member_id ASC LIMIT $3",
+    )
+    .bind(guild_id)
+    .bind(season_id)
+    .bind(clamp_leaderboard_limit(limit) as i64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, (member_id, xp))| {
+            let xp = xp as u64;
+            LeaderboardEntry {
+                member_id,
+                xp,
+                level: level_for_xp(xp),
+                rank: index as u64 + 1,
+            }
+        })
+        .collect())
+}
+
 /// Stored reward ladder, ascending by level (legacy `roleRewards`).
 pub async fn role_rewards(
     pool: &PgPool,

@@ -105,8 +105,15 @@ brief.
    schedules and feeds, moderation actions and unbans, voice ownership,
    audit and internal-action ledgers. Use the tested per-table and
    per-key mapping over a transactionally consistent capture, not a bare
-   timestamp filter (which misses deletes and ledger rows). Record
-   counts, hashes, conflicts and the final applied watermark.
+   timestamp filter (which misses deletes and ledger rows). Tables the
+   delta report marks `unmeasurable` carry a rollback `disposition`
+   (`accept-with-reason` or `manual-reconcile-required`, see
+   [rollback-delta.md](rollback-delta.md#dispositions-for-unmeasurable-tables)):
+   record the accepted reason for the former, attaching the alternate
+   evidence named in the report reason or in rollback-delta.md disposition
+   map and voice-window section (required where named), and reconcile the
+   latter by hand before GO. Record counts, hashes, conflicts and the
+   final applied watermark.
 4. Classify applied Discord effects from delivery, audit and replay
    receipts. Completed messages, sanctions, role changes, unbans and
    callbacks are **not** replayed or undone by a database restore.
