@@ -37,13 +37,17 @@ IMAGE_MAX_BYTES = 112 * MIB
 # measured the identical 16,777,376 bytes (run 39061090833). The stream
 # retention-expiry slice (ac8fd66, fence-preserving expiry of delivered
 # go-live dedup rows) tipped the full 16 MiB budget with no new
-# dependencies and no release-profile change. Main tip 89503f71 measured
-# 16,776,096 bytes (16.00 MiB, 1,120 bytes of headroom) and the voice
-# rename-decision logs (#1064) added 3,160 bytes (merged head 6a9c394e:
-# 16,779,256 bytes, 2,040 over 16 MiB), likewise with no new dependencies.
-# The go-live receiver-ledger branch independently measured 16801560 bytes
-# (16.02 MiB) on CI run 39056648109 job 117470241279, 24344 bytes over the
-# 16 MiB tripwire, after ~450 lines of shipping ledger/receiver code.
+# dependencies and no release-profile change. The game-activity
+# aggregate-expiry slice measured 16,782,608 bytes (16.01 MiB) on hosted CI,
+# 5,392 bytes over the 16 MiB budget with no new dependencies: the store
+# expiry plus its per-guild stale listing and the retention-cadence driver.
+# Main tip 89503f71 measured 16,776,096 bytes (16.00 MiB, 1,120 bytes of
+# headroom) and the voice rename-decision logs (#1064) added 3,160 bytes
+# (merged head 6a9c394e: 16,779,256 bytes, 2,040 over 16 MiB), likewise with
+# no new dependencies. The go-live receiver-ledger branch independently
+# measured 16801560 bytes (16.02 MiB) on CI run 39056648109 job 117470241279,
+# 24344 bytes over the 16 MiB tripwire, after ~450 lines of shipping
+# ledger/receiver code.
 # 17 MiB restores the tripwire with ~1.00 MiB headroom; revisit if approached.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
