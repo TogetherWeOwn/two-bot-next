@@ -73,6 +73,30 @@ test('fenced owner with null deployment emits null owner id', async () => {
   assert.equal(seen.length, 1);
 });
 
+test('fenced record keeping a deployment id still emits null owner id', async () => {
+  // Crash-recovery keeps the pending deploymentId on the fenced record, but
+  // require() refuses it, so nobody owns the singleton.
+  const seen = [];
+  const receipt = await readOwnershipStatus(
+    { url: STAGING, token: TOKEN },
+    sendOnce([{ status: 200, body: state(record({ phase: 'fenced', deploymentId: 'dep-new' })) }], seen),
+    () => FIXED_NOW,
+  );
+  assert.deepEqual(receipt, { owner_id: null, observed_at: '2026-10-18T08:30:00.000Z' });
+  assert.equal(seen.length, 1);
+});
+
+test('malformed JSON body fails closed with generic text', async () => {
+  const seen = [];
+  const message = await readOwnershipStatus(
+    { url: STAGING, token: TOKEN },
+    sendOnce([{ status: 200, body: '{"a" 1}' }], seen),
+    () => FIXED_NOW,
+  ).then(() => null, (error) => error.message);
+  assert.equal(message, 'Ownership status check failed; stop and report without substituting credentials');
+  assert.equal(seen.length, 1);
+});
+
 test('status fails closed on missing credentials without a request', async () => {
   const seen = [];
   await assert.rejects(

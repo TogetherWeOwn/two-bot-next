@@ -7,6 +7,15 @@ import { control } from './ownership-control.mjs';
 class StatusError extends Error {}
 
 const VALID_ID = /^[a-zA-Z0-9_-]{1,128}$/;
+const PRINTABLE = /^(Expected|OWNERSHIP_CONTROL_TOKEN|Ownership control failed|Ownership status|Invalid ownership|Invalid observation|Singleton is)/;
+
+function isPrintableControlError(error) {
+  // Parser/transport errors are never printable, whatever their text.
+  if (!(error instanceof Error)) return false;
+  if (error instanceof SyntaxError || error instanceof TypeError) return false;
+  if (error.name === 'AbortError' || error.name === 'TimeoutError') return false;
+  return PRINTABLE.test(error.message);
+}
 const VALID_ACTOR = /^[a-zA-Z0-9_.:@/-]{1,128}$/;
 
 function isValidId(value) {
@@ -46,7 +55,10 @@ export function sanitizeStatus(state, observedAt) {
       !Number.isFinite(Date.parse(observedAt))) {
     throw new StatusError('Invalid observation timestamp; stop without substituting credentials');
   }
-  const ownerId = owner === null ? null : owner.deploymentId;
+  // Only an active record owns the singleton. A fenced record keeps its
+  // pending deploymentId through crash-recovery, but require() refuses it,
+  // so reporting it would name an owner where nobody owns the singleton.
+  const ownerId = owner?.phase === 'active' ? owner.deploymentId : null;
   if (!(ownerId === null || isValidId(ownerId))) {
     throw new StatusError('Invalid ownership status response; stop without substituting credentials');
   }
@@ -63,8 +75,7 @@ export async function readOwnershipStatus({ url, token }, send = fetch, now = ()
   } catch (error) {
     // Fail closed on transport/redirect failures without echoing raw text.
     // Only the control client's fixed-text validation errors are printable.
-    if (error instanceof Error &&
-        /^(Expected|OWNERSHIP_CONTROL_TOKEN|Ownership control failed|Ownership status|Invalid ownership|Invalid observation|Singleton is)/.test(error.message)) {
+    if (isPrintableControlError(error)) {
       throw error;
     }
     throw new StatusError('Ownership status check failed; stop and report without substituting credentials');
@@ -87,8 +98,7 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
     // Only fixed-text validation errors are printable. Provider/JSON errors
     // are untrusted, even when their message starts with "Expected" or
     // "Invalid". Never echo response, headers, token, environment or raw errors.
-    const message = error instanceof Error &&
-      (/^(Expected|OWNERSHIP_CONTROL_TOKEN|Ownership control failed|Ownership status|Invalid ownership|Invalid observation|Singleton is)/.test(error.message))
+    const message = isPrintableControlError(error)
       ? error.message
       : 'Ownership status check failed; stop and report without substituting credentials';
     // Guard against a token-looking fixed string ever reaching the log.
