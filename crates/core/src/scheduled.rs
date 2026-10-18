@@ -415,9 +415,20 @@ pub fn schedule_list_overflow_line(remaining: i64) -> String {
     format!("(truncated, {remaining} more)")
 }
 
+/// `/schedule-list` fallback marker for a guild whose capped read came back
+/// full while the overflow count failed: the reply still names the cut, so a
+/// failed second query never renders as a silent cut. Static shape (no
+/// count); the counted form stays [`schedule_list_overflow_line`].
+#[must_use]
+pub fn schedule_list_truncated_text() -> &'static str {
+    "(truncated)"
+}
+
 /// Split whole-row lines into bounded pages, ordered as given. Each page
 /// holds as many whole rows as fit in [`SCHEDULE_LIST_MESSAGE_LIMIT`]
-/// UTF-16 units; no id is ever split or dropped. An empty guild yields one
+/// UTF-16 units; no id handed to this helper is ever split or dropped
+/// (the guild read upstream is capped — see `schedule_list_truncated_text`).
+/// An empty guild yields one
 /// page (`Nothing scheduled.`). A single page carries no indicator (the
 /// legacy shape); every page of a multi-page list ends with
 /// [`schedule_list_page_indicator`].
@@ -848,6 +859,12 @@ mod tests {
         // Pinned by the bounded-listing acceptance tests: keep byte-exact.
         assert_eq!(schedule_list_overflow_line(2), "(truncated, 2 more)");
         assert_eq!(schedule_list_overflow_line(1), "(truncated, 1 more)");
+    }
+
+    #[test]
+    fn truncated_marker_names_a_cut_without_a_count() {
+        // Fallback for a failed overflow count: static shape, no count.
+        assert_eq!(schedule_list_truncated_text(), "(truncated)");
     }
 
     #[test]

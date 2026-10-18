@@ -26,7 +26,7 @@ use two_bot_core::{
         format_iso_ms, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
         schedule_cancelled_text, schedule_confirm_text, schedule_list_line,
         schedule_list_overflow_line, schedule_list_page, schedule_list_page_underflow_text,
-        validate_schedule, ScheduleInput,
+        schedule_list_truncated_text, validate_schedule, ScheduleInput,
     },
     scheduled_store::{
         audit_scheduled, count_scheduled, delete_scheduled, get_scheduled, list_scheduled,
@@ -263,10 +263,13 @@ pub(crate) async fn schedule_remove(
 }
 
 /// `/schedule-list`: guild-scoped list → ephemeral text. The read is capped
-/// at the earliest [`SCHEDULE_LIST_CAP`] rows; a full page appends an
-/// explicit `(truncated, N more)` overflow line so no id is silently dropped.
-/// Rows are ordered by (`next_run_at`, `id`) and rendered as bounded
-/// whole-row pages; writes no audit row and never writes schedule rows.
+/// at the earliest [`SCHEDULE_LIST_CAP`] rows; a full read appends an
+/// explicit `(truncated, N more)` overflow line, or `(truncated)` when the
+/// overflow count itself fails, so a cut is never silent. Rows are ordered
+/// by (`next_run_at`, `id`) and the `page` option pages that capped window:
+/// rows past the cap keep firing but list only after earlier rows are
+/// removed (see `docs/schedule-queue-order.md`). Writes no audit row and
+/// never writes schedule rows.
 pub(crate) async fn schedule_list(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
@@ -294,8 +297,9 @@ pub(crate) async fn schedule_list(
                 })
                 .collect();
             // The read is capped at SCHEDULE_LIST_CAP earliest rows. A full
-            // page may hide more: count once and name the cut rows so no id
-            // is silently dropped. Under-cap guilds skip the second query
+            // read may hide more: count once and name the cut rows so no id
+            // is silently dropped; a failed count still marks the cut
+            // without a number. Under-cap guilds skip the second query
             // and render exactly as before.
             if rows.len() as i64 == SCHEDULE_LIST_CAP {
                 match count_scheduled(pool, guild_id).await {
@@ -305,6 +309,7 @@ pub(crate) async fn schedule_list(
                     Ok(_) => {}
                     Err(err) => {
                         tracing::warn!(reason = db_class(&err), "schedule list count failed");
+                        lines.push(schedule_list_truncated_text().to_owned());
                     }
                 }
             }
