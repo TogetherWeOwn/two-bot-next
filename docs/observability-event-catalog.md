@@ -360,6 +360,13 @@ out because only a token fix and a restart clear that halt.
 `voice halt re-probe: store still refusing` / `voice halt re-probe timed out`
 (debug): the latch stays set; the next probe runs after the re-probe interval.
 
+Empty-grace override warning (in `stored_empty_grace_with` in
+`crates/bot/src/voice_rooms.rs`, guild-only fields, no IDs):
+`stored empty-grace override out of range; using boot fallback` (warn): the
+stored per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row is malformed or
+outside 0 to 600 whole seconds, so the sweep keeps the boot fallback. The
+line carries the setting key and the `out_of_range` reason.
+
 Creator-view refresh actor messages (all in `GuildRoomWorker::revalidate_creator`
 / `reload_creators` in `crates/bot/src/voice_rooms.rs`, guild-only fields,
 no IDs):

@@ -168,7 +168,6 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID", SettingClass::Cold),
     ("TWO_TEMP_VOICE_CATEGORY_ID", SettingClass::Cold),
     ("TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS", SettingClass::Cold),
-    ("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS", SettingClass::Cold),
     ("TWO_TEMP_VOICE_SWEEP_SECONDS", SettingClass::Cold),
     ("TWO_TEMP_VOICE_MAX_PER_USER", SettingClass::Cold),
     ("TWO_TEMP_VOICE_MAX_PER_GUILD", SettingClass::Cold),
@@ -235,6 +234,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_SELF_ROLE_DRY_RUN", SettingClass::Hot),
     ("TWO_REDIRECT_FALLBACK_CODE", SettingClass::Hot),
     ("TWO_FEED_POLL_SECONDS", SettingClass::Hot),
+    ("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS", SettingClass::Hot),
 ];
 
 /// The hot keys whose consumers read through the live config (legacy
@@ -267,6 +267,7 @@ pub const HOT_WIRED: &[&str] = &[
     "TWO_FEED_POLL_SECONDS",
     "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
     "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
+    "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
 ];
 
 /// The catalogue class for `key`, or `None` for a name this file has never
@@ -889,6 +890,7 @@ mod tests {
         "TWO_REDIRECT_FALLBACK_CODE",
         "TWO_SELF_ROLE_DRY_RUN",
         "TWO_FEED_POLL_SECONDS",
+        "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
     ];
 
     const EXPECTED_COLD: &[&str] = &[
@@ -909,7 +911,6 @@ mod tests {
         "TWO_TEMP_VOICE_CATEGORY_ID",
         "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS",
         "TWO_TEMP_VOICE_DISABLED_CONTROLS",
-        "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
         "TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID",
         "TWO_TEMP_VOICE_MAX_PER_GUILD",
         "TWO_TEMP_VOICE_MAX_PER_USER",
@@ -1039,7 +1040,7 @@ mod tests {
 
     #[test]
     fn hot_wired_is_a_hot_subset() {
-        assert_eq!(HOT_WIRED.len(), 24);
+        assert_eq!(HOT_WIRED.len(), 25);
         for key in HOT_WIRED {
             assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
         }
