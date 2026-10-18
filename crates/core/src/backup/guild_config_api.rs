@@ -38,6 +38,14 @@ pub enum GuildConfigApiError {
 }
 
 /// Checked test-seam base: loopback only. Production default otherwise.
+///
+/// Closed allow-matrix on the raw string before `Url` normalization: only
+/// `http://` / `https://` with an exact `127.0.0.1`, `localhost` or `[::1]`
+/// host survive. Raw checks refuse what normalization would hide:
+/// whitespace/control, userinfo (`@`), percent-encoded hosts (`%`),
+/// non-ASCII hosts, query/fragment, and case/trailing-dot/dotted-suffix
+/// lookalikes via exact host comparison. Refusals stay fixed-vocabulary
+/// (`BadBase` / `NonLoopbackBase` render as `[REDACTED]`).
 pub fn checked_base(
     raw: Option<&str>,
     name: &str,
@@ -46,19 +54,92 @@ pub fn checked_base(
     let Some(raw) = raw else {
         return Ok(production.to_owned());
     };
-    let raw = raw.trim_end_matches('/');
-    let parsed = url::Url::parse(raw)
-        .map_err(|_| GuildConfigApiError::BadBase(Secret::new(name.to_owned())))?;
+    let bad = || GuildConfigApiError::BadBase(Secret::new(name.to_owned()));
+    // Whitespace or control anywhere is never a valid base. `Url::parse`
+    // strips leading/trailing C0 controls and spaces, so check the raw.
+    if raw.is_empty() || raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(bad());
+    }
+    // Exact lowercase scheme with `://`. This refuses `ftp://`, `file://`,
+    // `ws(s)://`, scheme-relative `//host`, schemeless `host:port`, and
+    // single-colon `http:host` forms before `Url` can normalize them.
+    let after_scheme = if let Some(rest) = raw.strip_prefix("http://") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("https://") {
+        rest
+    } else {
+        return Err(bad());
+    };
+    // Query and fragment are refused outright, even on loopback.
+    if raw.contains('?') || raw.contains('#') {
+        return Err(bad());
+    }
+    // Authority is scheme end through the next `/` (no `?`/`#` remain).
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return Err(bad());
+    }
+    // Userinfo (`user@`, `:pass@`, empty `:@`) never reaches parsing.
+    if authority.contains('@') {
+        return Err(bad());
+    }
+    // Percent-encoding in the host would decode to loopback-looking text.
+    if authority.contains('%') {
+        return Err(bad());
+    }
+    // Non-ASCII hosts (fullwidth, Cyrillic, ideographic separators).
+    if !authority.is_ascii() {
+        return Err(bad());
+    }
+    // Exact host comparison on the raw authority, before `Url` lowercases,
+    // strips trailing dots, or decodes anything.
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some(end) = bracketed.find(']') else {
+            return Err(bad());
+        };
+        let inside = &bracketed[..end];
+        let remainder = &bracketed[end + 1..];
+        // Remainder must be empty or `:port`; port digits are validated by `Url`.
+        if !remainder.is_empty() && !remainder.starts_with(':') {
+            return Err(bad());
+        }
+        if remainder.contains('[') || remainder.contains(']') {
+            return Err(bad());
+        }
+        if inside != "::1" {
+            return Err(GuildConfigApiError::NonLoopbackBase(
+                name.to_owned(),
+                Secret::new(inside.to_owned()),
+            ));
+        }
+    } else {
+        if authority.contains('[') || authority.contains(']') {
+            return Err(bad());
+        }
+        // Unbracketed hosts carry at most one `:` (host:port).
+        if authority.matches(':').count() > 1 {
+            return Err(bad());
+        }
+        let host = authority.split(':').next().unwrap_or("");
+        if !matches!(host, "127.0.0.1" | "localhost") {
+            return Err(GuildConfigApiError::NonLoopbackBase(
+                name.to_owned(),
+                Secret::new(host.to_owned()),
+            ));
+        }
+    }
+    let trimmed = raw.trim_end_matches('/');
+    let parsed = url::Url::parse(trimmed).map_err(|_| bad())?;
     if !matches!(parsed.scheme(), "http" | "https")
         || !parsed.username().is_empty()
         || parsed.password().is_some()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
-        return Err(GuildConfigApiError::BadBase(Secret::new(name.to_owned())));
+        return Err(bad());
     }
     let host = parsed.host_str().unwrap_or("");
-    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+    if !matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]") {
         return Err(GuildConfigApiError::NonLoopbackBase(
             name.to_owned(),
             Secret::new(host.to_owned()),

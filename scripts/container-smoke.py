@@ -43,6 +43,22 @@ IMAGE_MAX_BYTES = 112 * MIB
 # the release profile is already minimal (opt-level=z, lto, strip). 17 MiB
 # restores ~1.00 MiB of headroom while keeping a working tripwire; revisit
 # if the binary approaches it.
+# measurement comes from hosted CI on the merged head. 16 MiB trips on main
+# itself (main-red) with no new dependencies and the same minimal release
+# profile (opt-level=z, lto, strip). Main at d7774644 measured 16,768,848 bytes
+# (15.99 MiB), main tip 89503f71 measured 16,776,096 bytes (1,120 bytes of
+# headroom), and another calibration measured 16,777,376 bytes (160 over); this
+# head measured 16,778,152 bytes (936 over). The backfill rate-limit client head
+# measured 16,780,912 bytes (16.00 MiB) — the guard's bucket/pacing code. The
+# voice rename-decision logs add ~3,160 bytes (merged head 6a9c394e: 16,779,256
+# bytes, 2,040 over 16 MiB). The game-activity aggregate-expiry slice measured
+# 16,782,608 bytes (16.01 MiB, 5,392 over) — store expiry plus its per-guild
+# stale listing and the retention-cadence driver. The go-live receiver-ledger
+# slice independently measured 16,801,560 bytes (16.02 MiB, 24,344 over) on CI
+# run 39056648109 job 117470241279 after ~450 lines of ledger/receiver code.
+# The landed slices since the 16 MiB bump consumed its headroom, so 17 MiB
+# restores a working tripwire with ~1 MiB of headroom; revisit if the binary
+# approaches it.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.

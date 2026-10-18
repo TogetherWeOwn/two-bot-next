@@ -300,6 +300,31 @@ pub const VOICE_VOTE_KICK_OUTCOMES: &[&str] = &[
     "gave_up",
     "other",
 ];
+/// Moderation enforcement verbs for `two_bot_moderation_enforcements_total{verb,outcome}`
+/// (TOG-28482): exactly the nine `ModerationAction::command_name` verbs in
+/// legacy publish order. A test pins this list to
+/// `ModerationAction::ALL.map(command_name)` so a new verb fails the suite
+/// until the budget rows join it. Unknown verbs collapse to the trailing
+/// slot only when the allowlist grows; today every caller passes a real
+/// verb, so no user id, reason text or free-form detail ever becomes a label.
+pub const MODERATION_VERBS: &[&str] = &[
+    "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown", "unlock",
+];
+/// Terminal outcomes for `two_bot_moderation_enforcements_total{verb,outcome}`
+/// (TOG-28482): `success` for every completed enforcement (including
+/// idempotent replays served without a second effect), `refused` for
+/// policy/validation/definitive rejections that prove no mutation happened,
+/// `discord_error` for uncertain Discord failures (timeout, unreachable,
+/// rate-limited), `storage_error` for persistence failures, and `other` for
+/// anything else. Unknown outcomes collapse to the trailing `other`, never
+/// to a dynamic label. No IDs, tokens or bodies are retained.
+pub const MODERATION_ENFORCEMENT_OUTCOMES: &[&str] = &[
+    "success",
+    "refused",
+    "discord_error",
+    "storage_error",
+    "other",
+];
 /// Dispatch-lane names for `two_bot_dispatch_drops_total{lane}`, in the bot's
 /// `DISPATCH_LIMITS` order (messages, interactions, registry, privileged,
 /// busy, reactions). Length must equal the lane count; unknown names collapse
@@ -343,6 +368,27 @@ pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
 /// unrecognised outcome collapses to the last entry (`rejected`) rather than
 /// growing the series vocabulary.
 pub const PRESENCE_CAPTURE_OUTCOMES: &[&str] = &["inserted", "duplicate", "rejected"];
+/// Terminal automod decision outcomes for
+/// `two_bot_automod_decisions_total{outcome}`. Mirrors
+/// `automod_runtime::CompletionKind::as_str` in declaration order: `accepted`
+/// for clean content, `already_processed` for a counted retry, `dry_run` for
+/// a matched dry-run capture, `protected` for an exempt target, `deleted` /
+/// `warned` / `timed_out` for enforced ladders, and `sanction_refused` when
+/// the delete-adjacent sanction could not run. Exactly eight series from
+/// process start; no message text, excerpts or user IDs ever become labels.
+/// Unknown outcomes collapse to the trailing `sanction_refused` slot only
+/// when the allowlist grows; today every caller passes a member, so that
+/// slot stays zero unless hostile input arrives.
+pub const AUTOMOD_DECISION_OUTCOMES: &[&str] = &[
+    "accepted",
+    "already_processed",
+    "dry_run",
+    "protected",
+    "deleted",
+    "warned",
+    "timed_out",
+    "sanction_refused",
+];
 /// Website-action receiver families for
 /// `two_bot_internal_actions_total{family,outcome}` (TOG-20119, roadmap
 /// M4.23). The signed receiver (`crates/bot/src/internal_action_http.rs`)
@@ -546,6 +592,7 @@ struct Values {
     /// Halt-latch recoveries via credential re-probe.
     voice_halt_recoveries: u64,
     voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
+    moderation_enforcements: [[u64; MODERATION_ENFORCEMENT_OUTCOMES.len()]; MODERATION_VERBS.len()],
     voice_names: [u64; VOICE_NAME_OUTCOMES.len()],
     db_errors: [u64; DB_ERROR_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
@@ -553,6 +600,7 @@ struct Values {
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
     presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
+    automod_decisions: [u64; AUTOMOD_DECISION_OUTCOMES.len()],
     last_ready_unix: Option<u64>,
     last_resume_unix: Option<u64>,
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
@@ -665,6 +713,22 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter =
             &mut values.presence_capture[bounded_index(outcome, PRESENCE_CAPTURE_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One terminal automod decision (see [`AUTOMOD_DECISION_OUTCOMES`]).
+    /// Call once per committed [`StoredOutcome`](crate::automod_runtime::StoredOutcome):
+    /// the shared activation settles exactly one receipt per inspection, so
+    /// replays and retained claims never call this. The outcome is the whole
+    /// label vocabulary — no message text, excerpts or user IDs ever become
+    /// labels — and an unrecognised outcome collapses to `sanction_refused`.
+    pub fn automod_decision(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.automod_decisions[bounded_index(outcome, AUTOMOD_DECISION_OUTCOMES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -851,6 +915,26 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.voice_vote_kick[bounded_index(outcome, VOICE_VOTE_KICK_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One moderation enforcement terminal outcome (TOG-28482). Call once per
+    /// terminal member/channel enforcement from each dispatch site (slash
+    /// member/channel runtimes and website member/channel executors): each
+    /// request records exactly once, so an idempotent replay counts as
+    /// `success` on its own serve while the in-flight duplicate that prompted
+    /// it counts on its own terminal outcome. `verb` is a
+    /// `ModerationAction::command_name` verb; `outcome` is one of
+    /// [`MODERATION_ENFORCEMENT_OUTCOMES`]. Unknown verbs/outcomes collapse
+    /// to the trailing slots only when the allowlists grow. No user id,
+    /// reason text or free-form detail ever becomes a label.
+    pub fn moderation_enforcement(&self, verb: &str, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.moderation_enforcements[bounded_index(verb, MODERATION_VERBS)]
+            [bounded_index(outcome, MODERATION_ENFORCEMENT_OUTCOMES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -1324,6 +1408,22 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_automod_decisions_total",
+            "counter",
+            "Terminal automod inspection outcomes by bounded CompletionKind; fixed eight series.",
+        );
+        for (outcome, count) in AUTOMOD_DECISION_OUTCOMES
+            .iter()
+            .zip(values.automod_decisions)
+        {
+            writeln!(
+                out,
+                "two_bot_automod_decisions_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
             "two_bot_gateway_latency_seconds",
             "gauge",
             "Last heartbeat ACK latency; NaN until measured.",
@@ -1738,6 +1838,21 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_moderation_enforcements_total",
+            "counter",
+            "Moderation enforcement terminal outcomes by bounded verb and outcome; retries and rate-limit backoffs are not outcomes.",
+        );
+        for (verb, outcomes) in MODERATION_VERBS.iter().zip(values.moderation_enforcements) {
+            for (outcome, count) in MODERATION_ENFORCEMENT_OUTCOMES.iter().zip(outcomes) {
+                writeln!(
+                    out,
+                    "two_bot_moderation_enforcements_total{{verb=\"{verb}\",outcome=\"{outcome}\"}} {count}"
+                )
+                .unwrap();
+            }
+        }
+        header(
+            &mut out,
             "two_bot_community_facts_drain_failures_total",
             "counter",
             "Community-facts drain failures by bounded reason; the worker warns and continues, so each failed dispatch counts once.",
@@ -2078,6 +2193,7 @@ mod tests {
             metrics.checkpoint_failure(&hostile);
             metrics.presence_capture(&hostile);
             metrics.internal_action(&hostile, &hostile);
+            metrics.moderation_enforcement(&hostile, &hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
@@ -2398,6 +2514,68 @@ mod tests {
             "two_bot_voice_vote_kick_total{{outcome=\"started\"}} {}\n",
             u64::MAX
         )));
+    }
+
+    #[test]
+    fn moderation_verbs_match_the_nine_command_names() {
+        let names: Vec<&str> = crate::moderation::ModerationAction::ALL
+            .iter()
+            .map(|action| action.command_name())
+            .collect();
+        assert_eq!(names, MODERATION_VERBS);
+        assert_eq!(MODERATION_VERBS.len(), 9);
+        assert_eq!(MODERATION_ENFORCEMENT_OUTCOMES.len(), 5);
+        assert_eq!(MODERATION_ENFORCEMENT_OUTCOMES.last(), Some(&"other"));
+    }
+
+    #[test]
+    fn moderation_enforcements_cover_every_verb_and_outcome() {
+        // TOG-28482 acceptance: each verb/outcome pair records with no network.
+        let metrics = Metrics::default();
+        for verb in MODERATION_VERBS {
+            for outcome in MODERATION_ENFORCEMENT_OUTCOMES {
+                metrics.moderation_enforcement(verb, outcome);
+            }
+        }
+        let text = metrics.render(None);
+        for verb in MODERATION_VERBS {
+            for outcome in MODERATION_ENFORCEMENT_OUTCOMES {
+                assert!(
+                    text.contains(&format!(
+                        "two_bot_moderation_enforcements_total{{verb=\"{verb}\",outcome=\"{outcome}\"}} 1\n"
+                    )),
+                    "missing {verb}/{outcome}"
+                );
+            }
+        }
+        // Fixed cardinality: 9 verbs x 5 outcomes.
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_moderation_enforcements_total{"))
+                .count(),
+            MODERATION_VERBS.len() * MODERATION_ENFORCEMENT_OUTCOMES.len()
+        );
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn moderation_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.moderation_enforcement(&hostile, &hostile);
+            metrics.moderation_enforcement("ban", &hostile);
+            metrics.moderation_enforcement(&hostile, "success");
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
     }
 
     #[test]
@@ -2941,6 +3119,93 @@ mod tests {
         assert!(text.contains(&format!("two_bot_gateway_disconnects_total {}\n", u64::MAX)));
         assert!(text.contains(&format!(
             "two_bot_gateway_missed_events_total {}\n",
+            u64::MAX
+        )));
+    }
+
+    #[test]
+    fn automod_decisions_cover_each_completion_kind_without_new_series() {
+        // TOG-28481: one counter per terminal CompletionKind, fixed 8-value
+        // vocabulary. No message text, excerpts or user IDs ever reach labels.
+        use crate::automod_runtime::CompletionKind;
+        let kinds = [
+            CompletionKind::Accepted,
+            CompletionKind::AlreadyProcessed,
+            CompletionKind::DryRun,
+            CompletionKind::Protected,
+            CompletionKind::Deleted,
+            CompletionKind::Warned,
+            CompletionKind::TimedOut,
+            CompletionKind::SanctionRefused,
+        ];
+        assert_eq!(
+            kinds.map(CompletionKind::as_str).as_slice(),
+            AUTOMOD_DECISION_OUTCOMES,
+            "CompletionKind::as_str must mirror the metrics allowlist in order"
+        );
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        for outcome in AUTOMOD_DECISION_OUTCOMES {
+            assert!(text.contains(&format!(
+                "two_bot_automod_decisions_total{{outcome=\"{outcome}\"}} 0\n"
+            )));
+        }
+        for kind in kinds {
+            metrics.automod_decision(kind.as_str());
+        }
+        metrics.automod_decision("deleted");
+        let text = metrics.render(None);
+        for (kind, count) in [
+            (CompletionKind::Accepted, 1),
+            (CompletionKind::AlreadyProcessed, 1),
+            (CompletionKind::DryRun, 1),
+            (CompletionKind::Protected, 1),
+            (CompletionKind::Deleted, 2),
+            (CompletionKind::Warned, 1),
+            (CompletionKind::TimedOut, 1),
+            (CompletionKind::SanctionRefused, 1),
+        ] {
+            assert!(text.contains(&format!(
+                "two_bot_automod_decisions_total{{outcome=\"{}\"}} {count}\n",
+                kind.as_str()
+            )));
+        }
+        // Fixed cardinality: exactly eight series, parseable samples.
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_automod_decisions_total{"))
+            .collect();
+        assert_eq!(series.len(), AUTOMOD_DECISION_OUTCOMES.len());
+        let mut unique = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(unique.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn automod_decision_hostile_labels_collapse_and_saturate() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.automod_decision(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(
+            text.contains("two_bot_automod_decisions_total{outcome=\"sanction_refused\"} 100\n")
+        );
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.automod_decisions = [u64::MAX; AUTOMOD_DECISION_OUTCOMES.len()];
+        }
+        metrics.automod_decision("accepted");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_automod_decisions_total{{outcome=\"accepted\"}} {}\n",
             u64::MAX
         )));
     }

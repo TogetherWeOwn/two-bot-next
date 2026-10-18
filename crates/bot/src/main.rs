@@ -37,8 +37,11 @@ mod discord_test_common;
 mod dispatch;
 mod erasure_cli;
 mod event_cli;
+mod eventsub_delivery;
 mod eventsub_http;
 mod eventsub_reconcile;
+#[cfg(test)]
+mod fast_burn_page_tests;
 mod feed_jobs;
 mod gateway;
 // Bounded reconnect schedule and runner: no runtime caller yet. Test-only
@@ -79,6 +82,7 @@ mod onboarding_tests;
 mod ops_backfill;
 mod ops_http;
 mod preflight;
+mod privacy_command;
 mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
@@ -351,9 +355,11 @@ async fn run(cli_args: &[String]) {
         None => None,
     };
 
-    // Private EventSub listener (TOG-23387): verified deliveries only, no
-    // database and no Discord send in this slice. Enabled failures never fall
-    // back; a bound listener that later fails stops the container.
+    // Private EventSub listener: verified deliveries only. Boot injects no
+    // delivery dependencies yet (no announcements-channel/invite config is
+    // provisioned), so notifications are acknowledged without a send; see
+    // `eventsub_delivery`. Enabled failures never fall back; a bound
+    // listener that later fails stops the container.
     let eventsub_receiver = match eventsub_config {
         Some(eventsub_config) => Some(eventsub_http::bind(eventsub_config).await.unwrap_or_else(
             |_| {
