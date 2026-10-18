@@ -12776,41 +12776,105 @@ fn empty_grace_config_accepts_zero_to_ten_minutes_and_refuses_garbage() {
 
 /// Regression for the stored-grace fallback bug: a guild that spawns with a
 /// stored `0` must return to the true boot grace once the row is deleted
-/// (the documented undo path), not keep sweeping instantly. Simulates the
-/// fixed `ensure_actor` sequence: pre-load pollution, then the boot fallback
-/// restore before the revision-2 refresh.
+/// (the documented undo path), not keep sweeping instantly. Driven through
+/// the real `ensure_actor` spawn path, so the boot-fallback restore line in
+/// `ensure_actor` is what makes this pass: with that line removed the final
+/// assert sees `Some(ZERO)` instead of `Some(EMPTY_ROOM_GRACE)`.
 #[tokio::test]
 async fn spawn_with_stored_zero_then_row_removal_restores_boot_grace() {
-    use two_bot_core::settings::{live_channel, SettingsSnapshot};
+    use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
 
-    let (live, store, http, _trace) = fixture();
-    live.set_empty_grace(Duration::ZERO);
-    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
-    worker.empty_grace_fallback = EMPTY_ROOM_GRACE;
+    let trace = Trace::default();
     let (mut writer, reader) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_string(),
+            key: EMPTY_GRACE_KEY.to_owned(),
+            value: json!(0),
+            version: 1,
+        }],
+    });
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || (Store::new(trace.clone()), Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+    .with_live_source(move || Some(reader.clone()));
+    let actor = runtime.ensure_actor(GUILD).expect("spawn the guild actor");
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(Duration::ZERO) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(Duration::ZERO),
+        "spawn with a stored 0 applies the stored override first"
+    );
     writer.publish(&SettingsSnapshot {
         revision: 2,
         rows: vec![],
     });
-    worker.refresh_empty_grace_with(Some(&reader));
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(EMPTY_ROOM_GRACE) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     assert_eq!(
-        worker.live.read_state().empty_grace,
+        actor.live.read_state().empty_grace,
         Some(EMPTY_ROOM_GRACE),
         "deleting the stored row must restore the boot grace, never a stale zero"
     );
+    runtime.remove_guild(GUILD);
 }
 
 /// Same fallback bug via the out-of-range path: a stored `0` at spawn
-/// followed by a `601` edit must fail closed to the boot grace.
+/// followed by a `601` edit must fail closed to the boot grace. Driven
+/// through the real `ensure_actor` spawn path, like the row-removal test
+/// above: with the boot-fallback restore line removed the final assert
+/// sees `Some(ZERO)` instead of `Some(EMPTY_ROOM_GRACE)`.
 #[tokio::test]
 async fn spawn_with_stored_zero_then_out_of_range_restores_boot_grace() {
     use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
 
-    let (live, store, http, _trace) = fixture();
-    live.set_empty_grace(Duration::ZERO);
-    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
-    worker.empty_grace_fallback = EMPTY_ROOM_GRACE;
+    let trace = Trace::default();
     let (mut writer, reader) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_string(),
+            key: EMPTY_GRACE_KEY.to_owned(),
+            value: json!(0),
+            version: 1,
+        }],
+    });
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || (Store::new(trace.clone()), Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+    .with_live_source(move || Some(reader.clone()));
+    let actor = runtime.ensure_actor(GUILD).expect("spawn the guild actor");
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(Duration::ZERO) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(Duration::ZERO),
+        "spawn with a stored 0 applies the stored override first"
+    );
     writer.publish(&SettingsSnapshot {
         revision: 2,
         rows: vec![SettingRow {
@@ -12820,12 +12884,18 @@ async fn spawn_with_stored_zero_then_out_of_range_restores_boot_grace() {
             version: 2,
         }],
     });
-    worker.refresh_empty_grace_with(Some(&reader));
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(EMPTY_ROOM_GRACE) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     assert_eq!(
-        worker.live.read_state().empty_grace,
+        actor.live.read_state().empty_grace,
         Some(EMPTY_ROOM_GRACE),
         "an out-of-range edit after a stored zero must fail closed to boot"
     );
+    runtime.remove_guild(GUILD);
 }
 
 #[test]
