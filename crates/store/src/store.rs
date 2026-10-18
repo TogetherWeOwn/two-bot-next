@@ -23,6 +23,7 @@ use std::collections::HashSet;
 
 use sqlx::{postgres::PgRow, Pool, Postgres, Row};
 use two_bot_core::{
+    analytics_family::AnalyticsCategory,
     membership::{
         advance_observation, is_membership, project, set_observation, valid_observation,
         Membership, MembershipStore,
@@ -461,8 +462,16 @@ impl FunnelStore for PgFunnelStore {
     }
 
     /// Monotonic recency bump (never moves backwards). Failures panic — see
-    /// [`FunnelStore::record`].
-    fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str) {
+    /// [`FunnelStore::record`]. Like `record`, the bump honors the guild
+    /// analytics toggle for its originating family: a disabled family's
+    /// touch advances nothing.
+    fn touch_activity(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        at: &str,
+        family: AnalyticsCategory,
+    ) {
         let guild_id = snowflake_text(guild_id);
         let member_id = snowflake_text(member_id);
         let at = at.to_owned();
@@ -476,6 +485,10 @@ impl FunnelStore for PgFunnelStore {
                 .execute(&mut *tx)
                 .await?;
             if two_bot_core::privacy::suppressed_in(&mut tx, &guild_id, &member_id).await? {
+                tx.rollback().await?;
+                return Ok::<(), sqlx::Error>(());
+            }
+            if two_bot_core::privacy::category_off_in(&mut tx, &guild_id, family).await? {
                 tx.rollback().await?;
                 return Ok::<(), sqlx::Error>(());
             }
@@ -620,7 +633,7 @@ mod privacy_lock_tests {
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use sqlx::{Pool, Postgres};
 
-    use two_bot_core::{EventType, FunnelEvent, FunnelStore};
+    use two_bot_core::{analytics_family::AnalyticsCategory, EventType, FunnelEvent, FunnelStore};
 
     use super::PgFunnelStore;
 
@@ -815,7 +828,7 @@ mod privacy_lock_tests {
             let store = PgFunnelStore::new(writer_pool);
             for i in 0..20 {
                 let at = format!("2026-10-13T00:{i:02}:00.000Z");
-                store.touch_activity(guild, member, &at);
+                store.touch_activity(guild, member, &at, AnalyticsCategory::Activity);
                 store.mark_bot(guild, member);
             }
         });
@@ -838,7 +851,12 @@ mod privacy_lock_tests {
 
         // Other members still bump after the race.
         let store = PgFunnelStore::new(pool.clone());
-        store.touch_activity(guild, other, "2026-10-13T01:00:00.000Z");
+        store.touch_activity(
+            guild,
+            other,
+            "2026-10-13T01:00:00.000Z",
+            AnalyticsCategory::Activity,
+        );
         let other_rows: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM members WHERE guild_id = $1 AND member_id = $2",
         )
@@ -883,7 +901,12 @@ mod privacy_lock_tests {
         let writer_pool = pool.clone();
         let writer = tokio::spawn(async move {
             let store = PgFunnelStore::new(writer_pool);
-            store.touch_activity(guild, member, "2026-10-13T00:00:00.000Z");
+            store.touch_activity(
+                guild,
+                member,
+                "2026-10-13T00:00:00.000Z",
+                AnalyticsCategory::Activity,
+            );
         });
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         opt_tx.commit().await.expect("opt-out commit");

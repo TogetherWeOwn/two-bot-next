@@ -9,14 +9,14 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 28 built-ins plus the voice set
-  (50 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 29 built-ins plus the voice set
+  (51 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
 
-Counts: 3 core + 1 scorecard + 8 automations + 7 announcements +
-9 moderation = **28 built-ins**. Machine-readable mirror:
+Counts: 4 core + 1 scorecard + 8 automations + 7 announcements +
+9 moderation = **29 built-ins**. Machine-readable mirror:
 `crates/core/tests/fixtures/smoke_surface_inventory.json`, checked by
 `crates/core/tests/smoke_surface_inventory.rs` (registry shape in publish
 order, exactly-five-covered gate, handler routing for the five).
@@ -37,9 +37,12 @@ Each row links the exact expected reply in
 | 5 | `/ban` | moderation (gated) | BanMembers | Expected-response table, `/ban` routing + refusal copy; run-record row 5 |
 
 Denied-path probes for the gated three (gate off, permission missing) are
-rows 6–8 of the run-record sheet, using the shared denied copy.
+rows 6–8 of the run-record sheet, using the shared denied copy. Done: they
+are pinned offline by `crates/discord/tests/denied_path_probes.rs` (one test
+per row; each probe asserts a read-only `Refuse` with the immediate ephemeral
+type-4 reply on an isolated gate-safe router).
 
-## Deferred: 23 commands with reasons
+## Deferred: 24 commands with reasons
 
 Deferred means out of the read-only smoke, not untested: every row below
 is published by the same registry the unit test pins, and most share a
@@ -48,6 +51,7 @@ handler family with a covered command.
 | Command | Family | Deferral reason |
 | --- | --- | --- |
 | `/help` | core | Next-only discovery command with no legacy counterpart; answers from the live publish set with no store or network effect, so offline router and renderer tests pin it instead of the live smoke five. |
+| `/privacy` | core | Next-only member self-serve with no legacy counterpart; the purge-plus-suppression-plus-receipt path is pinned by the gateway dispatch tests on a disposable database rather than the live smoke five. |
 | `/attendance` | scorecard | Needs a seeded event-occurrence plus a verified-human fixture; outside the one-per-family smoke budget. |
 | `/command` | automations | Mutating admin CRUD that creates live commands; the read-only smoke excludes state writes. |
 | `/command-remove` | automations | Destructive admin op; excluded from the read-only smoke. |

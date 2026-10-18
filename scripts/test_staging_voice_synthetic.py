@@ -487,14 +487,14 @@ class MetricsSnapshotTest(unittest.TestCase):
                     return False
             return _Resp()
 
-        with mock.patch.object(synth.urllib.request, "urlopen", side_effect=fake_open):
+        with mock.patch.object(synth, "_open_no_redirect", side_effect=fake_open):
             received, refused = synth.metrics_snapshot("https://two-bot-next-staging.x", "tok")
         self.assertEqual(received, 7)
         self.assertEqual(refused, {"unknown_creator": 2.0, "halted": 1.0})
         self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
 
     def test_unavailable_metrics_report_none(self):
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                side_effect=OSError("down")):
             self.assertEqual(synth.metrics_snapshot("https://two-bot-next-staging.x", "tok"),
                              (None, None))
@@ -625,7 +625,7 @@ class BodyCapTest(unittest.TestCase):
         seen = []
         body = self.padded({"id": ROOM}, synth.MAX_BODY_BYTES)
         self.assertEqual(len(body), synth.MAX_BODY_BYTES)
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                return_value=self.response(body, seen)):
             self.assertEqual(synth.rest("t", f"/channels/{ROOM}")["id"], ROOM)
         self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
@@ -638,7 +638,7 @@ class BodyCapTest(unittest.TestCase):
         # Still valid JSON (trailing whitespace): the old parser would accept.
         self.assertEqual(json.loads(body)["note"], sentinel)
         seen = []
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                return_value=self.response(body, seen)):
             with self.assertRaises(synth.BodyTooLarge) as ctx:
                 synth.rest("t", f"/channels/{ROOM}")
@@ -650,7 +650,7 @@ class BodyCapTest(unittest.TestCase):
         prefix = self.padded({"id": ROOM}, synth.MAX_BODY_BYTES)
         self.assertEqual(json.loads(prefix)["id"], ROOM)
         seen = []
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                return_value=self.response(prefix + b"X", seen)):
             with self.assertRaises(synth.BodyTooLarge) as ctx:
                 synth.rest("t", f"/channels/{ROOM}")
@@ -660,14 +660,14 @@ class BodyCapTest(unittest.TestCase):
     def test_rest_http_error_path_is_bounded(self):
         seen = []
         big = b"y" * (synth.MAX_BODY_BYTES + 1)
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                side_effect=self.http_error(big, seen)):
             with self.assertRaises(synth.BodyTooLarge) as ctx:
                 synth.rest("t", f"/channels/{ROOM}")
         self.assertEqual(str(ctx.exception), "Discord REST read answered over the body cap")
         self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
         seen.clear()
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                side_effect=self.http_error(b"{}", seen)):
             with self.assertRaises(urllib.error.HTTPError):
                 synth.rest("t", f"/channels/{ROOM}")
@@ -679,7 +679,7 @@ class BodyCapTest(unittest.TestCase):
         body = line.encode() + b"# pad\n" * 10
         body = body + b" " * (synth.MAX_BODY_BYTES - len(body))
         self.assertEqual(len(body), synth.MAX_BODY_BYTES)
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                return_value=self.response(body, seen)):
             self.assertEqual(synth.metrics_value("https://two-bot-next-staging.x", "tok"), 4)
         self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
@@ -690,7 +690,7 @@ class BodyCapTest(unittest.TestCase):
         body = base + b" " * (synth.MAX_BODY_BYTES + 1 - len(base))
         self.assertEqual(len(body), synth.MAX_BODY_BYTES + 1)
         seen = []
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                return_value=self.response(body, seen)):
             with self.assertRaises(synth.BodyTooLarge) as ctx:
                 synth.metrics_value("https://two-bot-next-staging.x", "tok")
@@ -701,13 +701,13 @@ class BodyCapTest(unittest.TestCase):
     def test_metrics_http_error_path_is_bounded(self):
         seen = []
         big = b"z" * (synth.MAX_BODY_BYTES + 1)
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                side_effect=self.http_error(big, seen)):
             with self.assertRaises(synth.BodyTooLarge):
                 synth.metrics_value("https://two-bot-next-staging.x", "tok")
         self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
         seen.clear()
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                side_effect=self.http_error(b"oops", seen)):
             self.assertIsNone(synth.metrics_value("https://two-bot-next-staging.x", "tok"))
         self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
@@ -715,7 +715,7 @@ class BodyCapTest(unittest.TestCase):
     def test_patch_reports_status_without_raising(self):
         seen = []
         body = json.dumps({"id": CREATOR, "name": "Create a Lobby"}).encode()
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                return_value=self.response(body, seen)):
             self.assertEqual(synth.rest_patch("t", f"/channels/{CREATOR}", {"name": "x"}),
                              (200, {"id": CREATOR, "name": "Create a Lobby"}))
@@ -723,7 +723,7 @@ class BodyCapTest(unittest.TestCase):
 
     def test_patch_forbidden_reports_403(self):
         seen = []
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                side_effect=self.http_error(b"{}", seen, code=403)):
             self.assertEqual(synth.rest_patch("t", f"/channels/{CREATOR}", {"name": "x"}),
                              (403, None))
@@ -731,7 +731,7 @@ class BodyCapTest(unittest.TestCase):
 
     def test_patch_over_cap_refuses(self):
         big = b"y" * (synth.MAX_BODY_BYTES + 1)
-        with mock.patch.object(synth.urllib.request, "urlopen",
+        with mock.patch.object(synth, "_open_no_redirect",
                                return_value=self.response(big, [])):
             with self.assertRaises(synth.BodyTooLarge) as ctx:
                 synth.rest_patch("t", f"/channels/{CREATOR}", {"name": "x"})
@@ -744,7 +744,7 @@ class BodyCapTest(unittest.TestCase):
             requests.append(req)
             return self.response(b"{}", [])
 
-        with mock.patch.object(synth.urllib.request, "urlopen", side_effect=fake_open):
+        with mock.patch.object(synth, "_open_no_redirect", side_effect=fake_open):
             synth.rest("t", f"/channels/{ROOM}")
             synth.rest_patch("t", f"/channels/{ROOM}", {"name": "x"})
             synth.metrics_value("https://two-bot-next-staging.x", "tok")

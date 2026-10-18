@@ -74,6 +74,8 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 # (sqlx 0.9: `mod macros` is `#[cfg(feature = "macros")]`, so `migrate`
 # alone does not export the macro). TOG-9882 cutover migrations embed via
 # `sqlx::migrate!`.
+# On any sqlx bump: re-audit crates/core/src/database_url.rs allowlist +
+# suppressed pgpass target per SECURITY.md before merging.
 sqlx = { version = "0.9", default-features = false, features = [
     "postgres",
     "runtime-tokio",
