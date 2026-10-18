@@ -82,7 +82,7 @@ existing disposable Postgres service, rather than the lint-only `check` lane.
   `cfg_attr(..., allow/expect/ignore)` count as waivers. The
   guard reads that table from the base branch, so a PR cannot exempt itself.
 
-## Semgrep backlog (49 `panic!` hits, grandfathered until 2027-01-15)
+## Semgrep backlog (30 `panic!` hits, grandfathered until 2027-01-15)
 
 Grandfathered on the HARD promotion: these pre-existing hits stay silent
 (the gate only fails on lines the diff adds) until 2027-01-15. Work them
@@ -90,8 +90,8 @@ down or renew the date with a reason; never silently delete the list to get
 green. Counts below are the pinned snapshot; re-pin with real semgrep
 output if they drift.
 
-- `crates/bot/src/gateway.rs`: 12
-- `crates/core/src/onboarding.rs`: 7
+- `crates/bot/src/gateway.rs`: 0 (converted: test assertion fallbacks now `assert!(matches!(…))` with message guards, plus three `assert!(false, …)` single-line fallbacks; identical messages, no `panic!` macro left)
+- `crates/core/src/onboarding.rs`: 0 (converted: test assertion fallbacks now `assert!(matches!(…))` plus content `if let` checks; identical messages, no `panic!` macro left)
 - `crates/bot/src/backup_cli.rs`: 3
 - `crates/discord/src/voice_rooms.rs`: 3
 - `crates/core/src/rsvp_store.rs`: 2
