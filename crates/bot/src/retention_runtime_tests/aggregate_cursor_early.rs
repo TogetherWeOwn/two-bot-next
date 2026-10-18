@@ -1,12 +1,13 @@
 #![cfg(test)]
 
-//! Regression: the aggregate-expiry cursor advances per guild immediately
-//! before that guild's delete, so a hung delete or a supervisor timeout that
-//! cancels the pass still moves on to later guilds on the same page instead
-//! of re-blocking on the same first guild forever. Separate from the
-//! acceptance paging contract (which this file never edits): it holds a row
-//! lock on the first guild, cancels the blocked pass, runs a second pass
-//! without releasing the lock, and asserts the later guilds are reached.
+//! Regression: per-guild deletes carry `lock_timeout`/`statement_timeout`, so
+//! a row lock held by a stuck session fails that guild fast as an isolated
+//! retryable error instead of blocking the pass until the supervisor cancels
+//! it and pins its pooled connection (sqlx 0.9 pings the dropped connection
+//! with no timeout). Separate from the acceptance paging contract (which this
+//! file never edits): it holds a row lock on the first guild across three
+//! passes on a production-shaped 2-connection pool and asserts later guilds
+//! are still reached and the pool still hands out connections.
 
 use super::database::{database, RUNTIME_LOCK};
 use super::*;
@@ -60,16 +61,15 @@ async fn aggregate_expiry_cursor_advances_before_deletes_on_cancelled_pass() {
     let Some(db) = database().await else { return };
     let pool = db.pool();
     reset_aggregate_expiry_cursor_for_tests();
-    // Six guilds: test pages at 4, so the first page is guilds 1-4. The
-    // cursor must land on guild 1 (the last attempted guild) even when guild
-    // 1's delete never finishes, so the next pass resumes after it.
+    // Six guilds: test pages at 4, so the first page is guilds 1-4.
     for i in 1..=6 {
         seed_guild(pool, &guild_id(i), 1).await;
     }
     let first = guild_id(1);
     let second = guild_id(2);
-    // Hold a row lock on the first guild's stale row: the pass's batched
-    // ctid DELETE for that guild blocks until this transaction rolls back.
+    // Hold a row lock on the first guild's stale row: without per-guild
+    // timeouts the batched ctid DELETE for that guild would block until the
+    // supervisor cancels the pass and pins its pooled connection.
     let mut holder = pool.begin().await.unwrap();
     sqlx::query("SELECT ctid FROM game_activity_guild_aggregates WHERE guild_id = $1 FOR UPDATE")
         .bind(&first)
@@ -77,44 +77,84 @@ async fn aggregate_expiry_cursor_advances_before_deletes_on_cancelled_pass() {
         .await
         .unwrap();
 
-    let action = job(pool.clone(), RetentionMode::Execute).action;
-    let cancelled = tokio::time::timeout(Duration::from_secs(2), (action)())
+    // Production-shaped pool: 2 connections and a 10 s acquire timeout, like
+    // `pool_from_url`. The fixture's 5-connection pool would hide the pinning
+    // this test guards (two cancelled passes exhaust 2 connections).
+    let limited = PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect_with(pool.connect_options().clone())
         .await
-        .is_err();
-    assert!(
-        cancelled,
-        "the blocked delete must still be pending at the fixture deadline"
-    );
-    assert_eq!(
-        aggregate_expiry_cursor_for_tests(pool).as_deref(),
-        Some(first.as_str()),
-        "a cancelled pass must advance past the last attempted guild"
-    );
-
-    // Without releasing the lock, the next pass must resume after guild 1
-    // and reach guild 2: per-guild cursor advancement means a blocked delete
-    // cannot starve the other guilds on its page, even for a single-page
-    // fleet.
-    let retry = job(pool.clone(), RetentionMode::Execute).action;
-    tokio::time::timeout(Duration::from_secs(30), (retry)())
-        .await
-        .expect("the pass after a blocked guild must complete without the lock")
         .unwrap();
+
+    async fn pool_still_usable(pool: &sqlx::PgPool) {
+        // The exact failing point from the review: `run_retention` starts with
+        // `pool.begin()`, which timed out once both pooled connections were
+        // pinned by cancelled blocked deletes.
+        tokio::time::timeout(Duration::from_secs(10), pool.acquire())
+            .await
+            .expect("pool must still hand out connections while the lock is held")
+            .expect("acquire must succeed while the lock is held");
+        sqlx::query("SELECT 1")
+            .fetch_one(pool)
+            .await
+            .expect("trivial query must answer while the lock is held");
+    }
+
+    // Pass 1 visits guilds 1-4: guild 1's delete fails fast on `lock_timeout`
+    // as an isolated per-guild error while guilds 2-4 still drain in the same
+    // pass. The pass reports the failure (Err) but completes instead of
+    // hanging until cancellation.
+    let action = job(limited.clone(), RetentionMode::Execute).action;
+    tokio::time::timeout(Duration::from_secs(30), (action)())
+        .await
+        .expect("blocked-guild pass must complete via lock timeout, not hang");
     assert_eq!(
-        stale_rows_in(pool, &second).await,
+        stale_rows_in(&limited, &second).await,
         0,
-        "the guild after a still-locked guild must be expired by the next pass"
+        "the guild after a still-locked guild must be expired by the same pass"
     );
     assert_eq!(
-        stale_rows_in(pool, &first).await,
+        stale_rows_in(&limited, &first).await,
         1,
         "the locked guild keeps its row for a later retry"
+    );
+    pool_still_usable(&limited).await;
+
+    // Pass 2 resumes after the first page and drains guilds 5-6 with no locked
+    // guild on its page.
+    let retry = job(limited.clone(), RetentionMode::Execute).action;
+    tokio::time::timeout(Duration::from_secs(30), (retry)())
+        .await
+        .expect("second pass must complete while the lock is held");
+    pool_still_usable(&limited).await;
+
+    // Pass 3 wraps back to the still-locked first guild: it must still
+    // complete (isolated failure) and the pool must still hand out
+    // connections. Before the timeout fix this third pass pinned the second
+    // pooled connection, so every later tick failed at `pool.begin()`.
+    let third = job(limited.clone(), RetentionMode::Execute).action;
+    tokio::time::timeout(Duration::from_secs(30), (third)())
+        .await
+        .expect("third pass with the lock still held must complete");
+    assert_eq!(
+        stale_rows_in(&limited, &first).await,
+        1,
+        "the locked guild still keeps its row after three passes"
+    );
+    pool_still_usable(&limited).await;
+    // The cursor kept moving across all three passes instead of sticking on
+    // the blocked guild: the last pass attempted the locked guild again.
+    assert_eq!(
+        aggregate_expiry_cursor_for_tests(&limited).as_deref(),
+        Some(first.as_str()),
+        "three passes with a held lock must still advance the cursor"
     );
     holder.rollback().await.unwrap();
 
     // With the lock released, later passes drain everything, proving no work
     // was skipped.
-    let drain = job(pool.clone(), RetentionMode::Execute).action;
+    let drain = job(limited.clone(), RetentionMode::Execute).action;
     let mut passes = 0u64;
     loop {
         passes += 1;
@@ -125,11 +165,12 @@ async fn aggregate_expiry_cursor_advances_before_deletes_on_cancelled_pass() {
         let result = tokio::time::timeout(Duration::from_secs(30), (drain)())
             .await
             .expect("drain pass must complete within fixture deadline");
-        result.unwrap();
-        if stale_rows(pool).await == 0 {
+        let _ = result;
+        if stale_rows(&limited).await == 0 {
             break;
         }
     }
+    limited.close().await;
     reset_aggregate_expiry_cursor_for_tests();
     db.close().await.unwrap();
 }

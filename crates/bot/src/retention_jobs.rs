@@ -149,6 +149,11 @@ pub(crate) fn pool_from_url(url: &str) -> Result<PgPool, ErrorClass> {
     let options =
         two_bot_core::database_url::connect_options(url).map_err(|_| ErrorClass::Configuration)?;
     let options = database_tls::apply(options, tls);
+    // The statement timeout rides the connection options (server-side setting
+    // per connection), so a blocked statement fails on its own even outside
+    // the per-guild `SET LOCAL` deletes below. Same 15 s as the other runtime
+    // pools; the acquire timeout still bounds a stuck TCP connect.
+    let options = options.options([("statement_timeout", "15000ms")]);
     Ok(PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(Duration::from_secs(10))
@@ -286,15 +291,17 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
 /// [`AGGREGATE_ROWS_PER_GUILD_PER_PASS`] rows per visited guild. Consecutive
 /// passes advance past already visited guilds — in dry-run mode too, where
 /// nothing is deleted — and an oversized guild drains across passes with its
-/// remaining rows retained. Deletes stay one guild scope at a time, so one
-/// guild's bounded failure retains its rows for a later retry while the pass
-/// moves on to the later guilds instead of starving them; any failure still
-/// returns [`ErrorClass::Database`] for a bounded retry. The cursor is
-/// written per guild immediately before that guild's delete, so a hung delete
-/// or a supervisor timeout that cancels the pass still advances past the last
-/// attempted guild instead of re-blocking on the same first guild forever:
-/// the next pass resumes after it and reaches the later guilds on the same
-/// page, even for a single-page fleet. The sweep carries
+/// remaining rows retained. Deletes stay one guild scope at a time, each with
+/// `lock_timeout = '5s'` / `statement_timeout = '15s'`, so one guild's
+/// bounded failure (including a lock held by a stuck session) retains its rows
+/// for a later retry while the pass moves on to the later guilds instead of
+/// starving them; any failure still returns [`ErrorClass::Database`] for a
+/// bounded retry, and no cancelled blocked delete pins a pooled connection.
+/// The cursor is written per guild immediately before that guild's delete, so
+/// a failed or cancelled pass still advances past the last attempted guild
+/// instead of re-blocking on the same first guild forever: the next pass
+/// resumes after it and reaches the later guilds on the same page, even for
+/// a single-page fleet. The sweep carries
 /// `guilds_visited`/`guilds_deferred` counts (no per-guild labels), so a
 /// partial pass is distinguishable from a complete one; `stale_rows` covers
 /// only the visited page. `guilds_deferred` counts eligible guilds sorting
@@ -392,14 +399,15 @@ async fn expire_stale_game_aggregates(
         }
         None => (None, 0),
     };
-    // Advance per guild BEFORE that guild's delete: a hung or slow delete
-    // (row lock with no statement/lock timeout) or a supervisor timeout that
-    // cancels the pass must not pin the cursor on the same first guild
-    // forever. The cursor always points at the last attempted guild, so the
-    // next pass resumes after it and reaches the later guilds on the same
-    // page, even when the whole fleet fits on one page. Failed rows stay in
-    // the table, so a later cycle retries them; nothing is ever marked
-    // expired except by an actual delete.
+    // Advance per guild BEFORE that guild's delete, and bound each delete
+    // with `lock_timeout`/`statement_timeout` (see the store batch): a row
+    // lock held by a stuck session fails that guild fast as an isolated
+    // retryable error instead of blocking the pass until the supervisor
+    // cancels it and pins its pooled connection. The cursor always points at
+    // the last attempted guild, so the next pass resumes after it and reaches
+    // the later guilds on the same page, even when the whole fleet fits on
+    // one page. Failed rows stay in the table, so a later cycle retries them;
+    // nothing is ever marked expired except by an actual delete.
     let mut stale = 0u64;
     let mut failed = false;
     if mode == RetentionMode::Execute {
