@@ -22,6 +22,7 @@ use crate::{
     server, website_jobs,
 };
 
+mod aggregate_cursor_early;
 mod aggregate_paging;
 mod boot;
 mod database;

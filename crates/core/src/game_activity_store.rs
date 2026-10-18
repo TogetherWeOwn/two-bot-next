@@ -192,8 +192,10 @@ pub async fn list_aggregate_guilds(
 /// holding stale rows, ordered by guild key ascending, resuming after
 /// `after_guild` (exclusive; `None` starts at the first key). The per-guild
 /// counts use the same stale predicate as [`expire_stale_guild_aggregates`],
-/// so a dry-run pass previews exactly the rows an execute pass would delete
-/// from the visited page. Stable under concurrent inserts: a guild sorts by
+/// so a dry-run pass is a same-predicate upper bound per pass for the visited
+/// page: execute deletes at most the per-guild row batch per visited guild,
+/// so over-batch guilds report fewer deleted rows per pass than previewed.
+/// Stable under concurrent inserts: a guild sorts by
 /// key, never by position, so a pass never re-walks already visited keys.
 /// Horizons outside `1..=MAX_AGGREGATE_RETENTION_DAYS` are refused
 /// (fail-closed); a zero `limit` reads one guild.
