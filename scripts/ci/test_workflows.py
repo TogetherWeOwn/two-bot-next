@@ -1691,13 +1691,13 @@ def slow_burn_tracker_errors(workflow):
 
     Runs on a 5-minute schedule and manual dispatch, only from main, through
     the `slow-burn-tracker` environment. One job: `tracker` restores the
-    cached burn ring, runs the reviewed scripts/slow_burn_tracker.py (staging
-    scrape plus the checked-in slow-burn verdict, then exactly one
-    file/refresh/resolve issue write), saves the ring on live runs and
-    uploads the evidence receipt. The 5-minute cadence is load-bearing for
-    the slow long-window baseline. Dispatch takes only the fixture choice
-    (live/fire/clear proof runs file under a test label without touching the
-    ring) and the dry-run flag.
+    cached burn ring and coverage sidecar, runs the reviewed
+    scripts/slow_burn_tracker.py (staging scrape plus the checked-in
+    slow-burn verdict, then exactly one file/refresh/resolve issue write),
+    saves both on live runs and uploads the evidence receipt. The 5-minute
+    cadence is load-bearing for the slow long-window baseline. Dispatch takes
+    only the fixture choice (live/fire/clear proof runs file under a test
+    label without touching the ring or coverage) and the dry-run flag.
     """
     name = "slow-burn-tracker.yml"
     errors = []

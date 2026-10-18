@@ -330,6 +330,200 @@ class TrackerUnitTests(unittest.TestCase):
         stored = json.loads(Path(evidence).read_text())
         self.assertEqual(stored["cadence"], "ok")
 
+    def test_coverage_sidecar_round_trip_and_rejects_junk(self):
+        now = 1_700_000_000
+        path = self.dir / "coverage.json"
+        self.assertIsNone(tracker.load_covered_at(str(path)))
+        tracker.save_covered_at(str(path), now)
+        self.assertEqual(tracker.load_covered_at(str(path)), now)
+        for junk in ("not json", "[1, 2]",
+                     json.dumps({"last_covered": "soon"}),
+                     json.dumps({"last_covered": True}),
+                     json.dumps({"last_covered": 0}),
+                     json.dumps({"last_covered": -5}),
+                     json.dumps({"other": now})):
+            path.write_text(junk, encoding="utf-8")
+            self.assertIsNone(tracker.load_covered_at(str(path)),
+                              f"sidecar must reject {junk!r}")
+        path.write_text(json.dumps({"last_covered": now - 3600}),
+                        encoding="utf-8")
+        self.assertEqual(tracker.load_covered_at(str(path)), now - 3600)
+        path.write_text(str(now - 7200), encoding="utf-8")
+        self.assertEqual(tracker.load_covered_at(str(path)), now - 7200)
+
+    def test_covered_verdict_persists_the_moment(self):
+        # Every covered run (fire or clear) refreshes the sidecar, so a
+        # later unknown run can measure how long coverage has been gone.
+        now = 1_700_000_000
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(json.dumps(
+            [{"t": now - 300, "received": 25, "duplicate": 0, "fastMoves": 24}]),
+            encoding="utf-8")
+        coverage_path = str(self.dir / "coverage.json")
+        evidence = str(self.dir / "evidence.json")
+        env = base_env({"STAGING_WORKER_URL": "https://staging.example",
+                        "METRICS_SCRAPE_TOKEN": "token"})
+        next_ring = [{"t": now, "received": 50, "duplicate": 0, "fastMoves": 50}]
+        covered = {"slow": False, "fast": False, "held": False,
+                   "ring": next_ring, "slowCovered": True}
+        fake = FakeGh()
+        with mock.patch.object(tracker, "scrape_metrics", return_value="expo"):
+            with mock.patch.object(tracker, "run_driver", return_value=covered):
+                with mock.patch("subprocess.run", fake):
+                    with mock.patch.object(tracker.time, "time", return_value=now):
+                        code = tracker.main(
+                            ["--ring", str(ring_path), "--coverage-path",
+                             coverage_path, "--evidence-out", evidence,
+                             "--exposition-out", str(self.dir / "expo.prom")],
+                            env)
+        self.assertEqual(code, 0)
+        self.assertEqual(tracker.load_covered_at(coverage_path), now)
+        self.assertEqual(json.loads(Path(ring_path).read_text()), next_ring)
+        stored = json.loads(Path(evidence).read_text())
+        self.assertEqual(stored["verdict"], "clear")
+
+    def test_sub_600s_gap_with_stale_coverage_warns(self):
+        # The review repro: 420 s spacings never trip the entry-age check,
+        # yet the baseline window stays empty. A 7 h-old covered moment must
+        # still warn and mark the run coarse instead of reading green.
+        now = 1_700_000_000
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(json.dumps(
+            [{"t": now - 420, "received": 25, "duplicate": 0, "fastMoves": 24}]),
+            encoding="utf-8")
+        coverage_path = str(self.dir / "coverage.json")
+        Path(coverage_path).write_text(
+            json.dumps({"last_covered": now - 7 * 3600}), encoding="utf-8")
+        evidence = str(self.dir / "evidence.json")
+        env = base_env({"STAGING_WORKER_URL": "https://staging.example",
+                        "METRICS_SCRAPE_TOKEN": "token"})
+        next_ring = [{"t": now, "received": 50, "duplicate": 0, "fastMoves": 48}]
+        uncovered = {"slow": False, "fast": False, "held": False,
+                     "ring": next_ring, "slowCovered": False}
+        writes = []
+        with mock.patch.object(tracker, "scrape_metrics", return_value="expo"):
+            with mock.patch.object(tracker, "run_driver", return_value=uncovered):
+                with mock.patch("sys.stdout") as stdout:
+                    with mock.patch.object(tracker.time, "time", return_value=now):
+                        code = tracker.main(
+                            ["--ring", str(ring_path), "--coverage-path",
+                             coverage_path, "--evidence-out", evidence,
+                             "--exposition-out", str(self.dir / "expo.prom")],
+                            env)
+                    for call in stdout.write.call_args_list:
+                        writes.append(call.args[0])
+        self.assertEqual(code, 0)
+        self.assertTrue(any("::warning::" in chunk and "no covered" in chunk
+                            for chunk in writes),
+                        f"expected a stale-coverage warning, got {writes!r}")
+        stored = json.loads(Path(evidence).read_text())
+        self.assertEqual(stored["verdict"], "unknown")
+        self.assertEqual(stored["cadence"], "coarse")
+        self.assertEqual(stored["uncovered_seconds"], 7 * 3600)
+        self.assertEqual(stored["stale_gap_seconds"], 420)
+
+    def test_recently_covered_unknown_stays_quiet(self):
+        # Coverage an hour ago means the baseline only just lapsed: record
+        # the gap, but do not warn yet.
+        now = 1_700_000_000
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(json.dumps(
+            [{"t": now - 420, "received": 25, "duplicate": 0, "fastMoves": 24}]),
+            encoding="utf-8")
+        coverage_path = str(self.dir / "coverage.json")
+        Path(coverage_path).write_text(
+            json.dumps({"last_covered": now - 3600}), encoding="utf-8")
+        evidence = str(self.dir / "evidence.json")
+        env = base_env({"STAGING_WORKER_URL": "https://staging.example",
+                        "METRICS_SCRAPE_TOKEN": "token"})
+        next_ring = [{"t": now, "received": 50, "duplicate": 0, "fastMoves": 48}]
+        uncovered = {"slow": False, "fast": False, "held": False,
+                     "ring": next_ring, "slowCovered": False}
+        writes = []
+        with mock.patch.object(tracker, "scrape_metrics", return_value="expo"):
+            with mock.patch.object(tracker, "run_driver", return_value=uncovered):
+                with mock.patch("sys.stdout") as stdout:
+                    with mock.patch.object(tracker.time, "time", return_value=now):
+                        code = tracker.main(
+                            ["--ring", str(ring_path), "--coverage-path",
+                             coverage_path, "--evidence-out", evidence,
+                             "--exposition-out", str(self.dir / "expo.prom")],
+                            env)
+                    for call in stdout.write.call_args_list:
+                        writes.append(call.args[0])
+        self.assertEqual(code, 0)
+        self.assertFalse(any("::warning::" in chunk for chunk in writes),
+                         f"recent coverage must not warn, got {writes!r}")
+        stored = json.loads(Path(evidence).read_text())
+        self.assertEqual(stored["verdict"], "unknown")
+        self.assertEqual(stored["cadence"], "ok")
+        self.assertEqual(stored["uncovered_seconds"], 3600)
+
+    def test_unknown_without_sidecar_stays_quiet(self):
+        # A fresh install never recorded coverage: silence, not a warning.
+        now = 1_700_000_000
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(json.dumps(
+            [{"t": now - 420, "received": 25, "duplicate": 0, "fastMoves": 24}]),
+            encoding="utf-8")
+        evidence = str(self.dir / "evidence.json")
+        env = base_env({"STAGING_WORKER_URL": "https://staging.example",
+                        "METRICS_SCRAPE_TOKEN": "token"})
+        next_ring = [{"t": now, "received": 50, "duplicate": 0, "fastMoves": 48}]
+        uncovered = {"slow": False, "fast": False, "held": False,
+                     "ring": next_ring, "slowCovered": False}
+        writes = []
+        with mock.patch.object(tracker, "scrape_metrics", return_value="expo"):
+            with mock.patch.object(tracker, "run_driver", return_value=uncovered):
+                with mock.patch("sys.stdout") as stdout:
+                    with mock.patch.object(tracker.time, "time", return_value=now):
+                        code = tracker.main(
+                            ["--ring", str(ring_path), "--coverage-path",
+                             str(self.dir / "coverage.json"),
+                             "--evidence-out", evidence,
+                             "--exposition-out", str(self.dir / "expo.prom")],
+                            env)
+                    for call in stdout.write.call_args_list:
+                        writes.append(call.args[0])
+        self.assertEqual(code, 0)
+        self.assertFalse(any("::warning::" in chunk for chunk in writes),
+                         f"missing sidecar must not warn, got {writes!r}")
+        stored = json.loads(Path(evidence).read_text())
+        self.assertEqual(stored["verdict"], "unknown")
+        self.assertEqual(stored["cadence"], "ok")
+        self.assertIsNone(stored["uncovered_seconds"])
+
+    def test_held_verdict_leaves_coverage_alone(self):
+        # Unusable join series decide nothing: the covered moment must
+        # survive a held run untouched.
+        now = 1_700_000_000
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(json.dumps(
+            [{"t": now - 300, "received": 25, "duplicate": 0, "fastMoves": 24}]),
+            encoding="utf-8")
+        coverage_path = self.dir / "coverage.json"
+        coverage_path.write_text(json.dumps({"last_covered": now - 3600}),
+                                 encoding="utf-8")
+        evidence = str(self.dir / "evidence.json")
+        env = base_env({"STAGING_WORKER_URL": "https://staging.example",
+                        "METRICS_SCRAPE_TOKEN": "token"})
+        held = {"slow": False, "fast": False, "held": True, "ring": [],
+                "slowCovered": False}
+        with mock.patch.object(tracker, "scrape_metrics", return_value="expo"):
+            with mock.patch.object(tracker, "run_driver", return_value=held):
+                with mock.patch("subprocess.run",
+                                 side_effect=AssertionError("gh must not run")):
+                    with mock.patch.object(tracker.time, "time", return_value=now):
+                        code = tracker.main(
+                            ["--ring", str(ring_path), "--coverage-path",
+                             str(coverage_path), "--evidence-out", evidence,
+                             "--exposition-out", str(self.dir / "expo.prom")],
+                            env)
+        self.assertEqual(code, 0)
+        stored = json.loads(Path(evidence).read_text())
+        self.assertEqual(stored["verdict"], "held")
+        self.assertEqual(tracker.load_covered_at(str(coverage_path)), now - 3600)
+
     def test_dry_run_writes_nothing(self):
         fake = FakeGh()
         with mock.patch("subprocess.run", fake):
@@ -418,6 +612,59 @@ class TrackerDriverTests(unittest.TestCase):
         self.assertFalse(verdict.get("slowCovered", True))
         self.assertGreaterEqual(
             tracker.ring_gap_seconds(ring, now), 600)
+
+    def run_burn_loop(self, step_fn, snapshots):
+        """Replay a sustained 8x burn at the given per-step spacings."""
+        now = int(time.time())
+        stamps = [now]
+        for index in range(snapshots):
+            stamps.append(stamps[-1] - step_fn(index))
+        stamps = sorted(stamps)[:-1]
+        ring = []
+        received = 0
+        fast = 0
+        for tick in stamps:
+            received += 25
+            fast += 24
+            ring.append({"t": tick, "received": received, "duplicate": 0,
+                         "fastMoves": fast})
+        received += 25
+        fast += 24
+        exposition = (
+            f"two_bot_voice_joins_received_total {received}\n"
+            f'two_bot_voice_join_refused_total{{reason="duplicate"}} 0\n'
+            f'two_bot_voice_join_to_move_seconds_bucket{{le="5"}} {fast}\n'
+        )
+        expo = self.dir / "expo.prom"
+        expo.write_text(exposition, encoding="utf-8")
+        ring_path = self.dir / "ring.json"
+        ring_path.write_text(json.dumps(ring), encoding="utf-8")
+        return tracker.run_driver(NODE, str(DRIVER), expo, ring_path, now)
+
+    def test_steady_420s_steps_stay_uncovered(self):
+        # Below the 600 s entry-age tripwire, so the old check stays silent,
+        # yet the narrow baseline window still holds no snapshot: a sustained
+        # 8x burn covers nothing and fires nothing.
+        verdict = self.run_burn_loop(lambda index: 420, 60)
+        self.assertFalse(verdict["held"])
+        self.assertFalse(verdict["slow"])
+        self.assertFalse(verdict.get("slowCovered", True))
+
+    def test_steady_590s_steps_stay_uncovered(self):
+        # Just under the 600 s tripwire: same silence, same missing baseline.
+        verdict = self.run_burn_loop(lambda index: 590, 48)
+        self.assertFalse(verdict["held"])
+        self.assertFalse(verdict["slow"])
+        self.assertFalse(verdict.get("slowCovered", True))
+
+    def test_alternating_300s_560s_steps_stay_uncovered(self):
+        # A jittered cadence averaging ~430 s also starves the baseline
+        # window: no fire, no coverage, no warning from the entry-age check.
+        verdict = self.run_burn_loop(
+            lambda index: 300 if index % 2 == 0 else 560, 60)
+        self.assertFalse(verdict["held"])
+        self.assertFalse(verdict["slow"])
+        self.assertFalse(verdict.get("slowCovered", True))
 
     def test_malformed_ring_rebuilds_silently(self):
         now = int(time.time())

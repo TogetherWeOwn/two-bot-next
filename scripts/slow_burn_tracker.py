@@ -55,6 +55,13 @@ REFRESH_SECONDS = 6 * 3600
 # this threshold the baseline is already pruned and the verdict stays
 # unknown. Warn instead of reading green.
 CADENCE_WARN_SECONDS = 600
+# Entry age alone cannot prove coverage: sub-600 s spacings (420 s steady,
+# 590 s steady, alternating 300/560 s) also leave the narrow baseline window
+# empty, so the verdict stays unknown with no warning. The tracker therefore
+# records the most recent covered moment beside the cached ring and warns
+# once the slow windows have gone this long without coverage: genuine burns
+# go unfiled and open cards stay unclosed while coverage is gone.
+UNCOVERED_WARN_SECONDS = int(6.5 * 3600)
 MARKER_RE = re.compile(r"<!-- slow-burn-tracker:last-update=(\d+) -->")
 TIMEOUT_SECONDS = 6
 MAX_BODY_BYTES = 64 * 1024
@@ -129,6 +136,39 @@ def ring_gap_seconds(ring, now):
     if newest is None:
         return None
     return now - newest
+
+
+def load_covered_at(path):
+    """Most recent covered epoch from the coverage sidecar, or None.
+
+    A missing, unreadable or malformed sidecar means coverage was never
+    recorded (fresh install): the caller stays silent, it does not warn.
+    """
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    if isinstance(parsed, dict):
+        tick = parsed.get("last_covered")
+    elif isinstance(parsed, (int, float)):
+        tick = parsed
+    else:
+        return None
+    if isinstance(tick, bool) or not isinstance(tick, (int, float)):
+        return None
+    if tick != tick or tick <= 0:
+        return None
+    return int(tick)
+
+
+def save_covered_at(path, now):
+    """Record a covered moment beside the cached ring."""
+    Path(path).write_text(json.dumps({"last_covered": int(now)}) + "\n",
+                           encoding="utf-8")
 
 
 def run_driver(node, driver, exposition_path, ring_path, now):
@@ -331,6 +371,8 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ring", default="slow-burn-ring.json",
                         help="persisted burn ring path (workflow cache)")
+    parser.add_argument("--coverage-path", default="slow-burn-coverage.json",
+                        help="most-recent-covered sidecar path (workflow cache)")
     parser.add_argument("--evidence-out", default="slow-burn-tracker-evidence.json",
                         help="evidence receipt path for the workflow artifact")
     parser.add_argument("--exposition-out", default="slow-burn-exposition.prom",
@@ -363,7 +405,8 @@ def main(argv=None, env=None):
     evidence = {"utc": _utc_now(), "origin": "", "mode": args.fixture,
                 "verdict": "unknown", "ring_size": 0,
                 "action": "none", "issue": None, "run_url": run_url,
-                "stale_gap_seconds": None, "cadence": "ok"}
+                "stale_gap_seconds": None, "uncovered_seconds": None,
+                "cadence": "ok"}
     cadence_gap = None
 
     if args.fixture == "live":
@@ -435,19 +478,31 @@ def main(argv=None, env=None):
     elif slow_covered:
         evidence["verdict"] = "clear"
     else:
-        # The slow windows lack full history (late start, a gap at the long
-        # edge, or a rebuilt ring): this is unknown, not a clear. The ring
-        # still persists so history rebuilds, but no issue is filed,
-        # refreshed or closed; silence here is not recovery.
+        # The slow windows lack full history (late start, a coarse cadence,
+        # or a rebuilt ring): this is unknown, not a clear. The ring still
+        # persists so history rebuilds, but no issue is filed, refreshed or
+        # closed; silence here is not recovery.
         evidence["verdict"] = "unknown"
         if args.fixture == "live":
             Path(args.ring).write_text(json.dumps(next_ring) + "\n", encoding="utf-8")
+            covered_at = load_covered_at(args.coverage_path)
+            if covered_at is not None:
+                uncovered = max(0, now - covered_at)
+                evidence["uncovered_seconds"] = uncovered
+                if uncovered >= UNCOVERED_WARN_SECONDS:
+                    evidence["cadence"] = "coarse"
+                    print(f"::warning::slow-burn tracker has no covered "
+                          f"slow-window verdict for {int(uncovered)}s "
+                          f"(threshold {UNCOVERED_WARN_SECONDS}s); genuine "
+                          f"burns go unfiled and open cards stay unclosed "
+                          f"until coverage returns")
         Path(args.evidence_out).write_text(json.dumps(evidence, indent=2) + "\n",
                                            encoding="utf-8")
         print(f"slow-burn tracker: verdict=unknown action=none ring={len(next_ring)}")
         return 0
     if args.fixture == "live":
         Path(args.ring).write_text(json.dumps(next_ring) + "\n", encoding="utf-8")
+        save_covered_at(args.coverage_path, now)
 
     try:
         action, number = reconcile(
