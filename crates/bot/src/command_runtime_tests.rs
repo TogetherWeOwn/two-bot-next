@@ -4222,7 +4222,16 @@ async fn automation_quota_refusals_reply_with_a_remedy_and_write_no_rows_or_audi
     );
     assert_eq!(db.schedule_rows().await.len(), 25);
     assert_eq!(db.feed_rows().await.len(), 25);
-    assert!(db.schedule_audits().await.is_empty());
+    // Schedule capacity refusal audits one `scheduled.create`/`rejected` row
+    // (reason `quota`); feed capacity refusal still audits nothing.
+    let schedule_audits = db.schedule_audits().await;
+    assert_eq!(
+        schedule_audits.len(),
+        1,
+        "schedule capacity refusal audits one row: {schedule_audits:?}"
+    );
+    assert_eq!(schedule_audits[0].0, "scheduled.create");
+    assert_eq!(schedule_audits[0].2, "rejected");
     assert!(db.feed_audits().await.is_empty());
     assert!(!mock
         .requests()
