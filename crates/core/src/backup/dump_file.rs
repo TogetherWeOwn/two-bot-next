@@ -246,8 +246,9 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "gateway_onboarding_jobs",
     // Durable cutover rollback journal and per-table watermarks (store chain
     // 0406). The journal is append-only cutover evidence: the funnel append
-    // journals each committed events insert best-effort via journal::record,
-    // and rows stay re-capturable during the watch window.
+    // journals each events insert inside the primary transaction under a
+    // savepoint best-effort via journal::record_in, and rows stay
+    // re-capturable during the watch window.
     // Never replay pre-restore cutover cursors into a recovered process: a
     // restored watermark could mark post-backup writes as already journaled
     // and silently break rollback coverage.
