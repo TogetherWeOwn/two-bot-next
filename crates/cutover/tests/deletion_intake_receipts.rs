@@ -142,7 +142,6 @@ use two_bot_testsupport::TestDatabase;
 
 const GUILD_A: &str = "711111111111111111";
 const GUILD_B: &str = "722222222222222222";
-const GONE_GUILD: &str = "733333333333333333";
 const MEMBER: &str = "744444444444444444";
 const OTHER_MEMBER: &str = "755555555555555555";
 
@@ -358,9 +357,7 @@ async fn deletion_subject_binds_to_requester_not_caller_target() {
         // CommandOptionType::User is 6; a user picker would be a caller-supplied target.
         assert!(
             !(*kind == 6
-                && ["user", "member", "target", "user_id", "member_id"]
-                    .iter()
-                    .any(|b| name.as_str() == *b)),
+                && ["user", "member", "target", "user_id", "member_id"].contains(&name.as_str())),
             "no user-picker target option is allowed"
         );
     }
