@@ -540,21 +540,24 @@ function paddedRpcBody(
 }
 
 /** Pull-driven chunk stream with delivered/cancelled bookkeeping. */
-function trackedChunks(chunks: Uint8Array[]) {
+function trackedChunks(chunks: Uint8Array[], highWaterMark = 1) {
   const state = { pulls: 0, delivered: 0, cancelled: false };
-  const stream = new ReadableStream<Uint8Array>({
-    pull(controller) {
-      state.pulls++;
-      if (state.delivered < chunks.length) {
-        controller.enqueue(chunks[state.delivered++]!);
-      } else {
-        controller.close();
-      }
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        state.pulls++;
+        if (state.delivered < chunks.length) {
+          controller.enqueue(chunks[state.delivered++]!);
+        } else {
+          controller.close();
+        }
+      },
+      cancel() {
+        state.cancelled = true;
+      },
     },
-    cancel() {
-      state.cancelled = true;
-    },
-  });
+    { highWaterMark },
+  );
   return { stream, state };
 }
 
@@ -642,16 +645,30 @@ test("streamed oversize without Content-Length is cancelled at the cap, tail unr
   const marker = "synthetic-intake-streamed-marker";
   const h = harness(() => Response.json({ synthetic: true }));
   const bytes = encoder.encode(paddedRpcBody(INBOUND_CAP_BYTES + 8192, { marker }));
-  const { stream, state } = trackedChunks([
+  const chunks = [
     bytes.subarray(0, 32 * 1024),
     bytes.subarray(32 * 1024, INBOUND_CAP_BYTES),
     bytes.subarray(INBOUND_CAP_BYTES, INBOUND_CAP_BYTES + 1),
-    bytes.subarray(INBOUND_CAP_BYTES + 1),
-  ]);
+  ];
+  // Split the post-cap tail into small chunks so every extra read past
+  // the cap is visible as one more delivered chunk (see the bound below).
+  for (let off = INBOUND_CAP_BYTES + 1; off < bytes.length; off += 1024) {
+    chunks.push(bytes.subarray(off, off + 1024));
+  }
+  // highWaterMark 0 disables this fixture's own one-chunk-ahead pull (the
+  // default HWM of 1), so delivered counts the Worker's demand reads only.
+  const { stream, state } = trackedChunks(chunks, 0);
   const res = await worker.fetch(rawMcp(stream), h.env, h.ctx);
   await assertIntakeRefusal(res, marker);
+  // Stopping at the cap costs exactly three demand reads: the 32 KiB
+  // chunk, the rest up to the cap, and the cap+1 byte that proves the
+  // body is oversize. Any read past that point delivers a fourth chunk
+  // and fails here, as does draining (all chunks).
+  assert.ok(
+    state.delivered <= 3,
+    `tail past cap+1 must stay unread (delivered ${state.delivered}/${chunks.length})`,
+  );
   assert.equal(state.cancelled, true, "oversize streamed body must be cancelled, not drained");
-  assert.ok(state.delivered < 4, `tail past cap+1 must stay unread (delivered ${state.delivered}/4)`);
   assert.deepEqual(h.names, [], "oversize intake must not resolve the DO");
   assert.deepEqual(h.forwarded, [], "oversize intake must never reach the container");
 });
