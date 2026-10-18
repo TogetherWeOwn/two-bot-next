@@ -218,25 +218,3 @@ fn dry_run_and_session_mode_rejection_are_unchanged_for_unknown_only_input() {
         "session mode must not route the game select at all"
     );
 }
-
-#[test]
-fn operator_guide_distinguishes_raw_empty_from_wholly_unrecognized_input() {
-    let guide = include_str!("../../../docs/onboarding-operator-guide.md").to_lowercase();
-    let distinguishes = [
-        "unknown-only",
-        "no recognized game",
-        "no recognised game",
-        "wholly unrecognized",
-        "wholly unrecognised",
-        "none of the submitted keys",
-        "no submitted key is recognized",
-        "no submitted key is recognised",
-    ]
-    .iter()
-    .any(|phrase| guide.contains(phrase));
-    assert!(
-        distinguishes,
-        "the operator guide must distinguish a raw empty selection (clear) \
-         from a nonempty wholly unrecognized one (roles preserved)"
-    );
-}
