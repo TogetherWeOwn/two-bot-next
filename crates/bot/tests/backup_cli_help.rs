@@ -34,7 +34,22 @@ impl Scratch {
     }
 
     fn is_empty(&self) -> bool {
-        std::fs::read_dir(&self.0).unwrap().next().is_none()
+        // Coverage harness artifact, not product output: an instrumented
+        // child (cargo-llvm-cov) writes its profile next to its cwd when
+        // LLVM_PROFILE_FILE is unset. `two_bot` forwards the parent's path
+        // so this is normally empty; ignore any stray profile so a harness
+        // change cannot re-flake the "touches nothing" assertion.
+        std::fs::read_dir(&self.0)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".profraw"))
+            })
+            .next()
+            .is_none()
     }
 }
 
@@ -48,6 +63,14 @@ impl Drop for Scratch {
 fn two_bot(dir: &Scratch, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_two-bot"));
     command.args(args).env_clear().current_dir(&dir.0);
+    // Under cargo-llvm-cov the child binary is coverage-instrumented. With a
+    // cleared env it loses LLVM_PROFILE_FILE and dumps `default.profraw`
+    // into the scratch cwd, tripping `is_empty`. Forward the parent's path
+    // (already uniquified with %p/%m) so child coverage merges into the
+    // report instead of polluting the assertion directory.
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
     command
 }
 
