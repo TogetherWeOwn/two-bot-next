@@ -16,7 +16,9 @@
 // - Version attribution: under --version-override the Worker-stamped
 //   `x-two-worker-version` header must equal the override UUID, so a canary
 //   is tested directly instead of through sampled traffic. A silent fallback
-//   to the old version fails instead of passing on the wrong build.
+//   to the old version fails instead of passing on the wrong build. On this
+//   singleton Worker the pin only passes for the version that already holds
+//   ownership (see the staging limit below).
 // - Edge hardening: the Worker-owned copy carries `x-content-type-options:
 //   nosniff` on both probes.
 //
@@ -25,8 +27,16 @@
 // accepted for the apex contract and intentionally changes no assertion;
 // the flag is logged so apex runs are distinguishable in logs.
 //
-// Staging-first: exercise against staging any time with
-//   node bin/smoke.mjs "https://<staging-worker>" [--version-override ...]
+// Staging-first: the no-override probe runs against staging any time with
+//   node bin/smoke.mjs "https://<staging-worker>"
+// --version-override is contract-only for the isolated synthetic fixture
+// (two-bot-next-gradual-proof): on this singleton Worker an override probe
+// of a non-owner version answers 503 ownership_fenced (OwnershipFence.require
+// in wrangler/src/ownership.ts), so it cannot pass as a canary. Override mode
+// passes only when the candidate already holds ownership. Gradual promotion
+// here also needs a Durable Object config without `exports` (this
+// wrangler.toml uses exports, which Cloudflare documents as unsupported for
+// gradual deployments) or a separate non-DO fixture Worker.
 // Production wiring is passive (see docs/gradual-promote-caller.md); never
 // claim unwired stages as proof.
 import { pathToFileURL } from "node:url";

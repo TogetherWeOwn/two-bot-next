@@ -1158,6 +1158,14 @@ def gradual_promote_proof_errors(workflow):
         errors.append(f"{name}:proof: must run exactly checkout, setup-node, target lock, the pinned action and the upload")
         return errors
     checkout, node, guard, gradual, upload = steps
+    for step, label in ((checkout, "checkout"), (node, "setup-node"),
+                        (guard, "target-lock"), (gradual, "central action")):
+        if "if" in step:
+            errors.append(f"{name}:proof: {label} step must not set if (fail closed)")
+        if "continue-on-error" in step:
+            errors.append(f"{name}:proof: {label} step must not set continue-on-error (fail closed)")
+    if "continue-on-error" in upload:
+        errors.append(f"{name}:proof: upload step must not set continue-on-error (fail closed)")
     if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
             or (checkout.get("with") or {}).get("persist-credentials") != "false" \
             or (checkout.get("with") or {}).get("fetch-depth") != "1":
@@ -1173,7 +1181,10 @@ def gradual_promote_proof_errors(workflow):
     guard_run = str(guard.get("run") or "")
     if guard.get("shell") != "bash" or "set -euo pipefail" not in guard_run:
         errors.append(f"{name}:proof: target-lock step must run fail-closed bash")
-    for needle in (GRADUAL_PROOF_WORKER, "passive", "No Cloudflare call"):
+    for needle in (GRADUAL_PROOF_WORKER, "passive", "No Cloudflare call",
+                     "${#CANDIDATE_TAG}", "-gt 128",
+                     "two-bot-next-gradual-proof.*.*.workers.dev",
+                     "single-label synthetic host"):
         if needle not in guard_run:
             errors.append(f"{name}:proof: target-lock step must pin {needle}")
     if "${{" in guard_run:
@@ -1198,9 +1209,11 @@ def gradual_promote_proof_errors(workflow):
         if marker in text:
             errors.append(f"{name}:proof: must not contain {marker!r}")
     # workers.dev appears only as the synthetic host shape in the guard's
-    # domain case pattern; anywhere else it would be a deploy route.
-    if text.count("workers.dev") != 1 \
-            or "two-bot-next-gradual-proof.*.workers.dev" not in guard_run:
+    # domain case pattern (accept plus single-label rejection); anywhere else
+    # it would be a deploy route.
+    if text.count("workers.dev") != 2 \
+            or "two-bot-next-gradual-proof.*.workers.dev" not in guard_run \
+            or "two-bot-next-gradual-proof.*.*.workers.dev" not in guard_run:
         errors.append(f"{name}:proof: workers.dev may appear only in the guard domain pattern")
     secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
     if secrets != {"cloudflare_api_token", "cloudflare_account_id"}:
@@ -3235,6 +3248,14 @@ class WorkflowTests(unittest.TestCase):
                 {"run": 'echo "${{ inputs.confirm_worker }}"'}),
             "upload may be missing": lambda w: job(w)["steps"][4]["with"].update({"if-no-files-found": "error"}),
             "upload not always": lambda w: job(w)["steps"][4].pop("if"),
+            "checkout conditional": lambda w: job(w)["steps"][0].update({"if": "always()"}),
+            "guard conditional": lambda w: job(w)["steps"][2].update({"if": "always()"}),
+            "gradual continue-on-error": lambda w: job(w)["steps"][3].update({"continue-on-error": "true"}),
+            "guard without length gate": lambda w: job(w)["steps"][2].update(
+                {"run": job(w)["steps"][2]["run"].replace("${#CANDIDATE_TAG}", "CANDIDATE_TAG")}),
+            "guard without single-label rejection": lambda w: job(w)["steps"][2].update(
+                {"run": job(w)["steps"][2]["run"].replace("two-bot-next-gradual-proof.*.*.workers.dev",
+                                                         "two-bot-next-gradual-proof-rejected")}),
         }
         for label, change in changes.items():
             with self.subTest(change=label):

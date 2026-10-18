@@ -29,12 +29,23 @@ the wrong build. Both probes require `x-content-type-options: nosniff`.
 assertion: this Worker serves no indexable HTML (health, readiness, ops and
 redirect links only). The flag is logged so apex runs stay distinguishable.
 
-Exercise against staging any time:
+Live staging probes without an override run any time:
 
 ```sh
 node bin/smoke.mjs "https://<staging-worker>"
-node bin/smoke.mjs "https://<staging-worker>" --version-override 'two-bot-next="<version-uuid>"'
 ```
+
+`--version-override` is contract-only for the isolated synthetic fixture
+(`two-bot-next-gradual-proof="<version-uuid>"`, once provisioned). Do not run
+it against the `two-bot-next-staging` singleton: any overridden version that
+does not hold the singleton ownership fence answers `/health` and `/readyz`
+with 503 `ownership_fenced` (`OwnershipFence.require` in
+`wrangler/src/ownership.ts`), so the override stage fails and the run
+auto-rolls back. Override mode passes only when the candidate already owns
+the fence, which means it cannot serve as a canary for this Worker. Gradual
+promotion here additionally needs a Durable Object config without `exports`
+(this `wrangler.toml` uses `exports`, which Cloudflare documents as
+unsupported for gradual deployments) or a separate non-DO fixture Worker.
 
 Contract tests live in `wrangler/test/smoke-checker.test.ts` (loopback stub;
 no staging call, no secret).

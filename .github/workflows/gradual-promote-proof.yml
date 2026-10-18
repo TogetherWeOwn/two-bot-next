@@ -85,11 +85,21 @@ jobs:
               exit 1
               ;;
           esac
+          if [ "${#CANDIDATE_TAG}" -gt 128 ]; then
+            echo "::error::candidate_tag must be 1-128 chars of letters, digits, dot, underscore or dash; refusing"
+            exit 1
+          fi
           case "$PROOF_DOMAIN" in
             two-bot-next-gradual-proof.*.workers.dev)
+              case "$PROOF_DOMAIN" in
+                */*|*..*|two-bot-next-gradual-proof.*.*.workers.dev)
+                  echo "::error::domain must be the single-label synthetic host for two-bot-next-gradual-proof, without a scheme; refusing"
+                  exit 1
+                  ;;
+              esac
               ;;
             *)
-              echo "::error::domain must be the synthetic host for two-bot-next-gradual-proof, without a scheme; refusing"
+              echo "::error::domain must be the single-label synthetic host for two-bot-next-gradual-proof, without a scheme; refusing"
               exit 1
               ;;
           esac
