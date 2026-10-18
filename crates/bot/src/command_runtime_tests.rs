@@ -844,15 +844,18 @@ async fn activation_boot_from_env_fixture() {
     }
 }
 
-/// Process-level proof for the two `main.rs` call-site guards the port
-/// record flags as fixture-only: refused `SelfRoles` composes no
-/// `SelfRoleService` (`main.rs:376-390`) and refused `Automod` never resolves
-/// or validates config (`main.rs:606-620`). Each case runs in an isolated
-/// child process with a cleared environment, following
-/// `activation_boot_from_env_isolates_denied_moderation_validation`. The
-/// fixture mirrors each guard's shape (permission checked before the
-/// constructor) and pins the exact `live activation refused` log line plus
-/// narrow-not-throw per call site. No boot/intent/gateway semantics change.
+/// Process-isolated fixture evidence for the two `run()` call-site guards the
+/// port record flags as fixture-only: the `SelfRoles` match arm gating
+/// `SelfRoleService::from_env` on `(gateway_prerequisites, store, permitted)`
+/// and the `Automod`-permitted fence before `automod_gateway::resolve`. Each
+/// case runs in an isolated child process with a cleared environment,
+/// following `activation_boot_from_env_isolates_denied_moderation_validation`.
+/// The fixture calls the real `crate::gateway_prerequisites` plus the
+/// permission fence and constructors, and pins the exact
+/// `live activation refused` log line plus narrow-not-throw per call site. It
+/// does not execute `run()`, so a deleted or inverted guard in `run()` would
+/// not fail this test; it pins the composition behavior the guards implement.
+/// No boot/intent/gateway semantics change.
 #[test]
 fn activation_boot_call_sites_narrow_refused_guards() {
     const VALID_PANELS: &str = r#"[{"id":"games","channelId":"10000000000000007","messageId":"10000000000000008","mode":"button","options":[{"key":"chess","label":"Chess","roleId":"10000000000000004","permissions":"0"}]}]"#;
@@ -974,21 +977,13 @@ async fn activation_boot_call_site_fixture() {
     let log = String::from_utf8(capture.0.lock().expect("capture lock").clone()).unwrap();
 
     let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
-    // Mirror `main.rs:378-385`: prerequisites plus a present store gate the
-    // permission check, and only the permitted path reaches catalogue
-    // parsing, the first fallible step of `SelfRoleService::from_env`. The
-    // lazy pool stand-in is never touched: parsing needs no connection.
-    let prerequisites_ok = config
-        .discord_token
-        .as_ref()
-        .map(|secret| secret.expose().as_str())
-        .is_some_and(|token| !token.is_empty())
-        && config
-            .database_url
-            .as_ref()
-            .map(|secret| secret.expose().as_str())
-            .is_some_and(|url| !url.is_empty())
-        && config.guild_id.is_some_and(|id| id != 0);
+    // Mirror the `SelfRoles` match arm in `run()`: the real
+    // `crate::gateway_prerequisites` plus a present store gate the permission
+    // check, and only the permitted path reaches catalogue parsing, the first
+    // fallible step of `SelfRoleService::from_env`. No pool is built here; the
+    // fixture stops at parsing, so the store is treated as present and the
+    // permission fence is the varying input.
+    let prerequisites_ok = crate::gateway_prerequisites(&config).is_ok();
     let self_permitted = activation.permitted(two_bot_core::activation::LiveCapability::SelfRoles);
     let automod_permitted = activation.permitted(two_bot_core::activation::LiveCapability::Automod);
     let mut self_constructed = false;
@@ -998,8 +993,9 @@ async fn activation_boot_call_site_fixture() {
     } else {
         None
     };
-    // Mirror `main.rs:609-622`: a refused automod capability is never
-    // resolved or validated; the refusal was already logged once above.
+    // Mirror the `Automod`-permitted fence in `run()`: a refused automod
+    // capability is never resolved or validated; the refusal was already
+    // logged once above.
     let mut automod_resolved = false;
     let automod_config = if automod_permitted {
         automod_resolved = true;
