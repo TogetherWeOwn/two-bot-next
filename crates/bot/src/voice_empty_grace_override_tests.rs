@@ -87,6 +87,186 @@ fn published_snapshot_serves_the_stored_empty_grace_live() {
     );
 }
 
+/// Resolution contract (builder seam): `stored_empty_grace_with(guild,
+/// fallback, live)`, mirroring `live_poll_seconds_with`. Stored JSON numbers
+/// and strings both count (the settings writer stores either); the accepted
+/// range is the boot parser's 0..=600 whole seconds.
+#[test]
+fn stored_value_overrides_the_boot_fallback_within_range() {
+    for (value, expected) in [
+        (json!(0), Duration::ZERO),
+        (json!(1), Duration::from_secs(1)),
+        (json!(600), Duration::from_secs(600)),
+        (json!("0"), Duration::ZERO),
+        (json!("45"), Duration::from_secs(45)),
+        (json!("600"), Duration::from_secs(600)),
+    ] {
+        let live = live_with(vec![setting_row(&guild(), value.clone())]);
+        assert_eq!(
+            stored_empty_grace_with(&guild(), EMPTY_ROOM_GRACE, Some(&live)),
+            expected,
+            "stored {value} must override the boot fallback"
+        );
+    }
+}
+
+/// Resolution contract: no live reader, no row, or only another guild's row
+/// all keep the exact boot fallback — including a boot fallback of zero or
+/// any other operator-chosen value, never a hardcoded substitute.
+#[test]
+fn unset_rows_fall_back_to_the_exact_boot_value() {
+    let empty = live_with(vec![]);
+    let other_guild = live_with(vec![setting_row("200", json!(0))]);
+    for fallback in [
+        Duration::ZERO,
+        Duration::from_secs(45),
+        EMPTY_ROOM_GRACE,
+        Duration::from_secs(600),
+    ] {
+        assert_eq!(
+            stored_empty_grace_with(&guild(), fallback, None),
+            fallback,
+            "no live reader keeps the boot value"
+        );
+        assert_eq!(
+            stored_empty_grace_with(&guild(), fallback, Some(&empty)),
+            fallback,
+            "no stored row keeps the boot value"
+        );
+        assert_eq!(
+            stored_empty_grace_with(&guild(), fallback, Some(&other_guild)),
+            fallback,
+            "another guild's row never drives this guild"
+        );
+    }
+}
+
+/// Resolution contract: every out-of-range or malformed stored value fails
+/// closed to the boot fallback. The fallback here is 45 s — neither the
+/// shipped default nor zero — so a result of 60 s (hardcoded default) or
+/// 0 s (zero-grace sweep) both fail this test.
+#[test]
+fn out_of_range_stored_values_fail_closed_to_the_boot_fallback() {
+    let fallback = Duration::from_secs(45);
+    for value in [
+        json!(601),
+        json!(86400),
+        json!("601"),
+        json!(-1),
+        json!("-1"),
+        json!("abc"),
+        json!("1.5"),
+        json!(1.5),
+        json!(""),
+        json!(true),
+        json!([0]),
+        json!(null),
+    ] {
+        let live = live_with(vec![setting_row(&guild(), value.clone())]);
+        assert_eq!(
+            stored_empty_grace_with(&guild(), fallback, Some(&live)),
+            fallback,
+            "stored {value} must fail closed to the boot fallback"
+        );
+    }
+}
+
+/// Resolution contract: an out-of-range stored value leaves a named reason
+/// in the log — one warning line carrying the setting key and the
+/// `out_of_range` reason — so an operator can find why the boot value is in
+/// force. An in-range value logs no such reason.
+#[test]
+fn out_of_range_stored_value_logs_a_named_reason() {
+    let capture = crate::tracing_capture::global();
+    let live = live_with(vec![setting_row(&guild(), json!(601))]);
+    let start = capture.text().len();
+    assert_eq!(
+        stored_empty_grace_with(&guild(), EMPTY_ROOM_GRACE, Some(&live)),
+        EMPTY_ROOM_GRACE
+    );
+    let logged = capture.text()[start..].to_owned();
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains(KEY) && line.contains("out_of_range")),
+        "expected one warning naming {KEY} with reason out_of_range: {logged}"
+    );
+
+    let live = live_with(vec![setting_row(&guild(), json!(30))]);
+    let start = capture.text().len();
+    assert_eq!(
+        stored_empty_grace_with(&guild(), EMPTY_ROOM_GRACE, Some(&live)),
+        Duration::from_secs(30)
+    );
+    let logged = capture.text()[start..].to_owned();
+    assert!(
+        !logged
+            .lines()
+            .any(|line| line.contains(KEY) && line.contains("out_of_range")),
+        "an in-range stored value logs no out_of_range reason: {logged}"
+    );
+}
+
+/// One room (500) already empty, with the resolved grace applied to the
+/// live guild exactly where production applies the boot value.
+async fn sweep_worker(grace: Duration) -> (GuildRoomWorker<Store, Http>, Trace) {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.live.set_empty_grace(grace);
+    (worker, trace)
+}
+
+/// Sweep path: a stored grace longer than the boot value holds the room
+/// past the boot grace and deletes it at the stored one.
+#[tokio::test(start_paused = true)]
+async fn sweep_holds_the_room_for_the_stored_grace_not_the_boot_grace() {
+    let live = live_with(vec![setting_row(&guild(), json!(600))]);
+    let grace = stored_empty_grace_with(&guild(), EMPTY_ROOM_GRACE, Some(&live));
+    let (mut worker, trace) = sweep_worker(grace).await;
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
+    worker.reconcile();
+    assert!(
+        !worker.dispatch_one(0).await,
+        "the boot grace must not delete a room under a longer stored grace"
+    );
+    tokio::time::advance(Duration::from_secs(600) - EMPTY_ROOM_GRACE).await;
+    worker.reconcile();
+    dispatch(&mut worker, 1).await;
+    assert_eq!(*trace.lock().unwrap(), ["delete:500", "forget:500"]);
+}
+
+/// Sweep path: a stored zero deletes on the first sweep even when the boot
+/// value would have waited the full default grace.
+#[tokio::test(start_paused = true)]
+async fn sweep_deletes_at_once_under_a_stored_zero_grace() {
+    let live = live_with(vec![setting_row(&guild(), json!(0))]);
+    let grace = stored_empty_grace_with(&guild(), EMPTY_ROOM_GRACE, Some(&live));
+    let (mut worker, trace) = sweep_worker(grace).await;
+    worker.reconcile();
+    dispatch(&mut worker, 0).await;
+    assert_eq!(*trace.lock().unwrap(), ["delete:500", "forget:500"]);
+}
+
+/// Sweep path: an out-of-range stored row sweeps at the boot grace — the
+/// room survives just before it and is deleted at it, never instantly.
+#[tokio::test(start_paused = true)]
+async fn sweep_with_an_out_of_range_stored_row_uses_the_boot_grace_not_zero() {
+    let live = live_with(vec![setting_row(&guild(), json!(601))]);
+    let grace = stored_empty_grace_with(&guild(), EMPTY_ROOM_GRACE, Some(&live));
+    let (mut worker, trace) = sweep_worker(grace).await;
+    worker.reconcile();
+    assert!(
+        !worker.dispatch_one(0).await,
+        "an out-of-range row must never become a zero-grace sweep"
+    );
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
+    worker.reconcile();
+    dispatch(&mut worker, 1).await;
+    assert_eq!(*trace.lock().unwrap(), ["delete:500", "forget:500"]);
+}
+
 /// Control: no stored row anywhere — the sweep keeps the shipped default,
 /// byte-identical to today (no delete before the grace, delete at it).
 #[tokio::test(start_paused = true)]
@@ -146,8 +326,31 @@ async fn stored_row_in_a_real_database_reaches_the_live_snapshot() {
         "the stored row must be served live for its guild"
     );
     assert_eq!(
-        reader.get("999999999999999999", KEY),
+        reader.get("200", KEY),
         None,
         "one guild's stored override never leaks to another guild"
+    );
+    assert_eq!(
+        stored_empty_grace_with(&guild(), EMPTY_ROOM_GRACE, Some(&reader)),
+        Duration::ZERO,
+        "the database row, not the boot value, drives the resolved grace"
+    );
+
+    // A hand-edited out-of-range row in the same table fails closed to the
+    // boot value through the same real load path.
+    store
+        .set(&guild(), KEY, Some(json!(601)), "test")
+        .await
+        .expect("store an out-of-range override");
+    let snapshot = store
+        .load_snapshot()
+        .await
+        .expect("reload the stored guild settings snapshot");
+    let (mut writer, reader) = live_channel();
+    writer.publish(&snapshot);
+    assert_eq!(
+        stored_empty_grace_with(&guild(), EMPTY_ROOM_GRACE, Some(&reader)),
+        EMPTY_ROOM_GRACE,
+        "an out-of-range database row resolves to the boot fallback"
     );
 }
