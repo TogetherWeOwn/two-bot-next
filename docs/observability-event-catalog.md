@@ -220,9 +220,11 @@ is the single shared spelling also pinned in `evidence.rs`
 | `rest_5xx_rate` | `two_bot_rest_requests_total{result="5xx"}` and all `two_bot_rest_requests_total` samples | Pages when at least 10 new REST requests arrive between samples and more than 10% are 5xx; a counter reset suppresses the window. |
 | `job_unknown_stale` | `two_bot_job_last_success_timestamp_seconds{job}` for labels outside `JOB_INTERVAL_SECONDS`, `TICKER_STALE_JOBS` and `UNKNOWN_STALE_EXCLUDED` | Ticket when a job without a cadence entry has a nonzero success timestamp older than 2 hours; never-succeeded stays silent; `session_checkpoint` is event-driven and excluded |
 | `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` against `two_bot_gateway_resumes_total` plus fresh `two_bot_gateway_events_total{event="READY"}` | Pages after 3 consecutive samples with disconnect growth and no RESUMED or fresh READY growth (pairing in `pairGatewayDisconnects`); any recovery growth clears at once; the disconnect counter increments in `gateway.rs` (`transport_disconnected`) |
+| `gateway_not_ready` | `/readyz` `components` gateway entry (parsed by the keepalive probe, not a `/metrics` series) with the pairing counters as the restart signal | Pages after 3 consecutive valid samples with the gateway component `starting`/`down` and no disconnect edge required (stuck starting, parked, or draining); any ready sample clears at once; invalid probes and failed scrapes hold the previous state |
 | `voice_join_fast_burn` | `two_bot_voice_joins_received_total` minus benign `duplicate` refusals in `two_bot_voice_join_refused_total` against `two_bot_voice_join_to_move_seconds_bucket{le="5"}` | Pages when the creator-join budget (99.5% moved within 5 s) burns faster than 14.4x in both the 1 h and 5 min windows; every non-duplicate refusal, failed move and slow (>5 s) move is burn; each window needs at least 10 genuine joins and two bad moves, receive counts lag one scrape, and incomplete post-restart windows stay inactive; missing inputs hold the previous state |
 | `voice_join_slow_burn` | Same inputs as `voice_join_fast_burn` | Ticket, not page: same budget burning faster than 6x in both the 6 h and 30 min windows with the same per-window volume and bad-move floors; catches the sustained grind the fast rule never spikes on; do not close as "fast burn resolved" |
 | `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` with `two_bot_voice_creator_map_generation` | Pages when the age since the last successful creator-map merge passes 600 s (two missed 5 min refreshes) after at least one merge; generation 0 (never merged: boot or voice parked) never fires; the gauges are optional scrape inputs, so older containers hold the previous state |
+| `error_budget_fast_burn` | All `two_bot_rest_requests_total` samples (eligible requests) against `result="5xx"` plus `result="transport"` (budget spend) | Pages when the REST error budget (99.9% success over 48 h) burns faster than 12x in both the 15 min and 2 min windows; each window needs at least 10 eligible requests and two budget errors; incomplete post-restart windows stay inactive; missing or malformed inputs hold the previous state |
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
@@ -255,8 +257,10 @@ Startup `error_class` values logged before fatal exits (see
 
 ## Voice structured fields (gateway sink, adjacent)
 
-`voice_event` fields in `crates/bot/src/voice_rooms.rs`; no channel,
-member, token, body or ID leaves the process. Included because the voice
+`voice_event` fields in `crates/bot/src/voice_rooms.rs`; guild and channel
+IDs are emitted as strings (notably `guild` on every `voice_join_received`
+line and `channel` on every refused line), but no member, token, body, name
+or presence content leaves the process. Included because the voice
 sink attaches to the gateway writer on the cutover path.
 
 | Field value | Callsite (stable anchor) | Meaning |
@@ -268,6 +272,29 @@ sink attaches to the gateway writer on the cutover path.
 | `voice_event="voice_dead_letter"` | `crates/bot/src/voice_rooms.rs` (`mark_failed_observed`: `voice action dead-lettered`) | Queue write exhausted retries with bounded `action` and attempts |
 | `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs` (`execute_create`: `voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
 | `voice_event="voice_join_received"` | `crates/bot/src/voice_rooms.rs` (`accept_join_received`: `voice creator join accepted` / `voice creator join refused before queueing`) | One creator-channel join delivered to the guild actor, accepted or refused. The refused line carries a bounded `reason` (`halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked`, `other`) plus the refusing `channel` id and creator-map state at join time (`creators_len`, `known`, `halted`, `ready`, `live_generation`, `ticket_generation`; no member/name/token content); every delivery bumps `two_bot_voice_joins_received_total`, so received-vs-handled drift is the stall signal |
+
+### `voice_event` JSON field shapes (verified 2026-10-17, emitter code only, no live log paste)
+
+Field names and Rust types per `voice_event` value, verified against the
+emitter in `crates/bot/src/voice_rooms.rs` (callsite = enclosing function,
+never a line number). JSON keys match the field names; the message string is
+the last argument to the log macro. In the JSON line these fields are
+flattened at the root next to the envelope keys `ts`, `level`, `msg`,
+`target`, `build_sha`, `release` and `spans` (`docs/logging.md`). None of
+these lines sets `msg` and none of their messages is snake_case, so `msg` is
+always `"tracing_event"` and the text above sits under `message`. Match on
+`voice_event` or `message`, never `msg`.
+
+| `voice_event` value | Fields (name: Rust type) | Emitter | Level / message |
+| --- | --- | --- | --- |
+| `voice_join` | `outcome`: `&'static str`; `queue_dwell_seconds`, `wait_before_dispatch_seconds`, `claim_seconds`, `reorder_seconds`, `post_seconds`, `persist_seconds`, `move_seconds`, `elapsed_seconds`: `f64` | `JoinTiming::finish` | info / `voice join completed` |
+| `voice_operation` | `op`: `&'static str`; `outcome`: `&'static str` | `observe_voice_operation` | info / `voice_operation succeeded`; warn / `voice_operation failed` |
+| `voice_respace` | `outcome`: `&'static str` | `observe_voice_respace` | info / `voice respace succeeded`; warn / `voice respace failed` |
+| `voice_reconcile` | `delete_enqueued`, `suspended`, `resumed`, `succession_enqueued`: `u64` (emitted only when at least one is nonzero) | `reconcile` | info / `voice_reconcile planned` |
+| `voice_dead_letter` | `action`: `&str` (bounded family); `attempts`: `u32` (queue budget constant) | `mark_failed_observed` | warn / `voice action dead-lettered` |
+| `voice_creator_orphan` | `outcome`: `&str` (always `manual_needed`) | `execute_create` | warn / `voice creator orphan needs manual deletion` |
+| `voice_join_received` accepted | `guild`: `String` | `accept_join_received` | info / `voice creator join accepted` |
+| `voice_join_received` refused | `guild`, `channel`: `String`; `reason`: `&str` (bounded: `halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked`, unknown folds to `other` in the counter); `creators_len`: `u64`; `known`, `halted`, `ready`: `bool`; `live_generation`, `ticket_generation`: `u64` | `accept_join_received` | warn when `reason` is `halted`, debug when `duplicate`, info otherwise (including `name_blocked`) / `voice creator join refused before queueing` |
 
 Rename-decision lines without a `voice_event` field:
 `voice room rename decision` (`log_rename_decision` and
@@ -336,16 +363,11 @@ the `config_snapshot` read failed, so the naming reload kept the cached
 settings and creators; the direct creator merge still converges the view while
 this fails.
 
-## Unknowns (TBD)
+## Verification notes (all three TBDs resolved 2026-10-17)
 
-- Whether any additional `tracing` message on the session-commit path was
-  added after this extract; re-run the `tracing::(info|warn|error)` search
-  before treating this table as exhaustive. Status: TBD.
-- Exact JSON shape of the `voice_event` lines (formatting owner separate);
-  this catalog records only the field names and message strings. Status: TBD.
-- Worker-side `container_gateway_failure` JSON line is emitted by the
-  keepalive tick, not Rust; its spelling is recorded in
-  `docs/startup-diagnostics.md`, not verified here. Status: TBD.
+- Session-commit search re-run 2026-10-17: `grep -rn 'tracing::\(info\|warn\|error\)' crates/ --include='*.rs'` (pinned fully-qualified form) plus an offline extractor mirror over the six scoped sources that also covers bare `info!` / `warn!` / `error!` / `debug!` / `trace!` (same rule as the conformance suite: last string literal is the event name). Result: 84 unique messages, identical to the pinned catalog set (20 gateway + 9 main traced + 5 server + 2 shutdown + 1 jobs + 16 voice catalog + 14 main adjacent + 16 voice adjacent + 1 test-only). The two main drain strings are checked separately for presence and are not included in this total. Added: none. Removed: none. Sources: the six `SCOPED_SOURCES` files (`gateway.rs`, `main.rs`, `server.rs`, `shutdown.rs`, `jobs.rs`, `voice_rooms.rs`) plus the conformance pin in `crates/bot/src/observability_event_conformance_tests.rs`.
+- `voice_event` JSON field shapes recorded 2026-10-17 from the emitters (names + Rust types; no live log paste): see the `voice_event` JSON field shapes table above. Verified against `JoinTiming::finish`, `observe_voice_operation`, `observe_voice_respace`, `reconcile`, `mark_failed_observed`, `execute_create` and `accept_join_received` in `crates/bot/src/voice_rooms.rs`; refusal vocabulary cross-checked against the bounded allowlist in `crates/core/src/metrics.rs` (`VOICE_JOIN_REFUSAL_REASONS`), where unknown reasons fold to `other`. JSON formatting ownership stays separate; only shapes are pinned here.
+- Worker-side `container_gateway_failure` spelling cross-checked 2026-10-17: the keepalive tick in `wrangler/src/index.ts` (`keepalive`) emits `event: "container_gateway_failure"` with keys `event`, `phase`, `class`, `failed_step`, `error_code`, `build_revision`, `release`, `worker_version`, `log_url`. Spelling matches `docs/startup-diagnostics.md`, which records the abbreviated shape with placeholders for `phase`, `class`, `release` and `worker_version`; the four extra keys (`failed_step`, `error_code`, `build_revision`, `log_url`) are keepalive-tick context, not a spelling drift. Verified: event name identical, shared keys identical.
 
 ## Sources
 

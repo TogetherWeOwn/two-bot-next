@@ -152,6 +152,40 @@ pub async fn opt_out_member(
     Ok(counts)
 }
 
+/// Whether the pair has a purge receipt younger than `cooldown_minutes`.
+/// Member self-serve checks this before `opt_out_member` so a repeat tap or
+/// a rapid opt-in/opt-out loop cannot retake the purge's write-blocking
+/// locks on every invocation. Returns false when no receipt exists or the
+/// youngest receipt is older than the window. Read-only: no locks taken.
+pub async fn has_recent_opt_out(
+    db: &CutoverDb,
+    guild: &str,
+    member: &str,
+    cooldown_minutes: i32,
+) -> Result<bool, sqlx::Error> {
+    if !valid_identity(guild, member) {
+        return Err(sqlx::Error::InvalidArgument(
+            "invalid opt-out identity".into(),
+        ));
+    }
+    if cooldown_minutes <= 0 {
+        return Err(sqlx::Error::InvalidArgument(
+            "invalid opt-out cooldown".into(),
+        ));
+    }
+    let recent: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM privacy_opt_out_audit
+          WHERE guild_id = $1 AND member_id = $2
+          AND opted_out_at > clock_timestamp() - make_interval(mins => $3))",
+    )
+    .bind(guild)
+    .bind(member)
+    .bind(cooldown_minutes)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(recent)
+}
+
 /// Remove the guild-scoped suppression row (opt-back-in). Returns true when
 /// a row was removed; afterwards the pair persists exactly as before the
 /// opt-out. Re-enabling writes no purge receipt: the receipt table records
@@ -170,6 +204,25 @@ pub async fn opt_back_in(db: &CutoverDb, guild: &str, member: &str) -> Result<bo
             .await?
             .rows_affected();
     Ok(removed == 1)
+}
+
+/// Whether the member currently suppresses analytics persistence for the
+/// guild (a `privacy_opt_outs` row exists for the pair). Read-only: the
+/// `/privacy status` self-serve reply uses this, never the raw table.
+pub async fn is_opted_out(db: &CutoverDb, guild: &str, member: &str) -> Result<bool, sqlx::Error> {
+    if !valid_identity(guild, member) {
+        return Err(sqlx::Error::InvalidArgument(
+            "invalid opt-out identity".into(),
+        ));
+    }
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
+    )
+    .bind(guild)
+    .bind(member)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(exists)
 }
 
 /// The guild's analytics switches as `(presence, activity, voice)`. A guild
