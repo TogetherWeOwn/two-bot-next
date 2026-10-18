@@ -1982,7 +1982,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
         self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 11)
+        self.assertEqual(len(guarded), 12)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -1998,6 +1998,7 @@ class WorkflowTests(unittest.TestCase):
             "--test internal_channel_moderation": True,
             "--test feeds_store": True,
             "--test legacy_verify_db": False,
+            "--test legacy_tls_fence": False,
             "--test staging_migrate_db": False,
             "--test internal_events": True,
             "--test raid_list_db": False,
