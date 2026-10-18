@@ -41,13 +41,20 @@ The `supply` output of `scripts/job-inputs.py` (the `job-inputs` job in
 Push to `main`, the weekly schedule, manual dispatch, any undecidable diff
 (missing SHAs, classifier error) and any non-PR event fail closed to full
 jobs, so release-candidate and staging validation always get the scan.
-On PRs the scan is selected by Rust code, dependency manifests
-(`Cargo.toml`, `Cargo.lock`, `deny.toml`), the runtime image inputs
-(`Dockerfile`, `.dockerignore`), any `.github/**` change (workflow edits
-revalidate everything), and the selectors or their regression suites
-themselves; `supply` additionally follows `rust` because Rust changes alter
-the shipped binary the scan inventories. Docs-only and worker-UI-only PRs
-skip it.
+On PRs the scan is selected by Rust sources (`crates/`, `src/`), `sql/`,
+`.cargo/`, `tests/`, and `scripts/`. Each of those selects `rust` (except
+voice-template-only assets, which no job reads), and `supply` follows `rust`
+because Rust changes alter the shipped binary the scan inventories. It is
+also selected by dependency manifests (`Cargo.toml`, `Cargo.lock`, `deny.toml`,
+`rust-toolchain.toml`, `migrations.lock`), the runtime image inputs
+(`Dockerfile`, `.dockerignore`, which select `supply` directly),
+`.github/workflows/**` (workflow edits revalidate everything), `deploy/`,
+and the selectors or their regression suites themselves; any other
+unrecognised path fails closed to full jobs. The only `.github/` files that
+select nothing are `CODEOWNERS`, `dependabot.yml` and the PR template.
+Docs-only and worker-UI-only PRs skip it. The full list lives in
+`scripts/job-inputs.py` (`classify()`/`selection()`), which is authoritative
+when this guide and the selector disagree.
 
 Not every Markdown change deselects the scan: docs whose content is read by
 PR-run code (for example `docs/parity.md`, `docs/cutover.md`,
@@ -162,18 +169,22 @@ and use the explicit repair input below. Publication isn't atomic with
 the tag; require the assets before treating the release as fully delivered.
 
 ```sh
-# Opening/updating a PR automatically runs check.yml's PR SBOM dry-run.
+# A PR the selector picks (see Selection above), plus every main push and
+# scheduled run, gets check.yml's SBOM dry-run. A deselected PR skips the
+# supply-chain job, so there is no supply-chain artifact to download.
 # The 40-minute job has contents: read, no deploy secrets and no publishing path.
 # No release workflow dispatch or pull_request_target is required.
-# Inspect the PR run's supply-chain artifact: two nonempty CycloneDX BOMs,
-# SHA256SUMS, source SHA/image ID, and both vulnerability reports.
+# On a selected run, inspect the supply-chain artifact: two nonempty
+# CycloneDX BOMs, SHA256SUMS, source SHA/image ID, and both vulnerability
+# reports.
 gh run download <run-id> -n supply-chain -D <run-owned-scratch-directory>
 # Repair assets on an existing stable release; rebuilds its tag, not current main.
 gh workflow run release.yml --ref main -f release_tag=vX.Y.Z
 ```
 
-The PR dry-run inventories the exact PR head SHA, validates lockfile coverage
-and Debian image components, and records checksums/provenance before scanning.
+On a selected PR, the dry-run inventories the exact PR head SHA, validates
+lockfile coverage and Debian image components, and records
+checksums/provenance before scanning.
 Image tags include the Actions run ID and attempt. No shared cache exists:
 the image build uses no `cache-from`/`cache-to`, and Trivy caching is off
 (`cache: false`), so per-run state lives only under `runner.temp`.
