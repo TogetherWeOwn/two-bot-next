@@ -1,7 +1,8 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use two_bot_core::commands::{
-    CommandDefinition, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS,
+    CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS,
+    OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION,
 };
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
@@ -32,6 +33,7 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("lfg-close", "docs/parity.md §1 #27 caps"),
     ("feed-add", "docs/parity.md §1 #28 caps"),
     ("feed-remove", "docs/parity.md §1 #29 caps"),
+    ("privacy", "docs/parity.md §1 privacy"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -168,6 +170,30 @@ pub fn expected_registry() -> Value {
     let help = serde_json::to_value(CommandDefinition::new("help", HELP_DESCRIPTION))
         .expect("help serializes");
     commands.insert(2, help);
+    // Next-only `/privacy` member self-serve: no legacy counterpart. Insert
+    // at the publish position (fourth, after help) as the exact published
+    // definition — the same subcommand shape `core_commands` publishes.
+    let privacy = serde_json::to_value(
+        CommandDefinition::new("privacy", PRIVACY_DESCRIPTION).options(vec![
+            CommandOption::new(
+                "opt-out",
+                "Delete your stored activity for this server and stop future analytics persistence.",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "opt-in",
+                "Resume analytics persistence for this server (already-deleted rows are not restored).",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "status",
+                "Show whether you are opted out and this server's analytics switches.",
+                CommandOptionType::SubCommand,
+            ),
+        ]),
+    )
+    .expect("privacy serializes");
+    commands.insert(3, privacy);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.

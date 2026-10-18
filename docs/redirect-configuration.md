@@ -33,9 +33,22 @@ an empty store or a disabled fallback. `/health` and `/readyz` still proxy the
 Container independently; those are not redirect configuration probes. Internal
 reserved aliases remain 404 before configuration parsing.
 
-The snapshot remains the current Worker mapping source. This change does not
-wire the deferred Hyperdrive connector, alter cache/proxy policy, add campaign
-management UI or contact deployed services.
+When `REDIRECT_DB` is bound, the Worker supplies `connectPostgres` to
+`RedirectStore` ([wiring](../wrangler/src/index.ts),
+[store](../wrangler/src/redirect-store.ts)): lookups and click inserts go live
+against the database. Without that binding, the store serves the
+`REDIRECT_MAPPINGS_JSON` snapshot and click records are logged and dropped,
+never faked into a store. A failed live lookup serves the configured
+`REDIRECT_FALLBACK_CODE` invite, or 503 with `Retry-After: 30` when none is
+valid ([outage path](../wrangler/src/redirect.ts)); it never falls back to the
+snapshot. Pinned by `wrangler/test/redirect-db.test.ts` (bound hit ignores the
+snapshot, unbound mode never connects and drops clicks, store failures use the
+fallback without leaking the connection string) and
+`wrangler/test/redirect.test.ts` (lookup outage with no fallback is a 503 that
+records nothing). Whether any deployed environment actually binds
+`REDIRECT_DB` is a deployment fact, not stated here: confirm the deployed
+wiring before diagnosing. This change does not alter cache/proxy policy, add
+campaign management UI or contact deployed services.
 
 ## Diagnostics and privacy
 
@@ -69,7 +82,7 @@ From `wrangler/` with the pinned dev dependencies installed:
 ```sh
 npm run typecheck
 node --import ./test/cloudflare-loader.mjs --test \
-  test/redirect.test.ts test/redirect-config.test.ts test/container.test.ts
+  test/redirect.test.ts test/redirect-config.test.ts test/redirect-db.test.ts test/container.test.ts
 ```
 
 All bindings and errors are synthetic. No live endpoint, Discord or database

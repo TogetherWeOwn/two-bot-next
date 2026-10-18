@@ -98,14 +98,20 @@ import {
   readOpsBody,
 } from "./ops-control.ts";
 import {
+  EMPTY_SCRAPE_LOSS,
   EMPTY_STATE,
   LOG_QUERY_URL,
+  SCRAPE_LOSS_THRESHOLD,
   alertContextSuffix,
   evaluateMetrics,
   interruptDispatchDrops,
+  sanitizeScrapeLossState,
+  scrapeLossFiringMessage,
+  scrapeLossResolvedMessage,
   transitionMessages,
   type AlertContext,
   type MetricsAlertState,
+  type ScrapeLossState,
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
 import {
@@ -339,6 +345,7 @@ const DEFAULT_KEEPALIVE_SECONDS = 60;
 const DEFAULT_UNREADY_SECONDS = 120;
 const READINESS_KEY = "two-bot:readiness";
 const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
+const SCRAPE_LOSS_KEY = "two-bot:metrics-scrape-loss";
 const REMEDIATION_KEY = "two-bot:remediation";
 const OPS_METRICS_PATH = "/ops/metrics";
 // Read-only operator roll-ups (TOG-22860), served by the container as JSON.
@@ -1393,6 +1400,7 @@ export class TwoBotContainer extends Container<Env> {
   private async evaluateMetricsAlerts(context?: AlertContext, gatewayReady?: boolean): Promise<void> {
     try {
       const previous = (await this.ctx.storage.get<MetricsAlertState>(METRICS_ALERT_KEY)) ?? EMPTY_STATE;
+      const scrapeLoss = sanitizeScrapeLossState(await this.ctx.storage.get<ScrapeLossState>(SCRAPE_LOSS_KEY));
       let samples;
       try {
         const signal = AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS);
@@ -1417,14 +1425,58 @@ export class TwoBotContainer extends Container<Env> {
       if (!samples) {
         // A failed scrape is not recovery, nor part of a consecutive growth
         // window. Preserve all firing keys and other rules' existing state.
+        // It does advance the observer-loss streak: three consecutive failed
+        // scheduled scrapes ticket once, further failures stay quiet, and the
+        // streak lives apart from metric-rule state.
         console.warn("two-bot metrics scrape failed");
+        const streak = Math.min(scrapeLoss.streak + 1, SCRAPE_LOSS_THRESHOLD);
+        const firing = scrapeLoss.firing || streak >= SCRAPE_LOSS_THRESHOLD;
+        const justFired = firing && !scrapeLoss.firing;
+        // Persist before notifying: at most one attempt per transition, even
+        // if the webhook fails or an alarm is retried.
         await this.ctx.storage.put(METRICS_ALERT_KEY, interruptDispatchDrops(previous));
+        await this.ctx.storage.put(SCRAPE_LOSS_KEY, { streak, firing });
+        if (justFired) {
+          const content = scrapeLossFiringMessage(context);
+          console.warn(JSON.stringify({
+            event: "metrics_alert",
+            service: "two-bot-next",
+            content,
+            build_revision: context?.buildRevision ?? "unknown",
+            release: releaseTag(this.lastRelease),
+            worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+            log_url: LOG_QUERY_URL,
+          }));
+          await this.postWebhookText(content);
+        }
         return;
       }
       const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000, gatewayReady);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);
       for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses, context)) {
+        console.warn(JSON.stringify({
+          event: "metrics_alert",
+          service: "two-bot-next",
+          content,
+          build_revision: context?.buildRevision ?? "unknown",
+          release: releaseTag(this.lastRelease),
+          worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+          log_url: LOG_QUERY_URL,
+        }));
+        await this.postWebhookText(content);
+      }
+      // A complete valid scrape clears only observer-loss state: silently
+      // below the ticket threshold, or with exactly one recovery once firing.
+      // After the metric transitions above, so a transient failure of this
+      // write can only delay the scrape-loss resolve (retried next tick),
+      // never skip an already-persisted metric notification.
+      const recovering = scrapeLoss.firing;
+      if (scrapeLoss.streak !== 0 || scrapeLoss.firing) {
+        await this.ctx.storage.put(SCRAPE_LOSS_KEY, { ...EMPTY_SCRAPE_LOSS });
+      }
+      if (recovering) {
+        const content = scrapeLossResolvedMessage(context);
         console.warn(JSON.stringify({
           event: "metrics_alert",
           service: "two-bot-next",
