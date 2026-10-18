@@ -7,6 +7,8 @@ use std::sync::Mutex;
 mod cold_authority;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
+#[path = "voice_empty_grace_override_tests.rs"]
+mod empty_grace_override;
 #[path = "voice_join_requests_tests.rs"]
 mod join;
 #[path = "voice_kick_tests.rs"]
