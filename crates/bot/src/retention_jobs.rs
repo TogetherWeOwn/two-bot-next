@@ -18,6 +18,7 @@ use two_bot_core::game_activity_store;
 use two_bot_cutover::retention::{run_retention, RetentionMode};
 
 use crate::backfill_retention_chains::render_retention_failure;
+use crate::db_log::db_class;
 use crate::gateway_failure::FailureClass;
 use crate::jobs::{self, ErrorClass, Job};
 
@@ -105,6 +106,16 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                     );
                     ErrorClass::Database
                 })?;
+                // Stale per-guild game-activity aggregates expire on this same
+                // cadence, never on the hourly flush/send path: quiet guilds
+                // stop accumulating rows while active guilds keep every fresh
+                // row. Execute deletes; drier modes count the same rows and
+                // log them under the same event, so the dry run previews
+                // exactly what execute will delete. The expiry runs before the
+                // report log below so a failed tick never leaves behind the
+                // plain success line: the report only prints after the expiry
+                // has settled.
+                expire_stale_game_aggregates(&pool, mode).await?;
                 let partial = report.guild_purges_failed > 0
                     || report.guild_purges_deferred > 0
                     || report.deletions_deferred > 0
@@ -150,15 +161,6 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                         "retention run completed",
                     );
                 }
-                // Stale per-guild game-activity aggregates expire on this same
-                // cadence, never on the hourly flush/send path: quiet guilds
-                // stop accumulating rows while active guilds keep every fresh
-                // row. Execute deletes; drier modes count the same rows and
-                // log them under the same event, so the dry run previews
-                // exactly what execute will delete. Runs after the report
-                // above so an expiry failure never discards the retention
-                // report unlogged.
-                expire_stale_game_aggregates(&pool, mode).await?;
                 Ok(())
             })
         }),
@@ -183,35 +185,58 @@ async fn expire_stale_game_aggregates(
             .ok()
             .as_deref(),
     );
-    let guilds = game_activity_store::list_aggregate_guilds(pool, horizon)
-        .await
-        .map_err(|_| aggregate_expiry_failed())?;
+    let guilds = match game_activity_store::list_aggregate_guilds(pool, horizon).await {
+        Ok(guilds) => guilds,
+        Err(err) => {
+            tracing::warn!(
+                message = "game_activity_aggregate_expiry_failed",
+                horizon_days = horizon,
+                mode = ?mode,
+                reason = aggregate_db_class(&err),
+                "aggregate expiry listing failed, retryable",
+            );
+            return Err(ErrorClass::Database);
+        }
+    };
     let mut stale = 0u64;
     if mode == RetentionMode::Execute {
         for (guild_id, _) in &guilds {
-            stale += game_activity_store::expire_stale_guild_aggregates(pool, guild_id, horizon)
-                .await
-                .map_err(|_| aggregate_expiry_failed())?;
+            match game_activity_store::expire_stale_guild_aggregates(pool, guild_id, horizon).await
+            {
+                Ok(deleted) => {
+                    stale = stale.saturating_add(deleted);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        message = "game_activity_aggregate_expiry_failed",
+                        guild_id = guild_id.as_str(),
+                        horizon_days = horizon,
+                        mode = ?mode,
+                        reason = aggregate_db_class(&err),
+                        "aggregate expiry delete failed, retryable",
+                    );
+                    return Err(ErrorClass::Database);
+                }
+            }
         }
     } else {
         stale = guilds.iter().map(|(_, count)| *count).sum();
     }
-    if stale > 0 {
-        tracing::info!(
-            message = "game_activity_aggregate_expiry",
-            stale_rows = stale,
-            horizon_days = horizon,
-            mode = ?mode,
-            "sweep",
-        );
-    }
+    tracing::info!(
+        message = "game_activity_aggregate_expiry",
+        stale_rows = stale,
+        horizon_days = horizon,
+        mode = ?mode,
+        "sweep",
+    );
     Ok(())
 }
 
-/// Single log site for aggregate-expiry store failures: one guild's failure
-/// aborts the tick as [`ErrorClass::Database`] so the supervisor retries on
-/// the next bounded opportunity.
-fn aggregate_expiry_failed() -> ErrorClass {
-    tracing::warn!("game_activity_aggregate_expiry_failed");
-    ErrorClass::Database
+/// Classify an aggregate-expiry store failure without its internals: the raw
+/// `sqlx::Error` text can carry statement detail, so the failure line carries
+/// only the fixed [`db_class`] token under the house `reason` field.
+fn aggregate_db_class(err: &game_activity_store::GameActivityStoreError) -> &'static str {
+    match err {
+        game_activity_store::GameActivityStoreError::Db(inner) => db_class(inner),
+    }
 }
