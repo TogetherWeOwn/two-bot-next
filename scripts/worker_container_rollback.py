@@ -448,26 +448,44 @@ class Rollback:
             row = base.mapping(self.client.api(
                 f"/containers/applications/{base.identifier(self.app_id)}/rollouts/{rollout_id}"))
             require(row.get("id") == rollout_id, "rollout_identity_drift")
-            self.log(f"image rollout {row.get('status')}")
+            status = row.get("status")
+            require(status not in ("replaced", "reverted"), "rollout_replaced_or_reverted")
+            require(status in ("pending", "progressing", "completed"), "unknown_rollout_status")
+            require(base.mapping(row.get("target_configuration")).get("image") == image,
+                    "rollout_identity_drift")
             if target_version is None:
                 try:
                     target_version = base.number(row.get("target_version"))
                 except GateError:
                     target_version = None
-            # The lag shape is the same steady state staging verify accepts
-            # (a completed rollout whose counters read active:1/healthy:0
-            # under durable_object scheduling); the stable gate after takeover
-            # still proves the exact version serves.
-            if (target_version is not None
-                    and (base.converged(row, image, target_version)
-                         or base.active_lag(row, image, target_version))
-                    and base.mapping(application_by_name(
-                        self.client, self.application).get("configuration")).get("image")
-                    == image):
+            # The pinned rollout proves the image leg, including the same
+            # completed counter-lag shapes accepted by staging verify. Staging's
+            # application listing can lag that record indefinitely; takeover
+            # and the unchanged stable runtime gate still have to pass next.
+            # Production retains its separate application-listing requirement.
+            ready = (target_version is not None
+                     and (base.converged(row, image, target_version)
+                          or base.active_lag(row, image, target_version)))
+            if target_version is None:
+                waiting_for = "target_version"
+            elif status != "completed":
+                waiting_for = "rollout_completion"
+            else:
+                waiting_for = "counters_or_progress"
+            if ready and self.variant != "staging":
+                ready = base.mapping(application_by_name(
+                    self.client, self.application).get("configuration")).get("image") == image
+                waiting_for = "application_image"
+            if ready:
+                self.log(f"image rollout {status}")
+                self.evidence.pop("image_restore_wait", None)
                 self.evidence["restored_rollout_id"] = rollout_id
                 self.stamp("image restored")
                 return
-            require(self.now() < deadline, "image_rollout_timeout")
+            self.evidence["image_restore_wait"] = waiting_for
+            self.log(f"image rollout {status} waiting_for={waiting_for}")
+            require(self.now() < deadline, "image_rollout_timeout",
+                    f"waiting_for={waiting_for} rollout={status}")
             self.sleep(POLL_SECONDS)
 
     def take_over(self, version):
@@ -596,6 +614,7 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
     roll.add_argument("--evidence", required=True)
     args = parser.parse_args(argv)
     env = os.environ if environ is None else environ
+    rollback = None
     try:
         worker = args.worker or WORKERS[args.variant]
         application = args.application or APPLICATIONS[args.variant]
@@ -688,6 +707,9 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
         print(f"worker-container rollback failed: {error}")
         if error.detail:
             print(f"worker-container rollback diagnostic: {error.detail}")
+        if rollback is not None and str(error) == "image_rollout_timeout":
+            evidence = dict(rollback.evidence, failure="image_rollout_timeout")
+            Path(args.evidence).write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
         return 1
     Path(args.evidence).write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
     print("worker-container rollback evidence: " + json.dumps(evidence, sort_keys=True))
