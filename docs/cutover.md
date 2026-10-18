@@ -183,7 +183,7 @@ safety boundary.
 | `two-bot guild-config-snapshot` / `two-bot guild-config-restore --snapshot FILE` | Pinned **staging-only** guild structure recovery. Does **not** snapshot application commands; never use as production registry rollback |
 
 Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L136),
-[restore implementation](../crates/bot/src/backup_cli.rs#L482) and
+[restore implementation](../crates/bot/src/backup_cli.rs#L489) and
 [backup runbook](backup.md). `restore --dry-run` optionally reads a target when
 `TWO_RESTORE_URL` is set; do not mistake it for automatically offline operation.
 For local fixture/artifact inspection **without any DB connection**:
