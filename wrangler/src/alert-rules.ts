@@ -288,9 +288,9 @@ export interface JoinBurnSnapshot {
 
 export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, breakerOpenStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
 
-/** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
+/** An unsuccessful scrape breaks dispatch and breaker streaks, never existing alerts. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
-  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {} };
+  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0 };
 }
 
 export function parseExposition(text: string): Sample[] {

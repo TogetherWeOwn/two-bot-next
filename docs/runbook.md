@@ -322,16 +322,17 @@ wider Discord or network incident.
 #### Alert: REST admission breaker open
 
 The invalid-request breaker stayed open (`two_bot_rest_guard_breaker_open` 1)
-for three consecutive keepalive samples. This is a **ticket**, not a page:
-Discord sends are being refused locally faster than the rolling window can
-clear, but essential interaction acknowledgements still bypass the breaker and
-nothing pages until members are actually affected. Local refusals happen
-before any REST wire attempt, so the request counter
-(`two_bot_rest_requests_total`) and its 429/5xx alerts cannot see this
-condition — a quiet 429/5xx board alongside this ticket is the expected shape
-of a local-refusal episode, not proof the REST path is healthy. Normal global
-pauses (`two_bot_rest_guard_global_paused`) are healthy backpressure from
-Discord global rate limits and never open this breaker.
+for three consecutive valid keepalive samples. This is a **ticket**, not a page:
+the guard refuses non-essential REST sends locally. Essential interaction
+acknowledgements may bypass this breaker, but never a global pause or fatal
+token state. Local refusals happen before any REST wire attempt, so the
+request counter (`two_bot_rest_requests_total`) and its 429/5xx alerts cannot
+see this condition — a quiet 429/5xx board alongside this ticket is the
+expected shape of a local-refusal episode, not proof the REST path is healthy.
+Global pauses (`two_bot_rest_guard_global_paused`) report separate backpressure
+and are not this rule's input. However, every 429 response, including global
+429s, counts toward the same 600 s invalid-request window and can contribute
+to opening the breaker.
 
 First response: read the guard's `discord_breaker_open` log line for the
 invalid-request count and threshold, plus `two_bot_rest_guard_invalid_requests_in_window`
@@ -341,10 +342,18 @@ deploy shipping a bad token or a hot invalid route fills the window fast).
 There is no manual breaker reset: the breaker closes on its own when the
 10-minute rolling invalid-request window clears below threshold, so do not
 restart the container to "clear" it — a restart only resets the counters and
-destroys the evidence. Invalid-token behavior is separate and already fatal
-until process restart (`two_bot_rest_guard_token_invalid`, see
-[metrics](metrics.md)): when that gauge is also 1, the breaker is a symptom
-of the token state, not the cause, and waiting for the window cannot clear it.
+destroys the evidence. Missing, malformed or failed scrapes break the sampling
+streak but hold any firing ticket; only a valid closed sample resolves it.
+
+Check `two_bot_rest_guard_token_invalid` and the `/readyz` `token_invalid`
+component separately. That fatal latch refuses all new REST attempts, including
+essential acknowledgements. Once outstanding responses finish and the window
+drains, the breaker closes and this ticket resolves even while the token latch
+stays set and readiness stays **503**. **Ticket resolution is not REST recovery.**
+Follow the [fatal-token procedure](rest-guard.md#fatal-bot-token-and-readiness):
+the authorized credential operator verifies provisioning/token validity, then
+restarts with corrected configuration. Waiting for the window cannot clear
+the token latch; never automatically rotate a token or bypass the guard.
 
 Escalate when the breaker stays open across windows after the rolling window
 should have cleared, when invalid requests keep arriving with no suspect

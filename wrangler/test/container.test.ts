@@ -1594,6 +1594,61 @@ for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) 
   });
 }
 
+for (const failure of ["missing", "invalid", "fetch"] as const) {
+  for (const forwarding of ["on", "off"] as const) {
+    test(`DO breaker ticket interrupts ${failure} samples with forwarding ${forwarding}`, async (t) => {
+      const h = await alertHarness(t, { ...ALERT_ENV, OPS_ALERT_FORWARDING: forwarding });
+      const gauge = "two_bot_rest_guard_breaker_open";
+      const rule = "rest_admission_breaker_open";
+      let open = 1;
+      let failed = false;
+      t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+        const path = new URL(typeof input === "string" ? input : input.url).pathname;
+        if (path !== "/metrics") return new Response(null, { status: 200 });
+        if (failed && failure === "fetch") throw new Error("synthetic metrics transport failure");
+        const row = failed ? (failure === "missing" ? "" : `${gauge} 2`) : `${gauge} ${open}`;
+        return new Response(metricsBody().replace(`${gauge} 0`, row));
+      });
+      const state = () => h.values.get("two-bot:metrics-alerts") as MetricsAlertState;
+      const transitions = () => h.events().filter((event) => event.event === "metrics_alert");
+      await h.tick();
+      await h.tick();
+      assert.equal(state().breakerOpenStreak, 2);
+      assert.equal(transitions().length, 0);
+      failed = true;
+      await h.tick();
+      assert.equal(state().breakerOpenStreak, 0, "a gap invalidates the persisted two-open streak");
+      assert.deepEqual(state().firing, []);
+      failed = false;
+      for (const streak of [1, 2]) {
+        await h.tick();
+        assert.equal(state().breakerOpenStreak, streak);
+        assert.equal(transitions().length, 0, "a fresh streak needs three valid open samples");
+      }
+      await h.tick();
+      await h.tick();
+      assert.equal(state().breakerOpenStreak, 3);
+      assert.deepEqual(state().firing, [rule]);
+      assert.equal(transitions().length, 1, "sustained opening notifies once");
+      assert.match(transitions()[0].content, /ALERT rest_admission_breaker_open \(ticket\):/);
+      failed = true;
+      await h.tick();
+      assert.equal(state().breakerOpenStreak, 0);
+      assert.deepEqual(state().firing, [rule], "missing evidence cannot resolve an existing ticket");
+      failed = false;
+      await h.tick();
+      assert.equal(transitions().length, 1, "open after a gap neither resolves nor re-alerts");
+      open = 0;
+      await h.tick();
+      await h.tick();
+      assert.deepEqual(state().firing, []);
+      assert.equal(transitions().length, 2, "only a valid closed sample recovers once");
+      assert.match(transitions()[1].content, /RESOLVED rest_admission_breaker_open\./);
+      assert.equal(h.posts.length, forwarding === "on" ? 2 : 0);
+    });
+  }
+}
+
 type AlertSender = "readiness" | "metrics";
 async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<Env>, values?: Map<string, unknown>) {
   const h = await alertHarness(t, { UNREADY_ALERT_FAILURES: "1", ...env }, values);
@@ -2096,7 +2151,7 @@ const SCRAPE_FAILURE = "two-bot metrics scrape failed";
 const PRIOR_METRICS: MetricsAlertState = {
   ...EMPTY_STATE, firing: ["job_consecutive_failures:rank"],
   rest429: 12, restTotal: 100, poolStreak: 2, dbErrors: 7,
-  sendBlocked: 8, sendBlockedStreak: 2, voiceOps: 40, voiceFailures: 2,
+  sendBlocked: 8, sendBlockedStreak: 2, breakerOpenStreak: 2, voiceOps: 40, voiceFailures: 2,
   voiceDeadLetters: 1, voiceOrphans: 1, gatewayMissed: 4, gatewayMissedSeen: true,
   receiverRefusals: { membership: 8 }, receiverRefusalsSeen: true,
   receiverRefusalStreaks: { membership: 2 },
@@ -2117,13 +2172,13 @@ async function backgroundMetricsHarness(t: TestContext) {
     ...h, previous, puts,
     setMetricsResponse: (next: typeof response) => { response = next; },
     assertInterrupted: () => {
-      // A failed scrape preserves firing keys and every baseline/streak except
-      // the dispatch-drop window, which resets without resolving anything.
+      // A failed scrape resets dispatch-drop and breaker evidence, preserving
+      // firing keys and all unrelated baselines/streaks without a recovery.
       const writes = puts.mock.calls.filter((call) => call.arguments[0] === METRICS_KEY);
-      assert.equal(writes.length, 1, "one dispatch-interrupt write");
-      assert.deepEqual(writes[0]!.arguments[1], { ...previous, dispatchDrops: {}, dispatchDropStreaks: {} });
+      assert.equal(writes.length, 1, "one scrape-interrupt write");
+      assert.deepEqual(writes[0]!.arguments[1], { ...previous, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0 });
       assert.deepEqual(previous, PRIOR_METRICS, "no in-place baseline/streak/firing mutation");
-      assert.deepEqual(h.values.get(METRICS_KEY), { ...PRIOR_METRICS, dispatchDrops: {}, dispatchDropStreaks: {} });
+      assert.deepEqual(h.values.get(METRICS_KEY), { ...PRIOR_METRICS, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0 });
       assert.equal(h.posts.length, 0, "no false RESOLVED notification");
       assert.equal(h.events().length, 0, "no false transition logs");
       assert.deepEqual(h.logs.filter((line) => line !== "two-bot container started"), [SCRAPE_FAILURE]);
@@ -2196,6 +2251,11 @@ for (const [name, body] of Object.entries({
   nonfinite: metricsBody().replace("two_bot_gateway_missed_events_total 0", "two_bot_gateway_missed_events_total NaN"),
   negative: metricsBody().replace("two_bot_db_pool_connections 0", "two_bot_db_pool_connections -1"),
   duplicate: `${metricsBody()}two_bot_gateway_missed_events_total 0\n`,
+  ...Object.fromEntries(["NaN", "2", "-1", "0.5", "+Inf", "-Inf"].map((value) => [
+    `breaker_${value}`, metricsBody().replace("two_bot_rest_guard_breaker_open 0", `two_bot_rest_guard_breaker_open ${value}`),
+  ])),
+  breakerLabeled: metricsBody().replace("two_bot_rest_guard_breaker_open 0", 'two_bot_rest_guard_breaker_open{route="other"} 1'),
+  breakerDuplicate: `${metricsBody()}two_bot_rest_guard_breaker_open 1\n`,
 })) {
   test(`background metrics: invalid 200 preserves all previous alert state (${name})`, async (t) => {
     const h = await backgroundMetricsHarness(t);
