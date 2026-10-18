@@ -267,30 +267,66 @@ export async function handleActionsIngress(
   if ("refusal" in checked) return checked.refusal;
   if (inFlight >= MAX_IN_FLIGHT) return refuse(429, "rate_limited", true, { "retry-after": "1" }, requestId, release);
   inFlight++;
+  let forwardPromise: Promise<Response> | undefined;
   try {
     const body = await readBody(request, requestId, release);
     if ("refusal" in body) return body.refusal;
+    const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const abortController = new AbortController();
+    const abortOrphan = (): void => {
+      try {
+        abortController.abort();
+      } catch {
+        // Ignore: the fixed refusal below stands.
+      }
+    };
+    if (timeoutSignal.aborted) abortOrphan();
+    else timeoutSignal.addEventListener("abort", abortOrphan, { once: true });
+    const signal = AbortSignal.any([timeoutSignal, abortController.signal]);
     const sanitized = forwardRequest(
       `https://worker.invalid${ACTIONS_PATH}`,
       checked.headers,
       body.bytes,
+      signal,
+    );
+    try {
+      forwardPromise = forward(sanitized);
+    } catch {
+      // DO construction/binding failures: never serialize the exception.
+      return refuse(503, "unavailable", true, undefined, requestId);
+    }
+    // Hold the slot until the forward settles; observe now so a late
+    // rejection after the deadline never surfaces as unhandled.
+    void forwardPromise.then(
+      () => {
+        inFlight--;
+      },
+      () => {
+        inFlight--;
+      },
     );
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<"timeout">((resolve) => {
       timer = setTimeout(() => resolve("timeout"), REQUEST_TIMEOUT_MS);
     });
     try {
-      const upstream = await Promise.race([forward(sanitized), deadline]);
-      if (upstream === "timeout") return refuse(504, "upstream_timeout", true, undefined, requestId, release);
+      const upstream = await Promise.race([forwardPromise, deadline]);
+      if (upstream === "timeout") {
+        abortOrphan();
+        return refuse(504, "upstream_timeout", true, undefined, requestId, release);
+      }
       return upstream;
     } catch {
+      // An abort-driven rejection after the deadline is still a timeout.
+      if (signal.aborted) return refuse(504, "upstream_timeout", true, undefined, requestId);
       // DO construction/binding failures: never serialize the exception.
       return refuse(503, "unavailable", true, undefined, requestId, release);
     } finally {
       clearTimeout(timer);
+      timeoutSignal.removeEventListener("abort", abortOrphan);
     }
   } finally {
-    inFlight--;
+    if (forwardPromise === undefined) inFlight--;
   }
 }
 

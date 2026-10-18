@@ -3417,6 +3417,28 @@ impl TestDb {
         .expect("seed scheduled message");
     }
 
+    /// Seed one scheduled message with caller-chosen channel, timing,
+    /// recurrence and enabled state (full-quota list fixtures need rows
+    /// whose rendered lines carry realistic lengths and state markers).
+    async fn seed_schedule_row(&self, guild_id: &str, row: &ScheduleListFixtureRow) {
+        sqlx::query(
+            "INSERT INTO scheduled_messages
+               (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                created_by, created_at, updated_by, updated_at)
+             VALUES ($1, $2, $3, 'remember this', $4, $5, $6,
+                     '77', '2026-09-30T12:00:00.000Z', '77', '2026-09-30T12:00:00.000Z')",
+        )
+        .bind(&row.id)
+        .bind(guild_id)
+        .bind(&row.channel_id)
+        .bind(&row.next_run_at)
+        .bind(row.interval_seconds)
+        .bind(row.enabled)
+        .execute(&self.pool)
+        .await
+        .expect("seed scheduled message row");
+    }
+
     /// (id, channel_id) for this guild's scheduled messages, in list order.
     async fn schedule_rows(&self) -> Vec<(String, String)> {
         sqlx::query_as(
@@ -4630,6 +4652,373 @@ async fn schedule_list_is_scoped_to_the_configured_guild_and_audits_nothing() {
     assert!(
         db.schedule_audits().await.is_empty(),
         "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+// --- schedule-list pagination: every configured id stays discoverable -----
+//
+// Locked contract for the builder (test-author handoff; do not edit these
+// tests to fit an implementation):
+//
+// - `/schedule-list` gains ONE optional integer option, `page` (1-based,
+//   minimum 1 in the published registry). Omitting it means page 1.
+// - Each reply holds only whole rows in the existing row format
+//   (`schedule_list_line`), ordered by (`next_run_at`, `id`), and never
+//   exceeds 2,000 UTF-16 units. No id is ever split or silently dropped.
+// - Whenever the guild's rows need more than one page, every page's reply
+//   carries the indicator `Page <current> of <total>` (exact substring), so
+//   staff can walk the pages and enumerate every configured id exactly once.
+//   A single-page reply may or may not carry `Page 1 of 1`.
+// - Empty guild: page 1 (or no page) replies `Nothing scheduled.`; any
+//   higher page is out of range against a total of 1 page.
+// - `page < 1` replies exactly `Page must be at least 1.`
+// - `page > total` replies exactly
+//   `Page <page> is out of range: this server has <total> page(s) of schedules.`
+//   Refusals list no rows and must not overflow on extreme page values.
+// - Listing stays guild-scoped, ephemeral, audit-free and write-free, and
+//   keeps disabled/recurring markers visible on each row.
+
+/// One full-quota fixture row: a realistic 32-hex id, a 19-digit channel
+/// snowflake and a full ISO timestamp, so 25 rendered rows cannot fit in a
+/// single 2,000-unit message (each row is at least ~84 units before state
+/// markers).
+struct ScheduleListFixtureRow {
+    id: String,
+    channel_id: String,
+    next_run_at: String,
+    interval_seconds: Option<i64>,
+    enabled: bool,
+}
+
+/// The 25-row guild quota (`AutomationQuota::Schedules`), in the order the
+/// list must return them: ascending (`next_run_at`, `id`). Rows 10 and 11
+/// share a `next_run_at` so the `id` tie-break is load-bearing; every third
+/// row recurs every 90 minutes; every fifth row is disabled.
+fn schedule_list_fixture_rows() -> Vec<ScheduleListFixtureRow> {
+    (0..25)
+        .map(|n| {
+            let minute = if n == 11 { 10 } else { n };
+            ScheduleListFixtureRow {
+                id: format!("a1b2c3d4e5f60718293a4b5c{n:08x}"),
+                channel_id: format!("123456789012345{:04}", 6000 + n),
+                next_run_at: format!("2030-01-01T00:{minute:02}:00.000Z"),
+                interval_seconds: (n % 3 == 0).then_some(5400),
+                enabled: n % 5 != 4,
+            }
+        })
+        .collect()
+}
+
+/// Parse the `Page <current> of <total>` indicator out of a list reply.
+fn schedule_list_page_indicator(content: &str) -> Option<(i64, i64)> {
+    let rest = content.split("Page ").nth(1)?;
+    let (current, rest) = rest.split_once(" of ")?;
+    let total: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some((current.trim().parse().ok()?, total.parse().ok()?))
+}
+
+/// The schedule rows in a list reply: lines in the row format, which start
+/// with a backticked id. Page indicators and refusals are not rows.
+fn schedule_list_row_lines(content: &str) -> Vec<&str> {
+    content
+        .lines()
+        .filter(|line| line.starts_with('`'))
+        .collect()
+}
+
+/// The complete id a row line leads with (between the first backticks).
+fn schedule_list_row_id(line: &str) -> &str {
+    line.trim_start_matches('`')
+        .split('`')
+        .next()
+        .expect("row line leads with a backticked id")
+}
+
+/// Invoke `/schedule-list` through the shared runtime, optionally with the
+/// `page` option.
+async fn invoke_schedule_list(runtime: &Arc<CommandRuntime>, page: Option<i64>) {
+    let options = page
+        .map(|page| vec![option("page", CommandOptionValue::Integer(page))])
+        .unwrap_or_default();
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), options))
+        .await;
+}
+
+/// Every deferred-reply completion body (`content`), in invocation order.
+/// Also pins the transport shape shared by every page: one ephemeral defer
+/// (type 5, flags 64) and one completion edit per invocation, nothing else.
+fn schedule_list_reply_contents(mock: &MockRest, invocations: usize) -> Vec<String> {
+    let requests = mock.requests();
+    let callbacks: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/callback"))
+        .collect();
+    assert_eq!(
+        callbacks.len(),
+        invocations,
+        "one ephemeral defer per list invocation"
+    );
+    for callback in &callbacks {
+        let json: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("callback json");
+        assert_eq!(json["type"], 5, "deferred reply");
+        assert_eq!(json["data"]["flags"], 64, "ephemeral defer");
+    }
+    let edits: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(
+        edits.len(),
+        invocations,
+        "one completion edit per list invocation, no extra messages"
+    );
+    assert_eq!(
+        requests.len(),
+        invocations * 2,
+        "listing makes no REST calls beyond defer + completion"
+    );
+    edits
+        .iter()
+        .map(|edit| {
+            let json: serde_json::Value =
+                serde_json::from_slice(&edit.body).expect("completion json");
+            json["content"]
+                .as_str()
+                .expect("list content is text")
+                .to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_full_quota_enumerates_every_id_across_pages() {
+    let db = TestDb::new().await;
+    let fixture = schedule_list_fixture_rows();
+    assert_eq!(fixture.len(), 25, "the per-guild schedule quota");
+    // Seed in reverse order: neither insertion order nor a bare
+    // `next_run_at` sort may decide the tied pair's order.
+    for row in fixture.iter().rev() {
+        db.seed_schedule_row(GUILD_S, row).await;
+    }
+    db.seed_schedule("9999", "sched-foreign-full").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    // Page 1 by default, then explicitly: the two must agree byte for byte.
+    invoke_schedule_list(&runtime, None).await;
+    invoke_schedule_list(&runtime, Some(1)).await;
+    let first_two = schedule_list_reply_contents(&mock, 2);
+    assert_eq!(
+        first_two[0], first_two[1],
+        "omitting page means page 1 exactly"
+    );
+    let first = &first_two[0];
+    assert!(
+        first.encode_utf16().count() <= 2000,
+        "page 1 stays within Discord's 2,000 UTF-16 unit cap: {} units",
+        first.encode_utf16().count()
+    );
+    let (current, total_pages) = schedule_list_page_indicator(first)
+        .unwrap_or_else(|| panic!("a full-quota list must announce `Page 1 of <total>`: {first}"));
+    assert_eq!(current, 1, "the first reply is page 1");
+    assert!(
+        (2..=25).contains(&total_pages),
+        "25 whole rows cannot fit one capped message, so pages must continue: \
+         indicator claims {total_pages} page(s)"
+    );
+
+    for page in 2..=total_pages {
+        invoke_schedule_list(&runtime, Some(page)).await;
+    }
+    let contents = schedule_list_reply_contents(&mock, 1 + total_pages as usize);
+    // contents[1] repeats page 1 (checked above); walk 1, 2, ..= total.
+    let mut pages: Vec<&str> = vec![contents[0].as_str()];
+    pages.extend(contents.iter().skip(2).map(String::as_str));
+
+    let mut listed: Vec<&ScheduleListFixtureRow> = Vec::new();
+    for (index, content) in pages.iter().enumerate() {
+        let page = index as i64 + 1;
+        assert!(
+            content.encode_utf16().count() <= 2000,
+            "page {page} stays within the 2,000 UTF-16 unit cap: {} units",
+            content.encode_utf16().count()
+        );
+        assert_eq!(
+            schedule_list_page_indicator(content),
+            Some((page, total_pages)),
+            "every page announces its position: {content}"
+        );
+        assert!(
+            !content.contains("sched-foreign-full"),
+            "another guild's schedule never leaks into page {page}: {content}"
+        );
+        let lines = schedule_list_row_lines(content);
+        assert!(!lines.is_empty(), "page {page} carries at least one row");
+        for line in lines {
+            let id = schedule_list_row_id(line);
+            let row = fixture
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap_or_else(|| panic!("row leads with a complete configured id: {line}"));
+            assert!(
+                line.contains(&format!("<#{}>", row.channel_id)),
+                "row keeps its whole channel mention: {line}"
+            );
+            assert!(
+                line.contains(&row.next_run_at),
+                "row keeps its whole next-run timestamp: {line}"
+            );
+            if row.interval_seconds.is_some() {
+                assert!(
+                    line.contains(" every 90m"),
+                    "recurring row keeps its interval marker: {line}"
+                );
+            } else {
+                assert!(
+                    !line.contains(" every "),
+                    "one-shot row carries no interval marker: {line}"
+                );
+            }
+            if row.enabled {
+                assert!(
+                    !line.contains("(disabled)"),
+                    "enabled row carries no disabled marker: {line}"
+                );
+            } else {
+                assert!(
+                    line.contains(" (disabled)"),
+                    "disabled row keeps its disabled marker: {line}"
+                );
+            }
+            listed.push(row);
+        }
+    }
+
+    let listed_ids: Vec<&str> = listed.iter().map(|row| row.id.as_str()).collect();
+    let expected_ids: Vec<&str> = fixture.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(
+        listed_ids, expected_ids,
+        "walking every page enumerates each configured id exactly once, in \
+         (next_run_at, id) order, with no tail silently dropped"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "listing writes no audit rows on any page"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len(),
+        25,
+        "listing never writes schedule rows"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_empty_guild_pages_are_defined() {
+    let db = TestDb::new().await;
+    // Only another guild has schedules: this guild's list is empty on every
+    // page, and the foreign id must never surface.
+    db.seed_schedule("9999", "sched-foreign-only").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, None).await;
+    invoke_schedule_list(&runtime, Some(1)).await;
+    invoke_schedule_list(&runtime, Some(2)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 3);
+    assert_eq!(contents[0], "Nothing scheduled.");
+    assert_eq!(
+        contents[1], "Nothing scheduled.",
+        "explicit page 1 matches the default on an empty guild"
+    );
+    assert_eq!(
+        contents[2], "Page 2 is out of range: this server has 1 page(s) of schedules.",
+        "an empty guild has exactly one (empty) page"
+    );
+    for content in &contents {
+        assert!(
+            !content.contains("sched-foreign-only"),
+            "foreign rows never surface: {content}"
+        );
+        assert!(content.encode_utf16().count() <= 2000);
+    }
+    assert!(db.schedule_audits().await.is_empty());
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_invalid_and_out_of_range_pages_refuse_without_writes() {
+    let db = TestDb::new().await;
+    let fixture = schedule_list_fixture_rows();
+    for row in fixture.iter().take(3) {
+        db.seed_schedule_row(GUILD_S, row).await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(1)).await;
+    invoke_schedule_list(&runtime, Some(0)).await;
+    invoke_schedule_list(&runtime, Some(-1)).await;
+    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(i64::MAX)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 5);
+    let single_page = &contents[0];
+    assert!(single_page.encode_utf16().count() <= 2000);
+    assert!(
+        matches!(
+            schedule_list_page_indicator(single_page),
+            None | Some((1, 1))
+        ),
+        "a single-page list announces at most `Page 1 of 1`: {single_page}"
+    );
+    let single_ids: Vec<&str> = schedule_list_row_lines(single_page)
+        .iter()
+        .map(|line| schedule_list_row_id(line))
+        .collect();
+    assert_eq!(
+        single_ids,
+        fixture
+            .iter()
+            .take(3)
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        "page 1 lists the whole small guild in order"
+    );
+    assert_eq!(contents[1], "Page must be at least 1.");
+    assert_eq!(contents[2], "Page must be at least 1.");
+    assert_eq!(
+        contents[3],
+        "Page 2 is out of range: this server has 1 page(s) of schedules."
+    );
+    assert_eq!(
+        contents[4],
+        format!(
+            "Page {} is out of range: this server has 1 page(s) of schedules.",
+            i64::MAX
+        ),
+        "extreme page values refuse cleanly instead of overflowing page math"
+    );
+    for refusal in &contents[1..] {
+        for row in fixture.iter().take(3) {
+            assert!(
+                !refusal.contains(&row.id),
+                "a refused page lists no rows: {refusal}"
+            );
+        }
+    }
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "refused pages write no audit rows"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len(),
+        3,
+        "refused pages never write schedule rows"
     );
     mock.shutdown().await;
     db.close().await;
