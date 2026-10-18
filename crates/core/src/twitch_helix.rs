@@ -185,24 +185,69 @@ impl AppToken {
     }
 }
 
+/// Largest `expires_in` accepted from the token endpoint: 365 days in seconds.
+/// Real Twitch app tokens live far below this; zero, negatives and absurd
+/// values are refused fail-closed.
+const MAX_TOKEN_EXPIRES_IN_SECS: i64 = 31_536_000;
+/// Largest top-level string value accepted in a token response body, in bytes.
+/// Covers `access_token`, `token_type` and any unknown field; other unknown
+/// fields of ordinary size stay ignored for forward compatibility.
+const MAX_TOKEN_STRING_BYTES: usize = 1024;
+
 /// Parse a `POST` token response (`{"access_token","expires_in",...}`) into a
 /// cached [`AppToken`]. `now_ms` is a parameter so tests pin the clock.
+///
+/// Fail-closed: the body must be a JSON object, `access_token` must be a
+/// 1..=1024-byte printable non-space ASCII string (`0x21..=0x7E`, suitable
+/// for an `Authorization` header), `expires_in` must be a JSON integer in
+/// `1..=31_536_000` seconds with no coercion, and every top-level string
+/// value must fit the same 1024-byte bound. Every refusal is the existing
+/// fixed-vocabulary [`HelixError::BadResponse`] with no body content echo.
 pub fn parse_token_response(body: &serde_json::Value, now_ms: i64) -> Result<AppToken, HelixError> {
-    let token = body
+    let obj = body.as_object().ok_or(HelixError::BadResponse(
+        "token response body must be an object",
+    ))?;
+    let token = obj
         .get("access_token")
         .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
         .ok_or(HelixError::BadResponse(
             "token response is missing access_token",
         ))?;
-    let expires_in_secs = body
-        .get("expires_in")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|secs| *secs > 0)
-        .ok_or(HelixError::BadResponse(
-            "token response is missing expires_in",
-        ))?;
-    let ttl_ms = i64::try_from(expires_in_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
+    let token_usable = !token.is_empty()
+        && token.len() <= MAX_TOKEN_STRING_BYTES
+        && token.bytes().all(|byte| (0x21..=0x7E).contains(&byte));
+    if !token_usable {
+        return Err(HelixError::BadResponse(
+            "token response has unusable access_token",
+        ));
+    }
+    let expires_in_secs = match obj.get("expires_in") {
+        Some(serde_json::Value::Number(n)) if n.is_i64() => n.as_i64().unwrap_or(0),
+        Some(serde_json::Value::Number(n)) if n.is_u64() => {
+            let raw = n.as_u64().unwrap_or(u64::MAX);
+            i64::try_from(raw).unwrap_or(i64::MAX)
+        }
+        _ => {
+            return Err(HelixError::BadResponse(
+                "token response is missing expires_in",
+            ));
+        }
+    };
+    if !(1..=MAX_TOKEN_EXPIRES_IN_SECS).contains(&expires_in_secs) {
+        return Err(HelixError::BadResponse(
+            "token response has unusable expires_in",
+        ));
+    }
+    for value in obj.values() {
+        if let Some(text) = value.as_str() {
+            if text.len() > MAX_TOKEN_STRING_BYTES {
+                return Err(HelixError::BadResponse(
+                    "token response has oversized field",
+                ));
+            }
+        }
+    }
+    let ttl_ms = expires_in_secs.saturating_mul(1_000);
     Ok(AppToken {
         token: Secret::new(token.to_owned()),
         expires_at_ms: now_ms.saturating_add(ttl_ms),

@@ -161,17 +161,18 @@ event-executors measurement. No new dependencies or release-profile changes;
 revisit if the binary approaches the limit. The 112 MiB image ceiling is
 unchanged.
 
-On 2026-10-17, main at `89c859b` measured 16,777,376 bytes (16.00 MiB +
+On 2026-10-17, main at `89c859b1` measured 16,777,376 bytes (16.00 MiB +
 160 bytes) in the [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39061354880/job/117479846522),
 and the PR-1093 merge_group against the same base measured the identical
-16,777,376 bytes in [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39061090833).
-The stream retention-expiry slice (`ac8fd66`, fence-preserving expiry of
-delivered go-live dedup rows) tipped the full 16 MiB budget with no new
-dependencies and no release-profile change. The x1.4 rule would yield
+16,777,376 bytes in [its container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39061090833),
+so the gate trips on main itself. The stream retention-expiry slice (`ac8fd66`,
+fence-preserving expiry of delivered go-live dedup rows) tipped the full 16 MiB
+budget with no new dependencies and no release-profile change, and the
+moderation-enforcement-outcomes head measured 16,778,152 bytes (16.00 MiB),
+936 bytes over, with the same minimal release profile. The x1.4 rule would yield
 23 MiB, but the budget is set to 17 MiB instead to retain a useful
-tripwire: 1,048,416 bytes (1.00 MiB, 5.9%) of headroom above the measured
-16,777,376 bytes. The 112 MiB image ceiling is unchanged; the
-release-binary ceiling is now 17 MiB.
+tripwire: about 1 MiB of headroom above the measured heads. The 112 MiB image
+ceiling is unchanged; the release-binary ceiling is now 17 MiB.
 
 This branch's automation-only head separately measured 15,769,872 bytes
 (15.04 MiB) before the event-executor merge. This PR keeps the current-main
