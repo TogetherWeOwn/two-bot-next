@@ -149,21 +149,13 @@ async fn main() {
     if cli_args.first().is_some_and(|arg| arg == "commands") {
         std::process::exit(commands_cli::dispatch(&cli_args[1..]).await);
     }
-    // Bare-boot owed-release override: the documented `two-bot --allow-owed`
-    // service-start flag must reach the boot preflight in `run`, not the
-    // backup unknown-subcommand handler. Recognize only the exact single flag;
-    // misspellings, extra arguments and operator subcommands carrying the flag
-    // still exit 2 through `backup_cli::dispatch` below.
-    let bare_boot_override =
-        cli_args.len() == 1 && cli_args[0] == two_bot_core::disable_preflight::OVERRIDE_FLAG;
-    if !bare_boot_override && !cli_args.is_empty() && cli_args[0] != "--help" && cli_args[0] != "-h"
-    {
+    if !cli_args.is_empty() && cli_args[0] != "--help" && cli_args[0] != "-h" {
         let code = backup_cli::dispatch(&cli_args).await;
         // 100 = not a backup subcommand: fall through to serve.
         if code != 100 {
             std::process::exit(code);
         }
-    } else if !bare_boot_override && !cli_args.is_empty() {
+    } else if !cli_args.is_empty() {
         print_backup_help_and_exit().await;
     }
 
