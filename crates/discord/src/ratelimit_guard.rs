@@ -735,7 +735,7 @@ fn parse_http_date(raw: &str) -> Option<SystemTime> {
     if parts.next().is_some() {
         return None;
     }
-    if !(1..=31).contains(&day) {
+    if day == 0 || day > days_in_month(year, month) {
         return None;
     }
     let mut clock = time.split(':');
@@ -783,6 +783,25 @@ fn month_number(name: &str) -> Option<u32> {
         "Nov" => Some(11),
         "Dec" => Some(12),
         _ => None,
+    }
+}
+
+/// Days in a civil month, with Gregorian leap years: divisible by 4, except
+/// centuries not divisible by 400. Rejects rollover dates like 31 Feb that
+/// the day-count below would otherwise silently carry into March.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
     }
 }
 
