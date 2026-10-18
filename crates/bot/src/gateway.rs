@@ -2645,6 +2645,88 @@ mod tests {
         assert_eq!(*sink.0.lock().unwrap(), [42]);
     }
 
+    /// Ordering contract behind a warm RESUME (2026-10-18 voice stall
+    /// investigation): reception bumps the generation and disconnects voice
+    /// at the transport loss, *before* the new connection's RESUMED is
+    /// received and stamped, so the worker's post-handle generation check
+    /// keeps that RESUMED's snapshot publish. Only a loss that lands after
+    /// the RESUMED was received may revoke it again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_keeps_the_resumed_voice_publish_unless_a_later_loss_lands() {
+        struct Recorder(std::sync::Mutex<Vec<&'static str>>);
+        impl VoiceEventSink for Recorder {
+            fn handle(&self, event: &Event, _: &twilight_cache_inmemory::DefaultInMemoryCache) {
+                if matches!(event, Event::Resumed) {
+                    self.0.lock().unwrap().push("resumed");
+                }
+            }
+            fn presence(&self, _: &twilight_model::gateway::payload::incoming::PresenceUpdate) {}
+            fn disconnect(&self) {
+                self.0.lock().unwrap().push("disconnect");
+            }
+            fn needs_bootstrap(&self, _: &twilight_cache_inmemory::DefaultInMemoryCache) -> bool {
+                false
+            }
+        }
+        let pipeline = build_pipeline(vec![], None);
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let store = GatewaySessionStore::new(pool, "test-guild".to_owned(), 1);
+        let sink = Arc::new(Recorder(std::sync::Mutex::new(Vec::new())));
+        let voice: Arc<dyn VoiceEventSink> = sink.clone();
+        // Transport loss at reception: generation bump, then voice disconnect.
+        transport_disconnected(&state, &generation).await;
+        voice_disconnected(Some(&voice));
+        let run = |observed: u64| {
+            let checkpoint = GatewaySession {
+                session_id: "test-session".to_owned(),
+                sequence: 9,
+                resume_url: "ws://127.0.0.1:1".to_owned(),
+                updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+            };
+            // The checkpoint commit cannot reach the lazy pool; the voice
+            // handling under test runs before it, so the outcome is ignored.
+            let _ = tokio::task::block_in_place(|| {
+                apply_dispatch(
+                    &tokio::runtime::Handle::current(),
+                    &state,
+                    &generation,
+                    &pipeline,
+                    &store,
+                    None,
+                    None,
+                    Some(Arc::clone(&voice)),
+                    None,
+                    LiveInteractions::default(),
+                    Arc::new(tokio::sync::Notify::new()),
+                    Some(Box::new(ReceivedDispatch::new(Event::Resumed))),
+                    None,
+                    checkpoint,
+                    // Short commit deadline: the unreachable pool only
+                    // times out; nothing under test waits on it.
+                    std::time::Duration::from_millis(100),
+                    observed,
+                    None,
+                    None,
+                )
+            });
+        };
+        // RESUMED stamped at reception after the loss: its publish stands.
+        run(generation.load(Ordering::Acquire));
+        assert_eq!(*sink.0.lock().unwrap(), ["disconnect", "resumed"]);
+        // A further loss after reception revokes the publish it just made.
+        let observed = generation.load(Ordering::Acquire);
+        transport_disconnected(&state, &generation).await;
+        run(observed);
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            ["disconnect", "resumed", "resumed", "disconnect"]
+        );
+    }
+
     /// The worker itself — not just the error constructor — records a failed
     /// leveling drain as a typed error and skips the checkpoint commit. A
     /// message that queues a leveling award drains through a runtime whose
@@ -3011,8 +3093,12 @@ mod tests {
             ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
         ]);
         let command_config =
-            crate::gateway_commands::GatewayCommandConfig::from_map(42, &command_vars)
-                .expect("test command config");
+            crate::gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                42,
+                &command_vars,
+                true,
+            )
+            .expect("test command config");
         runtime.initialize_custom_commands_for_test(command_config);
         let handle = tokio::runtime::Handle::current();
         let message_event = |id: &str, guild: &str| {

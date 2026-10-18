@@ -1131,6 +1131,7 @@ mod tests {
             capture_only: false,
             occurred_at: Some(T_MSG.to_owned()),
             content_length: None,
+            has_embed_or_attachment: false,
         });
         let voice_start_out = handlers.on_voice_join(VoiceInput {
             guild_id: G,
