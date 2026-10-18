@@ -174,10 +174,10 @@ fn assert_custom_oracle(raw: &str, result: &Result<(String, String), NameRefusal
         Err(refusal) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
-                assert_eq!(refusal, NameRefusal::Empty, "{raw:?}");
+                assert_eq!(*refusal, NameRefusal::Empty, "{raw:?}");
             }
             if trimmed.chars().count() > MAX_CUSTOM_NAME_CHARS {
-                assert_eq!(refusal, NameRefusal::TooLong, "{raw:?}");
+                assert_eq!(*refusal, NameRefusal::TooLong, "{raw:?}");
             }
             if *refusal == NameRefusal::Taken {
                 assert!(is_literal_name(trimmed), "{raw:?}");
