@@ -149,9 +149,13 @@ consumed at proposal. It is always on (legacy parity) and independent of
 Container through the Worker's explicit `FORWARDED_DISCORD_IDS` allowlist
 (`wrangler/src/container-env.ts:139-157`), pinned by the executable
 `DISCORD_ID_FIXTURES` allowlist-shape and verbatim-forwarding tests
-(`wrangler/test/container-env.test.ts:199-242`). A missing, empty or invalid
-value is dropped before the Container (the name is logged, never the value),
-so the runtime sees it as unset and stays log-only for that boot. Forwarding
+(`wrangler/test/container-env.test.ts:199-242`). Missing, non-string, empty
+and whitespace-only values are dropped silently before the Container (the
+runtime sees the variable as unset); only a non-empty value that fails
+snowflake validation is dropped with a Worker warning that names the variable
+and never logs its value (`wrangler/src/container-env.ts:227-249`,
+`wrangler/test/container-env.test.ts:289-310`), so the runtime sees it as
+unset and stays log-only for that boot. Forwarding
 alone never claims a live channel is configured or that delivery succeeds. **Landed — join-risk delivery:**
 `crates/bot/src/join_risk_runtime.rs`. The pipeline takes one observer, so risk
 chains behind the raid watch in a fan-out and both stay behind the funnel's join
@@ -192,8 +196,14 @@ permission, channel, tuning or runtime changes.
   wins per observation for the hot keys (`crates/bot/src/raid_runtime.rs:159-200`,
   `SETTING_KEYS`). A stored row moves the next observation, and deleting the
   row hands the key back to the boot value. Tuning behaves the same way: a
-  failed refresh keeps the last good values. Check the `raid_watch_enabled`
-  boot line for the effective target before assuming anything about delivery.
+  failed refresh keeps the last good values. The first join the worker
+  observes after each start logs `raid_watch_enabled` with the target in force
+  at that moment (`crates/bot/src/raid_runtime.rs:190-198`, reached only via
+  `handle` at `:322-339`; `start`/`start_from_env` log nothing) — a quiet
+  guild logs nothing until a join arrives, and later hot channel changes are
+  not logged (only tuning changes emit `setting_changed`). Read the
+  settings-store row for the live value instead of treating that line as a
+  boot line.
 - Delivery requirements. Every post needs all three: a usable channel value
   (unusable falls back to log-only, `RaidSettings::from_vars`), a guild text
   channel the bot can View and Send in (`MemberAccess::load` plus
@@ -202,15 +212,23 @@ permission, channel, tuning or runtime changes.
   (`raid_alert_refused`) rather than widened (`crates/bot/src/raid_runtime.rs:230-297`).
   No identifier or credential is ever needed to check these: read the log
   lines, not the values.
-- Evidence map. Search logs for these exact strings: `raid_alert` is the
-  log-first proposal (always emitted, even when nothing is posted);
+- Evidence map (raid alerts; join risk shares the staff channel and the
+  `Delivery` enum under `join_risk_*` strings). Search logs for these exact
+  strings: `raid_alert` is the log-first proposal (always emitted, even when
+  nothing is posted — an unset staff channel logs only this line and no
+  delivery-status line, `crates/bot/src/raid_runtime.rs:244-246`);
   `raid_alert_posted` means `Delivery::Posted`; `raid_alert_undeliverable`
   means the channel is missing, not text, or View/Send was refused
-  (`Delivery::Undeliverable`); `raid_alert_post_failed` means there was no
-  usable evidence or the send failed (`Delivery::Failed`). The proposal
-  consumes the cooldown, so a missing channel, a refusal and a failed send
-  are all logged and never retried — do not re-post, replay or "fix" them
-  into a second send.
+  (`Delivery::Undeliverable`); `raid_alert_post_failed` means delivery failed
+  (`Delivery::Failed`: failed bot-identity lookup, failed member/permission
+  read — so an unproven permission reports as post_failed, not
+  undeliverable — the 12 s delivery timeout, or a failed send,
+  `crates/bot/src/raid_runtime.rs:267-297`). Join-risk equivalents are
+  `join_risk_posted`, `join_risk_undeliverable`, `join_risk_post_failed` and
+  `join_risk_refused` (`crates/bot/src/join_risk_runtime.rs:372-389`). The
+  proposal consumes the cooldown, so a missing channel, a refusal and a
+  failed send are all logged and never retried — do not re-post, replay or
+  "fix" them into a second send.
 - Restart semantics. Restarting clears the volatile `RaidWatch` (window,
   repeat and cooldown), because one worker owns it in memory. That resets
   future detection; it does not repair, re-deliver or erase an old alert,
