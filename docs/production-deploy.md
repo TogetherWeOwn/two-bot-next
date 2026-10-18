@@ -47,7 +47,7 @@ required reviewers work on every plan; no Enterprise plan is needed.
 staging runs, so the newest `main` commit is often not staged). The guard then
 applies every rule below to that commit and refuses it if its `ci-ok` or
 `worker check` has not finished green. To deploy a specific commit, dispatch
-with `sha` set to a full 40-character commit that is on `main`. That commit needs successful, completed `ci-ok` and `worker check`
+with `sha` set to a full 40-character commit (or an unambiguous 7-40 character hex prefix, which the guard resolves to the full commit via the commits API) that is on `main`. That commit needs successful, completed `ci-ok` and `worker check`
 runs from GitHub Actions and a successful `deploy-staging` run. `ci-ok` is the
 full verdict over lint, worker checks and every selected Rust/DB test lane;
 a green lint-only `check` job is not enough. The guard enumerates `check.yml`
@@ -115,7 +115,8 @@ Dispatch again with `rollback` set to the previous version ID
 from the failed run's summary, `image` set to the previous container image
 digest from the same summary's rollback-snapshot line, and `takeover: true`.
 Set `sha` to the commit that version was built
-from. It is recorded as the rollback message, and the `/readyz` gate after the
+from (full SHA or an unambiguous 7-40 character hex prefix; the guard resolves
+a prefix and records the full SHA). It is recorded as the rollback message, and the `/readyz` gate after the
 rollback must report that revision, or a pre-stamp version on 200 with
 gateway ready (see below). The
 rollback passes the same guard and the same Environment approval, except the

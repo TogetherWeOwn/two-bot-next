@@ -120,6 +120,7 @@ import {
   sanitizeRemediationState,
   type RemediationState,
 } from "./remediation.ts";
+import { applyStagingFaultInjection } from "./staging-fault.ts";
 import { parseRelease, releaseTag, workerVersionTag } from "./error-events.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
 import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
@@ -214,6 +215,13 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
    * Container on an explicit fenced line below, never flag-forwarded. The
    * TWO_DEPLOY_ENV marker it is fenced by rides FORWARDED_FLAGS. */
   TWO_GATEWAY_READINESS_FAIL_INJECTION?: string;
+  /** Staging remediation-drill switches (staging fault injector): Worker-only
+   * trigger input for the guarded auto-remediation soak. Set only in the
+   * generated staging deploy config by a manual deploy-staging dispatch,
+   * never a committed var (check-env-bindings.py). Never forwarded to the
+   * Container (NOT_FORWARDED in container-env.ts) and never logged. */
+  TWO_VOICE_STALL_FAULT_INJECTION?: string;
+  TWO_GATEWAY_UNPAIRED_FAULT_INJECTION?: string;
   /** Operator-set Worker secrets for the private receiver. Never flag-forwarded. */
   TWO_INTERNAL_ACTIONS?: string;
   TWO_INTERNAL_CALLERS?: string;
@@ -898,18 +906,36 @@ export class TwoBotContainer extends Container<Env> {
           return this.proxyOpsBody(`http://c${url.pathname}`, OPS_JSON_CONTENT_TYPE, "ops unavailable\n", signed);
         }
         // Bound the entire probe, including auto-start, below the 30s DO gate.
-        const probe = new Request(request, { signal: AbortSignal.timeout(6000) });
+        // The deadline covers the fetch AND rejected-body consumption: a
+        // sub-cap stall cannot extend caller settlement, and late or
+        // abort-shaped bodies are released best-effort without replacing
+        // the fixed refusal.
+        const probeSignal = AbortSignal.timeout(6000);
+        const probe = new Request(request, { signal: probeSignal });
+        let probeResponse: Response;
         try {
-          const response = await this.containerFetch(probe);
+          probeResponse = await deadlineFetch(this.containerFetch(probe), probeSignal);
+        } catch {
+          return containerUnavailable();
+        }
+        if (probeSignal.aborted) {
+          releaseBody(probeResponse);
+          return containerUnavailable();
+        }
+        try {
           // SDK startup failures arrive as responses rather than rejections.
           // Bound the discard like the keepalive read: small error text drains
           // so the SDK proxy pipe settles, oversize cancels via the reader.
-          if (!isBotProbeResponse(response)) {
-            await readBoundedText(response, MAX_PROBE_BODY_BYTES).catch(() => null);
+          if (!isBotProbeResponse(probeResponse)) {
+            await readBoundedText(probeResponse, MAX_PROBE_BODY_BYTES, probeSignal).catch(() => null);
+            return containerUnavailable();
+          }
+          if (probeSignal.aborted) {
+            releaseBody(probeResponse);
             return containerUnavailable();
           }
           await this.armKeepalive();
-          return response;
+          return probeResponse;
         } catch {
           return containerUnavailable();
         }
@@ -1007,15 +1033,37 @@ export class TwoBotContainer extends Container<Env> {
       body.bytes,
       AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     );
+    // The existing receiver deadline on `forward` bounds the fetch AND the
+    // body relay below: no larger or independent budget is created. A fetch
+    // that ignores abort, a stalled tail, or a never-settling cancel settles
+    // here at that deadline; late bodies are released best-effort and never
+    // relayed. A timeout refuses only this wrapper call: it never retries the
+    // signed action and never proves the receiver stood down.
+    const signal = forward.signal;
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
         if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
+        let upstream: Response;
         try {
-          return await relayReceiverResponse(await this.containerFetch(forward, RECEIVER_PORT), requestId);
+          upstream = await deadlineFetch(this.containerFetch(forward, RECEIVER_PORT), signal);
         } catch {
           return envelope(503, "unavailable", true, {}, requestId);
         }
+        if (signal.aborted) {
+          releaseBody(upstream);
+          return envelope(503, "unavailable", true, {}, requestId);
+        }
+        let relayed: Response;
+        try {
+          relayed = await relayReceiverResponse(upstream, requestId, signal);
+        } catch {
+          return envelope(503, "unavailable", true, {}, requestId);
+        }
+        // The relayed body is fully buffered bytes; past the deadline it is
+        // simply not served, so there is nothing to release.
+        if (signal.aborted) return envelope(503, "unavailable", true, {}, requestId);
+        return relayed;
       });
     } catch (error) {
       // Logs the closed ownership reason; the caller only sees the envelope.
@@ -1048,15 +1096,35 @@ export class TwoBotContainer extends Container<Env> {
       body.bytes,
       AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     );
+    // Same bound as the actions path above: the existing receiver deadline on
+    // `forward` covers the fetch AND the body relay, with no larger or
+    // independent budget. Late bodies are released best-effort and never
+    // relayed; a timeout never retries the delivery.
+    const signal = forward.signal;
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
         if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
+        let upstream: Response;
         try {
-          return await relayEventsubResponse(await this.containerFetch(forward, EVENTSUB_RECEIVER_PORT), requestId);
+          upstream = await deadlineFetch(this.containerFetch(forward, EVENTSUB_RECEIVER_PORT), signal);
         } catch {
           return envelope(503, "unavailable", true, {}, requestId);
         }
+        if (signal.aborted) {
+          releaseBody(upstream);
+          return envelope(503, "unavailable", true, {}, requestId);
+        }
+        let relayed: Response;
+        try {
+          relayed = await relayEventsubResponse(upstream, requestId, signal);
+        } catch {
+          return envelope(503, "unavailable", true, {}, requestId);
+        }
+        // The relayed body is fully buffered bytes; past the deadline it is
+        // simply not served, so there is nothing to release.
+        if (signal.aborted) return envelope(503, "unavailable", true, {}, requestId);
+        return relayed;
       });
     } catch (error) {
       // Logs the closed ownership reason; the caller only sees the envelope.
@@ -1452,7 +1520,12 @@ export class TwoBotContainer extends Container<Env> {
         }
         return;
       }
-      const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000, gatewayReady);
+      // Staging-only fault injector: synthetic drill input for the
+      // guarded-remediation soak. Dark unless the generated staging deploy
+      // config arms it; production and unarmed staging evaluate the scraped
+      // samples untouched. Never logged: the switches never leave this gate.
+      const faulted = applyStagingFaultInjection(samples, previous, this.env);
+      const { firing, state } = evaluateMetrics(faulted, previous, Date.now() / 1000, gatewayReady);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);
       for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses, context)) {
@@ -1751,9 +1824,10 @@ export default {
         const upstream = await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         // SDK startup failures arrive as responses rather than rejections.
         // Cancel without reading: a huge non-bot body must not bypass the
-        // probe cap by being drained here.
+        // probe cap by being drained here. Best-effort: a stalling cancel
+        // hook must not hold the fixed refusal.
         if (!isBotProbeResponse(upstream)) {
-          await upstream.body?.cancel().catch(() => {});
+          releaseBody(upstream);
           response = containerUnavailable();
         } else {
           response = upstream;

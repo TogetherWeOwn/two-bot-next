@@ -632,6 +632,27 @@ impl ActionError {
     pub fn status(&self) -> u16 {
         self.code.status()
     }
+
+    /// Bounded metrics outcome for `two_bot_moderation_enforcements_total`
+    /// (TOG-28482): `refused` for malformed/forbidden/definitive Discord
+    /// rejections, `discord_error` for uncertain Discord failures,
+    /// `storage_error` for persistence failures, `other` for anything else
+    /// (auth, stale, in-progress, version conflicts, replays). The caller
+    /// passes a `ModerationAction::command_name` verb; no user id, reason
+    /// text or free-form detail ever becomes a label.
+    #[must_use]
+    pub fn enforcement_outcome(&self) -> &'static str {
+        match self.code {
+            ErrorCode::Malformed | ErrorCode::ActionNotAllowed | ErrorCode::DiscordRejected => {
+                "refused"
+            }
+            ErrorCode::UpstreamTimeout | ErrorCode::RateLimited | ErrorCode::DiscordUnavailable => {
+                "discord_error"
+            }
+            ErrorCode::Internal => "storage_error",
+            _ => "other",
+        }
+    }
 }
 
 /// Every auth failure is this one error: same code, same message, detail only

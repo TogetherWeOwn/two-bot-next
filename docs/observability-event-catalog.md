@@ -180,6 +180,22 @@ body, broadcaster, subscription or secret data reaches any label.
 | `two_bot_eventsub_reconcile_actions_total{action}` | Successful reconcile mutations by bounded action; `action` is `create` or `delete`; 409 already-exists confirmations fold into the pass outcome |
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | Reconcile failure sites by bounded log `error_class`; `error_class` is `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed` or `other`; no status, body or response bytes in labels |
 
+## Moderation enforcement series
+
+Counters emitted by the moderation enforcement render. Unknown outcomes
+collapse to `other` (unknown verbs collapse to the trailing verb slot,
+`unlock`, until the verb allowlist grows), and no member ID, reason text
+or message content reaches any label. Verbs are the bounded `ModerationAction`
+command vocabulary (`ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`,
+`slowmode`, `lockdown`, `unlock`); outcomes are `success`, `refused`,
+`discord_error`, `storage_error` and `other`. Each terminal member or
+channel enforcement counts once; retries and rate-limit backoffs are not
+outcomes. See `docs/metrics.md` for the full label table.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_moderation_enforcements_total{verb,outcome}` | Terminal moderation enforcements by bounded verb and outcome |
+
 ## Scheduled job labels
 
 Each label owns independent `two_bot_job_runs_total{job,outcome}`,
@@ -215,6 +231,7 @@ is the single shared spelling also pinned in `evidence.rs`
 | `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` with `two_bot_voice_creator_map_generation` | Pages when the age since the last successful creator-map merge passes 600 s (two missed 5 min refreshes) after at least one merge; generation 0 (never merged: boot or voice parked) never fires; the gauges are optional scrape inputs, so older containers hold the previous state |
 | `error_budget_fast_burn` | All `two_bot_rest_requests_total` samples (eligible requests) against `result="5xx"` plus `result="transport"` (budget spend) | Pages when the REST error budget (99.9% success over 48 h) burns faster than 12x in both the 15 min and 2 min windows; each window needs at least 10 eligible requests and two budget errors; incomplete post-restart windows stay inactive; missing or malformed inputs hold the previous state |
 | `audit_delivery_halt` | `two_bot_audit_delivery_halt` with `two_bot_job_consecutive_failures{job="audit_retry"}` and `two_bot_job_last_success_timestamp_seconds{job="audit_retry"}` | Ticket when the label-free halt gauge reads `1` for 3 consecutive valid samples (about two minutes at the 60 s cadence); any nonzero `audit_retry` failure count vetoes both firing and recovery, and missing, duplicate, labeled or non-boolean readings break the streak while holding an active ticket; a valid `0` after a healthy sweep resolves once, and a boot-default zero cannot resolve until `audit_retry` has a nonzero success timestamp |
+| `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` | Pages when the `tampered` counter (only `BadSignature`) rises in 3 consecutive samples; the first sample only baselines, a flat window resolves, a reset rebaselines, and missing/invalid scrapes hold firing |
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
