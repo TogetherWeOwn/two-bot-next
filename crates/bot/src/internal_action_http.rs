@@ -319,8 +319,22 @@ impl ModerationEffect for ModerationExecutor {
                         "moderation_snapshot_unavailable",
                     )
                 })?;
+            // The resolver runs before the instrumented executor: definitive
+            // refusals (`ActionNotAllowed`) record `refused` here so the
+            // website path counts what slash counts via `preflight_refused`.
+            // Snapshot failures stay unsampled.
             let (actor, target, bot_position) =
-                moderation_resolve(&self.discord, request, &facts, bot_position).await?;
+                match moderation_resolve(&self.discord, request, &facts, bot_position).await {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        record_resolver_refusal(
+                            metrics::global(),
+                            request.action().command_name(),
+                            &err,
+                        );
+                        return Err(err);
+                    }
+                };
             match self
                 .inner
                 .execute(
@@ -413,7 +427,19 @@ impl ChannelModerationEffect for ChannelModerationExecutor {
         Box::pin(async move {
             let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
             let facts = moderation_guild_facts(&self.discord, guild_id).await?;
-            let actor = channel_resolve(&self.discord, request, &facts).await?;
+            // Same boundary as the member path: definitive resolver refusals
+            // record `refused` here, before the instrumented executor runs.
+            let actor = match channel_resolve(&self.discord, request, &facts).await {
+                Ok(actor) => actor,
+                Err(err) => {
+                    record_resolver_refusal(
+                        metrics::global(),
+                        request.action().command_name(),
+                        &err,
+                    );
+                    return Err(err);
+                }
+            };
             self.inner
                 .execute(request, &actor, request_id, idempotency_key, now)
                 .await
@@ -443,6 +469,21 @@ fn channel_action_outcome(action: &str) -> Option<&'static str> {
         "moderation.lockdown" => Some("locked_down"),
         "moderation.unlock" => Some("unlocked"),
         _ => None,
+    }
+}
+
+/// Record a definitive website resolver refusal. The actor/target checks in
+/// [`moderation_resolve`] and [`channel_resolve`] run before the instrumented
+/// executors, so without this the website path under-counts `refused`
+/// relative to slash (which counts the same refusals via `preflight_refused`
+/// and service policy errors). Snapshot failures (`DiscordUnavailable`) and
+/// other indeterminate errors prove nothing about the enforcement and stay
+/// unsampled, matching the slash rule for indeterminate preflight reads.
+/// Takes the recorder so tests assert on a fresh [`metrics::Metrics`]
+/// instead of the process-global registry.
+fn record_resolver_refusal(metrics: &metrics::Metrics, verb: &str, err: &ActionError) {
+    if err.code == ErrorCode::ActionNotAllowed {
+        metrics.moderation_enforcement(verb, "refused");
     }
 }
 
@@ -3237,6 +3278,17 @@ fn now_ms() -> u64 {
             elapsed.as_millis().try_into().unwrap_or(u64::MAX)
         })
 }
+
+/// Serializes exact-delta `two_bot_moderation_enforcements_total` assertions
+/// on the process-global registry across test modules (TOG-28482): the
+/// website refusal/executor tests in `tests` and the slash preflight test in
+/// `command_runtime_tests` both record `refused` for the same member verbs,
+/// and `cargo test --workspace --lib --bins` runs them as threads of one
+/// process. Hold across the before/after reads. Test-only; never used in
+/// production. Acquire before any flag lock; flag locks are leaves under it.
+#[cfg(test)]
+pub(crate) static MODERATION_METRICS_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests;

@@ -140,6 +140,9 @@ stay banned.
 ## Override
 
 Re-run the check with `--allow-owed`, or boot with
-`TWO_ALLOW_OWED_RELEASES=1`. The override proceeds and is logged loudly
-(`moderation_disable_override`) with the still-owed ids. Prefer completing
-or explicitly cancelling the releases instead.
+`TWO_ALLOW_OWED_RELEASES=1` or the bare service-start invocation
+`two-bot --allow-owed` (that exact flag only; misspellings, extra arguments
+and operator subcommands carrying the flag stay usage errors). The override
+proceeds and is logged loudly (`moderation_disable_override`) with the
+still-owed ids. Prefer completing or explicitly cancelling the releases
+instead.
