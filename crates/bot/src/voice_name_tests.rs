@@ -314,7 +314,10 @@ fn hostile_name_ids_refuse_through_the_router() {
         );
         assert_eq!(
             name_component_action(&modal(&name_modal_custom_id(room_id))),
-            Some(submit("Den"))
+            Some(NameInteraction::Submit {
+                room_id,
+                text: "Den".to_owned(),
+            })
         );
         // A modal id on a button and button ids on a modal stay silent,
         // even at the largest encodable room.
