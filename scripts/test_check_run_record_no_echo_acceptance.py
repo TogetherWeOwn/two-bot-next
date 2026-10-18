@@ -35,7 +35,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import check_run_record as checker  # noqa: E402
+import check_run_record as checker
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "docs" / "staging-e2e-run-record.schema.json"
