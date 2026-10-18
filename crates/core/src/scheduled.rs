@@ -92,6 +92,82 @@ pub enum ScheduleError {
     EveryMinutesOutOfRange(i64),
 }
 
+/// Neutralize mass mentions and invite links in a schedule body so the
+/// ticker can never post a ping or a clickable invite pill.
+///
+/// Mass mentions (`@everyone`/`@here`, including zero-width-split
+/// obfuscation) are broken with the shared mention neutralizer; every
+/// case-insensitive invite host (`discord.gg`, `discord.com/invite`,
+/// `discordapp.com/invite` — the same three hosts as the automod invite
+/// policy) is split with a zero-width space after its dot
+/// (`discord.\u{200b}gg`) so Discord never linkifies it. Plain text
+/// without any of these patterns passes through byte-identical, and the
+/// transform is idempotent: already-neutralized text is returned unchanged.
+///
+/// Applied at the validate boundary (stored bodies leave neutralized) and
+/// again at the ticker post boundary (rows written before any validate-side
+/// screen are defused on the way to the channel; the ticker additionally
+/// truncates to the message ceiling so neutralization growth on legacy rows
+/// cannot turn a post into a permanent failure).
+#[must_use]
+pub fn neutralize_scheduled_body(body: &str) -> String {
+    split_invite_host(&crate::message_safety::neutralize_mentions(body))
+}
+
+/// Split the dot of every case-insensitive invite host with a zero-width
+/// space so Discord does not linkify it. Covers the same three hosts as the
+/// automod invite policy: `discord.gg`, `discord.com/invite`, and
+/// `discordapp.com/invite`. Original casing is preserved (`DISCORD.GG`
+/// becomes `DISCORD.\u{200b}GG`); text without an invite host passes through
+/// byte-identical. Longest host wins at each position so
+/// `discordapp.com/invite` is never partially matched.
+fn split_invite_host(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((pos, needle_len, dot_len)) = find_invite_host(rest) {
+        let (head, tail) = rest.split_at(pos);
+        out.push_str(head);
+        out.push_str(&tail[..dot_len]);
+        out.push('\u{200b}');
+        out.push_str(&tail[dot_len..needle_len]);
+        rest = &tail[needle_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Byte offset, needle length and dot-prefix length of the earliest
+/// case-insensitive invite host in `text`, if any. All needles are pure
+/// ASCII, so every match starts and ends on a character boundary.
+fn find_invite_host(text: &str) -> Option<(usize, usize, usize)> {
+    const HOSTS: [(&[u8], usize, usize); 3] = [
+        (b"discordapp.com/invite", 21, 11), // `discordapp.` prefix length
+        (b"discord.com/invite", 18, 8),     // `discord.` prefix length
+        (b"discord.gg", 10, 8),             // `discord.` prefix length
+    ];
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().find_map(|(pos, _)| {
+        // Mid-char byte positions can never start an all-ASCII match;
+        // skip them so `split_at` below only sees char boundaries.
+        if !text.is_char_boundary(pos) {
+            return None;
+        }
+        HOSTS.iter().find_map(|(needle, len, dot)| {
+            if bytes.len() - pos < *len {
+                return None;
+            }
+            let matches = needle.iter().enumerate().all(|(i, b)| {
+                if *b == b'.' || *b == b'/' {
+                    bytes[pos + i] == *b
+                } else {
+                    bytes[pos + i].eq_ignore_ascii_case(b)
+                }
+            });
+            matches.then_some((pos, *len, *dot))
+        })
+    })
+}
+
 /// Validate a `/schedule` invocation (legacy `putScheduled` checks plus the
 /// handler's one-of rule). Count UTF-16 units and require sendable text after
 /// the shared outbound rendering, preserving the original body for storage.
@@ -113,14 +189,25 @@ pub fn validate_schedule(input: &ScheduleInput<'_>) -> Result<ValidatedSchedule,
             return Err(ScheduleError::EveryMinutesOutOfRange(every_minutes));
         }
     }
+    // Defuse mass mentions and invite pills before storage; benign bodies
+    // pass through byte-identical. A neutralization that grows the text past
+    // the ceiling refuses instead of handing storage a body the wire would
+    // reject, and a neutralization with no sendable text left refuses too.
+    let neutralized = neutralize_scheduled_body(body);
+    if crate::message_safety::text_len(&neutralized) > MAX_BODY_CHARS {
+        return Err(ScheduleError::BodyTooLong);
+    }
+    if !crate::message_safety::has_message_text(&neutralized) {
+        return Err(ScheduleError::BodyEmpty);
+    }
     match (input.in_minutes, input.every_minutes) {
         (Some(in_minutes), _) => Ok(ValidatedSchedule {
-            body: body.to_owned(),
+            body: neutralized,
             delay_minutes: in_minutes,
             interval_seconds: input.every_minutes.map(|m| m * 60),
         }),
         (None, Some(every_minutes)) => Ok(ValidatedSchedule {
-            body: body.to_owned(),
+            body: neutralized,
             delay_minutes: every_minutes,
             interval_seconds: Some(every_minutes * 60),
         }),
@@ -688,6 +775,66 @@ mod tests {
                 body
             );
         }
+    }
+
+    #[test]
+    fn neutralize_splits_every_invite_host_and_stays_idempotent() {
+        // Same three hosts as the automod invite policy; casing preserved.
+        for (hostile, broken) in [
+            ("join discord.gg/abc", "join discord.\u{200b}gg/abc"),
+            ("see DISCORD.GG/abc", "see DISCORD.\u{200b}GG/abc"),
+            (
+                "see https://discord.com/invite/xyz",
+                "see https://discord.\u{200b}com/invite/xyz",
+            ),
+            (
+                "see https://DISCORDAPP.COM/INVITE/xyz",
+                "see https://DISCORDAPP.\u{200b}COM/INVITE/xyz",
+            ),
+            ("@everyone party", "@\u{200b}everyone party"),
+        ] {
+            let safe = neutralize_scheduled_body(hostile);
+            assert_eq!(safe, broken, "{hostile:?}");
+            assert_eq!(
+                neutralize_scheduled_body(&safe),
+                safe,
+                "replay must be idempotent: {hostile:?}"
+            );
+        }
+        // Benign bodies pass through byte-identical.
+        for benign in [
+            "hello world",
+            "game night bring snacks",
+            "Meeting at 5pm",
+            "plain discord chat with no link",
+        ] {
+            assert_eq!(neutralize_scheduled_body(benign), benign);
+        }
+        // Multibyte text around a host never panics and still defuses.
+        let mixed = format!("{}discord.gg/abc{}", "界".repeat(10), "😀".repeat(5));
+        let safe = neutralize_scheduled_body(&mixed);
+        assert!(safe.contains("discord.\u{200b}gg"));
+        assert_eq!(neutralize_scheduled_body(&safe), safe);
+    }
+
+    #[test]
+    fn neutralize_growth_can_be_truncated_back_to_the_ceiling() {
+        // A legacy row at the old pre-neutralize limit grows by one unit per
+        // mass mention; the ticker's truncate-then-post keeps it sendable.
+        let body = format!("{} @everyone", "x".repeat(1990));
+        assert_eq!(crate::message_safety::text_len(&body), MAX_BODY_CHARS);
+        let neutralized = neutralize_scheduled_body(&body);
+        assert_eq!(
+            crate::message_safety::text_len(&neutralized),
+            MAX_BODY_CHARS + 1
+        );
+        let posted =
+            crate::message_safety::truncate(&neutralized, crate::message_safety::CONTENT_LIMIT);
+        assert_eq!(
+            crate::message_safety::text_len(&posted),
+            crate::message_safety::CONTENT_LIMIT
+        );
+        assert!(!posted.contains("@everyone"));
     }
 
     #[test]

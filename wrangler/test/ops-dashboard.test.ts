@@ -525,9 +525,12 @@ test(`${OPS_SUMMARY_PATH}: accepts either credential with scrape 429 as hard fen
   assert.equal(res.status, 503);
   await res.text();
   assert.equal(both.calls.length, 3, "only forwards reach the container");
-  // Scrape 429 is a hard fence: exhaust the scrape budget with 10 bearer
-  // forwards on one caller (dashboard budget untouched, since scrape success
-  // returns before it), then valid creds on the same caller still 429.
+  // Scrape 429 is a hard fence for bearer-presenting requests: exhaust the
+  // scrape budget with 10 bearer forwards on one caller (dashboard budget
+  // untouched, since bearer-only requests never spend it and scrape success
+  // returns before it), then both credentials on the same caller still 429.
+  // A dashboard-only request presents no bearer, so it skips the spent scrape
+  // gate (per-credential budgets, TOG-29408).
   const ip = freshCaller();
   const onIp = (headers: Record<string, string>) =>
     get(both.env, OPS_SUMMARY_PATH, { headers: { ...headers, "cf-connecting-ip": ip } });
@@ -538,7 +541,7 @@ test(`${OPS_SUMMARY_PATH}: accepts either credential with scrape 429 as hard fen
     await forwarded.text();
   }
   assert.equal(both.calls.length, 13);
-  const fenced = await onIp(creds);
+  const fenced = await onIp({ ...bearer, ...creds });
   assert.equal(fenced.status, 429);
   await fenced.text();
   assert.equal(both.calls.length, 13, "fenced attempts never reach the container");

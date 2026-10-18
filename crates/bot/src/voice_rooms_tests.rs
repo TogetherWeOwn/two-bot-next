@@ -7,6 +7,8 @@ use std::sync::Mutex;
 mod cold_authority;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
+#[path = "voice_empty_grace_override_tests.rs"]
+mod empty_grace_override;
 #[path = "voice_join_requests_tests.rs"]
 mod join;
 #[path = "voice_kick_tests.rs"]
@@ -15,6 +17,8 @@ mod kick;
 mod limit_command;
 #[path = "voice_name_tests.rs"]
 mod name;
+#[path = "voice_name_rerender_tests.rs"]
+mod name_rerender;
 #[path = "voice_private_runtime_tests.rs"]
 mod private;
 #[path = "voice_rooms_sink_tests.rs"]
@@ -5832,6 +5836,298 @@ async fn handle_reclaim_outside_voice_asks_to_join() {
     assert!(owned);
     let text = response_text(response.as_ref().expect("reply"));
     assert!(text.contains("need to be in a voice room"), "{text}");
+}
+
+// Exact-text pins for reclaim/transfer outcome copy. Each `ownership_refusal`
+// arm plus the reclaim/transfer confirmation lines is asserted with exact
+// equality through the real reply path. Reachable cases go through
+// `handle_capture` (the full interaction reply); succession cases use
+// `worker.apply_ownership` (the exact string the handler replies with);
+// defensive arms that consistent live state cannot produce are pinned via the
+// refusal helper directly and noted as such. A one-word swap in any pinned
+// literal must fail its test; scratch-mutant runs are recorded on the card.
+
+#[tokio::test]
+async fn ownership_copy_reclaim_outside_voice_exact() {
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction = voice_interaction_as(Some(command_data("reclaim", Vec::new())), None, 302);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "You need to be in a voice room to use /reclaim."
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_transfer_outside_voice_exact() {
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 301)])),
+        None,
+        302,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "You need to be in a voice room to use /transfer."
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_transfer_missing_member_exact() {
+    // A transfer with no member option parses to target 0, which the handler
+    // refuses before touching the worker (not the InvalidMemberId arm).
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction =
+        voice_interaction_as(Some(command_data("transfer", Vec::new())), None, MEMBER);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "Choose a member in the room to transfer to."
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_reclaim_already_owner_exact() {
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction = voice_interaction_as(Some(command_data("reclaim", Vec::new())), None, MEMBER);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "You're already the owner of this room."
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_transfer_already_with_exact() {
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data(
+            "transfer",
+            vec![user_option("member", MEMBER)],
+        )),
+        None,
+        MEMBER,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        format!("Ownership is already with <@{MEMBER}>.")
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_transfer_success_exact() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 301)])),
+        None,
+        MEMBER,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "Transferred ownership of this room to <@301>."
+    );
+    wait_trace(&trace, "update_ownership:500:301").await;
+}
+
+#[tokio::test]
+async fn ownership_copy_reclaim_creator_return_exact() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    worker.reconcile();
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, 301);
+    worker
+        .live
+        .voice_update_at(MEMBER, Some(500), Some(false), 2_000);
+    assert_eq!(
+        worker.apply_ownership(MEMBER, false, OwnershipCommand::Reclaim),
+        "You're the owner of this room again."
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_reclaim_owner_gone_exact() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    assert_eq!(
+        worker.apply_ownership(301, false, OwnershipCommand::Reclaim),
+        "The room's owner is gone, so it's yours now."
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_refusal_not_original_creator_exact() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(Some(command_data("reclaim", Vec::new())), None, 301);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "Only the original creator can reclaim this room while its owner is still here."
+    );
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn ownership_copy_refusal_not_owner_exact() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data(
+            "transfer",
+            vec![user_option("member", MEMBER)],
+        )),
+        None,
+        301,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "Only the room owner or an admin can transfer this room."
+    );
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn ownership_copy_refusal_target_not_in_room_exact() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 302)])),
+        None,
+        MEMBER,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "The transfer recipient must be in the room."
+    );
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn ownership_copy_refusal_bot_actor_exact() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    assert!(runtime.voice_frame(GUILD, 302, Some(500), Some(true), "bot".to_owned()));
+    let interaction = voice_interaction_as(Some(command_data("reclaim", Vec::new())), None, 302);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "Bots can't own temporary rooms."
+    );
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn ownership_copy_refusal_bot_target_exact() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    assert!(runtime.voice_frame(GUILD, 302, Some(500), Some(true), "bot".to_owned()));
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 302)])),
+        None,
+        MEMBER,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "Bots can't own temporary rooms."
+    );
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn ownership_copy_corrupt_target_zero_exact() {
+    // `Transfer { target_id: 0 }` reaches the worker only via the direct call
+    // (the interaction handler refuses a missing member first). The worker
+    // maps the resulting `InvalidMemberId` through the shared corrupt-data arm.
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert_eq!(
+        worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 0 }),
+        "Something's off with this room's membership data — leave and rejoin, then try again."
+    );
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.starts_with("update_ownership")));
+}
+
+#[test]
+fn ownership_copy_refusal_actor_not_in_room_exact() {
+    // `ActorNotInRoom` is defensive: the worker resolves the room from the
+    // actor's own voice state under one lock, so consistent live state always
+    // yields the "voice room" or "temporary room" replies before `decide`
+    // could report it. Pin the literal so copy drift still fails.
+    assert_eq!(
+        super::ownership_refusal(OwnershipError::ActorNotInRoom),
+        "You need to be in the room to use this command."
+    );
+}
+
+#[test]
+fn ownership_copy_refusal_corrupt_variants_exact() {
+    // All four corrupt-snapshot variants share one arm and one literal.
+    const EXPECTED: &str =
+        "Something's off with this room's membership data — leave and rejoin, then try again.";
+    assert_eq!(
+        super::ownership_refusal(OwnershipError::InvalidMemberId),
+        EXPECTED
+    );
+    assert_eq!(
+        super::ownership_refusal(OwnershipError::DuplicateMember(2)),
+        EXPECTED
+    );
+    assert_eq!(
+        super::ownership_refusal(OwnershipError::BotOwnership),
+        EXPECTED
+    );
+    assert_eq!(
+        super::ownership_refusal(OwnershipError::EmptyRoom),
+        EXPECTED
+    );
 }
 
 fn gated_runtime(
@@ -12770,6 +13066,130 @@ fn empty_grace_config_accepts_zero_to_ten_minutes_and_refuses_garbage() {
     assert_eq!(configured_empty_grace(Some("601")), Err(InvalidEmptyGrace));
     assert_eq!(configured_empty_grace(Some("-1")), Err(InvalidEmptyGrace));
     assert_eq!(configured_empty_grace(Some("1m")), Err(InvalidEmptyGrace));
+}
+
+/// Regression for the stored-grace fallback bug: a guild that spawns with a
+/// stored `0` must return to the true boot grace once the row is deleted
+/// (the documented undo path), not keep sweeping instantly. Driven through
+/// the real `ensure_actor` spawn path, so the boot-fallback restore line in
+/// `ensure_actor` is what makes this pass: with that line removed the final
+/// assert sees `Some(ZERO)` instead of `Some(EMPTY_ROOM_GRACE)`.
+#[tokio::test]
+async fn spawn_with_stored_zero_then_row_removal_restores_boot_grace() {
+    use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+
+    let trace = Trace::default();
+    let (mut writer, reader) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_string(),
+            key: EMPTY_GRACE_KEY.to_owned(),
+            value: json!(0),
+            version: 1,
+        }],
+    });
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || (Store::new(trace.clone()), Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+    .with_live_source(move || Some(reader.clone()));
+    let actor = runtime.ensure_actor(GUILD).expect("spawn the guild actor");
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(Duration::ZERO) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(Duration::ZERO),
+        "spawn with a stored 0 applies the stored override first"
+    );
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![],
+    });
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(EMPTY_ROOM_GRACE) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(EMPTY_ROOM_GRACE),
+        "deleting the stored row must restore the boot grace, never a stale zero"
+    );
+    runtime.remove_guild(GUILD);
+}
+
+/// Same fallback bug via the out-of-range path: a stored `0` at spawn
+/// followed by a `601` edit must fail closed to the boot grace. Driven
+/// through the real `ensure_actor` spawn path, like the row-removal test
+/// above: with the boot-fallback restore line removed the final assert
+/// sees `Some(ZERO)` instead of `Some(EMPTY_ROOM_GRACE)`.
+#[tokio::test]
+async fn spawn_with_stored_zero_then_out_of_range_restores_boot_grace() {
+    use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+
+    let trace = Trace::default();
+    let (mut writer, reader) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_string(),
+            key: EMPTY_GRACE_KEY.to_owned(),
+            value: json!(0),
+            version: 1,
+        }],
+    });
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || (Store::new(trace.clone()), Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+    .with_live_source(move || Some(reader.clone()));
+    let actor = runtime.ensure_actor(GUILD).expect("spawn the guild actor");
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(Duration::ZERO) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(Duration::ZERO),
+        "spawn with a stored 0 applies the stored override first"
+    );
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_string(),
+            key: EMPTY_GRACE_KEY.to_owned(),
+            value: json!(601),
+            version: 2,
+        }],
+    });
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(EMPTY_ROOM_GRACE) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(EMPTY_ROOM_GRACE),
+        "an out-of-range edit after a stored zero must fail closed to boot"
+    );
+    runtime.remove_guild(GUILD);
 }
 
 #[test]
