@@ -80,6 +80,7 @@ mod onboarding_tests;
 mod ops_backfill;
 mod ops_http;
 mod preflight;
+mod privacy_command;
 mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
