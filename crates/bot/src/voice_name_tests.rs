@@ -541,6 +541,13 @@ async fn hostile_runtime_clicks_are_unowned_and_echo_nothing() {
     let trace = Trace::default();
     let runtime = ownership_room_runtime(trace.clone()).await;
     let names = directory();
+    // `ownership_room_runtime` publishes the room through the real actor, so
+    // the trace already holds its setup writes (`create`, `persist:500`,
+    // `move:300:500`). Settle, then clear, so the empty-trace assertion below
+    // isolates the hostile phase instead of the setup.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    trace.lock().unwrap().clear();
     for id in [
         "two:voice:Name-Custom:500",
         "two:voice:name-custom:500:600",
