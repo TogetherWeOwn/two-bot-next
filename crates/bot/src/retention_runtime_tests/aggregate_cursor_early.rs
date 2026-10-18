@@ -12,7 +12,7 @@
 use super::database::{database, RUNTIME_LOCK};
 use super::*;
 use crate::retention_jobs::{
-    aggregate_expiry_cursor_for_tests, reset_aggregate_expiry_cursor_for_tests,
+    aggregate_expiry_cursor_for_tests, pool_from_url, reset_aggregate_expiry_cursor_for_tests,
 };
 
 fn guild_id(index: u64) -> String {
@@ -79,13 +79,48 @@ async fn aggregate_expiry_cursor_advances_before_deletes_on_cancelled_pass() {
 
     // Production-shaped pool: 2 connections and a 10 s acquire timeout, like
     // `pool_from_url`. The fixture's 5-connection pool would hide the pinning
-    // this test guards (two cancelled passes exhaust 2 connections).
+    // this test guards (two cancelled passes exhaust 2 connections). The
+    // trailing `statement_timeout=0` strips the fixture's 5 s server-side
+    // timeout (a later `-c` wins in sqlx 0.9), so the only bound on a blocked
+    // DELETE is the fix's own per-guild `SET LOCAL`: deleting those lines
+    // makes the first pass hang past the 30 s deadline and fail this test.
     let limited = PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(Duration::from_secs(10))
-        .connect_with(pool.connect_options().as_ref().clone())
+        .connect_with(
+            pool.connect_options()
+                .as_ref()
+                .clone()
+                .options([("statement_timeout", "0")]),
+        )
         .await
         .unwrap();
+    let limited_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+        .fetch_one(&limited)
+        .await
+        .unwrap();
+    assert_eq!(
+        limited_timeout, "0",
+        "test pool must carry no server-side timeout of its own, so only the fix bounds a blocked delete"
+    );
+    // Pin the other half of the fix: the production pool constructor must set
+    // the 15 s pool-level statement timeout. `pool_from_url` refuses CI-service
+    // hosts under the default required TLS policy, so opt this test process
+    // into local-only first (CI already sets it; this only ever touches
+    // disposable local databases, serialized by RUNTIME_LOCK).
+    std::env::set_var("TWO_DATABASE_TLS", "local-only");
+    let bootstrap_url = std::env::var("TWO_TEST_DATABASE_URL")
+        .expect("retention runtime fixture needs TWO_TEST_DATABASE_URL");
+    let prod_pool = pool_from_url(&bootstrap_url).expect("production pool builds from test URL");
+    let prod_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+        .fetch_one(&prod_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        prod_timeout, "15s",
+        "pool_from_url must set the 15 s pool-level statement timeout"
+    );
+    prod_pool.close().await;
 
     async fn pool_still_usable(pool: &sqlx::PgPool) {
         // The exact failing point from the review: `run_retention` starts with
