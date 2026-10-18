@@ -220,6 +220,10 @@ struct LedgerRow {
     receipt_id: Option<String>,
 }
 
+/// Tuple shape of the ledger read in [`ledger_row_for_requester`], factored out
+/// so the query binding does not inline a very complex type.
+type LedgerRowTuple = (String, String, String, i64, Option<i64>, Option<String>);
+
 /// Load the ledger row for `request_id` and bind it to the authenticated
 /// caller. Every mismatch — unknown id, cross-member read, cross-guild read —
 /// fails with the same error and never leaks another member's data.
@@ -232,7 +236,7 @@ async fn ledger_row_for_requester(
     validate_identity(guild_id)?;
     validate_identity(requester_id)?;
     validate_token_free_id(request_id, "invalid deletion request id")?;
-    let row: Option<(String, String, String, i64, Option<i64>, Option<String>)> = sqlx::query_as(
+    let row: Option<LedgerRowTuple> = sqlx::query_as(
         "SELECT guild_id, user_id, status, \
             (EXTRACT(EPOCH FROM requested_at))::BIGINT, \
             (EXTRACT(EPOCH FROM completed_at))::BIGINT, receipt_id \
