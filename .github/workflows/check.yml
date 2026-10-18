@@ -1856,7 +1856,7 @@ jobs:
           --health-cmd "pg_isready -U agent_test -d postgres"
           --health-interval 10s --health-timeout 5s --health-retries 5
     env:
-      TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/postgres
+      TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1895,6 +1895,19 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo
           save-if: ${{ github.event_name == 'push' }}
+      # The presence fixtures now route through the shared disposable-database
+      # guard, which accepts only the explicit-empty-password bootstrap URL
+      # naming a two_bot_test_* database. Create that bootstrap here; the
+      # legacy bespoke helpers in the sibling stores accept the same URL
+      # (they check host and principal only), so one URL serves all four
+      # suites below. The rust:bookworm job container ships no PostgreSQL
+      # client, so install it first like the other DB jobs do.
+      - name: Prepare isolated test database
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
+          rm -rf /var/lib/apt/lists/*
+          createdb -h agent-testdb -U agent_test two_bot_test_ci
       - name: Check feature-gated community stores
         run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - name: Test presence, scorecard and inactivity ledgers on ephemeral Postgres
@@ -2087,9 +2100,10 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Builds all nineteen libFuzzer targets. No campaign or generated corpus
-      # output; the existing weekly run replays only the bounded eventsub_delivery
-      # seeds below. Bounded vote_kick and helix_token smokes are manual (README).
+      # Builds all twenty-two libFuzzer targets. No campaign or generated corpus
+      # output; the existing weekly run replays the bounded eventsub_delivery
+      # and helix_token seeds below. Bounded vote_kick and helix_token smokes
+      # are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -2103,7 +2117,7 @@ jobs:
       # the harness and production, a token-contract drift between the
       # helix_token oracle and the parser, or seed misrouting panics an
       # assertion here instead of passing a compile-only gate. Compile stays
-      # the only gate for the other seventeen targets.
+      # the only gate for the other twenty targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048

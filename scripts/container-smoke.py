@@ -28,6 +28,21 @@ IMAGE_MAX_BYTES = 112 * MIB
 # KiB over the old 15 MiB budget with no new dependencies. The settings
 # hot-reload head measured 15,730,600 bytes (15.00 MiB), also below this
 # limit. This branch's automation-only head measured 15,769,872 bytes
+# (15.04 MiB) before the event-executor merge; the combined-head
+# measurement comes from hosted CI on the merged head. 16 MiB restores a
+# working tripwire with headroom; revisit if the binary approaches it.
+# 2026-10-17 recalibration: main tip 89503f71 measured 16,776,096 bytes
+# (16.00 MiB) in hosted CI, leaving 1,120 bytes of headroom — the tripwire
+# is exhausted even before new code lands. The stream delivered-dedup
+# expiry slice (PR #1079, `ac8fd66`) added 1,280 bytes with no new
+# dependencies (two store methods plus retention wiring) and measured
+# 16,777,376 bytes — 160 bytes over the ceiling on hosted CI, failing the
+# check workflow on main twice (including a re-run of the failed jobs). The
+# voice rename-decision logs (PR #1064) add 3,160 bytes (merged head
+# 6a9c394e: 16,779,256 bytes, 2,040 over 16 MiB) with no new dependencies;
+# the release profile is already minimal (opt-level=z, lto, strip). 17 MiB
+# restores ~1.00 MiB of headroom while keeping a working tripwire; revisit
+# if the binary approaches it.
 # measurement comes from hosted CI on the merged head. 16 MiB trips on main
 # itself (main-red) with no new dependencies and the same minimal release
 # profile (opt-level=z, lto, strip). Main at d7774644 measured 16,768,848 bytes
