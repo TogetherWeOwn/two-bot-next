@@ -271,6 +271,7 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_eventsub_reconcile_passes_total",
     "two_bot_eventsub_reconcile_actions_total",
     "two_bot_eventsub_reconcile_errors_total",
+    "two_bot_retention_replay_needed_total",
 ];
 
 fn check_docs_against_exposition(doc: &str, exposition: &str) -> Result<(), String> {

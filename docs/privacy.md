@@ -221,9 +221,12 @@ dispatch and replays it) until the ACL plan is applied, because the queue
 may hold a pending purge for that guild. A missing queue table (`42P01`) on
 a rejoin is still skipped — an absent table holds nothing to cancel — and
 a skipped true guild removal is logged at error level with the guild id
-(`retention purge skipped; schema gap, operator replay required`) and must be
-replayed by the Operator once the migration lands, running the same insert
-the live path runs: `INSERT INTO retention_guild_purge_queue (guild_id)
+(`retention purge skipped; schema gap, operator replay required`), increments
+the pollable `retention_replay_needed` counter on `/metrics`
+(`two_bot_retention_replay_needed_total`), and must be replayed by the
+Operator once the migration lands — poll the counter first instead of
+log-grep, then run the same insert the live path runs:
+`INSERT INTO retention_guild_purge_queue (guild_id)
 VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;`
 Conditional: replay only if no `GUILD_CREATE` for that guild was acked after
 the `operator replay required` line — a later `retention lifecycle skipped;
