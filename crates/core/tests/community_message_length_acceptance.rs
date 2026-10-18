@@ -367,12 +367,14 @@ fn on_message_handler_forwards_content_length_to_the_fact_sink() {
         capture_only: false,
         occurred_at: Some("2026-09-01T10:00:00.000Z".to_owned()),
         content_length: Some(11),
+        has_embed_or_attachment: false,
     };
     handlers.on_message(base.clone());
     handlers.on_message(MessageInput {
         message_id: Some("msg-gateway-2".to_owned()),
         occurred_at: Some("2026-09-01T10:01:00.000Z".to_owned()),
         content_length: None,
+        has_embed_or_attachment: false,
         ..base
     });
     let captured = sink.messages.lock().expect("capture lock");
