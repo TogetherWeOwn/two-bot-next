@@ -12,15 +12,20 @@
 //! Enabled only by the crate `db` feature so unit tests for pure domain logic
 //! never need a Postgres driver or a live database.
 //!
-//! Transaction shape (legacy `award`): one transaction holding the
+//! Transaction shape (policy awards): one transaction holding eligibility
+//! serialization (`SELECT … FOR UPDATE` on the member row when present),
+//! the policy reads (cooldown clock, daily counters, burst window), the
 //! atomic cooldown claim (`INSERT … ON CONFLICT DO UPDATE … WHERE
 //! last_awarded_at <= cutoff RETURNING`), then the XP upsert guarded by the
 //! ceiling (`… WHERE member_levels.xp <= MAX - amount RETURNING xp`), then the
-//! `xp_awards` audit row. A lost cooldown race or a zero amount returns the
-//! current award with nothing written; a ceiling rejection rolls the whole
-//! transaction back — including the cooldown claim — so a rejected award
-//! never consumes cooldown (legacy golden test). Amounts above the ceiling
-//! are rejected the same way instead of underflowing the guard.
+//! `xp_awards` audit row, then the seasonal projection with the same ceiling
+//! guard. A lost cooldown race or a zero amount returns the current award
+//! with nothing written; a lifetime or seasonal ceiling rejection rolls the
+//! whole transaction back — including the cooldown claim — so a rejected
+//! award never consumes cooldown (legacy golden test) and never leaves a
+//! partial lifetime-without-seasonal commit. Amounts above the ceiling are
+//! rejected the same way instead of underflowing the guard. The raw `award`
+//! helper keeps the legacy lifetime-only shape for direct callers.
 //!
 //! Everything takes `&PgPool` (`Copy`, reusable across the sequential
 //! queries inside one call): reads are single-connection statements and the
@@ -179,13 +184,48 @@ fn utc_day_bounds(at_ms: i64) -> (i64, i64) {
     (start, start + 86_400_000)
 }
 
+/// Serialize award eligibility for one guild/member: hold the lifetime row
+/// (when it exists) before reading any policy input, so two concurrent
+/// awards cannot both pass eligibility on the same stale counters. Missing
+/// rows carry no lock; first awards serialize on the atomic cooldown claim
+/// inside the same transaction.
+async fn lock_member_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    guild_id: &str,
+    member_id: &str,
+) -> Result<(), LevelingStoreError> {
+    let _: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM member_levels WHERE guild_id = $1 AND member_id = $2 FOR UPDATE",
+    )
+    .bind(guild_id)
+    .bind(member_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Lifetime total inside the award transaction (0 when the row is absent).
+async fn total_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    guild_id: &str,
+    member_id: &str,
+) -> Result<u64, LevelingStoreError> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT xp FROM member_levels WHERE guild_id = $1 AND member_id = $2")
+            .bind(guild_id)
+            .bind(member_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(row.map(|(xp,)| xp as u64).unwrap_or(0))
+}
+
 /// Seconds since the last award from one source, if any (AC2 policy input).
 /// Future-dated rows (clock skew) read as 0, i.e. cooldown-blocked. Reads
 /// epoch millis out of Postgres (`EXTRACT EPOCH`, floored) rather than
 /// parsing `timestamptz::text`, whose `"YYYY-MM-DD HH:MM:SS+ZZ"` rendering is
 /// not the ISO form [`parse_iso_millis`] accepts.
 async fn seconds_since_last_award(
-    pool: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     guild_id: &str,
     member_id: &str,
     source: XpSource,
@@ -198,7 +238,7 @@ async fn seconds_since_last_award(
     .bind(guild_id)
     .bind(member_id)
     .bind(source.as_str())
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await?;
     Ok(row.map(|(last_ms,)| (at_ms - last_ms).max(0) as u64 / 1000))
 }
@@ -209,7 +249,7 @@ async fn seconds_since_last_award(
 /// table can drift from it. Zero-XP audit rows inflate the count but never
 /// the total, and the ladder is already 0 past ten awards either way.
 async fn day_counters(
-    pool: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     guild_id: &str,
     member_id: &str,
     source: XpSource,
@@ -227,7 +267,7 @@ async fn day_counters(
     .bind(source.as_str())
     .bind(day_start_iso)
     .bind(day_end_iso)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await?;
     Ok((count as u64, total.unwrap_or(0) as u64))
 }
@@ -236,7 +276,7 @@ async fn day_counters(
 /// burst input). `None` channels match only `NULL` rows
 /// (`IS NOT DISTINCT FROM`).
 async fn same_channel_recent(
-    pool: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     guild_id: &str,
     member_id: &str,
     channel_id: Option<&str>,
@@ -252,26 +292,27 @@ async fn same_channel_recent(
     .bind(member_id)
     .bind(channel_id)
     .bind(window_start_iso)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await?;
     Ok(count as u64)
 }
 
 /// Mirror a granted award into the seasonal projection (AC3): append-only
-/// upsert paralleling the lifetime write, same ceiling guard shape. Runs
-/// after the lifetime award commits; a crash between the two leaves lifetime
-/// ahead, which no later award repairs — accepted for this slice (a backfill
-/// owns historical gaps). New activity restarts the decay grace window, so
-/// the upsert resets the `decayed_weeks` watermark to 0.
+/// upsert paralleling the lifetime write, same ceiling guard shape, in the
+/// same transaction as eligibility and the lifetime award. Returns the
+/// affected row count: 0 means the seasonal ceiling rejected the update, so
+/// the caller rolls the whole award back instead of leaving a partial
+/// commit. New activity restarts the decay grace window, so the upsert
+/// resets the `decayed_weeks` watermark to 0.
 async fn upsert_seasonal(
-    pool: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     guild_id: &str,
     season_id: &str,
     member_id: &str,
     amount: u64,
     at_norm: &str,
-) -> Result<(), LevelingStoreError> {
-    sqlx::query(
+) -> Result<u64, LevelingStoreError> {
+    let affected = sqlx::query(
         "INSERT INTO member_season_xp (guild_id, season_id, member_id, seasonal_xp, updated_at)
          VALUES ($1, $2, $3, $4, $5::text::timestamptz)
          ON CONFLICT (guild_id, season_id, member_id) DO UPDATE SET
@@ -286,24 +327,26 @@ async fn upsert_seasonal(
     .bind(amount as i64)
     .bind(at_norm)
     .bind((MAX_STORED_XP - amount) as i64)
-    .execute(pool)
-    .await?;
-    Ok(())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(affected)
 }
 
 /// Leave the decision-marked 0-XP audit row for a policy-capped attempt
 /// (AC2): capped attempts are observable — unlike cooldown rejections, which
 /// write nothing — without granting XP or consuming extra state (no
-/// cooldown, level or projection write).
+/// cooldown, level or projection write). Runs in the caller's serialized
+/// award transaction; the caller commits.
 async fn record_capped_attempt(
-    pool: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     guild_id: &str,
     member_id: &str,
     source: XpSource,
     at_norm: &str,
     channel_id: Option<&str>,
     decision: &str,
-) -> Result<XpAward, LevelingStoreError> {
+) -> Result<(), LevelingStoreError> {
     sqlx::query(
         "INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at, channel_id, decision)
          VALUES ($1, $2, $3, 0, $4::text::timestamptz, $5, $6)",
@@ -314,9 +357,9 @@ async fn record_capped_attempt(
     .bind(at_norm)
     .bind(channel_id)
     .bind(decision)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
-    current_award(pool, guild_id, member_id).await
+    Ok(())
 }
 
 /// Award message XP (legacy `awardMessage` base [`MESSAGE_XP`]) through the
@@ -340,12 +383,17 @@ pub async fn award_message(
 ) -> Result<XpAward, LevelingStoreError> {
     let at_ms = validate_at(at_iso)?;
     let at_norm = format_iso_millis(at_ms);
-    let current = current_award(pool, guild_id, member_id).await?;
+    // One transaction holds eligibility serialization, the lifetime award
+    // (cooldown claim, XP upsert, audit) and the seasonal projection: a
+    // seasonal failure or ceiling rejection rolls everything back.
+    let mut tx = pool.begin().await?;
+    lock_member_row(&mut tx, guild_id, member_id).await?;
+    let previous_xp = total_in_tx(&mut tx, guild_id, member_id).await?;
     let since =
-        seconds_since_last_award(pool, guild_id, member_id, XpSource::Message, at_ms).await?;
+        seconds_since_last_award(&mut tx, guild_id, member_id, XpSource::Message, at_ms).await?;
     let (day_start, day_end) = utc_day_bounds(at_ms);
     let (day_count, day_total) = day_counters(
-        pool,
+        &mut tx,
         guild_id,
         member_id,
         XpSource::Message,
@@ -354,7 +402,7 @@ pub async fn award_message(
     )
     .await?;
     let channel_recent = same_channel_recent(
-        pool,
+        &mut tx,
         guild_id,
         member_id,
         channel_id,
@@ -362,38 +410,101 @@ pub async fn award_message(
     )
     .await?;
     let policy = adjudicate_message_award(MessageAwardInput {
-        previous_xp: current.total_xp,
+        previous_xp,
         daily_award_index: day_count as usize,
         day_total_xp: day_total,
         seconds_since_last_award: since,
         content_len: MESSAGE_SHORT_MIN_LEN,
         has_embed_or_attachment: false,
         same_channel_awards_in_10min: channel_recent as usize,
-        headroom: MAX_STORED_XP - current.total_xp,
+        headroom: MAX_STORED_XP - previous_xp,
     });
     if policy.awarded > 0 {
-        let out = award(
-            pool,
-            guild_id,
-            member_id,
-            XpSource::Message,
-            policy.awarded,
-            at_iso,
-            channel_id,
+        let amount = policy.awarded;
+        let cutoff_iso = format_iso_millis(at_ms - AWARD_COOLDOWN_SECONDS as i64 * 1000);
+        let claimed: Option<(String,)> = sqlx::query_as(
+            "INSERT INTO xp_cooldowns (guild_id, member_id, source, last_awarded_at)
+             VALUES ($1, $2, $3, $4::text::timestamptz)
+             ON CONFLICT (guild_id, member_id, source) DO UPDATE
+               SET last_awarded_at = excluded.last_awarded_at
+             WHERE xp_cooldowns.last_awarded_at <= $5::text::timestamptz
+             RETURNING last_awarded_at::text",
         )
+        .bind(guild_id)
+        .bind(member_id)
+        .bind(XpSource::Message.as_str())
+        .bind(&at_norm)
+        .bind(cutoff_iso)
+        .fetch_optional(&mut *tx)
         .await?;
-        if out.awarded > 0 {
-            upsert_seasonal(
-                pool,
-                guild_id,
-                &season_id_for_ms(at_ms),
-                member_id,
-                out.awarded,
-                &at_norm,
-            )
-            .await?;
+        if claimed.is_none() {
+            tx.rollback().await?;
+            return current_award(pool, guild_id, member_id).await;
         }
-        return Ok(out);
+        let message_xp = amount;
+        let row: Option<(i64,)> = sqlx::query_as(
+            "INSERT INTO member_levels
+               (guild_id, member_id, xp, message_xp, voice_xp, imported_xp, updated_at)
+             VALUES ($1, $2, $3, $4, $5, 0, $6::text::timestamptz)
+             ON CONFLICT (guild_id, member_id) DO UPDATE SET
+               xp = member_levels.xp + excluded.xp,
+               message_xp = member_levels.message_xp + excluded.message_xp,
+               voice_xp = member_levels.voice_xp + excluded.voice_xp,
+               updated_at = excluded.updated_at
+             WHERE member_levels.xp <= $7
+             RETURNING xp",
+        )
+        .bind(guild_id)
+        .bind(member_id)
+        .bind(amount as i64)
+        .bind(message_xp as i64)
+        .bind(0_i64)
+        .bind(&at_norm)
+        .bind((MAX_STORED_XP - amount) as i64)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((total,)) = row else {
+            tx.rollback().await?;
+            return current_award(pool, guild_id, member_id).await;
+        };
+        sqlx::query(
+            "INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at, channel_id)
+             VALUES ($1, $2, $3, $4, $5::text::timestamptz, $6)",
+        )
+        .bind(guild_id)
+        .bind(member_id)
+        .bind(XpSource::Message.as_str())
+        .bind(amount as i64)
+        .bind(&at_norm)
+        .bind(channel_id)
+        .execute(&mut *tx)
+        .await?;
+        let season_id = season_id_for_ms(at_ms);
+        match upsert_seasonal(&mut tx, guild_id, &season_id, member_id, amount, &at_norm).await {
+            Ok(affected) => {
+                if affected == 0 {
+                    // Seasonal ceiling rejection: defined non-partial outcome,
+                    // never silent success with diverged projection.
+                    tx.rollback().await?;
+                    return current_award(pool, guild_id, member_id).await;
+                }
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+        }
+        tx.commit().await?;
+        let total_xp = total as u64;
+        let previous_level = level_for_xp(total_xp - amount);
+        let level = level_for_xp(total_xp);
+        return Ok(XpAward {
+            awarded: amount,
+            total_xp,
+            level,
+            previous_level,
+            leveled_up: level > previous_level,
+        });
     }
     // Policy zero: cooldown and ceiling rejections stay silent like legacy
     // (no row, no state); cap and ladder exhaustion leave the
@@ -411,8 +522,9 @@ pub async fn award_message(
     } else {
         ladder
     };
-    let ceiling = burst > 0 && burst > MAX_STORED_XP - current.total_xp;
+    let ceiling = burst > 0 && burst > MAX_STORED_XP - previous_xp;
     if cooldown_blocked || ceiling {
+        tx.rollback().await?;
         return current_award(pool, guild_id, member_id).await;
     }
     // The only other reachable zeros are the day cap and ladder exhaustion
@@ -424,7 +536,7 @@ pub async fn award_message(
         "daily_ladder_exhausted"
     };
     record_capped_attempt(
-        pool,
+        &mut tx,
         guild_id,
         member_id,
         XpSource::Message,
@@ -432,7 +544,9 @@ pub async fn award_message(
         channel_id,
         decision,
     )
-    .await
+    .await?;
+    tx.commit().await?;
+    current_award(pool, guild_id, member_id).await
 }
 
 /// Award voice XP for a session duration (legacy `awardVoice`: whole minutes
@@ -451,26 +565,24 @@ pub async fn award_voice(
     let base = voice_xp_for_duration(duration_seconds);
     if base == 0 {
         // Sub-minute sessions award nothing and touch no state (legacy).
-        return award(
-            pool,
-            guild_id,
-            member_id,
-            XpSource::Voice,
-            0,
-            at_iso,
-            channel_id,
-        )
-        .await;
+        validate_at(at_iso)?;
+        return current_award(pool, guild_id, member_id).await;
     }
     let at_ms = validate_at(at_iso)?;
     let at_norm = format_iso_millis(at_ms);
-    let since = seconds_since_last_award(pool, guild_id, member_id, XpSource::Voice, at_ms).await?;
+    // Same atomic shape as messages: eligibility, lifetime award and
+    // seasonal projection commit as one unit.
+    let mut tx = pool.begin().await?;
+    lock_member_row(&mut tx, guild_id, member_id).await?;
+    let since =
+        seconds_since_last_award(&mut tx, guild_id, member_id, XpSource::Voice, at_ms).await?;
     if since.is_some_and(|s| s < AWARD_COOLDOWN_SECONDS) {
+        tx.rollback().await?;
         return current_award(pool, guild_id, member_id).await;
     }
     let (day_start, day_end) = utc_day_bounds(at_ms);
     let (_, day_total) = day_counters(
-        pool,
+        &mut tx,
         guild_id,
         member_id,
         XpSource::Voice,
@@ -480,8 +592,8 @@ pub async fn award_voice(
     .await?;
     let remaining = VOICE_DAILY_CAP_XP.saturating_sub(day_total);
     if remaining == 0 {
-        return record_capped_attempt(
-            pool,
+        record_capped_attempt(
+            &mut tx,
             guild_id,
             member_id,
             XpSource::Voice,
@@ -489,36 +601,98 @@ pub async fn award_voice(
             channel_id,
             "daily_cap",
         )
-        .await;
-    }
-    let amount = base.min(remaining);
-    let current = current_award(pool, guild_id, member_id).await?;
-    if amount > MAX_STORED_XP - current.total_xp {
-        // Ceiling rejection stays silent like legacy (no row, no state).
+        .await?;
+        tx.commit().await?;
         return current_award(pool, guild_id, member_id).await;
     }
-    let out = award(
-        pool,
-        guild_id,
-        member_id,
-        XpSource::Voice,
-        amount,
-        at_iso,
-        channel_id,
-    )
-    .await?;
-    if out.awarded > 0 {
-        upsert_seasonal(
-            pool,
-            guild_id,
-            &season_id_for_ms(at_ms),
-            member_id,
-            out.awarded,
-            &at_norm,
-        )
-        .await?;
+    let amount = base.min(remaining);
+    let previous_xp = total_in_tx(&mut tx, guild_id, member_id).await?;
+    if amount > MAX_STORED_XP - previous_xp {
+        // Ceiling rejection stays silent like legacy (no row, no state).
+        tx.rollback().await?;
+        return current_award(pool, guild_id, member_id).await;
     }
-    Ok(out)
+    let cutoff_iso = format_iso_millis(at_ms - AWARD_COOLDOWN_SECONDS as i64 * 1000);
+    let claimed: Option<(String,)> = sqlx::query_as(
+        "INSERT INTO xp_cooldowns (guild_id, member_id, source, last_awarded_at)
+         VALUES ($1, $2, $3, $4::text::timestamptz)
+         ON CONFLICT (guild_id, member_id, source) DO UPDATE
+           SET last_awarded_at = excluded.last_awarded_at
+         WHERE xp_cooldowns.last_awarded_at <= $5::text::timestamptz
+         RETURNING last_awarded_at::text",
+    )
+    .bind(guild_id)
+    .bind(member_id)
+    .bind(XpSource::Voice.as_str())
+    .bind(&at_norm)
+    .bind(cutoff_iso)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if claimed.is_none() {
+        tx.rollback().await?;
+        return current_award(pool, guild_id, member_id).await;
+    }
+    let row: Option<(i64,)> = sqlx::query_as(
+        "INSERT INTO member_levels
+           (guild_id, member_id, xp, message_xp, voice_xp, imported_xp, updated_at)
+         VALUES ($1, $2, $3, $4, $5, 0, $6::text::timestamptz)
+         ON CONFLICT (guild_id, member_id) DO UPDATE SET
+           xp = member_levels.xp + excluded.xp,
+           message_xp = member_levels.message_xp + excluded.message_xp,
+           voice_xp = member_levels.voice_xp + excluded.voice_xp,
+           updated_at = excluded.updated_at
+         WHERE member_levels.xp <= $7
+         RETURNING xp",
+    )
+    .bind(guild_id)
+    .bind(member_id)
+    .bind(amount as i64)
+    .bind(0_i64)
+    .bind(amount as i64)
+    .bind(&at_norm)
+    .bind((MAX_STORED_XP - amount) as i64)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((total,)) = row else {
+        tx.rollback().await?;
+        return current_award(pool, guild_id, member_id).await;
+    };
+    sqlx::query(
+        "INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at, channel_id)
+         VALUES ($1, $2, $3, $4, $5::text::timestamptz, $6)",
+    )
+    .bind(guild_id)
+    .bind(member_id)
+    .bind(XpSource::Voice.as_str())
+    .bind(amount as i64)
+    .bind(&at_norm)
+    .bind(channel_id)
+    .execute(&mut *tx)
+    .await?;
+    let season_id = season_id_for_ms(at_ms);
+    match upsert_seasonal(&mut tx, guild_id, &season_id, member_id, amount, &at_norm).await {
+        Ok(affected) => {
+            if affected == 0 {
+                tx.rollback().await?;
+                return current_award(pool, guild_id, member_id).await;
+            }
+        }
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    }
+    tx.commit().await?;
+    let total_xp = total as u64;
+    let previous_level = level_for_xp(total_xp - amount);
+    let level = level_for_xp(total_xp);
+    Ok(XpAward {
+        awarded: amount,
+        total_xp,
+        level,
+        previous_level,
+        leveled_up: level > previous_level,
+    })
 }
 
 /// Monday seasonal-decay tick (AC2): decay every seasonal row in
