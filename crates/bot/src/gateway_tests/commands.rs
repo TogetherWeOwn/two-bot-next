@@ -196,6 +196,27 @@ async fn wait_requests(rest: &MockRest, count: usize) {
     .expect("REST request deadline");
 }
 
+/// Completion edits ride a detached lane behind the defer callback, so a total
+/// request count can be satisfied by later traffic while an edit is still in
+/// flight. Poll for the edits themselves instead of inferring them.
+async fn wait_patch_count(rest: &MockRest, count: usize) {
+    tokio::time::timeout(BOUND, async {
+        loop {
+            let patches = rest
+                .requests()
+                .iter()
+                .filter(|request| request.method == "PATCH")
+                .count();
+            if patches >= count {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("REST patch deadline");
+}
+
 /// Detached command work commits its audit rows after the checkpoint the test
 /// already waited on, so poll for them instead of asserting immediately.
 async fn wait_audit_ok(pool: &PgPool, expected: i64) {
@@ -529,7 +550,11 @@ async fn shared_runtime_preserves_custom_sticky_and_feed_registry_and_single_rep
         wait_sequence(&db.store, sequence).await;
         // Command replies ride a detached lane after the checkpoint: wait for
         // both the defer callback and the completion edit before asserting.
+        // The total count alone is not enough: a later command's traffic can
+        // satisfy it while this command's completion edit is still in flight,
+        // so wait for the edits themselves too.
         wait_requests(&rest, 3 + (index + 1) * 2).await;
+        wait_patch_count(&rest, index + 1).await;
         let requests = rest.requests();
         let callback = format!("/interactions/{id}/custom-command-fixture/callback");
         assert_eq!(
