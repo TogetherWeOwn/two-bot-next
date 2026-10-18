@@ -999,15 +999,37 @@ export class TwoBotContainer extends Container<Env> {
       body.bytes,
       AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     );
+    // The existing receiver deadline on `forward` bounds the fetch AND the
+    // body relay below: no larger or independent budget is created. A fetch
+    // that ignores abort, a stalled tail, or a never-settling cancel settles
+    // here at that deadline; late bodies are released best-effort and never
+    // relayed. A timeout refuses only this wrapper call: it never retries the
+    // signed action and never proves the receiver stood down.
+    const signal = forward.signal;
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
         if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
+        let upstream: Response;
         try {
-          return await relayReceiverResponse(await this.containerFetch(forward, RECEIVER_PORT), requestId);
+          upstream = await deadlineFetch(this.containerFetch(forward, RECEIVER_PORT), signal);
         } catch {
           return envelope(503, "unavailable", true, {}, requestId);
         }
+        if (signal.aborted) {
+          releaseBody(upstream);
+          return envelope(503, "unavailable", true, {}, requestId);
+        }
+        let relayed: Response;
+        try {
+          relayed = await relayReceiverResponse(upstream, requestId, signal);
+        } catch {
+          return envelope(503, "unavailable", true, {}, requestId);
+        }
+        // The relayed body is fully buffered bytes; past the deadline it is
+        // simply not served, so there is nothing to release.
+        if (signal.aborted) return envelope(503, "unavailable", true, {}, requestId);
+        return relayed;
       });
     } catch (error) {
       // Logs the closed ownership reason; the caller only sees the envelope.
@@ -1040,15 +1062,35 @@ export class TwoBotContainer extends Container<Env> {
       body.bytes,
       AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     );
+    // Same bound as the actions path above: the existing receiver deadline on
+    // `forward` covers the fetch AND the body relay, with no larger or
+    // independent budget. Late bodies are released best-effort and never
+    // relayed; a timeout never retries the delivery.
+    const signal = forward.signal;
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
         if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
+        let upstream: Response;
         try {
-          return await relayEventsubResponse(await this.containerFetch(forward, EVENTSUB_RECEIVER_PORT), requestId);
+          upstream = await deadlineFetch(this.containerFetch(forward, EVENTSUB_RECEIVER_PORT), signal);
         } catch {
           return envelope(503, "unavailable", true, {}, requestId);
         }
+        if (signal.aborted) {
+          releaseBody(upstream);
+          return envelope(503, "unavailable", true, {}, requestId);
+        }
+        let relayed: Response;
+        try {
+          relayed = await relayEventsubResponse(upstream, requestId, signal);
+        } catch {
+          return envelope(503, "unavailable", true, {}, requestId);
+        }
+        // The relayed body is fully buffered bytes; past the deadline it is
+        // simply not served, so there is nothing to release.
+        if (signal.aborted) return envelope(503, "unavailable", true, {}, requestId);
+        return relayed;
       });
     } catch (error) {
       // Logs the closed ownership reason; the caller only sees the envelope.
