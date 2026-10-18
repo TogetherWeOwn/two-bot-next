@@ -31,10 +31,10 @@
 //! TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local \
 //! python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db \
 //!   --test leveling_seasonal_leaderboard_boundary_acceptance -- --ignored --test-threads=1
-#[allow(dead_code)]
-mod common;
+#[path = "support/rest_capture.rs"]
+mod rest_capture;
 
-use common::{MockRest, ScriptedResponse};
+use rest_capture::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::sync::Arc;
