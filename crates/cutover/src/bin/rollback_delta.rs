@@ -19,7 +19,10 @@ before mutating, then replays the rows inside one transaction;
 re-running an identical import changes nothing. `--apply` requires
 `--allow-live-target` before any connection attempt. Malformed lines,
 unknown tables and per-table row-cap overruns refuse with exit 2 before
-any write. No migrations are applied.";
+any write. Rows replay parent-first; the apply reports inserted vs
+already-present rows (pre-existing rows keep their values, so divergent
+updates need manual reconciliation) and advances owned sequences past the
+imported maxima. No migrations are applied.";
 
 #[tokio::main]
 async fn main() {
@@ -169,8 +172,13 @@ async fn run_import(args: Args) -> i32 {
         }
     };
     let outcome = match apply_import(db.pool(), &rows).await {
-        Ok(imported) => {
-            eprintln!("rollback-delta import: applied {imported} rows");
+        Ok(outcome) => {
+            eprintln!(
+                "rollback-delta import: applied {} of {} rows ({} already present)",
+                outcome.inserted,
+                outcome.total(),
+                outcome.skipped
+            );
             0
         }
         Err(_) => {

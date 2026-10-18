@@ -17,15 +17,24 @@
 //!
 //! Rows are written with `jsonb_populate_record`, which maps the exported
 //! `to_jsonb` object back onto the table's columns by name (unknown keys are
-//! ignored, missing keys become NULL). Inserts use bare `ON CONFLICT DO
-//! NOTHING`, so re-running an identical import is idempotent: conflicting
-//! rows keep their existing values. Divergent-value conflicts and serial-PK
-//! sequence advancement are deliberately out of scope.
+//! ignored, missing keys become NULL). Rows replay in backup
+//! [`two_bot_core::backup::DUMP_TABLES`] restore order (parents before
+//! children), stably, so a file listing a child before its parent still
+//! applies. Inserts use bare `ON CONFLICT DO NOTHING`, so re-running an
+//! identical import is idempotent: conflicting rows keep their existing
+//! values and are reported as skipped, never silently applied. Owned serial
+//! sequences for imported tables advance past the imported maxima in the same
+//! transaction. Divergent-value conflicts (a pre-existing row with different
+//! values) keep the target values; the operator reconciles them by hand.
+//! `lfg_roles` has no timestamp column so a post-freeze role row is never
+//! exported: signups for a post-freeze post refuse on the missing parent (the
+//! transaction rolls back) instead of half-importing.
 
 use std::collections::BTreeMap;
 
 use sqlx::PgPool;
 use thiserror::Error;
+use two_bot_core::backup::DUMP_TABLES;
 
 use crate::rollback_delta::{TableMeasure, MAX_EXPORT_ROWS_PER_TABLE, TABLE_SPECS};
 
@@ -160,25 +169,131 @@ pub fn import_plan(mode: &str, rows: &[ImportRow]) -> serde_json::Value {
     })
 }
 
+/// Outcome of [`apply_import`]: rows actually inserted vs rows skipped as
+/// already present (`ON CONFLICT DO NOTHING`). `inserted + skipped` is always
+/// the number of import rows processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplyOutcome {
+    pub inserted: u64,
+    pub skipped: u64,
+}
+
+impl ApplyOutcome {
+    /// Total rows processed.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.inserted + self.skipped
+    }
+}
+
+/// Restore rank of an exportable table: its position in the backup
+/// [`DUMP_TABLES`] order (parents before children). Tables outside the
+/// allowlist sort last.
+#[must_use]
+pub fn import_table_order(table: &str) -> usize {
+    DUMP_TABLES
+        .iter()
+        .position(|t| *t == table)
+        .unwrap_or(usize::MAX)
+}
+
+/// Rows in FK-safe apply order: a stable sort by [`import_table_order`], so
+/// file order is preserved among rows for the same table.
+#[must_use]
+pub fn ordered_rows(rows: &[ImportRow]) -> Vec<&ImportRow> {
+    let mut ordered: Vec<&ImportRow> = rows.iter().collect();
+    ordered.sort_by_key(|row| import_table_order(&row.table));
+    ordered
+}
+
+/// Advance every sequence owned by one of `tables` past its column maximum,
+/// without ever moving a sequence backwards. Discovered via `pg_depend`, so
+/// tables with no owned sequence (natural keys) and tables absent from a
+/// partially migrated target are no-ops.
+async fn advance_owned_sequences(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tables: &[&str],
+) -> Result<(), ImportApplyError> {
+    for table in tables {
+        let owned: Vec<(String, String)> = sqlx::query_as(
+            "SELECT s.relname::text, a.attname::text \
+             FROM pg_depend d \
+             JOIN pg_class s ON s.oid = d.objid \
+             JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid \
+             WHERE d.refobjid = to_regclass($1) AND d.deptype = 'a' AND s.relkind = 'S'",
+        )
+        .bind(*table)
+        .fetch_all(&mut **tx)
+        .await?;
+        for (sequence, column) in &owned {
+            let table_q = quote(table)?;
+            let seq_q = quote(sequence)?;
+            let col_q = quote(column)?;
+            // `setval` with `is_called = false` makes the next `nextval`
+            // return exactly the set value (1 on an empty table, not 2).
+            let sql = format!(
+                "SELECT setval('{seq_q}'::regclass, GREATEST(COALESCE((SELECT MAX({col_q}) FROM {table_q}), 0) + 1, (SELECT last_value + CASE WHEN is_called THEN 1 ELSE 0 END FROM {seq_q})), false)"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Replay validated rows into the target inside one transaction. Each row is
 /// mapped back onto its table's columns with `jsonb_populate_record` and
 /// inserted with bare `ON CONFLICT DO NOTHING`, so an identical re-run
-/// changes nothing. Returns the number of import rows processed.
-pub async fn apply_import(pool: &PgPool, rows: &[ImportRow]) -> Result<u64, ImportApplyError> {
+/// changes nothing. Rows apply in [`DUMP_TABLES`] parent-first order.
+/// Returns the inserted vs skipped counts: skipped rows already existed and
+/// keep their target values.
+pub async fn apply_import(
+    pool: &PgPool,
+    rows: &[ImportRow],
+) -> Result<ApplyOutcome, ImportApplyError> {
+    let ordered = ordered_rows(rows);
     let mut tx = pool.begin().await?;
-    for row in rows {
+    // Serial writers behind this import read `events_id_seq`; hold the table
+    // while its rows land so the post-insert reconciliation sees a stable
+    // maximum. Only when the file carries events rows and the target has the
+    // table (partially migrated targets may not).
+    if rows.iter().any(|row| row.table == "events") {
+        let events_exists: bool = sqlx::query_scalar("SELECT to_regclass('events') IS NOT NULL")
+            .fetch_one(&mut *tx)
+            .await?;
+        if events_exists {
+            sqlx::query("LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    let mut inserted: u64 = 0;
+    for row in &ordered {
         let table = quote(&row.table)?;
         // Table names are validated statics; only the row document is bound.
         let sql = format!(
             "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table}, $1) ON CONFLICT DO NOTHING"
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql))
+        inserted += sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&row.row)
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected();
     }
+    let mut seen: Vec<&str> = Vec::new();
+    for row in &ordered {
+        if !seen.contains(&row.table.as_str()) {
+            seen.push(&row.table);
+        }
+    }
+    advance_owned_sequences(&mut *tx, &seen).await?;
     tx.commit().await?;
-    Ok(rows.len() as u64)
+    let total = rows.len() as u64;
+    Ok(ApplyOutcome {
+        inserted,
+        skipped: total.saturating_sub(inserted),
+    })
 }
 
 #[cfg(test)]
@@ -328,5 +443,76 @@ mod tests {
         assert!(quote("members").is_ok());
         assert!(quote("members; DROP TABLE x").is_err());
         assert!(quote("").is_err());
+    }
+
+    #[test]
+    fn import_table_order_is_parent_first() {
+        assert!(import_table_order("tickets") < import_table_order("ticket_transcripts"));
+        assert!(import_table_order("feed_relays") < import_table_order("feed_deliveries"));
+        assert!(
+            import_table_order("internal_idempotency") < import_table_order("internal_action_log")
+        );
+        assert!(import_table_order("voice_rooms") < import_table_order("voice_room_blocks"));
+        assert!(import_table_order("voice_rooms") < import_table_order("voice_join_grants"));
+        assert!(
+            import_table_order("moderation_idempotency")
+                < import_table_order("moderation_channel_executions")
+        );
+        assert!(import_table_order("lfg_posts") < import_table_order("lfg_roles"));
+        assert!(import_table_order("lfg_roles") < import_table_order("lfg_signups"));
+        assert_eq!(import_table_order("no_such_table"), usize::MAX);
+    }
+
+    #[test]
+    fn ordered_rows_replays_parents_before_children_stably() {
+        // Child listed before its parents: the parent rows still apply first.
+        let rows = parse_import(&format!(
+            "{}\n{}\n{}\n{}\n",
+            line("ticket_transcripts", "{}"),
+            line("tickets", "{\"k\":\"b\"}"),
+            line("tickets", "{\"k\":\"a\"}"),
+            line("members", "{}"),
+        ))
+        .unwrap();
+        let tables: Vec<&str> = ordered_rows(&rows)
+            .iter()
+            .map(|row| row.table.as_str())
+            .collect();
+        assert_eq!(
+            tables,
+            vec!["members", "tickets", "tickets", "ticket_transcripts"]
+        );
+        // Same-table file order is preserved (stable sort).
+        let ordered = ordered_rows(&rows);
+        assert_eq!(
+            ordered[1].row,
+            serde_json::json!({"k": "b"}),
+            "first tickets row keeps file order"
+        );
+
+        let rows = parse_import(&format!(
+            "{}\n{}\n{}\n",
+            line("voice_room_blocks", "{}"),
+            line("voice_join_grants", "{}"),
+            line("voice_rooms", "{}"),
+        ))
+        .unwrap();
+        let tables: Vec<&str> = ordered_rows(&rows)
+            .iter()
+            .map(|row| row.table.as_str())
+            .collect();
+        assert_eq!(
+            tables,
+            vec!["voice_rooms", "voice_room_blocks", "voice_join_grants"]
+        );
+    }
+
+    #[test]
+    fn apply_outcome_total_sums_inserted_and_skipped() {
+        let outcome = ApplyOutcome {
+            inserted: 2,
+            skipped: 1,
+        };
+        assert_eq!(outcome.total(), 3);
     }
 }
