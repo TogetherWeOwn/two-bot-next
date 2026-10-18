@@ -94,7 +94,7 @@ No SBOM file is committed to the repo. Per-image SBOMs are produced by the
 reusable `sbom.yml` workflow (called from `check.yml` on PRs and from
 `release.yml` on releases) and live in CI artifacts:
 
-- Scanner: Trivy Action 0.35.0 with Trivy v0.69.3, fresh vulnerability DB per
+- Scanner: Trivy Action 0.36.0 with Trivy v0.69.3, fresh vulnerability DB per
   run, no shared layer/DB cache, `cache: false` everywhere.
 - `sbom/rust-workspace.cdx.json`: CycloneDX inventory of `Cargo.lock`
   (workspace, optional and dev dependencies; not a claim every locked crate

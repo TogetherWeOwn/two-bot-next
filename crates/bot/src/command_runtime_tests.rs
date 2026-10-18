@@ -56,6 +56,7 @@ use crate::command_runtime::{
     actor_id, ephemeral, feed_add_options, feed_remove_option, new_id, router_with_commands,
     sticky_options, CommandRuntime, RegistrySyncError,
 };
+use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::MemberRuntime;
 use crate::privacy_command::{privacy_action, PrivacyAction};
 use crate::schedule_runtime::{schedule_options, schedule_remove_option};
@@ -1434,6 +1435,12 @@ async fn member_verbs_reach_executor_facts_then_fail_closed_without_db() {
 
 #[tokio::test]
 async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
+    // Serialize with the website exact-delta `refused` tests in
+    // `internal_action_http::tests` (TOG-28482): this test records
+    // `kick/refused` (and the other member verbs) on the process-global
+    // registry via `preflight_refused`, and `cargo test --workspace --lib
+    // --bins` runs both modules as threads of one process.
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let json_response = |body: serde_json::Value| RestResponse {
             status: 200,

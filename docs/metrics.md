@@ -73,6 +73,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. `dispatch_drops:<lane>` raises a ticket after growth in 3 consecutive completed keepalive sample windows; the first valid sample only establishes a baseline. A flat sample or counter reset clears the streak; missing/invalid samples break growth but never falsely resolve an active ticket. A single burst never pages. `reactions`-lane growth can reflect per-member fairness rather than an undersized lane. Dispatch refusals are not proof of gateway packet loss |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert rule `gateway_checkpoint_failures` fires on any increase summed over every `stage` between consecutive keepalive samples (the first sample is baseline-only; the failing process lingers 75 s so a scrape lands before the restart resets the counter); unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
 | `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
+| `two_bot_moderation_enforcements_total{verb,outcome}` | Moderation enforcement terminal outcomes. `verb` is one of `ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`, `slowmode`, `lockdown` or `unlock` (see label allowlists below). `outcome` is `success`, `refused`, `discord_error`, `storage_error` or `other`. Each terminal member/channel enforcement counts once; retries and rate-limit backoffs are not outcomes |
 | `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert-threshold hook for M2.1: alert when the counter increases across consecutive scrapes; a single failed drain is not paging |
 | `two_bot_audit_delivery_halt` | Audit mirror delivery-halt state for staleness evaluation: `1` while the persistent kill switch is engaged, `0` once cleared. Label-free gauge set once per readable `audit_retry` sweep from the store's `delivery_halt` read; an unreadable halt keeps the last reported state, and a halted sweep still counts as a job `success` (the sweep ran; it claimed nothing by design). Manual check, not an alert input: no alert rule consumes this series and production alert forwarding stays off. No actor ID, timestamp, error text or row content ever reaches exposition |
 | `two_bot_event_store_consumer_lag_seconds` | Event-store consumer lag in seconds (`received_at` minus `event_time` for the newest observed capture row); `0` when unobserved. Label-free gauge; S1 exposes the series and its setter contract (last writer wins; non-finite or negative input clears to `0` so exposition stays a finite non-negative duration). The periodic store-read caller lands with the consumer slice, so until then the series reads `0` (unobserved), not "no lag". Manual check, not an alert input: no alert rule consumes this series. No message, channel, user, dedup-key, content or body label ever reaches exposition |
@@ -351,6 +352,30 @@ as dynamic labels.
   `ReceiverState::terminal` plus the keyless-read and settings/moderation
   success envelopes for executions); no key id, token, body or request bytes
   ever become labels.
+- `two_bot_moderation_enforcements_total{verb,outcome}` — `verb` is one of
+  `ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`, `slowmode`,
+  `lockdown` or `unlock` (exactly `ModerationAction::command_name`, in legacy
+  publish order; `crates/core/src/metrics.rs` `MODERATION_VERBS`); `outcome`
+  is `success` (completed enforcement, including idempotent replays served
+  without a second effect), `refused` (policy/validation/definitive
+  rejections that prove no mutation happened), `discord_error` (uncertain
+  Discord failures: timeout, unreachable, rate-limited), `storage_error`
+  (persistence failures) or `other`. Recorded once per terminal member
+  enforcement (slash `MemberRuntime`, website `ModerationExecutor` plus
+  `InternalMemberExecutor`), including definitive preflight refusals (slash:
+  unknown roles and non-member target; website: resolver `ActionNotAllowed`
+  such as non-member target, actor not member, or actor forbidden, recorded
+  by the website effect before the executor runs); actor cooldowns, Discord
+  snapshot failures and other indeterminate reads are not outcomes.
+  Recorded once per terminal channel enforcement (slash
+  `ChannelModerationRuntime`, website `ChannelModerationExecutor` plus
+  `InternalChannelExecutor`), with the same boundary: website resolver
+  `ActionNotAllowed` records `refused` at the effect, snapshot failures stay
+  unsampled. Retries and rate-limit backoffs are not outcomes. Channel
+  slash enforcement records uncertain outcomes as `other`; website enforcement
+  records uncertain Discord failures as `discord_error`. A purge timeout that
+  proves no deletion was sent is recorded as `refused`. No user id, reason
+  text or free-form detail ever becomes a label.
 - `two_bot_community_facts_drain_failures_total{reason}` — `reason` is `error`,
   `timeout` or `other`. Recorded once per failed community-facts drain in
   `crates/bot/src/gateway.rs` (`apply_dispatch`), in both warn-and-continue

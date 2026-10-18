@@ -857,10 +857,30 @@ above. A stuck-gateway rule (non-ready `/readyz` gateway component with no
 disconnect edge) is not a trigger in v1; wiring it into the crash-loop scope
 is follow-up work once that rule lands, not part of this slice. Sustained
 `/readyz` red (`container_unready_alert`) and repeated process restarts stay
-manual. A positive-path staging proof (forcing a real stall) needs an injector
-that does not exist; v1 staging proof is a clean deploy with no spurious
-recommendation lines plus the unit suite below. Forcing these two alerts on
-staging is follow-up work, not a silent gap.
+manual.
+
+#### Staging fault injector drill
+
+Positive-path staging proof uses the staging-only fault injector
+(`wrangler/src/staging-fault.ts`), armed solely through the generated
+staging deploy config by a manual `deploy-staging` dispatch with
+`inject_voice_stall` and/or `inject_unpaired_disconnect` (both default
+false; a push can never arm them, and the switches are never committed
+vars). While armed, the keepalive tick holds
+`two_bot_voice_creator_map_generation` at 1 with age 660 s (past the 600 s
+bound, the 2x300 s refresh) and/or advances
+`two_bot_gateway_disconnects_total` with no recovery so the unpaired rule
+holds an outstanding disconnect; the alert rules and the guard above run
+unmodified, so every recommendation still fires only alongside its trigger.
+Expected timeline at the 60 s keepalive: the stall alert fires on the first
+armed tick, the unpaired alert needs one baseline tick plus three
+outstanding ticks (about 4 min). Observe one full 30-minute cooldown window
+for R1-to-R2 escalation (`creator-map-reload`, no host action, then one
+Operator card for `same-sha-takeover` at the same SHA); a further window
+proves the two-failure CEO page and silence. Re-dispatching without the
+flags (or any plain push deploy) disarms the drill: the triggers resolve on
+their own rules and the guards reset. Rollback is disarm-by-redeploy; the
+Worker recommends only, so nothing executes from this path.
 
 ### Event-store capture gaps and lag
 
