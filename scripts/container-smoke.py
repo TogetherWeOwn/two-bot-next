@@ -50,20 +50,21 @@ IMAGE_MAX_BYTES = 112 * MIB
 # headroom — the tripwire is exhausted even before new code lands. This
 # branch's feed-fetch outcome gauges add ~2,240 bytes of bounded-vocabulary
 # counters and pure mapping functions (PR merge head 16,778,336 bytes, 1,120
-# over 16 MiB). Main at d7774644 measured 16,768,848 bytes (15.99 MiB), another
-# calibration measured 16,777,376 bytes (160 over), and this head measured
-# 16,778,152 bytes (936 over). Main's voice rename-decision logs add 3,160
-# bytes (merged head 6a9c394e: 16,779,256 bytes, 2,040 over 16 MiB), the
-# backfill rate-limit client head measured 16,780,912 bytes (16.00 MiB) on
-# hosted CI — the guard's bucket/pacing code — the game-activity
-# aggregate-expiry slice measured 16,782,608 bytes (16.01 MiB, 5,392 over) —
-# store expiry plus its per-guild stale listing and the retention-cadence
-# driver — and the go-live receiver-ledger branch independently measured
-# 16,801,560 bytes (16.02 MiB) on CI run 39056648109 job 117470241279, 24,344
-# bytes over the 16 MiB tripwire, after ~450 lines of shipping ledger/receiver
-# code. The landed slices since the 16 MiB bump consumed its headroom, so
-# 17 MiB restores a working tripwire with ~1 MiB of headroom; revisit if the
-# binary approaches it.
+# over 16 MiB). Main at d7774644 measured 16,768,848 bytes (15.99 MiB),
+# another calibration measured 16,777,376 bytes (160 over, byte-identical on
+# main HEAD 89c859b), and this head measured 16,778,152 bytes (936 over).
+# Main's voice rename-decision logs add 3,160 bytes (merged head 6a9c394e:
+# 16,779,256 bytes, 2,040 over 16 MiB), the backfill rate-limit client head
+# measured 16,780,912 bytes (16.00 MiB) on hosted CI — the guard's
+# bucket/pacing code — the game-activity aggregate-expiry slice measured
+# 16,782,608 bytes (16.01 MiB, 5,392 over) — store expiry plus its per-guild
+# stale listing and the retention-cadence driver — and the go-live
+# receiver-ledger branch independently measured 16,801,560 bytes (16.02 MiB)
+# on CI run 39056648109 job 117470241279, 24,344 bytes over the 16 MiB
+# tripwire, after ~450 lines of shipping ledger/receiver code. The landed
+# slices since the 16 MiB bump consumed its headroom, so 17 MiB restores a
+# working tripwire with ~1 MiB of headroom; revisit if the binary approaches
+# it.
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
