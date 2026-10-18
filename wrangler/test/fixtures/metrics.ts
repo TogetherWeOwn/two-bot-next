@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 const rust = readFileSync(new URL("../../../crates/core/src/metrics.rs", import.meta.url), "utf8");
 
 export function rustLabels(name: string): string[] {
-  const list = new RegExp(`pub const ${name}: &\\[.*?\\] = &\\[([\\s\\S]*?)\\];`).exec(rust);
+  const list = new RegExp(`pub const ${name}:[^=]*=\\s*(?:&)?\\[([\\s\\S]*?)\\];`).exec(rust);
   if (!list) throw new Error(`missing Rust metric dimension ${name}`);
   const quoted = [...list[1]!.matchAll(/"([^"]+)"/g)].map((m) => m[1]!);
   if (quoted.length > 0) return quoted;
@@ -42,6 +42,7 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string>> = {
   two_bot_gateway_checkpoint_failures_total: { stage: "CHECKPOINT_FAILURE_STAGES" },
   two_bot_dispatch_drops_total: { lane: "DISPATCH_LANES" },
   two_bot_internal_actions_total: { family: "INTERNAL_ACTION_FAMILIES", outcome: "INTERNAL_ACTION_OUTCOMES" },
+  two_bot_eventsub_classified_total: { kind: "EVENTSUB_DELIVERY_KINDS" },
 };
 
 /** Complete consumed-input fixture generated from the Rust label contract, not the validator. */

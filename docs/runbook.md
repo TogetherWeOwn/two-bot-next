@@ -450,6 +450,15 @@ drift; `discord`/`persistence` move outcomes point at REST or storage. Then
 read the container logs for `voice_event="voice_join_received"` refusal lines
 and `voice_event="voice_join"` terminal lines with their stage durations.
 
+The burn rules cannot see joins that never reach the actor. If members stop
+being moved while `joins_received` stays flat and no refusal lines appear,
+read `two_bot_voice_live_not_ready_seconds`: above 0 means the guild's live
+view is not ready on a connected gateway, so joins are dropped before a
+ticket. Every dispatch retries the cached snapshot
+(`two_bot_voice_live_self_heal_total` counts the repairs); a value that keeps
+climbing past 120 s needs a restart (fresh IDENTIFY + GUILD_CREATE) and a bug
+report with the logs around the last gateway close.
+
 Escalate when the burn persists across hours (the slow-burn ticket below will
 already be open), when `halted` refusals dominate, or when the stall matches a
 deploy — the fix belongs to the on-call engineer, not another redeploy.
@@ -798,6 +807,42 @@ The Container DO failed the container-internal `/metrics` scrape on 3 consecutiv
 First response: read the scrape through the existing authorized `/ops/metrics` path, check container `/readyz` and Worker/container logs for `two-bot metrics scrape failed`. Timeouts (6 s deadline), non-OK status, oversized bodies (64 KiB cap) and invalid exposition all count as failure; the deadline and cap are unchanged by this alert. Notifications and logs carry only this runbook link and build context, never response bodies.
 
 A lost scrape never resolves any metric-rule incident: missing evidence is not recovery evidence, so previously firing alerts stay firing through the loss, and the existing dispatch-drop interruption still applies. The first complete valid scrape after the incident resolves only the scrape-loss ticket; metric rules re-evaluate on that same scrape and resolve only on their own evidence. A valid scrape before the third failure silently resets the streak with no resolve.
+
+#### Alert: EventSub tampered
+
+`two_bot_eventsub_classified_total{kind="tampered"}` rose in 3 consecutive
+keepalive samples after a baseline. Only `BadSignature` counts as `tampered`;
+every other kind stays silent. The streak (not a single window) pages, because
+a sustained rise means an active forgery attempt or a broken secret rotation
+while one forged probe must not. The firing key is the bare rule id
+(`eventsub_tampered`): no broadcaster, subscription ID, body, token, or
+free-text label ever rides on it. The first valid sample only stores the
+baseline and never fires, a backwards counter means the process restarted and
+rebaselines without firing, missing/invalid scrapes preserve a firing alert
+without manufacturing recovery, and a flat valid window resolves.
+
+First response: scope the fixed `kind="tampered"` counter through the existing
+authorized `/ops/metrics` path; confirm no deploy is in progress (a fresh
+deploy restarts the process and resets the counter); then read the container
+logs for the matching `eventsub delivery refused` warn lines (scalar `status`
+/ `error_class` only: header values, challenge, body bytes, and query strings
+are never logged). A single historic rise with no growth never re-pages.
+Forgery versus rotation: a rotation in progress shows 401 `unauthorized`
+refusals while the two sides disagree (the running container must already
+carry the new secret before old subscriptions are deleted, so not-yet-deleted
+subscriptions signed with the old secret fail until the reconciler recreates
+them). When no rotation or deploy is underway, treat a sustained rise as
+forged traffic. Follow the existing
+[secret provisioning and rotation](eventsub-runbook.md#secret-provisioning-and-rotation)
+procedure for any credential change; this alert changes no verification, Helix,
+or secret handling. Record only the fixed kind and sanitized counts, never
+IDs, payloads, or scrape tokens.
+
+Escalate when tampered growth persists across windows after the suspect caller
+or rotation is identified, when it coincides with 429, DB-error, or
+reconcile-failure alerts, or when `notification` traffic for the same window
+collapses while tampered rises — the receiver may be refusing legitimate work
+and the fix belongs to the on-call engineer, not another redeploy.
 
 #### Auto-remediation: guarded stall and crash-loop response
 

@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 707 samples
+## Cardinality budget: 709 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -37,7 +37,7 @@ table and the test are updated together.
 | `two_bot_rest_guard_*` | 11 | Fixed, label-free shared admission-guard counters and gauges |
 | job runs, timestamps, failure streaks | 64 | 16 jobs x (2 outcomes + timestamp + streak) |
 | `two_bot_job_last_error_class{job,class}` | 112 | 16 jobs x 7 classes (`database`, `rest`, `configuration`, `timeout`, `panic`, `feed`, `recovery_required`) |
-| voice ops, reconcile, dead-letters, state | 53 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans + 7 join-refused reasons + 2 queue lanes + halted + oldest-age + rest-age + creator-map generation + creator-map age + backoff-capped + dispatch-timeouts + watchdog-stucks + halt-recoveries |
+| voice ops, reconcile, dead-letters, state | 55 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans + 7 join-refused reasons + 2 queue lanes + halted + oldest-age + live-not-ready age + live self-heals + rest-age + creator-map generation + creator-map age + backoff-capped + dispatch-timeouts + watchdog-stucks + halt-recoveries |
 | `two_bot_voice_join_occupancy_total{occupancy}` | 8 | seeding-TEST occupancy buckets `0`-`6` + `7+`; fixed vocabulary, no per-channel/member labels |
 | pool gauges | 4 | configured, size, idle, max |
 | `two_bot_db_errors_total{op}` | 2 | `admission`, `other` |
@@ -62,7 +62,7 @@ table and the test are updated together.
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | 5 | `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed`, `other`; no status, body or response bytes in labels |
 | `two_bot_feed_fetches_total{outcome}` | 4 | `success`, `invalid_source`, `refused_redirect`, `failure`; per-outcome, never per-feed |
 | `two_bot_feed_fetch_errors_total{error_class}` | 12 | 11 named classes + `other` (`invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error`); successes record nothing here |
-| `# HELP` / `# TYPE` headers | 138 | 69 families x 2 |
+| `# HELP` / `# TYPE` headers | 142 | 71 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 

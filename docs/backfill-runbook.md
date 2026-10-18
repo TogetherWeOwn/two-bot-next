@@ -79,13 +79,17 @@ with shared admission:
 - Paced lane 110 ms, kick lane 350 ms (`PACE_INTERVAL_MS` at
   `executor.rs:66`, `KICK_INTERVAL_MS` at `executor.rs:69`, wired at
   `executor.rs:971-972`).
-- Paced GETs retry 429 with `retry_after_wait_ms()` and spend one of the
-  same 5 tries per 429/5xx/transport failure; a steady 429 stream exhausts
-  the budget instead of parking forever (`get_json_observed` at
-  `executor.rs:1753`, 429 arm at `executor.rs:1791-1805`). In the kick
-  path, a global 429 uses the header-anchored shared deadline at the next
-  admission, while route-local 429s sleep locally
-  (`executor.rs:1686-1691`).
+- The backfill evidence reads (`get_json_observed`, `get_json_checked`)
+  retry a per-route 429 by waiting out the header unclamped — one sleep per
+  429 — bounded by a 5 min ceiling per wait
+  (`MAX_BACKFILL_RETRY_AFTER_MS` in `crates/core/src/action_outcomes.rs`),
+  and spend one of the same 5 tries per 429/5xx/transport failure; a steady
+  429 stream exhausts the budget instead of parking forever. The general
+  `get_json` read (containment snapshot, website jobs, onboarding probe)
+  keeps the 60 s `retry_after_wait_ms()` clamp, as do the kick, publish
+  and registry lanes. In the kick path, a global 429 uses the
+  header-anchored shared deadline at the next admission, while route-local
+  429s sleep locally.
 - The process-wide guard (`crates/discord/src/ratelimit_guard.rs`) counts
   401/403/429 toward the invalid-request budget — 10-minute rolling window
   (`INVALID_REQUEST_WINDOW:15`), default threshold 5 000 (production

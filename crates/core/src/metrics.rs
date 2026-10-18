@@ -569,6 +569,9 @@ struct VoiceActorStall {
     halted: bool,
     queue_pending: [u64; VOICE_QUEUE_LANES.len()],
     oldest_age_secs: u64,
+    /// Seconds this actor's live view has been not ready while the gateway
+    /// is connected (joins are dropped meanwhile); 0 when ready or offline.
+    live_not_ready_secs: u64,
 }
 
 #[derive(Default)]
@@ -618,6 +621,8 @@ struct Values {
     voice_watchdog_stucks: u64,
     /// Halt-latch recoveries via credential re-probe.
     voice_halt_recoveries: u64,
+    /// Live views republished by the not-ready-while-connected self-heal.
+    voice_live_self_heals: u64,
     voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
     moderation_enforcements: [[u64; MODERATION_ENFORCEMENT_OUTCOMES.len()]; MODERATION_VERBS.len()],
     voice_names: [u64; VOICE_NAME_OUTCOMES.len()],
@@ -683,6 +688,7 @@ fn voice_actor_entry(
         entry.halted = false;
         entry.queue_pending = [0; VOICE_QUEUE_LANES.len()];
         entry.oldest_age_secs = 0;
+        entry.live_not_ready_secs = 0;
     }
     Some(entry)
 }
@@ -1044,6 +1050,32 @@ impl Metrics {
         if let Some(entry) = voice_actor_entry(&mut values, actor, generation) {
             entry.halted = halted;
         }
+    }
+
+    /// Record how long one guild actor's live view has been not ready while
+    /// the gateway is connected (0 when ready or while the transport is
+    /// down). The public `two_bot_voice_live_not_ready_seconds` gauge is the
+    /// maximum across current actors, so a healthy guild cannot hide a
+    /// guild whose joins are being dropped. Generation fencing matches
+    /// [`Self::set_voice_actor_halted`].
+    pub fn set_voice_actor_live_not_ready(&self, actor: u64, generation: u64, secs: u64) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = voice_actor_entry(&mut values, actor, generation) {
+            entry.live_not_ready_secs = secs;
+        }
+    }
+
+    /// One live view republished from the gateway cache by the self-heal
+    /// path: it was not ready while the gateway was connected.
+    pub fn voice_live_self_heal(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_live_self_heals = values.voice_live_self_heals.saturating_add(1);
     }
 
     /// Record one guild actor's queued depth by lane plus its oldest
@@ -1718,11 +1750,13 @@ impl Metrics {
         let voice_halted = u64::from(values.voice_actors.values().any(|actor| actor.halted));
         let mut voice_queue_pending = [0_u64; VOICE_QUEUE_LANES.len()];
         let mut voice_queue_oldest_age_secs = 0_u64;
+        let mut voice_live_not_ready_secs = 0_u64;
         for actor in values.voice_actors.values() {
             for (total, depth) in voice_queue_pending.iter_mut().zip(actor.queue_pending) {
                 *total = total.saturating_add(depth);
             }
             voice_queue_oldest_age_secs = voice_queue_oldest_age_secs.max(actor.oldest_age_secs);
+            voice_live_not_ready_secs = voice_live_not_ready_secs.max(actor.live_not_ready_secs);
         }
         header(
             &mut out,
@@ -1755,6 +1789,23 @@ impl Metrics {
             "two_bot_voice_queue_oldest_age_seconds {voice_queue_oldest_age_secs}"
         )
         .unwrap();
+        header(
+            &mut out,
+            "two_bot_voice_live_not_ready_seconds",
+            "gauge",
+            "Seconds a guild live voice view has been not ready while the gateway is connected (creator joins are dropped meanwhile), maximum across guild actors; 0 when every view is ready or the gateway is down.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_live_not_ready_seconds {voice_live_not_ready_secs}"
+        )
+        .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_voice_live_self_heal_total",
+            "counter",
+            values.voice_live_self_heals,
+        );
         header(
             &mut out,
             "two_bot_voice_rest_in_flight_age_seconds",
@@ -3059,6 +3110,40 @@ mod tests {
             let (_, value) = series[0].rsplit_once(' ').unwrap();
             value.parse::<u64>().expect("bad sample");
         }
+    }
+
+    #[test]
+    fn live_not_ready_gauge_is_the_label_free_maximum_across_actors() {
+        // A live voice view left not ready on a connected gateway drops every
+        // creator join silently (production 2026-10-17/18). The host watchdog
+        // alerts on this gauge directly; a healthy guild must not hide it.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_live_not_ready_seconds gauge\n"));
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 0\n"));
+        assert!(text.contains("two_bot_voice_live_self_heal_total 0\n"));
+        metrics.set_voice_actor_live_not_ready(1, 1, 0);
+        metrics.set_voice_actor_live_not_ready(2, 1, 95);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 95\n"));
+        assert!(!text.contains("two_bot_voice_live_not_ready_seconds{"));
+        // A stale incarnation cannot overwrite; a newer one resets the entry.
+        metrics.set_voice_actor_halted(2, 2, false);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 0\n"));
+        metrics.set_voice_actor_live_not_ready(2, 1, 400);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 0\n"));
+        // Retiring the stuck actor removes its contribution.
+        metrics.set_voice_actor_live_not_ready(2, 2, 30);
+        metrics.remove_voice_actor(2, 2);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 0\n"));
+        metrics.voice_live_self_heal();
+        metrics.voice_live_self_heal();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_live_self_heal_total counter\n"));
+        assert!(text.contains("two_bot_voice_live_self_heal_total 2\n"));
     }
 
     #[test]

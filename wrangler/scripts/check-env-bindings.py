@@ -50,6 +50,9 @@ OPTIONAL_SECRET_BINDINGS = {
     # secrets only; a committed value would hand out dashboard access.
     "OPS_DASHBOARD_CLIENT_ID",
     "OPS_DASHBOARD_CLIENT_SECRET",
+    # TOG-29201: the MCP shared bearer (docs/mcp.md). Optional Worker
+    # secret only; a committed var would publish the bearer.
+    "MCP_TOKEN",
 }
 # TOG-22861 workers.dev break-glass: staging and production serve the public
 # suffix until a custom domain and Access app exist. Every named environment
