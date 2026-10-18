@@ -549,8 +549,9 @@ only `two-bot metrics scrape failed`: no response body,
 exception detail, token or URL. Empty/non-exposition, malformed or interrupted
 bodies, timeouts, and missing/duplicate/invalid alert inputs keep the previous
 firing set, counter baselines and streaks, and emit no `RESOLVED` — except the
-dispatch-drop baselines and streaks, which reset without resolving active
-tickets (a failed scrape invalidates all dispatch baselines).
+dispatch-drop baselines and streaks and the event-store lag streak, which reset
+without resolving active tickets (a failed scrape invalidates all dispatch
+baselines and breaks the lag streak).
 The validator requires every always-emitted series consumed by the rules,
 including all current label combinations from `crates/core/src/metrics.rs`,
 with finite nonnegative integer inputs (pool-configured is 0 or 1). Additional
