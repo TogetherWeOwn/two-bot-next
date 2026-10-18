@@ -92,6 +92,66 @@ pub enum ScheduleError {
     EveryMinutesOutOfRange(i64),
 }
 
+/// Neutralize mass mentions and invite links in a schedule body so the
+/// ticker can never post a ping or a clickable invite pill.
+///
+/// Mass mentions (`@everyone`/`@here`, including zero-width-split
+/// obfuscation) are broken with the shared mention neutralizer; every
+/// case-insensitive `discord.gg` invite host is split with a zero-width
+/// space (`discord.\u{200b}gg`) so Discord never linkifies it. Plain text
+/// without either pattern passes through byte-identical, and the transform
+/// is idempotent: already-neutralized text is returned unchanged.
+///
+/// Applied at the validate boundary (stored bodies leave neutralized) and
+/// again at the ticker post boundary (rows written before any validate-side
+/// screen are defused on the way to the channel).
+#[must_use]
+pub fn neutralize_scheduled_body(body: &str) -> String {
+    split_invite_host(&crate::message_safety::neutralize_mentions(body))
+}
+
+/// Split the dot of every case-insensitive `discord.gg` host with a
+/// zero-width space so Discord does not linkify it. Original casing is
+/// preserved (`DISCORD.GG` becomes `DISCORD.\u{200b}GG`); text without the
+/// host passes through byte-identical.
+fn split_invite_host(text: &str) -> String {
+    const NEEDLE_LEN: usize = 10; // `discord.gg`
+    const DOT_OFFSET: usize = 8; // `discord.` prefix length
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while rest.len() >= NEEDLE_LEN {
+        let Some(pos) = find_invite_host(rest) else {
+            break;
+        };
+        let (head, tail) = rest.split_at(pos);
+        out.push_str(head);
+        out.push_str(&tail[..DOT_OFFSET]);
+        out.push('\u{200b}');
+        out.push_str(&tail[DOT_OFFSET..NEEDLE_LEN]);
+        rest = &tail[NEEDLE_LEN..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Byte offset of a case-insensitive `discord.gg` in `text`, if any. The
+/// needle is pure ASCII, so every match starts and ends on a character
+/// boundary.
+fn find_invite_host(text: &str) -> Option<usize> {
+    text.as_bytes().windows(10).position(|w| {
+        w[0].eq_ignore_ascii_case(&b'd')
+            && w[1].eq_ignore_ascii_case(&b'i')
+            && w[2].eq_ignore_ascii_case(&b's')
+            && w[3].eq_ignore_ascii_case(&b'c')
+            && w[4].eq_ignore_ascii_case(&b'o')
+            && w[5].eq_ignore_ascii_case(&b'r')
+            && w[6].eq_ignore_ascii_case(&b'd')
+            && w[7] == b'.'
+            && w[8].eq_ignore_ascii_case(&b'g')
+            && w[9].eq_ignore_ascii_case(&b'g')
+    })
+}
+
 /// Validate a `/schedule` invocation (legacy `putScheduled` checks plus the
 /// handler's one-of rule). Count UTF-16 units and require sendable text after
 /// the shared outbound rendering, preserving the original body for storage.
@@ -113,14 +173,25 @@ pub fn validate_schedule(input: &ScheduleInput<'_>) -> Result<ValidatedSchedule,
             return Err(ScheduleError::EveryMinutesOutOfRange(every_minutes));
         }
     }
+    // Defuse mass mentions and invite pills before storage; benign bodies
+    // pass through byte-identical. A neutralization that grows the text past
+    // the ceiling refuses instead of handing storage a body the wire would
+    // reject, and a neutralization with no sendable text left refuses too.
+    let neutralized = neutralize_scheduled_body(body);
+    if crate::message_safety::text_len(&neutralized) > MAX_BODY_CHARS {
+        return Err(ScheduleError::BodyTooLong);
+    }
+    if !crate::message_safety::has_message_text(&neutralized) {
+        return Err(ScheduleError::BodyEmpty);
+    }
     match (input.in_minutes, input.every_minutes) {
         (Some(in_minutes), _) => Ok(ValidatedSchedule {
-            body: body.to_owned(),
+            body: neutralized,
             delay_minutes: in_minutes,
             interval_seconds: input.every_minutes.map(|m| m * 60),
         }),
         (None, Some(every_minutes)) => Ok(ValidatedSchedule {
-            body: body.to_owned(),
+            body: neutralized,
             delay_minutes: every_minutes,
             interval_seconds: Some(every_minutes * 60),
         }),
