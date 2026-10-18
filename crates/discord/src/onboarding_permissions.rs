@@ -196,7 +196,7 @@ impl MemberAccess {
         let needed = VIEW_CHANNEL
             | if post {
                 SEND_MESSAGES
-            } else if kind == 2 {
+            } else if matches!(kind, 2 | 13) {
                 CONNECT
             } else {
                 0
@@ -289,6 +289,15 @@ mod tests {
             {"id":"44","type":1,"allow":"0","deny":CONNECT.to_string()}
         ]});
         assert_eq!(access(&[]).permits_channel(&channel, 12, true), Ok(true));
+        assert_eq!(access(&[]).permits_channel(&channel, 12, false), Ok(false));
+    }
+
+    #[test]
+    fn stage_lobby_connect_deny_is_not_recommended() {
+        // Discord requires Connect to join a stage channel (type 13) too.
+        let channel = json!({"id":"12","guild_id":"22","type":13,"permission_overwrites":[
+            {"id":"44","type":1,"allow":"0","deny":CONNECT.to_string()}
+        ]});
         assert_eq!(access(&[]).permits_channel(&channel, 12, false), Ok(false));
     }
 

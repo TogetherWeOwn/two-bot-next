@@ -180,7 +180,7 @@ picker always answers).
 
 Before routing selected session destinations, the runtime reads fresh member,
 role and channel evidence. The voice lobby's **Join voice now** recommendation
-requires effective **View Channel + Connect** on a voice channel (type 2), using
+requires effective **View Channel + Connect** on a voice or stage channel (types 2 and 13), using
 @everyone, combined-role and member-overwrite precedence, including the existing
 owner/administrator semantics. A visible lobby with Connect denied is unavailable:
 it contributes no actionable voice link or successful voice-route fact. If the
