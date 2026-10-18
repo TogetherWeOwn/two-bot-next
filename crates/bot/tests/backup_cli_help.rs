@@ -48,6 +48,14 @@ impl Drop for Scratch {
 fn two_bot(dir: &Scratch, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_two-bot"));
     command.args(args).env_clear().current_dir(&dir.0);
+    // Under cargo-llvm-cov the child is instrumented and writes its profile
+    // to LLVM_PROFILE_FILE. `env_clear` would drop that redirect, so the
+    // child drops `default.profraw` into the scratch dir and `is_empty`
+    // flakes. Forward the harness redirect (it carries `%p`/`%m`, so each
+    // child still gets its own profile); the cleared app env stays cleared.
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
     command
 }
 
