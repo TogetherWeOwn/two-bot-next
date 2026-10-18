@@ -175,13 +175,47 @@ async function poll() {
     el.innerHTML = '<p class="bad">summary request failed: ' + res.status + '</p>';
     return;
   }
+  // Validate and render before stamping: a malformed report must replace the
+  // previous readiness with an explicit failure state instead of leaving a
+  // stale READY on screen as current. render throws on malformed shapes.
+  let html;
+  try {
+    html = render(data, res.status);
+  } catch (e) {
+    status.textContent = "summary " + res.status;
+    el.innerHTML = '<p class="bad">summary report invalid: ' + res.status + '</p>';
+    return;
+  }
   status.textContent = "updated " + new Date().toISOString();
-  el.innerHTML = render(data, res.status);
+  el.innerHTML = html;
 }
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
+function isValidReport(data) {
+  // Mirror the server summary shape: an object whose components (when
+  // present) are [name, state] string pairs and whose jobs (when present)
+  // map names to objects. Anything else (null entries, null job values,
+  // non-pair entries, non-object reports) is malformed: rendering it would
+  // either throw or show a vacuous READY, so reject it before render.
+  if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+  if (data.components !== undefined) {
+    if (!Array.isArray(data.components)) return false;
+    for (const entry of data.components) {
+      if (!Array.isArray(entry) || entry.length !== 2
+        || typeof entry[0] !== "string" || typeof entry[1] !== "string") return false;
+    }
+  }
+  if (data.jobs !== undefined) {
+    if (!data.jobs || typeof data.jobs !== "object" || Array.isArray(data.jobs)) return false;
+    for (const job of Object.values(data.jobs)) {
+      if (!job || typeof job !== "object" || Array.isArray(job)) return false;
+    }
+  }
+  return true;
+}
 function render(data, status) {
+  if (!isValidReport(data)) throw new Error("invalid summary report");
   const comps0 = Array.isArray(data && data.components) ? data.components : [];
   // Readiness mirrors the server HealthReport ready rule: every listed
   // component reports "ready" (vacuous truth when none are listed). The
