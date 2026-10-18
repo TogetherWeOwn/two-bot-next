@@ -110,8 +110,8 @@ fuzz/Cargo.toml` and pin any drifted shared crate back with `cargo update -p
 the verification evidence before reporting a campaign; record nightly,
 cargo-fuzz, libfuzzer-sys and OS versions and exact git HEAD. The required
 `fuzz-compile` job proves the excluded targets build and replays the
-`eventsub_delivery` seeds once (`-runs=0`); it runs no fuzz campaign for any
-target. A bounded smoke result must cite its own non-controller host, command,
+`eventsub_delivery`, `helix_token` and `custom_command_template` seed corpora
+once each (`-runs=0`); it runs no fuzz campaign for any target. A bounded smoke result must cite its own non-controller host, command,
 elapsed time and artifacts, never CI compile (or seed replay) alone.
 
 ## Crashes and evidence

@@ -2111,9 +2111,9 @@ jobs:
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
       # Builds all twenty-two libFuzzer targets. No campaign or generated corpus
-      # output; the existing weekly run replays the bounded eventsub_delivery
-      # and helix_token seeds below. Bounded vote_kick and helix_token smokes
-      # are manual (README).
+      # output; the existing weekly run replays the bounded eventsub_delivery,
+      # helix_token, and custom_command_template seeds below. Bounded vote_kick
+      # and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under

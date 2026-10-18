@@ -7,9 +7,11 @@
 //! - Oversized templates fail as bounded `TemplateError::InvalidLength`,
 //!   measured in UTF-16 units (legacy `string.length`); length refusal comes
 //!   first, before any placeholder inspection.
-//! - Degenerate brace shapes (`{}`, `{User}`, `{user-name}`, unclosed or
-//!   doubled braces) are literal text: they validate clean and render
-//!   byte-identical, never panicking on any byte path.
+//! - Degenerate brace shapes (`{}`, `{User}`, `{user-name}`, or unclosed
+//!   braces) are literal text: they validate clean and render byte-identical,
+//!   never panicking on any byte path. A doubled opening brace before a known
+//!   placeholder leaves the first brace literal and substitutes the inner
+//!   placeholder once (for example, `{{user}}` renders as `{<user>}`).
 //! - Placeholder extraction is total-bounded: at most `MAX_PLACEHOLDERS`
 //!   distinct keys in first-seen order, deterministic; validation refuses
 //!   unknown keys with the exact offending key and never reports
@@ -191,9 +193,10 @@ fn hostile_expansion_refuses_as_bounded_render_too_long() {
     };
     match render_template(&"{user}".repeat(500), &big) {
         Err(TemplateError::RenderTooLong(len)) => {
-            assert!(
-                len > MAX_RENDERED_CHARS,
-                "RenderTooLong only past the ceiling, got {len}"
+            assert_eq!(
+                len,
+                big.user.len(),
+                "byte tripwire must refuse before a second hostile expansion, got {len}"
             );
         }
         other => panic!("expected bounded RenderTooLong, got {other:?}"),
