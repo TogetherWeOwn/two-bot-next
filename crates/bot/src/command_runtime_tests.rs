@@ -3157,9 +3157,12 @@ async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fe
         assert!(pipeline.handle(&event).await.unwrap().is_empty());
         runtime.on_interaction(interaction).await;
     }
+    // The routed board reads the current season only: lifetime stays empty,
+    // so every row below must come from `member_season_xp`.
+    let season = two_bot_core::leveling::season_id_for_ms(now_millis_for_test());
     for member in 77..89 {
-        sqlx::query("INSERT INTO member_levels (guild_id,member_id,xp,imported_xp,updated_at) VALUES ($1,$2,$3,$3,NOW())")
-            .bind(GUILD_S).bind(member.to_string()).bind(i64::from(member))
+        sqlx::query("INSERT INTO member_season_xp (guild_id,season_id,member_id,seasonal_xp,updated_at) VALUES ($1,$2,$3,$4,NOW())")
+            .bind(GUILD_S).bind(&season).bind(member.to_string()).bind(i64::from(member))
             .execute(db.pool()).await.unwrap();
     }
     runtime.on_interaction(&leaderboard).await;
@@ -3191,7 +3194,10 @@ async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fe
             two_bot_core::leveling::rank_text(name, 0, None, 0, 0)
         );
     }
-    assert_eq!(replies[2]["data"]["content"], "No XP has been earned yet.");
+    assert_eq!(
+        replies[2]["data"]["content"],
+        two_bot_core::leveling::leaderboard_reply_for_season(&[], &season).content
+    );
     for reply in &replies[2..] {
         assert!(reply["data"]["flags"].is_null(), "leaderboard stays public");
         assert_eq!(

@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use twilight_model::{application::interaction::Interaction, gateway::event::Event};
 use two_bot_core::{
-    leveling::{rank_text, LevelRoleReward},
+    leveling::{leaderboard_reply_for_season, rank_text, season_id_for_ms, LevelRoleReward},
     leveling_store as store, HandlerId, MemStore, OnboardingGates, OnboardingMode,
 };
 use two_bot_discord::{
@@ -24,6 +24,12 @@ const CHANNEL: u64 = 300000000000000001;
 
 fn at(seconds: i64) -> String {
     two_bot_core::format_iso_millis(1_786_771_200_000 + seconds * 1000)
+}
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_millis() as i64
 }
 fn user(id: u64) -> Value {
     json!({"id":id.to_string(),"username":"username","global_name":"Global name","discriminator":"0","avatar":null,"bot":false})
@@ -122,9 +128,13 @@ async fn routed_rank_optional_member_and_fixed_public_top_ten_match_legacy() {
         .handle_interaction(&interaction("leaderboard", false), HandlerId::Leaderboard)
         .await
         .unwrap();
+    // The routed board reads the current season only: lifetime stays empty,
+    // so every row below must come from `member_season_xp`.
+    let season = season_id_for_ms(now_ms());
     for offset in 0..12_u64 {
-        sqlx::query("INSERT INTO member_levels (guild_id,member_id,xp,imported_xp,updated_at) VALUES ($1,$2,$3,$3,NOW())")
+        sqlx::query("INSERT INTO member_season_xp (guild_id,season_id,member_id,seasonal_xp,updated_at) VALUES ($1,$2,$3,$4,NOW())")
             .bind(GUILD.to_string())
+            .bind(&season)
             .bind((MEMBER + offset).to_string())
             .bind(100_i64 + offset as i64)
             .execute(&db.pool)
@@ -160,7 +170,10 @@ async fn routed_rank_optional_member_and_fixed_public_top_ten_match_legacy() {
         rank_text("username", 0, None, 0, 0)
     );
     assert_eq!(body[0]["data"]["flags"], 64);
-    assert_eq!(body[2]["data"]["content"], "No XP has been earned yet.");
+    assert_eq!(
+        body[2]["data"]["content"],
+        leaderboard_reply_for_season(&[], &season).content
+    );
     assert_eq!(body[3]["data"]["allowed_mentions"]["parse"], json!([]));
     assert_eq!(
         body[3]["data"]["content"].as_str().unwrap().lines().count(),
