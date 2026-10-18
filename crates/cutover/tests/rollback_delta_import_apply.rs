@@ -33,7 +33,10 @@ struct TestDb {
 }
 
 impl TestDb {
-    async fn new(role: &str, migrations: &[&str]) -> TestResult<Self> {
+    async fn new(
+        role: &str,
+        migrations: &[&str],
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let name = format!(
             "two_bot_test_rbapply_{role}_{}_{}_{}",
             std::process::id(),
@@ -70,7 +73,7 @@ impl TestDb {
         options: sqlx::postgres::PgConnectOptions,
         name: &str,
         migrations: &[&str],
-    ) -> TestResult<Self> {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_with(options)

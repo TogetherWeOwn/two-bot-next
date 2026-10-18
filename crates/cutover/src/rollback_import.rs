@@ -287,7 +287,7 @@ pub async fn apply_import(
             seen.push(&row.table);
         }
     }
-    advance_owned_sequences(&mut *tx, &seen).await?;
+    advance_owned_sequences(&mut tx, &seen).await?;
     tx.commit().await?;
     let total = rows.len() as u64;
     Ok(ApplyOutcome {
