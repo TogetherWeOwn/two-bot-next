@@ -56,6 +56,7 @@ use crate::command_runtime::{
     actor_id, ephemeral, feed_add_options, feed_remove_option, new_id, router_with_commands,
     sticky_options, CommandRuntime, RegistrySyncError,
 };
+use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::MemberRuntime;
 use crate::privacy_command::{privacy_action, PrivacyAction};
 use crate::schedule_runtime::{schedule_options, schedule_remove_option};
@@ -845,6 +846,249 @@ async fn activation_boot_from_env_fixture() {
     }
 }
 
+/// Process-isolated fixture evidence for the two `run()` call-site guards the
+/// port record flags as fixture-only: the `SelfRoles` match arm gating
+/// `SelfRoleService::from_env` on `(gateway_prerequisites, store, permitted)`
+/// and the `Automod`-permitted fence before `automod_gateway::resolve`. Each
+/// case runs in an isolated child process with a cleared environment,
+/// following `activation_boot_from_env_isolates_denied_moderation_validation`.
+/// The fixture calls the real `crate::gateway_prerequisites` plus the
+/// permission fence and constructors, and pins the exact
+/// `live activation refused` log line plus narrow-not-throw per call site. It
+/// does not execute `run()`, so a deleted or inverted guard in `run()` would
+/// not fail this test; it pins the composition behavior the guards implement.
+/// No boot/intent/gateway semantics change.
+#[test]
+fn activation_boot_call_sites_narrow_refused_guards() {
+    const VALID_PANELS: &str = r#"[{"id":"games","channelId":"10000000000000007","messageId":"10000000000000008","mode":"button","options":[{"key":"chess","label":"Chess","roleId":"10000000000000004","permissions":"0"}]}]"#;
+    for (guild, token, owen, protected_roles, panels, expected) in [
+        // Staging pair with a valid catalogue: both guards permit, both
+        // construct as today.
+        (
+            "1545644954272137297",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "123456789012345678",
+            "",
+            VALID_PANELS,
+            "permitted-constructs",
+        ),
+        // Live pair: the reviewed self_roles clearance stays while automod
+        // refuses and never resolves, even with vars that would fail
+        // validation once permitted.
+        (
+            "326474832151838730",
+            "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+            "",
+            "invalid",
+            VALID_PANELS,
+            "live-automod-refused",
+        ),
+        // Unknown guild: both refuse; invalid vars prove narrow-not-throw.
+        (
+            "1555555555555555555",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "",
+            "invalid",
+            "not-json",
+            "both-refused",
+        ),
+        // Control: the same invalid vars under a permitted identity fail
+        // loudly, so the refused narrow comes from the guard, not the vars.
+        (
+            "1545644954272137297",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "",
+            "invalid",
+            "not-json",
+            "permitted-validates",
+        ),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "command_runtime_tests::activation_boot_call_site_fixture",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("ACTIVATION_CALL_SITE_EXPECTED", expected)
+            .env("GUILD_ID", guild)
+            .env("DISCORD_TOKEN", token)
+            .env(
+                "DATABASE_URL",
+                "postgres://agent_test@agent-testdb:5432/agent_test",
+            )
+            .env("DISCORD_API_BASE", "http://127.0.0.1:9")
+            .env("TWO_MODERATION", "1")
+            .env("TWO_OWEN_USER_ID", owen)
+            .env("TWO_MODERATION_PROTECTED_ROLE_IDS", protected_roles)
+            .env("TWO_AUTOMOD", "1")
+            .env("TWO_SELF_ROLE_PANELS", panels)
+            .env("TWO_SELF_ROLE_DRY_RUN", "0")
+            .output()
+            .expect("isolated call-site fixture");
+        assert!(
+            output.status.success(),
+            "fixture {expected}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("1 passed"));
+        // The marker goes to stderr (`print_stdout` is denied workspace-wide):
+        // its presence proves the child ran this case's arm instead of
+        // early-returning with the env var unset.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("CALL_SITE") && stderr.contains(expected),
+            "fixture {expected} must emit its summary line"
+        );
+    }
+}
+
+#[tokio::test]
+async fn activation_boot_call_site_fixture() {
+    let Ok(expected) = std::env::var("ACTIVATION_CALL_SITE_EXPECTED") else {
+        return;
+    };
+    // Capture the boot refusal lines: `log_refusals` is the only writer in
+    // this process, so the buffer holds exactly this identity's refusals.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let capture = Capture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let config = two_bot_core::Config::from_env().unwrap();
+    let guild = config.guild_id.unwrap();
+    let activation = crate::activation::BootActivation::from_config(&config);
+    activation.log_refusals();
+    let log = String::from_utf8(capture.0.lock().expect("capture lock").clone()).unwrap();
+
+    let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+    // Mirror the `SelfRoles` match arm in `run()`: the real
+    // `crate::gateway_prerequisites` plus a present store gate the permission
+    // check, and only the permitted path reaches catalogue parsing, the first
+    // fallible step of `SelfRoleService::from_env`. No pool is built here; the
+    // fixture stops at parsing, so the store is treated as present and the
+    // permission fence is the varying input.
+    let prerequisites_ok = crate::gateway_prerequisites(&config).is_ok();
+    let self_permitted = activation.permitted(two_bot_core::activation::LiveCapability::SelfRoles);
+    let automod_permitted = activation.permitted(two_bot_core::activation::LiveCapability::Automod);
+    let mut self_constructed = false;
+    let self_gates = if prerequisites_ok && self_permitted {
+        self_constructed = true;
+        Some(two_bot_core::self_roles::SelfRoleGates::from_map(&vars))
+    } else {
+        None
+    };
+    // Mirror the `Automod`-permitted fence in `run()`: a refused automod
+    // capability is never resolved or validated; the refusal was already
+    // logged once above.
+    let mut automod_resolved = false;
+    let automod_config = if automod_permitted {
+        automod_resolved = true;
+        Some(crate::automod_gateway::resolve(&vars, guild))
+    } else {
+        None
+    };
+
+    match expected.as_str() {
+        "permitted-constructs" => {
+            assert!(self_permitted && automod_permitted);
+            assert!(
+                !log.contains("live activation refused"),
+                "staging permits every capability, so nothing is refused"
+            );
+            let gates = self_gates.expect("permitted self-roles reaches parsing");
+            let gates = gates.expect("valid panels parse");
+            assert!(!gates.panels.is_empty());
+            let resolved = automod_config.expect("permitted automod reaches resolve");
+            assert!(
+                resolved.expect("valid automod resolves").is_some(),
+                "permitted automod constructs as today"
+            );
+        }
+        "live-automod-refused" => {
+            assert!(
+                self_permitted,
+                "live pair keeps the reviewed self_roles clearance"
+            );
+            assert!(!automod_permitted);
+            assert!(log.contains("live activation refused"));
+            assert!(log.contains("automod"));
+            assert!(
+                !log.contains("self_roles"),
+                "permitted self_roles logs no refusal"
+            );
+            let gates = self_gates.expect("permitted self-roles reaches parsing");
+            assert!(
+                !gates.expect("valid panels parse").panels.is_empty(),
+                "permitted self-roles constructs as today"
+            );
+            assert!(
+                !automod_resolved,
+                "refused automod never resolves or validates"
+            );
+            assert!(
+                automod_config.is_none(),
+                "refused automod narrows, not throws"
+            );
+        }
+        "both-refused" => {
+            assert!(!self_permitted && !automod_permitted);
+            assert!(log.contains("live activation refused"));
+            assert!(log.contains("self_roles"));
+            assert!(log.contains("automod"));
+            assert!(
+                !self_constructed,
+                "refused SelfRoles composes no SelfRoleService"
+            );
+            assert!(self_gates.is_none());
+            assert!(
+                !automod_resolved,
+                "refused Automod never resolves or validates"
+            );
+            assert!(
+                automod_config.is_none(),
+                "refused automod narrows, not throws"
+            );
+        }
+        "permitted-validates" => {
+            assert!(self_permitted && automod_permitted);
+            assert!(
+                self_gates
+                    .expect("permitted self-roles reaches parsing")
+                    .is_err(),
+                "invalid panels fail once permitted"
+            );
+            assert!(
+                automod_config
+                    .expect("permitted automod reaches resolve")
+                    .is_err(),
+                "invalid automod vars fail once permitted"
+            );
+        }
+        other => panic!("unknown call-site expectation {other}"),
+    }
+    // `eprintln!`: `clippy::print_stdout` is denied workspace-wide, and the
+    // parent reads this marker from the child's stderr.
+    eprintln!("CALL_SITE {expected} self_permitted={self_permitted} automod_permitted={automod_permitted}");
+}
+
 #[test]
 fn sticky_options_extract_body_and_debounce() {
     let interaction = slash(
@@ -1191,6 +1435,12 @@ async fn member_verbs_reach_executor_facts_then_fail_closed_without_db() {
 
 #[tokio::test]
 async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
+    // Serialize with the website exact-delta `refused` tests in
+    // `internal_action_http::tests` (TOG-28482): this test records
+    // `kick/refused` (and the other member verbs) on the process-global
+    // registry via `preflight_refused`, and `cargo test --workspace --lib
+    // --bins` runs both modules as threads of one process.
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let json_response = |body: serde_json::Value| RestResponse {
             status: 200,

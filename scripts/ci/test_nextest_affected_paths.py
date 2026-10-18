@@ -33,7 +33,7 @@ job_inputs = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(job_inputs)
 
 # Pinned selector action: a moved tag would change what "affected" means.
-DORNY_PIN = "dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad"  # v3.0.4
+DORNY_PIN = "dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d"  # v4.0.3
 
 # Every path here can change what the nextest lane executes: sources, the
 # compiled-in fixtures, manifests, the nextest profile, the lane definition

@@ -257,6 +257,7 @@ jobs:
         run: |
           python3 scripts/check_run_record.py --record scripts/fixtures/staging_e2e_run_record_mock.json --allow-mock
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_no_echo_acceptance.py' -v
 
       - name: Validate voice template fixtures (hermetic, no renderer)
         run: |
@@ -701,7 +702,7 @@ jobs:
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
         # The publication regression has its own guarded DB and actual binary
         # in the dedicated step below; never feed it the round-trip fixture URL.
-        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump --skip per_route_bucket_headers_gate_same_bucket_without_hardcoded_limits --skip independent_workers_share_global_pacing --skip reset_after_header_drives_sleep_then_retry_with_no_request_during_pause --skip shared_scope_429_does_not_spend_invalid_budget_while_others_do --skip header_absent_responses_keep_conservative_spacing --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
+        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
 
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).
@@ -2080,7 +2081,7 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Builds all sixteen libFuzzer targets. No campaign or generated corpus
+      # Builds all nineteen libFuzzer targets. No campaign or generated corpus
       # output; the existing weekly run replays only the bounded eventsub_delivery
       # seeds below. Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
@@ -2090,15 +2091,19 @@ jobs:
       - name: Compile-only fuzz build (no execution)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz build
-      # Bounded seed replay, eventsub_delivery only: `-runs=0` executes each
-      # committed corpus seed exactly once (plus the target's fixed matrix)
-      # and exits without fuzzing. A signing-key drift between the harness
-      # and production, or seed misrouting, panics an assertion here instead
-      # of passing a compile-only gate. Compile stays the only gate for the
-      # other fifteen targets.
+      # Bounded seed replay, eventsub_delivery and helix_token: `-runs=0`
+      # executes each committed corpus seed exactly once (plus the target's
+      # fixed matrix) and exits without fuzzing. A signing-key drift between
+      # the harness and production, a token-contract drift between the
+      # helix_token oracle and the parser, or seed misrouting panics an
+      # assertion here instead of passing a compile-only gate. Compile stays
+      # the only gate for the other seventeen targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
+      - name: Seed replay for helix_token (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run helix_token -- -runs=0 -timeout=10 -rss_limit_mb=2048
 
   worker:
     name: worker check
