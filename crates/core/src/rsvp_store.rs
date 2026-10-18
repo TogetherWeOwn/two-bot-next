@@ -119,7 +119,7 @@ async fn upsert_rsvp_row(
     )
     .bind(&record.guild_id)
     .bind(&record.event_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     // FOR UPDATE cannot lock an absent row. Serialize the complete identity
     // first; tuple encoding avoids delimiter ambiguity, and a hash collision
@@ -131,7 +131,7 @@ async fn upsert_rsvp_row(
     .bind(&record.guild_id)
     .bind(&record.event_id)
     .bind(&record.user_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     let previous: Option<(String, sqlx::types::time::OffsetDateTime)> = sqlx::query_as(
         "SELECT status, responded_at FROM event_rsvps
@@ -140,7 +140,7 @@ async fn upsert_rsvp_row(
     .bind(&record.guild_id)
     .bind(&record.event_id)
     .bind(&record.user_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     // Per-user rate first (caller behavior), then the event admission cap.
     // The window buckets on the write's own timestamp, not the database
@@ -157,7 +157,7 @@ async fn upsert_rsvp_row(
     .bind(&record.user_id)
     .bind(RSVP_AUDIT_ACTION)
     .bind(&record.responded_at)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     if recent >= MAX_RSVP_WRITES_PER_USER_PER_MINUTE {
         return Err(RsvpStoreError::RsvpRateLimited);
@@ -168,7 +168,7 @@ async fn upsert_rsvp_row(
         )
         .bind(&record.guild_id)
         .bind(&record.event_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         if members >= MAX_RSVPS_PER_EVENT {
             return Err(RsvpStoreError::EventAtCapacity);
@@ -185,7 +185,7 @@ async fn upsert_rsvp_row(
     .bind(&record.user_id)
     .bind(record.status.as_str())
     .bind(&record.responded_at)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     Ok(previous)
 }
