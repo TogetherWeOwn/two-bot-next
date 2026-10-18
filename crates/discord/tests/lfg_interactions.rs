@@ -1037,13 +1037,12 @@ async fn direct_replay_retries_refresh_without_duplicating_signup_audit_or_resur
     let db = TestDb::new().await;
     let post = "lfg-8401";
     open_post_with_message(&db.pool, post, "5000").await;
+    // Callback defers accept 204 or a 200 JSON receipt; the refresh PATCH
+    // needs only a 200 status; the follow-up webhook edit needs a 200 JSON
+    // receipt with an id. One scripted 204 plus the JSON default covers all
+    // six routed calls (callback, refresh, webhook edit per handle).
     let mock = MockRest::start(
-        vec![
-            ScriptedResponse::status(204),
-            ScriptedResponse::status(200),
-            ScriptedResponse::status(204),
-            ScriptedResponse::status(200),
-        ],
+        vec![ScriptedResponse::status(204)],
         ScriptedResponse::json(200, json!({"id": "5900"})),
     )
     .await;
