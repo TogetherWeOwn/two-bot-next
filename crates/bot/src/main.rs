@@ -44,6 +44,8 @@ mod eventsub_reconcile;
 mod fast_burn_page_tests;
 mod feed_jobs;
 mod gateway;
+#[cfg(test)]
+mod slow_burn_ticket_tests;
 // Bounded reconnect schedule and runner: no runtime caller yet. Test-only
 // until the gateway loop adopts it, so it lives in test builds instead of
 // shipping dead code to the container.
