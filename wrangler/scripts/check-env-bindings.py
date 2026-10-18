@@ -114,6 +114,13 @@ OPS_KILLSWITCH_ENVS = {"staging"}
 DEPLOY_ENV_VAR = "TWO_DEPLOY_ENV"
 DEPLOY_ENV_ENVS = {"staging"}
 GATEWAY_FAIL_INJECTION_VAR = "TWO_GATEWAY_READINESS_FAIL_INJECTION"
+# Remediation-drill fence (staging fault injector): the same generated-only
+# rule as the rollback-drill switch above. Either switch committed anywhere —
+# staging included — fails; only the generated per-deploy staging config from
+# a manual drill dispatch may carry them, so a toml change alone can never
+# arm (or leave armed) a synthetic stall or unpaired disconnect.
+VOICE_STALL_FAULT_VAR = "TWO_VOICE_STALL_FAULT_INJECTION"
+UNPAIRED_FAULT_VAR = "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"
 
 
 def check(path: Path) -> list[str]:
@@ -236,6 +243,12 @@ def _collect_errors(cfg: dict) -> list[str]:
                 f"{prefix}: {GATEWAY_FAIL_INJECTION_VAR} must never be a committed var "
                 "(only the generated staging deploy config from a manual drill dispatch may carry it)"
             )
+        for fault_var in (VOICE_STALL_FAULT_VAR, UNPAIRED_FAULT_VAR):
+            if fault_var in variables:
+                errors.append(
+                    f"{prefix}: {fault_var} must never be a committed var "
+                    "(only the generated staging deploy config from a manual drill dispatch may carry it)"
+                )
         for key in sorted(k for k in variables if k.startswith(RECEIVER_CONFIG_PREFIX)):
             errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
         for key in sorted(
