@@ -3040,21 +3040,26 @@ fn wire_headers(headers: &HeaderMap) -> Result<WireHeaders<'_>, Failure> {
         ));
     }
     if let Some(length) = one_header(headers, header::CONTENT_LENGTH.as_str(), 20)? {
-        match length.parse::<usize>() {
-            Ok(length) if length <= MAX_BODY_BYTES => {}
-            _ => {
-                return Err(Failure::http(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "malformed",
-                    false,
-                    ErrorCode::Malformed,
-                ))
-            }
+        // Wire grammar is digits only: `usize` parsing would accept a leading
+        // `+`, which is not a digit on the wire. Refuse with the existing
+        // fixed vocabulary, never echoing the value.
+        let usable = !length.is_empty()
+            && length.bytes().all(|b| b.is_ascii_digit())
+            && matches!(length.parse::<usize>(), Ok(n) if n <= MAX_BODY_BYTES);
+        if !usable {
+            return Err(Failure::http(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "malformed",
+                false,
+                ErrorCode::Malformed,
+            ));
         }
     }
     let required = |name, max| {
+        // A whitespace-only value carries no credential material: treat it as
+        // the existing missing-header refusal (`unauthorized`), not as present.
         one_header(headers, name, max)?
-            .filter(|v| !v.is_empty())
+            .filter(|v| !v.trim().is_empty())
             .ok_or_else(|| Failure::code(ErrorCode::Unauthorized))
     };
     Ok(WireHeaders {
@@ -3292,3 +3297,7 @@ pub(crate) static MODERATION_METRICS_LOCK: tokio::sync::Mutex<()> =
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "internal_action_envelope_tests.rs"]
+mod internal_action_envelope_tests;

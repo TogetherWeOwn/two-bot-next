@@ -142,6 +142,54 @@ fn fuzz_shapes_malformed_data_envelopes_fail_bounded() {
     }
 }
 
+/// Deep nesting fails closed without panic: a `data` object nested far past
+/// any reasonable depth is still a non-array envelope, hostile nesting inside
+/// a valid `data` array only filters entries, and bytes nested past
+/// `serde_json`'s recursion limit are a malformed page.
+#[test]
+fn fuzz_shapes_deeply_nested_envelopes_fail_closed_or_filter() {
+    // A `data` object nested 200 levels deep is still not a `data` array.
+    // Pre-fix this read as an empty list; now it is a bounded error.
+    let mut nested: Value = json!(1);
+    for _ in 0..200 {
+        nested = json!({"nest": nested});
+    }
+    let document = json!({"data": nested});
+    let error = validate_subscription_listing_page(&document)
+        .expect_err("deeply nested object data must not validate");
+    assert_bounded_envelope_error(
+        &error,
+        "subscription listing has no data array",
+        "deeply nested object data",
+    );
+
+    // Hostile nesting inside a valid `data` array only filters entries: the
+    // envelope stays valid and the listing accumulates nothing from it.
+    let mut hostile: Value = json!("leaf");
+    for _ in 0..50 {
+        hostile = json!([hostile]);
+    }
+    let document = json!({"data": [hostile], "pagination": {}});
+    let cursor = validate_subscription_listing_page(&document)
+        .expect("valid envelope with nested entries must validate");
+    assert_eq!(cursor, None, "no cursor in the terminal page");
+    assert!(
+        parse_subscriptions(&document).is_empty(),
+        "nested arrays are not subscriptions and must filter out"
+    );
+
+    // Bytes nested past the JSON recursion limit are a malformed page, never a
+    // panic: the multi-page driver reports `BadResponse`. Arrays nest without
+    // a key so depth alone triggers the parser's recursion limit.
+    let deep = format!("{{\"data\": {}1{}}}", "[".repeat(300), "]".repeat(300));
+    let error = run_listing(&[deep.as_bytes()])
+        .expect_err("over-nested bytes must fail as a malformed page");
+    assert!(
+        matches!(error, HelixError::BadResponse(_)),
+        "over-nested bytes must fail closed with BadResponse, got: {error:?}"
+    );
+}
+
 #[test]
 fn fuzz_shapes_unusable_cursors_fail_bounded() {
     for (shape, cursor) in [

@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -811,6 +812,108 @@ def make_repo():
 
 
 class GitPlumbingTests(unittest.TestCase):
+    def rename_errors(self, old_path, new_path):
+        tmp, root, env = make_repo()
+        self.addCleanup(tmp.cleanup)
+        source, target = root / old_path, root / new_path
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("#[test]\nfn it_works() { assert_eq!(1, 1); }\n")
+        git("add", ".", cwd=root)
+        git("commit", "-m", "test fixture", cwd=root, env=env)
+        base = head_sha(root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        git("mv", old_path, new_path, cwd=root)
+        git("commit", "-m", "rename fixture", cwd=root, env=env)
+        return gate.check(root, base, head_sha(root))
+
+    def test_rename_to_non_runnable_suffix_deletes_test(self):
+        old_path = "crates/core/tests/store.rs"
+        for name in ("store.md", "store.txt", "store.rs.disabled", "store.RS"):
+            with self.subTest(name=name):
+                errors = self.rename_errors(old_path, "crates/core/tests/" + name)
+                self.assertTrue(
+                    any("deleted-test" in e and old_path in e for e in errors), errors
+                )
+
+    def test_non_crate_rename_to_non_runnable_suffix_deletes_test(self):
+        # Outside crates/, the integration-target clause cannot mask a
+        # regression in the suffix check for the broader test-path model.
+        old_path = "tools/tests/store.rs"
+        errors = self.rename_errors(old_path, "tools/tests/store.txt")
+        self.assertTrue(
+            any("deleted-test" in e and old_path in e for e in errors), errors
+        )
+
+    def test_markdown_destination_never_preserves_test_scope(self):
+        # Pin the markdown clause independently of a suffix change: the
+        # guard's broad test-path heuristic also covers files under tests/.
+        old_path = "crates/core/tests/store.md"
+        errors = self.rename_errors(old_path, "crates/core/tests/renamed.md")
+        self.assertTrue(
+            any("deleted-test" in e and old_path in e for e in errors), errors
+        )
+
+    def test_integration_rename_to_test_named_source_deletes_test(self):
+        old_path = "crates/core/tests/test_store.rs"
+        for new_path in (
+            "crates/core/src/test_store.rs",
+            "crates/core/src/store_tests.rs",
+            "crates/core/src/gateway_tests/store.rs",
+        ):
+            with self.subTest(new_path=new_path):
+                errors = self.rename_errors(old_path, new_path)
+                self.assertTrue(
+                    any("deleted-test" in e and old_path in e for e in errors), errors
+                )
+
+    def test_rename_between_integration_tests_preserves_test(self):
+        self.assertEqual(
+            self.rename_errors(
+                "crates/core/tests/test_store.rs", "crates/core/tests/renamed.rs"
+            ),
+            [],
+        )
+
+    def test_copy_status_consumes_both_paths_without_deleting_source(self):
+        stream = (
+            "C100\0crates/core/tests/test_store.rs\0src/test_store.rs\0"
+            "M\0src/main.rs\0D\0crates/core/tests/deleted.rs\0"
+            "R100\0crates/core/tests/old.rs\0crates/core/tests/new.rs\0"
+        )
+        with mock.patch.object(
+            gate, "_git", side_effect=[
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, stream, ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+        ):
+            added_lines, removed_lines, deleted = gate.collect(ROOT, "base")
+        self.assertEqual(added_lines, [])
+        self.assertEqual(removed_lines, [])
+        self.assertEqual(deleted, ["crates/core/tests/deleted.rs"])
+
+    def test_git_collection_failures_raise_and_exit_2(self):
+        tmp, root, _ = make_repo()
+        self.addCleanup(tmp.cleanup)
+        real_git = gate._git
+        for command, option in (
+            ("diff", "--unified=0"),
+            ("diff", "--name-status"),
+            ("ls-files", "--others"),
+        ):
+            with self.subTest(command=command, option=option):
+                def failing_git(cwd, *args):
+                    if args[0] == command and option in args:
+                        return subprocess.CompletedProcess([], 128, "", "failed")
+                    return real_git(cwd, *args)
+
+                with mock.patch.object(gate, "_git", side_effect=failing_git):
+                    with self.assertRaisesRegex(ValueError, "git .* failed.*128"):
+                        gate.collect(root, "HEAD")
+                    with self.assertRaises(SystemExit) as ctx:
+                        gate.main(["--root", str(root), "--base-ref", "HEAD"])
+                    self.assertEqual(ctx.exception.code, 2)
+
     def test_missing_base_raises_no_merge_base(self):
         tmp, root, _ = make_repo()
         try:

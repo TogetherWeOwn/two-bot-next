@@ -149,6 +149,15 @@ impl ScriptTransport {
         })
     }
 
+    /// A 200 answer carrying raw `body` bytes verbatim (for inputs that are
+    /// not necessarily decodable JSON, e.g. over-nested payloads).
+    fn ok_raw(body: Vec<u8>) -> Result<HelixResponse, HelixError> {
+        Ok(HelixResponse {
+            status: StatusCode::OK,
+            body,
+        })
+    }
+
     fn status(status: StatusCode) -> Result<HelixResponse, HelixError> {
         Ok(HelixResponse {
             status,
@@ -321,6 +330,37 @@ async fn malformed_later_page_rejects_the_entire_listing() {
             "{shape}: token plus both listing pages were fetched"
         );
     }
+}
+
+/// A listing body nested past the JSON recursion limit fails the whole listing
+/// closed: no panic, no partial reads, zero subscription mutations.
+#[tokio::test]
+async fn deeply_nested_listing_body_fails_closed_without_mutations() {
+    // Arrays nest without a key so depth alone triggers the parser's limit.
+    let deep_body = format!("{{\"data\": {}1{}}}", "[".repeat(300), "]".repeat(300)).into_bytes();
+    let log = CallLog::default();
+    let mut client = client_with(
+        vec![
+            ScriptTransport::token_answer(),
+            ScriptTransport::ok_raw(deep_body),
+        ],
+        log.clone(),
+    );
+    let error = client
+        .list_subscriptions()
+        .await
+        .expect_err("an over-nested listing body must fail closed, not read as empty");
+    assert_bounded_listing_error(&error, "over-nested listing body");
+    assert_eq!(
+        log.mutation_count(),
+        0,
+        "invalid evidence must cause zero create/delete calls"
+    );
+    assert_eq!(
+        log.requests().len(),
+        2,
+        "exactly the token call and one listing call, no retries"
+    );
 }
 
 /// Regression pin: a valid multipage listing still accumulates every page,
