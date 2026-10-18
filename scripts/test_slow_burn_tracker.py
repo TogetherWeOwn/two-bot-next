@@ -459,39 +459,111 @@ class TrackerUnitTests(unittest.TestCase):
         self.assertEqual(stored["cadence"], "ok")
         self.assertEqual(stored["uncovered_seconds"], 3600)
 
-    def test_unknown_without_sidecar_stays_quiet(self):
-        # A fresh install never recorded coverage: silence, not a warning.
-        now = 1_700_000_000
+    def drive_unknown_loop(self, step, runs, start=1_700_000_000):
+        """Drive live unknown runs from an empty ring with no sidecar.
+
+        Mocks the scrape and the verdict (always uncovered) so the loop
+        proves the tracker warning, not the evaluator: the evaluator pins
+        that 420/590 s spacings stay uncovered in the driver tests below.
+        Returns (warn_chunks, last_evidence, ring_path, coverage_path).
+        """
         ring_path = self.dir / "ring.json"
-        ring_path.write_text(json.dumps(
-            [{"t": now - 420, "received": 25, "duplicate": 0, "fastMoves": 24}]),
-            encoding="utf-8")
+        coverage_path = self.dir / "coverage.json"
         evidence = str(self.dir / "evidence.json")
         env = base_env({"STAGING_WORKER_URL": "https://staging.example",
                         "METRICS_SCRAPE_TOKEN": "token"})
-        next_ring = [{"t": now, "received": 50, "duplicate": 0, "fastMoves": 48}]
-        uncovered = {"slow": False, "fast": False, "held": False,
-                     "ring": next_ring, "slowCovered": False}
-        writes = []
+
+        def uncovered_driver(*args, **kwargs):
+            tick = int(tracker.time.time())
+            return {"slow": False, "fast": False, "held": False,
+                    "ring": [{"t": tick, "received": 50,
+                              "duplicate": 0, "fastMoves": 48}],
+                    "slowCovered": False}
+
+        warn_chunks = []
+        last_writes = []
         with mock.patch.object(tracker, "scrape_metrics", return_value="expo"):
-            with mock.patch.object(tracker, "run_driver", return_value=uncovered):
-                with mock.patch("sys.stdout") as stdout:
-                    with mock.patch.object(tracker.time, "time", return_value=now):
-                        code = tracker.main(
-                            ["--ring", str(ring_path), "--coverage-path",
-                             str(self.dir / "coverage.json"),
-                             "--evidence-out", evidence,
-                             "--exposition-out", str(self.dir / "expo.prom")],
-                            env)
-                    for call in stdout.write.call_args_list:
-                        writes.append(call.args[0])
-        self.assertEqual(code, 0)
-        self.assertFalse(any("::warning::" in chunk for chunk in writes),
-                         f"missing sidecar must not warn, got {writes!r}")
+            with mock.patch.object(tracker, "run_driver",
+                                   side_effect=uncovered_driver):
+                for index in range(runs):
+                    tick = start + index * step
+                    with mock.patch.object(tracker.time, "time",
+                                            return_value=tick):
+                        with mock.patch("sys.stdout") as stdout:
+                            code = tracker.main(
+                                ["--ring", str(ring_path), "--coverage-path",
+                                 str(coverage_path), "--evidence-out", evidence,
+                                 "--exposition-out",
+                                 str(self.dir / "expo.prom")],
+                                env)
+                    self.assertEqual(code, 0)
+                    last_writes = [call.args[0] for call in
+                                   stdout.write.call_args_list]
+                    warn_chunks = [chunk for chunk in last_writes
+                                   if "::warning::" in chunk]
         stored = json.loads(Path(evidence).read_text())
+        return warn_chunks, stored, ring_path, coverage_path
+
+    def test_never_covered_420s_loop_warns_after_warmup(self):
+        # The review repro: steady 420 s from an empty ring never covers,
+        # so the first seed must still warn once ~6.5 h have passed.
+        warns, stored, _, coverage_path = self.drive_unknown_loop(
+            step=420, runs=60)
+        self.assertTrue(
+            any("no covered" in chunk for chunk in warns),
+            f"steady 420 s from empty must warn, got {warns!r}")
+        self.assertEqual(stored["verdict"], "unknown")
+        self.assertEqual(stored["cadence"], "coarse")
+        self.assertGreaterEqual(stored["uncovered_seconds"],
+                                tracker.UNCOVERED_WARN_SECONDS)
+        seeded = json.loads(Path(coverage_path).read_text())
+        self.assertEqual(seeded.get("tracking_since"), 1_700_000_000)
+
+    def test_never_covered_590s_loop_warns_after_warmup(self):
+        # Just under the 600 s entry-age tripwire: same silence at first,
+        # then the same seeded warning once the install is ~6.5 h old.
+        warns, stored, _, coverage_path = self.drive_unknown_loop(
+            step=590, runs=45)
+        self.assertTrue(
+            any("no covered" in chunk for chunk in warns),
+            f"steady 590 s from empty must warn, got {warns!r}")
+        self.assertEqual(stored["verdict"], "unknown")
+        self.assertEqual(stored["cadence"], "coarse")
+        self.assertGreaterEqual(stored["uncovered_seconds"],
+                                tracker.UNCOVERED_WARN_SECONDS)
+        seeded = json.loads(Path(coverage_path).read_text())
+        self.assertEqual(seeded.get("tracking_since"), 1_700_000_000)
+
+    def test_healthy_300s_warmup_stays_quiet_before_threshold(self):
+        # Warm-up takes ~6 h: 5 h of 300 s unknowns must not warn yet, so
+        # a healthy install keeps its margin before first coverage lands.
+        warns, stored, _, _ = self.drive_unknown_loop(step=300, runs=60)
+        self.assertEqual(warns, [])
         self.assertEqual(stored["verdict"], "unknown")
         self.assertEqual(stored["cadence"], "ok")
-        self.assertIsNone(stored["uncovered_seconds"])
+        self.assertLess(stored["uncovered_seconds"],
+                        tracker.UNCOVERED_WARN_SECONDS)
+
+    def test_tracking_seed_preserves_covered_moment(self):
+        # Seeding must not clobber an existing covered moment, and a covered
+        # run must keep the tracking start while refreshing the cover time.
+        now = 1_700_000_000
+        path = self.dir / "coverage.json"
+        path.write_text(json.dumps({"last_covered": now - 3600}),
+                        encoding="utf-8")
+        tracker.seed_tracking_since(str(path), now)
+        self.assertEqual(tracker.load_covered_at(str(path)), now - 3600)
+        self.assertIsNone(tracker.load_tracking_since(str(path)))
+        tracker.save_covered_at(str(path), now)
+        fresh = json.loads(path.read_text())
+        self.assertEqual(fresh.get("last_covered"), now)
+        blank = self.dir / "fresh.json"
+        tracker.seed_tracking_since(str(blank), now)
+        self.assertIsNone(tracker.load_covered_at(str(blank)))
+        self.assertEqual(tracker.load_tracking_since(str(blank)), now)
+        tracker.save_covered_at(str(blank), now + 60)
+        self.assertEqual(tracker.load_covered_at(str(blank)), now + 60)
+        self.assertEqual(tracker.load_tracking_since(str(blank)), now)
 
     def test_held_verdict_leaves_coverage_alone(self):
         # Unusable join series decide nothing: the covered moment must
