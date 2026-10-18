@@ -396,14 +396,16 @@ mod tests {
     fn command_gates_use_shared_parsers_and_fail_closed() {
         let mut vars = HashMap::new();
         assert!(GatewayCommandConfig::from_map_for_activation(0, &vars, true).is_err());
-        let config = GatewayCommandConfig::from_map_for_activation(1, &vars, true).unwrap();
+        let config = GatewayCommandConfig::from_map_for_activation(1, &vars, true)
+            .expect("empty settings keep command gates disabled");
         assert!(!config.gates.automations);
         assert!(!config.text_commands);
         assert!(!config.acceptance.permits_automations());
         vars.insert("TWO_AUTOMATIONS".into(), "1".into());
         vars.insert("TWO_TEXT_COMMANDS".into(), "1".into());
         vars.insert("TWO_AUTOMOD".into(), "0".into());
-        let config = GatewayCommandConfig::from_map_for_activation(1, &vars, true).unwrap();
+        let config = GatewayCommandConfig::from_map_for_activation(1, &vars, true)
+            .expect("valid automation flags enable command gates");
         assert!(config.gates.automations && config.text_commands);
         assert!(config.acceptance.permits_automations());
         vars.insert("TWO_MODERATION".into(), "1".into());
