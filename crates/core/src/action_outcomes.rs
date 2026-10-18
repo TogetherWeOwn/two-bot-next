@@ -161,6 +161,30 @@ pub fn unlock_overwrite(allow: u64, deny: u64) -> (u64, u64) {
 /// run for a day.
 #[must_use]
 pub fn retry_after_ms(header_secs: Option<f64>, body_retry_after_secs: Option<f64>) -> u64 {
+    retry_after_ms_inner(header_secs, body_retry_after_secs, true)
+}
+
+/// How long a backfill read parks on a per-route 429, in millis: the same
+/// header/body/padding policy as [`retry_after_ms`] without the
+/// [`MAX_RETRY_AFTER_MS`] clamp, so a long `Retry-After` is waited out in one
+/// sleep instead of retry-storming past it — but still bounded by
+/// [`MAX_BACKFILL_RETRY_AFTER_MS`], so a malformed or hostile value cannot
+/// park a caller for days. Kick/publish lanes and the general `get_json`
+/// read keep the clamped form; only the backfill evidence reads
+/// (`get_json_observed`, `get_json_checked`) use this.
+#[must_use]
+pub fn retry_after_ms_unclamped(
+    header_secs: Option<f64>,
+    body_retry_after_secs: Option<f64>,
+) -> u64 {
+    retry_after_ms_inner(header_secs, body_retry_after_secs, false)
+}
+
+fn retry_after_ms_inner(
+    header_secs: Option<f64>,
+    body_retry_after_secs: Option<f64>,
+    clamp: bool,
+) -> u64 {
     let mut seconds = header_secs.unwrap_or(1.0);
     if let Some(body) = body_retry_after_secs {
         if body.is_finite() {
@@ -170,15 +194,23 @@ pub fn retry_after_ms(header_secs: Option<f64>, body_retry_after_secs: Option<f6
     if !seconds.is_finite() || seconds < 0.0 {
         seconds = 1.0;
     }
-    ((seconds * 1000.0).ceil() as u64)
-        .saturating_add(RETRY_AFTER_PADDING_MS)
-        .min(MAX_RETRY_AFTER_MS)
+    let waited = ((seconds * 1000.0).ceil() as u64).saturating_add(RETRY_AFTER_PADDING_MS);
+    if clamp {
+        waited.min(MAX_RETRY_AFTER_MS)
+    } else {
+        waited.min(MAX_BACKFILL_RETRY_AFTER_MS)
+    }
 }
 
 /// Legacy 250 ms padding added to every 429 wait (`kick.ts`, `rest.ts`).
 pub const RETRY_AFTER_PADDING_MS: u64 = 250;
 /// Legacy clamp on one 429 wait (`MAX_RETRY_AFTER_MS` in `kick.ts`).
 pub const MAX_RETRY_AFTER_MS: u64 = 60_000;
+/// Backfill ceiling on one unclamped 429 wait: long per-route `Retry-After`
+/// values are waited out, but no single wait parks a caller past five
+/// minutes — a malformed or hostile value (even `1e300`, which saturates the
+/// millis conversion) stops here instead of parking for days.
+pub const MAX_BACKFILL_RETRY_AFTER_MS: u64 = 300_000;
 /// Legacy 5xx / transport backoff base (`500 * 2 ** attempt` in `rest.ts`,
 /// `500 * 2 ** (attempts - 1)` in `kick.ts` — the same sequence).
 pub const BACKOFF_BASE_MS: u64 = 500;
@@ -392,6 +424,49 @@ mod tests {
         // Clamp: a malformed retry-after of 86400 must not park the run.
         assert_eq!(retry_after_ms(Some(86_400.0), None), MAX_RETRY_AFTER_MS);
         assert_eq!(retry_after_ms(Some(120.0), None), MAX_RETRY_AFTER_MS);
+    }
+
+    #[test]
+    fn unclamped_backfill_read_waits_out_long_header() {
+        // Backfill reads honor the header past the 60 s kick/publish clamp.
+        assert_eq!(retry_after_ms_unclamped(Some(75.0), None), 75_250);
+        assert_eq!(retry_after_ms_unclamped(Some(2.0), None), 2250);
+        assert_eq!(retry_after_ms_unclamped(Some(5.0), Some(1.5)), 1750);
+        assert_eq!(retry_after_ms_unclamped(None, None), 1250);
+        assert_eq!(retry_after_ms_unclamped(Some(f64::NAN), None), 1250);
+    }
+
+    #[test]
+    fn unclamped_backfill_wait_has_finite_ceiling() {
+        assert_eq!(MAX_BACKFILL_RETRY_AFTER_MS, 300_000);
+        // The specified 75 s wait still passes through in full.
+        assert_eq!(retry_after_ms_unclamped(Some(75.0), None), 75_250);
+        // A plausible-but-huge value stops at the ceiling instead of parking
+        // the caller for a day per attempt.
+        assert_eq!(
+            retry_after_ms_unclamped(Some(86_400.0), None),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+        assert_eq!(
+            retry_after_ms_unclamped(Some(3_600.0), None),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+        // A hostile finite value saturates the millis conversion and still
+        // stops at the ceiling, via header or body alike.
+        assert_eq!(
+            retry_after_ms_unclamped(Some(1e300), None),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+        assert_eq!(
+            retry_after_ms_unclamped(None, Some(1e300)),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+        // Boundary: just under the ceiling passes through, just over stops.
+        assert_eq!(retry_after_ms_unclamped(Some(299.0), None), 299_250);
+        assert_eq!(
+            retry_after_ms_unclamped(Some(300.0), None),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
     }
 
     #[test]
