@@ -41,6 +41,10 @@ const ORPHAN_REASON: &str = "Scheduled message run was not recorded";
 #[path = "scheduled_jobs_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "scheduled_stale_audit_acceptance_tests.rs"]
+mod acceptance_tests;
+
 /// The supervised ticker for the configured guild, or `None` while
 /// `TWO_AUTOMATIONS` is off (legacy only started the scheduler when automations
 /// were enabled, and a disabled scheduler fired zero jobs) or the boot
@@ -266,7 +270,12 @@ impl Occurrence<'_> {
                     None => false,
                 };
                 // Keep the nonce when the message survives so the re-run
-                // dedupes against it instead of posting a second copy.
+                // dedupes against it instead of posting a second copy. The
+                // unrecorded outcome is audited even when the claim was lost
+                // (the re-queue retains nothing): a posted message must never
+                // vanish without an audit row. A lost claim keeps no nonce,
+                // so a surviving orphan has no idempotent retry: report it
+                // as stale, not retry-idempotent.
                 let retained = retry_scheduled(
                     self.pool,
                     &self.row.guild_id,
@@ -277,14 +286,12 @@ impl Occurrence<'_> {
                 )
                 .await
                 .map_err(database)?;
-                if retained {
-                    self.audit(
-                        &OccurrenceOutcome::PostedUnrecorded { cleaned },
-                        Some(reason),
-                        audit_failed,
-                    )
-                    .await;
-                }
+                let outcome = if retained || cleaned {
+                    OccurrenceOutcome::PostedUnrecorded { cleaned }
+                } else {
+                    OccurrenceOutcome::StaleCompletion
+                };
+                self.audit(&outcome, Some(reason), audit_failed).await;
                 Ok(Step::Stop)
             }
         }
@@ -315,6 +322,17 @@ impl Occurrence<'_> {
                     audit_failed,
                 )
                 .await;
+            } else {
+                // The claim went stale (the definition was replaced or
+                // cancelled while the retryable post was in flight): the
+                // re-queue lands nowhere, so audit the stale completion with
+                // the failure reason instead of vanishing silently.
+                self.audit(
+                    &OccurrenceOutcome::StaleCompletion,
+                    Some(reason),
+                    audit_failed,
+                )
+                .await;
             }
             return Ok(Step::Next);
         }
@@ -337,6 +355,17 @@ impl Occurrence<'_> {
         if completed.is_some() {
             self.audit(
                 &OccurrenceOutcome::FailedPermanent,
+                Some(reason),
+                audit_failed,
+            )
+            .await;
+        } else {
+            // The claim went stale (the definition was replaced or cancelled
+            // while Discord refused the post): the completion lands nowhere,
+            // so audit the stale completion with the refusal reason instead
+            // of vanishing silently.
+            self.audit(
+                &OccurrenceOutcome::StaleCompletion,
                 Some(reason),
                 audit_failed,
             )
