@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -366,20 +365,53 @@ struct TestSchema {
 
 impl TestSchema {
     async fn new() -> Self {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("tog10430_risk_{stamp}");
+        // Random identifiers do not depend on clock resolution or process identity.
+        // The database still arbitrates ownership; never adopt an existing schema.
+        Self::with_candidates(
+            (0..8).map(|_| format!("join_risk_test_{:032x}", rand::random::<u128>())),
+        )
+        .await
+    }
+
+    async fn with_candidates(schemas: impl IntoIterator<Item = String>) -> Self {
+        let mut schemas = schemas.into_iter();
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&mut admin)
+        let (schema, mut transaction) = loop {
+            let schema = schemas.next().expect("schema collision budget exhausted");
+            let mut transaction = admin.begin().await.unwrap();
+            match sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+                .execute(&mut *transaction)
+                .await
+            {
+                Ok(_) => break (schema, transaction),
+                Err(error) => {
+                    let collision = error.as_database_error().is_some_and(|db| {
+                        db.code().as_deref() == Some("42P06")
+                            || (db.code().as_deref() == Some("23505")
+                                && db.constraint() == Some("pg_namespace_nspname_index"))
+                    });
+                    transaction.rollback().await.unwrap();
+                    assert!(collision, "create isolated join-risk schema: {error}");
+                }
+            }
+        };
+        // Roll back both the schema and migration if fixture setup fails.
+        sqlx::query("SELECT set_config('search_path', $1, true)")
+            .bind(&schema)
+            .execute(&mut *transaction)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../cutover/migrations/0360_join_risk_flags.sql"
+        ))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
         let path = schema.clone();
-        let pool = PgPoolOptions::new()
+        let pool = match PgPoolOptions::new()
             .max_connections(4)
             .after_connect(move |connection, _| {
                 let path = path.clone();
@@ -393,26 +425,84 @@ impl TestSchema {
             })
             .connect(TEST_DATABASE)
             .await
-            .expect("only agent-testdb");
-        sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0360_join_risk_flags.sql"
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
+        {
+            Ok(pool) => pool,
+            Err(_) => {
+                Self::drop_schema(&mut admin, &schema).await;
+                panic!("connect isolated join-risk pool on agent-testdb");
+            }
+        };
         Self { pool, schema }
     }
 
     async fn close(self) {
         self.pool.close().await;
         let mut admin = PgConnection::connect(TEST_DATABASE).await.unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA {} CASCADE",
-            self.schema
-        )))
-        .execute(&mut admin)
+        Self::drop_schema(&mut admin, &self.schema).await;
+    }
+
+    async fn drop_schema(admin: &mut PgConnection, schema: &str) {
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(admin)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn join_risk_runtime_fixture_retries_collisions_and_cleans_only_owned_schemas() {
+    let occupied = TestSchema::new().await;
+    sqlx::query("CREATE TABLE fixture_owner AS SELECT 7 AS value")
+        .execute(&occupied.pool)
         .await
         .unwrap();
+    let taken = occupied.schema.clone();
+    let shared = format!("{taken}_shared");
+    let allocations = tokio::spawn(async move {
+        tokio::join!(
+            TestSchema::with_candidates([taken.clone(), shared.clone(), format!("{taken}_a")]),
+            TestSchema::with_candidates([taken.clone(), shared, format!("{taken}_b")]),
+        )
+    })
+    .await;
+    let owner_value: i32 = sqlx::query_scalar("SELECT value FROM fixture_owner")
+        .fetch_one(&occupied.pool)
+        .await
+        .unwrap();
+    let occupied_name = occupied.schema.clone();
+    occupied.close().await;
+    // Close the deliberately occupied fixture even when the old allocator panics.
+    let (first, second) = allocations.expect("occupied names must not abort fixture allocation");
+    assert_eq!(
+        owner_value, 7,
+        "a collision must not touch its owner's data"
+    );
+    assert_ne!(
+        first.schema, second.schema,
+        "concurrent fixtures stay isolated"
+    );
+    let first_name = first.schema.clone();
+    let second_name = second.schema.clone();
+    first.close().await;
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM join_risk_flags")
+        .fetch_one(&second.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "closing a peer must leave this fixture usable"
+    );
+    second.close().await;
+    let mut admin = PgConnection::connect(TEST_DATABASE).await.unwrap();
+    for schema in [occupied_name, first_name, second_name] {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
+                .bind(schema)
+                .fetch_one(&mut admin)
+                .await
+                .unwrap();
+        assert!(!exists, "explicit close removes every owned schema");
     }
 }
 
