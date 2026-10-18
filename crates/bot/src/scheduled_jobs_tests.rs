@@ -612,6 +612,110 @@ async fn definition_replaced_mid_post_surfaces_a_timed_out_orphan_delete() {
 }
 
 #[tokio::test]
+async fn retryable_failure_with_replaced_definition_audits_stale_completion() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool().clone();
+    seed(&pool, "retry-stale", T0 - 1_000, None).await;
+    let (mock, gate) = MockRest::start_gated(
+        vec![ScriptedResponse::status(503)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+
+    let ticker = {
+        let (pool, rest) = (pool.clone(), rest.clone());
+        tokio::spawn(async move { tick(&pool, &rest, GUILD, || T0).await })
+    };
+    gate.wait_for_request().await;
+    // The claim goes stale first: replacing the definition clears it, so the
+    // re-queue lands nowhere.
+    seed(&pool, "retry-stale", T0 + 600_000, None).await;
+    gate.release();
+    ticker.await.unwrap().expect("tick");
+
+    assert_eq!(
+        posts(&mock).len(),
+        1,
+        "the retryable failure is never re-posted"
+    );
+    let replaced = row(&pool, "retry-stale").await;
+    assert!(replaced.enabled, "the new definition stands");
+    assert_eq!(replaced.next_run_at, format_iso_ms(T0 + 600_000));
+    assert_eq!(replaced.claim_token, None);
+    assert_eq!(
+        audits(&pool, "retry-stale").await,
+        [audit("stale_completion", Some("discord_unavailable"))],
+        "a retryable failure whose claim went stale is audited, not silent"
+    );
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+/// Make recording a run fail the way a store error would: the completion
+/// update sets `last_run_at`, the claim/retry updates never do, so a
+/// trigger on that column refuses exactly the recording write.
+async fn refuse_run_recording(pool: &PgPool) {
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_scheduled_completion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.last_run_at IS DISTINCT FROM OLD.last_run_at THEN RAISE EXCEPTION 'fixture completion failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_scheduled_completion BEFORE UPDATE ON scheduled_messages FOR EACH ROW EXECUTE FUNCTION refuse_scheduled_completion();",
+    )
+    .execute(pool)
+    .await
+    .expect("install completion-refusing trigger");
+}
+
+#[tokio::test]
+async fn unrecorded_post_with_lost_claim_and_surviving_orphan_audits_stale_completion() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool().clone();
+    seed(&pool, "unrecorded-surviving", T0 - 1_000, None).await;
+    refuse_run_recording(&pool).await;
+    // The gate holds the orphan DELETE (the last scripted response): the
+    // window between the failed recording and the re-queue attempt. The
+    // delete is refused, so the orphan survives and keeps no nonce.
+    let (mock, gate) = MockRest::start_gated(
+        vec![posted(), ScriptedResponse::status(403)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+
+    let ticker = {
+        let (pool, rest) = (pool.clone(), rest.clone());
+        tokio::spawn(async move { tick(&pool, &rest, GUILD, || T0).await })
+    };
+    gate.wait_for_request().await;
+    // The claim is lost before the re-queue: replacing clears it.
+    seed(&pool, "unrecorded-surviving", T0 + 600_000, None).await;
+    gate.release();
+    let outcome = ticker.await.unwrap();
+    assert!(
+        matches!(outcome, Err(ErrorClass::Database)),
+        "a failed recording still fails the attempt, got {outcome:?}"
+    );
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].method, "DELETE");
+    assert_eq!(requests[1].path, "/api/v10/channels/4444/messages/9001");
+    assert_eq!(posts(&mock).len(), 1, "the orphan is never re-posted");
+    let replaced = row(&pool, "unrecorded-surviving").await;
+    assert!(replaced.enabled, "the new definition stands");
+    assert_eq!(replaced.next_run_at, format_iso_ms(T0 + 600_000));
+    assert_eq!(
+        audits(&pool, "unrecorded-surviving").await,
+        [audit("stale_completion", Some("database"))],
+        "a surviving orphan with a lost claim audits stale, not retry-idempotent"
+    );
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn supervised_runs_reach_the_metrics_endpoint() {
     use axum::{
         body::{to_bytes, Body},
