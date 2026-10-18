@@ -202,12 +202,12 @@ def load_document(path):
 def check_format(value, fmt, path, errors):
     if fmt == "date-time":
         if not isinstance(value, str) or not DATETIME_RE.match(value):
-            errors.append(f"{path}: not a UTC ISO-8601 date-time: {value!r}")
+            errors.append(f"{path}: not a UTC ISO-8601 date-time")
             return
         try:
             datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
-            errors.append(f"{path}: invalid calendar date-time: {value!r}")
+            errors.append(f"{path}: invalid calendar date-time")
             return
         if is_utc_field(path):
             check_utc_suffix(value, path, errors)
@@ -218,21 +218,20 @@ def check_utc_suffix(value, path, errors):
 
     Accepts `Z` and explicit zero offsets; negative zero normalizes to
     UTC. Rejects naive timestamps and nonzero offsets with field-level
-    diagnostics. Callers must run the public-safety scan first, so echoing
-    the offending value here cannot leak a secret-shaped string.
+    diagnostics that never include the rejected value.
     """
     if value.endswith("Z"):
         return
     match = UTC_OFFSET_RE.search(value)
     if match is None:
         errors.append(
-            f"{path}: naive timestamp without timezone: {value!r}; "
+            f"{path}: naive timestamp without timezone; "
             "*_utc fields require Z or an explicit zero offset (+00:00)"
         )
         return
     if match.group(2) != "00" or match.group(3) != "00":
         errors.append(
-            f"{path}: non-UTC offset {match.group(0)!r} in {value!r}; "
+            f"{path}: non-UTC offset; "
             "*_utc fields require Z or an explicit zero offset (+00:00)"
         )
 
@@ -273,7 +272,10 @@ def check_instance(instance, schema, path, errors):
     if "const" in schema and instance != schema["const"]:
         errors.append(f"{path}: must equal {schema['const']!r}")
     if "enum" in schema and instance not in schema["enum"]:
-        errors.append(f"{path}: {instance!r} not one of {schema['enum']!r}")
+        errors.append(
+            f"{path}: invalid enum value not one of {schema['enum']!r}; "
+            "must be one of the allowed values"
+        )
     if isinstance(instance, str):
         if "minLength" in schema and len(instance) < schema["minLength"]:
             errors.append(
@@ -281,7 +283,8 @@ def check_instance(instance, schema, path, errors):
             )
         if "pattern" in schema and not re.search(schema["pattern"], instance):
             errors.append(
-                f"{path}: {instance!r} does not match {schema['pattern']!r}"
+                f"{path}: string does not match required pattern "
+                f"{schema['pattern']!r}"
             )
     if isinstance(instance, (int, float)) and not isinstance(instance, bool):
         if "minimum" in schema and instance < schema["minimum"]:

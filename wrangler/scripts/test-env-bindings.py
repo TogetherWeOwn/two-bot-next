@@ -212,6 +212,20 @@ class AlertBindingTests(unittest.TestCase):
                 )
         self.assertEqual(self.check_config(BASE), [])
 
+    def test_remediation_fault_switches_are_never_committed_vars(self):
+        # Same generated-only rule as the rollback-drill switch: either
+        # remediation drill switch committed anywhere fails.
+        for key in ["TWO_VOICE_STALL_FAULT_INJECTION", "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"]:
+            for section in ["vars", "env.staging.vars", "env.production.vars"]:
+                with self.subTest(key=key, section=section):
+                    config = BASE.replace(f"[{section}]", f'[{section}]\n{key} = "1"', 1)
+                    errors = self.check_config(config)
+                    self.assertTrue(
+                        any(f"{key} must never be a committed var" in e for e in errors),
+                        errors,
+                    )
+        self.assertEqual(self.check_config(BASE), [])
+
     def test_dashboard_secrets_are_never_toml_vars(self):
         # TOG-22861: the dashboard service-token pair gates human access; a
         # committed value would hand out that access. Both keys must stay

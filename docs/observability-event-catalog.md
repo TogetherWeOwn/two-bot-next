@@ -191,6 +191,22 @@ source URL, host, header, body or feed id reaches any label.
 | `two_bot_feed_fetches_total{outcome}` | Feed fetch attempts by bounded outcome; `outcome` is `success` (2xx fetch), `invalid_source` (source refused before dialling), `refused_redirect` (redirect refused by policy) or `failure` (every other failure, including non-2xx HTTP) |
 | `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class; `error_class` is `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`; successes record nothing here |
 
+## Moderation enforcement series
+
+Counters emitted by the moderation enforcement render. Unknown outcomes
+collapse to `other` (unknown verbs collapse to the trailing verb slot,
+`unlock`, until the verb allowlist grows), and no member ID, reason text
+or message content reaches any label. Verbs are the bounded `ModerationAction`
+command vocabulary (`ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`,
+`slowmode`, `lockdown`, `unlock`); outcomes are `success`, `refused`,
+`discord_error`, `storage_error` and `other`. Each terminal member or
+channel enforcement counts once; retries and rate-limit backoffs are not
+outcomes. See `docs/metrics.md` for the full label table.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_moderation_enforcements_total{verb,outcome}` | Terminal moderation enforcements by bounded verb and outcome |
+
 ## Scheduled job labels
 
 Each label owns independent `two_bot_job_runs_total{job,outcome}`,

@@ -161,6 +161,14 @@ event-executors measurement. No new dependencies or release-profile changes;
 revisit if the binary approaches the limit. The 112 MiB image ceiling is
 unchanged.
 
+On 2026-10-17, the landed slices since the 16 MiB bump consumed its headroom:
+main at `89c859b1` measured 16,777,376 bytes (16.00 MiB), 160 bytes over the
+ceiling, so the gate trips on main itself. The moderation-enforcement-outcomes
+head measured 16,778,152 bytes (16.00 MiB), 936 bytes over, with no new
+dependencies and the same minimal release profile. The budget is therefore
+rebumped to 17 MiB, leaving about 1 MiB of headroom above the measured heads;
+revisit if the binary approaches it. The 112 MiB image ceiling is unchanged.
+
 This branch's automation-only head separately measured 15,769,872 bytes
 (15.04 MiB) before the event-executor merge. This PR keeps the current-main
 16 MiB binary ceiling; the combined exact-head CI measurement is still

@@ -967,35 +967,79 @@ fn member_overwrite(doc: &Value, member: &str) -> Result<(u64, u64)> {
     Ok((bits("allow")?, bits("deny")?))
 }
 
-fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
-    messages
-        .into_iter()
-        .map(|message| {
-            let author_id = message["author"]["id"]
-                .as_str()
-                .ok_or(Failure::InvalidEvidence)?
-                .to_owned();
-            let mut custom_ids = Vec::new();
-            let rows = match message.get("components") {
-                None => &[][..],
-                Some(value) => value.as_array().ok_or(Failure::InvalidEvidence)?.as_slice(),
-            };
+/// Discord allows at most 5 action rows of 5 buttons on one message, so a
+/// legitimate panel message never carries more than 25 button custom ids.
+/// Longer id lists are truncated to this bound; the message itself is kept.
+const MAX_PANEL_CUSTOM_IDS: usize = 25;
+
+/// Fixed process-wide count of isolated ticket panel rows: skipped malformed
+/// messages plus over-bound truncations share this one counter. Log fields
+/// echo only the count, never message content.
+static PANEL_ISOLATED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn panel_isolated_count_for_test() -> u64 {
+    PANEL_ISOLATED_ROWS.load(Ordering::Relaxed)
+}
+
+/// Parse one channel-document message into a panel row. Returns `None` when
+/// the message is malformed (bad author shape, bad components shape, or any
+/// bad action row drops the whole message). Buttons without a string
+/// `custom_id` are ignored, never fatal. The boolean is true when the
+/// message was kept with its `custom_ids` truncated to
+/// [`MAX_PANEL_CUSTOM_IDS`].
+fn parse_panel_message(message: &Value) -> Option<(PanelMessage, bool)> {
+    let author_id = message.get("author")?.get("id")?.as_str()?.to_owned();
+    let mut custom_ids = Vec::new();
+    let mut truncated = false;
+    match message.get("components") {
+        None => {}
+        Some(value) => {
+            let rows = value.as_array()?;
             for row in rows {
-                for button in row["components"]
-                    .as_array()
-                    .ok_or(Failure::InvalidEvidence)?
-                {
-                    if let Some(id) = button["custom_id"].as_str() {
-                        custom_ids.push(id.to_owned());
+                let buttons = row.get("components")?.as_array()?;
+                for button in buttons {
+                    if let Some(id) = button.get("custom_id").and_then(Value::as_str) {
+                        if custom_ids.len() < MAX_PANEL_CUSTOM_IDS {
+                            custom_ids.push(id.to_owned());
+                        } else {
+                            truncated = true;
+                        }
                     }
                 }
             }
-            Ok(PanelMessage {
-                author_id,
-                custom_ids,
-            })
-        })
-        .collect()
+        }
+    }
+    Some((
+        PanelMessage {
+            author_id,
+            custom_ids,
+        },
+        truncated,
+    ))
+}
+
+fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut skipped = 0_u64;
+    for message in &messages {
+        match parse_panel_message(message) {
+            Some((panel, truncated)) => {
+                if truncated {
+                    skipped += 1;
+                }
+                out.push(panel);
+            }
+            None => {
+                skipped += 1;
+            }
+        }
+    }
+    if skipped > 0 {
+        PANEL_ISOLATED_ROWS.fetch_add(skipped, Ordering::Relaxed);
+        tracing::debug!(skipped, "ticket panel messages isolated");
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1013,3 +1057,7 @@ mod acceptance_tests;
 #[cfg(test)]
 #[path = "ticket_revision_tests.rs"]
 mod revision_tests;
+
+#[cfg(test)]
+#[path = "ticket_panels_isolation_tests.rs"]
+mod panels_isolation_tests;
