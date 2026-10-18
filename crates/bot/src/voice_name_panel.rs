@@ -37,8 +37,8 @@ use two_bot_core::{
     voice_naming::{local_hour, minutes_tier, GameOptions, RoomContext},
     voice_presence::{apply_room_presence, OccupantPresence},
     voice_room_name::{
-        decide_custom_name, decide_template_name, NameChecks, RenderFacts, MAX_CUSTOM_NAME_CHARS,
-        NAME_INPUT_ID,
+        decide_custom_name, decide_template_name, is_literal_name, NameChecks, RenderFacts,
+        MAX_CUSTOM_NAME_CHARS, NAME_INPUT_ID,
     },
 };
 
@@ -558,9 +558,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// budget. Rooms with a `/name` override under a creator with a name
     /// template re-render the stored override through the same sanitizer and
     /// filter instead of the creator template (see `refresh_custom_name`);
-    /// under a blank template the room stays manually managed, override or
-    /// not. A blank template keeps the room's current name; a render the
-    /// name filter blocks is skipped.
+    /// a literal override (no template syntax) never re-renders, so it stays
+    /// manually managed like the submit left it. Under a blank template the
+    /// room stays manually managed, override or not. A blank template keeps
+    /// the room's current name; a render the name filter blocks is skipped.
     pub(super) fn refresh_template_names(&mut self, now_ms: u64) {
         let (ready, generation) = {
             let live = self.live.read_state();
@@ -634,7 +635,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 // under a blank creator template the room stays manually
                 // managed (override or not), so a status-only room never
                 // spends a rename and a `/name` submit keeps its own render.
-                if template.is_some() {
+                // A literal override carries no template syntax, so no fact
+                // change can alter its render: leave it as the submit left it
+                // instead of spending a rename on today's channel name.
+                if template.is_some() && !is_literal_name(&stored) {
                     self.refresh_custom_name(&room, &command, &facts, &stored, now_ms);
                 }
                 continue;
