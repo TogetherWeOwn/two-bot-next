@@ -702,7 +702,12 @@ impl RoomPersistence for Store {
     async fn join_grants(&self, _: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
         Ok(self.join_grants.lock().unwrap().clone())
     }
-    async fn save_join_grant(&self, _: u64, room: u64, member: u64) -> Result<bool, StoreError> {
+    async fn save_join_grant(
+        &self,
+        _: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<JoinGrantIntent, StoreError> {
         self.trace
             .lock()
             .unwrap()
@@ -711,15 +716,20 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         if !self.rooms.lock().unwrap().contains_key(&room) {
-            return Ok(false);
+            return Ok(JoinGrantIntent::RoomMissing);
         }
-        self.join_grants
+        let inserted = self
+            .join_grants
             .lock()
             .unwrap()
             .entry(room)
             .or_default()
             .insert(member);
-        Ok(true)
+        Ok(if inserted {
+            JoinGrantIntent::Fresh
+        } else {
+            JoinGrantIntent::Retained
+        })
     }
     async fn remove_join_grant(&self, _: u64, room: u64, member: u64) -> Result<(), StoreError> {
         self.trace

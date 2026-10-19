@@ -118,7 +118,7 @@ use two_bot_core::{
     AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
-use two_bot_cutover::voice_rooms::{CreateClaim, OwnerGrantIntent, PgRoomStore};
+use two_bot_cutover::voice_rooms::{CreateClaim, JoinGrantIntent, OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
     RoomHttp, RoomHttpError,
@@ -352,16 +352,16 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         guild: Snowflake,
     ) -> impl Future<Output = Result<BTreeMap<Snowflake, BTreeSet<Snowflake>>, StoreError>> + Send;
-    /// Record an approval's intent before granting Connect. Idempotent; a
-    /// retried intent is a no-op. `Ok(false)` when the room has no database
-    /// row, so a grant never outlives its room.
+    /// Record an approval's intent before granting Connect, distinguishing a
+    /// fresh insert from an existing obligation that may already hold access.
+    /// A missing room writes nothing, so a grant never outlives its room.
     fn save_join_grant(
         &self,
         guild: Snowflake,
         room: Snowflake,
         member: Snowflake,
-    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
-    /// Retire a grant after its revocation landed (or its grant was refused).
+    ) -> impl Future<Output = Result<JoinGrantIntent, StoreError>> + Send;
+    /// Retire a grant after a safe revoke (or a fresh intent's PUT was refused).
     /// Idempotent: retiring an absent grant is success.
     fn remove_join_grant(
         &self,
@@ -601,7 +601,7 @@ impl RoomPersistence for PgRoomStore {
         guild: Snowflake,
         room: Snowflake,
         member: Snowflake,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<JoinGrantIntent, StoreError> {
         self.save_join_grant(guild, room, member)
             .await
             .map_err(store_error)
@@ -3115,8 +3115,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         // Hydrate approved Connect grants: a private room remembers its
         // approvals so a later `/public` revokes them; a grant whose room is
         // public or gone still needs its revocation, which the queue lost on
-        // restart, so it is re-queued here. The witness is retired only by a
-        // successful revoke (or a refused grant), never by this hydration.
+        // restart, so it is re-queued here. Only a safe revoke or a fresh
+        // intent's definitively refused PUT retires it, never this hydration.
         let mut pending_revokes = Vec::new();
         for (room, members) in &join_grants {
             match privacy.get_mut(room) {
