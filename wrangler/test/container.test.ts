@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
-import { EMPTY_STATE, type MetricsAlertState } from "../src/alert-rules.ts";
+import { EMPTY_STATE, LOG_QUERY_URL, type MetricsAlertState } from "../src/alert-rules.ts";
 import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
 
 const ID = "deployment-A";
@@ -421,7 +421,12 @@ for (const failure of ["lookup", "insert"] as const) {
           assert.ok(h.requests.filter((r) => r.pathname === path).length > forwardedBefore);
           assert.equal(h.starts.length, 1, "monitoring must not cause an extra startup");
           assert.equal(h.pending().length, 0);
-          assert.ok(h.logs.includes(JSON.stringify({ event: "container_keepalive_arm_failed" })));
+          assert.ok(h.logs.includes(JSON.stringify({
+            event: "container_keepalive_arm_failed",
+            release: "unknown",
+            worker_version: ID,
+            log_url: LOG_QUERY_URL,
+          })));
           assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.OPS_ALERT_WEBHOOK_URL)));
 
           failing = false;
@@ -442,7 +447,13 @@ test("cold keepalive passes env through the SDK's string-URL fetch path", async 
   await tickKeepalive(h.bot);
   assert.equal(h.starts.length, 1);
   assert.deepEqual(h.starts[0]?.env, EXPECTED_ENV);
-  assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
+  assert.ok(h.logs.includes(JSON.stringify({
+    event: "container_readyz_unhealthy",
+    status: 503,
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })));
 });
 
 // TOG-13044: the bot reports why its gateway task failed on /readyz; the
@@ -781,7 +792,13 @@ for (const port of ["9090", "1", "65535", "09090"]) {
       const h = await harness(t, { ...WORKER_ENV, BOT_PORT: port });
       if (path === "keepalive") {
         await tickKeepalive(h.bot);
-        assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
+        assert.ok(h.logs.includes(JSON.stringify({
+    event: "container_readyz_unhealthy",
+    status: 503,
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })));
         assert.ok(!h.logs.some((line) => line.includes("probe failed")));
       } else {
         const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`, {
@@ -1571,7 +1588,13 @@ async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map
     schedules,
     setStatus: (next: number | Error) => { status = next; },
     tick: () => tickKeepalive(h.bot),
-    events: () => h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line)),
+    // Transition/webhook sequence without the per-tick readiness
+    // observations: container_readyz_unhealthy and
+    // container_keepalive_probe_failed ride every failing tick and are pinned
+    // by the alert-line release battery, not by the alert-sequence tests.
+    events: () => h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line))
+      .filter((event) => event.event !== "container_readyz_unhealthy"
+        && event.event !== "container_keepalive_probe_failed"),
   };
 }
 
@@ -1712,13 +1735,18 @@ test("real SDK keeps one persistent chain across concurrent health traffic, rest
     assert.equal(h.values.get("two-bot:readiness")?.failures, failures);
     assert.equal(h.pending().length, 1, "exactly one successor per firing");
     assert.equal(h.requests.filter((r) => r.pathname === "/readyz").length, failures);
-    const events = h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
+    const events = h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line))
+      .filter((event) => event.event !== "container_readyz_unhealthy"
+        && event.event !== "container_keepalive_probe_failed");
     assert.equal(events.length, failures === 2 ? 1 : failures > 2 ? 1 : 0, "traffic must not accelerate the threshold");
   }
   h.setProbeStatus(200);
   await fireSdkAlarm(t, h.bot);
   await fireSdkAlarm(t, h.bot);
-  assert.deepEqual(h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line).event),
+  assert.deepEqual(h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line))
+    .filter((event) => event.event !== "container_readyz_unhealthy"
+      && event.event !== "container_keepalive_probe_failed")
+    .map((event) => event.event),
     ["container_unready_alert", "container_unready_recovery"]);
 });
 
@@ -1778,7 +1806,10 @@ for (const warm of [false, true]) {
       assert.equal(resumed.values.get("two-bot:readiness")?.failures, 0);
       assert.equal(resumed.pending().length, 1);
       const events = [...h.logs, ...resumed.logs].filter((line) => line.startsWith("{"))
-        .map((line) => JSON.parse(line).event);
+        .map((line) => JSON.parse(line))
+        .filter((event) => event.event !== "container_readyz_unhealthy"
+          && event.event !== "container_keepalive_probe_failed")
+        .map((event) => event.event);
       assert.deepEqual(events, status === 503
         ? ["container_unready_alert", "container_unready_recovery"] : []);
     });

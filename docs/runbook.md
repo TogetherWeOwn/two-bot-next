@@ -151,8 +151,8 @@ Look for these literal messages:
   only a running-gateway failure lingers 75 s) and in Workers Logs as
   `container_gateway_failure` (see [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
-- Worker: `two-bot container started|stopped`, `two-bot /readyz unhealthy`,
-  `two-bot keepalive probe failed`, `two-bot container error`.
+- Worker: `two-bot container started|stopped`, `container_readyz_unhealthy`,
+  `container_keepalive_probe_failed`, `two-bot container error`.
 
 The DO renews activity and probes `/readyz` every `KEEPALIVE_SECONDS` (default
 60); `sleepAfter` is 30 minutes. Outbound gateway traffic alone does not keep
@@ -1902,8 +1902,8 @@ Gateway reconnect symptoms and REST send failures are different incidents:
 gateway-ready does not prove REST delivery, and HTTP liveness does not prove
 either. Use literal `gateway reconnect failed; Twilight will retry`,
 `durable gateway initialized; shard connecting` (`resume`) and
-`gateway ready; checkpoint committed` (`sequence`). Worker
-`two-bot /readyz unhealthy: <status>` is a readiness observation, not a Discord
+`gateway ready; checkpoint committed` (`sequence`). The Worker
+`container_readyz_unhealthy` line is a readiness observation, not a Discord
 cause. Do not infer a Discord outage from a Worker error or 403 alone.
 
 Existing **private** metrics are `two_bot_gateway_reconnects_total`,
