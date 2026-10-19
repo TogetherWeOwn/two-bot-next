@@ -959,3 +959,191 @@ async fn disabled_and_unknown_dynamic_rows_and_failed_delivery() {
     mock.shutdown().await;
     pool.close().await;
 }
+
+fn patch_contents(mock: &MockRest) -> Vec<Value> {
+    mock.requests()
+        .iter()
+        .filter(|request| request.method == "PATCH")
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn manage_missing_options_reply_exact_copy() {
+    let pool = PgPoolOptions::new().connect_lazy_with(test_options());
+    // A missed early gate fails immediately instead of trying a live connection.
+    pool.close().await;
+    let cases: Vec<(u64, &str, Vec<(&str, &str)>, &str)> = vec![
+        (110, "command", vec![], "A command name is required."),
+        (111, "command-remove", vec![], "A command name is required."),
+        (
+            112,
+            "command",
+            vec![("name", "faq")],
+            "A template is required.",
+        ),
+    ];
+    for (id, name, options, expected) in cases {
+        let mock = MockRest::start(
+            vec![
+                ScriptedResponse::status(204),
+                ScriptedResponse::json(200, json!({"id": "9000"})),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let runtime = runtime(pool.clone(), &mock, true);
+        assert!(
+            runtime
+                .handle_interaction(&slash(id, name, 32, &options), None)
+                .await
+                .unwrap(),
+            "{expected}"
+        );
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2, "{expected}");
+        assert!(
+            requests.iter().all(|request| request.method != "PUT"),
+            "missing options must not republish: {expected}"
+        );
+        let patches = patch_contents(&mock);
+        assert_eq!(patches.len(), 1, "{expected}");
+        assert_eq!(patches[0]["content"], expected);
+        assert_eq!(patches[0]["allowed_mentions"]["parse"], json!([]));
+        mock.shutdown().await;
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn manage_save_remove_absent_replies_are_pinned() {
+    let pool = test_pool().await;
+    let base = InteractionRouter::new(gates(true))
+        .publish_set(&[])
+        .expect("base registry size")
+        .len();
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),                      // #120 defer
+            registry_receipt(base + 1, 7100),                   // create PUT
+            ScriptedResponse::json(200, json!({"id": "9001"})), // #120 complete
+            ScriptedResponse::status(204),                      // #121 defer
+            registry_receipt(base, 7200),                       // remove PUT
+            ScriptedResponse::json(200, json!({"id": "9001"})), // #121 complete
+            ScriptedResponse::status(204),                      // #122 defer
+            ScriptedResponse::json(200, json!({"id": "9001"})), // #122 complete
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(
+            &slash(
+                120,
+                "command",
+                32,
+                &[("name", "faq"), ("template", "saved")]
+            ),
+            None
+        )
+        .await
+        .unwrap());
+    assert!(runtime
+        .handle_interaction(&slash(121, "command-remove", 32, &[("name", "faq")]), None)
+        .await
+        .unwrap());
+    assert!(runtime
+        .handle_interaction(&slash(122, "command-remove", 32, &[("name", "faq")]), None)
+        .await
+        .unwrap());
+    let requests = mock.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "PUT")
+            .count(),
+        2,
+        "absent delete does not republish"
+    );
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 3);
+    assert_eq!(patches[0]["content"], "Saved /faq.");
+    assert_eq!(patches[1]["content"], "Removed /faq.");
+    assert_eq!(patches[2]["content"], "No command /faq found.");
+    for body in &patches {
+        assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+    }
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn manage_registry_publish_failure_suffix_is_pinned() {
+    const SUFFIX: &str = "Registry publication failed; the command picker is not yet synchronized.";
+    let pool = test_pool().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),                      // defer
+            ScriptedResponse::status(403),                      // registry publish (no retry)
+            ScriptedResponse::json(200, json!({"id": "9000"})), // honest partial-result edit
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    runtime
+        .handle_interaction(
+            &slash(
+                130,
+                "command",
+                32,
+                &[("name", "faq"), ("template", "saved")],
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store::get_command(&pool, "2222", "faq")
+            .await
+            .unwrap()
+            .is_some(),
+        "the write commits despite the publish failure"
+    );
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0]["content"], format!("Saved /faq. {SUFFIX}"),);
+    assert_eq!(mock.requests().len(), 3, "no hidden reads or retry PUTs");
+    mock.shutdown().await;
+
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(403),
+            ScriptedResponse::json(200, json!({"id": "9000"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = self::runtime(pool.clone(), &mock, true);
+    runtime
+        .handle_interaction(&slash(131, "command-remove", 32, &[("name", "faq")]), None)
+        .await
+        .unwrap();
+    assert!(
+        store::get_command(&pool, "2222", "faq")
+            .await
+            .unwrap()
+            .is_none(),
+        "the delete commits despite the publish failure"
+    );
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0]["content"], format!("Removed /faq. {SUFFIX}"),);
+    assert_eq!(mock.requests().len(), 3, "no hidden reads or retry PUTs");
+    mock.shutdown().await;
+    pool.close().await;
+}
