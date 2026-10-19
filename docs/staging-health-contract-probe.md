@@ -25,7 +25,9 @@ in the receipt become `null`, never copies of the rejected input. A canonical
 mismatch may retain the safe observed identity. The exact `unknown` pair with
 no pin passes only as explicitly **unstamped**, not a matched deployment; with
 a pin it fails. Identity failures do not change readiness or checkpoint-read
-classification.
+classification. The smoke-run caller also validates the pair before retaining
+identity for its run record: a rejected build ID cannot supply deployment run
+metadata. Explicit local deployment pins can still produce a safe failed record.
 
 `/healthz` at the staging origin is the Worker's redirect probe (`ok`),
 covered by the redirect smoke — not this probe.

@@ -204,6 +204,39 @@ class SmokeRunTests(unittest.TestCase):
         self.assertEqual(len(self.discord_requested), 2 + len(PUBLISHED))
         self.assertTrue(all(url.startswith(API) for url in self.discord_requested))
 
+    def test_malformed_remote_pair_cannot_supply_record_identity(self):
+        for revision, build_id in ((SHA, "9" * 5000 + "-1"),
+                                   (SHA, "1-" + "9" * 21),
+                                   (SHA, "unknown"),
+                                   ("unknown", "37512552064-1"),
+                                   (SHA, ["rejected-build-sentinel"]),
+                                   (["rejected-revision-sentinel"], "37512552064-1")):
+            with self.subTest(revision=revision, build_id=build_id):
+                report = dict(READY, build_revision=revision, build_id=build_id)
+                run = smoke.Run()
+                args = smoke.parse_args(["--expected-sha", SHA])
+                smoke.health_rows(args, ORIGIN, run, self.health_fetch(
+                    readyz=(200, {}, json.dumps(report).encode())))
+                self.assertIsNone(run.build_revision)
+                self.assertIsNone(run.build_id)
+                self.assertIsNone(smoke.build_record(args, run,
+                                                    "2026-10-19T10:00:00Z",
+                                                    "2026-10-19T10:00:01Z"))
+                self.assertEqual(run.rows[-1].result, "fail")
+
+    def test_malformed_remote_pair_with_explicit_deployment_keeps_safe_failure(self):
+        rejected_id = "9" * 5000 + "-1"
+        report = dict(READY, build_id=rejected_id)
+        code, out = self.drive(
+            health=self.health_fetch(readyz=(200, {}, json.dumps(report).encode())),
+            extra=("--expected-sha", SHA, "--deploy-run-id", "42"))
+        self.assertEqual(code, 1)
+        record = self.written()
+        self.assertEqual(record["deployment"]["deploy_staging_run_id"], "42")
+        self.assertEqual(record["verdict"]["disposition"], "NEEDS WORK")
+        self.assertEqual(self.rows(record)["readyz build identity"]["result"], "fail")
+        self.assertNotIn(rejected_id, out + json.dumps(record))
+
     def test_explicit_deploy_run_id_overrides_the_build_id_prefix(self):
         code, _ = self.drive(extra=("--deploy-run-id", "42"))
         self.assertEqual(code, 0)

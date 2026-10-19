@@ -154,9 +154,9 @@ def health_rows(args, origin, run, fetch_fn):
     probe_args = argparse.Namespace(staging_url=origin, expected_sha=args.expected_sha)
     started = utc()
     _, results, report = health_probe.run(probe_args, timed_fetch(fetch_fn, run))
-    if isinstance(report, dict):
-        run.build_revision = report.get("build_revision")
-        run.build_id = report.get("build_id")
+    identity = health_probe.canonical_build_identity(report)
+    run.build_revision = identity[0] if identity else None
+    run.build_id = identity[1] if identity else None
     meta = {
         "health": ("GET /health", "200 {\"status\":\"ok\"}", "health", SIGNATURE_HEALTH),
         "readyz": ("GET /readyz", "200, every component ready", "readyz", SIGNATURE_READYZ),
