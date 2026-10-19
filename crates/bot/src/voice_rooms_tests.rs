@@ -3,6 +3,8 @@ use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
+#[path = "voice_admission_config_acceptance_tests.rs"]
+mod admission_config_acceptance;
 #[path = "voice_cold_authority_tests.rs"]
 mod cold_authority;
 #[path = "voice_delete_guard_tests.rs"]
