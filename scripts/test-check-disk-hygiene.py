@@ -28,7 +28,9 @@ its own job container, so each keeps the guards (TOG-12134):
   device` on the 1 GiB tmpfs).
 - every Postgres lane reports storage headroom right after verify: per-DB
   sizes, WAL bytes and the bounded WAL budget, so the next incident has a
-  prepare-time baseline.
+  prepare-time baseline. max_wal_size is a soft target, not a ceiling, so
+  every Postgres lane also reports post-suite (always-runs) to bracket peak
+  WAL for the next ENOSPC triage.
 
 Toolchain ordering guard: pip 23 probes `rustc --version` from the workspace
 with a 0.5 s timeout for its user agent. If the pinned toolchain still lacks
@@ -98,6 +100,7 @@ PREREQUISITES = "Job-container prerequisites"
 GUARD = "Guard runner disk headroom"
 VERIFY = "Verify disposable Postgres defaults"
 REPORT = "Report Postgres storage headroom"
+POST_REPORT = "Report Postgres storage headroom (post-suite)"
 
 
 def step_names(body):
@@ -167,6 +170,7 @@ class CheckDiskHygieneTests(unittest.TestCase):
             self.assertNotIn("cargo-deny", step_names(self.jobs[lane]))
 
     def test_disk_guard_follows_prerequisites_in_every_lane(self):
+        guards = []
         for lane, body in self.jobs.items():
             with self.subTest(lane=lane):
                 names = step_names(body)
@@ -183,6 +187,17 @@ class CheckDiskHygieneTests(unittest.TestCase):
                 self.assertIn("floor=1073741824", guard)
                 self.assertIn("::error::runner disk exhausted", guard)
                 self.assertIn("Infra flake: rerun the job.", guard)
+                # Pin the rejection path: floor plus error text alone pass if
+                # the guard stops comparing free_bytes. The executed rejection
+                # test lives in scripts/ci/test_workflows.py across all five
+                # lanes; here require the comparison fragments and identical
+                # bodies so a single-lane edit fails offline.
+                self.assertIn('for mount in / "$GITHUB_WORKSPACE"', guard)
+                self.assertIn("df -B1 --output=avail", guard)
+                self.assertIn('if [ "$free_bytes" -lt "$floor" ]', guard)
+                self.assertIn("exit 1", guard)
+                guards.append(guard)
+        self.assertEqual(len(set(guards)), 1, "the lanes' disk guards drifted apart")
 
     def test_postgres_headroom_report_follows_verify(self):
         for lane, body in self.jobs.items():
@@ -190,6 +205,7 @@ class CheckDiskHygieneTests(unittest.TestCase):
                 names = step_names(body)
                 if lane == "check":
                     self.assertNotIn(REPORT, names, "the lint lane has no Postgres service")
+                    self.assertNotIn(POST_REPORT, names, "the lint lane has no Postgres service")
                     continue
                 self.assertIn(REPORT, names, f"missing step {REPORT!r} in {lane}")
                 self.assertEqual(
@@ -202,6 +218,25 @@ class CheckDiskHygieneTests(unittest.TestCase):
                 self.assertIn("pg_ls_waldir()", report)
                 self.assertIn("max_wal_size", report)
                 self.assertIn("min_wal_size", report)
+                # Post-suite bracket: max_wal_size is a soft target, so the
+                # pre-suite report cannot show peak WAL. The post-suite report
+                # always runs after the suite for the next ENOSPC triage.
+                self.assertIn(POST_REPORT, names, f"missing step {POST_REPORT!r} in {lane}")
+                post = step_body(body, POST_REPORT)
+                self.assertIn("if: always()", post)
+                self.assertIn("ON_ERROR_STOP=1", post)
+                self.assertIn("pg_database_size", post)
+                self.assertIn("pg_ls_waldir()", post)
+                self.assertIn("max_wal_size", post)
+                self.assertIn("min_wal_size", post)
+                test_steps = [
+                    index for index, name in enumerate(names)
+                    if "cargo test" in step_body(body, name)
+                    or "cargo nextest" in step_body(body, name)
+                    or "Patch coverage" in name
+                ]
+                self.assertTrue(test_steps)
+                self.assertGreater(names.index(POST_REPORT), max(test_steps))
 
     def test_toolchain_components_installed_before_first_pip_run(self):
         install = "Install pinned Rust toolchain components"

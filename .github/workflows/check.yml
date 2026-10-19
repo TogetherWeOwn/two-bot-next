@@ -699,8 +699,10 @@ jobs:
         id: prepare_test_databases
         run: |
           # The database service stores data and WAL on a 1 GiB tmpfs. The HARD
-          # coverage lane replays the database suites, so keep WAL recycling
-          # bounded with headroom for relation files and segment creation.
+          # coverage lane replays the database suites. max_wal_size is a soft
+          # checkpoint target, not a hard ceiling: heavy WAL can exceed it, so
+          # keep recycling bounded with headroom for relation files and segment
+          # creation. The pre/post suite reports bracket the run for tuning.
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
@@ -896,6 +898,17 @@ jobs:
           fi
           python3 scripts/ci/check-patch-coverage.py --lcov "$report_path" \
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
+
+      # Post-suite storage evidence: max_wal_size is a soft target, so the
+      # pre-suite report cannot show peak WAL. This always-runs report brackets
+      # the run with post-suite sizes for the next ENOSPC triage.
+      - name: Report Postgres storage headroom (post-suite)
+        if: always()
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
   # Required nextest lane (SDLC 2.3 CI speed pilot, promoted): the workspace
   # lib/bins scope under cargo-nextest (one retry, JUnit, flake ledger) via
   # the shared reusable lane. Same rust-selector gate as the other Rust test
@@ -1109,9 +1122,11 @@ jobs:
           # The database service stores data and WAL on a 1 GiB tmpfs. Unbounded
           # WAL (the PG18 default max_wal_size is 1GB) filled it: run 39209332791
           # died in the ignored-db-stores lane with `PANIC: could not write to
-          # file "pg_wal/xlogtemp.*": No space left on device`. Keep WAL
-          # recycling bounded with headroom for relation files and segment
-          # creation, mirroring the rust-tests lane.
+          # file "pg_wal/xlogtemp.*": No space left on device`. max_wal_size is
+          # a soft checkpoint target, not a hard ceiling: heavy WAL can exceed
+          # it, so keep recycling bounded with headroom for relation files and
+          # segment creation, mirroring the rust-tests lane. The pre/post suite
+          # reports bracket the run for future budget tuning.
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
@@ -1338,6 +1353,17 @@ jobs:
           cargo test -p two-bot-discord --features db-tests --lib --locked admission_ -- --ignored
           cargo test -p two-bot-cutover --test send_admission --locked -- --ignored
 
+      # Post-suite storage evidence: max_wal_size is a soft target, so the
+      # pre-suite report cannot show peak WAL. This always-runs report brackets
+      # the run with post-suite sizes for the next ENOSPC triage.
+      - name: Report Postgres storage headroom (post-suite)
+        if: always()
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
+
   ignored-db-runtime:
     name: ignored db (runtime)
     permissions:
@@ -1519,9 +1545,11 @@ jobs:
           # The database service stores data and WAL on a 1 GiB tmpfs. Unbounded
           # WAL (the PG18 default max_wal_size is 1GB) filled it: run 39209332791
           # died in the ignored-db-stores lane with `PANIC: could not write to
-          # file "pg_wal/xlogtemp.*": No space left on device`. Keep WAL
-          # recycling bounded with headroom for relation files and segment
-          # creation, mirroring the rust-tests lane.
+          # file "pg_wal/xlogtemp.*": No space left on device`. max_wal_size is
+          # a soft checkpoint target, not a hard ceiling: heavy WAL can exceed
+          # it, so keep recycling bounded with headroom for relation files and
+          # segment creation, mirroring the rust-tests lane. The pre/post suite
+          # reports bracket the run for future budget tuning.
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
@@ -1682,6 +1710,17 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test community_facts_capture -- --ignored --test-threads=1
+
+      # Post-suite storage evidence: max_wal_size is a soft target, so the
+      # pre-suite report cannot show peak WAL. This always-runs report brackets
+      # the run with post-suite sizes for the next ENOSPC triage.
+      - name: Report Postgres storage headroom (post-suite)
+        if: always()
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
 
   moderation-db:
     name: moderation db

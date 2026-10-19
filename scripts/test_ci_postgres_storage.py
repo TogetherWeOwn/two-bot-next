@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import textwrap
@@ -29,6 +30,22 @@ SCRIPTS = [
 ]
 PREPARES = [tail.split("\n      - name: ", 1)[0] for tail in PREPARE_TAILS]
 SCRIPT = SCRIPTS[0]
+POSTGRES_LANES = ("rust-tests", "ignored-db-stores", "ignored-db-runtime")
+
+
+def job_text(job_key):
+    """Raw text of one top-level job block in check.yml."""
+    lines = WORKFLOW_TEXT.splitlines(keepends=True)
+    start = next(
+        i for i, line in enumerate(lines)
+        if re.match(rf"^  {re.escape(job_key)}:\s*$", line)
+    )
+    taken = []
+    for line in lines[start + 1:]:
+        if line.strip() and re.match(r"^  \S", line):
+            break
+        taken.append(line)
+    return "".join(taken)
 EXPECTED = {
     "data_directory": "/var/lib/postgresql/18/docker",
     "fsync": "on",
@@ -78,17 +95,49 @@ class PostgresStorageTests(unittest.TestCase):
         # Run 39209332791: only rust-tests bounded WAL while the ignored lanes
         # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
         # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
-        # the bounded service must carry the budget and verify it.
+        # the bounded service must carry the budget and verify it. Scope the
+        # checks per job: a global count lets one lane's two prepares satisfy
+        # another lane's missing one.
         self.assertEqual(len(PREPARE_TAILS), 3)
         self.assertEqual(len(VERIFY_TAILS), 3)
-        for prepare in PREPARES:
-            self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare)
-            self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare)
-            self.assertIn("pg_reload_conf()", prepare)
-        for script in SCRIPTS:
-            self.assertIn("'max_wal_size': '512MB'", script)
-            self.assertIn("'min_wal_size': '64MB'", script)
-        self.assertEqual(len(set(SCRIPTS)), 1, "the lanes' verify probes drifted apart")
+        scripts = []
+        for lane in POSTGRES_LANES:
+            with self.subTest(lane=lane):
+                job = job_text(lane)
+                self.assertIn("agent-testdb:", job)
+                self.assertIn("--tmpfs /var/lib/postgresql:", job)
+                self.assertEqual(
+                    job.count("      - name: Prepare isolated test databases\n"), 1,
+                    f"{lane} must carry exactly one WAL prepare step",
+                )
+                self.assertEqual(
+                    job.count("      - name: Verify disposable Postgres defaults\n"), 1,
+                    f"{lane} must carry exactly one WAL verify step",
+                )
+                prepare = job.split(
+                    "      - name: Prepare isolated test databases\n", 1,
+                )[1].split("\n      - name: ", 1)[0]
+                self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare)
+                self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare)
+                self.assertIn("pg_reload_conf()", prepare)
+                self.assertLess(
+                    prepare.index("ALTER SYSTEM SET max_wal_size"),
+                    prepare.index("pg_reload_conf()"),
+                )
+                self.assertLess(
+                    prepare.index("ALTER SYSTEM SET min_wal_size"),
+                    prepare.index("pg_reload_conf()"),
+                )
+                verify_tail = job.split(
+                    "      - name: Verify disposable Postgres defaults\n", 1,
+                )[1]
+                script = textwrap.dedent(
+                    verify_tail.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+                )
+                self.assertIn("'max_wal_size': '512MB'", script)
+                self.assertIn("'min_wal_size': '64MB'", script)
+                scripts.append(script)
+        self.assertEqual(len(set(scripts)), 1, "the lanes' verify probes drifted apart")
 
     def test_probe_preserves_durability_and_uses_only_explicit_test_connection(self):
         output = io.StringIO()
