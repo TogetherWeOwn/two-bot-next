@@ -882,6 +882,36 @@ as `(ticket)` and supplies this runbook. Route a continuing delivery failure to
 the on-call engineer through the normal triage path. No new webhook, production
 activation or live load test is authorized.
 
+#### Alert: event-store consumer lag
+
+`two_bot_event_store_consumer_lag_seconds` stayed above 60 s (one keepalive
+window) in three consecutive valid keepalive samples. `event_store_consumer_lag`
+is a **ticket, not a page**: only lag above the 60 s threshold counts
+(fractional durations count), while samples at or below it — including `0`
+(unobserved) — never fire and a single transient spike stays quiet. Only a valid
+sample at or below 60 s resolves and rebaselines; missing or invalid samples
+(absent family, duplicate, labeled, non-finite, negative) and failed scrapes
+break the streak but preserve a firing ticket. A process restart reads `0`, so
+restarts rebaseline the same way.
+
+First response: triage within the watch shift through the existing read-only
+paths. Read `two_bot_event_store_consumer_lag_seconds` via the authorized
+`/ops/metrics` scrape and compare gateway readiness, missed-events and REST/DB
+alerts separately; a lag ticket with no gateway or store error is consumer
+pressure, not proof of capture loss. Diagnose the consumer with read-only
+checks only: recent deploy evidence, Worker `metrics_alert` log lines for the
+firing and recovery transitions, and the staging read-only verify query in the
+[event-store wiring note](event-store.md#staging-verify-steps-read-only).
+Record only the sanitized lag value and window, never message, channel, user,
+content or scrape tokens.
+
+Do not change the consumer, the store schema, retention or erasure, replay
+capture rows, or restart the bot to clear the gauge. This alert reuses the
+existing transition delivery as `(ticket)` and supplies this runbook. Persist
+sanitized incident evidence and route a continuing lag to the on-call engineer
+through the normal triage path. No new webhook, production activation or live
+load test is authorized.
+
 #### Alert: metrics scrape lost
 
 The Container DO failed the container-internal `/metrics` scrape on 3 consecutive scheduled keepalive ticks. This is a **ticket, not a page**: the observer itself is blind, so every metric-rule alert is missing evidence while this fires. One failed scrape stays quiet and three consecutive failures ticket exactly once; further failures do not re-ticket while the incident fires.
@@ -1080,29 +1110,27 @@ provider HTTP success alone is not guard evidence.
 
 ### Event-store capture gaps and lag
 
-This is operator guidance, not a metrics alert: no rule in
-`wrangler/src/alert-rules.ts` watches this table, so nothing here fires or
-pages. The append-only capture table (`event_store`) only sees what the
-gateway received, so its gaps follow the gateway counters, not a separate
-store alert. A `two_bot_gateway_missed_events_total` increase between
-keepalive samples is a capture gap: those dispatches never arrived, RESUME
-does not replay them, and no backfill can reconstruct them. First response
-is the same as [gateway missed events](#alert-gateway-missed-events):
-scrape the authorized `/ops/metrics` path, compare the disconnect and
-recovery counters, correlate recent deploys, and do not restart the
-container to clear the counter.
+Capture gaps remain operator guidance, not a metrics alert: no rule watches
+for missing rows, so gaps never fire. The append-only capture table
+(`event_store`) only sees what the gateway received, so its gaps follow the
+gateway counters, not a separate store alert. A
+`two_bot_gateway_missed_events_total` increase between keepalive samples is a
+capture gap: those dispatches never arrived, RESUME does not replay them, and
+no backfill can reconstruct them. First response is the same as [gateway
+missed events](#alert-gateway-missed-events): scrape the authorized
+`/ops/metrics` path, compare the disconnect and recovery counters, correlate
+recent deploys, and do not restart the container to clear the counter.
 
-Capture lag is the spread between `received_at` and `event_time` per event
-family. No counter tracks it yet: lag is only detected by the read-only
-staging verify query ([event-store wiring
-note](event-store.md#staging-verify-steps-read-only)) until a slice ships a
-real counter and rule. A spread that stays above one keepalive window
-(about 60 s) across consecutive windows gets the same first response as a
-missed-events increase. Backfills and repairs against this table are
-insert-only with fresh dedup keys: never rewrite history with `UPDATE` or
-`DELETE`, and never replay an uncertain Discord effect from a capture row.
-Full wiring, fence and staging steps live in the [event-store wiring
-note](event-store.md).
+Capture lag has a ticket: [event-store consumer
+lag](#alert-event-store-consumer-lag) watches the label-free
+`two_bot_event_store_consumer_lag_seconds` gauge. Until the periodic
+store-read caller lands, the gauge reads `0` (unobserved); the staging
+read-only verify query ([event-store wiring
+note](event-store.md#staging-verify-steps-read-only)) remains the manual
+check. Backfills and repairs against this table are insert-only with fresh
+dedup keys: never rewrite history with `UPDATE` or `DELETE`, and never replay
+an uncertain Discord effect from a capture row. Full wiring, fence and staging
+steps live in the [event-store wiring note](event-store.md).
 
 ## Persisted ownership control
 
