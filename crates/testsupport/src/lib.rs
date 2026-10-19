@@ -513,11 +513,10 @@ mod tests {
     /// from the live bootstrap so the failure is a fast undefined_catalog.
     /// Returns None (skip the test) without a configured bootstrap database.
     fn missing_bootstrap_url() -> Option<String> {
-        let base = match std::env::var("TWO_TEST_DATABASE_URL") {
-            Ok(raw) => raw,
-            Err(std::env::VarError::NotPresent) => return None,
-            Err(error) => Err(error).expect("invalid test bootstrap configuration"),
-        };
+        let os = std::env::var_os("TWO_TEST_DATABASE_URL")?;
+        let base = os
+            .into_string()
+            .expect("invalid test bootstrap configuration");
         // Splice the path by hand: Url serialization drops the explicit empty
         // password colon, which the guard requires byte-for-byte.
         let (head, _) = base
@@ -554,10 +553,11 @@ mod tests {
 
     #[tokio::test]
     async fn administrative_timeout_does_not_relax_fixture_queries() {
-        let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
-            Ok(raw) => raw,
-            Err(std::env::VarError::NotPresent) => return,
-            Err(error) => Err(error).expect("invalid test bootstrap configuration"),
+        let raw = match std::env::var_os("TWO_TEST_DATABASE_URL") {
+            Some(os) => os
+                .into_string()
+                .expect("invalid test bootstrap configuration"),
+            None => return,
         };
         let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
             .await
@@ -688,10 +688,11 @@ mod tests {
 
     #[tokio::test]
     async fn teardown_budget_is_finite_and_separate_from_fixture_queries() {
-        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
-            Ok(url) => url,
-            Err(std::env::VarError::NotPresent) => return,
-            Err(error) => Err(error).expect("invalid test bootstrap configuration"),
+        let url = match std::env::var_os("TWO_TEST_DATABASE_URL") {
+            Some(os) => os
+                .into_string()
+                .expect("invalid test bootstrap configuration"),
+            None => return,
         };
         let db = TestDatabase::create(&url, &sqlx::migrate!("./tests/migrations"))
             .await
@@ -880,10 +881,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_database_retry_treats_a_duplicate_as_created() {
-        let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
-            Ok(raw) => raw,
-            Err(std::env::VarError::NotPresent) => return,
-            Err(error) => Err(error).expect("invalid test bootstrap configuration"),
+        let raw = match std::env::var_os("TWO_TEST_DATABASE_URL") {
+            Some(os) => os
+                .into_string()
+                .expect("invalid test bootstrap configuration"),
+            None => return,
         };
         let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
             .await
@@ -923,10 +925,11 @@ mod tests {
 
     #[tokio::test]
     async fn migrations_retry_gives_up_after_the_last_delay() {
-        let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
-            Ok(raw) => raw,
-            Err(std::env::VarError::NotPresent) => return,
-            Err(error) => Err(error).expect("invalid test bootstrap configuration"),
+        let raw = match std::env::var_os("TWO_TEST_DATABASE_URL") {
+            Some(os) => os
+                .into_string()
+                .expect("invalid test bootstrap configuration"),
+            None => return,
         };
         let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
             .await
@@ -946,10 +949,11 @@ mod tests {
 
     #[tokio::test]
     async fn teardown_succeeds_when_the_database_is_already_gone() {
-        let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
-            Ok(raw) => raw,
-            Err(std::env::VarError::NotPresent) => return,
-            Err(error) => Err(error).expect("invalid test bootstrap configuration"),
+        let raw = match std::env::var_os("TWO_TEST_DATABASE_URL") {
+            Some(os) => os
+                .into_string()
+                .expect("invalid test bootstrap configuration"),
+            None => return,
         };
         let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
             .await
