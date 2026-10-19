@@ -17,6 +17,8 @@ mod kick;
 mod limit_command;
 #[path = "voice_name_tests.rs"]
 mod name;
+#[path = "voice_name_filter_acceptance_tests.rs"]
+mod name_filter_acceptance;
 #[path = "voice_name_rerender_tests.rs"]
 mod name_rerender;
 #[path = "voice_private_runtime_tests.rs"]
@@ -135,6 +137,9 @@ struct Store {
     creators: Mutex<Vec<CreatorChannel>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
     rooms_errors: Mutex<VecDeque<StoreError>>,
+    /// One-shot hang for the next `rooms()` call, consumed when it
+    /// starts, so a test can prove a load attempt is deadline-bounded.
+    rooms_delay: Mutex<Option<Duration>>,
     after_rooms: Option<Hook>,
     owner_intents: Mutex<HashMap<u64, OwnerGrantIntent>>,
     owner_pending: Mutex<HashSet<u64>>,
@@ -209,6 +214,7 @@ impl Store {
             creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
             rooms: Mutex::new(HashMap::new()),
             rooms_errors: Mutex::new(VecDeque::new()),
+            rooms_delay: Mutex::new(None),
             after_rooms: None,
             owner_intents: Mutex::new(HashMap::new()),
             owner_pending: Mutex::new(HashSet::new()),
@@ -299,6 +305,10 @@ impl RoomPersistence for Store {
         Ok(())
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
+        let delay = self.rooms_delay.lock().unwrap().take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if let Some(error) = self.rooms_errors.lock().unwrap().pop_front() {
             return Err(error);
         }

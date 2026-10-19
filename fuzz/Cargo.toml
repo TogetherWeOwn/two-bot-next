@@ -138,6 +138,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "database_url"
+path = "fuzz_targets/database_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "feeds_http"
 path = "fuzz_targets/feeds_http.rs"
 test = false
