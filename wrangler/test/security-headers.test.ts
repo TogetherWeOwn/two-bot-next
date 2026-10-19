@@ -5,8 +5,8 @@
  * Decided set: `x-content-type-options: nosniff`,
  * `referrer-policy: no-referrer` (matches the existing 302), and
  * `x-frame-options: DENY` (probe/metrics/control/redirect bodies are
- * machine-consumed text or JSON, never framed HTML). No `frame-ancestors`
- * CSP: X-Frame-Options DENY already states the posture with fewer bytes.
+ * machine-consumed text or JSON). Only the HTML dashboard adds a CSP;
+ * ops-dashboard.test.ts checks that page-specific policy.
  */
 
 import { test, type TestContext } from "node:test";
@@ -43,6 +43,7 @@ const EXPECTED: Record<string, string> = {
 };
 
 function assertHardened(headers: Headers, where: string): void {
+  assert.equal(headers.get("content-security-policy"), null, `${where}: CSP is dashboard-only`);
   for (const [name, value] of Object.entries(EXPECTED)) {
     assert.equal(headers.get(name), value, `${where}: ${name} must be ${value}`);
   }
