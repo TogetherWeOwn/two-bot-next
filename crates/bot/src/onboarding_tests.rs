@@ -4,6 +4,7 @@
 #[path = "onboarding_connect_acceptance_tests.rs"]
 mod connect_acceptance;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +26,22 @@ use crate::onboarding::{OnboardingJob, OnboardingRuntime};
 const TEST_DATABASE: &str = "postgres://agent_test@agent-testdb:5432/postgres";
 const NOW: i64 = 1_790_780_400_000;
 
+static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
+fn schema_name_at(nanos: u128) -> String {
+    format!(
+        "tog10278_onboarding_{}_{}_{}",
+        std::process::id(),
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
+        nanos
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -32,11 +49,16 @@ struct TestSchema {
 
 impl TestSchema {
     async fn new() -> Self {
-        let stamp = SystemTime::now()
+        // PID + counter + nanos: wall-clock nanos can repeat across parallel
+        // tests on a coarse clock (run 39175965289 attempt 1: duplicate
+        // schema `tog10278_*` -> 23505). The counter keeps same-tick
+        // names distinct, the PID separates test binaries, and nanos keeps a
+        // leaked schema plus PID reuse from ever repeating a name.
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("tog10278_onboarding_{stamp}");
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let schema = schema_name_at(nanos);
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");

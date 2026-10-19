@@ -927,6 +927,8 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "error_budget_slow_burn",
     "rest_admission_breaker_open",
     "eventsub_tampered",
+    "eventsub_reconcile_failed",
+    "event_store_consumer_lag",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -948,10 +950,12 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("voice_join_slow_burn", window), `evidence-voice_join_slow_burn-${window}.json`);
   assert.equal(packetFilename("voice_creator_map_stale", window), `evidence-voice_creator_map_stale-${window}.json`);
   assert.equal(packetFilename("eventsub_post_failed_share", window), `evidence-eventsub_post_failed_share-${window}.json`);
+  assert.equal(packetFilename("event_store_consumer_lag", window), `evidence-event_store_consumer_lag-${window}.json`);
   assert.equal(packetFilename("error_budget_fast_burn", window), `evidence-error_budget_fast_burn-${window}.json`);
   assert.equal(packetFilename("error_budget_slow_burn", window), `evidence-error_budget_slow_burn-${window}.json`);
   assert.equal(packetFilename("rest_admission_breaker_open", window), `evidence-rest_admission_breaker_open-${window}.json`);
   assert.equal(packetFilename("eventsub_tampered", window), `evidence-eventsub_tampered-${window}.json`);
+  assert.equal(packetFilename("eventsub_reconcile_failed", window), `evidence-eventsub_reconcile_failed-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -1143,6 +1147,16 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
     tampered = ev([`two_bot_eventsub_classified_total{kind="tampered"} ${n}`], tampered.state);
   }
   firing.push(...tampered.firing);
+  let lag = ev(["two_bot_event_store_consumer_lag_seconds 90"]);
+  lag = ev(["two_bot_event_store_consumer_lag_seconds 90"], lag.state);
+  lag = ev(["two_bot_event_store_consumer_lag_seconds 90"], lag.state);
+  firing.push(...lag.firing);
+  const reconcilePasses = (healthy: number, pending: number, failed: number) => [
+    `two_bot_eventsub_reconcile_passes_total{outcome="healthy"} ${healthy}`,
+    `two_bot_eventsub_reconcile_passes_total{outcome="pending"} ${pending}`,
+    `two_bot_eventsub_reconcile_passes_total{outcome="failed"} ${failed}`,
+  ];
+  firing.push(...ev(reconcilePasses(3, 1, 1), ev(reconcilePasses(3, 1, 0)).state).firing);
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);

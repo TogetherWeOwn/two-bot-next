@@ -529,7 +529,7 @@ jobs:
           # long database runs do not depend on service-alias DNS staying up.
           service_ip=""
           for attempt in $(seq 1 30); do
-            service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk 'NR == 1 { print $1; exit }')"
+            service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk 'NR == 1 { print $1; exit }')" || service_ip=""
             if [[ "$service_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
               break
             fi
@@ -907,6 +907,7 @@ jobs:
           fetch-depth: 1
 
       - name: Job-container prerequisites (loopback forward to agent-testdb)
+        shell: bash
         run: |
           # On hosted/overflow runners the job container's root does not own the
           # runner-owned checkout, so Git refuses it as dubious ownership.
@@ -916,6 +917,35 @@ jobs:
           # Disk hygiene for hosted overflow runners (TOG-12134): the package
           # lists stay on the job-container overlay otherwise.
           rm -rf /var/lib/apt/lists/*
+          set -e
+          # /etc/hosts is mounted in the job container; sed -i cannot rename over it.
+          # Remove any runner/image mapping first so resolution uses the
+          # disposable service's current job-scoped address.
+          hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"
+          sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > "$hosts_tmp"
+          cat "$hosts_tmp" > /etc/hosts
+          rm -f "$hosts_tmp"
+          # Resolve the disposable service and pin its job-scoped address so
+          # long database runs do not depend on service-alias DNS staying up.
+          service_ip=""
+          for attempt in $(seq 1 30); do
+            service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk 'NR == 1 { print $1; exit }')" || service_ip=""
+            if [[ "$service_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+              break
+            fi
+            service_ip=""
+            sleep 1
+          done
+          if [ -z "$service_ip" ]; then
+            echo "agent-testdb did not resolve to an IPv4 address"
+            exit 1
+          fi
+          printf '%s agent-testdb\n' "$service_ip" >> /etc/hosts
+          pinned_ip="$(getent ahostsv4 agent-testdb | awk 'NR == 1 { print $1; exit }')"
+          if [ "$pinned_ip" != "$service_ip" ]; then
+            echo "agent-testdb hosts pin did not take effect"
+            exit 1
+          fi
           # Tests that pin 127.0.0.1/localhost:5432 reach the service through
           # this job-private forward.
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
@@ -1001,6 +1031,14 @@ jobs:
 
       - name: Prepare isolated test databases
         run: |
+          # The database service stores data and WAL on a 1 GiB tmpfs. This
+          # lane runs ~30 sequential suites that each create, migrate and drop
+          # disposable databases, so keep WAL recycling bounded with headroom
+          # for relation files and segment creation (two main runs PANIC'd on
+          # No space left on device mid-suite before this cap).
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
           createdb -h agent-testdb -U agent_test two_bot_test_ci
           createdb -h agent-testdb -U agent_test two_next_backup_ci
           createdb -h agent-testdb -U agent_test two_next_backup_publication_ci
@@ -1020,6 +1058,8 @@ jobs:
               'fsync': 'on',
               'full_page_writes': 'on',
               'synchronous_commit': 'on',
+              'max_wal_size': '512MB',
+              'min_wal_size': '64MB',
           }
           fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
           settings = json.loads(subprocess.check_output([
@@ -1140,6 +1180,9 @@ jobs:
         # Serialized: 8 tests x full 93-migration schema on the 1 GiB tmpfs
         # Postgres service exhausts disk with parallel CREATE DATABASE
         # (run 39149193652 attempt 1: PG_VERSION No space left on device).
+        # Serialization caps peak pressure only; cumulative WAL is capped in
+        # Prepare isolated test databases (run 39197217315 attempt 1 still
+        # PANIC'd on ENOSPC when serialized).
         run: cargo test -p two-bot-discord --features db --locked --test internal_member_store -- --ignored --test-threads=1
 
       - name: Internal member moderation executor (mock REST and CI service only)
@@ -1176,6 +1219,11 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test event_store_s4
+
+      - name: Raw event-store retention acceptance (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-cutover --locked --test retention_raw_expiry --test retention_raw_expiry_bounds --test retention_guarded_purge_raw_expiry -- --test-threads=1
 
       - name: Event-store S5 message/reaction capture acceptance (CI service only)
         env:
@@ -2130,10 +2178,10 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Builds all twenty-three libFuzzer targets. No campaign or generated corpus
-      # output; the existing weekly run replays the bounded eventsub_delivery
-      # and helix_token seeds below. Bounded vote_kick and helix_token smokes
-      # are manual (README).
+      # Builds all twenty-five libFuzzer targets. No campaign or generated corpus
+      # output; the existing weekly run replays the bounded eventsub_delivery,
+      # helix_token, and custom_command_template seeds below. Bounded vote_kick
+      # and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -2141,19 +2189,25 @@ jobs:
       - name: Compile-only fuzz build (no execution)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz build
-      # Bounded seed replay, eventsub_delivery and helix_token: `-runs=0`
+      # Bounded seed replay, eventsub_delivery, helix_token and
+      # custom_command_template: `-runs=0`
       # executes each committed corpus seed exactly once (plus the target's
       # fixed matrix) and exits without fuzzing. A signing-key drift between
       # the harness and production, a token-contract drift between the
-      # helix_token oracle and the parser, or seed misrouting panics an
-      # assertion here instead of passing a compile-only gate. Compile stays
-      # the only gate for the other twenty-one targets.
+      # helix_token oracle and the parser, a template-contract drift between
+      # the custom_command_template oracle and the renderer, or seed
+      # misrouting panics an assertion here instead of passing a
+      # compile-only gate. Compile stays the only gate for the other
+      # twenty-two targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
       - name: Seed replay for helix_token (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run helix_token -- -runs=0 -timeout=10 -rss_limit_mb=2048
+      - name: Seed replay for custom_command_template (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run custom_command_template -- -runs=0 -timeout=10 -rss_limit_mb=2048
 
   worker:
     name: worker check

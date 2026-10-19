@@ -825,4 +825,41 @@ mod tests {
         assert!(!is_unknown_channel(Some(50013)));
         assert!(!is_unknown_channel(None));
     }
+
+    #[test]
+    fn ticket_error_display_strings_are_pinned() {
+        // Member-visible via `Failure::reply`; pin exact text, not just the variant.
+        assert_eq!(
+            TicketError::WrongGuild.to_string(),
+            "Tickets are only available in the configured guild"
+        );
+        assert_eq!(
+            TicketError::StaffOnly.to_string(),
+            "Only staff can claim or close tickets"
+        );
+        assert_eq!(
+            TicketError::AlreadyClaimed.to_string(),
+            "This ticket is already claimed or not open"
+        );
+        assert_eq!(
+            TicketError::InvalidTransition.to_string(),
+            "Ticket state changed; reload it before continuing"
+        );
+        assert_eq!(
+            TicketError::MissingChannel.to_string(),
+            "The ticket channel is unavailable"
+        );
+        assert_eq!(
+            TicketError::MissingHistoryAccess.to_string(),
+            "This ticket cannot be closed until the bot's channel history access is restored"
+        );
+        assert_eq!(
+            TicketError::MissingOpenerAccess.to_string(),
+            "This ticket cannot be closed until the opener's channel access is restored"
+        );
+        assert_eq!(
+            TicketError::StaleClose.to_string(),
+            "This ticket close was already recovered or completed"
+        );
+    }
 }

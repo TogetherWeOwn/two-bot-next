@@ -437,6 +437,9 @@ async function opsReadRefusal(request: Request, env: Env): Promise<Response | nu
         event: "metrics_scrape_token_misconfigured",
         reason: "token_below_minimum_length",
         minimum_length: MIN_SCRAPE_TOKEN_LENGTH,
+        release: releaseTag(null),
+        worker_version: workerVersionTag(env.CF_VERSION_METADATA?.id),
+        log_url: LOG_QUERY_URL,
       }));
     }
     return new Response("not found", { status: 404, headers: withSecurityHeaders() });
@@ -489,8 +492,14 @@ function backfillProgressRefusal(request: Request): Response | null {
 
 // SDK failures do not carry a trustworthy Rust startup class. Never serialize
 // arbitrary exception text (or claim stderr crossed the Container boundary).
-function containerUnavailable(): Response {
-  console.error(JSON.stringify({ event: "container_probe_failed", error_class: "container_unavailable" }));
+function containerUnavailable(workerVersionId: unknown): Response {
+  console.error(JSON.stringify({
+    event: "container_probe_failed",
+    error_class: "container_unavailable",
+    release: releaseTag(null),
+    worker_version: workerVersionTag(workerVersionId),
+    log_url: LOG_QUERY_URL,
+  }));
   return Response.json({ ready: false, error_class: "container_unavailable" }, { status: 500, headers: withSecurityHeaders() });
 }
 
@@ -942,11 +951,11 @@ export class TwoBotContainer extends Container<Env> {
         try {
           probeResponse = await deadlineFetch(this.containerFetch(probe), probeSignal);
         } catch {
-          return containerUnavailable();
+          return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
         }
         if (probeSignal.aborted) {
           releaseBody(probeResponse);
-          return containerUnavailable();
+          return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
         }
         try {
           // SDK startup failures arrive as responses rather than rejections.
@@ -954,16 +963,16 @@ export class TwoBotContainer extends Container<Env> {
           // so the SDK proxy pipe settles, oversize cancels via the reader.
           if (!isBotProbeResponse(probeResponse)) {
             await readBoundedText(probeResponse, MAX_PROBE_BODY_BYTES, probeSignal).catch(() => null);
-            return containerUnavailable();
+            return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
           }
           if (probeSignal.aborted) {
             releaseBody(probeResponse);
-            return containerUnavailable();
+            return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
           }
           await this.armKeepalive();
           return probeResponse;
         } catch {
-          return containerUnavailable();
+          return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
         }
       });
     } catch (error) { return refused(error); }
@@ -1334,7 +1343,12 @@ export class TwoBotContainer extends Container<Env> {
     })().catch(() => {
       // Scheduling failures are monitoring failures, not permission failures.
       // Never suppress the ownership read above or expose provider error text.
-      console.warn(JSON.stringify({ event: "container_keepalive_arm_failed" }));
+      console.warn(JSON.stringify({
+        event: "container_keepalive_arm_failed",
+        release: releaseTag(this.lastRelease),
+        worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+        log_url: LOG_QUERY_URL,
+      }));
     }).finally(() => { this.keepaliveArming = undefined; });
     return this.keepaliveArming;
   }
@@ -1366,7 +1380,18 @@ export class TwoBotContainer extends Container<Env> {
             const res = await deadlineFetch(
               this.containerFetch("http://c/readyz", { signal: probeSignal }), probeSignal);
             status = res.status;
-            if (!res.ok) console.warn(`two-bot /readyz unhealthy: ${status}`);
+            if (!res.ok) {
+              // Logged before the probe body is read, so this tick's SHA is
+              // not known yet: stamp unknown, never the previous image's SHA
+              // still in lastRelease (a failed probe must not reuse it).
+              console.warn(JSON.stringify({
+                event: "container_readyz_unhealthy",
+                status,
+                release: releaseTag(null),
+                worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+                log_url: LOG_QUERY_URL,
+              }));
+            }
             // Cap the keepalive /readyz read like the metrics scrape: a
             // compromised container controls this body, so an oversized answer
             // is a failed probe, never a buffered parse. Small bodies still
@@ -1379,10 +1404,20 @@ export class TwoBotContainer extends Container<Env> {
               // A probe that only completed past its deadline is no evidence
               // of readiness: record it as failed, never as recovery.
               status = null;
-              console.warn("two-bot keepalive probe failed");
+              console.warn(JSON.stringify({
+                event: "container_keepalive_probe_failed",
+                release: releaseTag(this.lastRelease),
+                worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+                log_url: LOG_QUERY_URL,
+              }));
             } else if (body === null) {
               status = null;
-              console.warn("two-bot keepalive probe failed");
+              console.warn(JSON.stringify({
+                event: "container_keepalive_probe_failed",
+                release: releaseTag(this.lastRelease),
+                worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+                log_url: LOG_QUERY_URL,
+              }));
             } else {
               const botBody = isBotProbeResponse(res);
               probe = botBody ? probeDetail(body) : { failure: null };
@@ -1409,7 +1444,12 @@ export class TwoBotContainer extends Container<Env> {
             }
             status = null;
             this.lastRelease = null;
-            console.warn("two-bot keepalive probe failed");
+            console.warn(JSON.stringify({
+              event: "container_keepalive_probe_failed",
+              release: releaseTag(this.lastRelease),
+              worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+              log_url: LOG_QUERY_URL,
+            }));
           }
           const context: AlertContext = {
             buildRevision: probe.buildRevision ?? "unknown",
@@ -1680,9 +1720,21 @@ export class TwoBotContainer extends Container<Env> {
         body: JSON.stringify({ content, allowed_mentions: { parse: [], replied_user: false } }),
       });
       await response.body?.cancel();
-      if (!response.ok) console.warn(JSON.stringify({ event: "metrics_alert_webhook_failed", status: response.status }));
+      if (!response.ok) console.warn(JSON.stringify({
+        event: "metrics_alert_webhook_failed",
+        status: response.status,
+        release: releaseTag(this.lastRelease),
+        worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+        log_url: LOG_QUERY_URL,
+      }));
     } catch {
-      console.warn(JSON.stringify({ event: "metrics_alert_webhook_failed", status: null }));
+      console.warn(JSON.stringify({
+        event: "metrics_alert_webhook_failed",
+        status: null,
+        release: releaseTag(this.lastRelease),
+        worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+        log_url: LOG_QUERY_URL,
+      }));
     }
   }
 
@@ -1708,11 +1760,25 @@ export class TwoBotContainer extends Container<Env> {
       });
       await response.body?.cancel();
       if (!response.ok) {
-        console.warn(JSON.stringify({ event: "container_unready_webhook_failed", notification: event, status: response.status }));
+        console.warn(JSON.stringify({
+          event: "container_unready_webhook_failed",
+          notification: event,
+          status: response.status,
+          release: releaseTag(this.lastRelease),
+          worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+          log_url: LOG_QUERY_URL,
+        }));
       }
     } catch {
       // Fetch errors can contain the secret URL. Never log the error or body.
-      console.warn(JSON.stringify({ event: "container_unready_webhook_failed", notification: event, status: null }));
+      console.warn(JSON.stringify({
+        event: "container_unready_webhook_failed",
+        notification: event,
+        status: null,
+        release: releaseTag(this.lastRelease),
+        worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+        log_url: LOG_QUERY_URL,
+      }));
     }
   }
 
@@ -1907,13 +1973,13 @@ export default {
         // hook must not hold the fixed refusal.
         if (!isBotProbeResponse(upstream)) {
           releaseBody(upstream);
-          response = containerUnavailable();
+          response = containerUnavailable(env.CF_VERSION_METADATA?.id);
         } else {
           response = upstream;
         }
       } catch {
         // Includes DO construction/binding failures before its fetch handler.
-        response = containerUnavailable();
+        response = containerUnavailable(env.CF_VERSION_METADATA?.id);
       }
       // The outer Worker owns provenance, not the container or DO version.
       // Copy the response to get mutable headers without changing status/body.

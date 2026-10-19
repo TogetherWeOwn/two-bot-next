@@ -1111,7 +1111,14 @@ mod tests {
             schedule_confirm_text(false, "id1", Some(60), "ignored"),
             "Replaced message `id1` every 60m."
         );
-        assert!(no_unique_match_text("abc").contains("Use the full id from /schedule-list."));
+        assert_eq!(
+            no_unique_match_text("abc"),
+            "No unique scheduled message matches `abc`. Use the full id from /schedule-list."
+        );
+        assert_eq!(
+            no_unique_match_text("a1b2c3d4"),
+            "No unique scheduled message matches `a1b2c3d4`. Use the full id from /schedule-list."
+        );
         assert_eq!(schedule_cancelled_text(), "Cancelled.");
         assert_eq!(no_such_schedule_text("id1"), "No scheduled message `id1`.");
         assert_eq!(schedule_list_text(&[]), "Nothing scheduled.");
