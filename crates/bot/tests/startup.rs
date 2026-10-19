@@ -5,7 +5,10 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     process::{Child, Command, Stdio},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -502,6 +505,128 @@ fn stolen_port_retries_with_fresh_port() {
     assert!(
         calls.get() >= 2,
         "stolen-port test never took its second attempt"
+    );
+}
+
+fn fake_readyz_body() -> String {
+    serde_json::json!({
+        "components": [
+            ["process", "ready"],
+            ["gateway", "down"],
+            ["database", "down"],
+            ["token_invalid", "ready"]
+        ],
+        "jobs": {
+            "counter": {"parked": true, "running": false, "last_start": null},
+            "rank": {"parked": true, "running": false, "last_start": null},
+            "scheduled_events": {"parked": true, "running": false, "last_start": null},
+            "settings": {"parked": true, "running": false, "last_start": null},
+            "presence_probe": {"parked": true, "running": false, "last_start": null},
+            "community_scorecard": {"parked": true, "running": false, "last_start": null},
+            "inactivity": {"parked": true, "running": false, "last_start": null}
+        }
+    })
+    .to_string()
+}
+
+/// Serve canned parked-gateway bodies on a stolen port. The listener stays
+/// bound (so the own child bind-dies) while accepting connections. Health
+/// responses wait 180ms so the bind-doomed child has exited before the
+/// response arrives; the wait stays under `get`'s 250ms timeout. Set
+/// `shutdown` to stop the thread.
+fn spawn_fake_parked_server(
+    listener: TcpListener,
+    shutdown: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        listener.set_nonblocking(true).expect("fake nonblocking");
+        let readyz_body = fake_readyz_body();
+        while !shutdown.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    if request.contains("GET /readyz") {
+                        let response = format!(
+                            "HTTP/1.0 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            readyz_body.len(),
+                            readyz_body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    } else if request.contains("GET /health") {
+                        thread::sleep(Duration::from_millis(180));
+                        let body = "OK";
+                        let response = format!(
+                            "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    } else {
+                        let body = "not found";
+                        let response = format!(
+                            "HTTP/1.0 404 Not Found\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    let _ = stream.flush();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+struct StopFakeOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopFakeOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn stolen_port_with_serving_sibling_retries_on_attribution() {
+    // Pins the child-attribution checks: a sibling serving identical /health
+    // and /readyz bodies on the stolen port must not satisfy the first
+    // attempt. The own child bind-dies during the delayed health response;
+    // the post-health alive check must notice and retry on a fresh port.
+    // With both alive checks deleted, attempt one accepts the fake response
+    // and the provider is called exactly once.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("hold test port");
+    let held_addr = listener.local_addr().unwrap();
+    let held_listen = format!("0.0.0.0:{}", held_addr.port());
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server = spawn_fake_parked_server(listener, Arc::clone(&shutdown));
+    let _stop = StopFakeOnDrop(Arc::clone(&shutdown));
+
+    let calls = std::cell::Cell::new(0u8);
+    let mut provider = || {
+        let n = calls.get() + 1;
+        calls.set(n);
+        if n == 1 {
+            (held_addr, held_listen.clone())
+        } else {
+            reserve_test_port()
+        }
+    };
+    assert_parked_gateway_with_ports(
+        &[("DISCORD_TOKEN", "INVALID"), ("GUILD_ID", "123")],
+        &mut provider,
+    );
+    shutdown.store(true, Ordering::SeqCst);
+    let _ = server.join();
+    assert!(
+        calls.get() >= 2,
+        "serving-sibling test never retried to a fresh port"
     );
 }
 
