@@ -616,6 +616,13 @@ struct Values {
     /// so the vocabulary is the single series name — no actor ID, timestamp,
     /// error text or row content ever reaches exposition.
     audit_delivery_halt: u64,
+    /// Skipped retention purges needing Operator replay: one per real guild
+    /// removal whose purge-queue write hit the schema gap (the
+    /// `retention_lifecycle` purge-skip arm). Successful queue writes and
+    /// rejoin-cancel skips never increment it. Label-free counter; resets on
+    /// process restart, so the runbook pairs it with the error log line. No
+    /// guild id, SQLSTATE or error text ever becomes a label.
+    retention_replay_needed: u64,
     /// Event-store consumer lag (S1): `received_at - event_time` spread in
     /// seconds for the newest observed capture row. Last writer wins; 0 when
     /// no row has been observed. Single label-free series — no message,
@@ -1155,6 +1162,19 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         values.voice_orphans = values.voice_orphans.saturating_add(1);
+    }
+
+    /// One skipped retention purge needing Operator replay: a real guild
+    /// removal whose purge-queue write hit the schema gap. Call exactly once
+    /// from the purge-skip arm of `retention_lifecycle`; successful queue
+    /// writes and rejoin-cancel skips never call this. Label-free counter;
+    /// no guild id, SQLSTATE or error text ever becomes a label.
+    pub fn retention_replay_needed(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.retention_replay_needed = values.retention_replay_needed.saturating_add(1);
     }
 
     /// One storage-layer failure. Unknown `op` values collapse
@@ -1930,6 +1950,12 @@ impl Metrics {
             values.audit_delivery_halt
         )
         .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_retention_replay_needed_total",
+            "counter",
+            values.retention_replay_needed,
+        );
         header(
             &mut out,
             "two_bot_event_store_consumer_lag_seconds",
@@ -2937,6 +2963,29 @@ mod tests {
             assert!(unique.insert(key), "duplicate series: {key}");
             assert!(sample.parse::<f64>().is_ok(), "bad sample: {line}");
         }
+    }
+
+    #[test]
+    fn retention_replay_needed_counter_is_label_free_and_zero_fresh() {
+        // TOG-29785: skipped purges render as one label-free counter series —
+        // 0 on a fresh registry, +1 per purge-skip — so no guild id, SQLSTATE
+        // or error text can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_retention_replay_needed_total counter\n"));
+        assert!(text.contains("two_bot_retention_replay_needed_total 0\n"));
+        metrics.retention_replay_needed();
+        metrics.retention_replay_needed();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_retention_replay_needed_total 2\n"));
+        assert!(!text.contains("two_bot_retention_replay_needed_total{"));
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_retention_replay_needed_total "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
     }
 
     #[test]
