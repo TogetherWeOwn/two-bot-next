@@ -331,7 +331,54 @@ pub fn grouped_number(n: u64) -> String {
     String::from_utf8(out).expect("grouped digits are ASCII")
 }
 
+/// Rendered display-name bound for the `/rank` reply, in characters. Par with
+/// the vote-grade public bound (`VOTE_KICK_PUBLIC_REASON_LIMIT` in the bot
+/// crate, also `GOODBYE_USERNAME_LIMIT`): applied to the escaped output so the
+/// bound holds on the wire.
+pub const RANK_DISPLAY_NAME_LIMIT: usize = 512;
+
+/// Sanitize a display name for the `/rank` reply name slot (goodbye grade):
+/// fold newlines to spaces so the reply keeps its three template lines,
+/// neutralize mass mentions with the shared neutralizer, split mention pills
+/// (`<@`, `<#`, `<:`, `<a:`) so they render literally, backslash-escape the
+/// vote-reason markdown set, and cap the escaped output at
+/// [`RANK_DISPLAY_NAME_LIMIT`] characters. Plain names pass through
+/// byte-identical.
+fn sanitize_rank_name(display_name: &str) -> String {
+    let mut single_line = String::with_capacity(display_name.len());
+    for chunk in display_name.split(['\r', '\n']) {
+        if !single_line.is_empty() {
+            single_line.push(' ');
+        }
+        single_line.push_str(chunk);
+    }
+    let neutralized = crate::message_safety::neutralize_mentions(&single_line);
+    let pills = neutralized
+        .replace("<@", "<\u{200b}@")
+        .replace("<#", "<\u{200b}#")
+        .replace("<:", "<\u{200b}:")
+        .replace("<a:", "<\u{200b}a:");
+    let mut escaped = String::with_capacity(pills.len());
+    for ch in pills.chars() {
+        if matches!(ch, '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    let mut capped: String = escaped.chars().take(RANK_DISPLAY_NAME_LIMIT).collect();
+    // A cut mid-escape would leave a lone backslash that eats the closing bold
+    // delimiter, so trim on escape-pair boundaries instead.
+    if capped.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 1 {
+        capped.pop();
+    }
+    capped
+}
+
 /// `/rank` reply body (legacy `rankText`).
+///
+/// `display_name` is untrusted text rendered through goodbye-grade sanitizing
+/// (single-line, mention-neutralized, markdown-escaped, length-capped); plain
+/// names render byte-identical to legacy.
 #[must_use]
 pub fn rank_text(
     display_name: &str,
@@ -349,8 +396,9 @@ pub fn rank_text(
     let progress = xp - floor;
     let span = next_floor - floor;
     let to_next = next_floor - xp;
+    let safe = sanitize_rank_name(display_name);
     format!(
-        "**{display_name}**\nLevel **{level}** · {rank_label}\nXP **{xp}** · {progress}/{span} this level · **{to_next}** to level {}",
+        "**{safe}**\nLevel **{level}** · {rank_label}\nXP **{xp}** · {progress}/{span} this level · **{to_next}** to level {}",
         level + 1,
         xp = grouped_number(xp),
         progress = grouped_number(progress),
