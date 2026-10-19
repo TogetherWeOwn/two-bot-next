@@ -821,6 +821,67 @@ class ContainerSmokeTests(unittest.TestCase):
         self.fixture.oom = True
         self.assert_rejected("shut down cleanly")
 
+    def test_cleanup_guard_failure_matrix_preserves_primary_and_bounds_output(self):
+        name = "two-bot-smoke-" + "a" * 32
+        sentinel = "uncontrolled Docker detail"
+        failures = (
+            subprocess.CompletedProcess([], 1, sentinel, sentinel),
+            subprocess.TimeoutExpired([sentinel], 30, output=sentinel, stderr=sentinel),
+            OSError(sentinel),
+            subprocess.CalledProcessError(1, [sentinel], output=sentinel, stderr=sentinel),
+        )
+        for stage in ("measurement", "health-probe", "main"):
+            for failure in failures:
+                for primary in (None, RuntimeError("primary smoke failure")):
+                    with self.subTest(stage=stage, failure=type(failure), primary=primary):
+                        def remove(*args, **kwargs):
+                            if isinstance(failure, BaseException):
+                                raise failure
+                            return failure
+                        with patch.object(smoke, "docker", side_effect=remove) as docker, \
+                                patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                                contextlib.redirect_stdout(io.StringIO()) as output:
+                            with self.assertRaises(RuntimeError) as caught:
+                                with smoke.owned_container(name, stage):
+                                    if primary is not None:
+                                        raise primary
+                        docker.assert_called_once_with("rm", "--force", name, timeout=30, check=False)
+                        if primary is not None:
+                            self.assertIs(caught.exception, primary)
+                        else:
+                            self.assertIsInstance(caught.exception, smoke.CleanupFailure)
+                            self.assertIsNone(caught.exception.__cause__)
+                            self.assertTrue(caught.exception.__suppress_context__)
+                        self.assertIn(f"FAIL cleanup {stage}:", output.getvalue())
+                        self.assertNotIn(sentinel, output.getvalue() + str(caught.exception))
+                        self.assertLess(len(output.getvalue()), 300)
+
+    def test_failed_log_collection_does_not_mask_primary_or_skip_cleanup(self):
+        fixture = self.fixture
+        self.http = lambda url: (500, {})
+        for error in (OSError("log process unavailable"), subprocess.TimeoutExpired("docker logs", 30)):
+            with self.subTest(error=type(error)):
+                fixture.calls.clear()
+                def docker(*args, **kwargs):
+                    if args[0] == "logs":
+                        raise error
+                    return fixture(*args, **kwargs)
+                self.fixture = docker
+                self.assert_rejected("/health did not return 200")
+                self.assertEqual(len(fixture.removals()), 2)
+
+    def test_cleanup_only_failure_does_not_collect_runtime_logs(self):
+        fixture = self.fixture
+        def docker(*args, **kwargs):
+            if args[:2] == ("rm", "--force") and args[2].endswith("-probe"):
+                fixture.calls.append((args, kwargs))
+                return subprocess.CompletedProcess(args, 1, "", "")
+            return fixture(*args, **kwargs)
+        self.fixture = docker
+        self.assert_rejected("cleanup health-probe")
+        self.assertEqual(len(fixture.removals()), 3)
+        self.assertFalse(any(args[0] == "logs" for args, _ in fixture.calls))
+
     def test_summary_records_measurements(self):
         scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")
         with tempfile.TemporaryDirectory(dir=scratch) as directory:
