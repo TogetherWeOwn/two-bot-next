@@ -48,9 +48,21 @@ Create a B4 evidence manifest before scheduling:
   implementation: every non-DROP behavior has merged runtime wiring and passing
   acceptance evidence, or an explicitly approved waiver. Moderation, automation,
   scheduled unbans and internal actions cannot be silently waived.
-- [ ] [B2 soak](staging-soak.md) is signed off: seven consecutive days with zero
-  missed gateway events, measured redeploy gap under 60 seconds and acceptable
-  memory placement. Include feature/voice soak evidence, not just health polls.
+- [ ] [B2 soak](staging-soak.md) is signed off: four fully evidenced ACTIVE
+  hours with zero missed events across joins, voice, messages and slash; every
+  actual outage recovers in under 60 seconds from outage start to verified
+  recovery; hours 3–4 include 120 expected one-minute samples. Flat memory and
+  no error spikes remain required (numeric RSS/error criteria are unaccepted).
+  Include feature/voice evidence, not just health polls; deploy-finish-to-ready
+  is not outage-recovery evidence. The approved policy does not operationally
+  define ACTIVE hours, the required samples' source/shape, or the hours 1–2
+  sample rule; no verified live route currently proves the four-family evidence
+  or 120 samples, so B2 remains NOT VERIFIED and cannot be signed off on the
+  current documentation. The documented staging redeploy interruption is
+  95–139 seconds (with a separate historical 92–139-second staging note); if
+  the approved policy counts planned redeploys as actual outages, these exceed
+  the 60-second limit. That classification is unresolved and no owner is named
+  in the approved text; do not infer a PASS.
 - [ ] W16 all-warm rollback rehearsal has passed and shared Neon data/region,
   schema compatibility and backups are signed off. B4 runs **last**. The old
   migration plan's TypeScript/no-copy assumptions are not evidence for the Rust
@@ -111,7 +123,10 @@ that can mutate the copied data can be paused and resumed without duplication.
 **T−15 min:** run read-only command diff and preflight with the production
 application/guild through the authorized REST executor (no gateway startup).
 Capture token-valid/application identity, intent flags, role/channel results and
-session-start budget; FAIL is NO-GO, WARN needs a recorded disposition. Snapshot
+the `session start budget` check (`GET /gateway/bot`: `remaining`, `total`,
+`reset_after_ms`, `max_concurrency`); FAIL is NO-GO (exit 1), including
+`remaining` below 10 or an unreadable budget, while WARN (`remaining` below
+100) needs a recorded disposition but keeps exit 0. Snapshot
 legacy configuration, command definitions **and separate guild permissions**
 *before* any overwrite. Confirm the legacy restart path does not auto-register a
 different registry or resume a stale session. Verify the persisted Worker/DO
@@ -144,18 +159,19 @@ has RESUME disabled (see below).
 
 ## Tool availability and command sheet
 
-Baseline checked: `44338b2` on 2026-09-30. Recheck candidate **source parsing**
+Baseline checked: `bce86a791` on 2026-10-09. Recheck candidate **source parsing**
 before invoking tools. `two-bot` with no subcommand starts the server;
-`two-bot serve` is **not** supported. For baseline help-only inspection, use
-**only `two-bot --help`** (top-level).
+`two-bot serve` is **not** supported.
 
-Do **not** run `two-bot backup --help` or
-`two-bot guild-config-snapshot --help`: dispatch ignores their trailing arguments
-and executes the backup/prune/upload or Discord snapshot/upload instead. The
-usage comment claiming help after any subcommand is not the dispatch behavior:
-[argument dispatch](../crates/bot/src/backup_cli.rs#L162). Other binaries or future
-subcommand help paths require source/fixture verification before approval; a
-`--help` suffix is not a read-only safety boundary.
+`--help` is read-only on the operator CLIs: `two-bot backup --help`,
+`two-bot guild-config-snapshot --help`, and `--help` after any subcommand print
+usage and exit 0 before any env, DB or network read, so `--help` never dumps,
+prunes or uploads
+([help routing](../crates/bot/src/backup_cli.rs#L228), [dispatch](../crates/bot/src/backup_cli.rs#L254)).
+A trailing argument that is not `--help` is refused with exit 2 (`:243-248`).
+Other binaries or future subcommand help paths still require source/fixture
+verification before approval; a `--help` suffix is not a universal read-only
+safety boundary.
 
 ### Existing tools: limited recovery, not the full cutover data path
 
@@ -166,8 +182,8 @@ subcommand help paths require source/fixture verification before approval; a
 | `two-bot backup-upload <dump.ndjson.gz>` | Uploads one dump using approved S3 bindings; an upload is not proof of completeness or restore compatibility |
 | `two-bot guild-config-snapshot` / `two-bot guild-config-restore --snapshot FILE` | Pinned **staging-only** guild structure recovery. Does **not** snapshot application commands; never use as production registry rollback |
 
-Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L99),
-[restore implementation](../crates/bot/src/backup_cli.rs#L380) and
+Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L148),
+[restore implementation](../crates/bot/src/backup_cli.rs#L501) and
 [backup runbook](backup.md). `restore --dry-run` optionally reads a target when
 `TWO_RESTORE_URL` is set; do not mistake it for automatically offline operation.
 For local fixture/artifact inspection **without any DB connection**:
@@ -184,12 +200,12 @@ FAIL; on a real restore require exit 0 and `RESTORE VERIFIED`, then separately
 verify canonical content and required table coverage. A v4 dump covers every
 table that either migration chain creates, except `xp_cooldowns`, the store
 chain's `rollback_journal`/`rollback_watermarks` and the migration ledgers
-([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L141)),
+([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L222)),
 plus retired legacy tables when the source still has them
 ([`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44)). Restore needs a
 target migrated to the dump's schema, and refuses before any write when a
 current table is missing. Coverage and the trigger and sequence handling are in
-[backup.md](backup.md#coverage-and-recovery-semantics-v4-tog-11142). Do not
+[backup.md](backup.md#coverage-and-recovery-semantics-v4-v5-v6-v7-and-v8). Do not
 treat its per-table count checks as complete final-copy verification.
 
 MEE6 XP/backfill/capture/reward utilities are **separate binaries**, not a
@@ -199,22 +215,29 @@ Do not use `dedupe-events` during cutover: it defaults to deletion and has no
 guild fence. Their exact behavior is in the
 [cutover CLI sources](../crates/cutover/src/bin) and is outside this procedure.
 
-### Planned copy, registry and preflight tools
+### Merged copy, registry and preflight tools
 
-The following are **planned, not merged into this baseline**; do not paste them
-into a production shell or invent flags to make them work:
+The following are merged in this baseline (re-checked at `bce86a791`); do not
+paste them into a production shell without the cutover executor's approval:
 
-| Planned invocation | Owner / use / missing evidence |
+| Merged invocation | Source / use / limit |
 |---|---|
-| `legacy_copy` (separate cutover binary), default dry-run; `--apply`, `--allow-live-target` planned | [TOG-10868](/TOG/issues/TOG-10868): per-group legacy→Next mapping and row-count plan. Pending schema groups must fail, not be omitted. Exact source/target binding flags and verification invocation require merged tool documentation. A forward upsert is **not** a rollback delta exporter |
-| `two-bot commands diff` | [TOG-10860](/TOG/issues/TOG-10860): read current guild registry and compare to compiled desired registry; no PUT/no gateway |
-| `two-bot commands publish --apply` | Same card: explicit overwrite; default dry-run and live-guild opt-in required. Verify final flag spelling after merge; global snapshot/restore is not implied by a guild tool |
-| `two-bot preflight --json` | [TOG-10858](/TOG/issues/TOG-10858): read-only REST identity/intents/role/channel checks, FAIL vs WARN. Verify target selection and live-target guards after merge |
+| `legacy_copy` (separate cutover binary), default dry-run; `--apply`, `--allow-live-target` | `crates/cutover/src/bin/legacy_copy.rs:9-18`: per-group legacy→Next mapping and row-count plan. Pending schema groups fail, not omitted. A forward upsert is **not** a rollback delta exporter |
+| `two-bot commands diff` | `crates/bot/src/commands_cli.rs:19-28`: read current guild registry and compare to compiled desired registry; no PUT/no gateway |
+| `two-bot commands publish --apply` | Same source: explicit overwrite; default dry-run and `--allow-live-guild` opt-in required. Global snapshot/restore is not implied by a guild tool |
+| `two-bot preflight --json` | `crates/bot/src/preflight.rs:31-40`: read-only REST identity/intents/role/channel checks, FAIL vs WARN |
+| `gateway-force-identify` (separate cutover binary), default dry-run; `--apply --reason`, `--allow-live-guild` | `crates/cutover/src/bin/gateway_force_identify.rs:1-14`: prints guild, shard, checkpoint age and directive, writes nothing; `--apply` arms a one-shot force-fresh IDENTIFY consumed by the next boot. Required for the first production boot ([gateway recovery](gateway-recovery.md#force-fresh-identify-first-production-boot)) |
+| `rollback-delta --since <RFC3339> [--export <path>]` (separate cutover binary) | `crates/cutover/src/bin/rollback_delta.rs`: read-only delta report on stdout; `--export` writes the measured post-`T_f` rows as NDJSON (`{"table","row"}` per line) |
+| `rollback-delta import --file <export.ndjson> [--apply] [--allow-live-target] [--acknowledge-divergent]` (same binary) | `crates/cutover/src/rollback_import.rs`: replays an `--export` file into `TWO_DATABASE_URL`. Default dry-run prints a row-count plan without opening a database; `--apply` plus the live-target opt-in applies it in one idempotent transaction, parent-first. `--export` parent-joins `lfg_roles` to every exported `lfg_posts` row so a post-freeze post imports with its roles and signups; a failed insert names its table and constraint for integrity violations, while other server errors stay redacted database errors. The apply reports inserted vs already-present rows per table and advances owned sequences past the imported maxima. Skipped rows with no identical match are divergent (target values kept): the comparison is primary-keyed inside a UTC-pinned transaction with destination-owned columns (e.g. `guild_settings.cas_version`) excluded, the keyless `member_erasure_audit` inserts only when no identical row exists so its re-run never duplicates, the run lists their `table:key` entries and exits 3 unless `--acknowledge-divergent` is passed after manual reconciliation. Malformed lines, unknown tables and row-cap overruns refuse before any write |
 
-No `commands restore`, complete database delta export/reverse-import, or
-`--disable-resume` command is established by this baseline. Gateway RESUME is
-automatic; there is no verified disable environment flag either. Do not invent
-`RESUME=0`, delete session rows or omit the database to force a fresh session.
+No `commands restore` (registry) or
+`--disable-resume` command is established by this baseline (re-checked at
+`bce86a791`: `commands_cli.rs` offers only `diff`/`publish`, no `restore`;
+no `disable-resume`/`RESUME=0` in `crates/bot/src`). Gateway RESUME is
+automatic and there is no verified disable environment flag. Do not invent
+`RESUME=0`: to force a fresh session, arm the one-shot IDENTIFY directive with
+`gateway-force-identify --apply` (see table); manual session-row edits are not a
+reviewed path.
 These are required **capabilities**, not claimed existing subcommands. B4 must
 attach a reviewed, fixture-rehearsed execution/restore command sheet covering
 them before GO. Likewise, the merged generic backup is not a complete snapshot
@@ -265,8 +288,11 @@ version; there is no client-supplied target deployment. `expectedEpoch` is 0 onl
 for a never-initialized record; a stale/replayed epoch returns 409. It is not safe
 to invent 0 or retry a conflict without reading and reconciling the new state.
 
-Each accepted change increments the epoch, atomically persists a **fenced**
+Each accepted change commits exactly one epoch higher, atomically persists a **fenced**
 owner and audit receipt, then awaits native destruction and checks `running=false`.
+The single exception is an idempotent repeat: a same-owner exact-epoch takeover
+over an `active` record with no recovery pending returns the stored record
+unchanged, with no write, no audit row, no destroy and no epoch increment.
 Only a successful takeover writes `phase=active`; it does **not** start the new
 container. A stop/crash/final-write failure leaves persisted denial and must be
 reconciled with a fresh authenticated epoch change. The independent audit keys
@@ -325,19 +351,21 @@ alongside an unconfirmed Next gateway.
 - Server binds `DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID`, and optional
   `LISTEN_ADDR`. Cutover utilities instead use `TWO_DATABASE_URL`, and some
   use `DISCORD_GUILD_ID`. Do not silently substitute bindings. Worker forwarding
-  currently covers token/database/guild/listener, **not feature flags**:
-  [configuration](../crates/core/src/config.rs#L34),
-  [tool connection](../crates/cutover/src/cli.rs#L102),
-  [Worker environment](../wrangler/src/index.ts#L73).
+  currently covers token/database/guild/listener, the non-secret flags in
+  [`FORWARDED_FLAGS`](../wrangler/src/container-env.ts#L20) and the ids in
+  `FORWARDED_DISCORD_IDS`:
+  [configuration](../crates/core/src/config.rs#L24),
+  [tool connection](../crates/cutover/src/cli.rs#L180),
+  [Worker environment](../wrangler/src/index.ts) (`containerEnvVars`).
 - Configured server startup runs embedded migrations; it is not a read-only
   preflight. Gateway boot wires the funnel pipeline, not the full feature/job
   stack. Domain/store libraries and command definitions are not activated
-  runtime evidence: [boot](../crates/bot/src/main.rs#L78),
-  [pipeline construction](../crates/bot/src/gateway.rs#L336).
+  runtime evidence: [boot](../crates/bot/src/main.rs),
+  [pipeline construction](../crates/bot/src/gateway.rs).
 - Fresh checkpoints (up to 15 minutes old) automatically trigger RESUME.
   Persistence deduplicates funnel batches, not all Discord effects:
   [session policy](../crates/core/src/gateway_session.rs#L4),
-  [boot resume](../crates/bot/src/gateway.rs#L315). A reviewed force-fresh path is
+  [boot resume](../crates/core/src/gateway_session.rs#L23). A reviewed force-fresh path is
   required for first production boot; do not assume a restart gives IDENTIFY.
 - SIGTERM drains accepted gateway dispatches, jobs and HTTP within
   `SHUTDOWN_TIMEOUT_SECONDS` (default 35 s), then exits; a second signal exits
@@ -345,9 +373,12 @@ alongside an unconfirmed Next gateway.
 - The baseline has no wired scheduled-unban handoff/sweeper. Moderator sign-off
   must identify a verified executor for every pending deadline before GO:
   [moderation port boundary](../crates/core/src/moderation.rs#L7).
-- `/health` reports process liveness; `/readyz` covers process + gateway only.
-  The baseline server does not expose `/internal/actions` or `/metrics`:
-  [HTTP routes and readiness](../crates/bot/src/server.rs#L21). Feature and
+- `/health` reports process liveness; `/readyz` always carries four components (`process`, `gateway`, `database`, plus `token_invalid` as Ready or Down, which forces 503) (`crates/bot/src/server.rs:228-240`, `:177`, `:191-209`; re-checked at `bce86a791`).
+  The baseline server does not expose `/internal/actions` (separate signed listener:
+  `crates/bot/src/internal_action_http.rs:285`, bound at `crates/bot/src/main.rs:301`),
+  but it does serve `/metrics` on the same listener
+  (`crates/bot/src/server.rs:65`, `crates/bot/src/metrics_http.rs:21`):
+  [HTTP routes and readiness](../crates/bot/src/server.rs#L59). Feature and
   internal-action acceptance therefore require separate merged runtime evidence.
 
 These are execution blockers to resolve on the implementation/acceptance cards,
@@ -496,10 +527,10 @@ the authorized migration procedure: no agent-run live test inserts, generic
 `setval` recipe or allowlisted dump restore as a substitute. Missing coverage or
 receipt is **NO-GO**. The same allocator gate applies to a rollback recovery target.
 
-Source example: [events BIGSERIAL](../crates/cutover/migrations/0001_funnel.sql#L13)
-is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L98)
+Source example: [events BIGSERIAL](../crates/cutover/migrations/0001_funnel.sql#L14)
+is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L374)
 that handle only idempotency-key conflicts, not primary-key collisions. The
-[restore's sequence restart](../crates/core/src/backup/dump.rs#L215)
+[restore's sequence restart](../crates/core/src/backup/dump.rs#L218)
 illustrates the hazard; it does not prove the planned copier covers every table.
 
 A backup restore (the drill, or a rollback recovery target) meets this gate for
@@ -584,6 +615,12 @@ warm until separate retirement authorization; do not close B4 on a failed watch.
 ## Rollback: preserve Next-window writes before reopening legacy
 
 **Maximum accepted loss:** **0 acknowledged committed database writes**.
+See the "Production decision window" section in
+[cutover-rollback-runbook.md](cutover-rollback-runbook.md#production-decision-window)
+for the recorded 2-hour decision window from `T_0` and the forward-fix posture
+after its closure. The zero-loss gate below continues to govern reopening
+legacy.
+
 The Next write window is `[T_0, T_r]` (up to the full 48-hour watch, longer if
 extended), not merely the time since the last nightly backup. Restore-to-`T_f`
 alone would lose that entire window and is **not an acceptable rollback**.
@@ -664,6 +701,18 @@ writes in maintenance, preserve both data sets, and escalate a decision brief to
 the Director of Engineering. **Never silently choose a 48-hour data loss** to
 restore availability. Any proposed loss/irreversible recovery requires its
 separate authority; the lead cannot waive this runbook's zero-loss gate.
+
+**Decision D5 (live cutover, declared by the cutover lead — see
+[cutover-rollback-runbook.md](cutover-rollback-runbook.md) §1 Decider):**
+the production cutover is live. Production is
+the PlanetScale main database `two_bot`. Writes made during the Next window
+are accepted as lost on rollback, bounded by a 2-hour rollback decision
+window; after that window it is forward-fix only, never rollback. Mitigation
+is the pre-cutover PlanetScale backup plus the untouched Coolify `twobot`
+database. The zero-loss gate above describes the pre-cutover plan; during
+the 2-hour rollback decision window this decision supersedes it for
+rollback. After the window closes it is forward-fix only, never rollback,
+so no rollback supersession applies there.
 
 ## Communication template
 

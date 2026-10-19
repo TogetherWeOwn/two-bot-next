@@ -53,6 +53,14 @@ fn script(
     script_channels(base, flags, target_position, managed, vec![channel])
 }
 
+/// `GET /gateway/bot` body: the session-start budget Discord enforces as a
+/// hard daily limit. `remaining` drives the PASS/WARN/FAIL cutover gate.
+fn gateway(remaining: u32) -> Value {
+    json!({"url": "wss://gateway.discord.gg", "shards": 1,
+        "session_start_limit": {"total": 1000, "remaining": remaining,
+            "reset_after": 84_686_789, "max_concurrency": 1}})
+}
+
 fn script_channels(
     base: Permissions,
     flags: u64,
@@ -60,10 +68,29 @@ fn script_channels(
     managed: bool,
     channels: Vec<Value>,
 ) -> Vec<ScriptedResponse> {
+    script_channels_gateway(
+        base,
+        flags,
+        target_position,
+        managed,
+        gateway(998),
+        channels,
+    )
+}
+
+fn script_channels_gateway(
+    base: Permissions,
+    flags: u64,
+    target_position: u64,
+    managed: bool,
+    gateway_body: Value,
+    channels: Vec<Value>,
+) -> Vec<ScriptedResponse> {
     let mut bodies = vec![
         user(),
         json!({"id": BOT.to_string(), "name": TOKEN, "description": "", "bot_public": true,
             "bot_require_code_grant": false, "verify_key": "fixture", "flags": flags}),
+        gateway_body,
         json!({"user": user(), "roles": [BOT_ROLE.to_string()], "deaf": false, "mute": false, "flags": 0}),
         json!([
             role(GUILD, Permissions::empty(), 0, false),
@@ -169,6 +196,7 @@ async fn pass_warn_fail_exit_codes_and_json_match_the_real_cli() {
             vec![
                 "/api/v10/users/@me".to_string(),
                 "/api/v10/applications/@me".to_string(),
+                "/api/v10/gateway/bot".to_string(),
                 format!("/api/v10/guilds/{GUILD}/members/{BOT}"),
                 format!("/api/v10/guilds/{GUILD}/roles"),
                 format!("/api/v10/guilds/{GUILD}/invites"),
@@ -459,6 +487,7 @@ fn self_role_script(target_position: u64, managed: bool) -> Vec<ScriptedResponse
         user(),
         json!({"id": BOT.to_string(), "name": TOKEN, "description": "", "bot_public": true,
             "bot_require_code_grant": false, "verify_key": "fixture", "flags": 1 << 15}),
+        gateway(998),
         json!({"user": user(), "roles": [BOT_ROLE.to_string()], "deaf": false, "mute": false, "flags": 0}),
         json!([
             role(GUILD, Permissions::empty(), 0, false),
@@ -606,7 +635,7 @@ async fn rejected_token_stops_and_does_not_echo_response_or_try_a_fallback() {
 
 #[tokio::test]
 async fn denied_application_and_channel_reads_are_failures_not_successful_skips() {
-    for (index, status) in [(1, 403), (5, 404)] {
+    for (index, status) in [(1, 403), (6, 404)] {
         let mut responses = script(permissions(), 1 << 15, 1, false, channel());
         responses[index] = ScriptedResponse::json(status, json!({"message": TOKEN, "code": 0}));
         let mock = mock(responses).await;
@@ -684,6 +713,100 @@ async fn live_checks_without_admission_authority_refuse_before_rest() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("TWO_DATABASE_URL"));
     assert!(mock.requests().is_empty());
     mock.shutdown().await;
+}
+
+fn budget_check(report: &Value) -> &Value {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["check"] == "session start budget")
+        .expect("session start budget check present")
+}
+
+/// The cutover's forced IDENTIFY spends one session start against a hard
+/// Discord daily limit: PASS with margin, WARN below 10% of the usual
+/// 1000-start budget, FAIL below the retry floor. A failed, timed-out or
+/// malformed budget read fails closed and stops the sequence like any other
+/// check; 429/5xx hold the lane with no retry storm.
+#[tokio::test]
+async fn session_start_budget_pass_warn_fail_and_fail_closed() {
+    for (remaining, expected_code, expected_status) in [
+        (998u32, 0, "PASS"),
+        (50u32, 0, "WARN"),
+        (9u32, 1, "FAIL"),
+        (0u32, 1, "FAIL"),
+    ] {
+        let mock = mock(script_channels_gateway(
+            permissions(),
+            1 << 15,
+            1,
+            false,
+            gateway(remaining),
+            vec![channel()],
+        ))
+        .await;
+        let output = cli(&mock, &["--json"], &[]).await;
+        assert_eq!(
+            output.status.code(),
+            Some(expected_code),
+            "remaining={remaining}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let check = budget_check(&report);
+        assert_eq!(check["status"], expected_status, "remaining={remaining}");
+        assert_eq!(
+            check["detail"],
+            format!("remaining={remaining} total=1000 reset_after_ms=84686789 max_concurrency=1"),
+            "remaining={remaining}"
+        );
+        assert_eq!(
+            mock.requests()[2].path,
+            "/api/v10/gateway/bot",
+            "remaining={remaining}"
+        );
+        mock.shutdown().await;
+    }
+
+    let malformed = ScriptedResponse {
+        status: 200,
+        headers: Vec::new(),
+        body: b"not json".to_vec(),
+        delay: Duration::ZERO,
+        body_delay: Duration::ZERO,
+        declared_body_len: None,
+    };
+    for (name, gateway_response) in [
+        ("malformed", malformed),
+        (
+            "missing field",
+            ScriptedResponse::json(200, json!({"url": "wss://gateway.discord.gg", "shards": 1})),
+        ),
+        (
+            "rate limited",
+            ScriptedResponse::json(429, json!({"retry_after": 0.001, "global": true})),
+        ),
+        (
+            "server error",
+            ScriptedResponse::json(500, json!({"message": "oops", "code": 0})),
+        ),
+    ] {
+        let mut responses = script(permissions(), 1 << 15, 1, false, channel());
+        responses[2] = gateway_response;
+        let mock = mock(responses).await;
+        let output = cli(&mock, &["--json"], &[]).await;
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(budget_check(&report)["status"], "FAIL", "{name}");
+        assert_eq!(mock.requests().len(), 3, "{name}: lane held, no retry");
+        mock.shutdown().await;
+    }
 }
 
 #[tokio::test]

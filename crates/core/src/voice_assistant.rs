@@ -27,8 +27,8 @@
 //! (the V12a [`crate::voice_assistant_cap`] ledger consumes the persisted
 //! row), the endpoint call with the validated V12b payload, the six-scenario
 //! V12c validation before the admin sees output, the Apply/Refine/Cancel
-//! flow, the credential binding for the endpoint, and publish wiring for
-//! this command alongside the V1 `voice_command_set` path.
+//! flow and the credential binding for the endpoint. Publication already runs
+//! through `InteractionRouter::publish_set` while both gates are on.
 
 use std::collections::HashMap;
 
@@ -43,10 +43,23 @@ pub const MAX_ENDPOINT_CHARS: usize = 2048;
 
 /// Configured assistant endpoint and model. `None` (from [`AssistantConfig::from_map`]) means
 /// disabled: no command is published and no endpoint call may happen.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is redacted on purpose: the endpoint URL may carry userinfo
+/// credentials and the model string is a supplied value, so formatting must
+/// never render either (log/debug output is how configs get printed).
+#[derive(Clone, PartialEq, Eq)]
 pub struct AssistantConfig {
     endpoint: String,
     model: String,
+}
+
+impl std::fmt::Debug for AssistantConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssistantConfig")
+            .field("endpoint", &"[REDACTED]")
+            .field("model", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl AssistantConfig {

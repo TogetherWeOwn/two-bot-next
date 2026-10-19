@@ -16,7 +16,7 @@
  * - HEAD redirects but is never counted (link previewers, incl. Discord's).
  * - Query strings are dropped, never parsed or recorded.
  * - `/healthz` → 200 `ok`; `/favicon.ico` + `/robots.txt` → 404, no DB touch.
- * - Reserved internal slugs (`metrics`, plus `metrics/*` subpaths) → 404 for
+ * - Reserved internal slugs (`metrics`/`ops`, plus `metrics/*` and `ops/*` subpaths) → 404 for
  *   every method, before lookup — canonical case/encoding/slash aliases
  *   included, never a redirect, never a click.
  * - Non-GET/HEAD on non-reserved paths → 405 with `Allow: GET, HEAD`.
@@ -97,11 +97,24 @@ export interface RedirectResult {
   click?: RedirectClick;
 }
 
+/**
+ * Worker response hardening, mirrored from security-headers.ts (TOG-22701).
+ * This file embeds standalone in the Miniflare acceptance
+ * (redirect-cache.test.ts builds its fixture from this file's text), so it
+ * cannot import that module. The security-headers test pins both to the same
+ * values; update them together.
+ */
+const SECURITY_HEADERS: Record<string, string> = {
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "x-frame-options": "DENY",
+};
+
 // Absolute end assertions: `$` alone also accepts a trailing line terminator.
 const SLUG = /^[a-z0-9][a-z0-9-]{0,38}[a-z0-9](?![\s\S])/;
 const INVITE_CODE = /^[A-Za-z0-9-]{1,64}(?![\s\S])/;
 /** Internal slugs that are never invite campaigns (matched post-canonicalization). */
-const RESERVED_SLUGS = ["metrics", "healthz"];
+const RESERVED_SLUGS = ["metrics", "healthz", "ops"];
 
 export function isValidSlug(slug: string): boolean {
   return SLUG.test(slug) && !RESERVED_SLUGS.includes(slug);
@@ -370,6 +383,44 @@ export class TokenBuckets {
     return verdict;
   }
 
+  /**
+   * Read-only throttle check: reports whether `take` would allow this caller
+   * right now without consuming budget, touching recency, denials or holds.
+   * Unknown callers report allowed without minting an entry, so scanners
+   * cannot grow the map through this path. Use it to refuse throttled
+   * callers before a secret comparison, so guessing cannot confirm a bearer
+   * while the bucket is exhausted; record real failures with `take`.
+   */
+  peek(key: string): ThrottleVerdict {
+    const canonical = canonicalCallerKey(key);
+    const t = this.clock();
+    const b = this.buckets.get(canonical);
+    if (!b) return { allowed: true, retryAfter: 0 };
+    if (b.heldUntil !== undefined) {
+      if (t < b.heldUntil) {
+        return {
+          allowed: false,
+          retryAfter: Math.max(1, Math.ceil((b.heldUntil - t) / 1000)),
+        };
+      }
+      // Hold elapsed: the next take clears the streak; a peek stays allowed
+      // only if refill has restored a token.
+    }
+    if (Math.max(0, t - b.updatedAt) >= this.idleTtlMs) {
+      // Idle-expired buckets restart full on next take; report allowed.
+      return { allowed: true, retryAfter: 0 };
+    }
+    // Map-full fail-closed state in take() only sheds unknown callers; a
+    // tracked caller keeps its computed verdict here.
+    const tokens = Math.min(
+      this.spec.capacity,
+      b.tokens + Math.max(0, (t - b.updatedAt) / 1000) * this.spec.refillPerSecond,
+    );
+    if (tokens >= 1) return { allowed: true, retryAfter: 0 };
+    const wait = Math.ceil((1 - tokens) / this.spec.refillPerSecond);
+    return { allowed: false, retryAfter: Math.max(1, wait) };
+  }
+
   /** Visit up to `sweepBudget` entries from the least-recent end. */
   private sweep(t: number): void {
     let budget = this.sweepBudget;
@@ -446,6 +497,9 @@ function redirect(location: string): RedirectResult {
       "cache-control": "no-store, no-cache, must-revalidate",
       "referrer-policy": "no-referrer",
       "content-type": "text/plain",
+      // Hardening mirrored from security-headers.ts: this file embeds
+      // standalone in the Miniflare acceptance and cannot import it.
+      ...SECURITY_HEADERS,
     },
     body: `redirecting to ${location}\n`,
   };
@@ -453,7 +507,8 @@ function redirect(location: string): RedirectResult {
 
 const text = (status: number, body: string, extra?: Record<string, string>): RedirectResult => ({
   status,
-  headers: { "content-type": "text/plain", ...extra },
+  // The decided set wins on collision; retry-after/allow pass through.
+  headers: { "content-type": "text/plain", ...extra, ...SECURITY_HEADERS },
   body,
 });
 
@@ -464,7 +519,7 @@ const retryAfterSeconds = (seconds: number): number =>
 /**
  * Reserved internal paths that are never invite campaigns. Recognize only the
  * first segment, stripping literal/encoded leading slashes and decoding once.
- * A malformed suffix cannot unreserve a recognized `metrics`/`healthz` prefix;
+ * A malformed suffix cannot unreserve a recognized `metrics`/`healthz`/`ops` prefix;
  * near-miss campaign slugs like `metricsfoo` still do not match.
  * The ownership-fence control plane (`internal/ownership`, plus subpaths) is
  * likewise reserved: it is served by the Worker (TOG-11143), never a campaign.

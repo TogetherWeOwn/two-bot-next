@@ -1,7 +1,16 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use two_bot_core::commands::{CommandDefinition, HELP_DESCRIPTION, OCCURRENCE_ID_MAX_CHARS};
+use two_bot_core::commands::{
+    CommandDefinition, CommandOption, CommandOptionType, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS,
+    OCCURRENCE_ID_MAX_CHARS, PRIVACY_DESCRIPTION,
+};
+use two_bot_core::custom_commands::{
+    MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
+};
+use two_bot_core::feeds_http::MAX_FEED_SOURCE_BYTES;
+use two_bot_core::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
 use two_bot_core::router::{InteractionRouter, RouterGates};
+use two_bot_core::scheduled::MAX_BODY_CHARS;
 
 pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #12 / #25"),
@@ -15,6 +24,17 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #25 copy"),
     ("lfg", "docs/parity.md §1 #26 copy"),
     ("lfg-close", "docs/parity.md §1 #27 copy"),
+    ("command", "docs/parity.md §1 #14 caps"),
+    ("command-remove", "docs/parity.md §1 #15 caps"),
+    ("schedule", "docs/parity.md §1 #17 caps"),
+    ("schedule-remove", "docs/parity.md §1 #18 caps"),
+    ("sticky", "docs/parity.md §1 #20 caps"),
+    ("lfg", "docs/parity.md §1 #26 caps"),
+    ("lfg-close", "docs/parity.md §1 #27 caps"),
+    ("feed-add", "docs/parity.md §1 #28 caps"),
+    ("feed-remove", "docs/parity.md §1 #29 caps"),
+    ("schedule-list", "docs/parity.md §1 #19 page"),
+    ("privacy", "docs/parity.md §1 privacy"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -24,6 +44,8 @@ pub fn all_on_router() -> InteractionRouter {
         automations: true,
         announcements: true,
         moderation: true,
+        voice: false,
+        voice_assistant: false,
         tickets: true,
         self_roles: true,
         onboarding_picker: true,
@@ -88,6 +110,56 @@ pub fn expected_registry() -> Value {
         assert!(duration["max_value"].is_null());
         duration["max_value"] = json!(max);
     }
+    // Custom-command caps: advertise ONLY max_length matching the runtime
+    // validators; every other field stays legacy-identical.
+    for (name, option_name, max, reference) in [
+        (
+            "command",
+            "name",
+            MAX_COMMAND_NAME_CHARS,
+            "docs/parity.md §1 #14 caps",
+        ),
+        (
+            "command",
+            "template",
+            MAX_TEMPLATE_CHARS,
+            "docs/parity.md §1 #14 caps",
+        ),
+        (
+            "command",
+            "description",
+            MAX_DESCRIPTION_CHARS,
+            "docs/parity.md §1 #14 caps",
+        ),
+        (
+            "command",
+            "text-trigger",
+            MAX_TEXT_TRIGGER_CHARS,
+            "docs/parity.md §1 #14 caps",
+        ),
+        (
+            "command-remove",
+            "name",
+            MAX_COMMAND_NAME_CHARS,
+            "docs/parity.md §1 #15 caps",
+        ),
+    ] {
+        let command = commands
+            .iter_mut()
+            .find(|c| c["name"] == name)
+            .expect(reference);
+        let opt = command["options"]
+            .as_array_mut()
+            .expect("legacy options array")
+            .iter_mut()
+            .find(|o| o["name"] == option_name)
+            .expect(reference);
+        assert!(
+            opt.get("max_length").is_none(),
+            "legacy has no max_length on {name} {option_name}"
+        );
+        opt["max_length"] = json!(max);
+    }
     let rota = commands
         .iter()
         .position(|c| c["name"] == INTENTIONAL_DIFFERENCES[1].0)
@@ -99,6 +171,30 @@ pub fn expected_registry() -> Value {
     let help = serde_json::to_value(CommandDefinition::new("help", HELP_DESCRIPTION))
         .expect("help serializes");
     commands.insert(2, help);
+    // Next-only `/privacy` member self-serve: no legacy counterpart. Insert
+    // at the publish position (fourth, after help) as the exact published
+    // definition — the same subcommand shape `core_commands` publishes.
+    let privacy = serde_json::to_value(
+        CommandDefinition::new("privacy", PRIVACY_DESCRIPTION).options(vec![
+            CommandOption::new(
+                "opt-out",
+                "Delete your stored activity for this server and stop future analytics persistence.",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "opt-in",
+                "Resume analytics persistence for this server (already-deleted rows are not restored).",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "status",
+                "Show whether you are opted out and this server's analytics switches.",
+                CommandOptionType::SubCommand,
+            ),
+        ]),
+    )
+    .expect("privacy serializes");
+    commands.insert(3, privacy);
     // Picker-copy exceptions (registry golden exceptions table): command and
     // option descriptions intentionally differ from legacy. Pointers mirror
     // the published option order.
@@ -111,7 +207,7 @@ pub fn expected_registry() -> Value {
         (
             "attendance",
             "/options/0/description",
-            "Event id (number in the event URL) or occurrence id, e.g. 12345 or weekly-standup-2026-10-03",
+            "Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly",
         ),
         (
             "rsvp",
@@ -149,6 +245,110 @@ pub fn expected_registry() -> Value {
             .find(|c| c["name"] == name)
             .expect("copy exception names a published command");
         *command.pointer_mut(pointer).expect("copy field exists") = json!(value);
+    }
+    // Further caps from the input-bound fix: advertise ONLY max_length
+    // matching the runtime validators; the frozen legacy registry fixture
+    // remains untouched. Custom-command caps are covered by the loop above.
+    for (name, option_name, max_length, reference) in [
+        (
+            "schedule",
+            "body",
+            MAX_BODY_CHARS,
+            "docs/parity.md §1 #17 caps",
+        ),
+        (
+            "schedule-remove",
+            "id",
+            MAX_RESOURCE_ID_CHARS,
+            "docs/parity.md §1 #18 caps",
+        ),
+        (
+            "sticky",
+            "body",
+            MAX_BODY_CHARS,
+            "docs/parity.md §1 #20 caps",
+        ),
+        (
+            "lfg",
+            "title",
+            MAX_TITLE_CHARS,
+            "docs/parity.md §1 #26 caps",
+        ),
+        (
+            "lfg",
+            "roles",
+            MAX_ROLE_SPEC_CHARS,
+            "docs/parity.md §1 #26 caps",
+        ),
+        (
+            "lfg-close",
+            "id",
+            MAX_RESOURCE_ID_CHARS,
+            "docs/parity.md §1 #27 caps",
+        ),
+        (
+            "feed-add",
+            "source",
+            MAX_FEED_SOURCE_BYTES,
+            "docs/parity.md §1 #28 caps",
+        ),
+        (
+            "feed-remove",
+            "id",
+            MAX_RESOURCE_ID_CHARS,
+            "docs/parity.md §1 #29 caps",
+        ),
+    ] {
+        let _ = INTENTIONAL_DIFFERENCES
+            .iter()
+            .find(|(command, _)| *command == name)
+            .expect("cap has a documented command exception");
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == name)
+            .expect(reference);
+        let option = command["options"]
+            .as_array_mut()
+            .expect("command options array")
+            .iter_mut()
+            .find(|option| option["name"] == option_name)
+            .expect(reference);
+        assert!(
+            option["max_length"].is_null(),
+            "legacy {name}/{option_name}"
+        );
+        option["max_length"] = json!(max_length);
+    }
+    // Schedule-list pagination: the Next-only additive `page` option keeps
+    // every configured id discoverable within Discord's 2,000-unit cap.
+    // Legacy publishes no options on `schedule-list`; permissions and the
+    // command name stay legacy-identical.
+    {
+        let _ = INTENTIONAL_DIFFERENCES
+            .iter()
+            .find(|(command, _)| *command == "schedule-list")
+            .expect("page has a documented command exception");
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == "schedule-list")
+            .expect("docs/parity.md §1 #19 page");
+        assert!(
+            command["options"]
+                .as_array()
+                .expect("command options array")
+                .is_empty(),
+            "legacy schedule-list has no options"
+        );
+        let page = serde_json::to_value(
+            CommandOption::new(
+                "page",
+                "Page of the schedule list (1-based)",
+                two_bot_core::commands::CommandOptionType::Integer,
+            )
+            .min_value(1),
+        )
+        .expect("page option serializes");
+        command["options"] = json!([page]);
     }
     canonical_registry(json!(commands))
 }

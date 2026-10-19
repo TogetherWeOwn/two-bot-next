@@ -91,3 +91,86 @@ maximum supported XP boundary; strict one-ACK transport scopes and isolated
 rank timeout/failure; sensitive-data exclusion from JSON and Debug; and
 independent simultaneous offline runs. Local timings are fixture timings, not
 production performance measurements.
+
+## Live read-mostly smoke run
+
+`scripts/staging_smoke_run.py` is the live counterpart: one fenced, GET-only
+pass over the deployed staging build and the TWO Staging guild that writes one
+[run record](staging-e2e-run-record.md). It composes
+`staging_health_contract_probe.py` and `staging_automation_read_smoke.py`, so
+the pinned guild, application and origin fences have a single authority.
+
+```sh
+STAGING_WORKER_URL=https://two-bot-next-staging.<sub>.workers.dev \
+DISCORD_STAGING_BOT_TOKEN=... DISCORD_STAGING_GUILD_ID=... \
+    python3 scripts/staging_smoke_run.py --tester "QA" \
+        --expected-sha <deployed 40-hex SHA> [--deploy-run-id <deploy-staging run id>] \
+        [--record staging-smoke-run-record.json]
+```
+
+These smokes (this one and `staging_voice_smoke.py`) never follow a redirect on an
+authenticated Discord read. Any 301, 302, 303, 307 or 308 stops the request before a
+second one is built, even to the same origin, and fails with a fixed message that
+names no token, `Location` or response body. Production targets stay refused.
+
+Exit 0 is PASS, 1 is NEEDS WORK, 2 is a fence refusal with nothing sent. Run it
+after every `deploy-staging` run you accept; the deploy gate proves the rollout,
+this proves the build answers readiness and the guild publishes the surface.
+
+| Row | Passes when | Failure signature |
+| --- | --- | --- |
+| `GET /health` | 200 with the exact `{"status":"ok"}` shape | `SMOKE-HEALTH-FAIL` |
+| `GET /readyz` | 200 and every component ready; a parked or down container fails | `SMOKE-READYZ-NOT-READY`, `SMOKE-READYZ-CHECKPOINT-READ-FAILED` |
+| `readyz build identity` | `build_revision` equals `--expected-sha` | `SMOKE-BUILD-MISMATCH` |
+| `identity and command list` | the token is the staging application and the guild command list reads | `SMOKE-DISCORD-REFUSED` |
+| `/rank`, `/leaderboard`, `/help` | listed and their own resource is scoped to the staging guild | `SMOKE-REGISTRY-MISSING`, `SMOKE-REGISTRY-DETAIL-MISMATCH` |
+| every other built-in | unpublished: `skipped` (gate off or publish pending); published: listed and its own resource is scoped to the staging guild | `SMOKE-REGISTRY-DETAIL-MISMATCH`, `SMOKE-DISCORD-REFUSED` |
+
+`SMOKE-READYZ-CHECKPOINT-READ-FAILED` replaces the older
+`SMOKE-READYZ-DB-BEHIND` signature for new records. It names the failed read
+step, not migration drift: a root-cause claim requires separate reviewed
+schema/ACL/connectivity evidence and an independent receipt, as described in
+[the health-contract probe](staging-health-contract-probe.md#checkpoint-read-assertion-not-a-root-cause-diagnosis).
+Only a status-consistent 503 classified by the health probe as a failed
+checkpoint read gets this signature. A contradictory status/breakdown
+keeps `SMOKE-READYZ-NOT-READY` even when the response carries the class;
+an all-ready 200 has no failure signature.
+No probe is allowed to apply a migration or test production.
+
+The record's deploy run id defaults to the `readyz` `build_id` prefix (the build
+id is `RUN_ID-RUN_ATTEMPT` of the `deploy-staging` run that built the image), but
+only when the recorded revision is the serving build: that run deployed the
+serving revision, so it cannot vouch for a different `--expected-sha`. When the
+two differ, pass `--deploy-run-id` for the run that should have deployed the
+expected revision. `--deploy-run-id` always overrides the default. With neither
+a tested revision nor a usable deploy run id the run prints its results, writes
+**no record** and exits 1: a missing revision is NEEDS WORK, not a waiver.
+
+### What it does not prove
+
+- **No slash command is invoked.** This GET-only smoke does not discharge
+  B2's required slash event family; live slash coverage remains **NOT
+  VERIFIED** until the existing reviewed evidence path and applicable
+  authorization are independently verified. Do not synthesize interactions,
+  claim a bot/webhook as a human, or add an ingress or receipt mechanism.
+- Registry presence is not behaviour: a published `/rank` can still fail its
+  database read. `GET /readyz` covers the database component, not a query.
+- It does not enable a gate. `/attendance` stays `skipped` until
+  `TWO_COMMUNITY_SCORECARD` is on in the staging Worker.
+
+### Why it is not a GitHub workflow
+
+The guild reads need the staging bot token, which lives in the staging Worker
+and in agent environments, not in a GitHub environment. Adding it there would
+distribute a credential, so the run stays a manual, operator/QA step. The
+credential-free half (`/health`, `/readyz`, build identity) is already enforced
+on every deploy by the `deploy-staging` gate.
+
+Offline coverage: `scripts/test_staging_smoke_run.py` (live-guild refusal before
+any request, container down, parked, checkpoint-read failure without a root-cause
+claim, contradictory status/breakdown with the checkpoint class keeping the
+generic signature, all-ready with the class and no failure signature,
+mismatched builds, missing core surface, present gated detail match, present
+gated detail mismatch, present gated detail refusal, absent gated stays skipped
+with a detail-checked present gated row, foreign or rejected token, token never in output, record schema,
+drift against the command matrix).

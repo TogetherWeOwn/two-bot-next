@@ -91,10 +91,13 @@ mod tests {
             assert!(rendered.contains("CREATE ROLE two_bot_migrator_ro NOLOGIN"));
             assert!(rendered.starts_with("-- Print-only operator plan."));
             assert!(rendered.ends_with("COMMIT;\n"));
-            // The ephemeral self-grant is present in both phases and revoked
-            // before COMMIT.
-            assert!(rendered.contains("WITH INHERIT TRUE, SET TRUE"));
-            assert!(rendered.contains("REVOKE two_bot_migrator FROM CURRENT_USER;"));
+            // The plan records whether it created temporary membership and
+            // revokes only its own grant before COMMIT.
+            assert!(rendered.contains("two_bot.roles.preexisting_migrator_membership"));
+            assert!(rendered.contains("two_bot.roles.ephemeral_migrator_membership"));
+            assert!(rendered.contains("WITH INHERIT TRUE, SET TRUE GRANTED BY CURRENT_USER"));
+            assert!(rendered.contains("REVOKE %I FROM %I GRANTED BY CURRENT_USER"));
+            assert!(!rendered.contains("REVOKE two_bot_migrator FROM CURRENT_USER;"));
         }
         assert!(VERIFY.replace("-- @matrix", MATRIX).contains(MATRIX));
         assert_eq!(plan(), plan_for_phase(Phase::Full));
@@ -144,12 +147,20 @@ mod tests {
         // Enumerate the migrations directory so a new CREATE without a matrix
         // row fails CI. No database connection is needed. Our 0130 custom
         // commands migration is covered automatically: the file lives in-tree.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
-        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .expect("migrations directory")
-            .map(|entry| entry.expect("migration entry").path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
-            .collect();
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let migration_dirs = [
+            manifest.join("../cutover/migrations"),
+            manifest.join("../store/migrations"),
+        ];
+        let mut paths = Vec::new();
+        for dir in migration_dirs {
+            paths.extend(
+                std::fs::read_dir(&dir)
+                    .expect("migrations directory")
+                    .map(|entry| entry.expect("migration entry").path())
+                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql")),
+            );
+        }
         paths.sort();
         assert!(!paths.is_empty(), "no migrations found");
         for path in paths {
@@ -164,7 +175,10 @@ mod tests {
                         .trim_matches(|c| c == '"' || c == '(')
                         .trim_end_matches('(')
                         .to_owned();
-                    let kind = if name == "discord_send_admission" {
+                    let kind = if matches!(
+                        name.as_str(),
+                        "discord_send_admission" | "voice_create_reservations"
+                    ) {
                         "admission"
                     } else if name == "member_erasure_audit" || name == "invite_campaigns" {
                         "migrator"

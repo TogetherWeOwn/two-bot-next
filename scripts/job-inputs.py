@@ -25,8 +25,10 @@ Job map (each a pure function of the changed paths):
 
 Coupling notes (verified 2026-10-02, enforced by test_job_inputs.py):
 - Rust tests read a pinned doc set by content (parity/cutover/commands/
-  configuration/voice-rooms plus the soak/parity JSON): those docs select
-  ``rust``. staging-soak/backup/preflight/runbook are existence-only inputs
+  configuration/voice-rooms plus the soak/parity JSON, plus
+  privacy/database-roles/rollback-delta/backup by the voice owner-grant
+  journal regression): those docs select
+  ``rust``. staging-soak/preflight/runbook are existence-only inputs
   to the preconditions binary (is_file, never content), so a content edit
   cannot break Rust and they fall through to the worker rule below; any
   deletion forces all jobs via the deletion rule. Every other doc has no
@@ -60,6 +62,8 @@ WORKER = "worker"
 PARITY = "parity"
 SUPPLY = "supply"
 DOCS = "docs"
+# Live voice synthetic offline suite (not a CI job; never part of ALL_JOBS).
+VOICE = "voice"
 ALL_JOBS = frozenset({RUST, WORKER, PARITY, SUPPLY})
 NO_JOBS = frozenset()
 
@@ -123,9 +127,12 @@ WORKER_PREFIX = "wrangler/"
 # fixture validator, staging-e2e-command-matrix by the matrix coverage test,
 # soak/parity by the checklist and baseline guards, smoke-run-record and
 # smoke-expected-responses by the smoke surface inventory link test (and
-# smoke-surface-inventory for the same family of smoke content reads).
+# smoke-surface-inventory for the same family of smoke content reads),
+# privacy/database-roles/rollback-delta/backup by the voice owner-grant
+# journal documentation regression
+# (crates/core/tests/voice_owner_grants_docs.rs).
 # parity.md and the baseline also gate parity-docs. Existence-only docs
-# (staging-soak/backup/preflight: the preconditions binary checks is_file,
+# (staging-soak/preflight: the preconditions binary checks is_file,
 # never content) and runbook/container-readiness (worker tests only) fall
 # through to the worker-only docs rule below; their absence is covered by
 # the deletion rule in selection().
@@ -142,10 +149,21 @@ RUST_DOCS = frozenset({
     "docs/smoke-expected-responses.md",
     "docs/smoke-run-record.md",
     "docs/smoke-surface-inventory.md",
+    "docs/privacy.md",
+    "docs/database-roles.md",
+    "docs/rollback-delta.md",
+    "docs/backup.md",
 })
 PARITY_DOCS = frozenset({
     "docs/parity.md",
     "docs/parity-baseline.json",
+})
+# Docs read by both Rust and worker code: docs/metrics.md is pinned by Rust
+# and worker tests, and startup-diagnostics.md is embedded by the Rust gateway
+# failure test and read by the worker docs listing assertion. Edits select both.
+RUST_WORKER_DOCS = frozenset({
+    "docs/metrics.md",
+    "docs/startup-diagnostics.md",
 })
 WORKER_DOCS = frozenset({
     "docs/runbook.md",
@@ -185,6 +203,10 @@ WORKER_EXACT = frozenset({
     "release-please-config.json",
     ".release-please-manifest.json",
     "CONTRIBUTING.md",
+})
+# The Rust shutdown test embeds the live Wrangler config; its edits also run
+# the worker job that validates that config.
+RUST_WORKER_EXACT = frozenset({
     "wrangler/wrangler.toml",
 })
 
@@ -194,7 +216,6 @@ WORKER_EXACT = frozenset({
 # ``supply`` (CI standard rule 6, TOG-14881). They select no test job.
 IMAGE_ONLY_EXACT = frozenset({
     "Dockerfile",
-    "Dockerfile.distroless",
     ".dockerignore",
 })
 
@@ -255,6 +276,8 @@ def classify(path):
         if PARITY_SCRIPT_MARKER in Path(path).name:
             jobs.add(PARITY)
         return frozenset(jobs)
+    if path in RUST_WORKER_DOCS or path in RUST_WORKER_EXACT:
+        return frozenset({RUST, WORKER})
     if path.startswith(WORKER_PREFIX):
         return frozenset({WORKER})
     if path in RUST_DOCS:
@@ -289,6 +312,48 @@ def classify(path):
     # Fail-closed: unrecognized paths (e.g. a brand-new top-level directory)
     # run everything rather than risk silently skipped coverage.
     return ALL_JOBS
+
+
+# Paths whose change can alter temp-voice behaviour or the voice synthetic
+# itself (owner policy 2026-10-11: the synthetic runs on PRs only when these
+# change; always after deploy-staging and every 6 h).
+# crates/discord + crates/cutover use narrow voice_rooms prefixes (not broad
+# voice): voice_rooms.rs is the Discord-write adapter / room persistence that
+# the synthetic lifecycle exercises, plus its http test and future splits;
+# sibling voice_config_*/voice_ghosts/voice_reconcile are read-only or
+# config-only and never change live rooms.
+VOICE_PREFIXES = (
+    "crates/bot/src/voice",
+    "crates/core/src/voice",
+    "crates/bot/src/gateway",
+    "crates/bot/src/presence",
+    "crates/discord/src/voice_rooms",
+    "crates/cutover/src/voice_rooms",
+    "tests/voice_templates/",
+)
+VOICE_EXACT = frozenset({
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".github/workflows/check.yml",
+    ".github/workflows/deploy-staging.yml",
+    ".github/workflows/voice-synthetic.yml",
+    "scripts/job-inputs.py",
+    "scripts/staging_voice_synthetic.py",
+    "scripts/test_staging_voice_synthetic.py",
+    "wrangler/src/container-env.ts",
+})
+
+
+def voice_selected(changed, deleted=()):
+    """True when a change can affect temp-voice behaviour (fail-closed on deletions)."""
+    if any(path.strip() for path in deleted):
+        return True
+    for path in changed:
+        path = normalize(path)
+        if path in VOICE_EXACT or path.startswith(VOICE_PREFIXES):
+            return True
+    return False
 
 
 def selection(changed, deleted=()):
@@ -338,7 +403,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", required=True)
     parser.add_argument("--head-ref", required=True)
-    parser.add_argument("--job", choices=(RUST, WORKER, PARITY, SUPPLY, DOCS),
+    parser.add_argument("--job", choices=(RUST, WORKER, PARITY, SUPPLY, DOCS, VOICE),
                         default=None,
                         help="print only this job's selection (default: all)")
     args = parser.parse_args(argv)
@@ -353,10 +418,11 @@ def main(argv=None):
               "selecting full jobs", flush=True)
         return 2
     jobs = selection(changed, deleted)
+    jobs[VOICE] = voice_selected(changed, deleted)
     if args.job is not None:
         print("true" if jobs[args.job] else "false")
     else:
-        for job in (RUST, WORKER, PARITY, SUPPLY, DOCS):
+        for job in (RUST, WORKER, PARITY, SUPPLY, DOCS, VOICE):
             print(f"{job}={'true' if jobs[job] else 'false'}")
     return 0
 

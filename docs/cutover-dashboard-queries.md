@@ -7,12 +7,11 @@ When this file and a live rule disagree, the live rule wins and this file is
 the one to fix.
 
 Scope: DB-error and send-admission signals from the shipped series, plus
-gateway and `/readyz` health. Two shipped gaps shape every panel below: there
-is **no DB error counter** (the pool rule is a proxy) and **no send-admission
-series**, so neither is alerted today (see
-[metrics](metrics.md#off-container-scrape-and-alert-rules)). Queries below use
-the closest shipped proxies and say so. Out of scope: installing alerts,
-paging tests, log-catalog extraction.
+gateway and `/readyz` health. The `db_errors`, `send_admission_blocked` and
+`gateway_missed_events` rules already ship (see
+[metrics](metrics.md#off-container-scrape-and-alert-rules)). Pool and job
+health remain complementary signals, not substitutes for those counters.
+Out of scope: installing alerts, paging tests, log-catalog extraction.
 
 Rules for every query: read-only; never run SQL, probes, or restores against
 staging or production databases (table queries run only against an authorized
@@ -49,59 +48,101 @@ curl --silent --show-error --max-time 10 --include "${WORKER_URL}/readyz"
 ```
 
 Expect `/health` 200 `{"status":"ok"}` (liveness only) and `/readyz` 200 with
-both wired components ready:
+every component ready (the bot serves four):
 
 ```json
-{"components": [["process", "ready"], ["gateway", "ready"]]}
+{"components": [["process", "ready"], ["gateway", "ready"], ["database", "ready"], ["token_invalid", "ready"]]}
 ```
 
-A 503 names the failing component (`starting` = connecting/bounded checkpoint
-I/O; `down` = parked prerequisites). A `token_invalid` component at `down`
-also returns 503 even with the gateway connected (see Panel 3). Never use the
+A 503 names the failing component. For the gateway, `starting` = connecting or
+bounded checkpoint I/O and `down` = parked prerequisites. A `database` or
+`token_invalid` component at `down` is a fault, never parked: the rollback gates
+refuse it, and `token_invalid` returns 503 even with the gateway connected (see
+Panel 3). Never use the
 invite redirect `/healthz` as gateway health. Source:
 [runbook](runbook.md#is-it-alive).
 
 Session continuity from the shipped gateway series (`READY`, accepted RESUMEs,
-and HELLOs after the first — the only session series on `main`):
+reconnects, transport disconnects, and missed sequence gaps):
 
 ```promql
 sum(increase(two_bot_gateway_events_total{event="READY"}[1h]))
 sum(increase(two_bot_gateway_resumes_total[1h]))
 sum(increase(two_bot_gateway_reconnects_total[1h]))
+sum(increase(two_bot_gateway_disconnects_total[1h]))
+sum(increase(two_bot_gateway_missed_events_total[1h]))
 ```
 
-Pending (series not yet shipped — do not query during the watch until they
-land): `two_bot_gateway_disconnects_total`,
-`two_bot_gateway_missed_events_total`, and the unpaired-disconnect detector
-built on them. Until then, disconnects are visible only as `gateway reconnect
-failed; Twilight will retry` lines in container stdout, and every reconnect
-must still pair with a later RESUME or fresh READY in the same window.
+Unpaired-disconnect presence check (hand-diff of the two scrapes; every transport
+loss must pair with a later RESUME or fresh READY in the same window):
+
+```promql
+sum(increase(two_bot_gateway_disconnects_total[1h])) > 0
+  and sum(increase(two_bot_gateway_resumes_total[1h]))
+    + sum(increase(two_bot_gateway_events_total{event="READY"}[1h])) == 0
+```
+
+A firing result means disconnects with no later RESUME or fresh READY in the
+window (same shape as [watch signals §8](watch-signal-queries.md#8-gateway-disconnects-and-missed-events)).
+Do not subtract RESUME + READY from disconnects to certify pairing:
+`two_bot_gateway_disconnects_total` counts each failed reconnect attempt
+through the shard supervisor (`transport_disconnected` in
+`crates/bot/src/gateway.rs` runs on every `Err(Reconnect)`, plus close frames,
+invalid sessions, and cold-resume IDENTIFY), so one recovered outage with N
+failed retries ends in a RESUME yet still leaves a positive subtraction
+remainder — while a process start or cold resume contributes a READY or RESUME
+with no disconnect, which can hide a real unpaired loss inside the same
+window. Match each loss to its recovery by timestamps in the container logs,
+not by counts. `two_bot_gateway_missed_events_total` counts
+dispatches Discord assigned but this process never received (sequence gaps
+inside one session); any increase over the window fails the zero-missed-events
+acceptance and the checked-in `gateway_missed_events` rule fires on it. The
+live `gateway_unpaired_disconnect` Worker rule now pages when disconnects
+have no RESUMED or fresh READY for 3 consecutive keepalive samples (runbook:
+[runbook](runbook.md#alert-gateway-unpaired-disconnect)); this hand query
+remains as the cross-check, and where they disagree the live rule wins.
 
 Cross-check with one log filter over the same window (container stdout in the
 dashboard; Worker tail is not Rust stdout): count `gateway shard loop started`
 against `gateway ready; checkpoint committed`. A rising `READY` count
 means fresh IDENTIFYs (checkpoint older than 15 minutes or rejected sessions);
 a rising `RESUMED` count means the session continued. (`gateway reconnect
-failed; Twilight will retry` is the stdout counterpart of a transport loss;
-there is no disconnect counter series on `main` yet.)
+failed; Twilight will retry` marks one failed reconnect attempt, not one
+transport loss: close frames and invalid sessions increment
+`two_bot_gateway_disconnects_total` without logging that line, and one outage
+can log it many times before a RESUME.)
 
 | Level | Condition | Action |
 |---|---|---|
 | Warn | Single 503 sample that recovers; single reconnect paired with a later RESUME or READY | Record the finding with timestamp; keep watching |
-| Page | 503 sustained past 60 s after a restart/deploy event; `container_unready_alert` (10 consecutive failed keepalive samples, ~10 min at defaults); reconnects with no later RESUME or fresh READY in the same window | Freeze writers, investigate, evaluate rollback per the 48-hour watch |
+| Page | 503 sustained past 60 s after a restart/deploy event; `container_unready_alert` (2 consecutive failed keepalive samples, ~2 min at defaults); reconnects with no later RESUME or fresh READY in the same window | Freeze writers, investigate, evaluate rollback per the 48-hour watch |
 
 Sources: [gateway recovery](gateway-recovery.md),
 [container readiness](container-readiness.md),
 [production deploy watch](production-deploy.md#48-hour-watch-log-tog-9699).
 
-## Panel 2 — DB-error signals (proxies; no dedicated counter ships)
+## Panel 2 — DB-error signals and pool/job health
 
 Owner: on-call operator; DB-side cause belongs to the database dependency
 owner. Do not probe staging/production SQL, add grants, or restart the
 container to "free" the pool.
 
-Pool saturation (the shipped proxy for DB trouble — SQLx bookkeeping, not DB
-reachability):
+Recorded storage failures by producer:
+
+```promql
+sum by (op) (increase(two_bot_db_errors_total[1h]))
+```
+
+The `db_errors` rule fires at 3+ errors across all `op` labels between two
+keepalive samples (resets skip the window). Producers are send-admission SQL
+(`op="admission"`) and voice actor load (`op="other"`), not all stores.
+Correlate voice load failures with `voice actor load failed; retrying with
+capped backoff` in container stdout (a credential refusal logs `voice
+actor load failed; credential refused, not retrying`); the warn is throttled to
+once per 300 s process-wide, but every failure increments the counter.
+
+Pool saturation (a complementary proxy for DB trouble — SQLx bookkeeping,
+not DB reachability):
 
 ```promql
 two_bot_db_pool_configured == 1
@@ -118,15 +159,18 @@ Job health (DB unreachable surfaces here as failed completions):
 
 ```promql
 max by (job) (two_bot_job_consecutive_failures) >= 3
-time() - two_bot_job_last_success_timestamp_seconds > 2 * <job cadence seconds>
+time() - two_bot_job_last_success_timestamp_seconds{job="counter"} > 120
 ```
 
-Cadences live in `JOB_INTERVAL_SECONDS` (`counter` 60, `rank` 600,
-`scheduled_events` 600, `presence_probe` 3600, `community_scorecard` 60,
-`inactivity` 3600). A zero success timestamp means never succeeded since start
-(parked/just-started), not stale — the rule ignores it. Counter resets skip a
-window rather than firing. Cross-check container logs for `periodic job failed`
-(error class only; payloads are never logged).
+Substitute 2 x cadence per job for the staleness threshold: `counter` 120,
+`rank` 1200, `scheduled_events` 1200, `presence_probe` 7200,
+`community_scorecard` 120, `inactivity` 7200. Cadences live in
+`JOB_INTERVAL_SECONDS` (`counter` 60, `rank` 600, `scheduled_events` 600,
+`presence_probe` 3600, `community_scorecard` 60, `inactivity` 3600). A zero
+success timestamp means never succeeded since start (parked/just-started),
+not stale — the checked-in rule requires the timestamp above zero and ignores
+it. Counter resets skip a window rather than firing. Cross-check container
+logs for `periodic job failed` (error class only; payloads are never logged).
 
 Startup failure class (one fixed class per fatal gateway failure, no SQL text):
 
@@ -137,7 +181,8 @@ curl --silent --show-error --max-time 10 "${WORKER_URL}/readyz" | jq .gateway_fa
 `store_unavailable`, `gateway_pool_connect_failed`, and
 `checkpoint_load_failed` are the DB-side classes; each is also logged once as
 `durable gateway failed; checkpoint unchanged, readiness unavailable` and kept
-for 15 s on `/readyz` plus Worker-side `container_gateway_failure`. Full
+for 15 s on `/readyz` (the startup linger; a running-gateway failure lingers
+75 s) plus Worker-side `container_gateway_failure`. Full
 vocabulary: [startup diagnostics](startup-diagnostics.md), [runbook](runbook.md#logs-and-keepalive).
 
 | Level | Condition | Action |
@@ -148,13 +193,26 @@ vocabulary: [startup diagnostics](startup-diagnostics.md), [runbook](runbook.md#
 Sources: [metrics](metrics.md#off-container-scrape-and-alert-rules),
 [runbook Alert: DB pool](runbook.md#alert-db-pool).
 
-## Panel 3 — Send-admission and REST guard signals (proxies; no admission series ships)
+## Panel 3 — Send-admission and REST guard signals
 
 Owner: on-call operator; containment uses the actual writer's verified control
 ([runbook containment](runbook.md#containment-kill-switches-and-feature-flags)).
 Never hammer Discord, replay uncertain writes, or invent a breaker reset.
 
-REST 429 share (the one shipped send-path alert) plus the hot route:
+Send-admission decisions by outcome:
+
+```promql
+sum by (outcome) (increase(two_bot_send_admissions_total[1h]))
+```
+
+The `send_admission_blocked` rule fires on new `outcome="blocked"` refusals
+in 3 consecutive keepalive windows; idle windows (no new blocked refusals)
+and counter resets clear the streak. The first sample after monitoring arms
+counts as a window whenever the blocked counter is already nonzero.
+Admission SQL failures instead increment
+`two_bot_db_errors_total{op="admission"}` and feed `db_errors`.
+
+REST 429 share (`rest_429_rate`) plus the hot route:
 
 ```promql
 sum(increase(two_bot_rest_requests_total{result="429"}[1h]))
@@ -167,10 +225,11 @@ topk(5, sum by (route) (increase(two_bot_rest_requests_total{result="transport"}
 The rule fires above 10% 429s between two keepalive samples with at least 10
 requests in the window (`rest_429_rate`). The executor honors `retry-after`
 per attempt, so read the `route` label first and confirm no deploy is in
-progress before acting. 5xx/transport shares are informational — no rule
-covers them. Counter resets skip the window.
+progress before acting. The 5xx share has the same 10% / 10-request rule
+(`rest_5xx_rate`); only `transport` shares stay informational with no rule.
+Counter resets skip the window.
 
-Guard and token state (logs + `/readyz`, no metric series):
+Guard and token state (private `/metrics` `two_bot_rest_guard_*` + logs + `/readyz`):
 
 - `discord_breaker_open` — rolling 401/403/429 count reached 5000 per 600 s;
   non-essential REST refuses pre-wire while open. Stop the offending workload,
@@ -180,6 +239,14 @@ Guard and token state (logs + `/readyz`, no metric series):
 - `discord_token_invalid` — a bot-authenticated 401 latched `token_invalid`;
   `/readyz` adds the component at `down` (503). Stop retries; provisioning is
   a governed path, not a rollback. Contract: [REST guard](rest-guard.md).
+
+Private scrape series: `two_bot_rest_guard_breaker_open`,
+`two_bot_rest_guard_token_invalid`, `two_bot_rest_guard_global_paused`, plus
+`two_bot_rest_guard_rejected_requests_total` and
+`two_bot_rest_guard_invalid_requests_total` (full list:
+[REST admission guard](metrics.md#rest-admission-guard)). A zero
+`two_bot_rest_guard_global_pause_remaining_seconds` does not mean admission is
+open while `two_bot_rest_guard_pending_global_responses` is nonzero.
 
 Admission lane state (durable gate in `public.discord_send_admission`: one row
 per credential fingerprint, 60 s self-heal lease on `in_flight`, no
@@ -215,9 +282,9 @@ Sources: [metrics](metrics.md#off-container-scrape-and-alert-rules),
 
 | Panel | Warn (record, keep watching) | Page (freeze writers, decide rollback) |
 |---|---|---|
-| Readiness / gateway | Single 503; paired reconnect | 503 past 60 s; unready alert; reconnects with no RESUME/READY (missed-events series pending) |
-| DB-error proxies | 1 saturated sample; 1–2 job failures | Pool saturated x3; 3 consecutive failures; job stale; store/checkpoint class persists |
-| Send-admission proxies | Single 429 window; 5xx/transport spike; one global pause | Repeat 429 after containment; breaker open; token invalid; indefinite/wedged lane |
+| Readiness / gateway | Single 503; paired reconnect | 503 past 60 s; unready alert; reconnects with no RESUME/READY; any missed-events increase |
+| DB errors / pool / jobs | 1 saturated sample; 1–2 job failures | `db_errors` (3+ between samples); pool saturated x3; 3 consecutive failures; job stale; store/checkpoint class persists |
+| Send admission / REST | Single 429 window; 5xx/transport spike; one global pause | `send_admission_blocked` (3 windows); repeat 429 after containment; breaker open; token invalid; indefinite/wedged lane |
 
 ## What this doc does not do
 

@@ -1,6 +1,6 @@
 [package]
 name = "two-bot-cutover"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -19,8 +19,11 @@ workspace = true
 [dependencies]
 # `db` for shared durable admission and the redacting database URL helper.
 # sqlx is already a direct dependency, so no new driver burden.
-two-bot-core = { version = "0.3.0", path = "../core", features = ["db"] }
-two-bot-discord = { version = "0.3.0", path = "../discord" }
+two-bot-core = { version = "0.4.0", path = "../core", features = ["db"] }
+two-bot-discord = { version = "0.4.0", path = "../discord" }
+# Store chain source of truth: the migrate runner plans/applies/verifies the
+# store migrations under their own ledger without re-implementing the set.
+two-bot-store = { version = "0.4.0", path = "../store" }
 hex = { workspace = true }
 serde = { workspace = true }
 # Preserve JSON syntax kinds and exact numeric tokens during parity checks.
@@ -40,7 +43,8 @@ libc = "0.2.189"
 
 [dev-dependencies]
 rustls = { workspace = true }
-two-bot-testsupport = { version = "0.3.0", path = "../testsupport" }
+tokio = { workspace = true, features = ["test-util"] }
+two-bot-testsupport = { version = "0.4.0", path = "../testsupport" }
 
 [[bin]]
 name = "legacy_verify"
@@ -79,6 +83,10 @@ name = "legacy_copy"
 path = "src/bin/legacy_copy.rs"
 
 [[bin]]
+name = "voice-config-apply"
+path = "src/bin/voice_config_apply.rs"
+
+[[bin]]
 name = "staging-migrate"
 path = "src/bin/staging_migrate.rs"
 
@@ -97,6 +105,10 @@ path = "src/bin/gateway_force_identify.rs"
 [[bin]]
 name = "reengagement-list"
 path = "src/bin/reengagement_list.rs"
+
+[[bin]]
+name = "game-activity-report"
+path = "src/bin/game_activity_report.rs"
 
 [[bin]]
 name = "rollback-delta"

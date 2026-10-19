@@ -58,8 +58,8 @@ use twilight_model::id::marker::{
 use twilight_model::id::Id;
 use two_bot_core::{
     backoff_ms, classify_kick_status, pace_wait_ms, parse_retry_after_secs, plan_purge,
-    retry_after_ms, utf16_len, ActionOutcome, KickOutcome, KickResult, KickStatus,
-    ModerationExecution, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
+    retry_after_ms, retry_after_ms_unclamped, utf16_len, ActionOutcome, KickOutcome, KickResult,
+    KickStatus, ModerationExecution, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
 };
 
 /// Minimum gap between paced requests, ms (legacy `rest.ts` default).
@@ -69,6 +69,26 @@ pub const PACE_INTERVAL_MS: u64 = 110;
 pub const KICK_INTERVAL_MS: u64 = 350;
 /// Per-call abort for moderation verbs, ms (legacy `timeoutMs ?? 5000`).
 pub const MODERATION_TIMEOUT_MS: u64 = 5_000;
+/// Admission-wait budget for receipt-callback and completion retries, ms.
+/// Absolute and receipt-relative: it bounds admission waits, transport time
+/// and backoff sleeps together, leaving margin below Discord's three-second
+/// acknowledgement window. Only provably pre-wire admission-Blocked failures
+/// may consume it; every other error returns immediately with no retry.
+pub const RECEIPT_ADMISSION_BUDGET_MS: u64 = 2_500;
+/// Backoff between admission-Blocked retries, ms.
+pub const BLOCKED_RETRY_SLEEP_MS: u64 = 20;
+/// Boot window, ms after the executor is built, in which the registry reads
+/// and publish that gate gateway startup wait out a held send lane instead of
+/// failing the gateway on the first refusal.
+pub const BOOT_WINDOW_MS: u64 = 120_000;
+/// Admission-wait budget for those boot-window calls, ms. Just above the 60 s
+/// lane lease (`IN_FLIGHT_LEASE_MS`), so a dead predecessor's occupancy always
+/// self-heals inside the wait. Only provably pre-wire Blocked refusals consume
+/// it; any other error returns at once.
+pub const BOOT_ADMISSION_BUDGET_MS: u64 = 65_000;
+/// Backoff between boot-window Blocked retries, ms. Slower than the receipt
+/// callback's so a stale holder costs a few polls per second, not fifty.
+pub const BOOT_BLOCKED_RETRY_SLEEP_MS: u64 = 250;
 /// Bound response-body collection, including the otherwise untimed GET/kick
 /// lanes, so a stalled global response cannot retain pending admission forever.
 pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
@@ -78,6 +98,14 @@ pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
 /// deadline stays deterministic when the inner body budget and the outer wire
 /// budget expire in the same timer tick ([TOG-12562](/TOG/issues/TOG-12562)).
 pub(crate) const BODY_TIMEOUT_MESSAGE: &str = "read body timed out";
+/// Wire marker for stalled response headers: the request reached the wire but
+/// headers never arrived within the caller's header allowance (the admitted
+/// paths pass their remaining attempt budget; the unadmitted public path
+/// passes no limit and relies on its own outer deadline). The executor seam
+/// maps this to [`DiscordError::Timeout`] like the body marker. A GET has no
+/// mutation effect, so the transport releases the durable send lane on this
+/// path; other methods keep the permit held (uncertain mutation).
+pub(crate) const HEADER_TIMEOUT_MESSAGE: &str = "read headers timed out";
 /// Legacy audit-log-reason header bound (`X-Audit-Log-Reason`, latin-1,
 /// percent-encoded; twilight validates ≤512 chars).
 pub const MAX_AUDIT_REASON_CHARS: usize = 512;
@@ -102,8 +130,8 @@ pub enum DiscordError {
     #[error("discord was unreachable: {0}")]
     Unavailable(String),
     /// Rate limited (legacy `rate_limited`): paced per §6. Discord did not
-    /// process the request ([`DiscordError::proves_no_effect`]), but the
-    /// member and website fences still classify it as uncertain.
+    /// process the request ([`DiscordError::proves_no_effect`]), so fences
+    /// release only the failed attempt; other failures stay uncertain.
     #[error("discord rate-limited this request")]
     RateLimited,
     /// Refused locally before any wire attempt; safe to release a claim.
@@ -112,11 +140,41 @@ pub enum DiscordError {
 }
 
 impl DiscordError {
+    /// Fixed-vocabulary cause for logs. Never the error text: `Unavailable`
+    /// can carry transport detail and `Rejected` provider text.
+    #[must_use]
+    pub fn cause(&self) -> &'static str {
+        if self.is_admission_blocked() {
+            return "admission_blocked";
+        }
+        match self {
+            Self::Rejected(_) => "rejected",
+            Self::Timeout => "timeout",
+            Self::Unavailable(_) => "unavailable",
+            Self::RateLimited => "rate_limited",
+            Self::Guard(GuardError::CircuitOpen) => "guard_circuit_open",
+            Self::Guard(GuardError::TokenInvalid) => "guard_token_invalid",
+            Self::Guard(GuardError::AdmissionTimeout) => "guard_admission_timeout",
+            Self::Guard(GuardError::GlobalPaused) => "guard_global_paused",
+        }
+    }
+
     /// True only for failures that prove no mutation happened (legacy
     /// `isSafePreMutationFailure`).
     #[must_use]
     pub fn is_safe_pre_mutation(&self) -> bool {
         matches!(self, Self::Rejected(_) | Self::Guard(_))
+    }
+
+    /// True only for the durable send-admission single-flight refusal: the
+    /// token lane is occupied, so this attempt never reached the wire and a
+    /// bounded receipt-callback retry may re-attempt. Every other error —
+    /// including timeouts, transport failures and rate limits — is uncertain
+    /// or definitive and must never be retried by the callback path.
+    #[must_use]
+    pub fn is_admission_blocked(&self) -> bool {
+        matches!(self, Self::Unavailable(detail)
+            if detail == &two_bot_core::send_admission::AdmissionError::Blocked.to_string())
     }
 
     /// True when the failure proves the request had no effect: everything
@@ -257,6 +315,7 @@ impl RawResponse {
 
     /// Legacy 429 wait: body wins, then header, default 1 s; +250 ms pad;
     /// clamped so a bad header cannot park a run (legacy `retryAfterMs`).
+    /// Kick/publish lanes and registry reads keep this clamp.
     #[must_use]
     pub fn retry_after_wait_ms(&self) -> u64 {
         let header = self
@@ -264,6 +323,23 @@ impl RawResponse {
             .as_deref()
             .and_then(|s| parse_retry_after_secs(Some(s)));
         retry_after_ms(header, self.body_retry_after_secs())
+    }
+
+    /// Backfill-read 429 wait: same header/body/padding policy without the
+    /// 60 s clamp, so a long per-route `Retry-After` is waited out in one
+    /// sleep instead of retry-storming past it — but still bounded by the
+    /// 5 min backfill ceiling, so a malformed or hostile value cannot park a
+    /// caller. Only the paced backfill reads (`get_json_observed`,
+    /// `get_json_checked` via `read_json`) use this; every other lane
+    /// (including the general `get_json` read) keeps
+    /// [`Self::retry_after_wait_ms`].
+    #[must_use]
+    pub fn retry_after_wait_ms_unclamped(&self) -> u64 {
+        let header = self
+            .retry_after_header
+            .as_deref()
+            .and_then(|s| parse_retry_after_secs(Some(s)));
+        retry_after_ms_unclamped(header, self.body_retry_after_secs())
     }
 }
 
@@ -411,11 +487,23 @@ impl HyperTransport {
         )
     }
 
-    /// Send one governed attempt through headers receipt. The caller either
-    /// collects the bounded body ([`PendingHeaders::collect`]) or settles a
-    /// status-only verdict without waiting on the body; dropping the pending
-    /// headers commits only header-anchored global timing.
-    async fn send_request_headers(&self, request: &Request) -> Result<PendingHeaders<'_>, String> {
+    /// Send one governed attempt through headers receipt. `deadline` is the
+    /// caller's absolute attempt instant: durable admission and the header
+    /// wait share it (the body takes what is left via [`Self::send_request`]),
+    /// so a slow admit cannot outlive the caller's budget — the 2.5 s receipt
+    /// window, the 5 s moderation reads, the 30 s cutover/preflight pages.
+    /// The unadmitted loopback path passes `None` (no durable lane, unbounded
+    /// headers). A stalled GET times out inside the permit scope, where it
+    /// releases its lane; other methods keep the permit held by dropping it
+    /// uncompleted (uncertain). The caller either collects the bounded body
+    /// ([`PendingHeaders::collect`]) or settles a status-only verdict without
+    /// waiting on the body; dropping the pending headers commits only
+    /// header-anchored global timing.
+    async fn send_request_headers(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<PendingHeaders<'_>, String> {
         if request
             .headers()
             .is_some_and(|headers| headers.contains_key(hyper::header::AUTHORIZATION))
@@ -469,16 +557,50 @@ impl HyperTransport {
         let hyper_req = builder
             .body(http_body_util::Full::new(body_bytes))
             .map_err(|e| format!("build request: {e}"))?;
+        // Durable admission shares the caller's absolute deadline: it is a
+        // Postgres statement on a pooled connection, not a local lock, so an
+        // unbounded admit would outlive the receipt/moderation/boot budgets.
+        // A timed-out admit never resolved, so no permit exists to release;
+        // it reports as a header stall so the caller spends one attempt.
         let permit = match &self.admission {
-            Some(admission) => Some(admission.admit().await.map_err(|e| e.to_string())?),
-            None => None, // Constructor restricts ungoverned transport to loopback fixtures.
+            // Constructor restricts ungoverned transport to loopback fixtures.
+            None => None,
+            Some(admission) => match deadline {
+                None => Some(admission.admit().await.map_err(|e| e.to_string())?),
+                Some(at) => match tokio::time::timeout_at(at, admission.admit()).await {
+                    Ok(Ok(permit)) => Some(permit),
+                    Ok(Err(error)) => return Err(error.to_string()),
+                    Err(_) => return Err(HEADER_TIMEOUT_MESSAGE.to_owned()),
+                },
+            },
         };
         let mut attempt = crate::executor_metrics::Attempt::new(request);
-        let response = self
-            .inner
-            .request(hyper_req)
-            .await
-            .map_err(|e| format!("transport: {e}"))?;
+        // Bound the header wait inside the permit scope so a stalled read
+        // releases its lane instead of orphaning it: an outer cancellation
+        // would drop the future with the permit already taken, leaving
+        // retries `Blocked` on the read's own permit and holding the lane
+        // for the 60 s lease. There is exactly one header timer — the
+        // caller's absolute deadline — so no outer backstop races it. A GET
+        // cannot mutate, so release it here; other methods keep the permit
+        // held by dropping it uncompleted (uncertain).
+        let request_fut = self.inner.request(hyper_req);
+        let response = match deadline {
+            None => request_fut
+                .await
+                .map_err(|error| format!("transport: {error}"))?,
+            Some(at) => match tokio::time::timeout_at(at, request_fut).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => return Err(format!("transport: {error}")),
+                Err(_) => {
+                    if request.method() == Method::Get {
+                        if let Some(permit) = permit {
+                            let _ = permit.complete(None).await;
+                        }
+                    }
+                    return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
+                }
+            },
+        };
         let status = response.status().as_u16();
         let accounting = crate::ratelimit_guard::ResponseAccounting::new(
             &self.guard,
@@ -486,17 +608,32 @@ impl HyperTransport {
             response.headers(),
             !is_interaction_token_request(request),
         );
+        // Learn per-route bucket state from this response's `X-RateLimit-*`
+        // headers before the body is read: the next admission gates on it.
+        self.guard
+            .observe_bucket(&bucket_route_key(request), response.headers());
         attempt.finish(Some(status));
-        let retry_after_header = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
+        // The 429 wait honors `retry-after` first, then the bucket
+        // `reset-after` hint: on a 429 both name the same pause, and the reset
+        // hint is the only timing when `retry-after` is absent (official
+        // rate-limits page, verified 2026-10-12). Body `retry_after` still
+        // wins inside `retry_after_wait_ms`.
+        let retry_after_header = ["retry-after", "x-ratelimit-reset-after"]
+            .into_iter()
+            .find_map(|name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            });
         // Reads cannot mutate; a complete failure may be retried independently.
         // Mutation success needs its caller's validated receipt. 5xx, redirects
         // and request-timeout responses remain uncertain even with a full body.
+        // Definitive rejections (see `is_definitive_rejection`) and 429 release
+        // the lane on receipt; everything else keeps the permit held.
         let complete_on_receipt =
-            request.method() == Method::Get || matches!(status, 400 | 401 | 403 | 404 | 405 | 429);
+            request.method() == Method::Get || status == 429 || is_definitive_rejection(status);
         Ok(PendingHeaders {
             response: Some(response),
             accounting: Some(accounting),
@@ -509,8 +646,34 @@ impl HyperTransport {
 
     /// One governed wire attempt; no Twilight or pooled-connection resends.
     /// Returns the response and whether a process-global pause was recorded.
-    pub async fn send_request(&self, request: &Request) -> Result<(RawResponse, bool), String> {
-        self.send_request_headers(request).await?.collect().await
+    /// `deadline` is the caller's absolute attempt instant: admission,
+    /// headers and body together stay inside it. The unadmitted loopback path
+    /// passes `None` (headers unbounded, body at the fixed
+    /// [`RESPONSE_BODY_TIMEOUT_MS`]).
+    pub async fn send_request(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(RawResponse, bool), String> {
+        match deadline {
+            None => {
+                self.send_request_headers(request, None)
+                    .await?
+                    .collect()
+                    .await
+            }
+            Some(at) => {
+                let pending = self.send_request_headers(request, Some(at)).await?;
+                let remaining = at
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .unwrap_or(Duration::ZERO);
+                // Body shares the attempt deadline: cap it at whatever is
+                // left, so headers-plus-body can never overrun the caller's
+                // absolute budget (the receipt/boot windows).
+                let body_budget = remaining.min(Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS));
+                pending.collect_with(body_budget).await
+            }
+        }
     }
 }
 
@@ -537,14 +700,22 @@ struct PendingHeaders<'a> {
 impl PendingHeaders<'_> {
     /// Collect the bounded body and settle guard/admission accounting exactly
     /// as the pre-split `send_request` always has.
-    async fn collect(mut self) -> Result<(RawResponse, bool), String> {
+    async fn collect(self) -> Result<(RawResponse, bool), String> {
+        self.collect_with(Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS))
+            .await
+    }
+
+    /// [`Self::collect`] with the caller's body allowance: budgeted wire
+    /// attempts pass what is left of their attempt deadline so a slow header
+    /// phase cannot push the body phase past it.
+    async fn collect_with(mut self, body_timeout: Duration) -> Result<(RawResponse, bool), String> {
         use http_body_util::BodyExt as _;
         let response = self.response.take().expect("pending headers");
         let status = self.status;
         // Expiry drops accounting, resolving the pending header restriction to
         // its header-anchored timing/fallback without opening admission early.
         let collected = tokio::time::timeout(
-            Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS),
+            body_timeout,
             http_body_util::Limited::new(response.into_body(), 8 * 1024 * 1024).collect(),
         )
         .await;
@@ -554,8 +725,29 @@ impl PendingHeaders<'_> {
             // timed-out body. Missing timing installs an indefinite hold
             // instead of a default.
             Err(_) | Ok(Err(_)) if status == 429 => Vec::new(),
-            Err(_) => return Err(BODY_TIMEOUT_MESSAGE.to_owned()),
-            Ok(Err(_)) => return Err("Discord response body unavailable".to_owned()),
+            Err(_) => {
+                // Headers arrived but the body stalled: a GET cannot mutate,
+                // so release the lane where the permit is in scope. Without
+                // this the retries are `Blocked` by this attempt's own
+                // orphaned permit until the 60 s lease. Mutations keep the
+                // permit held (uncertain) by returning with it taken.
+                if self.complete_on_receipt {
+                    if let Some(permit) = self.permit.take() {
+                        let _ = permit.complete(None).await;
+                    }
+                }
+                return Err(BODY_TIMEOUT_MESSAGE.to_owned());
+            }
+            Ok(Err(_)) => {
+                // Same orphan as a timed-out body: a truncated/errored body on
+                // a receipted read (every GET) must release the lane.
+                if self.complete_on_receipt {
+                    if let Some(permit) = self.permit.take() {
+                        let _ = permit.complete(None).await;
+                    }
+                }
+                return Err("Discord response body unavailable".to_owned());
+            }
         };
         let mut res = RawResponse {
             status,
@@ -613,6 +805,18 @@ impl Drop for PendingHeaders<'_> {
 
 fn is_interaction_callback(request: &Request) -> bool {
     request.path().starts_with("interactions/") && request.path().ends_with("/callback")
+}
+
+/// Bucket identity for one request: HTTP method plus path, without the
+/// query string. Paginated reads change `after`/`before`/`limit` on every
+/// page, so keying learned bucket state on the full path would orphan the
+/// deadline a response teaches before the next page admits; Discord can
+/// also bucket different methods on one path separately. Admission and
+/// `observe_bucket` share this key so a response's deadline gates the
+/// next page of the same route.
+fn bucket_route_key(request: &Request) -> String {
+    let path = request.path().split('?').next().unwrap_or(request.path());
+    format!("{} {path}", request.method().name())
 }
 
 fn is_interaction_token_request(request: &Request) -> bool {
@@ -712,9 +916,12 @@ struct ExecutorInner {
     /// encoding) and for publish/callback sends with default mention
     /// suppression.
     factory: TwilightClient,
+    command_identities: crate::command_identity::CommandIdentities,
     pace_interval: Duration,
     kick_interval: Duration,
     moderation_timeout: Duration,
+    /// End of the boot window; see [`BOOT_WINDOW_MS`].
+    boot_until: tokio::time::Instant,
     pace_last_at: tokio::sync::Mutex<tokio::time::Instant>,
     kick_last_at: tokio::sync::Mutex<tokio::time::Instant>,
     #[cfg(test)]
@@ -746,6 +953,17 @@ impl ActionExecutor {
     /// tests point this at the mock double).
     pub fn with_proxy(token: String, proxy_url: Option<String>) -> Result<Self, String> {
         Self::build(token, proxy_url, None)
+    }
+
+    /// Build a loopback test executor with an explicit moderation request budget.
+    #[cfg(feature = "test-support")]
+    pub fn with_proxy_and_moderation_timeout(
+        token: String,
+        proxy_url: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let transport = HyperTransport::build(token.clone(), proxy_url.clone(), None)?;
+        Self::assemble_with_timeout(token, proxy_url, transport, timeout)
     }
 
     /// Mandatory for non-loopback sends; every retry uses this same lane.
@@ -784,10 +1002,24 @@ impl ActionExecutor {
         proxy_url: Option<String>,
         transport: HyperTransport,
     ) -> Result<Self, String> {
+        Self::assemble_with_timeout(
+            token,
+            proxy_url,
+            transport,
+            Duration::from_millis(MODERATION_TIMEOUT_MS),
+        )
+    }
+
+    fn assemble_with_timeout(
+        token: String,
+        proxy_url: Option<String>,
+        transport: HyperTransport,
+        moderation_timeout: Duration,
+    ) -> Result<Self, String> {
         let mut builder = TwilightClient::builder()
             .token(token)
             .ratelimiter(None)
-            .timeout(Duration::from_millis(MODERATION_TIMEOUT_MS));
+            .timeout(moderation_timeout);
         if proxy_url.is_some() {
             // Reuse the already-validated origin, never reparse raw input for
             // the nested request factory with a different set of rules.
@@ -803,9 +1035,11 @@ impl ActionExecutor {
             inner: Arc::new(ExecutorInner {
                 transport,
                 factory: builder.build(),
+                command_identities: crate::command_identity::CommandIdentities::default(),
                 pace_interval: Duration::from_millis(PACE_INTERVAL_MS),
                 kick_interval: Duration::from_millis(KICK_INTERVAL_MS),
-                moderation_timeout: Duration::from_millis(MODERATION_TIMEOUT_MS),
+                moderation_timeout,
+                boot_until: tokio::time::Instant::now() + Duration::from_millis(BOOT_WINDOW_MS),
                 pace_last_at: tokio::sync::Mutex::new(
                     tokio::time::Instant::now() - Duration::from_secs(60),
                 ),
@@ -817,6 +1051,12 @@ impl ActionExecutor {
                 requests: std::sync::atomic::AtomicU64::new(0),
             }),
         })
+    }
+
+    /// Identity snapshots shared with interaction admission and voice handlers.
+    #[must_use]
+    pub fn command_identities(&self) -> crate::command_identity::CommandIdentities {
+        self.inner.command_identities.clone()
     }
 
     /// Requests made so far: the run's own Discord cost report.
@@ -857,8 +1097,29 @@ impl ActionExecutor {
     }
 
     async fn admit(&self, request: &Request, lane: Option<bool>) -> Result<(), GuardError> {
+        self.admit_essential(request, lane, is_interaction_callback(request))
+            .await
+    }
+
+    /// 429 sleep-then-retry admission: essential, so a breaker this read's
+    /// own 429 tally just opened cannot refuse its retry — and only that.
+    /// The guard still enforces `token_invalid`, pending/global pauses, the
+    /// learned bucket deadline and shared pacing, so no retry leaves during
+    /// a pause another request installed while this one slept.
+    async fn admit_retry(&self, request: &Request, lane: Option<bool>) -> Result<(), GuardError> {
+        self.admit_essential(request, lane, true).await
+    }
+
+    async fn admit_essential(
+        &self,
+        request: &Request,
+        lane: Option<bool>,
+        essential: bool,
+    ) -> Result<(), GuardError> {
         let guard = &self.inner.transport.guard;
-        let essential = is_interaction_callback(request);
+        // Route-aware admission on the paced lanes: the guard paces all
+        // executors sharing it and holds same-bucket reads until the header
+        // reset (see admit_route). Lane-less sends keep plain admission.
         let Some(kick_lane) = lane else {
             return guard.admit(essential).await;
         };
@@ -867,18 +1128,50 @@ impl ActionExecutor {
         } else {
             (&self.inner.pace_last_at, self.inner.pace_interval)
         };
-        // Keep the lane reservation through cooldown and pacing. Timestamp only
-        // the actual dispatch, not each queued caller's pre-cooldown admission.
-        let mut last = lock.lock().await;
-        guard.admit(essential).await?;
-        let earliest = *last + interval;
-        if earliest > tokio::time::Instant::now() {
-            tokio::time::sleep_until(earliest).await;
+        let route_key = bucket_route_key(request);
+        // Wait out guard gates (global pause, this route's bucket deadline,
+        // shared pacing) before taking the lane lock: a route-local bucket
+        // reset can be seconds away, and sleeping it out under the lane
+        // lock would stall every unrelated route sharing the lane until
+        // their own admission budgets expire. The first pass also takes
+        // this admission's one pacing turn; later passes only re-wait
+        // gates that arrived while this caller queued for or slept in the
+        // lane, detected by the non-blocking re-check under the lock.
+        let mut paced = false;
+        loop {
+            if paced {
+                guard.admit_route_recheck(&route_key, essential).await?;
+            } else {
+                guard.admit_route(&route_key, essential).await?;
+                paced = true;
+            }
+            // Keep the lane reservation through the lane sleep. Timestamp
+            // only the actual dispatch, not each queued caller's
+            // pre-cooldown admission.
+            let mut last = lock.lock().await;
+            if let Err(error) = guard.check_route_now(&route_key, essential) {
+                drop(last);
+                match error {
+                    GuardError::GlobalPaused => continue,
+                    other => return Err(other),
+                }
+            }
+            let earliest = *last + interval;
+            if earliest > tokio::time::Instant::now() {
+                tokio::time::sleep_until(earliest).await;
+            }
+            // A global response/breaker/bucket reset may arrive during the
+            // lane sleep; re-wait it outside the lock, never under it.
+            if let Err(error) = guard.check_route_now(&route_key, essential) {
+                drop(last);
+                match error {
+                    GuardError::GlobalPaused => continue,
+                    other => return Err(other),
+                }
+            }
+            self.stamp_paced_lane(&mut last, kick_lane);
+            return Ok(());
         }
-        // A global response/breaker may arrive during the lane sleep.
-        guard.admit(essential).await?;
-        self.stamp_paced_lane(&mut last, kick_lane);
-        Ok(())
     }
 
     /// Keep pacing/global waits before the audit service's late DB fence, and
@@ -908,21 +1201,44 @@ impl ActionExecutor {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// One admitted send bounded by `timeout` (the total wire budget:
+    /// callers have already passed local admission). The budget is the single
+    /// attempt deadline inside the transport — headers take at most `timeout`
+    /// and the body takes what is left — so there is no outer timer to race
+    /// the inner one: a stalled GET times out where its permit is in scope
+    /// and releases the lane instead of orphaning it.
+    async fn send_admitted_within(
+        &self,
+        request: &Request,
+        timeout: Duration,
+    ) -> Result<(RawResponse, bool), DiscordError> {
+        self.send_admitted_for(request, timeout).await
+    }
+
     async fn send_admitted(&self, request: &Request) -> Result<(RawResponse, bool), DiscordError> {
+        self.send_admitted_for(request, self.inner.moderation_timeout)
+            .await
+    }
+
+    async fn send_admitted_for(
+        &self,
+        request: &Request,
+        budget: Duration,
+    ) -> Result<(RawResponse, bool), DiscordError> {
         self.count();
+        // The absolute attempt instant is fixed before durable admission, so
+        // the admit, the header wait and the body share the one deadline.
+        let deadline = tokio::time::Instant::now() + budget;
         self.inner
             .transport
-            .send_request(request)
+            .send_request(request, Some(deadline))
             .await
             .map_err(|detail| {
-                // The body budget equals the wire budget and both start within
-                // milliseconds of each other, so on a loaded runner they expire in
-                // the same timer tick. Normalize the stalled-body marker to the
-                // wire-deadline error: a body that never completed inside the wire
-                // budget is "Discord did not answer in time" (legacy
-                // `upstream_timeout`), whichever timer wins
-                // ([TOG-12562](/TOG/issues/TOG-12562)).
-                if detail == BODY_TIMEOUT_MESSAGE {
+                // A body that never completed inside the wire budget is
+                // "Discord did not answer in time" (legacy `upstream_timeout`).
+                // The stalled-header marker maps the same way: headers never
+                // arrived in time ([TOG-12562](/TOG/issues/TOG-12562)).
+                if detail == BODY_TIMEOUT_MESSAGE || detail == HEADER_TIMEOUT_MESSAGE {
                     DiscordError::Timeout
                 } else {
                     DiscordError::Unavailable(detail)
@@ -958,9 +1274,15 @@ impl ActionExecutor {
         tokio::time::timeout_at(deadline, self.admit(request, lane))
             .await
             .map_err(|_| GuardError::AdmissionTimeout)??;
-        tokio::time::timeout_at(deadline, self.send_admitted(request))
-            .await
-            .map_err(|_| DiscordError::Timeout)?
+        // The wire phase takes whatever is left of the caller's deadline, so
+        // guard admission, durable admission, headers and body together stay
+        // inside it (the receipt window refuses to land past it). No outer
+        // backstop: the transport's timers share the absolute deadline, and a
+        // stalled GET releases its lane where the permit is in scope.
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or(Duration::ZERO);
+        self.send_admitted_for(request, remaining).await
     }
 
     /// Singular role mutations use status only. A truncated/stalled provider
@@ -969,8 +1291,20 @@ impl ActionExecutor {
     /// compensates instead of trusting a partial exchange.
     async fn send_status(&self, request: &Request) -> Result<u16, String> {
         self.count();
-        let pending = self.inner.transport.send_request_headers(request).await?;
+        let deadline = tokio::time::Instant::now() + self.inner.moderation_timeout;
+        let pending = self
+            .inner
+            .transport
+            .send_request_headers(request, Some(deadline))
+            .await?;
         Ok(pending.settle_status().await)
+    }
+
+    /// Twilight request factory for sibling Discord-native modules (funnel
+    /// invites): keeps method/path/body encoding twilight-owned, like the
+    /// moderation verbs below.
+    pub(crate) fn request_factory(&self) -> &TwilightClient {
+        &self.inner.factory
     }
 
     /// Build a twilight [`Request`] from a builder without sending (keeps
@@ -978,7 +1312,7 @@ impl ActionExecutor {
     /// (bad ids, out-of-range fields, failed validation) happen before any
     /// I/O, so they map to [`DiscordError::Rejected`] — provably no mutation
     /// happened and the claim fence is safe to release.
-    fn request_of<T>(build: T) -> Result<Request, DiscordError>
+    pub(crate) fn request_of<T>(build: T) -> Result<Request, DiscordError>
     where
         T: TryIntoRequest,
     {
@@ -1046,7 +1380,20 @@ impl ActionExecutor {
         accepted: &[u16],
         lane: Option<bool>,
     ) -> Result<RawResponse, DiscordError> {
-        let (res, _) = self.send_with_timeout(&request, lane).await?;
+        self.call_once_raw_lane_for(&request, accepted, lane, self.inner.moderation_timeout)
+            .await
+    }
+
+    /// One attempt bounded by `timeout`, borrowing the request so a caller can
+    /// re-attempt it after a pre-wire refusal.
+    async fn call_once_raw_lane_for(
+        &self,
+        request: &Request,
+        accepted: &[u16],
+        lane: Option<bool>,
+        timeout: Duration,
+    ) -> Result<RawResponse, DiscordError> {
+        let (res, _) = self.send_with_timeout_for(request, lane, timeout).await?;
         if accepted.contains(&res.status) {
             return Ok(res);
         }
@@ -1501,41 +1848,86 @@ impl ActionExecutor {
         .map_err(|e| e.to_string())
     }
 
-    /// Paced GET: 110 ms lane, 403/404 → `None`, 429 parks (same attempt),
-    /// 5xx/transport backs off ≤4, other statuses → `None` (legacy
-    /// `DiscordRest::get`). Supported paths cover the parity §6 reads —
+    /// Paced GET: 110 ms lane, 403/404 → `None`, 429 sleeps-then-retries under
+    /// the same admission (`retry-after`/`reset-after` + 250 ms, clamped at
+    /// 60 s like kick/publish; a global 429 additionally rides out the shared
+    /// pause) within the same 5-try budget as 5xx/transport, other statuses →
+    /// `None` (legacy `DiscordRest::get`). This is the general interactive
+    /// read (containment snapshot, website jobs, onboarding probe): it keeps
+    /// the clamp so a long per-route wait cannot park a serialized worker.
+    /// Supported paths cover the
+    /// parity §6 reads —
     /// guild, guild members (+`after`/`limit`), guild scheduled-events
     /// (+`with_user_count`), single channel and the channel-messages list
     /// (+`after`/`around`/`before`/`limit`). Anything else is a caller bug and
     /// is refused without I/O, never silently rewritten (finding 2).
     pub async fn get_json(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
-        Ok(self.get_json_observed(path).await?.map(|(data, _)| data))
+        Ok(self
+            .get_json_observed_inner(path, false)
+            .await?
+            .map(|(data, _)| data))
     }
 
     /// Permission evidence must distinguish denied/absent (403/404) from an
     /// unavailable or unreadable response. Keep the shared paced read policy,
     /// but never let a transient failure look like a proven delivery skip.
+    /// Shares the backfill evidence-read wait policy with
+    /// [`Self::get_json_observed`] (unclamped, 5 min ceiling).
     pub async fn get_json_checked(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
-        self.read_json(path, true).await
+        self.read_json(path, true, true).await
     }
 
     /// Membership evidence is bounded by the successful attempt's request
     /// start, after pacing, never by headers/body completion or an earlier
     /// failed attempt. Ordinary `get_json` keeps its data-only contract.
+    /// This is the backfill evidence read (driven by the store backfill): a
+    /// long per-route 429 is waited out unclamped (5 min ceiling per wait)
+    /// instead of retry-storming past it.
     pub async fn get_json_observed(
         &self,
         path: &str,
     ) -> Result<Option<(serde_json::Value, String)>, String> {
+        self.get_json_observed_inner(path, true).await
+    }
+
+    /// Shared observed-read loop: `backfill_wait` selects the unclamped
+    /// backfill 429 wait; the general read keeps the 60 s clamp.
+    async fn get_json_observed_inner(
+        &self,
+        path: &str,
+        backfill_wait: bool,
+    ) -> Result<Option<(serde_json::Value, String)>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
+        // A 429 proves the attempt reached Discord, so its sleep-then-retry
+        // re-admits as essential: a breaker the tally just opened must not
+        // refuse the in-flight read's own retry, while every other guard
+        // gate (token, pauses, bucket, pacing) still applies. New reads
+        // admit (and refuse) as usual.
+        let mut admitted_retry = false;
         loop {
             let request = Request::from_route(&route);
             // Guard refusals are terminal; pacing completes before the stamp.
-            self.admit(&request, Some(false))
-                .await
-                .map_err(|error| error.to_string())?;
+            if admitted_retry {
+                self.admit_retry(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            } else {
+                self.admit(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            admitted_retry = false;
             let observed_at = two_bot_core::now_iso();
-            let (res, global) = match self.send_admitted(&request).await {
+            // Each attempt gets the moderation bound across headers and body,
+            // so a response that never answers cannot park the caller (the
+            // containment worker's roles snapshot). A timeout spends one read
+            // attempt like any transport failure; `observed_at` above still
+            // marks the request start, never the deadline.
+            let (res, global) = match self
+                .send_admitted_within(&request, self.inner.moderation_timeout)
+                .await
+            {
                 Ok(r) => r,
                 Err(detail) => {
                     if attempt >= MAX_HTTP_TRIES - 1 {
@@ -1553,9 +1945,33 @@ impl ActionExecutor {
                         .map(|data| (data, observed_at)));
                 }
                 429 => {
-                    if !global {
-                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    // Every 429 spends one read attempt, like 5xx/transport:
+                    // a steady 429 stream exhausts the budget instead of
+                    // parking the read until a separate guard refuses it. The
+                    // retry re-admits as essential (see `admitted_retry`):
+                    // no request leaves during the wait or a shared pause.
+                    // Backfill evidence reads wait out a long per-route
+                    // Retry-After unclamped (5 min ceiling per wait): waking
+                    // early only earns another 429 and burns another try.
+                    // The general read and kick/publish keep the 60 s clamp.
+                    if attempt >= MAX_HTTP_TRIES - 1 {
+                        return Ok(None);
                     }
+                    if !global {
+                        let wait_ms = if backfill_wait {
+                            res.retry_after_wait_ms_unclamped()
+                        } else {
+                            res.retry_after_wait_ms()
+                        };
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                    }
+                    // A global 429 already installed the shared pause at
+                    // headers receipt, anchored to that instant: sleeping
+                    // the full wait again after the body would restart the
+                    // deadline. The essential re-admission waits out
+                    // whatever of the pause remains instead.
+                    admitted_retry = true;
+                    attempt += 1;
                 }
                 403 | 404 => return Ok(None),
                 500..=599 => {
@@ -1570,19 +1986,70 @@ impl ActionExecutor {
         }
     }
 
+    /// Announcement RSVP's single paced lookup: only 404 means absent. Unlike
+    /// the generic legacy REST GET, HTTP failures and malformed JSON must not
+    /// masquerade as a missing event. Never expose transport details in replies.
+    pub async fn get_scheduled_event(
+        &self,
+        guild_id: &str,
+        event_id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let guild = snowflake::<GuildMarker>(guild_id).map_err(|_| "Invalid guild id.")?;
+        let event = snowflake::<twilight_model::id::marker::ScheduledEventMarker>(event_id)
+            .map_err(|_| "Invalid scheduled event id.")?;
+        let request = Request::from_route(&Route::GetGuildScheduledEvent {
+            guild_id: guild.get(),
+            scheduled_event_id: event.get(),
+            with_user_count: false,
+        });
+        // Guard admission and pacing run inside bounded attempts. The lookup
+        // is mutation-free, so retrying a provably pre-wire admission-Blocked
+        // failure cannot double-apply anything; HTTP and parse outcomes still
+        // return after a single attempt with no retry.
+        let res = self
+            .retry_admission_blocked(|_| async {
+                self.send_with_timeout(&request, Some(false))
+                    .await
+                    .map(|(res, _)| res)
+            })
+            .await
+            .map_err(|_| "Unable to validate scheduled event.")?;
+        match res.status {
+            404 => Ok(None),
+            200..=299 => serde_json::from_slice(&res.body)
+                .map(Some)
+                .map_err(|_| "Discord returned an invalid scheduled event status.".to_owned()),
+            status => Err(format!("Discord request failed: HTTP {status}")),
+        }
+    }
+
+    /// `backfill_wait` selects the unclamped backfill 429 wait (5 min ceiling
+    /// per wait); callers outside the backfill evidence reads keep the clamp
+    /// by passing `false`.
     async fn read_json(
         &self,
         path: &str,
         checked: bool,
+        backfill_wait: bool,
     ) -> Result<Option<serde_json::Value>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
+        // Same essential re-admission as the observed read: a 429 retry
+        // bypasses only a just-opened breaker, never the other guard gates.
+        let mut admitted_retry = false;
         loop {
             let request = Request::from_route(&route);
             // Guard refusals are terminal; pacing completes before the send.
-            self.admit(&request, Some(false))
-                .await
-                .map_err(|error| error.to_string())?;
+            if admitted_retry {
+                self.admit_retry(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            } else {
+                self.admit(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            admitted_retry = false;
             let (res, global) = match self.send_admitted(&request).await {
                 Ok(r) => r,
                 Err(detail) => {
@@ -1606,9 +2073,34 @@ impl ActionExecutor {
                     };
                 }
                 429 => {
-                    if !global {
-                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    // Same finite budget as the observed read: each 429
+                    // spends one attempt, so persistent rate limiting ends in
+                    // the fixed transient-exhaustion error for checked reads
+                    // (absence for unchecked ones), never an open-ended park.
+                    // The retry re-admits as essential after sleeping out
+                    // a route-local wait — unclamped (5 min ceiling) for the
+                    // backfill evidence reads, clamped otherwise, like the
+                    // observed read; a shared pause rides admission.
+                    if attempt >= MAX_HTTP_TRIES - 1 {
+                        return if checked {
+                            Err("Discord evidence unavailable".to_owned())
+                        } else {
+                            Ok(None)
+                        };
                     }
+                    if !global {
+                        let wait_ms = if backfill_wait {
+                            res.retry_after_wait_ms_unclamped()
+                        } else {
+                            res.retry_after_wait_ms()
+                        };
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                    }
+                    // Global: no local sleep — the shared pause is anchored
+                    // at headers receipt and the essential re-admission
+                    // waits out its remainder (see the observed read).
+                    admitted_retry = true;
+                    attempt += 1;
                 }
                 403 | 404 => return Ok(None),
                 500..=599 => {
@@ -1644,6 +2136,36 @@ impl ActionExecutor {
         // Guard admission and pacing run inside the one bounded attempt.
         let (res, _) = self
             .send_with_timeout(&Request::from_route(&route), Some(false))
+            .await?;
+        match res.status {
+            200..=299 => serde_json::from_slice(&res.body)
+                .map(Some)
+                .map_err(|_| DiscordError::Unavailable("invalid JSON response".into())),
+            404 => Ok(None),
+            _ => Err(throw_for_status(&res)),
+        }
+    }
+
+    /// Membership-evidence read for the RSVP pre-write gate and post-write
+    /// fence. Same fail-closed mapping as [`Self::get_json_strict`] (only 404
+    /// is absence), but a provably pre-wire admission-Blocked attempt waits
+    /// out brief governed-lane occupancy inside the receipt budget instead of
+    /// refusing the command — the same posture as [`Self::get_scheduled_event`].
+    /// A Blocked attempt never reached the wire, so retrying it cannot
+    /// double-apply anything; every other error returns immediately.
+    pub async fn get_json_strict_with_blocked_retry(
+        &self,
+        path: &str,
+    ) -> Result<Option<serde_json::Value>, DiscordError> {
+        let route = raw_get_route(path).map_err(DiscordError::Rejected)?;
+        let request = Request::from_route(&route);
+        // Guard admission and pacing run inside bounded attempts. The
+        // timeout travels by value into the attempt future (the same shape
+        // as the receipt-callback retry), so no borrow outlives the call.
+        let (res, _) = self
+            .retry_admission_blocked(|timeout| {
+                self.send_with_timeout_for(&request, Some(false), timeout)
+            })
             .await?;
         match res.status {
             200..=299 => serde_json::from_slice(&res.body)
@@ -2260,6 +2782,9 @@ impl ActionExecutor {
     }
 
     /// Complete an already-deferred ephemeral reply through the same executor.
+    /// Re-attempts ONLY admission-Blocked failures within the absolute
+    /// [`RECEIPT_ADMISSION_BUDGET_MS`] budget: a Blocked attempt never reached
+    /// the wire, so retrying it cannot repeat an accepted edit.
     pub async fn finish_interaction(
         &self,
         application_id: u64,
@@ -2275,14 +2800,17 @@ impl ActionExecutor {
             roles: vec![],
             users: vec![],
         };
-        let req = Self::request_of(
-            interaction
-                .update_response(token)
-                .content(Some(content))
-                .allowed_mentions(Some(&mentions)),
-        )?;
-        self.call_once_raw(req, &[200]).await?;
-        Ok(())
+        self.retry_admission_blocked(|_| async {
+            let req = Self::request_of(
+                interaction
+                    .update_response(token)
+                    .content(Some(content))
+                    .allowed_mentions(Some(&mentions)),
+            )?;
+            self.call_once_raw(req, &[200]).await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Raw message send shared by [`Self::post_message`] and the audit
@@ -2585,11 +3113,14 @@ impl ActionExecutor {
         for attempt in 0..MAX_HTTP_TRIES {
             // Paced non-kick lane with the same bounded wire budget as the
             // publish sibling; 429 parks and 5xx back off within MAX_HTTP_TRIES.
+            // The budget travels inside the transport (headers take at most
+            // the allowance, the body takes what is left), so a stalled GET
+            // times out where its permit is in scope and releases the lane
+            // instead of orphaning it for the lease.
             self.admit(&req, Some(false)).await?;
-            let (res, _) =
-                tokio::time::timeout(self.inner.moderation_timeout, self.send_admitted(&req))
-                    .await
-                    .map_err(|_| DiscordError::Timeout)??;
+            let (res, _) = self
+                .send_admitted_within(&req, self.inner.moderation_timeout)
+                .await?;
             match res.status {
                 200..=299 => {
                     return crate::command_registry::decode_guild_commands(&res.body).map_err(
@@ -2628,6 +3159,11 @@ impl ActionExecutor {
         if publish {
             self.publish_guild_commands(application_id, guild_id, commands)
                 .await?;
+        } else {
+            self.inner
+                .command_identities
+                .replace_guild(application_id, guild_id, &current)
+                .map_err(|error| DiscordError::Unavailable(error.to_owned()))?;
         }
         Ok((diff, publish))
     }
@@ -2692,8 +3228,18 @@ impl ActionExecutor {
 
     /// One paced, bounded bootstrap read: only 200 accepted; an unreadable
     /// body is `None` so callers can refuse with their own fixed error.
+    ///
+    /// Inside the boot window a held send lane is waited out (see
+    /// [`Self::retry_blocked_at_boot`]): the gateway's bootstrap races the
+    /// supervised jobs' first reads for the single-flight lane, and a dead
+    /// predecessor can hold it up to the lease. Failing the gateway on the
+    /// first refusal costs a container restart per attempt.
     async fn bootstrap_doc(&self, req: Request) -> Result<Option<serde_json::Value>, DiscordError> {
-        let mut res = self.call_once_raw_paced(req, &[200]).await?;
+        let mut res = self
+            .retry_blocked_at_boot(|timeout| {
+                self.call_once_raw_lane_for(&req, &[200], Some(false), timeout)
+            })
+            .await?;
         let doc = serde_json::from_slice(&res.body).ok();
         res.complete().await;
         Ok(doc)
@@ -2727,10 +3273,16 @@ impl ActionExecutor {
             // Idempotent sync may wait out any global pause; the five-second
             // wire budget starts after paced admission, unlike moderation.
             self.admit(&req, Some(false)).await?;
-            let (mut res, global) =
-                tokio::time::timeout(self.inner.moderation_timeout, self.send_admitted(&req))
-                    .await
-                    .map_err(|_| DiscordError::Timeout)??;
+            // Only the first send waits out a held lane at boot. A retry follows
+            // this publish's own 429/5xx, which may itself have installed the
+            // hold: it must re-check admission once and refuse, not wait.
+            let (mut res, global) = if attempts == 0 {
+                self.retry_blocked_at_boot(|timeout| self.send_admitted_within(&req, timeout))
+                    .await?
+            } else {
+                self.send_admitted_within(&req, self.inner.moderation_timeout)
+                    .await?
+            };
             match res.status {
                 200 => {
                     let parsed: Result<
@@ -2751,6 +3303,10 @@ impl ActionExecutor {
                             "incomplete command registry receipt".to_owned(),
                         ));
                     }
+                    self.inner
+                        .command_identities
+                        .replace_guild(application_id, guild_id, &published)
+                        .map_err(|error| DiscordError::Unavailable(error.to_owned()))?;
                     return Ok(());
                 }
                 429 => {
@@ -2781,6 +3337,25 @@ impl ActionExecutor {
         interaction_token: &str,
         response: &twilight_model::http::interaction::InteractionResponse,
     ) -> Result<(), DiscordError> {
+        self.answer_interaction_with_timeout(
+            interaction_id,
+            interaction_token,
+            response,
+            self.inner.moderation_timeout,
+        )
+        .await
+    }
+
+    /// One receipt-callback attempt bounded by `timeout`: guard admission and
+    /// the admitted send share the one deadline, so a slow transport cannot
+    /// outlive the caller's remaining acknowledgement budget.
+    async fn answer_interaction_with_timeout(
+        &self,
+        interaction_id: u64,
+        interaction_token: &str,
+        response: &twilight_model::http::interaction::InteractionResponse,
+        timeout: Duration,
+    ) -> Result<(), DiscordError> {
         let interaction_id =
             Id::<InteractionMarker>::new_checked(interaction_id).ok_or_else(|| {
                 DiscordError::Rejected(format!("bad interaction id: {interaction_id}"))
@@ -2793,7 +3368,7 @@ impl ActionExecutor {
                 .create_response(interaction_id, interaction_token, &response),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
-        let (mut res, _) = self.send_with_timeout(&req, None).await?;
+        let (mut res, _) = self.send_with_timeout_for(&req, None, timeout).await?;
         match res.status {
             200 => {
                 mutation_receipt_id(&res.body)?;
@@ -2806,6 +3381,127 @@ impl ActionExecutor {
             }
             _ => Err(throw_for_status(&res)),
         }
+    }
+
+    /// Bounded retry for provably pre-wire admission-Blocked failures: the
+    /// absolute [`RECEIPT_ADMISSION_BUDGET_MS`] budget covers admission waits,
+    /// transport time and backoff sleeps together. Each attempt receives the
+    /// remaining budget capped by the moderation timeout, so the final attempt
+    /// cannot overrun the budget with its own transport wait. A Blocked
+    /// attempt never reached the wire, so retrying it cannot double-send;
+    /// every other error returns immediately with no retry.
+    async fn retry_admission_blocked<T, F, Fut>(&self, attempt: F) -> Result<T, DiscordError>
+    where
+        F: FnMut(Duration) -> Fut,
+        Fut: std::future::Future<Output = Result<T, DiscordError>>,
+    {
+        self.retry_admission_blocked_within(
+            Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS),
+            Duration::from_millis(BLOCKED_RETRY_SLEEP_MS),
+            attempt,
+        )
+        .await
+    }
+
+    /// [`Self::retry_admission_blocked`] with the caller's budget and backoff.
+    async fn retry_admission_blocked_within<T, F, Fut>(
+        &self,
+        budget: Duration,
+        sleep: Duration,
+        mut attempt: F,
+    ) -> Result<T, DiscordError>
+    where
+        F: FnMut(Duration) -> Fut,
+        Fut: std::future::Future<Output = Result<T, DiscordError>>,
+    {
+        let start = tokio::time::Instant::now();
+        let mut blocked: Option<DiscordError> = None;
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= budget {
+                // Only reachable after a Blocked attempt: the first iteration
+                // always runs with the full budget remaining.
+                return Err(blocked.expect("blocked retry exhausted without an attempt"));
+            }
+            let remaining = budget - elapsed;
+            match attempt(remaining.min(self.inner.moderation_timeout)).await {
+                Ok(value) => return Ok(value),
+                Err(error) if error.is_admission_blocked() => {
+                    blocked = Some(error);
+                    tokio::time::sleep(remaining.min(sleep)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Boot-window wrapper for the reads and registry publish that gate
+    /// gateway startup. Within [`BOOT_WINDOW_MS`] of construction it re-attempts
+    /// ONLY provably pre-wire admission-Blocked refusals for up to
+    /// [`BOOT_ADMISSION_BUDGET_MS`]; a Blocked attempt never reached the wire,
+    /// so no intent is ever resent. Past the window, or on any other error, it
+    /// is the single bounded attempt every other caller gets.
+    async fn retry_blocked_at_boot<T, F, Fut>(&self, mut attempt: F) -> Result<T, DiscordError>
+    where
+        F: FnMut(Duration) -> Fut,
+        Fut: std::future::Future<Output = Result<T, DiscordError>>,
+    {
+        if tokio::time::Instant::now() >= self.inner.boot_until {
+            return attempt(self.inner.moderation_timeout).await;
+        }
+        let blocked = std::sync::atomic::AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let result = self
+            .retry_admission_blocked_within(
+                Duration::from_millis(BOOT_ADMISSION_BUDGET_MS),
+                Duration::from_millis(BOOT_BLOCKED_RETRY_SLEEP_MS),
+                |timeout| {
+                    let pending = attempt(timeout);
+                    let blocked = &blocked;
+                    async move {
+                        let outcome = pending.await;
+                        if matches!(&outcome, Err(error) if error.is_admission_blocked()) {
+                            blocked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        outcome
+                    }
+                },
+            )
+            .await;
+        let attempts = blocked.load(std::sync::atomic::Ordering::Relaxed);
+        if attempts > 0 {
+            // Fixed fields only: counts and a duration, never provider text.
+            tracing::warn!(
+                blocked_attempts = attempts,
+                waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                recovered = result.is_ok(),
+                "boot send admission was held; waited for the lane"
+            );
+        }
+        result
+    }
+
+    /// Bounded receipt-callback retry for governed-lane occupancy: re-attempts
+    /// ONLY admission-Blocked failures within the absolute receipt-relative
+    /// [`RECEIPT_ADMISSION_BUDGET_MS`] budget, leaving margin below Discord's
+    /// three-second acknowledgement window. A Blocked attempt never reached
+    /// the wire, so retrying it cannot double-ACK; every other error returns
+    /// immediately with no retry.
+    pub async fn answer_interaction_with_blocked_retry(
+        &self,
+        interaction_id: u64,
+        interaction_token: &str,
+        response: &twilight_model::http::interaction::InteractionResponse,
+    ) -> Result<(), DiscordError> {
+        self.retry_admission_blocked(|timeout| {
+            self.answer_interaction_with_timeout(
+                interaction_id,
+                interaction_token,
+                response,
+                timeout,
+            )
+        })
+        .await
     }
 
     /// Execute a router reply operation in the unpaced interaction lane.
@@ -2897,6 +3593,7 @@ impl ActionExecutor {
 
     /// Complete an acknowledged interaction by editing its original response.
     /// Like the initial callback, this bypasses the paced moderation lane.
+    /// One attempt: a lost reply must not repeat already-committed store effects.
     /// Single attempt with bounded errors: never repeat an accepted effect after
     /// an edit failure or expose the interaction token in a returned error.
     /// The original callback decides ephemerality; edits retain it.
@@ -2923,6 +3620,24 @@ impl ActionExecutor {
         mutation_receipt_id(&res.body)?;
         res.complete().await;
         Ok(())
+    }
+
+    /// Complete an acknowledged interaction with bounded contention tolerance:
+    /// re-attempts ONLY admission-Blocked failures within the absolute
+    /// [`RECEIPT_ADMISSION_BUDGET_MS`] budget. A Blocked attempt never reached
+    /// the wire, so retrying it cannot repeat an accepted edit; any accepted
+    /// or ambiguous outcome returns immediately with no retry.
+    pub async fn edit_interaction_response_with_blocked_retry(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), DiscordError> {
+        self.retry_admission_blocked(|_| async {
+            self.edit_interaction_response(application_id, interaction_token, content)
+                .await
+        })
+        .await
     }
 
     /// Turn one adjudicated [`ModerationExecution`] into its Discord effect
@@ -3080,13 +3795,25 @@ fn mutation_receipt_id(body: &[u8]) -> Result<String, DiscordError> {
     }
 }
 
+/// Definitive Discord rejections that prove no mutation happened, shared by
+/// every internal-action transport. 400/401/403/404/405 are the long-standing
+/// confirmed-rejection allowlist; 413 (payload too large), 415 (unsupported
+/// media type) and 422 (validation failed) are likewise terminal: Discord
+/// validates before applying the scheduled-event mutation, so none of them
+/// may retain the execution fence for reconciliation. 408, redirects, 409,
+/// 425 and 5xx stay uncertain. 429 is definitive separately (rate-limited).
+#[must_use]
+pub fn is_definitive_rejection(status: u16) -> bool {
+    matches!(status, 400 | 401 | 403 | 404 | 405 | 413 | 415 | 422)
+}
+
 /// Only documented no-effect rejections are retry-safe. An unexpected success,
 /// redirect, timeout status or other ambiguous response may follow a mutation.
 #[must_use]
 pub fn throw_for_status(res: &RawResponse) -> DiscordError {
     match res.status {
         429 => DiscordError::RateLimited,
-        400 | 401 | 403 | 404 | 405 => {
+        status if is_definitive_rejection(status) => {
             DiscordError::Rejected(format!("Discord refused the request with {}", res.status))
         }
         _ => DiscordError::Unavailable(format!("Discord returned {}", res.status)),
@@ -3240,6 +3967,18 @@ fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
                 guild_id,
                 with_user_count: query_param(query, "with_user_count").is_some_and(|v| v == "true"),
             }),
+            Some(rest) if rest.starts_with("scheduled-events/") && query.is_empty() => {
+                let scheduled_event_id = rest
+                    .strip_prefix("scheduled-events/")
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .filter(|id| *id != 0)
+                    .ok_or_else(err)?;
+                Ok(Route::GetGuildScheduledEvent {
+                    guild_id,
+                    scheduled_event_id,
+                    with_user_count: false,
+                })
+            }
             _ => Err(err()),
         };
     }
@@ -3336,12 +4075,41 @@ pub fn pace_delay_ms(last_at_ms: u64, interval_ms: u64, now_ms: u64) -> u64 {
     pace_wait_ms(last_at_ms, interval_ms, now_ms)
 }
 
+/// The shared executor is the production go-live `LiveSender`:
+/// `post_message` builds the exact no-ping body
+/// (`allowed_mentions: { parse: [] }`, pinned above) and makes a single
+/// attempt. Only an error that proves no effect (explicit rejection, 429,
+/// a local guard refusal, or the shared admission-lane refusal before any
+/// wire attempt) may release the durable claim; timeouts and transport
+/// failures are ambiguous and stay fenced. The impl lives here,
+/// with the type, because the trait is defined in `two-bot-core`.
+#[cfg(feature = "db")]
+impl two_bot_core::stream_live_store::LiveSender for ActionExecutor {
+    fn send_live<'a>(
+        &'a self,
+        channel_id: &'a str,
+        content: &'a str,
+    ) -> two_bot_core::stream_live_store::SendFuture<'a> {
+        use two_bot_core::stream_live_store::LiveSendError;
+        Box::pin(async move {
+            match self.post_message(channel_id, content, None).await {
+                Ok(message_id) => Ok(message_id),
+                Err(error) if error.is_admission_blocked() || error.proves_no_effect() => {
+                    Err(LiveSendError::ProvenNoSend)
+                }
+                Err(_) => Err(LiveSendError::Ambiguous),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use two_bot_core::send_admission::{
         AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, TokenKey,
     };
+    use two_bot_core::MAX_BACKFILL_RETRY_AFTER_MS;
 
     #[derive(Debug)]
     struct NeverSendAdmission(TokenKey);
@@ -3358,6 +4126,120 @@ mod tests {
 
     fn never_send_admission(token: &str) -> Arc<dyn SendAdmission> {
         Arc::new(NeverSendAdmission(TokenKey::for_bot_token(token).unwrap()))
+    }
+
+    #[test]
+    fn only_the_canonical_blocked_detail_is_retryable() {
+        assert!(
+            DiscordError::Unavailable(AdmissionError::Blocked.to_string()).is_admission_blocked()
+        );
+        for error in [
+            DiscordError::Unavailable("transport: connection reset".to_owned()),
+            DiscordError::Unavailable("Discord response body unavailable".to_owned()),
+            DiscordError::Unavailable("discord send admission is blocked ".to_owned()),
+            DiscordError::Timeout,
+            DiscordError::RateLimited,
+            DiscordError::Rejected("discord refused the request".to_owned()),
+        ] {
+            assert!(!error.is_admission_blocked(), "{error:?}");
+        }
+    }
+
+    fn boot_executor() -> ActionExecutor {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = "fixture-boot-wait-token";
+        ActionExecutor::with_admission(token.to_owned(), None, never_send_admission(token)).unwrap()
+    }
+
+    fn blocked() -> DiscordError {
+        DiscordError::Unavailable(AdmissionError::Blocked.to_string())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn boot_wait_outlasts_the_lane_lease_then_gives_up() {
+        let executor = boot_executor();
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let result: Result<(), DiscordError> = executor
+            .retry_blocked_at_boot(|_| {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(blocked()) }
+            })
+            .await;
+        assert!(result.unwrap_err().is_admission_blocked());
+        let waited = started.elapsed();
+        // Budget sits just above the 60 s lease so a dead holder always clears.
+        assert!(waited >= Duration::from_millis(BOOT_ADMISSION_BUDGET_MS));
+        assert!(waited < Duration::from_millis(BOOT_ADMISSION_BUDGET_MS + 1_000));
+        // `IN_FLIGHT_LEASE_MS` (60 s) lives behind the core `db` feature.
+        const { assert!(BOOT_ADMISSION_BUDGET_MS > 60_000) };
+        let attempts = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (200..=300).contains(&attempts),
+            "poll cadence stays near 4/s: {attempts}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn boot_wait_returns_at_once_on_any_other_error() {
+        let executor = boot_executor();
+        for error in [
+            DiscordError::Timeout,
+            DiscordError::RateLimited,
+            DiscordError::Rejected("discord refused the request with 403".to_owned()),
+            DiscordError::Unavailable("Discord returned 503".to_owned()),
+        ] {
+            let attempts = std::sync::atomic::AtomicU32::new(0);
+            let started = tokio::time::Instant::now();
+            let result: Result<(), DiscordError> = executor
+                .retry_blocked_at_boot(|_| {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let error = error.clone();
+                    async move { Err(error) }
+                })
+                .await;
+            assert_eq!(result.unwrap_err(), error);
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(started.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn boot_wait_ends_with_the_boot_window() {
+        let executor = boot_executor();
+        tokio::time::advance(Duration::from_millis(BOOT_WINDOW_MS + 1)).await;
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let result: Result<(), DiscordError> = executor
+            .retry_blocked_at_boot(|_| {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(blocked()) }
+            })
+            .await;
+        // Runtime callers keep the single bounded attempt.
+        assert!(result.unwrap_err().is_admission_blocked());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[test]
+    fn error_causes_are_fixed_tokens() {
+        assert_eq!(blocked().cause(), "admission_blocked");
+        assert_eq!(DiscordError::Timeout.cause(), "timeout");
+        assert_eq!(DiscordError::RateLimited.cause(), "rate_limited");
+        // Transport and provider text never reaches the token.
+        assert_eq!(
+            DiscordError::Unavailable("transport: secret-host.invalid".to_owned()).cause(),
+            "unavailable"
+        );
+        assert_eq!(
+            DiscordError::Rejected("private body".to_owned()).cause(),
+            "rejected"
+        );
+        assert_eq!(
+            DiscordError::Guard(GuardError::TokenInvalid).cause(),
+            "guard_token_invalid"
+        );
     }
 
     #[test]
@@ -3532,6 +4414,40 @@ mod tests {
     }
 
     #[test]
+    fn backfill_read_waits_out_long_header_unclamped() {
+        let long = RawResponse {
+            status: 429,
+            retry_after_header: Some("75".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        // Backfill reads honor the 75 s header in one wait; the kick/publish
+        // clamp stays pinned at 60 s for the same response.
+        assert_eq!(long.retry_after_wait_ms_unclamped(), 75_250);
+        assert_eq!(long.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
+        let short = RawResponse {
+            status: 429,
+            retry_after_header: Some("2".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        assert_eq!(short.retry_after_wait_ms_unclamped(), 2250);
+        // A huge header stops at the 5 min backfill ceiling instead of
+        // parking the caller, while the clamped wait is untouched.
+        let huge = RawResponse {
+            status: 429,
+            retry_after_header: Some("86400".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        assert_eq!(
+            huge.retry_after_wait_ms_unclamped(),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+        assert_eq!(huge.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
+    }
+
+    #[test]
     fn backoff_sequence_and_paced_steps() {
         assert_eq!(
             (0..5).map(backoff_ms).collect::<Vec<_>>(),
@@ -3577,13 +4493,16 @@ mod tests {
             throw_for_status(&down),
             DiscordError::Unavailable(_)
         ));
-        for status in [400, 401, 403, 404, 405] {
+        // Shared with the announcement transport: 404 proves absence and
+        // 413/415/422 prove Discord validated before mutating.
+        for status in [400, 401, 403, 404, 405, 413, 415, 422] {
             let no = RawResponse {
                 status,
                 retry_after_header: None,
                 body: Vec::new(),
                 completion: None,
             };
+            assert!(is_definitive_rejection(status), "{status}");
             assert!(throw_for_status(&no).is_safe_pre_mutation(), "{status}");
         }
         for status in [100, 200, 202, 204, 301, 302, 307, 408, 409, 425, 500, 503] {

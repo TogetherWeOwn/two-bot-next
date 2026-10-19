@@ -3,9 +3,23 @@
 ## Implementation and deployment boundary
 
 The container source integrates an opt-in private `POST /internal/actions`
-listener with the durable store, announcement executor, nonce-commit
-authentication capability and strict receiver configuration. It supports only
-`announcement.post`, regardless of the core action catalogue's broader defaults.
+listener with the durable store, announcement executor, event-read,
+event-mutation, settings, automations, moderation, membership and
+channel-moderation executors, nonce-commit authentication capability and strict
+receiver configuration. It supports `announcement.post`, the keyless `event.read`
+(behind `TWO_INTERNAL_ALLOW_EVENT_READ`), `event.upsert` and `event.cancel`
+(cancel behind `TWO_INTERNAL_ALLOW_EVENT_CANCEL`), `settings.get`/`settings.set`
+(behind `TWO_INTERNAL_ALLOW_SETTINGS`), the automations pair
+`automations.export` (keyless redacted read) / `automations.import` (claimed
+transactional import), the restrictive member verbs `moderation.ban`,
+`moderation.tempban`, `moderation.kick`, `moderation.warn` and
+`moderation.timeout`, the membership pair (`role.assign` through the
+allowlisted role-key map, `guild.add_member`
+behind its own allowlist flag with a transient OAuth token), and the
+channel-moderation verbs (`moderation.purge`, `moderation.slowmode`,
+`moderation.lockdown`, `moderation.unlock`), regardless of the core action
+catalogue's broader defaults. Every other verb stays refused by the per-effect
+fences.
 The public health/readiness/metrics router has no action route. A merged,
 deployed receiver is dark until the Operator enables it, and it is reachable
 only through the staging-only Worker ingress described in
@@ -23,7 +37,7 @@ Production has no ingress, route, variable or secret for this receiver.
 
 | Layer | Behavior |
 | --- | --- |
-| Gate | Worker var `INTERNAL_ACTIONS_INGRESS = "1"`, declared only under `[env.staging.vars]`, **and** the Operator's Worker secret `TWO_INTERNAL_ACTIONS` exactly `1`. Either one missing, or any other value, leaves the route absent: today's response, no container contact. `scripts/check-env-bindings.py` fails a top-level or production declaration and any `TWO_INTERNAL_*` var in `wrangler.toml`. |
+| Gate | Worker var `INTERNAL_ACTIONS_INGRESS = "1"`, declared only under `[env.staging.vars]`, **and** the Operator's Worker secret `TWO_INTERNAL_ACTIONS` exactly `1`. Either one missing, or any other value, leaves the route absent: today's response, no container contact. `wrangler/scripts/check-env-bindings.py` fails a top-level or production declaration and any `TWO_INTERNAL_*` var in `wrangler.toml`. |
 | Route | Exactly `POST /internal/actions`, no query string, no trailing slash. Everything else, including other methods, is today's behavior (404). |
 | Request bounds | `application/json` (optionally `; charset=utf-8`), no `Content-Encoding`, body 1 byte to 2 MiB (413 over, declared or streamed), body read within 5 s (408), whole request within 20 s (504). Per-IP token bucket (burst 20, 1/s) and 8 concurrent requests per isolate answer 429 before the container is touched. |
 | Headers | Only `X-TWO-Key-Id`, `X-TWO-Timestamp`, `X-TWO-Nonce`, `X-TWO-Signature` (required), `Idempotency-Key` and `Content-Type` reach the container, each a single printable token within the receiver's own length caps. `Authorization`, `Cookie`, `X-Forwarded-*` and any caller-supplied deployment header are dropped. The Worker stamps the deployment id itself. |
@@ -49,6 +63,7 @@ lines, and only while `TWO_INTERNAL_ACTIONS` is exactly `1`:
 | `TWO_INTERNAL_CALLERS` | Worker secret, e.g. `web-staging:website-staging` |
 | `TWO_INTERNAL_CONTAINER` | Worker constant `1`: the Worker sets it to mark the process as running inside the container network, where the wildcard bind is reachable only via `containerFetch` and the startup port check. That network is presumed private but unverified. The marker is a deployment claim, not a proof: the bot trusts it only because the Worker (not the Operator) sets it. A wildcard bind without exactly this marker is refused. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Worker secret, e.g. `smoke-throwaway:<channel snowflake in the TWO Staging guild>` |
+| `TWO_INTERNAL_ROLE_KEYS` | Worker secret, e.g. `member:<role snowflake in the TWO Staging guild>`; empty stages no role and every `role.assign` key refuses |
 | `TWO_INTERNAL_KEYS` | Worker secret `web-staging:<64 hex>`; never a var, never logged |
 
 Fixed receiver port: **8091** (health stays on `BOT_PORT` 8080, and the two may
@@ -65,14 +80,27 @@ with the `TWO_INTERNAL_CONTAINER` marker; other binds still pass
 Every Worker secret change publishes a new Worker version, and the ownership
 fence keeps a new version from serving until the Operator transfers ownership
 (see [persisted ownership control](runbook.md#persisted-ownership-control)).
-Stage the secrets with `wrangler versions secret put --env staging` (a version
+Stage the secrets with `wrangler versions secret put --env staging <KEY> --message <sha>` (a version
 that is not yet deployed), deploy that one version, then run the takeover once.
+Stamp with the live `/readyz` `build_revision` of staging; an unstamped secret-change version can
+never form a rollback receipt (see `docs/production-deploy.md`). Precheck first:
+`versions secret put` builds on the newest-created version, not necessarily the
+serving one — confirm the last block of `wrangler versions list --env staging`
+(the list prints oldest first, so the last block is the newest version)
+is the serving version (same id as `wrangler deployments status --env staging`),
+and if they differ redeploy the intended SHA through the workflow first (full rule
+in `docs/production-deploy.md`).
 
 1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
-2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values).
+2. Operator stages `TWO_INTERNAL_CALLERS`, `TWO_INTERNAL_CHANNEL_KEYS` and `TWO_INTERNAL_ROLE_KEYS` (plain values).
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
-4. Operator stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
-5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete`), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
+4. Operator applies migrations `0423` (settings CAS) and `0424` (event outcome) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
+5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete --env staging TWO_INTERNAL_ACTIONS --message <sha>`, same precheck and stamp as above), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
+
+Migration `0424` adds the nullable `internal_idempotency.outcome` column that
+event receipts read back. Roll back in this order: disable the receiver (step 5)
+and deploy the previous binary, then drop the column. Dropping it while this
+binary runs fails every finish and every success replay, not only event receipts.
 
 TOG-16851 proved a loopback-only receiver never becomes healthy: the Containers
 port check and `containerFetch` cannot reach it, so the container waited on 8091
@@ -125,8 +153,9 @@ An enabled receiver requires all of these settings, without defaults:
 | `TWO_INTERNAL_KEYS` | Existing comma-separated `key-id:secret` signing specification; each secret is at least 32 bytes. At most 64 keys, with unique IDs and distinct secrets. |
 | `TWO_INTERNAL_CALLERS` | Comma-separated `key-id:caller` mappings. Exactly one entry for each signing key, no unknown entries. The caller is a stable logical identity, not a key-rotation version. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Explicit nonempty comma-separated channel-key/Discord-ID map. Names are unique; IDs are canonical, nonzero, u64-representable snowflakes. |
+| `TWO_INTERNAL_ROLE_KEYS` | Optional comma-separated role-key/Discord-ID map, empty by default. Names are unique; IDs are canonical, nonzero, u64-representable snowflakes. An empty map refuses every `role.assign` key; a malformed entry is a boot error. |
 
-Key IDs, caller names and channel-key names are 1–128 ASCII alphanumeric,
+Key IDs, caller names, channel-key names and role-key names are 1–128 ASCII alphanumeric,
 period, underscore or hyphen characters. Multiple rotating keys may identify the
 same logical caller, but every key ID must have a distinct signing secret, even
 for that same caller. The shared parser refuses secret aliases: the key ID
@@ -165,11 +194,14 @@ Rejections use bounded closed scalar telemetry with periodic/shutdown flushes,
 never raw paths, bodies, signatures, secrets or unknown caller labels.
 
 After authentication, durable nonce burn and per-key admission, the receiver
-validates the announcement and original `Idempotency-Key`, then atomically
-claims its intent and audit record. Only a committed `Claimed` result permits
-an effect. Replay returns the stored terminal response; mismatched payloads,
-in-flight or reconciliation-required intents never send. The stable caller
-mapping preserves this ownership across distinct-key rotation and restart.
+validates the announcement or the event mutation (`event_key`, and the full
+event input plus staging-guild key resolution for upserts) and the original
+`Idempotency-Key`, then atomically claims its intent and audit record. Only a
+committed `Claimed` result permits an effect. Replay returns the stored
+terminal response; mismatched payloads, in-flight or reconciliation-required
+intents never send. The stable caller mapping preserves this ownership across
+distinct-key rotation and restart. Upserts register their key only after
+Discord confirms; cancels retain the mapping.
 
 Runtime constructs the single-attempt announcement adapter with
 `PgSendAdmission` over the same database/token authority as other governed
@@ -181,8 +213,40 @@ finalization retain durable ownership and require reconciliation. Success is
 returned only after the receipt/audit transaction commits. See
 [the executor contract](internal-action-executor.md#single-attempt-and-safe-results).
 
+A local admission refusal (the guard, or a token lane held by another send)
+proves nothing was sent, so the event claim is released and the same key may
+retry, unless another intent has mapped the key in the meantime; that retry is
+refused as a version conflict and needs a new key. Event reads and mutations share
+one process-wide gate, so a mutation that has registered its key is visible to the
+next read or mutation for that key. A request that cannot enter the gate within 8
+seconds is refused `in_progress` before any claim. A claimed mutation runs to its
+receipt in its own task, even if the client has timed out. A create whose Discord
+call times out, gets a 5xx or an unreadable reply, or whose key mapping or mirror
+write fails, can leave a Discord event with no key mapping; a create under a new
+Idempotency-Key for that key would then make a second event. The same can happen
+if the process stops mid-create. Callers must not re-submit a
+`needs_reconciliation` operation under a new key: reconcile the Discord event by
+hand first. An in-flight intent whose owner has stopped answers `in_progress` to its own key
+until its claim goes stale, then `needs_reconciliation`; a live owner can still
+finish after that. A panic after a claim answers `needs_reconciliation`. A 504 on a
+mutation is an unknown outcome that may still complete: retry the same key only.
+A claimed mutation holds the gate until it finishes, so a slow database can keep
+queued requests waiting for their 8 seconds. The events poller writes the mirror
+outside the gate, but both writers stamp `updated_at` with the same UTC-millis
+clock and only overwrite rows at or below their own `observed_at`: a snapshot
+taken before a mutation leaves that mutation's newer mirror row in place, and a
+stale mutation write cannot overwrite a newer snapshot row; key mappings and
+receipts are unaffected. Operators reconcile unknown event intents with the
+inspection-first, explicitly confirmed `two-bot reconcile-event` CLI: list the
+fenced intents, verify the Discord event by hand, then resolve the exact intent
+as created/updated/cancelled (healing the key mapping for upserts) or no-effect.
+
 The website-compatible envelopes contain `ok`, `request_id`, and either
-`result.message_id` or `error.{code,message,retryable}`. Durable replay adds
+`result.message_id` (announcements), `result.{outcome,event_id}` (event
+upsert/cancel, with `outcome` replayed from the stored receipt, never
+re-derived), `result.outcome` (membership: `assigned`/`already_held`,
+`added`/`already_member`) or `error.{code,message,retryable}`. Durable replay
+adds
 `Idempotent-Replay: true`; inbound bucket refusal carries `Retry-After`.
 Messages are fixed/redacted and all envelopes use `Cache-Control: no-store`.
 
@@ -201,8 +265,14 @@ Receiver tests use a module-private injected effect and guarded, migrated
 `TestDatabase` instances. They cover protocol caps and body deadlines, request
 capacity, redacted authentication failures, nonce-before-parse ordering,
 concurrent/restarted/key-rotated replay, byte mismatch, unsupported actions,
+membership happy-path/replay/refusal (allowlisted role assignment, OAuth-backed
+joins, redacted unknown-key/malformed refusals, dark add-member flag),
 cancellation/stale ownership, unknown/no-effect outcomes, unavailable stores,
-failed receipt finalization and listener supervision. Nonces are generated
+failed receipt finalization, event verb flags, malformed event bodies (including a
+101-character location), concurrent creates for one key, a gate-wait refusal before
+any claim for a mutation and for a read, a mutation completing its receipt after its
+client is dropped, a mirror failure reported by the mutation path, admission-refusal
+release for creates and cancels, and listener supervision. Nonces are generated
 fresh for each attempt; the nonce-replay test intentionally reuses one generated
 value. They do not send live Discord actions.
 

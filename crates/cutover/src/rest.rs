@@ -13,6 +13,7 @@
 //! the analogue of legacy `DISCORD_API_BASE`): verification runs point the
 //! tools at a local mock instead of Discord.
 
+use sqlx::postgres::PgConnectOptions;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use twilight_model::guild::invite::Invite;
 use twilight_model::guild::{Guild, Member};
 use twilight_model::id::marker::{ChannelMarker, GuildMarker, MessageMarker, UserMarker};
 use twilight_model::id::Id;
+use two_bot_core::database_tls::{self, TlsPolicy};
 use two_bot_core::send_admission::{PgSendAdmission, SendAdmission};
 use two_bot_discord::executor::HyperTransport;
 
@@ -61,6 +63,39 @@ pub enum DeleteOutcome {
     Deleted,
     /// 404: the channel was already gone; nothing was deleted.
     AlreadyGone,
+}
+
+/// Send-admission pool shape for the operator tools: max 2 + 15 s statement
+/// timeout with a 10 s acquire timeout (website-jobs admission parity,
+/// threat-model F6).
+const ADMISSION_POOL_MAX: u32 = 2;
+const ADMISSION_STATEMENT_TIMEOUT_MS: u64 = 15_000;
+const ADMISSION_ACQUIRE_TIMEOUT_SECS: u64 = 10;
+
+/// Read the one TLS policy setting; an unset value is `Required`.
+fn tls_policy_from_env() -> Result<TlsPolicy, RestError> {
+    let value = std::env::var_os(database_tls::POLICY_SETTING);
+    // A non-UTF-8 value parses as "" and is refused like any unknown value.
+    TlsPolicy::from_setting(value.as_ref().map(|v| v.to_str().unwrap_or("")))
+        .map_err(|_| RestError::Wire("admission authority unavailable".to_owned()))
+}
+
+/// Shared fenced options builder: validate before SQLx can WARN-log query
+/// values, enforce the TLS policy, then apply the effective mode. The
+/// statement timeout rides the connection options. Failures are fixed
+/// strings; nothing echoes the URL, host or credential.
+fn admission_connect_options(url: &str, tls: TlsPolicy) -> Result<PgConnectOptions, &'static str> {
+    two_bot_core::database_url::validate(url)?;
+    // Threat-model F6: refuse plaintext/unverified modes and the wrong host
+    // class before SQLx parses the URL (see `docs/database-tls.md`).
+    database_tls::enforce(url, tls)?;
+    let options = two_bot_core::database_url::connect_options(url)
+        .map_err(|_| "admission authority unavailable")?;
+    let options = database_tls::apply(options, tls);
+    Ok(options.options([(
+        "statement_timeout",
+        format!("{ADMISSION_STATEMENT_TIMEOUT_MS}ms"),
+    )]))
 }
 
 /// Paced twilight client with legacy retry semantics.
@@ -105,14 +140,44 @@ impl RestClient {
 
     /// Administrative data targets may differ; admission must use the runtime's
     /// TWO_DATABASE_URL authority, never the backfill/capture target database.
+    /// The pool is fenced by the `TWO_DATABASE_TLS` policy (unset means
+    /// `required`): refusals read as the same redacted authority error, with
+    /// no oracle for which fence tripped and no URL part in the message.
     pub async fn from_env(token: String, proxy_url: Option<String>) -> Result<Self, RestError> {
         let url = std::env::var("TWO_DATABASE_URL").map_err(|_| {
             RestError::Wire("TWO_DATABASE_URL admission authority required".to_owned())
         })?;
-        let options = two_bot_core::database_url::connect_options(&url)
+        let tls = tls_policy_from_env()?;
+        let options = admission_connect_options(&url, tls)
             .map_err(|_| RestError::Wire("admission authority unavailable".to_owned()))?;
+        Self::from_options(token, proxy_url, options).await
+    }
+
+    /// [`Self::from_env`] with an explicit database URL and TLS policy (tests
+    /// pass `LocalOnly`). Refusals are fixed strings with no URL, host or
+    /// credential part, raised before SQLx parses the URL or opens a socket.
+    /// Eager: the pool connects before the gate binds, so a dead authority
+    /// fails here rather than on the first send.
+    pub async fn from_url_with_tls(
+        token: String,
+        proxy_url: Option<String>,
+        url: &str,
+        tls: TlsPolicy,
+    ) -> Result<Self, RestError> {
+        let options =
+            admission_connect_options(url, tls).map_err(|e| RestError::Wire(e.to_owned()))?;
+        Self::from_options(token, proxy_url, options).await
+    }
+
+    /// Eager pool connect plus gate bind for the fenced options above.
+    async fn from_options(
+        token: String,
+        proxy_url: Option<String>,
+        options: PgConnectOptions,
+    ) -> Result<Self, RestError> {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(ADMISSION_POOL_MAX)
+            .acquire_timeout(Duration::from_secs(ADMISSION_ACQUIRE_TIMEOUT_SECS))
             .connect_with(options)
             .await
             .map_err(|_| RestError::Wire("admission authority unavailable".to_owned()))?;
@@ -187,11 +252,15 @@ impl RestClient {
             self.pace().await;
             let request = make()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let (res, _) =
-                tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
-                    .await
-                    .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
-                    .map_err(RestError::Wire)?;
+            // The 30 s page budget is the transport's absolute deadline —
+            // durable admission, headers and body share it — so a stalled GET
+            // times out where its permit is in scope and releases the lane.
+            // No outer timeout may wrap this call (it would orphan the lane).
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (res, _) = transport
+                .send_request(&request, Some(deadline))
+                .await
+                .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(ListPage::Read(serde_json::from_slice(&res.body)?)),
                 403 | 404 => return Ok(ListPage::Interrupted(ScanCompletion::Unreadable)),
@@ -222,11 +291,12 @@ impl RestClient {
             self.pace().await;
             let request = make()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let (res, _) =
-                tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
-                    .await
-                    .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
-                    .map_err(RestError::Wire)?;
+            // Same absolute-deadline shape as the page scan above.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (res, _) = transport
+                .send_request(&request, Some(deadline))
+                .await
+                .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(Some(serde_json::from_slice(&res.body)?)),
                 403 | 404 => return Ok(None),
@@ -305,6 +375,40 @@ impl RestClient {
         Ok(Some(out))
     }
 
+    /// One member-list page as raw JSON for the member-catch-up slice
+    /// (TOG-22941): `limit` is the caller's 1-1000 page size, `after` is the
+    /// resume cursor carried verbatim onto the wire. Rides the same governed
+    /// transport as every page (pacing, retries, `requests()` counting), so
+    /// the catch-up proof that every request passed through the rate-limit
+    /// client holds. An unreadable page (403/404) or a 5xx that is still
+    /// failing after the last retry is an error, never an empty page: only
+    /// a real `200 []` ends a walk, so a Discord outage mid-catch-up cannot
+    /// read as a finished walk. Strict traversal callers keep using
+    /// [`Self::fetch_all_members`].
+    pub async fn fetch_members_page_json(
+        &self,
+        guild_id: Id<GuildMarker>,
+        limit: u16,
+        after: Option<Id<UserMarker>>,
+    ) -> Result<Vec<serde_json::Value>, RestError> {
+        let page: ListPage<serde_json::Value> = self
+            .exec_list(|| {
+                let client = &self.inner.client;
+                let mut req = client.guild_members(guild_id).limit(limit);
+                if let Some(cursor) = after {
+                    req = req.after(cursor);
+                }
+                req.try_into_request()
+            })
+            .await?;
+        match page {
+            ListPage::Read(batch) => Ok(batch),
+            ListPage::Interrupted(reason) => Err(RestError::Wire(format!(
+                "member list page unreadable: {reason}"
+            ))),
+        }
+    }
+
     /// Guild invites (attribution baseline / capture window counters).
     pub async fn guild_invites(
         &self,
@@ -357,11 +461,13 @@ impl RestClient {
                 .reason(reason)
                 .try_into_request()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let (res, _) =
-                tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
-                    .await
-                    .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
-                    .map_err(RestError::Wire)?;
+            // Absolute deadline covers admission, headers and body. A DELETE
+            // timeout keeps the permit held (uncertain mutation) by design.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (res, _) = transport
+                .send_request(&request, Some(deadline))
+                .await
+                .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(DeleteOutcome::Deleted),
                 404 => return Ok(DeleteOutcome::AlreadyGone),
@@ -1149,6 +1255,271 @@ mod tests {
             mock.befores().len(),
             2,
             "one discovery page plus one compat call"
+        );
+        mock.shutdown();
+    }
+
+    /// A page whose headers never arrive must fail at the 30 s page budget on
+    /// every transport call site (`exec_list`, `exec_one`, `delete_channel`):
+    /// the absolute deadline lives in the transport, so reverting any of
+    /// those sites to `None` parks the caller instead of returning. The clock
+    /// is paused so the three budgets elapse without wall time; the stall can
+    /// never win.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_reads_time_out_at_page_budget() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use twilight_model::id::{
+            marker::{ChannelMarker, GuildMarker},
+            Id,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stall");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let accepted = Arc::new(AtomicU32::new(0));
+        let handle = {
+            let accepted = Arc::clone(&accepted);
+            tokio::spawn(async move {
+                // One stalled connection per call site below. Each connection
+                // is stalled on its own task so the accept loop stays
+                // responsive: a sequential sleep past the budget would hold
+                // the loop while the paused clock fires the caller's timeout,
+                // and later call sites would time out before being accepted.
+                for _ in 0..3 {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut buf = Vec::with_capacity(1024);
+                        let mut chunk = [0u8; 1024];
+                        while let Ok(n) = stream.read(&mut chunk).await {
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_secs(600)).await;
+                    });
+                }
+            })
+        };
+        let rest = client_for(&origin);
+        let result = tokio::time::timeout(
+            Duration::from_secs(300),
+            rest.fetch_all_members(Id::<GuildMarker>::new(2222)),
+        )
+        .await
+        .expect("a stalled member page must not outlive the page budget");
+        assert!(result.is_err(), "a stalled page is an error: {result:?}");
+        let result = tokio::time::timeout(
+            Duration::from_secs(300),
+            rest.guild(Id::<GuildMarker>::new(2222)),
+        )
+        .await
+        .expect("a stalled guild read must not outlive the page budget");
+        assert!(result.is_err(), "a stalled read is an error: {result:?}");
+        let result = tokio::time::timeout(
+            Duration::from_secs(300),
+            rest.delete_channel(Id::<ChannelMarker>::new(3333), "stall test"),
+        )
+        .await
+        .expect("a stalled delete must not outlive the page budget");
+        assert!(result.is_err(), "a stalled delete is an error: {result:?}");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            3,
+            "one stalled wire request per call site"
+        );
+        handle.abort();
+    }
+
+    /// Threat-model F6 refusal pins for the operator-tool admission pool: a
+    /// remote `sslmode=disable` URL (and the other refusal cases) fails with
+    /// a fixed string before SQLx parses the URL or opens a socket, with no
+    /// URL part in the error. Hermetic: every case is refused, so no
+    /// connection is attempted and no database is needed. The log-silence half
+    /// of the proof lives in
+    /// `crates/cutover/tests/admission_configuration.rs`, where the capture
+    /// helper is already wired.
+    #[tokio::test]
+    async fn admission_tls_fence_refuses_plaintext_and_wrong_hosts() {
+        use two_bot_core::database_tls::TlsPolicy;
+        let cases = [
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+                TlsPolicy::Required,
+                "database sslmode does not require TLS",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=prefer",
+                TlsPolicy::Required,
+                "database sslmode does not require TLS",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db",
+                TlsPolicy::Required,
+                "database URL must set sslmode under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=verify-full",
+                TlsPolicy::Required,
+                "local database host is refused under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=verify-full",
+                TlsPolicy::LocalOnly,
+                "remote database host is refused under the local-only TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=fixture-mode",
+                TlsPolicy::LocalOnly,
+                "unsupported database sslmode",
+            ),
+        ];
+        for (url, policy, expected) in cases {
+            let error = admission_connect_options(url, policy).unwrap_err();
+            assert_eq!(error, expected, "{url}");
+            assert!(!error.contains("fixture"), "TLS refusal echoed the URL");
+            // Same through the client constructor: refused before the pool
+            // opens, so no socket and no database is needed.
+            let error =
+                RestClient::from_url_with_tls("fixture-token".to_owned(), None, url, policy)
+                    .await
+                    .unwrap_err();
+            let shown = error.to_string();
+            assert_eq!(shown, format!("discord send refused: {expected}"));
+            assert!(!shown.contains("fixture"), "TLS refusal echoed the URL");
+            let debug = format!("{error:?}");
+            assert!(!debug.contains("fixture"), "TLS refusal echoed the URL");
+        }
+    }
+
+    /// Threat-model F6 happy path: a fenced fixture builds fenced options
+    /// (effective SQLx mode applied) and a lazy pool with no socket, so no
+    /// database is needed.
+    #[tokio::test]
+    async fn admission_tls_fence_permits_fenced_fixture() {
+        use two_bot_core::database_tls::TlsPolicy;
+        // `LocalOnly` loopback keeps the URL mode as written.
+        let options = admission_connect_options(
+            "postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable",
+            TlsPolicy::LocalOnly,
+        )
+        .unwrap();
+        assert!(matches!(
+            options.get_ssl_mode(),
+            sqlx::postgres::PgSslMode::Disable
+        ));
+        // `Required` upgrades a remote `require` URL to `verify-full`.
+        let options = admission_connect_options(
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=require",
+            TlsPolicy::Required,
+        )
+        .unwrap();
+        assert!(matches!(
+            options.get_ssl_mode(),
+            sqlx::postgres::PgSslMode::VerifyFull
+        ));
+        // A lazy pool from fenced options opens no socket.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(options);
+        assert_eq!(pool.size(), 0);
+        pool.close().await;
+    }
+
+    /// Loopback member list serving one scripted HTTP status per request
+    /// (consumed in order; repeats the last once the script is spent), so
+    /// failure-path tests never touch Discord.
+    struct StatusMock {
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl StatusMock {
+        async fn start(mut script: Vec<u16>) -> (Self, String) {
+            if script.is_empty() {
+                script.push(200);
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("mock listen");
+            let origin = format!("http://{}", listener.local_addr().expect("addr"));
+            let handle = tokio::spawn(async move {
+                let mut script = script.into_iter();
+                let mut last = 200u16;
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = Vec::with_capacity(1024);
+                    let header_end = loop {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos;
+                        }
+                        if buf.len() > 64 * 1024 {
+                            break usize::MAX;
+                        }
+                        match stream.read_buf(&mut buf).await {
+                            Ok(0) => break usize::MAX,
+                            Ok(_) => continue,
+                            Err(_) => break usize::MAX,
+                        }
+                    };
+                    if header_end == usize::MAX {
+                        continue;
+                    }
+                    if let Some(next) = script.next() {
+                        last = next;
+                    }
+                    let (reason, body) = match last {
+                        200 => ("OK", "[]".to_owned()),
+                        403 => ("Forbidden", r#"{"message": "403"}"#.to_owned()),
+                        404 => ("Not Found", r#"{"message": "404"}"#.to_owned()),
+                        _ => ("Service Unavailable", r#"{"retry_after": 1}"#.to_owned()),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {last} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
+                }
+            });
+            (Self { handle }, origin)
+        }
+
+        fn shutdown(self) {
+            self.handle.abort();
+        }
+    }
+
+    /// Paperclip Review #927: a failed member page is an error, never an
+    /// empty page. A 403 refuses at once; a 5xx that is still failing after
+    /// the last retry surfaces as retry-exhausted. Either way the caller —
+    /// and the catch-up walker — must not read it as end of list.
+    #[tokio::test]
+    async fn failed_member_pages_are_errors_not_empty_pages() {
+        let (mock, origin) = StatusMock::start(vec![403]).await;
+        let rest = client_for(&origin);
+        let err = rest
+            .fetch_members_page_json(Id::new(2222), 1000, None)
+            .await
+            .expect_err("a 403 member page is an error, not end of list");
+        assert!(
+            err.to_string().contains("unreadable"),
+            "unexpected error: {err:?}"
+        );
+        mock.shutdown();
+
+        // Five 503s (initial attempt plus four retries) exhaust the page
+        // budget: the sixth scripted status is never reached.
+        let (mock, origin) = StatusMock::start(vec![503, 503, 503, 503, 503, 200]).await;
+        let rest = client_for(&origin);
+        let err = rest
+            .fetch_members_page_json(Id::new(2222), 1000, None)
+            .await
+            .expect_err("an exhausted 5xx member page is an error, not end of list");
+        assert!(
+            err.to_string().contains("unreadable"),
+            "unexpected error: {err:?}"
         );
         mock.shutdown();
     }

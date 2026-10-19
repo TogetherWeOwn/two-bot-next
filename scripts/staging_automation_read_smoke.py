@@ -25,6 +25,13 @@ shell history), and it is never printed, logged, or written to evidence.
 A 401 refuses with a fixed message: rotation is an operator decision, and no
 substitute credential is ever tried.
 
+Body-cap refusal contract: the transport reads at most BODY_CAP+1 bytes so a
+hidden suffix is detected. Any body longer than BODY_CAP (64 KiB) is refused
+before JSON parsing with the fixed message "interactions endpoint answered
+over the body cap"; exact-cap valid input passes, and the extra byte never
+reaches a successful JSON path. Refusals never echo the body, headers, URL or
+parse exceptions.
+
 Guild fence (fail-closed, before any request): the run proceeds only when the
 guild id is exactly the TWO Staging guild. The live guild, any other guild,
 or a missing id refuses with exit 2 and no request is sent.
@@ -93,6 +100,20 @@ def require_token(token):
     return token
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Authenticated reads never follow a redirect, even to the same origin.
+
+    Raising here stops urllib before it builds the second request, so the bot
+    token is never replayed; the Location and body are never read.
+    """
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        fp.close()
+        raise SmokeError("refusing: authenticated read answered a redirect (not followed)")
+
+    http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_301
+
+
 def make_fetch(token):
     """Build the only network function; the token never leaves this closure."""
 
@@ -105,7 +126,8 @@ def make_fetch(token):
                      "Cache-Control": "no-cache"},
         )
         try:
-            with urllib.request.build_opener().open(request, timeout=TIMEOUT_SECONDS) as response:
+            with urllib.request.build_opener(_RefuseRedirect).open(
+                    request, timeout=TIMEOUT_SECONDS) as response:
                 return response.status, response.read(BODY_CAP + 1)
         except urllib.error.HTTPError as error:
             return error.code, error.read(BODY_CAP + 1)
@@ -127,9 +149,11 @@ def get_json(fetch_fn, url):
         raise SmokeError("rate limited (429); rerun later")
     if status != 200:
         raise SmokeError(f"interactions endpoint answered {status}, expected 200")
+    if len(body) > BODY_CAP:
+        raise SmokeError("interactions endpoint answered over the body cap")
     try:
         value = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         raise SmokeError("interactions endpoint answered 200 with invalid JSON")
     return value
 

@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Full-history gitleaks scan with a base-branch policy on pull requests.
+# Full-history gitleaks scan with a base-branch policy on pull requests and
+# merge-queue commits.
 #
-# On `pull_request` the checkout is the PR merge ref, so the root
-# `.gitleaks.toml`, the root `.gitleaksignore` and any `gitleaks:allow` comment
-# are whatever the PR author wrote. Left alone, a PR could silence the required
-# `gitleaks` check for its own leak by adding an allowlist. This wrapper makes a
-# PR run honour only the policy that has already merged:
+# On `pull_request` the checkout is the PR merge ref, and on `merge_group` it
+# is the unmerged queue commit, so the root `.gitleaks.toml`, the root
+# `.gitleaksignore` and any inline allow comment are whatever the PR author
+# wrote. Left alone, a PR could silence the required `gitleaks` check
+# for its own leak by adding an allowlist. This wrapper makes a PR or queue
+# run honour only the policy that has already merged:
 #   * `--config` points at the base branch's `.gitleaks.toml` (or the stock
 #     rules when the base branch has none);
 #   * `--gitleaks-ignore-path` points at the base branch's `.gitleaksignore`
@@ -23,11 +25,15 @@
 #
 # Inputs (environment):
 #   GITLEAKS_BIN  path to the verified gitleaks binary (required)
-#   EVENT_NAME    github.event_name; the base-branch policy applies to `pull_request`
-#   BASE_REF      github.base_ref; required when EVENT_NAME is `pull_request`
+#   EVENT_NAME    github.event_name; the base-branch policy applies to
+#                 `pull_request` and `merge_group`
+#   BASE_REF      github.base_ref, or on `merge_group`
+#                 github.event.merge_group.base_ref (a full ref such as
+#                 `refs/heads/main`; the prefix is stripped here). Required
+#                 when EVENT_NAME is `pull_request` or `merge_group`.
 #   RUNNER_TEMP   scratch directory (falls back to TMPDIR, then /tmp)
-# Run from the repository root. In a PR run it overwrites the working-tree
-# `.gitleaksignore`; run it only in a disposable checkout.
+# Run from the repository root. In a PR or queue run it overwrites the
+# working-tree `.gitleaksignore`; run it only in a disposable checkout.
 set -euo pipefail
 
 : "${GITLEAKS_BIN:?GITLEAKS_BIN must point at the verified gitleaks binary}"
@@ -35,11 +41,13 @@ set -euo pipefail
 # --log-opts=HEAD: scan only history reachable from HEAD, not every fetched branch.
 args=(git . --redact --verbose --exit-code 1 --log-opts=HEAD --ignore-gitleaks-allow)
 
-if [[ "${EVENT_NAME:-}" == "pull_request" ]]; then
-  : "${BASE_REF:?BASE_REF is required for pull_request runs}"
-  base="refs/remotes/origin/${BASE_REF}"
+if [[ "${EVENT_NAME:-}" == "pull_request" || "${EVENT_NAME:-}" == "merge_group" ]]; then
+  : "${BASE_REF:?BASE_REF is required for pull_request and merge_group runs}"
+  # merge_group.base_ref arrives as a full ref (refs/heads/main); strip it.
+  base_ref="${BASE_REF#refs/heads/}"
+  base="refs/remotes/origin/${base_ref}"
   if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
-    echo "::error::base branch ${BASE_REF} is not fetched; the PR scan cannot load its policy" >&2
+    echo "::error::base branch ${base_ref} is not fetched; the ${EVENT_NAME} scan cannot load its policy" >&2
     exit 2
   fi
 
@@ -65,7 +73,7 @@ if [[ "${EVENT_NAME:-}" == "pull_request" ]]; then
     rm -f .gitleaksignore
   fi
 
-  echo "PR scan policy: ${base} .gitleaks.toml ($(sha256sum "${config}" | cut -c1-12))," \
+  echo "${EVENT_NAME} scan policy: ${base} .gitleaks.toml ($(sha256sum "${config}" | cut -c1-12))," \
     ".gitleaksignore ($(grep -c . "${ignore}" || true) non-empty lines)"
   args+=(--config "${config}" --gitleaks-ignore-path "${ignore}")
 fi

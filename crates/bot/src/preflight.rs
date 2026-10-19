@@ -14,6 +14,7 @@ use twilight_http::{
 };
 use twilight_model::{
     channel::{Channel, ChannelType},
+    gateway::connection_info::BotConnectionInfo,
     guild::{invite::Invite, Member, Permissions, Role},
     id::Id,
     oauth::{Application, ApplicationFlags},
@@ -23,7 +24,7 @@ use two_bot_core::onboarding::{
     game_picker_allowed, level_role_writes_allowed, OnboardingGates, GAME_PICKS, PLATFORM_PICKS,
     TWO_GUILD_ID,
 };
-use two_bot_core::self_roles::parse_self_role_panels;
+use two_bot_core::self_roles::{parse_self_role_dry_run, parse_self_role_panels};
 use two_bot_core::send_admission::PgSendAdmission;
 use two_bot_discord::channel_access::{guild_permissions, resolve_channel_access};
 use two_bot_discord::executor::HyperTransport;
@@ -39,6 +40,14 @@ pub const USAGE: &str = "\
       Exit 0: PASS/WARN only; 1: FAIL; 2: invalid CLI/configuration.
       See docs/preflight.md for coverage and interpretation.
 ";
+
+// A cutover spends at least one session start on the forced IDENTIFY, plus
+// more on reconnect retries if the first connect fails. Discord's
+// session-start budget is a hard daily limit, so preflight fails closed with
+// margin above a single start and warns earlier at 10% of Discord's usual
+// 1000-start daily budget.
+const SESSION_START_FAIL_FLOOR: u32 = 10;
+const SESSION_START_WARN_THRESHOLD: u32 = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -196,7 +205,8 @@ impl Targets {
         };
         let guild_id =
             snowflake(&guild).map_err(|_| "GUILD_ID must be a nonzero Discord snowflake")?;
-        let gates = OnboardingGates::from_map(vars).map_err(|_| "invalid TWO_ONBOARDING_MODE")?;
+        let gates = OnboardingGates::from_map(vars)
+            .map_err(|_| "invalid TWO_ONBOARDING_MODE or TWO_ONBOARDING_DRY_RUN")?;
         let role_writes = level_role_writes_allowed(gates.mode) && !gates.dry_run;
         let ticket_keys = [
             "DISCORD_TICKET_CATEGORY_ID",
@@ -278,6 +288,7 @@ impl Targets {
                 snowflake(staff_raw.trim()).map_err(|_| "invalid configured staff role ID")?;
             targets.roles.insert(staff_id, "ticket staff");
         }
+        parse_self_role_dry_run(vars).map_err(|_| "invalid TWO_SELF_ROLE_DRY_RUN")?;
         let raw = env("TWO_SELF_ROLE_PANELS");
         if !raw.trim().is_empty() {
             let panels = parse_self_role_panels(&raw)
@@ -342,18 +353,18 @@ async fn read_discord<T: serde::de::DeserializeOwned>(
 ) -> Result<T, Check> {
     let request =
         request.map_err(|_| Check::fail(check, "Discord request invalid (checks stopped)"))?;
-    let (response, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        transport.send_request(&request),
-    )
-    .await
-    .map_err(|_| Check::fail(check, "Discord request timed out (lane held)"))?
-    .map_err(|_| {
-        Check::fail(
-            check,
-            "Discord send unavailable or admission held (checks stopped)",
-        )
-    })?;
+    // Absolute deadline covers admission, headers and body, so a stalled GET
+    // releases its lane where the permit is in scope instead of orphaning it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (response, _) = transport
+        .send_request(&request, Some(deadline))
+        .await
+        .map_err(|_| {
+            Check::fail(
+                check,
+                "Discord request timed out, send unavailable or admission held (checks stopped)",
+            )
+        })?;
     if !(200..=299).contains(&response.status) {
         return Err(Check::fail(
             check,
@@ -362,6 +373,54 @@ async fn read_discord<T: serde::de::DeserializeOwned>(
     }
     serde_json::from_slice(&response.body)
         .map_err(|_| Check::fail(check, "invalid Discord response"))
+}
+
+/// Privileged-intent rows: a requested intent the portal has not granted
+/// fails (Discord would close the gateway with 4014); a granted intent the
+/// runtime does not request warns.
+fn intent_checks(intents: Intents, flags: ApplicationFlags) -> Vec<(Status, &'static str, String)> {
+    // Source: https://docs.discord.com/developers/resources/application#application-object-application-flags
+    [
+        (
+            "Guild Members intent",
+            intents.contains(Intents::GUILD_MEMBERS),
+            flags.intersects(
+                ApplicationFlags::GATEWAY_GUILD_MEMBERS
+                    | ApplicationFlags::GATEWAY_GUILD_MEMBERS_LIMITED,
+            ),
+        ),
+        (
+            "Message Content intent",
+            intents.contains(Intents::MESSAGE_CONTENT),
+            flags.intersects(
+                ApplicationFlags::GATEWAY_MESSAGE_CONTENT
+                    | ApplicationFlags::GATEWAY_MESSAGE_CONTENT_LIMITED,
+            ),
+        ),
+        (
+            "Presence intent",
+            intents.contains(Intents::GUILD_PRESENCES),
+            flags.intersects(
+                ApplicationFlags::GATEWAY_PRESENCE | ApplicationFlags::GATEWAY_PRESENCE_LIMITED,
+            ),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, requested, enabled)| {
+        let status = if requested && !enabled {
+            Status::Fail
+        } else if !requested && enabled {
+            Status::Warn
+        } else {
+            Status::Pass
+        };
+        (
+            status,
+            name,
+            format!("runtime requested={requested}, portal enabled={enabled}"),
+        )
+    })
+    .collect()
 }
 
 async fn check_discord(
@@ -386,38 +445,36 @@ async fn check_discord(
         format!("application ID {}", app.id),
     );
     let flags = app.flags.unwrap_or_else(ApplicationFlags::empty);
-    // Source: https://docs.discord.com/developers/resources/application#application-object-application-flags
-    for (name, requested, enabled) in [
-        (
-            "Guild Members intent",
-            intents.contains(Intents::GUILD_MEMBERS),
-            flags.intersects(
-                ApplicationFlags::GATEWAY_GUILD_MEMBERS
-                    | ApplicationFlags::GATEWAY_GUILD_MEMBERS_LIMITED,
-            ),
-        ),
-        (
-            "Message Content intent",
-            intents.contains(Intents::MESSAGE_CONTENT),
-            flags.intersects(
-                ApplicationFlags::GATEWAY_MESSAGE_CONTENT
-                    | ApplicationFlags::GATEWAY_MESSAGE_CONTENT_LIMITED,
-            ),
-        ),
-    ] {
-        let status = if requested && !enabled {
-            Status::Fail
-        } else if !requested && enabled {
-            Status::Warn
-        } else {
-            Status::Pass
-        };
-        report.add(
-            status,
-            name,
-            format!("runtime requested={requested}, portal enabled={enabled}"),
-        );
+    for (status, name, detail) in intent_checks(intents, flags) {
+        report.add(status, name, detail);
     }
+    // The cutover's forced IDENTIFY spends one session start against a hard
+    // Discord daily limit, so the budget is read here through the same
+    // governed GET path: lane released on timeout, no retry, and any failed, timed-out or
+    // malformed read fails closed like every other check. Counts only; the
+    // token is never part of the detail.
+    let budget: BotConnectionInfo = read_discord(
+        transport,
+        "session start budget",
+        client.gateway().authed().try_into_request(),
+    )
+    .await?;
+    let limit = &budget.session_start_limit;
+    let status = if limit.remaining < SESSION_START_FAIL_FLOOR {
+        Status::Fail
+    } else if limit.remaining < SESSION_START_WARN_THRESHOLD {
+        Status::Warn
+    } else {
+        Status::Pass
+    };
+    report.add(
+        status,
+        "session start budget",
+        format!(
+            "remaining={} total={} reset_after_ms={} max_concurrency={}",
+            limit.remaining, limit.total, limit.reset_after, limit.max_concurrency
+        ),
+    );
     let guild_id = Id::new(targets.guild_id);
     let member: Member = read_discord(
         transport,
@@ -569,16 +626,15 @@ async fn admission_transport(
 ) -> Result<HyperTransport, Check> {
     match std::env::var("TWO_DATABASE_URL") {
         Ok(url) => {
-            let options = two_bot_core::database_url::connect_options(&url).map_err(|_| {
+            // Threat-model F6: the shared website-jobs fence (validate + TLS
+            // enforce/apply + timeouts). Refusals read as the same redacted
+            // authority error. Lazy: no socket opens here; later wires fail closed.
+            let tls = crate::website_jobs::admission_tls_policy_from_env().map_err(|_| {
                 Check::fail("send admission", "runtime admission authority unavailable")
             })?;
-            let pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(2)
-                .connect_with(options)
-                .await
-                .map_err(|_| {
-                    Check::fail("send admission", "runtime admission authority unavailable")
-                })?;
+            let pool = crate::website_jobs::admission_pool_with_tls(&url, tls).map_err(|_| {
+                Check::fail("send admission", "runtime admission authority unavailable")
+            })?;
             let gate = PgSendAdmission::new(pool, &token)
                 .map_err(|_| Check::fail("send admission", "invalid credential namespace"))?;
             HyperTransport::with_admission(token, proxy, std::sync::Arc::new(gate))
@@ -699,6 +755,39 @@ pub async fn dispatch(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn presence_intent_needs_the_portal_grant() {
+        use twilight_model::oauth::ApplicationFlags;
+        let row = |intents, flags| {
+            super::intent_checks(intents, flags)
+                .into_iter()
+                .find(|(_, name, _)| *name == "Presence intent")
+                .map(|(status, _, _)| status)
+                .expect("presence row")
+        };
+        let presences = Intents::GUILD_PRESENCES;
+        assert!(matches!(
+            row(presences, ApplicationFlags::empty()),
+            super::Status::Fail
+        ));
+        assert!(matches!(
+            row(presences, ApplicationFlags::GATEWAY_PRESENCE_LIMITED),
+            super::Status::Pass
+        ));
+        assert!(matches!(
+            row(presences, ApplicationFlags::GATEWAY_PRESENCE),
+            super::Status::Pass
+        ));
+        assert!(matches!(
+            row(Intents::empty(), ApplicationFlags::GATEWAY_PRESENCE_LIMITED),
+            super::Status::Warn
+        ));
+        assert!(matches!(
+            row(Intents::empty(), ApplicationFlags::empty()),
+            super::Status::Pass
+        ));
+    }
+
     use super::*;
 
     #[test]
@@ -721,6 +810,150 @@ mod tests {
     #[test]
     fn admission_query_guard_redacts_dependency_logs() {
         crate::admission_test_support::run_probe("preflight::tests::admission_query_guard_child");
+    }
+
+    /// Threat-model F6: the shared admission fence (same helper as the website
+    /// jobs) refuses plaintext, unverified and wrong-host URLs with fixed
+    /// strings, and the `LocalOnly` happy path builds a lazy pool with no
+    /// socket. Explicit policies, so deterministic under any process setting.
+    #[test]
+    fn admission_tls_fence_refuses_plaintext_and_wrong_hosts() {
+        use two_bot_core::database_tls::TlsPolicy;
+        let cases = [
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+                TlsPolicy::Required,
+                "database sslmode does not require TLS",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db",
+                TlsPolicy::Required,
+                "database URL must set sslmode under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=verify-full",
+                TlsPolicy::Required,
+                "local database host is refused under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=verify-full",
+                TlsPolicy::LocalOnly,
+                "remote database host is refused under the local-only TLS policy",
+            ),
+        ];
+        let capture = crate::tracing_capture::Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                for (url, policy, expected) in cases {
+                    let error =
+                        crate::website_jobs::admission_pool_with_tls(url, policy).unwrap_err();
+                    assert_eq!(error, expected, "{url}");
+                    assert!(!error.contains("fixture"), "TLS refusal echoed the URL");
+                }
+                for (url, policy) in [
+                    (
+                        "postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable",
+                        TlsPolicy::LocalOnly,
+                    ),
+                    (
+                        "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=verify-full",
+                        TlsPolicy::Required,
+                    ),
+                ] {
+                    let pool =
+                        crate::website_jobs::admission_pool_with_tls(url, policy).unwrap();
+                    assert_eq!(pool.size(), 0);
+                    pool.close().await;
+                }
+                tracing::warn!("preflight admission capture remains active");
+            });
+        });
+        let text = capture.text();
+        assert!(text.contains("preflight admission capture remains active"));
+        assert!(!text.contains("fixture"), "TLS refusal reached logs");
+    }
+
+    /// Child-process probe for the transport wiring: refusal reads as the same
+    /// redacted authority error, and the `LocalOnly` happy path builds without
+    /// a socket. Runs only when `ADMISSION_TLS_PROBE` is set (see the parent).
+    #[test]
+    fn admission_tls_guard_child() {
+        if std::env::var_os("ADMISSION_TLS_PROBE").is_none() {
+            return;
+        }
+        let capture = crate::tracing_capture::Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                if std::env::var("ADMISSION_TLS_MODE").as_deref() == Ok("happy") {
+                    let transport = admission_transport("fixture-token".to_owned(), None).await;
+                    assert!(
+                        transport.is_ok(),
+                        "local-only happy path must build without a socket"
+                    );
+                } else {
+                    let error = admission_transport("fixture-token".to_owned(), None)
+                        .await
+                        .err()
+                        .unwrap();
+                    assert_eq!(error.detail, "runtime admission authority unavailable");
+                    assert!(!error.detail.contains("fixture"));
+                }
+                tracing::warn!("preflight TLS capture remains active");
+            });
+        });
+        let text = capture.text();
+        assert!(text.contains("preflight TLS capture remains active"));
+        assert!(!text.contains("fixture"), "TLS refusal reached logs");
+    }
+
+    /// Parent: re-run the probe above in env-cleared children, once refusing a
+    /// remote plaintext URL under the default `Required` policy and once
+    /// accepting a loopback URL under `LocalOnly`. Separate processes avoid
+    /// process-global environment races with the parallel suite.
+    #[test]
+    fn admission_tls_guard_redacts_dependency_logs() {
+        for (mode, url, tls) in [
+            (
+                "refusal",
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+                None,
+            ),
+            (
+                "happy",
+                "postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable",
+                Some("local-only"),
+            ),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["preflight::tests::admission_tls_guard_child", "--exact", "--nocapture"])
+                .env_clear()
+                .env("ADMISSION_TLS_PROBE", "1")
+                .env("ADMISSION_TLS_MODE", mode)
+                .env("TWO_DATABASE_URL", url);
+            if let Some(policy) = tls {
+                command.env("TWO_DATABASE_TLS", policy);
+            }
+            let output = command.output().expect("run isolated TLS probe");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "TLS {mode} probe failed: {stderr}"
+            );
+            assert!(stdout.contains("running 1 test"));
+            for text in [&stdout, &stderr] {
+                assert!(!text.contains("fixture"), "TLS {mode} probe leaked");
+            }
+        }
     }
 
     fn vars(guild: &str, mode: &str) -> HashMap<String, String> {
@@ -751,6 +984,54 @@ mod tests {
         assert!(
             targets.roles.is_empty() && targets.channels.is_empty() && targets.level_roles_known
         );
+    }
+
+    /// A preflight read whose headers never arrive must fail at the 30 s
+    /// absolute deadline instead of parking the check sequence: the deadline
+    /// lives in the transport call, so reverting it to `None` hangs here.
+    /// The clock is paused so the budget elapses without wall time.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_preflight_read_times_out_at_deadline() {
+        use twilight_http::{request::Request, routing::Route};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stall");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let handle = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = Vec::with_capacity(1024);
+            let mut chunk = [0u8; 1024];
+            while let Ok(n) = stream.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        });
+        let transport = HyperTransport::with_proxy("fixture-token".to_owned(), Some(origin))
+            .expect("loopback transport");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            super::read_discord::<serde_json::Value>(
+                &transport,
+                "stall check",
+                Ok(Request::from_route(&Route::GetCurrentUser)),
+            ),
+        )
+        .await
+        .expect("a stalled preflight read must not outlive its deadline");
+        assert!(
+            result.is_err(),
+            "a stalled preflight read is an error, not a verdict"
+        );
+        handle.abort();
     }
 
     #[test]
@@ -822,5 +1103,15 @@ mod tests {
             let err = Targets::from_map(&env, None).expect_err("boot-refused catalogue");
             assert_eq!(err, "invalid TWO_SELF_ROLE_PANELS catalogue");
         }
+    }
+
+    #[test]
+    fn self_role_dry_run_refuses_values_other_than_zero_or_one() {
+        let mut env = vars("2222", "session");
+        env.insert("TWO_SELF_ROLE_DRY_RUN".into(), "true".into());
+        let err = Targets::from_map(&env, None).expect_err("refused dry run");
+        assert_eq!(err, "invalid TWO_SELF_ROLE_DRY_RUN");
+        env.insert("TWO_SELF_ROLE_DRY_RUN".into(), "1".into());
+        assert!(Targets::from_map(&env, None).is_ok());
     }
 }

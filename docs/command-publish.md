@@ -25,9 +25,16 @@ rollout approval separately.
 The desired set is the compiled builtins enabled by the same publishing gates:
 `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`, `TWO_MODERATION=1` (including its existing
 `TWO_OWEN_USER_ID`/protected-role validation), and `TWO_COMMUNITY_SCORECARD=1`.
-Without them, only the always-enabled core commands are included. Other router
-surfaces have no additional published command definitions here. Invalid feature
-configuration fails before a request.
+`TWO_VOICE=1` adds the temporary-voice set after moderation (21 new names with
+moderation on, because the voice `kick` loses first-wins to moderation `/kick`;
+22 with moderation off), and `/templateassistant`
+joins it only when `TWO_ASSISTANT_ENDPOINT` is also configured. The running bot
+publishes the voice set only while its voice sink actually built; this CLI reads
+the same env flags and cannot see that, so a diff against a bot whose voice
+sink failed to start will show the voice commands as extra desired entries.
+Without these gates, only the always-enabled core commands are included. Other
+router surfaces have no additional published command definitions here. Invalid
+feature configuration fails before a request.
 
 **This is a complete replacement, not a per-command patch.** Remote commands
 absent from the desired set are removed, including disabled feature commands,
@@ -96,7 +103,14 @@ Boot uses the normal `GUILD_ID`, `DISCORD_TOKEN`, and feature bindings. Normal
 gateway prerequisites (including `DATABASE_URL`) still apply. If enabled,
 publication/refusal happens before opening the gateway database or connecting
 the shard; failure stops the configured gateway task rather than continuing with
-an unknown registry. With the opt-in absent, existing server behavior is unchanged.
+an unknown registry. The early sync reads the same env flags as the CLI, so with
+`TWO_VOICE=1` it already carries the voice set; keeping it there means a healthy
+restart does not delete and recreate the voice commands (which would drop their
+command IDs and permission overrides). It runs before the voice sink is built,
+so if the sink then fails to build, the voice commands stay published until the
+gateway's own registry sync, which runs before shard polling and uses the built
+sink's presence, withdraws them. With the opt-in absent, the early sync is
+skipped; gateway publication still runs.
 
 This synchronizes command definitions only; it does not wire missing interaction
 handlers or certify a command cutover. Keep it disabled until the required
@@ -109,7 +123,7 @@ before opting into this boot behavior.
 `TWO_COMMANDS_PUBLISH_ON_BOOT = "1"` plus the staging bot's public
 `DISCORD_APPLICATION_ID`. The container publishes with its own send-admission
 database, so an operator CLI run needs no second database credential, and the
-live-guild fence stays on. `scripts/check-env-bindings.py` rejects the opt-in
+live-guild fence stays on. `wrangler/scripts/check-env-bindings.py` rejects the opt-in
 at top level and in production; production publication stays an
 Operator-approved Worker binding. The staging guild's registry is a full
 replacement on every boot where the hashes differ: do not keep a separate
@@ -121,6 +135,20 @@ compares canonical SHA-256 hashes. A matching fetched hash skips PUT. This
 fetch-and-compare approach needs no DB publication-hash table, works across
 process restarts, and detects out-of-band edits instead of trusting a stale
 cached success. Boot logs only the desired hash and whether it applied a write.
+
+The gateway keeps command identity separately from the drift hash. Successful
+bulk PUT receipts replace the application/guild snapshot, including custom-command
+republishes; a matching GET that skips PUT also hydrates it. Failed publication
+keeps the last successful snapshot. Voice admission and parsing, the shared
+router and ordered RSVP preparation share this map: a known slash command ID
+selects its registered name, not the payload's name. Canonical names reach
+existing ownership and permission checks, preventing competing callbacks while
+keeping moderation-first `/kick` and its vote delegate intact.
+Unknown or removed IDs cannot claim known voice names. Name fallback is limited
+to a registration scope not yet read, or a registration with no ID metadata.
+Guild/global scope and command type remain distinct; guild publication does not
+hydrate global registrations. Components still use their own custom IDs, and
+`/kick` remains owned by the shared router's moderation-first dispatch.
 
 Canonicalization ignores server IDs/versions, guild-irrelevant global settings,
 command-list order, object-key order, and null/empty/default-false optional

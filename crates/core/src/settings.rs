@@ -124,6 +124,22 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_INTERNAL_CONTAINER", SettingClass::EnvOnly),
     ("TWO_INTERNAL_PORT", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ROLE_KEYS", SettingClass::EnvOnly),
+    // --- private EventSub receiver (TOG-23387): enable/bind plus the Twitch
+    // --- signing secret. Env-only like the internal-actions receiver above:
+    // --- a web form must never enable the ingress or see the secret. ---
+    ("TWO_EVENTSUB", SettingClass::EnvOnly),
+    (
+        "TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID",
+        SettingClass::EnvOnly,
+    ),
+    ("TWO_EVENTSUB_BIND", SettingClass::EnvOnly),
+    ("TWO_EVENTSUB_DELIVERY", SettingClass::EnvOnly),
+    ("TWO_EVENTSUB_INVITE_URL", SettingClass::EnvOnly),
+    ("TWO_TWITCH_BROADCASTERS", SettingClass::EnvOnly),
+    ("TWO_TWITCH_CALLBACK_URL", SettingClass::EnvOnly),
+    ("TWO_TWITCH_CLIENT_ID", SettingClass::EnvOnly),
+    ("TWO_TWITCH_CLIENT_SECRET", SettingClass::EnvOnly),
+    ("TWO_TWITCH_WEBHOOK_SECRET", SettingClass::EnvOnly),
     // --- capability gates outside the namespace (TOG-3183 finding) ---
     ("TWO_MODERATION", SettingClass::EnvOnly),
     ("TWO_ONBOARDING_MODE", SettingClass::EnvOnly),
@@ -145,6 +161,9 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_ANTI_NUKE_TRUSTED_USER_IDS", SettingClass::EnvOnly),
     // A filesystem path chosen by a web form is a write primitive.
     ("TWO_ANTI_NUKE_SNAPSHOT_PATH", SettingClass::EnvOnly),
+    // Test-only reach boundary: which bot accounts the voice runtime treats as
+    // human occupants. A dashboard must never widen it.
+    ("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS", SettingClass::EnvOnly),
     // --- cold: read once at boot ---
     ("TWO_AUTOMOD", SettingClass::Cold),
     ("TWO_ANNOUNCEMENTS", SettingClass::Cold),
@@ -155,7 +174,6 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID", SettingClass::Cold),
     ("TWO_TEMP_VOICE_CATEGORY_ID", SettingClass::Cold),
     ("TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS", SettingClass::Cold),
-    ("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS", SettingClass::Cold),
     ("TWO_TEMP_VOICE_SWEEP_SECONDS", SettingClass::Cold),
     ("TWO_TEMP_VOICE_MAX_PER_USER", SettingClass::Cold),
     ("TWO_TEMP_VOICE_MAX_PER_GUILD", SettingClass::Cold),
@@ -170,7 +188,6 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_COMMUNITY_CORRECTION_CYCLES", SettingClass::Cold),
     ("TWO_SELF_ROLE_PANELS", SettingClass::Cold),
     ("TWO_PRESENCE_PROBE", SettingClass::Cold),
-    ("TWO_FEED_POLL_SECONDS", SettingClass::Cold),
     ("TWO_INACTIVITY_DAYS", SettingClass::Cold),
     ("TWO_TICKET_COOLDOWN_SECONDS", SettingClass::Cold),
     ("LOG_LEVEL", SettingClass::Cold),
@@ -222,6 +239,8 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_ONBOARDING_DRY_RUN", SettingClass::Hot),
     ("TWO_SELF_ROLE_DRY_RUN", SettingClass::Hot),
     ("TWO_REDIRECT_FALLBACK_CODE", SettingClass::Hot),
+    ("TWO_FEED_POLL_SECONDS", SettingClass::Hot),
+    ("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS", SettingClass::Hot),
 ];
 
 /// The hot keys whose consumers read through the live config (legacy
@@ -234,7 +253,27 @@ pub const HOT_WIRED: &[&str] = &[
     "TWO_RAID_WINDOW_SECONDS",
     "DISCORD_LANDING_CHANNEL_IDS",
     "DISCORD_GOODBYE_CHANNEL_IDS",
+    "DISCORD_AUDIT_LOG_CHANNEL_ID",
+    "DISCORD_MODERATION_LOG_CHANNEL_ID",
+    "DISCORD_STAFF_ALERT_CHANNEL_ID",
+    "DISCORD_TICKET_CATEGORY_ID",
+    "DISCORD_TICKET_PANEL_CHANNEL_ID",
+    "DISCORD_TICKET_STAFF_ROLE_ID",
+    "DISCORD_VOICE_LOG_CHANNEL_ID",
     "TWO_AUTOMOD_REPEAT_COUNT",
+    "TWO_AUTOMOD_ALLOWED_DOMAINS",
+    "TWO_AUTOMOD_BAD_WORDS",
+    "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS",
+    "TWO_AUTOMOD_BYPASS_ROLE_IDS",
+    "TWO_AUTOMOD_ENFORCE",
+    "TWO_AUTOMOD_EXEMPT_CHANNEL_IDS",
+    "TWO_AUTOMOD_MENTION_LIMIT",
+    "TWO_AUTOMOD_REPEAT_WINDOW_SECONDS",
+    "TWO_AUTOMOD_SANCTIONS",
+    "TWO_FEED_POLL_SECONDS",
+    "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
+    "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
+    "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
 ];
 
 /// The catalogue class for `key`, or `None` for a name this file has never
@@ -337,13 +376,25 @@ pub fn to_env_string(value: &Value) -> Option<String> {
         // Id lists are comma-separated in the environment and stay that way,
         // so the dashboard can store a real array without every reader
         // learning a second shape. Unrenderable elements become "".
-        Value::Array(items) => Some(
-            items
+        // Arrays holding objects (e.g. stored automod sanctions) would not
+        // survive comma-joining, so they render as compact JSON, a shape the
+        // typed readers already accept.
+        Value::Array(items) => {
+            if items
                 .iter()
-                .map(|v| to_env_string(v).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join(","),
-        ),
+                .any(|v| matches!(v, Value::Object(_) | Value::Array(_)))
+            {
+                serde_json::to_string(value).ok()
+            } else {
+                Some(
+                    items
+                        .iter()
+                        .map(|v| to_env_string(v).unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            }
+        }
         Value::Object(_) => serde_json::to_string(value).ok(),
     }
 }
@@ -720,7 +771,13 @@ pub enum WriteRefusal {
     MissingActor,
     #[error("refused: setting values cannot contain U+0000")]
     NullCharacter,
+    #[error("refused: {0} accepts only a boolean, 0 or 1")]
+    InvalidGateValue(String),
 }
+
+/// Dry-run gates the env parsers accept only as `0` or `1`; a stored value
+/// that renders to anything else would be refused at every hot refresh.
+const ZERO_ONE_GATE_KEYS: &[&str] = &["TWO_ONBOARDING_DRY_RUN", "TWO_SELF_ROLE_DRY_RUN"];
 
 /// Postgres JSONB cannot represent decoded NUL in strings or object keys.
 /// Inspect the domain value, not its encoding (literal `\\u0000` is valid).
@@ -765,6 +822,14 @@ pub fn validate_write(
     }
     if value.as_ref().is_some_and(contains_json_nul) {
         return Err(WriteRefusal::NullCharacter);
+    }
+    if ZERO_ONE_GATE_KEYS.contains(&key)
+        && value
+            .as_ref()
+            .and_then(to_env_string)
+            .is_some_and(|rendered| rendered != "0" && rendered != "1")
+    {
+        return Err(WriteRefusal::InvalidGateValue(key.to_owned()));
     }
     Ok(ValidatedWrite {
         guild_id: guild_id.to_owned(),
@@ -830,6 +895,8 @@ mod tests {
         "TWO_RAID_WINDOW_SECONDS",
         "TWO_REDIRECT_FALLBACK_CODE",
         "TWO_SELF_ROLE_DRY_RUN",
+        "TWO_FEED_POLL_SECONDS",
+        "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
     ];
 
     const EXPECTED_COLD: &[&str] = &[
@@ -843,7 +910,6 @@ mod tests {
         "TWO_COMMUNITY_CORRECTION_CYCLES",
         "TWO_COMMUNITY_RECOMMENDATIONS",
         "TWO_COMMUNITY_SCORECARD",
-        "TWO_FEED_POLL_SECONDS",
         "TWO_INACTIVITY_DAYS",
         "TWO_PRESENCE_PROBE",
         "TWO_SELF_ROLE_PANELS",
@@ -851,7 +917,6 @@ mod tests {
         "TWO_TEMP_VOICE_CATEGORY_ID",
         "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS",
         "TWO_TEMP_VOICE_DISABLED_CONTROLS",
-        "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
         "TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID",
         "TWO_TEMP_VOICE_MAX_PER_GUILD",
         "TWO_TEMP_VOICE_MAX_PER_USER",
@@ -884,6 +949,11 @@ mod tests {
         "TWO_BACKUP_S3_SECRET_ACCESS_KEY",
         "TWO_DATABASE_URL",
         "TWO_DB_POOL_MAX",
+        "TWO_EVENTSUB",
+        "TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID",
+        "TWO_EVENTSUB_BIND",
+        "TWO_EVENTSUB_DELIVERY",
+        "TWO_EVENTSUB_INVITE_URL",
         "TWO_HEALTH_BIND_HOST",
         "TWO_HEALTH_PORT",
         "TWO_INTERNAL_ACTIONS",
@@ -917,6 +987,12 @@ mod tests {
         "TWO_STAGING_DATABASE_URL",
         "TWO_STAGING_RESTART_CONTAINMENT",
         "TWO_STAGING_RESTART_SYNTHETIC_ACTORS",
+        "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
+        "TWO_TWITCH_BROADCASTERS",
+        "TWO_TWITCH_CALLBACK_URL",
+        "TWO_TWITCH_CLIENT_ID",
+        "TWO_TWITCH_CLIENT_SECRET",
+        "TWO_TWITCH_WEBHOOK_SECRET",
     ];
 
     #[test]
@@ -931,7 +1007,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 122, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 133, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,
@@ -973,7 +1049,7 @@ mod tests {
 
     #[test]
     fn hot_wired_is_a_hot_subset() {
-        assert_eq!(HOT_WIRED.len(), 5);
+        assert_eq!(HOT_WIRED.len(), 25);
         for key in HOT_WIRED {
             assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
         }
@@ -1015,6 +1091,22 @@ mod tests {
             to_env_string(&json!([3.0, u64::MAX])).as_deref(),
             Some("3,18446744073709551615")
         );
+    }
+
+    #[test]
+    fn object_arrays_render_as_json_for_typed_readers() {
+        // A dashboard-stored sanctions ladder is a real array of objects; the
+        // live snapshot must hand readers the JSON shape, not comma-joined
+        // objects no parser accepts.
+        let rendered = to_env_string(&json!([
+            {"violations": 1, "action": "delete", "timeout_seconds": null},
+            {"violations": 2, "action": "warn", "timeout_seconds": null},
+        ]))
+        .expect("renders");
+        assert!(rendered.starts_with('['), "{rendered}");
+        assert!(rendered.contains("\"violations\""), "{rendered}");
+        // Scalar arrays keep the comma-separated env shape.
+        assert_eq!(to_env_string(&json!(["1", "2"])).as_deref(), Some("1,2"));
     }
 
     #[test]
@@ -1127,7 +1219,7 @@ mod tests {
         let loaded = snapshot(
             1,
             vec![
-                row("g1", "TWO_FEED_POLL_SECONDS", json!(600), 1),
+                row("g1", "TWO_AUTOMATIONS", json!("1"), 1),
                 row("g1", "TWO_MODERATION", json!("1"), 2),
                 row("g1", "TWO_TOTALLY_MADE_UP", json!("1"), 3),
             ],
@@ -1136,7 +1228,7 @@ mod tests {
         assert!(report.changed);
         assert!(report.hot.is_empty());
         assert_eq!(report.cold.len(), 1);
-        assert_eq!(report.cold[0].key, "TWO_FEED_POLL_SECONDS");
+        assert_eq!(report.cold[0].key, "TWO_AUTOMATIONS");
         assert_eq!(report.ignored.len(), 2);
         let reasons: Vec<_> = report
             .ignored
@@ -1147,13 +1239,13 @@ mod tests {
         assert!(reasons.contains(&("TWO_TOTALLY_MADE_UP", IgnoreReason::Unknown)));
         // Cold keys stay in the snapshot (restart applies them); env-only and
         // unknown keys never do, through either read API.
-        assert_eq!(cache.get("g1", "TWO_FEED_POLL_SECONDS"), Some(&json!(600)));
+        assert_eq!(cache.get("g1", "TWO_AUTOMATIONS"), Some(&json!("1")));
         assert_eq!(cache.get("g1", "TWO_MODERATION"), None);
         assert_eq!(cache.get("g1", "TWO_TOTALLY_MADE_UP"), None);
         let rendered = cache.env_snapshot(Some("g1"));
         assert_eq!(
-            rendered.get("TWO_FEED_POLL_SECONDS").map(String::as_str),
-            Some("600")
+            rendered.get("TWO_AUTOMATIONS").map(String::as_str),
+            Some("1")
         );
         assert!(!rendered.contains_key("TWO_MODERATION"));
         assert!(!rendered.contains_key("TWO_TOTALLY_MADE_UP"));
@@ -1232,12 +1324,43 @@ mod tests {
             .expect("hot validates");
         assert_eq!(hot.class, SettingClass::Hot);
         assert_eq!(hot.action, WriteAction::Upsert(json!(3)));
-        let cold = validate_write("g1", "TWO_FEED_POLL_SECONDS", Some(json!(600)), "admin")
+        let feed_hot = validate_write("g1", "TWO_FEED_POLL_SECONDS", Some(json!(600)), "admin")
+            .expect("feed interval validates as hot");
+        assert_eq!(feed_hot.class, SettingClass::Hot);
+        let cold = validate_write("g1", "TWO_AUTOMATIONS", Some(json!("1")), "admin")
             .expect("cold validates");
         assert_eq!(cold.class, SettingClass::Cold);
         let delete = validate_write("g1", "TWO_ONBOARDING_DRY_RUN", None, "admin")
             .expect("delete validates");
         assert_eq!(delete.action, WriteAction::Delete);
+    }
+
+    #[test]
+    fn gate_values_accept_only_boolean_zero_or_one() {
+        for value in [
+            json!(true),
+            json!(false),
+            json!("1"),
+            json!("0"),
+            json!(1),
+            json!(0),
+        ] {
+            assert!(
+                validate_write("g1", "TWO_ONBOARDING_DRY_RUN", Some(value.clone()), "admin")
+                    .is_ok(),
+                "{value}"
+            );
+        }
+        for value in [json!("true"), json!("on"), json!(""), json!(2)] {
+            assert_eq!(
+                validate_write("g1", "TWO_SELF_ROLE_DRY_RUN", Some(value.clone()), "admin"),
+                Err(WriteRefusal::InvalidGateValue(
+                    "TWO_SELF_ROLE_DRY_RUN".to_owned()
+                )),
+                "{value}"
+            );
+        }
+        assert!(validate_write("g1", "TWO_SELF_ROLE_DRY_RUN", None, "admin").is_ok());
     }
 
     #[test]
@@ -1271,12 +1394,14 @@ mod tests {
     #[test]
     fn live_channel_never_publishes_restart_required_or_ignored_keys() {
         let (mut writer, live) = live_channel();
-        let blocked = [
+        // Automod lists/thresholds and the feed interval ride the live
+        // snapshot (TOG-19027); only cold, env-only and unknown stay out.
+        let live_keys = [
             "TWO_FEED_POLL_SECONDS",
-            "TWO_AUTOMOD_BAD_WORDS", // Hot, but not yet in HOT_WIRED.
-            "DISCORD_TOKEN",
-            "TWO_MADE_UP_KEY",
+            "TWO_AUTOMOD_BAD_WORDS",
+            "TWO_AUTOMOD_MENTION_LIMIT",
         ];
+        let blocked = ["TWO_AUTOMATIONS", "DISCORD_TOKEN", "TWO_MADE_UP_KEY"];
         for revision in 1..=2 {
             let mut rows = vec![row(
                 "g1",
@@ -1285,31 +1410,40 @@ mod tests {
                 revision,
             )];
             rows.extend(
+                live_keys
+                    .iter()
+                    .map(|key| row("g1", key, json!(revision), revision)),
+            );
+            rows.extend(
                 blocked
                     .iter()
                     .map(|key| row("g1", key, json!(revision), revision)),
             );
             let report = writer.publish(&snapshot(revision, rows));
             assert!(report.changed);
-            assert_eq!(report.cold.len(), 2);
+            assert_eq!(report.cold.len(), 1);
             assert_eq!(report.ignored.len(), 2);
             assert_eq!(
                 live.get("g1", "TWO_RAID_JOIN_THRESHOLD"),
                 Some(json!(revision))
             );
+            for key in live_keys {
+                assert_eq!(live.get("g1", key), Some(json!(revision)), "{key}");
+                assert!(live.env_snapshot(Some("g1")).contains_key(key), "{key}");
+            }
             for key in blocked {
                 assert_eq!(live.get("g1", key), None, "{key}");
                 assert_eq!(live.snapshot().get("g1", key), None, "{key}");
                 assert!(!live.env_snapshot(Some("g1")).contains_key(key), "{key}");
             }
             // Poll marks still cover all stored rows, not just live entries.
-            assert!(!writer.needs_refresh(revision, 5));
+            assert!(!writer.needs_refresh(revision, 7));
         }
         let report = writer.publish(&snapshot(
             3,
             vec![row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(2), 2)],
         ));
-        assert_eq!(report.cold.len(), 2); // Deletion also requires restart.
+        assert_eq!(report.cold.len(), 1); // Deletion also requires restart.
         assert_eq!(live.snapshot().size(), 1);
         assert!(live
             .env_snapshot(Some("g1"))

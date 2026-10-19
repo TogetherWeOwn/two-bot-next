@@ -102,7 +102,8 @@ async fn malformed_event_elements_and_optionals_never_reach_storage() {
                 &executor(&mock),
                 "2222",
                 &Mutex::new(()),
-                &shutdown
+                &shutdown,
+                false
             )
             .await,
             Err(ErrorClass::Rest),
@@ -157,7 +158,16 @@ async fn stopped_or_closed_attempts_and_queued_observations_do_no_io() {
                 drop(stop);
             }
             assert_eq!(
-                run_once(kind, &pool, &rest, "2222", &Mutex::new(()), &shutdown).await,
+                run_once(
+                    kind,
+                    &pool,
+                    &rest,
+                    "2222",
+                    &Mutex::new(()),
+                    &shutdown,
+                    false
+                )
+                .await,
                 Ok(())
             );
         }
@@ -166,7 +176,7 @@ async fn stopped_or_closed_attempts_and_queued_observations_do_no_io() {
         let observation = Mutex::new(());
         let held = observation.lock().await;
         let (stop, shutdown) = watch::channel(false);
-        let attempt = run_once(kind, &pool, &rest, "2222", &observation, &shutdown);
+        let attempt = run_once(kind, &pool, &rest, "2222", &observation, &shutdown, false);
         tokio::pin!(attempt);
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut attempt)
@@ -257,7 +267,16 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
     let rest = executor(&mock);
     for snapshot in &snapshots {
         assert_eq!(
-            run_once(Kind::Events, pool, &rest, "2222", &observation, &shutdown).await,
+            run_once(
+                Kind::Events,
+                pool,
+                &rest,
+                "2222",
+                &observation,
+                &shutdown,
+                false
+            )
+            .await,
             Err(ErrorClass::Rest),
             "{snapshot}"
         );
@@ -317,7 +336,16 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
     .await;
     let rest = executor(&mock);
     assert_eq!(
-        run_once(Kind::Events, pool, &rest, "2222", &observation, &shutdown).await,
+        run_once(
+            Kind::Events,
+            pool,
+            &rest,
+            "2222",
+            &observation,
+            &shutdown,
+            false
+        )
+        .await,
         Err(ErrorClass::Database)
     );
     assert_eq!(
@@ -325,9 +353,17 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
         before,
         "failed replacement was not atomic"
     );
-    run_once(Kind::Events, pool, &rest, "2222", &observation, &shutdown)
-        .await
-        .unwrap();
+    run_once(
+        Kind::Events,
+        pool,
+        &rest,
+        "2222",
+        &observation,
+        &shutdown,
+        false,
+    )
+    .await
+    .unwrap();
     type EventRow = (String, Option<String>, Option<String>, String, String);
     let rows: Vec<EventRow> = sqlx::query_as(
         "SELECT event_id, channel_id, description, starts_at, updated_at FROM scheduled_events WHERE guild_id='2222' ORDER BY event_id"
@@ -346,9 +382,176 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
             .await
             .unwrap();
     assert_eq!(pin, "2222");
-    run_once(Kind::Events, pool, &rest, "2222", &observation, &shutdown)
+    run_once(
+        Kind::Events,
+        pool,
+        &rest,
+        "2222",
+        &observation,
+        &shutdown,
+        false,
+    )
+    .await
+    .unwrap();
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT guild_id FROM scheduled_events ORDER BY guild_id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining,
+        ["3333"],
+        "valid empty response clears only its own guild"
+    );
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+fn named_event(id: &str, name: &str, start: &str, status: u64) -> Value {
+    json!({"id":id, "name":name, "scheduled_start_time":start, "status":status})
+}
+
+fn duplicate_id_snapshots() -> Vec<Value> {
+    let first = named_event("3000", "First name", "2026-10-01T19:00:00Z", 1);
+    let second = named_event("3000", "Second name", "2026-10-02T19:00:00Z", 2);
+    vec![
+        // Identical duplicates refuse under the same policy as conflicts.
+        json!([event("3000"), event("3000")]),
+        // Conflicting duplicates refuse in either order; no last-row winner.
+        json!([first.clone(), second.clone()]),
+        json!([second, first]),
+        // A duplicate anywhere refuses the whole snapshot.
+        json!([event("3001"), event("3000"), event("3000")]),
+        json!([event("3000"), event("3001"), event("3002"), event("3000")]),
+        json!([event("3000"), event("3000"), event("3000")]),
+    ]
+}
+
+#[tokio::test]
+async fn duplicate_event_ids_never_reach_storage() {
+    let snapshots = duplicate_id_snapshots();
+    let mock = MockRest::start(
+        snapshots
+            .iter()
+            .cloned()
+            .map(|v| ScriptedResponse::json(200, v))
+            .collect(),
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let pool = poison_pool();
+    let (_stop, shutdown) = watch::channel(false);
+    for snapshot in &snapshots {
+        assert_eq!(
+            run_once(
+                Kind::Events,
+                &pool,
+                &executor(&mock),
+                "2222",
+                &Mutex::new(()),
+                &shutdown,
+                false
+            )
+            .await,
+            Err(ErrorClass::Rest),
+            "{snapshot}"
+        );
+    }
+    assert_eq!(mock.requests().len(), snapshots.len());
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn duplicate_event_ids_preserve_full_mirror_and_valid_controls_still_replace() {
+    let Some(db) = fixture().await else {
+        return;
+    };
+    let pool = db.pool();
+    let (_stop, shutdown) = watch::channel(false);
+    let observation = Mutex::new(());
+    let seed = normalize_events(&[raw_event(&event("3000")).unwrap()]).unwrap();
+    replace_events(pool, "2222", "2026-09-30T12:00:00.123Z", &seed)
         .await
         .unwrap();
+    replace_events(pool, "3333", "2026-09-30T12:00:00.123Z", &seed)
+        .await
+        .unwrap();
+    let before = mirror(pool).await;
+    let snapshots = duplicate_id_snapshots();
+    let mock = MockRest::start(
+        snapshots
+            .iter()
+            .cloned()
+            .map(|v| ScriptedResponse::json(200, v))
+            .collect(),
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let rest = executor(&mock);
+    for snapshot in &snapshots {
+        assert_eq!(
+            run_once(
+                Kind::Events,
+                pool,
+                &rest,
+                "2222",
+                &observation,
+                &shutdown,
+                false
+            )
+            .await,
+            Err(ErrorClass::Rest),
+            "{snapshot}"
+        );
+        assert_eq!(
+            mirror(pool).await,
+            before,
+            "duplicate-id snapshot changed rows/timestamps/contract pin: {snapshot}"
+        );
+    }
+    mock.shutdown().await;
+
+    // Controls: a unique snapshot still replaces, and a valid empty snapshot
+    // still performs the intentional empty-set replacement for its guild.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!([event("3001"), event("3002")])),
+            ScriptedResponse::json(200, json!([])),
+        ],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let rest = executor(&mock);
+    run_once(
+        Kind::Events,
+        pool,
+        &rest,
+        "2222",
+        &observation,
+        &shutdown,
+        false,
+    )
+    .await
+    .unwrap();
+    let replaced: Vec<String> = sqlx::query_scalar(
+        "SELECT event_id FROM scheduled_events WHERE guild_id='2222' ORDER BY event_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(replaced, ["3001", "3002"]);
+    run_once(
+        Kind::Events,
+        pool,
+        &rest,
+        "2222",
+        &observation,
+        &shutdown,
+        false,
+    )
+    .await
+    .unwrap();
     let remaining: Vec<String> =
         sqlx::query_scalar("SELECT guild_id FROM scheduled_events ORDER BY guild_id")
             .fetch_all(pool)
@@ -399,6 +602,7 @@ async fn stop_during_fetch_discards_snapshot_results_without_post_shutdown_publi
             "2222",
             &observation,
             &shutdown,
+            false,
         )
         .await
         .unwrap();
@@ -451,7 +655,7 @@ async fn stop_during_fetch_discards_snapshot_results_without_post_shutdown_publi
             let rest = executor(&mock);
             let observation = observation.clone();
             tokio::spawn(async move {
-                run_once(kind, &pool, &rest, "2222", &observation, &shutdown).await
+                run_once(kind, &pool, &rest, "2222", &observation, &shutdown, false).await
             })
         };
         tokio::time::timeout(Duration::from_secs(5), gate.wait_for_request())
@@ -484,6 +688,7 @@ async fn stop_during_fetch_discards_snapshot_results_without_post_shutdown_publi
             "2222",
             &observation,
             &stop.subscribe(),
+            false,
         )
         .await;
         assert_eq!(next, Ok(()));

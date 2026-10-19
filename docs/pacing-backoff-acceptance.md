@@ -29,5 +29,5 @@ helpers the executor feeds them.
 
 ## Not covered here
 
-- The executor's retry loops (same-attempt 429 park vs. attempt-counting 5xx retry), lane floors, the 5 s moderation abort, and the no-auto-retry moderation path — all `two-bot-discord` behavior, not `action_outcomes` values.
+- The executor's retry loops (429 and 5xx both spend the 5-try read budget in the shared GET helpers; kicks and registry publish bound 429 the same way), lane floors, the 5 s moderation abort, and the no-auto-retry moderation path — all `two-bot-discord` behavior, not `action_outcomes` values.
 - `KickOutcome`/`KickResult` construction (the executor builds these from `KickStatus`); the unit tests in `action_outcomes.rs` cover the outcome/action mapping.

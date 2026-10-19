@@ -12,14 +12,19 @@ import { randomBytes } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import { OWNER_KEY, DEPLOYMENT_HEADER } from "../src/ownership.ts";
+import { LOG_QUERY_URL } from "../src/alert-rules.ts";
+import { isRequestId } from "../src/request-id.ts";
 import {
   ACTIONS_PATH,
   CONTAINER_MARKER,
   CONTAINER_MARKER_VALUE,
   MAX_BODY_BYTES,
   MAX_IN_FLIGHT,
+  MAX_RESPONSE_BYTES,
   RECEIVER_BIND,
   RECEIVER_PORT,
+  handleActionsIngress,
+  relayReceiverResponse,
   resetIngressLimits,
 } from "../src/internal-actions.ts";
 
@@ -426,9 +431,11 @@ test("forwards exactly the allowlisted headers and unchanged bytes to the fixed 
   assert.equal(call.method, "POST");
   assert.equal(Buffer.compare(call.body, payload), 0, "body bytes unchanged");
   assert.deepEqual(Object.keys(call.headers).sort(), [
-    "content-type", "idempotency-key",
+    "content-type", "idempotency-key", "x-request-id",
     "x-two-key-id", "x-two-nonce", "x-two-signature", "x-two-timestamp",
   ]);
+  // No inbound id here, so the edge minted one: a valid join key, not a leak.
+  assert.ok(isRequestId(call.headers["x-request-id"] ?? ""));
   assert.equal(call.headers["x-two-signature"], SIGNATURE);
   assert.equal(call.headers["x-two-nonce"], NONCE);
   assert.equal(call.headers["content-type"], "application/json");
@@ -467,23 +474,37 @@ test("receiver answers relay with allowlisted headers only; container error text
   assert.equal(relayed.headers.get("set-cookie"), null);
   assert.equal(relayed.headers.get("x-secret"), null);
   assert.equal((await relayed.json() as { ok: boolean }).ok, false);
+  // The drained happy path settles the SDK proxy pipe.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(h.bot["inflightRequests"], 0, "drained relays must release the proxy slot");
 
+  // Refused shapes bypass the SDK proxy pipe. The pinned SDK (0.3.7,
+  // unmodified) forwards container bodies through
+  // `res.body?.pipeTo(writable).finally(...)` with no rejection handler, so an
+  // early consumer cancel aborts that internal pipe and rejects with
+  // `undefined` — the same wart the /ops/metrics cancel path already lives
+  // with. Cancelling through it under Node fails the file with an unattributed
+  // unhandled rejection, so these shapes are served past the pipe exactly as
+  // the /ops/metrics tests serve fixtures; early-cancel mechanics (cancel +
+  // unread tails) are proven by the instrumented relay unit tests below.
   const leak = `boom ${ENABLED_ENV.DISCORD_TOKEN} ${ENABLED_ENV.DATABASE_URL} ${KEYS}`;
-  for (const response of [
-    () => new Response(leak, { status: 500 }),
-    () => new Response(leak, { status: 429 }),
-    () => new Response(leak, { status: 503, headers: { "content-type": "text/html" } }),
-    () => new Response(leak, { status: 200, headers: { "content-type": "application/jsonp" } }),
-    () => new Response(new Uint8Array(70 * 1024), { status: 200, headers: { "content-type": "application/json" } }),
-    () => new Response(null, { status: 204, headers: { "content-type": "application/json" } }),
-  ]) {
-    h.setReceiver(response);
+  const refused: Response[] = [
+    new Response(leak, { status: 500 }),
+    new Response(leak, { status: 429 }),
+    new Response(leak, { status: 503, headers: { "content-type": "text/html" } }),
+    new Response(leak, { status: 200, headers: { "content-type": "application/jsonp" } }),
+    new Response(new Uint8Array(70 * 1024), { status: 200, headers: { "content-type": "application/json" } }),
+    new Response(null, { status: 204, headers: { "content-type": "application/json" } }),
+  ];
+  const fetchPastPipe = t.mock.method(h.bot, "containerFetch", async () => refused.shift()!);
+  for (let i = 0; i < 6; i++) {
     const sanitized = await h.call(post());
     assert.equal(sanitized.status, 503);
     const text = await sanitized.text();
     assert.deepEqual(Object.keys((JSON.parse(text) as { error: object }).error).sort(), ["code", "message", "retryable"]);
     assert.ok(!text.includes("boom") && !text.includes(KEYS) && !text.includes(ENABLED_ENV.DISCORD_TOKEN));
   }
+  fetchPastPipe.mock.restore();
 
   // The SDK turns a failed proxy into a text 500 carrying the raw message.
   h.setReceiver(() => { throw new Error(`connection reset ${leak}`); });
@@ -538,7 +559,7 @@ test("the ownership fence refuses ingress; a stale or spoofed deployment never f
   assert.equal(h.seen.length, before);
 });
 
-test("logs carry only scalar event, status and error class", async (t) => {
+test("logs carry only scalar event, status, error class, request id, release and log url", async (t) => {
   const h = await harness(t, ENABLED_ENV);
   await h.warm();
   const secrets = [SIGNATURE, NONCE, BODY, KEYS, "203.0.113", INTENT_ID];
@@ -551,10 +572,205 @@ test("logs carry only scalar event, status and error class", async (t) => {
   assert.ok(ingress.length >= 3, "refusals are logged");
   for (const line of ingress) {
     const record = JSON.parse(line) as Record<string, unknown>;
-    assert.deepEqual(Object.keys(record).sort(), ["error_class", "event", "status"]);
+    assert.deepEqual(Object.keys(record).sort(), ["error_class", "event", "log_url", "release", "request_id", "status"]);
     assert.match(String(record["error_class"]), /^[a-z_]+$/);
+    assert.ok(isRequestId(String(record["request_id"])), `bad id shape: ${line}`);
+    assert.match(String(record["release"]), /^(?:[0-9a-f]{7,40}|unknown)$/, `bad release shape: ${line}`);
+    assert.equal(record["log_url"], LOG_QUERY_URL, `bad log url: ${line}`);
   }
   for (const line of h.logs) for (const secret of secrets) assert.ok(!line.includes(secret), secret);
+});
+
+// Paperclip Review (PR #1116): pin the edge wiring with an exact SHA. The
+// shape test above accepts `sha|unknown`, so replacing `env.CONTAINER_RELEASE`
+// with `undefined` at the edge call site stays green. This test drives a real
+// 40-hex SHA through `worker.fetch` and asserts the span line carries it
+// verbatim; a hostile value must bucket to the visible "unknown".
+test("edge stamps the deploy CONTAINER_RELEASE on span lines; hostile values bucket to unknown", async (t) => {
+  const sha = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
+  const withSha = await harness(t, { ...ENABLED_ENV, CONTAINER_RELEASE: sha });
+  await withSha.warm();
+  const refused = await withSha.call(post(BODY, { ...SIGNED_HEADERS, "content-type": "text/plain" }));
+  assert.equal(refused.status, 415);
+  await refused.arrayBuffer();
+  const span = withSha.logs.filter((line) => line.includes("internal_actions_ingress"));
+  assert.ok(span.length >= 1, "expected a span line");
+  for (const line of span) {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    assert.equal(record["release"], sha, `edge must stamp the deploy SHA: ${line}`);
+    assert.equal(record["log_url"], LOG_QUERY_URL, `bad log url: ${line}`);
+  }
+
+  const hostile = await harness(t, {
+    ...ENABLED_ENV,
+    CONTAINER_RELEASE: "postgres://user:hunter2@db.internal/app",
+  });
+  await hostile.warm();
+  const refusedHostile = await hostile.call(post(BODY, { ...SIGNED_HEADERS, "content-type": "text/plain" }));
+  assert.equal(refusedHostile.status, 415);
+  await refusedHostile.arrayBuffer();
+  const hostileSpan = hostile.logs.filter((line) => line.includes("internal_actions_ingress"));
+  assert.ok(hostileSpan.length >= 1, "expected a span line");
+  for (const line of hostileSpan) {
+    assert.equal((JSON.parse(line) as Record<string, unknown>)["release"], "unknown", line);
+  }
+  assert.ok(hostile.logs.every((line) => !line.includes("hunter2")), "hostile release must not echo");
+});
+
+// Paperclip Review (PR #1116): pin the DO wiring with an exact SHA. Warming
+// the keepalive probe with a /readyz `build_revision` SHA sets `lastRelease`;
+// a DO-side refusal (malformed header, before the ownership fence) must carry
+// that SHA verbatim. Passing `null` at any DO call site logs "unknown" and
+// fails this test.
+test("DO stamps the probed build_revision on span lines", async (t) => {
+  const sha = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
+  const h = await harness(t, ENABLED_ENV);
+  await h.warm();
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    if (url.pathname === "/readyz") {
+      return Object.assign(
+        new Response(
+          JSON.stringify({ components: [["process", "ready"]], build_revision: sha, build_id: "123-1" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+        { webSocket: null },
+      );
+    }
+    return Object.assign(Response.json({ ready: true }), { webSocket: null });
+  });
+  await h.bot.onStart();
+  const [pending] = await h.bot.listSchedules<{ startedAt: number }>("keepalive");
+  assert.ok(pending, "keepalive must be armed");
+  await h.bot.keepalive(pending.payload!, pending);
+  const before = h.logs.length;
+  const direct = await h.bot.fetch(new Request(`https://worker.invalid${ACTIONS_PATH}`, {
+    method: "POST",
+    body: BODY,
+    headers: { ...SIGNED_HEADERS, "content-type": "text/plain" },
+  }));
+  assert.equal(direct.status, 415);
+  await direct.arrayBuffer();
+  const span = h.logs.slice(before).filter((line) => line.includes("internal_actions_ingress"));
+  assert.ok(span.length >= 1, "expected a DO-side span line");
+  for (const line of span) {
+    assert.equal((JSON.parse(line) as Record<string, unknown>)["release"], sha, line);
+  }
+});
+
+// Paperclip Review round 4 (PR #1116): pin the merged-in #1181 refusal sites
+// with an exact SHA. The abort/throw/relay branches arrived from main without
+// the trailing `release` argument and logged `unknown` despite a valid SHA.
+test("abort/throw/relay refusals stamp the SHA (no unknown leak)", async (t) => {
+  const sha = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
+  const lines: string[] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  });
+  resetIngressLimits();
+  t.after(() => resetIngressLimits());
+
+  // 1. Synchronous forward throw -> 503 unavailable.
+  const syncThrow = await handleActionsIngress(
+    post(BODY, SIGNED_HEADERS),
+    `span-release-sync-${randomBytes(4).toString("hex")}`,
+    () => { throw new Error("synthetic binding failure"); },
+    sha,
+  );
+  assert.equal(syncThrow.status, 503);
+  await syncThrow.arrayBuffer();
+
+  // 2. Abort-driven forward rejection -> 504 upstream_timeout.
+  const timeoutMock = t.mock.method(AbortSignal, "timeout", () => AbortSignal.abort());
+  try {
+    const aborted = await handleActionsIngress(
+      post(BODY, SIGNED_HEADERS),
+      `span-release-abort-${randomBytes(4).toString("hex")}`,
+      async () => { throw new Error("synthetic abort rejection"); },
+      sha,
+    );
+    assert.equal(aborted.status, 504);
+    await aborted.arrayBuffer();
+  } finally {
+    timeoutMock.mock.restore();
+  }
+
+  // 3. Relay with an already-aborted signal -> 503 unavailable.
+  const relayed = await relayReceiverResponse(
+    Response.json({ ok: true }),
+    "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    AbortSignal.abort(),
+    sha,
+  );
+  assert.equal(relayed.status, 503);
+  await relayed.arrayBuffer();
+
+  const span = lines.filter((line) => line.includes("internal_actions_ingress"));
+  assert.ok(span.length >= 3, `expected 3 span lines, got: ${JSON.stringify(lines)}`);
+  for (const line of span) {
+    assert.equal((JSON.parse(line) as Record<string, unknown>)["release"], sha, line);
+  }
+});
+
+test("minted request id survives header filtering and an upstream refusal", async (t) => {
+  resetIngressLimits();
+  t.after(() => resetIngressLimits());
+  t.mock.method(console, "warn", () => {});
+  const attacker = "Bearer synthetic-ingress-secret";
+  let forwardedId: string | null = null;
+  const response = await handleActionsIngress(
+    post(BODY, { ...SIGNED_HEADERS, "x-request-id": attacker }),
+    "request-id-correlation-test",
+    async (sanitized) => {
+      forwardedId = sanitized.headers.get("x-request-id");
+      throw new Error("synthetic upstream failure");
+    },
+  );
+  assert.equal(response.status, 503);
+  const body = await response.json() as { request_id: string };
+  assert.ok(isRequestId(forwardedId ?? ""));
+  assert.equal(body.request_id, forwardedId);
+});
+
+test("honored request id survives ingress refusal and receiver forward", async (t) => {
+  const h = await harness(t, ENABLED_ENV);
+  await h.warm();
+  // Hand-built 26-char Crockford id (no I/L/O/U, no lowercase).
+  const sent = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  assert.equal(sent.length, 26);
+  const refused = await h.call(post(BODY, { ...SIGNED_HEADERS, "content-type": "text/plain", "x-request-id": sent }));
+  assert.equal(refused.status, 415);
+  assert.equal((await refused.json() as { request_id: string }).request_id, sent);
+  const forwarded = await h.call(post(BODY, { ...SIGNED_HEADERS, "x-request-id": sent }));
+  assert.equal(forwarded.status, 200);
+  const calls = h.receiverCalls();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.headers["x-request-id"], sent);
+  const ingress = h.logs.filter((line) => line.includes("internal_actions_ingress"));
+  assert.ok(ingress.every((line) => line.includes(sent)), "refusal log must join by the sent id");
+  // An attacker-shaped value is never honored, forwarded or logged.
+  const attacker = "Bearer synthetic-ingress-secret";
+  const refusedAttacker = await h.call(post(BODY, { ...SIGNED_HEADERS, "content-type": "text/plain", "x-request-id": attacker }));
+  assert.equal(refusedAttacker.status, 415);
+  const minted = (await refusedAttacker.json() as { request_id: string }).request_id;
+  assert.ok(isRequestId(minted));
+  assert.notEqual(minted, attacker);
+  await h.call(post(BODY, { ...SIGNED_HEADERS, "x-request-id": attacker }));
+  for (const callRecord of h.receiverCalls().slice(1)) {
+    assert.ok(isRequestId(callRecord.headers["x-request-id"] ?? ""));
+    assert.notEqual(callRecord.headers["x-request-id"], attacker);
+  }
+  for (const line of h.logs) assert.ok(!line.includes("synthetic-ingress-secret"), line);
+});
+
+test("receiver relay refusal keeps the request id from the incoming request", async () => {
+  const sent = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const response = await relayReceiverResponse(new Response("synthetic receiver failure", {
+    status: 503,
+    headers: { "content-type": "text/plain" },
+  }), sent);
+  assert.equal(response.status, 503);
+  assert.equal((await response.json() as { request_id: string }).request_id, sent);
 });
 
 // ---------------------------------------------------------------- container wiring
@@ -650,4 +866,171 @@ test("health and receiver ports listening together pass startup while enabled", 
   assert.equal(env["TWO_INTERNAL_BIND"], RECEIVER_BIND);
   assert.equal(env[CONTAINER_MARKER], CONTAINER_MARKER_VALUE);
   assert.deepEqual(h.bot.requiredPorts, [8080, RECEIVER_PORT]);
+});
+
+// ---------------------------------------------------------------- TOG-20884: incremental relay cap
+
+function trackedChunks(chunks: Uint8Array[], hooks: { onCancel?: () => void } = {}) {
+  const state = { pulls: 0, delivered: 0, cancelled: false };
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      state.pulls++;
+      if (state.delivered < chunks.length) {
+        controller.enqueue(chunks[state.delivered++]);
+      } else {
+        controller.close();
+      }
+    },
+    cancel() {
+      state.cancelled = true;
+      hooks.onCancel?.();
+    },
+  });
+  return { stream, state };
+}
+
+function jsonResponse(stream: ReadableStream<Uint8Array>, status = 200, headers: Record<string, string> = {}) {
+  return new Response(stream, {
+    status,
+    headers: { "content-type": "application/json", ...headers },
+  });
+}
+
+async function fixedEnvelope(response: Response) {
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const body = await response.text();
+  assert.deepEqual(JSON.parse(body), {
+    ok: false,
+    request_id: JSON.parse(body).request_id,
+    error: { code: "unavailable", message: "request refused", retryable: true },
+  });
+  return body;
+}
+
+test("relay preserves below-cap bytes, allowlisted headers and retry-after validation", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const payload = new TextEncoder().encode(JSON.stringify({ ok: true, result: { message_id: "1" } }));
+  const { stream, state } = trackedChunks([payload]);
+  const upstream = jsonResponse(stream, 200, {
+    "idempotent-replay": "true",
+    "retry-after": "7",
+    "set-cookie": "session=leak",
+    "x-secret": "leak",
+    "cache-control": "public, max-age=999",
+  });
+  const relayed = await relayReceiverResponse(upstream);
+  assert.equal(relayed.status, 200);
+  assert.equal(relayed.headers.get("idempotent-replay"), "true");
+  assert.equal(relayed.headers.get("retry-after"), "7");
+  assert.equal(relayed.headers.get("cache-control"), "no-store");
+  assert.equal(relayed.headers.get("set-cookie"), null);
+  assert.equal(relayed.headers.get("x-secret"), null);
+  assert.equal(Buffer.compare(new Uint8Array(await relayed.arrayBuffer()), payload), 0);
+  assert.equal(state.cancelled, false);
+
+  // Invalid retry-after is stripped, not forwarded.
+  const { stream: badRetry } = trackedChunks([payload]);
+  const invalid = await relayReceiverResponse(jsonResponse(badRetry, 200, { "retry-after": "7.5" }));
+  assert.equal(invalid.status, 200);
+  assert.equal(invalid.headers.get("retry-after"), null);
+  await invalid.arrayBuffer();
+});
+
+test("relay preserves exactly the 64 KiB cap byte for byte", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const first = new Uint8Array(32 * 1024).fill(0x61);
+  const second = new Uint8Array(MAX_RESPONSE_BYTES - first.byteLength).fill(0x62);
+  const { stream, state } = trackedChunks([first, second]);
+  const relayed = await relayReceiverResponse(jsonResponse(stream));
+  assert.equal(relayed.status, 200);
+  const body = new Uint8Array(await relayed.arrayBuffer());
+  assert.equal(body.byteLength, MAX_RESPONSE_BYTES);
+  assert.equal(state.cancelled, false);
+  assert.equal(state.delivered, 2);
+});
+
+test("relay cancels at cap+1 across chunks and leaves the tail unread", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const first = new Uint8Array(32 * 1024).fill(0x61);
+  const second = new Uint8Array(32 * 1024).fill(0x62);
+  const over = new Uint8Array([0x63]);
+  const tail = new Uint8Array([0x64]);
+  const { stream, state } = trackedChunks([first, second, over, tail]);
+  const relayed = await relayReceiverResponse(jsonResponse(stream));
+  const text = await fixedEnvelope(relayed);
+  assert.ok(!text.includes("a".repeat(8)));
+  assert.equal(state.cancelled, true, "reader cancelled at cap+1");
+  assert.ok(state.delivered < 4, `tail unread (delivered ${state.delivered}/4)`);
+});
+
+test("relay cancels rejected shapes without reading a never-ending tail", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  let pulls = 0;
+  let cancelled = false;
+  const endless = () =>
+    new ReadableStream<Uint8Array>({ pull: () => { pulls++; return new Promise<never>(() => {}); }, cancel() { cancelled = true; } });
+
+  // Wrong media with a tail that never ends: must resolve promptly via cancel.
+  const textTail = await relayReceiverResponse(
+    new Response(endless(), { status: 500, headers: { "content-type": "text/plain" } }),
+  );
+  await fixedEnvelope(textTail);
+  assert.equal(cancelled, true);
+  assert.equal(pulls, 0, "rejected media is cancelled, never pulled");
+
+  // Bodyless 204 with a JSON media and an endless tail (204 cannot carry a
+  // body per the Response constructor, so the status is overlaid on a real
+  // streaming response to exercise the same cancel path).
+  pulls = 0; cancelled = false;
+  const bodylessUpstream = new Response(endless(), { status: 200, headers: { "content-type": "application/json" } });
+  Object.defineProperty(bodylessUpstream, "status", { value: 204 });
+  const bodyless = await relayReceiverResponse(bodylessUpstream);
+  await fixedEnvelope(bodyless);
+  assert.equal(cancelled, true);
+  assert.equal(pulls, 0, "bodyless is cancelled, never pulled");
+
+  // Out-of-range status shares the same cancel path (simulated: Response caps 200-599).
+  pulls = 0; cancelled = false;
+  const odd = new Response(endless(), { status: 200, headers: { "content-type": "application/json" } });
+  Object.defineProperty(odd, "status", { value: 99 });
+  await fixedEnvelope(await relayReceiverResponse(odd));
+  assert.equal(cancelled, true);
+  assert.equal(pulls, 0, "out-of-range status is cancelled, never pulled");
+});
+
+test("relay cancel failure still yields the fixed refusal without leaking", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const sentinel = `cancel-boom-${KEYS}`;
+  const failing = new ReadableStream<Uint8Array>({
+    pull() { return new Promise<never>(() => {}); },
+    cancel(): Promise<void> { throw new Error(sentinel); },
+  });
+  const refused = await relayReceiverResponse(
+    new Response(failing, { status: 500, headers: { "content-type": "text/plain" } }),
+  );
+  const text = await fixedEnvelope(refused);
+  assert.ok(!text.includes("cancel-boom") && !text.includes(KEYS));
+});
+
+test("relay stream errors and oversize sentinels become the fixed envelope", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const leak = `boom ${ENABLED_ENV.DISCORD_TOKEN} ${ENABLED_ENV.DATABASE_URL} ${KEYS}`;
+  let n = 0;
+  const flaky = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (n++ === 0) controller.enqueue(new TextEncoder().encode(`{"ok":true,"leak":"${leak}"}`));
+      else throw new Error(`read boom ${leak}`);
+    },
+  });
+  const errored = await relayReceiverResponse(jsonResponse(flaky));
+  const errorText = await fixedEnvelope(errored);
+  assert.ok(!errorText.includes("boom") && !errorText.includes(KEYS));
+
+  // Oversize body carrying the sentinel: cancelled early, sentinel never leaves.
+  const big = new Uint8Array(MAX_RESPONSE_BYTES + 1).fill(0x7a);
+  const { stream } = trackedChunks([big]);
+  const oversize = await relayReceiverResponse(jsonResponse(stream));
+  const oversizeText = await fixedEnvelope(oversize);
+  assert.ok(!oversizeText.includes(leak));
 });

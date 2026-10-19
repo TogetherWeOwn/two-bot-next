@@ -128,18 +128,27 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert_eq!(store.rooms_for_owner(100, 300).await?, vec![first.clone()]);
     assert!(store.rooms_in_guild(101).await?.is_empty());
 
-    // V2 caretaker handoff: owner fields move on the tracked row, nothing
-    // else changes, and a missing row reports false instead of erroring.
-    // The handoff also stamps `owner_touched_at` for the rollback delta.
+    // V2 caretaker handoff: owner fields move on the tracked row through the
+    // journaled grant path, nothing else changes, and a missing row prepares
+    // no intent instead of erroring. The handoff also stamps
+    // `owner_touched_at` for the rollback delta.
     let touched_before: String =
         sqlx::query_scalar("SELECT owner_touched_at::text FROM voice_rooms WHERE guild_id = '100' AND channel_id = '500'")
             .fetch_one(pool)
             .await?;
-    assert!(store.update_ownership(100, 500, 301, 300).await?);
     let handed = VoiceRoom {
         owner_id: 301,
         ..first.clone()
     };
+    let handoff = store
+        .prepare_owner_grants(&handed, 300)
+        .await?
+        .expect("tracked room prepares a handoff intent");
+    assert!(
+        store
+            .complete_owner_grants(&handed, &handoff.revision)
+            .await?
+    );
     assert_eq!(store.room_for(100, 500).await?, Some(handed.clone()));
     // Channel 501 (`second`) already belongs to owner 301, so both rows
     // now list under 301 in channel order.
@@ -156,7 +165,9 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
         touched_after >= touched_before,
         "handoff must not move the rollback stamp backwards"
     );
-    assert!(!store.update_ownership(100, 599, 301, 300).await?);
+    let mut missing = handed.clone();
+    missing.channel_id = 599;
+    assert!(store.prepare_owner_grants(&missing, 301).await?.is_none());
     verify_owner_grant_journal(&store, pool, &handed).await?;
 
     // V3 `/name` override: stored as typed (tokens and SQL-looking text are

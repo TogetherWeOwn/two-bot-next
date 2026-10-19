@@ -20,6 +20,25 @@ use crate::{
 const GUILD: &str = "2222";
 const CHANNEL: &str = "3333";
 
+async fn run_once(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    fetch: &dyn FeedFetch,
+) -> Result<(), ErrorClass> {
+    FeedPoller::default()
+        .run_once(pool, rest, guild, fetch)
+        .await
+}
+
+async fn reconcile(rest: &ActionExecutor, post: &FeedPost) -> Result<String, ErrorClass> {
+    let mut recovery = RecoveryBudget {
+        deadline: tokio::time::Instant::now() + RECOVERY_BUDGET,
+        reads: 0,
+    };
+    super::reconcile(rest, post, &mut recovery).await
+}
+
 fn executor(mock: &MockRest) -> ActionExecutor {
     crate::gateway::ensure_crypto_provider();
     ActionExecutor::with_proxy("synthetic-feed-test-token".to_owned(), Some(mock.origin())).unwrap()
@@ -99,7 +118,7 @@ impl FeedFetch for FixtureHttp {
             let fetched = fetch_feed_with(&http, &http, &feed.source, &FetchOptions::default())
                 .await
                 .map_err(|_| ErrorClass::Feed)?;
-            parse_fetched(fetched)
+            parse_fetched(fetched, &feed)
         })
     }
 }
@@ -244,6 +263,179 @@ fn default_off_and_interval_validation() {
     }
 }
 
+/// TOG-19027: the stored feed interval reaches the consumer through the
+/// live snapshot, without a restart. Store-first: the live value wins, an
+/// absent/unparsable/out-of-range value falls back to the boot value.
+#[test]
+fn live_poll_seconds_prefers_the_stored_value() {
+    use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+
+    assert_eq!(live_poll_seconds_with(GUILD, 300, None), 300);
+    let (_, live) = live_channel();
+    assert_eq!(
+        live_poll_seconds_with(GUILD, 300, Some(&live)),
+        300,
+        "empty snapshot falls back"
+    );
+    assert_eq!(
+        live_poll_seconds_with("other-guild", 300, Some(&live)),
+        300,
+        "other guilds fall back"
+    );
+
+    let (mut writer, live) = live_channel();
+    for ((value, expected), revision) in [
+        (json!(600), 600),
+        (json!("120"), 120),
+        // Out of range and unparsable values keep the boot interval.
+        (json!(59), 300),
+        (json!(86401), 300),
+        (json!("hourly"), 300),
+        (json!(["600"]), 300),
+    ]
+    .into_iter()
+    .zip(1i64..)
+    {
+        writer.publish(&SettingsSnapshot {
+            revision,
+            rows: vec![SettingRow {
+                guild_id: GUILD.to_owned(),
+                key: INTERVAL_KEY.to_owned(),
+                value,
+                version: 1,
+            }],
+        });
+        assert_eq!(
+            live_poll_seconds_with(GUILD, 300, Some(&live)),
+            expected,
+            "stored value applies without restart"
+        );
+    }
+
+    // A deleted row hands the interval back to the boot value.
+    writer.publish(&SettingsSnapshot {
+        revision: 7,
+        rows: vec![],
+    });
+    assert_eq!(live_poll_seconds_with(GUILD, 300, Some(&live)), 300);
+}
+
+/// The per-tick schedule gate reschedules the pending run when the stored
+/// interval changes, mirroring the supervisor's cadence policy: the next run
+/// moves to last-begin + new interval, in both directions, without a
+/// restart. An unchanged value leaves the pending slot untouched.
+#[test]
+fn schedule_gate_observes_a_stored_increase_without_restart() {
+    use two_bot_core::feeds::FeedPollSchedule;
+
+    let mut schedule = FeedPollSchedule::new(60).expect("valid boot interval");
+    assert!(schedule.begin(0));
+    schedule.finish();
+
+    // The stored interval moves 60 s to 3600 s without re-registering.
+    assert!(schedule.set_interval_seconds(3600));
+    assert_eq!(schedule.interval_seconds(), 3600);
+    assert!(
+        !schedule.set_interval_seconds(3600),
+        "same interval is a no-op"
+    );
+    assert!(!schedule.set_interval_seconds(59), "out of range refused");
+    assert_eq!(schedule.interval_seconds(), 3600);
+
+    // The pending run rescheduled from t=60 s to last-begin + 3600 s: a tick
+    // at the old slot skips, the run lands at the new slot.
+    assert!(!schedule.begin(61_000), "old slot no longer due");
+    assert!(schedule.begin(3_600_000), "new slot due");
+    schedule.finish();
+
+    // A stored decrease pulls the pending run in to last-begin + 60 s.
+    assert!(schedule.set_interval_seconds(60));
+    assert!(!schedule.begin(3_659_999));
+    assert!(schedule.begin(3_660_000));
+    schedule.finish();
+
+    // Unchanged interval: the pending slot stays exactly one interval out.
+    assert!(!schedule.set_interval_seconds(60));
+    assert!(!schedule.begin(3_719_999));
+    assert!(schedule.begin(3_720_000));
+}
+
+/// End to end through the real supervisor: a stored interval decrease below
+/// the boot cadence takes effect at last-run + new interval without waiting
+/// for the pending boot-cadence slot, and the schedule gate admits exactly
+/// that run (no duplicate, no skip). Paused time only; no network or DB.
+#[tokio::test(start_paused = true)]
+async fn supervisor_applies_a_hot_reloaded_feed_interval_without_restart() {
+    use std::sync::atomic::AtomicU64;
+
+    use crate::jobs::{statuses, supervise};
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let action: JobAction = Arc::new({
+        let runs = runs.clone();
+        move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    });
+    // Boot cadence 3600 s; the stored interval starts at the boot value.
+    let stored = Arc::new(AtomicU64::new(3600));
+    let interval = {
+        let stored = stored.clone();
+        Arc::new(move || stored.load(Ordering::SeqCst))
+    };
+    let job = scheduled_job_dynamic(3600, action, interval).expect("valid boot interval");
+    assert_eq!(job.cadence, Duration::from_secs(3600));
+    assert!(job.cadence_source.is_some(), "supervisor cadence is live");
+
+    let status = statuses(&[NAME], false);
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(supervise(vec![job], status, rx));
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "immediate first run at t=0");
+
+    // Unchanged stored interval: nothing runs inside the boot cadence.
+    tokio::time::advance(Duration::from_secs(300)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    // The stored interval drops to 60 s at t=300. The next run reschedules to
+    // last-run + 60 s (already past), so one prompt run fires on observation
+    // instead of waiting for the t=3600 boot slot.
+    stored.store(60, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "decrease applies promptly");
+
+    // The new 60 s cadence continues: one run per interval, no duplicates.
+    tokio::time::advance(Duration::from_secs(60)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+
+    // An increase back to 3600 s pushes the pending tick out a full new
+    // interval from the last run.
+    stored.store(3600, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(600)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        3,
+        "increase defers the next run"
+    );
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn registration_parks_off_values_without_constructing_work() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -260,7 +452,7 @@ async fn registration_parks_off_values_without_constructing_work() {
             vars.insert("TWO_ANNOUNCEMENTS".to_owned(), value.to_owned());
         }
         let gates = FeatureGates::from_map(&vars).unwrap();
-        assert!(register_gated(gates, action.clone()).is_none());
+        assert!(register_gated(gates, action.clone(), GUILD.to_owned()).is_none());
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let gates = FeatureGates::from_map(&std::collections::HashMap::from([
@@ -268,7 +460,7 @@ async fn registration_parks_off_values_without_constructing_work() {
         ("TWO_FEED_POLL_SECONDS".to_owned(), "60".to_owned()),
     ]))
     .unwrap();
-    let job = register_gated(gates, action).unwrap();
+    let job = register_gated(gates, action, GUILD.to_owned()).unwrap();
     assert_eq!(job.cadence, Duration::from_secs(60));
     assert_eq!(calls.load(Ordering::SeqCst), 0, "registration is lazy");
     (job.action)().await.unwrap();
@@ -299,7 +491,7 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
     });
     let on = announcements(Some("1"));
 
-    let job = register_fenced(on, &fixtures::staging(), action.clone())
+    let job = register_fenced(on, &fixtures::staging(), action.clone(), GUILD.to_owned())
         .expect("staging identity registers the poller");
     assert_eq!(job.name, "feeds");
     (job.action)().await.unwrap();
@@ -307,7 +499,7 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
 
     for (label, activation) in fixtures::refused() {
         assert!(
-            register_fenced(on, &activation, action.clone()).is_none(),
+            register_fenced(on, &activation, action.clone(), GUILD.to_owned()).is_none(),
             "{label} must not register the poller"
         );
     }
@@ -315,9 +507,13 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
 
     // Identity never enables what the environment left off.
     for value in [None, Some("0")] {
-        assert!(
-            register_fenced(announcements(value), &fixtures::staging(), action.clone()).is_none()
-        );
+        assert!(register_fenced(
+            announcements(value),
+            &fixtures::staging(),
+            action.clone(),
+            GUILD.to_owned()
+        )
+        .is_none());
     }
 }
 
@@ -841,4 +1037,461 @@ async fn bounded_recovery_rotates_unresolved_rows_even_when_they_remain_in_xml()
     );
     mock.shutdown().await;
     db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn slow_unresolved_history_leaves_fresh_progress_and_shared_admission_each_pass() {
+    let db = fixture().await;
+    let relay = feed("slow_recovery");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    for index in 0..8 {
+        let post = plan_post(&relay, &item(index)).unwrap();
+        assert_eq!(
+            store::claim_delivery(
+                db.pool(),
+                GUILD,
+                &post,
+                &format!("seed-{index}"),
+                now_millis_for_test() - 120_000,
+            )
+            .await
+            .unwrap(),
+            Some(DeliveryClaim::Fresh),
+        );
+    }
+    let sent = Arc::new(AtomicUsize::new(0));
+    let responses = sent.clone();
+    let mock = MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.ends_with("/users/@me") {
+            me()
+        } else if request.method == "GET" && request.path.contains("/messages") {
+            // Eight misses would consume more than the full relay deadline.
+            // Each successful read still finishes inside the REST wire limit.
+            ScriptedResponse::json(200, json!([])).delayed(Duration::from_secs(4))
+        } else if request.method == "POST" && request.path.ends_with("/messages") {
+            let id = 9001 + responses.fetch_add(1, Ordering::SeqCst);
+            ScriptedResponse::json(200, json!({"id":id.to_string()}))
+        } else {
+            ScriptedResponse::status(500)
+        }
+    })
+    .await;
+    let token = "synthetic-feed-test-token";
+    let admission = Arc::new(
+        two_bot_core::send_admission::PgSendAdmission::new(db.pool().clone(), token).unwrap(),
+    );
+    crate::gateway::ensure_crypto_provider();
+    let rest =
+        ActionExecutor::with_admission(token.to_owned(), Some(mock.origin()), admission).unwrap();
+    let poller = FeedPoller::default();
+    let mut reclaimed = 0;
+    for pass in 0..2 {
+        // Simulate the default five-minute cadence, preserving lease order.
+        sqlx::query("UPDATE feed_deliveries SET claimed_at = claimed_at - interval '300 seconds' WHERE state = 'pending'")
+            .execute(db.pool()).await.unwrap();
+        assert_eq!(
+            poller
+                .run_once(db.pool(), &rest, GUILD, &Items(vec![item(8 + pass)]))
+                .await
+                .err(),
+            Some(ErrorClass::Timeout),
+        );
+        assert_eq!(states(db.pool()).await, ((pass + 1) as i64, 8));
+        assert_eq!(post_count(&mock), pass + 1, "only the new fresh item posts");
+        let searched: i64 = sqlx::query_scalar("SELECT count(*) FROM feed_deliveries WHERE state = 'pending' AND claim_token NOT LIKE 'seed-%'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert!(
+            searched > reclaimed,
+            "unsearched pending rows get the next turn"
+        );
+        reclaimed = searched;
+    }
+    let posts = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .collect::<Vec<_>>();
+    for (index, request) in posts.iter().enumerate() {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let fresh = plan_post(&relay, &item(8 + index)).unwrap();
+        assert_eq!(
+            body["nonce"],
+            json!(fresh.nonce),
+            "no recovery row is reposted"
+        );
+    }
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn identity_only_budget_refusal_keeps_the_unsearched_row_first_next_pass() {
+    let db = fixture().await;
+    let relay = feed("identity_budget");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let unresolved = plan_post(&relay, &item(0)).unwrap();
+    let confirmed = plan_post(&relay, &item(1)).unwrap();
+    // Keep the oldest-first recovery order explicit; equal millisecond claims
+    // fall back to item_key, which need not match source item order.
+    let now_ms = now_millis_for_test();
+    for (index, (post, age_ms)) in [(&unresolved, 180_000), (&confirmed, 120_000)]
+        .into_iter()
+        .enumerate()
+    {
+        store::claim_delivery(
+            db.pool(),
+            GUILD,
+            post,
+            &format!("seed-{index}"),
+            now_ms - age_ms,
+        )
+        .await
+        .unwrap();
+    }
+    let matching_history = history(&confirmed);
+    let mock = MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.ends_with("/users/@me") {
+            me().delayed(Duration::from_secs(4))
+        } else if request.method == "GET" && request.path.contains("/messages") {
+            matching_history.clone().delayed(Duration::from_millis(400))
+        } else {
+            ScriptedResponse::status(500)
+        }
+    })
+    .await;
+    let rest = executor(&mock);
+    let poller = FeedPoller::default();
+    for pass in 0..2 {
+        assert_eq!(
+            poller
+                .run_once(db.pool(), &rest, GUILD, &Items(vec![]))
+                .await
+                .err(),
+            Some(ErrorClass::Timeout),
+        );
+        assert_eq!(states(db.pool()).await, (pass, 2 - pass));
+        assert_eq!(post_count(&mock), 0, "history recovery never posts");
+        if pass == 0 {
+            let token: String =
+                sqlx::query_scalar("SELECT claim_token FROM feed_deliveries WHERE item_key = $1")
+                    .bind(&confirmed.item_key)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                token, "seed-1",
+                "identity-only read must not renew the lease"
+            );
+            sqlx::query("UPDATE feed_deliveries SET claimed_at = claimed_at - interval '300 seconds' WHERE state = 'pending'")
+                .execute(db.pool()).await.unwrap();
+            let next =
+                store::pending_deliveries(db.pool(), &relay, now_millis_for_test(), RECOVERY_LIMIT)
+                    .await
+                    .unwrap();
+            assert_eq!(next[0].item_key, confirmed.item_key);
+        }
+    }
+    let message: String =
+        sqlx::query_scalar("SELECT message_id FROM feed_deliveries WHERE item_key = $1")
+            .bind(&confirmed.item_key)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(message, "9001");
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[test]
+fn cursor_uses_creation_order_and_survives_removal_or_disable() {
+    let poller = FeedPoller::default();
+    let mut newer = feed("a");
+    newer.created_at = 2;
+    let feeds = vec![feed("b"), feed("c"), newer];
+    assert_eq!(poller.start_index(&feeds), 0);
+    poller.advance(&feeds[0]);
+    assert_eq!(poller.start_index(&feeds), 1);
+    // The cursor need not remain in the enabled listing to find its successor.
+    assert_eq!(poller.start_index(&feeds[1..]), 0);
+    poller.advance(&feeds[1]);
+    assert_eq!(poller.start_index(&feeds), 2);
+    assert_eq!(poller.start_index(&[feeds[0].clone(), feeds[2].clone()]), 1);
+    poller.advance(&feeds[2]);
+    assert_eq!(poller.start_index(&feeds), 0, "wrap exactly once");
+    assert_eq!(poller.start_index(&[]), 0);
+    assert!(RELAY_TIMEOUT < PASS_BUDGET && PASS_BUDGET < JOB_TIMEOUT);
+}
+
+struct SlowFeeds {
+    healthy: String,
+    healthy_delay: Duration,
+    started: tokio::sync::mpsc::UnboundedSender<String>,
+    active: Arc<AtomicUsize>,
+}
+
+impl FeedFetch for SlowFeeds {
+    fn fetch(&self, feed: FeedRelay) -> FetchFuture {
+        let healthy = feed.id == self.healthy;
+        let healthy_delay = self.healthy_delay;
+        let started = self.started.clone();
+        let active = self.active.clone();
+        Box::pin(async move {
+            assert_eq!(
+                active.fetch_add(1, Ordering::SeqCst),
+                0,
+                "no overlapping fetch"
+            );
+            let _active = Active(active);
+            started.send(feed.id).unwrap();
+            if healthy {
+                tokio::time::sleep(healthy_delay).await;
+                Ok(vec![item(0)])
+            } else {
+                std::future::pending().await
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn repeated_deadline_passes_reach_a_healthy_tail_without_overlapping_relays() {
+    let db = fixture().await;
+    // A multiple of four exposes the old residual-slot trap: with 30+30+30+10
+    // seconds per pass, this 15-second tail would ALWAYS get only ten seconds.
+    for index in 0..24 {
+        store::add_feed(db.pool(), &feed(&format!("relay-{index:02}")))
+            .await
+            .unwrap();
+    }
+    let feeds = store::list_feeds(db.pool(), GUILD, true).await.unwrap();
+    let healthy = feeds.last().unwrap().id.clone();
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let active = Arc::new(AtomicUsize::new(0));
+    let fetch = SlowFeeds {
+        healthy: healthy.clone(),
+        healthy_delay: Duration::from_secs(15),
+        started,
+        active: active.clone(),
+    };
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"9001"}))).await;
+    let rest = executor(&mock);
+    let poller = FeedPoller::default();
+    let mut visited = Vec::new();
+    for _ in 0..8 {
+        let run = poller.run_once(db.pool(), &rest, GUILD, &fetch);
+        tokio::pin!(run);
+        let result = loop {
+            tokio::select! {
+                result = &mut run => break result,
+                id = starts.recv() => {
+                    let id = id.unwrap();
+                    visited.push(id.clone());
+                    // The injected fetch is pending; no DB/REST I/O is in
+                    // flight. Resume before polling the next DB operation.
+                    let delay = if id == healthy { fetch.healthy_delay } else { RELAY_TIMEOUT };
+                    tokio::time::pause();
+                    tokio::time::advance(delay + Duration::from_millis(1)).await;
+                    tokio::time::resume();
+                }
+            }
+        };
+        assert_eq!(result, Err(ErrorClass::Timeout));
+        assert_eq!(active.load(Ordering::SeqCst), 0, "timed-out work dropped");
+    }
+    assert_eq!(
+        &visited[..24],
+        &feeds.iter().map(|f| f.id.clone()).collect::<Vec<_>>(),
+        "continuation visits every relay in order before wrapping"
+    );
+    assert_eq!(post_count(&mock), 1, "healthy tail delivered");
+    assert_eq!(states(db.pool()).await, (1, 0));
+    let checked = store::list_feeds(db.pool(), GUILD, true).await.unwrap();
+    assert!(checked.last().unwrap().last_checked_at.is_some());
+    assert!(checked[..23].iter().all(|f| f.last_checked_at.is_none()));
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn aborted_registered_action_retains_cursor_and_drops_work_before_next_pass() {
+    let db = fixture().await;
+    for id in ["slow", "tail"] {
+        store::add_feed(db.pool(), &feed(id)).await.unwrap();
+    }
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let active = Arc::new(AtomicUsize::new(0));
+    let fetch = Arc::new(SlowFeeds {
+        healthy: "tail".to_owned(),
+        healthy_delay: Duration::ZERO,
+        started,
+        active: active.clone(),
+    });
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"9001"}))).await;
+    let rest = Arc::new(executor(&mock));
+    let poller = Arc::new(FeedPoller::default());
+    let job = scheduled_job(
+        60,
+        Arc::new({
+            let pool = db.pool().clone();
+            move || {
+                let pool = pool.clone();
+                let rest = rest.clone();
+                let fetch = fetch.clone();
+                let poller = poller.clone();
+                Box::pin(async move { poller.run_once(&pool, &rest, GUILD, fetch.as_ref()).await })
+            }
+        }),
+    )
+    .unwrap();
+    let run = tokio::spawn((job.action)());
+    assert_eq!(starts.recv().await.unwrap(), "slow");
+    run.abort();
+    assert!(run.await.unwrap_err().is_cancelled());
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    let run = tokio::spawn((job.action)());
+    assert_eq!(
+        starts.recv().await.unwrap(),
+        "tail",
+        "cursor retained by job"
+    );
+    assert_eq!(
+        starts.recv().await.unwrap(),
+        "slow",
+        "wrap after delivering tail"
+    );
+    run.abort();
+    assert!(run.await.unwrap_err().is_cancelled());
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(post_count(&mock), 1);
+    assert_eq!(states(db.pool()).await, (1, 0));
+    drop(job);
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn relay_deadline_preserves_delivered_pending_and_fresh_items_across_restart() {
+    let db = fixture().await;
+    let relay = feed("send_deadline");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let pending = plan_post(&relay, &item(1)).unwrap();
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"id":"9001"})),
+            // Shorter than the executor's wire deadline, longer than the relay's.
+            ScriptedResponse::json(200, json!({"id":"9002"})).delayed(Duration::from_secs(4)),
+            me(),
+            ScriptedResponse::json(200, json!([])),
+            ScriptedResponse::json(200, json!({"id":"9003"})),
+            me(),
+            ScriptedResponse::json(
+                200,
+                json!([{
+                    "id":"9002", "channel_id":CHANNEL,
+                    "author":{"id":"5555"}, "nonce":pending.nonce
+                }]),
+            ),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+    let poller = FeedPoller {
+        relay_timeout: Duration::from_secs(3),
+        ..FeedPoller::default()
+    };
+    assert_eq!(
+        poller
+            .run_once(db.pool(), &rest, GUILD, &FixtureHttp::items(3))
+            .await,
+        Err(ErrorClass::Timeout)
+    );
+    assert_eq!(
+        post_count(&mock),
+        2,
+        "relay cancelled during the second POST"
+    );
+    assert_eq!(
+        states(db.pool()).await,
+        (1, 1),
+        "confirmed receipt survives, ambiguous claim remains"
+    );
+    let fresh = plan_post(&relay, &item(2)).unwrap();
+    let fresh_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM feed_deliveries WHERE item_key = $1")
+            .bind(&fresh.item_key)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(fresh_rows, 0, "unvisited fresh item was not claimed");
+    expire(db.pool()).await;
+    let reopened = db.independent_pool().await.unwrap();
+    assert_eq!(
+        run_once(&reopened, &rest, GUILD, &FixtureHttp::items(3)).await,
+        Err(ErrorClass::RecoveryRequired)
+    );
+    assert_eq!(states(&reopened).await, (2, 1));
+    assert_eq!(
+        post_count(&mock),
+        3,
+        "history miss does not repost pending item"
+    );
+    expire(&reopened).await;
+    run_once(&reopened, &rest, GUILD, &FixtureHttp::items(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        states(&reopened).await,
+        (3, 0),
+        "late receipt reconciled without XML"
+    );
+    assert_eq!(post_count(&mock), 3);
+    let message: String =
+        sqlx::query_scalar("SELECT message_id FROM feed_deliveries WHERE item_key = $1")
+            .bind(&pending.item_key)
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+    assert_eq!(message, "9002");
+    let summaries: i64 = sqlx::query_scalar("SELECT count(*) FROM announcements_audit_log WHERE outcome = 'poll_result' AND reason LIKE '%reconciled=1%'")
+        .fetch_one(&reopened).await.unwrap();
+    assert_eq!(summaries, 1);
+    reopened.close().await;
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+/// Production-path metric assertion: the real fetch helper records exactly
+/// one outcome sample plus one error-class sample for a failed fetch. No
+/// network (the source is refused before dialling), no database, and a
+/// runtime-local registry, so removing the production `record_feed_fetch`
+/// call fails this test instead of going silent.
+#[tokio::test]
+async fn public_feed_fetch_records_failed_fetch_without_network() {
+    use two_bot_core::metrics::Metrics;
+
+    let metrics = Metrics::default();
+    let mut relay = feed("metric-path");
+    relay.source = "not a feed source".to_owned();
+    let result = fetch_public_feed(&metrics, &relay.source).await;
+    assert!(
+        matches!(result, Err(ErrorClass::Feed)),
+        "invalid source must surface as a feed error"
+    );
+    let text = metrics.render(None);
+    assert!(
+        text.contains("two_bot_feed_fetches_total{outcome=\"invalid_source\"} 1\n"),
+        "exactly one invalid_source outcome sample, got:\n{text}"
+    );
+    assert!(
+        text.contains("two_bot_feed_fetch_errors_total{error_class=\"invalid_source\"} 1\n"),
+        "exactly one invalid_source error-class sample, got:\n{text}"
+    );
+    assert!(
+        !text.contains("metric-path"),
+        "no feed id in any label, got:\n{text}"
+    );
 }

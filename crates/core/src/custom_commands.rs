@@ -27,6 +27,15 @@ pub const MAX_RENDERED_CHARS: usize = 2000;
 pub const MAX_DESCRIPTION_CHARS: usize = 100;
 /// Command-name bound, characters (legacy `NAME_PATTERN` `{1,32}`).
 pub const MAX_COMMAND_NAME_CHARS: usize = 32;
+/// Text-trigger bound, characters including the leading `!` (legacy
+/// `TRIGGER_PATTERN` `^![a-z0-9_-]{1,32}$`: one `!` plus a command name).
+pub const MAX_TEXT_TRIGGER_CHARS: usize = MAX_COMMAND_NAME_CHARS + 1;
+/// Placeholder-extraction bound: `placeholders_in` returns at most this many
+/// distinct keys in first-seen order, then stops scanning. Only four keys are
+/// ever known, so any five distinct keys already contain an unknown one —
+/// capping at 64 preserves `validate_template`'s unknown-placeholder refusal
+/// exactly while keeping hostile inputs total-bounded in time and memory.
+pub const MAX_PLACEHOLDERS: usize = 64;
 
 /// Said to anybody who reaches a custom command while automations are off
 /// (legacy `AUTOMATIONS_DISABLED_REPLY`; one constant shared with the router).
@@ -80,13 +89,17 @@ fn placeholder_end(bytes: &[u8], i: usize) -> Option<usize> {
 }
 
 /// Every placeholder the template references, deduplicated in first-seen
-/// order (legacy `placeholdersIn`).
+/// order (legacy `placeholdersIn`), capped at [`MAX_PLACEHOLDERS`] distinct
+/// keys so hostile inputs stay total-bounded.
 #[must_use]
 pub fn placeholders_in(template: &str) -> Vec<String> {
     let bytes = template.as_bytes();
     let mut found = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
+        if found.len() >= MAX_PLACEHOLDERS {
+            break;
+        }
         if bytes[i] == b'{' {
             if let Some(end) = placeholder_end(bytes, i) {
                 let key = template[i + 1..end - 1].to_owned();
@@ -122,22 +135,31 @@ pub fn validate_template(template: &str) -> Result<(), TemplateError> {
 /// Render a validated template against `ctx` (legacy `renderTemplate`).
 /// Unknown-but-pattern-matching keys render literally (unreachable after
 /// validation, kept so render never invents text); output past Discord's
-/// ceiling is refused.
+/// ceiling is refused. The render refuses once buffered bytes breach a byte
+/// tripwire (`3 *` the ceiling: byte length upper-bounds UTF-16 length, so
+/// past the tripwire the output is certainly over-ceiling), materialising at
+/// most one expansion past it. Outputs within the tripwire render exactly as
+/// before, keeping exact lengths; tripwire refusals report buffered bytes,
+/// always past the ceiling.
 pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, TemplateError> {
     let bytes = template.as_bytes();
-    let mut out = String::with_capacity(template.len());
+    let mut out = String::new();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
             if let Some(end) = placeholder_end(bytes, i) {
                 let key = &template[i + 1..end - 1];
-                match key {
-                    "user" => out.push_str(&ctx.user),
-                    "username" => out.push_str(&ctx.username),
-                    "server" => out.push_str(&ctx.server),
-                    "channel" => out.push_str(&ctx.channel),
-                    _ => out.push_str(&template[i..end]),
+                let text = match key {
+                    "user" => ctx.user.as_str(),
+                    "username" => ctx.username.as_str(),
+                    "server" => ctx.server.as_str(),
+                    "channel" => ctx.channel.as_str(),
+                    _ => &template[i..end],
+                };
+                if out.len() > MAX_RENDERED_CHARS * 3 {
+                    return Err(TemplateError::RenderTooLong(out.len()));
                 }
+                out.push_str(text);
                 i = end;
                 continue;
             }
@@ -297,8 +319,8 @@ pub fn builtin_command_names() -> HashSet<String> {
 }
 
 /// Names a custom command may not be *written* under: every builtin plus the
-/// voice-room set. The voice sink dispatches by name, so a custom command named
-/// `setup` or `export` would reach the voice handlers the moment `TWO_VOICE`
+/// voice-room and assistant sets. The voice sink dispatches by name, so a custom
+/// command named `setup` or `export` would reach the voice handlers the moment `TWO_VOICE`
 /// turns on, even if it was created while voice was off. This guards writes
 /// only (`/command`, imports). Dispatch keeps [`builtin_command_names`], so a
 /// stored row that predates the reservation keeps running while voice is off.
@@ -308,6 +330,7 @@ pub fn reserved_command_names() -> HashSet<String> {
     names.extend(
         super::voice_rooms::voice_commands()
             .into_iter()
+            .chain(super::voice_assistant::assistant_commands())
             .map(|def| def.name),
     );
     names
@@ -337,6 +360,10 @@ pub struct AuditRecord {
     pub reason: Option<String>,
 }
 
+fn bounded_audit_name(name: &str) -> String {
+    name.chars().take(MAX_COMMAND_NAME_CHARS).collect()
+}
+
 impl AuditRecord {
     #[must_use]
     pub fn put(guild_id: &str, actor_id: &str, name: &str, created: bool) -> Self {
@@ -349,7 +376,7 @@ impl AuditRecord {
                 "command.update"
             })
             .to_owned(),
-            target_key: Some(name.to_owned()),
+            target_key: Some(bounded_audit_name(name)),
             outcome: "ok".to_owned(),
             reason: None,
         }
@@ -372,7 +399,7 @@ impl AuditRecord {
                 "command.create"
             })
             .to_owned(),
-            target_key: Some(name.to_owned()),
+            target_key: Some(bounded_audit_name(name)),
             outcome: "rejected".to_owned(),
             reason: Some(error_code(err).to_owned()),
         }
@@ -384,7 +411,7 @@ impl AuditRecord {
             guild_id: guild_id.to_owned(),
             actor_id: Some(actor_id.to_owned()),
             action: "command.delete".to_owned(),
-            target_key: Some(name.to_owned()),
+            target_key: Some(bounded_audit_name(name)),
             outcome: (if deleted { "ok" } else { "absent" }).to_owned(),
             reason: None,
         }
@@ -396,7 +423,7 @@ impl AuditRecord {
             guild_id: guild_id.to_owned(),
             actor_id: Some(actor_id.to_owned()),
             action: "command.run".to_owned(),
-            target_key: Some(name.to_owned()),
+            target_key: Some(bounded_audit_name(name)),
             outcome: (if ok { "ok" } else { "failed" }).to_owned(),
             reason: reason.map(str::to_owned),
         }
@@ -680,6 +707,59 @@ mod tests {
     }
 
     #[test]
+    fn template_placeholders_in_is_total_bounded_on_hostile_input() {
+        // 200 distinct lowercase keys: unbounded extraction would return all
+        // 200; the hold caps distinct placeholders so fuzz-sized inputs stay
+        // bounded in time and memory.
+        fn alpha_key(mut n: usize) -> String {
+            let mut key = Vec::new();
+            loop {
+                key.push((b'a' + (n % 26) as u8) as char);
+                n /= 26;
+                if n == 0 {
+                    break;
+                }
+                n -= 1;
+            }
+            key.into_iter().rev().collect()
+        }
+        let hostile: String = (0..200).map(|i| format!("{{{}}}", alpha_key(i))).collect();
+        let found = placeholders_in(&hostile);
+        assert!(
+            found.len() <= 64,
+            "placeholders_in must stay total-bounded, got {}",
+            found.len()
+        );
+        // First-seen order preserved for the capped prefix.
+        assert_eq!(found[0], alpha_key(0));
+        assert_eq!(found[1], alpha_key(1));
+    }
+
+    #[test]
+    fn template_render_hostile_expansion_refused_without_panic() {
+        // Degenerate expansion: many placeholders over a large context must
+        // fail as a bounded RenderTooLong, never panic, hang, or blow up to
+        // the full expansion. The byte tripwire refuses once buffered bytes
+        // breach it (here the second push sees 10_000 buffered bytes),
+        // reporting bytes always past the ceiling.
+        let ctx = TemplateContext {
+            user: "y".repeat(10_000),
+            username: String::new(),
+            server: String::new(),
+            channel: String::new(),
+        };
+        let template = "{user}".repeat(500);
+        let result = render_template(&template, &ctx);
+        assert!(
+            matches!(
+                result,
+                Err(TemplateError::RenderTooLong(len)) if len > MAX_RENDERED_CHARS
+            ),
+            "expected bounded RenderTooLong, got {result:?}"
+        );
+    }
+
+    #[test]
     fn template_lengths_bounded() {
         assert_eq!(validate_template(""), Err(TemplateError::InvalidLength));
         assert_eq!(
@@ -836,6 +916,51 @@ mod tests {
                 def.name
             );
         }
+    }
+
+    #[test]
+    fn write_reservations_cover_the_maximal_publish_set_and_capacity() {
+        use crate::commands::CustomCommand;
+        use crate::router::{InteractionRouter, RouterGates};
+
+        let router = InteractionRouter::new(RouterGates {
+            scorecard: true,
+            automations: true,
+            announcements: true,
+            moderation: true,
+            voice: true,
+            voice_assistant: true,
+            configured_guild: Some(1),
+            tickets: false,
+            self_roles: false,
+            onboarding_picker: false,
+            session_picker: false,
+        });
+        let reserved = reserved_command_names();
+        let definitions = router.publish_set(&[]).unwrap();
+        let published: HashSet<_> = definitions.iter().map(|def| def.name.clone()).collect();
+        assert_eq!(reserved, published);
+        assert!(reserved.contains("templateassistant"));
+        assert_eq!(
+            validate_put_input(&put_input("templateassistant"), &reserved),
+            Err(CommandError::ReservedName("templateassistant".to_owned()))
+        );
+        let capacity = max_custom_commands(reserved.len());
+        let custom: Vec<_> = (0..capacity)
+            .map(|index| CustomCommand {
+                name: format!("custom-{index}"),
+                description: "Custom command".to_owned(),
+                enabled: true,
+            })
+            .collect();
+        assert_eq!(
+            router.publish_set(&custom).unwrap().len(),
+            GUILD_COMMAND_LIMIT
+        );
+        assert_eq!(
+            check_capacity(capacity, true, reserved.len()),
+            Err(CommandError::OverCapacity(capacity))
+        );
     }
 
     #[test]
@@ -1016,6 +1141,79 @@ mod tests {
         let d = adjudicate_delete(GUILD, ACTOR, "faq", false);
         assert!(!d.deleted && !d.resync_registry);
         assert_eq!(d.audit.outcome, "absent");
+    }
+
+    #[test]
+    fn rejected_and_absent_audits_bound_untrusted_names() {
+        let name = "😀".repeat(MAX_COMMAND_NAME_CHARS + 17);
+        let expected = "😀".repeat(MAX_COMMAND_NAME_CHARS);
+        let err = CommandError::ReservedName("ban".to_owned());
+
+        let rejected = AuditRecord::put_rejected(GUILD, ACTOR, &name, false, &err);
+        assert_eq!(rejected.outcome, "rejected");
+        assert_eq!(rejected.target_key.as_deref(), Some(expected.as_str()));
+
+        let absent = adjudicate_delete(GUILD, ACTOR, &name, false);
+        assert_eq!(absent.audit.outcome, "absent");
+        assert_eq!(absent.audit.target_key.as_deref(), Some(expected.as_str()));
+    }
+
+    fn successful_audits_expecting_target(
+        name: &str,
+        target: &str,
+    ) -> [(&'static str, AuditRecord, AuditRecord); 5] {
+        let expect = |action: &str, outcome: &str, reason: Option<&str>| AuditRecord {
+            guild_id: GUILD.to_owned(),
+            actor_id: Some(ACTOR.to_owned()),
+            action: action.to_owned(),
+            target_key: Some(target.to_owned()),
+            outcome: outcome.to_owned(),
+            reason: reason.map(str::to_owned),
+        };
+        [
+            (
+                "put created",
+                adjudicate_put(GUILD, ACTOR, name, None).audit,
+                expect("command.create", "ok", None),
+            ),
+            (
+                "put updated",
+                adjudicate_put(GUILD, ACTOR, name, Some(&stored("faq"))).audit,
+                expect("command.update", "ok", None),
+            ),
+            (
+                "delete ok",
+                adjudicate_delete(GUILD, ACTOR, name, true).audit,
+                expect("command.delete", "ok", None),
+            ),
+            (
+                "run ok",
+                AuditRecord::run(GUILD, ACTOR, name, true, None),
+                expect("command.run", "ok", None),
+            ),
+            (
+                "run failed",
+                AuditRecord::run(GUILD, ACTOR, name, false, Some("delivery_failed")),
+                expect("command.run", "failed", Some("delivery_failed")),
+            ),
+        ]
+    }
+
+    #[test]
+    fn successful_audits_bound_target_key_by_characters_at_the_name_limit() {
+        let bound = MAX_COMMAND_NAME_CHARS;
+        for (input_chars, kept_chars) in [
+            (bound - 1, bound - 1),
+            (bound, bound),
+            (bound + 1, bound),
+            (bound + 17, bound),
+        ] {
+            let name = "😀".repeat(input_chars);
+            let target = "😀".repeat(kept_chars);
+            for (label, audit, expected) in successful_audits_expecting_target(&name, &target) {
+                assert_eq!(audit, expected, "{label} with {input_chars} characters");
+            }
+        }
     }
 
     #[test]

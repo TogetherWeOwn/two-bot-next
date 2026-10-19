@@ -366,7 +366,7 @@ impl TestSchema {
 
 #[tokio::test]
 #[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
-async fn raid_runtime_store_tuning_is_live_and_the_channel_is_boot_only() {
+async fn raid_runtime_store_tuning_and_channel_are_live() {
     let db = TestSchema::new().await;
     let guild = GUILD.to_string();
     let deployment: HashMap<String, String> = HashMap::from([
@@ -419,17 +419,22 @@ async fn raid_runtime_store_tuning_is_live_and_the_channel_is_boot_only() {
     assert_eq!(live.tuning, RaidTuning::new(30.0, 3.0).unwrap());
     assert_eq!(
         live.staff_channel.as_deref(),
-        Some("123456789012345678"),
-        "the staff channel is not hot-wired; a stored row does not move it"
+        Some("999999999999999999"),
+        "the staff channel is hot-wired; a stored row moves it"
     );
 
-    // Deleting the override hands the key back to the deployment value.
+    // Deleting the overrides hands the keys back to the deployment values.
     store
         .set(&guild, "TWO_RAID_JOIN_THRESHOLD", None, "raid-test")
         .await
         .unwrap();
+    store
+        .set(&guild, "DISCORD_STAFF_ALERT_CHANNEL_ID", None, "raid-test")
+        .await
+        .unwrap();
     let back = source.current().await;
     assert_eq!(back.tuning, RaidTuning::new(30.0, 7.0).unwrap());
+    assert_eq!(back.staff_channel.as_deref(), Some("123456789012345678"));
 
     // A failed refresh keeps the last good values.
     db.pool.close().await;

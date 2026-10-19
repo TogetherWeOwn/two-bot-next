@@ -67,8 +67,7 @@ class SelectionTests(unittest.TestCase):
         # The container selector owns the image build and the check job's
         # offline manifest step always runs, so no test job is needed -- but
         # the SBOM/vulnerability scan inventories exactly these files.
-        for path in ["Dockerfile", "Dockerfile.distroless",
-                     ".dockerignore"]:
+        for path in ["Dockerfile", ".dockerignore"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {SUPPLY}, path)
         self.assertEqual(
@@ -103,6 +102,17 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {RUST}, path)
 
+    def test_fuzz_workspace_inputs_run_everything(self):
+        # The separate cargo-fuzz workspace resolves outside the root
+        # lockfile, so any of its inputs runs the full matrix (including the
+        # locked fuzz-compile gate) rather than silently skipping it. The
+        # fuzz README stays docs-only: it selects no job.
+        for path in ["fuzz/Cargo.toml", "fuzz/Cargo.lock",
+                     "fuzz/fuzz_targets/rsvp.rs"]:
+            with self.subTest(path=path):
+                self.assertEqual(inputs.classify(path), inputs.ALL_JOBS, path)
+        self.assertEqual(inputs.classify("fuzz/README.md"), set())
+
     def test_voice_template_assets_skip_heavy_jobs(self):
         # Coverage, validator tests and readme are validated by the check
         # job's hermetic offline step, which always runs. Only the corpus
@@ -120,7 +130,7 @@ class SelectionTests(unittest.TestCase):
         # Docs-only: skips Rust and supply, keeps worker (docs/ listing
         # assertion). `docs` is informational only and gates nothing.
         self.assertEqual(
-            jobs(["docs/metrics.md", "README.md"]),
+            jobs(["docs/gateway-recovery.md", "README.md"]),
             {RUST: False, WORKER: True, PARITY: False,
              SUPPLY: False, DOCS: True})
         # Asset-only: validator assets plus chrome select no job; the
@@ -136,7 +146,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(
             jobs(["tests/voice_templates/coverage.json",
                   "tests/voice_templates/README.md",
-                  "docs/metrics.md", "README.md"]),
+                  "docs/gateway-recovery.md", "README.md"]),
             {RUST: False, WORKER: True, PARITY: False,
              SUPPLY: False, DOCS: True})
         # Code: runs Rust, worker and supply (the scan inventories the
@@ -179,18 +189,23 @@ class SelectionTests(unittest.TestCase):
     def test_worker_tree_selects_worker_only(self):
         for path in ["wrangler/src/index.ts",
                      "wrangler/test/container-env.test.ts",
-                     "wrangler/package.json", "wrangler/wrangler.toml",
+                     "wrangler/package.json",
                      "wrangler/scripts/check-env-bindings.py"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
 
     def test_rust_docs_select_rust_only(self):
-        # Content reads only; existence-only docs (staging-soak/backup/
+        # Content reads only; existence-only docs (staging-soak/
         # preflight) fall through to the worker-only docs rule.
+        # docs/backup.md reads content in the voice owner-grant journal
+        # regression, so it selects rust despite the preconditions
+        # existence check.
         rust_docs = ["docs/cutover.md",
                      "docs/commands.md", "docs/configuration.md",
                      "docs/voice-rooms.md",
-                     "docs/soak-checklist.json", "docs/soak-checklist.md"]
+                     "docs/soak-checklist.json", "docs/soak-checklist.md",
+                     "docs/privacy.md", "docs/database-roles.md",
+                     "docs/rollback-delta.md", "docs/backup.md"]
         for path in rust_docs:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {RUST}, path)
@@ -200,6 +215,31 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(inputs.classify("docs/parity-baseline.json"),
                          {PARITY})
 
+    def test_metrics_doc_selects_rust_and_worker(self):
+        # docs/metrics.md is read by both the Rust exposition-conformance
+        # test and the worker event/alert catalog tests, so its edits run
+        # the Rust matrix, the worker job and the supply scan (via rust).
+        self.assertEqual(inputs.classify("docs/metrics.md"),
+                         {RUST, WORKER})
+        self.assertEqual(
+            jobs(["docs/metrics.md"]),
+            {RUST: True, WORKER: True, PARITY: False,
+             SUPPLY: True, DOCS: True})
+
+    def test_embedded_rust_inputs_select_rust_and_worker(self):
+        self.assertEqual(inputs.classify("docs/startup-diagnostics.md"),
+                         {RUST, WORKER})
+        self.assertEqual(inputs.classify("wrangler/wrangler.toml"),
+                         {RUST, WORKER})
+        self.assertEqual(
+            jobs(["docs/startup-diagnostics.md"]),
+            {RUST: True, WORKER: True, PARITY: False,
+             SUPPLY: True, DOCS: True})
+        self.assertEqual(
+            jobs(["wrangler/wrangler.toml"]),
+            {RUST: True, WORKER: True, PARITY: False,
+             SUPPLY: True, DOCS: False})
+
     def test_runbook_docs_select_worker_only(self):
         for path in ["docs/runbook.md", "docs/container-readiness.md"]:
             with self.subTest(path=path):
@@ -208,10 +248,11 @@ class SelectionTests(unittest.TestCase):
     def test_unrelated_docs_select_worker_only(self):
         # No file reader in PR-run code, but runbook.test.ts asserts on the
         # docs/ listing itself (case-collision + readiness links).
-        for path in ["docs/metrics.md", "docs/gateway-recovery.md",
+        # docs/database-roles.md left this list: the voice owner-grant
+        # journal regression reads its content, so it selects rust.
+        for path in ["docs/gateway-recovery.md",
                      "docs/leveling-port.md", "docs/feeds-port.md",
                      "docs/distroless-evaluation.md", "docs/build-cache.md",
-                     "docs/database-roles.md",
                      "docs/member-journey-parity.md"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
@@ -259,7 +300,7 @@ class SelectionTests(unittest.TestCase):
 
     def test_docs_only_pr_skips_rust_and_supply(self):
         self.assertEqual(
-            jobs(["docs/metrics.md", "docs/gateway-recovery.md",
+            jobs(["docs/leveling-port.md", "docs/gateway-recovery.md",
                   "README.md", ".github/CODEOWNERS"]),
             {RUST: False, WORKER: True, PARITY: False,
              SUPPLY: False, DOCS: True})
@@ -311,7 +352,8 @@ class SelectionTests(unittest.TestCase):
 
     def test_cli_job_flag_prints_single_value(self):
         with patch.object(inputs, "git_diff_names",
-                          side_effect=self.fake_diff(["docs/metrics.md"])):
+                          side_effect=self.fake_diff(
+                              ["docs/gateway-recovery.md"])):
             for job, want in ((RUST, "false"), (WORKER, "true"),
                               (PARITY, "false"), (SUPPLY, "false"),
                               (DOCS, "true")):
@@ -345,37 +387,46 @@ class SelectionTests(unittest.TestCase):
 
 
 class ReaderCoverageTests(unittest.TestCase):
-    """Every doc-literal reader must agree with the classifier.
+    """Every repo-owned literal content reader must agree with the classifier.
 
-    If a new docs/ read lands in Rust/scripts/wrangler code, this suite
-    forces the RUST_DOCS/WORKER_DOCS/PARITY_DOCS sets to follow it.
+    Rust literal include_str! paths resolve from their source file; dynamic
+    macro arguments are intentionally outside this scan. The existence-only
+    docs policy remains separate from content-reader classification.
     """
 
     # Docs the preconditions binary checks by existence only (is_file, never
     # content): a content edit cannot break Rust, and a deletion forces all
     # jobs via the deletion rule. Every other docs/ literal in Rust is a
-    # content read and must select the rust job.
+    # content read and must select the rust job. docs/backup.md left this
+    # set: the voice owner-grant journal regression reads its content, so a
+    # content edit must select rust (the preconditions is_file check still
+    # holds alongside the content read).
     EXISTENCE_ONLY_DOCS = frozenset({
         "docs/staging-soak.md",
-        "docs/backup.md",
         "docs/preflight.md",
         "docs/runbook.md",
     })
 
-    def test_rust_doc_literals_are_classified_rust(self):
-        literals = set()
-        for path in list((ROOT / "crates").rglob("*.rs")) + (
-                [ROOT / "src/lib.rs"] if (ROOT / "src/lib.rs").exists() else []):
-            for line in path.read_text().splitlines():
-                if line.strip().startswith("//"):
-                    continue
-                literals.update(
-                    re.findall(r'"(docs/[A-Za-z0-9_./-]+\.md)"', line))
-        self.assertTrue(literals, "expected Rust doc literals")
+    def test_rust_content_readers_are_classified_rust(self):
+        content_readers = set()
+        rust_sources = list((ROOT / "crates").rglob("*.rs")) + (
+            [ROOT / "src/lib.rs"] if (ROOT / "src/lib.rs").exists() else [])
+        for source in rust_sources:
+            source_text = "\n".join(
+                line for line in source.read_text().splitlines()
+                if not line.strip().startswith("//"))
+            content_readers.update(re.findall(
+                r'"(docs/[A-Za-z0-9_./-]+\.(?:md|json))"', source_text))
+            for include_path in re.findall(
+                    r'include_str!\(\s*"([A-Za-z0-9_./-]+)"\s*\)', source_text):
+                resolved = (source.parent / include_path).resolve()
+                if resolved.is_file() and resolved.is_relative_to(ROOT):
+                    content_readers.add(resolved.relative_to(ROOT).as_posix())
+        self.assertTrue(content_readers, "expected Rust content readers")
         for doc in self.EXISTENCE_ONLY_DOCS:
-            self.assertIn(doc, literals, f"{doc} left Rust sources")
-        for literal in sorted(literals):
-            with self.subTest(doc=literal):
+            self.assertIn(doc, content_readers, f"{doc} left Rust sources")
+        for literal in sorted(content_readers):
+            with self.subTest(path=literal):
                 if literal in self.EXISTENCE_ONLY_DOCS:
                     self.assertNotIn(RUST, inputs.classify(literal), literal)
                 else:
@@ -474,7 +525,8 @@ class WorkflowSurfaceTests(unittest.TestCase):
     def test_consumer_jobs_wait_on_selector(self):
         for job in ("check", "rust-tests", "ignored-db-stores",
                     "ignored-db-runtime", "community-db", "feeds-db",
-                    "tickets-postgres", "worker", "supply-chain", "ci-ok"):
+                    "tickets-postgres", "worker", "supply-chain", "ci-ok",
+                    "fuzz-compile"):
             head = self.text.split(f"\n  {job}:")[1].split("steps:", 1)[0]
             with self.subTest(job=job):
                 self.assertIn("job-inputs", head)
@@ -505,10 +557,11 @@ class WorkflowSurfaceTests(unittest.TestCase):
         for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
                     "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
-                    "feeds-db", "tickets-postgres", "moderation-db"):
+                    "feeds-db", "tickets-postgres", "moderation-db", "fuzz-compile"):
             self.assertIn(job, head)
         body = self.text.split("\n  ci-ok:")[1]
         self.assertIn("SUPPLY_SELECTED", body)
+        self.assertIn("FUZZ_COMPILE_RESULT", body)
         self.assertIn("ci-ok passed", body)
 
     def test_weekly_full_run_schedule_exists(self):
@@ -594,10 +647,17 @@ class WorkflowSurfaceTests(unittest.TestCase):
     # Always-on gates that only touch the checkout and the `agent-testdb`
     # service; they never need the toolchain or the CI database.
     ALWAYS_ON = ("Job-container prerequisites",)
+    # Name-pinned exemption from the guard above (deterministic quality
+    # gates): the deny action ships its own toolchain and reads only the
+    # lockfile plus the advisory DB, so its advisories run on every PR,
+    # including docs-only, with no repo toolchain or database. Any other step
+    # mentioning cargo still needs the guard.
+    SELF_CONTAINED = ("cargo-deny",)
 
     def unguarded(self, text, job):
         return [name for name, body in self.job_steps(text, job)
                 if not name.startswith(self.ALWAYS_ON)
+                and name not in self.SELF_CONTAINED
                 and self.NEEDS_RUST.search(body)
                 and not re.search(r"(?m)^\s+if:.*needs\.job-inputs\.outputs\.rust != 'false'", body)]
 
@@ -607,6 +667,14 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertEqual(self.unguarded(self.text, "check"), [],
                          "needs the Rust toolchain or the CI database but is not "
                          "guarded by the rust selector")
+
+    def test_cargo_deny_runs_ungated_on_every_pr(self):
+        # Deterministic quality gates: advisories run on every PR, so the
+        # self-contained deny step carries no selector guard. The exemption
+        # stays name-pinned to this one step.
+        self.assertEqual(self.SELF_CONTAINED, ("cargo-deny",))
+        body = dict(self.job_steps(self.text, "check"))["cargo-deny"]
+        self.assertNotIn("needs.job-inputs.outputs.rust", body)
 
     def test_rust_test_lanes_skip_at_the_job_level(self):
         # No Rust inputs (docs-only, worker-UI-only): the lanes never start,
@@ -621,6 +689,21 @@ class WorkflowSurfaceTests(unittest.TestCase):
                     self.assertNotRegex(
                         body, r"(?m)^\s+if:.*outputs\.rust",
                         f"{name!r}: the lane is already gated at the job level")
+
+    def test_fuzz_compile_lane_skips_at_the_job_level(self):
+        # Compile-only libFuzzer lane follows the same rust selector as the
+        # test lanes; ci-ok only accepts its skip when rust was deselected.
+        head = self.job_text(self.text, "fuzz-compile").split("\n    steps:\n", 1)[0]
+        self.assertIn(f"\n    {self.LANE_GUARD}\n", head)
+        self.assertIn("job-inputs", head)
+        body = self.job_text(self.text, "fuzz-compile")
+        self.assertIn("fuzz build", body)
+        # The `+nightly` selector is load-bearing: the repo-root
+        # rust-toolchain.toml (stable) otherwise wins over the installed
+        # nightly and `-Zsanitizer` fails.
+        self.assertIn("cargo +nightly-2026-10-01 fuzz build", body)
+        self.assertIn("cargo +nightly-2026-10-01 fetch --locked", body)
+        self.assertNotIn("cargo fuzz run", body)
 
     def test_guard_scan_flags_an_unguarded_db_step(self):
         # Self-test of the scan: dropping the guard on a step that needs the
@@ -645,6 +728,54 @@ class WorkflowSurfaceTests(unittest.TestCase):
     def test_push_to_main_selects_everything(self):
         self.assertIn("pull_request", self.selector)
         self.assertIn("rust=true", self.selector)
+
+class VoiceSelectionTest(unittest.TestCase):
+    """Owner policy 2026-10-11: the voice synthetic runs on PRs only for voice inputs."""
+
+    def test_voice_inputs_select_the_synthetic(self):
+        for path in (
+            "crates/bot/src/voice_rooms.rs",
+            "crates/bot/src/voice_rooms/join_requests.rs",
+            "crates/core/src/voice_name_filter.rs",
+            "crates/bot/src/gateway.rs",
+            "crates/discord/src/voice_rooms.rs",
+            "crates/cutover/src/voice_rooms.rs",
+            "crates/discord/src/voice_rooms_http_tests.rs",
+            "./crates/cutover/src/voice_rooms.rs",
+            "tests/voice_templates/corpus.json",
+            "Cargo.lock",
+            "scripts/staging_voice_synthetic.py",
+            ".github/workflows/voice-synthetic.yml",
+            "./crates/bot/src/voice_room_plan.rs",
+        ):
+            self.assertTrue(inputs.voice_selected([path]), path)
+
+    def test_unrelated_changes_skip_the_synthetic(self):
+        for path in (
+            "crates/bot/src/tickets.rs",
+            "crates/core/src/settings.rs",
+            "crates/discord/src/automod.rs",
+            "crates/cutover/src/tickets.rs",
+            "crates/cutover/src/voice_config_store.rs",
+            "crates/cutover/src/voice_ghosts.rs",
+            "crates/cutover/src/voice_reconcile.rs",
+            "docs/voice-rooms.md",
+            "wrangler/src/index.ts",
+            "README.md",
+        ):
+            self.assertFalse(inputs.voice_selected([path]), path)
+        self.assertFalse(inputs.voice_selected([]))
+
+    def test_any_deletion_selects_the_synthetic(self):
+        self.assertTrue(inputs.voice_selected([], ["docs/old.md"]))
+        for path in (
+            "crates/discord/src/voice_rooms.rs",
+            "crates/cutover/src/voice_rooms.rs",
+        ):
+            self.assertTrue(inputs.voice_selected([], [path]), path)
+
+    def test_voice_is_never_a_ci_job(self):
+        self.assertNotIn(inputs.VOICE, inputs.ALL_JOBS)
 
 
 if __name__ == "__main__":

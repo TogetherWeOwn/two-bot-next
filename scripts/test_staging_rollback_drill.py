@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -123,10 +124,10 @@ class WorldOpener:
 
 
 def make_control(world):
-    def control(action, epoch=None, release_fence=False):
+    def control(action, epoch=None, release_fence=False, expected_deployment=None):
         world.tick(1)
         count = sum(1 for call in world.calls if call[0] == action) + 1
-        world.calls.append((action, epoch, release_fence))
+        world.calls.append((action, epoch, release_fence, expected_deployment))
         world.events.append(("control", action))
         failure = world.fail_control.get((action, count))
         if failure:
@@ -361,9 +362,9 @@ class EvidenceTests(unittest.TestCase):
         world = World()
         control = make_control(world)
 
-        def hostile(action, epoch=None, release_fence=False):
-            state = control(action, epoch, release_fence)
-            if action == "status" and world.calls.count(("status", None, False)) >= 2:
+        def hostile(action, epoch=None, release_fence=False, expected_deployment=None):
+            state = control(action, epoch, release_fence, expected_deployment)
+            if action == "status" and world.calls.count(("status", None, False, None)) >= 2:
                 state["owner"]["phase"] = f"weird {SENTINEL}"
             return state
 
@@ -518,6 +519,24 @@ class ClientAndControlTests(unittest.TestCase):
         with patch.object(drill.subprocess, "run", return_value=done) as run:
             control("deployment-takeover", release_fence=True)
         self.assertEqual(run.call_args.kwargs["env"]["OWNERSHIP_RELEASE_FENCE"], "true")
+        self.assertNotIn("OWNERSHIP_EXPECTED_DEPLOYMENT", run.call_args.kwargs["env"])
+
+    def test_expected_deployment_travels_only_in_the_child_environment(self):
+        done = subprocess.CompletedProcess([], 0, stdout=json.dumps({"owner": {"phase": "active", "epoch": 1}}),
+                                           stderr="")
+        control = drill.ownership_control(SENTINEL, URL, "github-actions:1:rollback-drill", root="/repo")
+        with patch.object(drill.subprocess, "run", return_value=done) as run:
+            control("deployment-takeover", release_fence=True, expected_deployment=TARGET)
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["OWNERSHIP_EXPECTED_DEPLOYMENT"], TARGET)
+        self.assertNotIn(TARGET, " ".join(run.call_args.args[0]))
+
+    def test_takeover_legs_pin_the_target_and_restore_versions(self):
+        world = World()
+        instance, failures, logs = run_drill(world)
+        self.assertEqual(failures, [])
+        takeovers = [call for call in world.calls if call[0] == "deployment-takeover"]
+        self.assertEqual([call[3] for call in takeovers], [TARGET, PRE])
 
     def test_child_environment_keeps_only_path_and_explicit_ownership_inputs(self):
         inherited = {"PATH": "/runtime/bin:/usr/bin", "CLOUDFLARE_API_TOKEN": SENTINEL,
@@ -555,6 +574,13 @@ class ClientAndControlTests(unittest.TestCase):
             ("Ownership control failed (HTTP 403); stop, do not change credentials", "ownership_auth_failed", None),
             ("Ownership control failed (HTTP 503); stop, do not change credentials", "ownership_control_failed",
              "Ownership control failed (HTTP 503)"),
+            ("Ownership control failed (HTTP 503) reason=deployment_mismatch attempts=12 elapsed=121s; "
+             "stop, do not change credentials", "ownership_control_failed", "Ownership control failed (HTTP 503)"),
+            ("Singleton is intentionally fenced or uninitialized; explicit staging release required; "
+             "earlier takeover refusal HTTP 503 reason=shutdown_unconfirmed attempts=2 elapsed=0s",
+             "ownership_control_failed", "Singleton is intentionally fenced or uninitialized"),
+            ("Ownership control failed; earlier takeover refusal HTTP 503 reason=deployment_mismatch "
+             "attempts=2 elapsed=0s; stop, do not change credentials", "ownership_control_failed", None),
             (f"boom {SENTINEL}", "ownership_control_failed", None),
         ]
         for line, code, detail in cases:
@@ -647,6 +673,22 @@ class SourcePinTests(unittest.TestCase):
     def test_worker_name_is_the_staging_worker_only(self):
         self.assertEqual(drill.WORKER, "two-bot-next-staging")
         self.assertNotIn("production", self.SOURCE.lower().replace("never production", ""))
+
+
+class OwnershipControlTimeoutTests(unittest.TestCase):
+    def test_timeout_outlasts_the_client_takeover_window(self):
+        client = (Path(__file__).resolve().parents[1] / "wrangler/scripts/ownership-control.mjs").read_text()
+        window_ms = int(re.search(r"takeoverWindowMs = (\d+)", client).group(1))
+        request_ms = int(re.search(r"AbortSignal\.timeout\((\d+)\)", client).group(1))
+        self.assertGreater(drill.OWNERSHIP_CONTROL_TIMEOUT_SECONDS * 1000, window_ms + 2 * request_ms)
+
+    def test_control_subprocess_is_called_with_the_timeout(self):
+        done = subprocess.CompletedProcess([], 0, stdout=json.dumps({"owner": {"phase": "active", "epoch": 1}}),
+                                           stderr="")
+        control = drill.ownership_control(SENTINEL, URL, "github-actions:1:rollback-drill", root="/repo")
+        with patch.object(drill.subprocess, "run", return_value=done) as run:
+            control("status")
+        self.assertEqual(run.call_args.kwargs["timeout"], drill.OWNERSHIP_CONTROL_TIMEOUT_SECONDS)
 
 
 if __name__ == "__main__":

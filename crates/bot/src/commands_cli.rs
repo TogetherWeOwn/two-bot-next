@@ -11,6 +11,9 @@ use two_bot_core::feature_commands::FeatureGates;
 use two_bot_core::moderation::ModerationGates;
 use two_bot_core::router::{InteractionRouter, RouterGates, SurfaceFlags};
 use two_bot_core::send_admission::{is_loopback_http, PgSendAdmission};
+use two_bot_core::voice_assistant::AssistantConfig;
+use two_bot_core::voice_rooms::VoiceGates;
+use two_bot_discord::executor::DiscordError;
 use two_bot_discord::{publish_commands, ActionExecutor};
 
 pub const USAGE: &str = "\
@@ -18,7 +21,8 @@ pub const USAGE: &str = "\
   two-bot commands publish [--apply] [--guild-id ID] [--application-id ID] [--allow-live-guild]
       Fetch and compare the guild command list against the compiled, feature-gated
       builtins. Both commands are read-only unless publish receives --apply.
-      Env: DISCORD_TOKEN, GUILD_ID, DISCORD_APPLICATION_ID; feature gates as on boot.
+      Env: DISCORD_TOKEN, GUILD_ID, DISCORD_APPLICATION_ID; feature gates as on boot
+      (TWO_VOICE=1 adds the voice set; TWO_ASSISTANT_ENDPOINT also adds /templateassistant).
       Live Discord targets additionally require TWO_DATABASE_URL (or DATABASE_URL
       when unset), the shared send-admission Postgres. No database is opened for
       loopback DISCORD_API_BASE fixtures, and no gateway is started.
@@ -113,6 +117,8 @@ fn desired_definitions(
         scorecard: vars
             .get("TWO_COMMUNITY_SCORECARD")
             .is_some_and(|v| v == "1"),
+        voice: VoiceGates::from_map(vars).enabled,
+        voice_assistant: AssistantConfig::from_map(vars).is_some(),
         ..SurfaceFlags::default()
     };
     InteractionRouter::new(RouterGates::from_slices(
@@ -153,12 +159,12 @@ async fn executor(token: &str, vars: &HashMap<String, String>) -> Result<ActionE
             .cloned()
             .ok_or_else(|| "set TWO_DATABASE_URL before live command checks".to_owned())?,
     };
-    let options = two_bot_core::database_url::connect_options(&url)
+    // Threat-model F6: the shared website-jobs fence (validate + TLS
+    // enforce/apply + timeouts). Refusals read as the same redacted error.
+    // Lazy: no socket opens here; later wires fail closed.
+    let tls = crate::website_jobs::admission_tls_policy_from_env()
         .map_err(|_| "cannot configure send-admission Postgres".to_owned())?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect_with(options)
-        .await
+    let pool = crate::website_jobs::admission_pool_with_tls(&url, tls)
         .map_err(|_| "cannot configure send-admission Postgres".to_owned())?;
     let admission = PgSendAdmission::new(pool, token)
         .map_err(|_| "cannot configure send-admission Postgres".to_owned())?;
@@ -226,10 +232,14 @@ pub async fn dispatch(args: &[String]) -> i32 {
 /// loop of 2026-10-05 showed the bare line hides the decisive detail (a
 /// send-admission storage failure looks identical to a Discord outage). The
 /// `tracing::error!` call site keeps its exact message so the observability
-/// catalog still matches; the cause rides in the `error` field. The source
-/// is always a Discord executor error display string (status class, no secrets).
-fn boot_sync_error(source: &impl std::fmt::Display) -> String {
-    format!("boot command registry synchronization failed: {source}")
+/// catalog still matches; the cause rides in the `reason` field as a fixed
+/// token ([`discord_class`](crate::db_log::discord_class)), never the
+/// executor's error text.
+fn boot_sync_error(source: &DiscordError) -> String {
+    format!(
+        "boot command registry synchronization failed: {}",
+        crate::db_log::discord_class(source)
+    )
 }
 
 /// Publication did not previously run on boot. Keep it opt-in while the shared
@@ -267,6 +277,7 @@ pub async fn publish_on_boot(token: &str, guild: u64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use two_bot_core::send_admission::AdmissionError;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| (*s).to_owned()).collect()
@@ -346,6 +357,63 @@ mod tests {
         );
     }
 
+    /// Threat-model F6: the shared admission fence (same helper as the website
+    /// jobs) refuses plaintext, unverified and wrong-host URLs before any
+    /// socket, with no URL part in the error. The executor wiring reads those
+    /// refusals as the same redacted error. Remote plaintext is refused under
+    /// either policy, so the wiring assertions hold regardless of the process
+    /// `TWO_DATABASE_TLS` setting; happy paths use explicit `LocalOnly`.
+    #[tokio::test]
+    async fn send_admission_tls_fence_refuses_plaintext_and_wrong_hosts() {
+        use two_bot_core::database_tls::TlsPolicy;
+        for (url, policy, expected) in [
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+                TlsPolicy::Required,
+                "database sslmode does not require TLS",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db",
+                TlsPolicy::Required,
+                "database URL must set sslmode under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=verify-full",
+                TlsPolicy::Required,
+                "local database host is refused under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=verify-full",
+                TlsPolicy::LocalOnly,
+                "remote database host is refused under the local-only TLS policy",
+            ),
+        ] {
+            let error = crate::website_jobs::admission_pool_with_tls(url, policy).unwrap_err();
+            assert_eq!(error, expected, "{url}");
+            assert!(!error.contains("fixture"), "TLS refusal echoed the URL");
+        }
+        for url in [
+            "postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable",
+            "postgres://fixture:fixture-password@127.0.0.1:1/fixture",
+        ] {
+            let pool =
+                crate::website_jobs::admission_pool_with_tls(url, TlsPolicy::LocalOnly).unwrap();
+            assert_eq!(pool.size(), 0);
+            pool.close().await;
+        }
+        // Executor wiring: refused before any socket, same redacted error.
+        for url in [
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+            "postgres://fixture:fixture-password@127.0.0.1:1/fixture?api_key=fixture-admission-query-secret",
+        ] {
+            let mut env = vars();
+            env.insert("DATABASE_URL".into(), url.into());
+            let error = executor("synthetic-token", &env).await.unwrap_err();
+            assert_eq!(error, "cannot configure send-admission Postgres", "{url}");
+            assert!(!error.contains("fixture"), "wiring error echoed the URL");
+        }
+    }
+
     #[tokio::test]
     async fn loopback_fixture_needs_no_database_or_token_admission() {
         let mut env = vars();
@@ -360,27 +428,83 @@ mod tests {
 
     #[test]
     fn boot_sync_failure_keeps_message_and_carries_cause() {
-        let rendered =
-            boot_sync_error(&"discord was unreachable: Discord send admission storage unavailable");
+        let rendered = boot_sync_error(&DiscordError::Unavailable(
+            AdmissionError::Storage.to_string(),
+        ));
         assert!(
             rendered.starts_with("boot command registry synchronization failed"),
             "catalog message preserved, got: {rendered}"
         );
         assert!(
-            rendered.contains("Discord send admission storage unavailable"),
+            rendered.ends_with(": admission_storage_unavailable"),
             "cause attached, got: {rendered}"
         );
     }
 
     #[test]
+    fn boot_sync_failure_never_renders_transport_or_provider_text() {
+        for (source, token) in [
+            (
+                DiscordError::Unavailable(
+                    "error sending request for url (https://user:secret@example.invalid/)".into(),
+                ),
+                "unavailable",
+            ),
+            (
+                DiscordError::Rejected("provider text with secret".into()),
+                "rejected",
+            ),
+            (
+                DiscordError::Unavailable(AdmissionError::Blocked.to_string()),
+                "admission_blocked",
+            ),
+            (DiscordError::Timeout, "timeout"),
+        ] {
+            let rendered = boot_sync_error(&source);
+            assert!(rendered.ends_with(&format!(": {token}")), "got: {rendered}");
+            assert!(!rendered.contains("secret"), "leaked: {rendered}");
+        }
+    }
+
+    #[test]
+    fn desired_registry_reads_voice_and_assistant_gates_without_io() {
+        for (voice, endpoint, assistant) in [
+            ("0", "https://example.invalid/assistant", false),
+            ("1", "", false),
+            ("1", "file:///assistant", false),
+            ("1", "https://example.invalid/assistant", true),
+        ] {
+            let mut env = vars();
+            env.insert("TWO_VOICE".into(), voice.into());
+            env.insert("TWO_ASSISTANT_ENDPOINT".into(), endpoint.into());
+            let definitions = desired_definitions(2222, &env).unwrap();
+            let names: Vec<_> = definitions.iter().map(|def| def.name.as_str()).collect();
+            for definition in two_bot_core::voice_rooms::voice_commands() {
+                assert_eq!(names.contains(&definition.name.as_str()), voice == "1");
+            }
+            assert_eq!(names.contains(&"templateassistant"), assistant);
+        }
+    }
+
+    #[test]
     fn desired_registry_uses_existing_feature_gates() {
         let mut env = vars();
-        assert_eq!(desired_definitions(2222, &env).unwrap().len(), 3);
+        assert_eq!(
+            desired_definitions(2222, &env)
+                .expect("desired registry assembles")
+                .len(),
+            4
+        );
         env.insert("TWO_AUTOMATIONS".into(), "1".into());
         env.insert("TWO_ANNOUNCEMENTS".into(), "1".into());
         env.insert("TWO_COMMUNITY_SCORECARD".into(), "1".into());
         env.insert("TWO_MODERATION".into(), "1".into());
         env.insert("TWO_OWEN_USER_ID".into(), "123456789012345678".into());
-        assert_eq!(desired_definitions(2222, &env).unwrap().len(), 28);
+        assert_eq!(
+            desired_definitions(2222, &env)
+                .expect("desired registry assembles")
+                .len(),
+            29
+        );
     }
 }

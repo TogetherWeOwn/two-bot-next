@@ -47,7 +47,8 @@ async fn onboarding_gateway_ingress_ack_precedes_blocked_sql_but_selection_waits
     let mock = discord(Arc::new(AtomicBool::new(false)), PauseAt::PermissionRead).await;
     let result = bounded(async {
         let mut ws = gateway(false).await;
-        let runner = spawn_onboarding_with_store(&db, &mock, &ws.mock.url, "session", &store).await;
+        let runner =
+            spawn_onboarding_with_store(&db, &mock, &ws.mock.url, "session", &store, None).await;
         assert_eq!(ws.mock.authentication().await["op"], 2);
         wait_sequence(&store, 1).await;
         let lock = lock_gateway(&db).await;
@@ -250,6 +251,58 @@ async fn onboarding_gateway_ingress_unconfirmed_ack_has_no_selection_effects_or_
             "delayed callback was never accepted inside the ACK budget"
         );
         runner.stop().await;
+    })
+    .await;
+    cleanup(db, Some(mock), result).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn onboarding_gateway_cooperative_shutdown_drains_accepted_selection() {
+    let db = TestDb::exclusive_with_pool_max(crate::gateway::FEATURE_POOL_MAX).await;
+    let gateway_pool = db.independent_pool(crate::gateway::GATEWAY_POOL_MAX).await;
+    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0);
+    let mock = discord(Arc::new(AtomicBool::new(false)), PauseAt::PermissionRead).await;
+    let result = bounded(async {
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let mut ws = gateway(false).await;
+        let mut runner = spawn_onboarding_with_store(
+            &db,
+            &mock,
+            &ws.mock.url,
+            "session",
+            &store,
+            Some(receiver),
+        )
+        .await;
+        assert_eq!(ws.mock.authentication().await["op"], 2);
+        wait_sequence(&store, 1).await;
+        // Hold the writer behind the gateway lock: the accepted selection is
+        // acknowledged and queued while its persistence waits on this lock.
+        let lock = lock_gateway(&db).await;
+        ws.send(component(2, "6202", "shutdown-test-token")).await;
+        wait_unready(&runner).await;
+        let callback_path = "/api/v10/interactions/6202/shutdown-test-token/callback";
+        let response = wait_response(&mock, callback_path).await;
+        assert_eq!(response.status, 204);
+        // Cooperative shutdown must persist the queued accepted work instead of
+        // discarding it at ingress closure.
+        shutdown.send_replace(true);
+        lock.rollback().await.unwrap();
+        tokio::time::timeout(DEADLINE, &mut runner.task)
+            .await
+            .expect("shutdown drain")
+            .unwrap()
+            .unwrap();
+        wait_sequence(&store, 2).await;
+        wait_receipt(&db, 2, "completed").await;
+        wait_request(
+            &mock,
+            "PATCH",
+            "/api/v10/webhooks/1111/shutdown-test-token/messages/@original",
+        )
+        .await;
+        drop(ws);
     })
     .await;
     cleanup(db, Some(mock), result).await;

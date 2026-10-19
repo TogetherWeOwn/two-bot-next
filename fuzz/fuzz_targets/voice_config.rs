@@ -56,6 +56,9 @@ fuzz_target!(|data: &[u8]| {
         let encoded = export_configuration(&config, inventory()).unwrap();
         let decoded = import_configuration(&encoded, inventory()).unwrap();
         assert_eq!(decoded, config);
-        assert_eq!(export_configuration(&decoded, inventory()).unwrap(), encoded);
+        assert_eq!(
+            export_configuration(&decoded, inventory()).unwrap(),
+            encoded
+        );
     }
 });

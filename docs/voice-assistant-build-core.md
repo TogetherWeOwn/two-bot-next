@@ -79,7 +79,6 @@ The parent still owns all of the following:
 - The real HTTPS transport with the endpoint credential binding and timeout.
 - The V12a per-guild monthly-cap ledger check before calling.
 - The Apply/Refine/Cancel flow around the returned build.
-- Publish wiring alongside the V1 `voice_command_set` path.
 
 ## Hermetic verification
 

@@ -204,13 +204,16 @@ function checkLocalLinks(markdown: string): number {
 test("runbook local file links and Markdown heading anchors resolve", () => {
   assert.ok(checkLocalLinks(runbook) > 20);
   assert.ok(checkLocalLinks(read("docs/incident-tabletop-2026-10-01.md")) > 0);
+  assert.ok(checkLocalLinks(read("docs/incident-tabletop-2026-10-06.md")) > 0);
   assert.throws(() => checkLocalLinks("[missing](does-not-exist.md)"), /missing local/);
   assert.throws(() => checkLocalLinks("[missing](#does-not-exist)"), /missing runbook heading/);
 });
 
 test("public tabletop evidence contains no private tracker references", () => {
-  assert.doesNotMatch(read("docs/incident-tabletop-2026-10-01.md"),
-    /\b(?:TOG|PAP)-\d+\b|\/(?:TOG|PAP)\/(?:issues|agents|projects|approvals|runs)\//);
+  for (const doc of ["docs/incident-tabletop-2026-10-01.md", "docs/incident-tabletop-2026-10-06.md"]) {
+    assert.doesNotMatch(read(doc),
+      /\b(?:TOG|PAP)-\d+\b|\/(?:TOG|PAP)\/(?:issues|agents|projects|approvals|runs)\//);
+  }
 });
 
 test("incident playbooks cite emitted metrics and selected literal log messages", () => {
@@ -287,6 +290,16 @@ test("historical tabletop cannot substitute for current wiring or staging accept
   assert.match(history, /not current\s+wiring guidance/);
   assert.match(history, /Local source walkthrough completed; staging walkthrough blocked/);
   assert.match(history, /successful source tests do not fill this gate/);
+});
+
+test("staging tabletop record stays a dry run with explicit open gaps", () => {
+  const record = read("docs/incident-tabletop-2026-10-06.md");
+  assert.match(record, /no outage was injected/);
+  assert.match(record, /It is not cutover acceptance/);
+  assert.match(record, /## Gaps found/);
+  assert.match(record, /Image provenance for this head is unproven/);
+  assert.ok(runbook.includes("(incident-tabletop-2026-10-06.md)"), "runbook must link the staging record");
+  assert.doesNotMatch(record, /(?:token|secret)\s*[:=]\s*[A-Za-z0-9_-]{16,}/i);
 });
 
 test("ownership runbook examples use only the covered staging control client", () => {

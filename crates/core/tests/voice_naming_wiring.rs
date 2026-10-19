@@ -28,6 +28,8 @@ fn ctx(owner: &str, members: u32, room_number: u32, seed: u64) -> RoomContext {
         members_playing: 0,
         parties: Vec::new(),
         timestamp: 1_790_683_200, // 2026-09-29 12:00:00 UTC (a Tuesday).
+        room_minutes: 0,
+        game_minutes: 0,
         tz_offset_minutes: 0,
         seed,
         named_lists: HashMap::new(),
@@ -60,9 +62,11 @@ fn rename_rerenders_on_membership_change_without_reroll() {
     assert!(solo.ends_with("1 person"), "unexpected {solo:?}");
     let busy = resolve_room_name(template, &ctx("Ava", 4, 1, 9), &solo);
     assert!(busy.ends_with("4 people"), "unexpected {busy:?}");
+    // The leading emoji now joins the count with 〢, so the seeded pick is
+    // everything before the separator.
     assert_eq!(
-        solo.split(' ').next(),
-        busy.split(' ').next(),
+        solo.split('〢').next(),
+        busy.split('〢').next(),
         "rename re-rolled the seeded pick"
     );
 }

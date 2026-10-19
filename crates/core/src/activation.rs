@@ -18,16 +18,20 @@ pub enum LiveCapability {
     /// Added with the tickets lifecycle slice; live denial is the default
     /// until the cleared allowlist below is reviewed and widened.
     Tickets,
+    /// Added with the rank-ladder self-heal; live denial is the default
+    /// until the cleared allowlist below is reviewed and widened.
+    RankHeal,
 }
 
 impl LiveCapability {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::SelfRoles,
         Self::Announcements,
         Self::Automations,
         Self::Automod,
         Self::Moderation,
         Self::Tickets,
+        Self::RankHeal,
     ];
 
     #[must_use]
@@ -39,6 +43,7 @@ impl LiveCapability {
             Self::Automod => "automod",
             Self::Moderation => "moderation",
             Self::Tickets => "tickets",
+            Self::RankHeal => "rank_heal",
         }
     }
 }

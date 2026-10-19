@@ -249,6 +249,121 @@ pub fn position_for_index(category_order: &[CategoryChannel], index: usize) -> u
     }
 }
 
+/// Gap left between channels by a re-space, so later creates find a free
+/// position without another reorder (Auto-Voice uses the same step).
+pub const POSITION_STEP: u64 = 16;
+
+/// Where a new room is created so it lands at `index` of the category order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSlot {
+    /// Discord `position` for the create call. No other channel holds it once
+    /// `respace` (if any) is applied.
+    pub position: u64,
+    /// Bulk reorder to apply before the create when no free position exists
+    /// at `index`: every listed channel with its new position. Empty when the
+    /// slot is free already.
+    pub respace: Vec<(Snowflake, u64)>,
+    /// Position to fall back to when the reorder is refused: the channel
+    /// above the slot, so the tie (broken by the newer, larger id) still
+    /// renders the room on the correct side of it. `None` when nothing is
+    /// above the slot: a tie there would sort the room below its neighbour,
+    /// so the room is created without a position instead.
+    pub fallback: Option<u64>,
+}
+
+/// The create position for slot `index` (as returned by [`plan_placement`]).
+///
+/// Discord honours a create-time position exactly and shifts no other
+/// channel, and a shared position renders in no reliable order. So the room
+/// takes the first free integer below the channel above the slot when there
+/// is one; otherwise the category is re-spaced at [`POSITION_STEP`] intervals
+/// with a gap opened at `index`, in one bulk reorder before the create.
+#[must_use]
+pub fn create_slot(category_order: &[CategoryChannel], index: usize) -> CreateSlot {
+    let mut sorted: Vec<&CategoryChannel> = category_order.iter().collect();
+    sorted.sort_by_key(|entry| (entry.position, entry.id));
+    let lower = index
+        .checked_sub(1)
+        .and_then(|above| sorted.get(above))
+        .map_or(-1, |entry| i64::from(entry.position));
+    let clamp = |position: i64| u64::try_from(position).unwrap_or(0);
+    let Some(upper) = sorted.get(index).map(|entry| i64::from(entry.position)) else {
+        let position = clamp((lower + 1).max(0));
+        return CreateSlot {
+            position,
+            respace: Vec::new(),
+            fallback: Some(position),
+        };
+    };
+    if upper - lower > 1 {
+        let position = clamp(lower + 1);
+        return CreateSlot {
+            position,
+            respace: Vec::new(),
+            fallback: Some(position),
+        };
+    }
+    let respace = sorted
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let rank = if i < index { i + 1 } else { i + 2 };
+            (entry.id, rank as u64 * POSITION_STEP)
+        })
+        .collect();
+    CreateSlot {
+        position: (index as u64 + 1) * POSITION_STEP,
+        respace,
+        fallback: (lower >= 0).then(|| clamp(lower)),
+    }
+}
+
+/// Deferred post-move repair for one room's slot: position patches for the
+/// suffix starting at `index` only.
+///
+/// The pre-create path opens a gap before the POST; the deferred path creates
+/// first (at the fallback tie) and repairs afterwards, so join-to-move
+/// latency never waits on a bulk reorder. `rest` is the category order
+/// WITHOUT the room and `index` its slot in that frame (an insert position:
+/// past-the-end means append); the caller derives the slot from the room's
+/// settings and seniority, so reordering converges instead of oscillating.
+/// Entries before `index` keep their exact positions: manual and established
+/// sibling order is never rewritten. Only the room and the suffix below its
+/// slot are re-spaced at [`POSITION_STEP`] intervals, preserving their
+/// relative order. Returns empty when the room already renders at `index`
+/// with a unique position (a free gap: no PATCH needed).
+#[must_use]
+pub fn suffix_respace(
+    rest: &[CategoryChannel],
+    index: usize,
+    room_id: Snowflake,
+    room_position: i32,
+) -> Vec<(Snowflake, u64)> {
+    let mut sorted: Vec<&CategoryChannel> = rest.iter().collect();
+    sorted.sort_by_key(|entry| (entry.position, entry.id));
+    let index = index.min(sorted.len());
+    let rank = sorted
+        .iter()
+        .filter(|entry| (entry.position, entry.id) < (room_position, room_id))
+        .count();
+    let unique = sorted.iter().all(|entry| entry.position != room_position);
+    if rank == index && unique {
+        return Vec::new();
+    }
+    let floor: i64 = sorted[..index]
+        .iter()
+        .map(|entry| i64::from(entry.position))
+        .max()
+        .unwrap_or(-1);
+    let mut patch = Vec::with_capacity(sorted.len() - index + 1);
+    patch.push((room_id, (floor + POSITION_STEP as i64) as u64));
+    patch.extend(sorted[index..].iter().enumerate().map(|(slot, entry)| {
+        let position = floor + POSITION_STEP as i64 * (slot as i64 + 2);
+        (entry.id, position as u64)
+    }));
+    patch
+}
+
 /// Resolve a new room's starting limit and privacy from its creator's
 /// `/defaultlimit` and `/alwaysprivate` defaults. Only the validated range
 /// `0..=99` is accepted (0 means unlimited); anything else is refused rather

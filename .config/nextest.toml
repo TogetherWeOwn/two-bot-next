@@ -1,0 +1,18 @@
+# cargo-nextest profiles (SDLC 2.3 CI speed pilot).
+#
+# The advisory `rust nextest` lane runs `--profile ci`: one retry per test
+# (two attempts total) so a fail-then-pass is reported as flaky instead of
+# red, with JUnit written to junit.xml for the flake-ledger parser
+# (scripts/ci/flake_ledger.py). fail-fast stays off on purpose: the ledger
+# is evidence, not a gate, so every test must run even after a failure —
+# otherwise junit.xml omits the cancelled tests and per-run ledger rows
+# stop being comparable. Default `cargo test` behavior elsewhere is
+# untouched: no other lane reads this file.
+[profile.ci]
+retries = 1
+fail-fast = false
+
+[profile.ci.junit]
+# Store-relative: nextest writes target/nextest/ci/junit.xml, not the
+# workspace root. The reusable lane copies it to ./junit.xml for parse/upload.
+path = "junit.xml"

@@ -35,7 +35,8 @@ async fn bootstrap(
     rest: &MockRest,
     vars: &HashMap<String, String>,
 ) -> Arc<crate::command_runtime::CommandRuntime> {
-    let config = GatewayCommandConfig::from_map(2222, vars).expect("command config");
+    let config =
+        GatewayCommandConfig::from_map_for_activation(2222, vars, true).expect("command config");
     let executor = ActionExecutor::with_proxy(TOKEN.into(), Some(rest.origin())).unwrap();
     let commands = tokio::time::timeout(
         BOUND,
@@ -327,7 +328,11 @@ async fn ready_routes_custom_slash_and_accepted_prefix_before_checkpoint() {
 
     // A terminal runtime failure is not a shard failure and does not block
     // capture/checkpoint; its already-committed reservation still fences replay.
-    gateway.send(prefix(4, 52)).await;
+    let mut failed_prefix = prefix(4, 52);
+    // An independent actor bypasses neither moderation nor permanent replay,
+    // but has their own text-trigger cooldown window.
+    failed_prefix["d"]["author"]["id"] = json!("3334");
+    gateway.send(failed_prefix).await;
     wait_sequence(&db.store, 4).await;
     wait_requests(&rest, 7).await;
     wait_connected(&state).await;
@@ -498,6 +503,9 @@ async fn shared_runtime_preserves_custom_sticky_and_feed_registry_and_single_rep
     assert_eq!(gateway.authentication().await["op"], 2);
     gateway.send(ready(&gateway.url, "combined-session")).await;
     wait_sequence(&db.store, 1).await;
+    // Registry publication rides a detached spawn lane, so wait for the PUT
+    // instead of assuming it lands with the checkpoint.
+    wait_requests(&rest, 3).await;
     assert_registry(&rest);
     let registry: Vec<Value> = serde_json::from_slice(&rest.requests()[2].body).unwrap();
     for name in [
@@ -520,20 +528,26 @@ async fn shared_runtime_preserves_custom_sticky_and_feed_registry_and_single_rep
         interaction["d"]["member"]["permissions"] = json!("32");
         gateway.send(interaction).await;
         wait_sequence(&db.store, sequence).await;
+        // Command replies ride a detached lane after the checkpoint: wait for
+        // both the defer callback and the completion edit before asserting.
+        wait_requests(&rest, 3 + (index + 1) * 2).await;
         let requests = rest.requests();
+        let seen: Vec<String> = requests
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect();
         let callback = format!("/interactions/{id}/custom-command-fixture/callback");
         assert_eq!(
             requests
                 .iter()
                 .filter(|r| r.path.ends_with(&callback))
                 .count(),
-            1
+            1,
+            "one defer callback for {id}; requests: {seen:#?}"
         );
-        assert_eq!(
-            requests.iter().filter(|r| r.method == "PATCH").count(),
-            index + 1
-        );
-        let body: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        let patches: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+        assert_eq!(patches.len(), index + 1, "requests: {seen:#?}");
+        let body: Value = serde_json::from_slice(&patches.last().unwrap().body).unwrap();
         assert_ne!(
             body["content"],
             "This command is not available in this build yet."
@@ -541,7 +555,12 @@ async fn shared_runtime_preserves_custom_sticky_and_feed_registry_and_single_rep
     }
     wait_connected(&state).await;
     assert_registry(&rest); // No competing builtin-only publisher erased faq.
-    assert_eq!(rest.requests().len(), 11);
+    let seen: Vec<String> = rest
+        .requests()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert_eq!(rest.requests().len(), 11, "requests: {seen:#?}");
     runner.abort();
     let _ = runner.await;
     gateway.stop().await;

@@ -15,21 +15,24 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
   `test`, `docs`, `build`, `ci`, `chore`, `revert`, `style`, `security`. The
   scope names the area of the code (`gateway`, `automod`, `store`). The release
   automation below reads these headers.
-- **Body.** Fill in every section of the
-  [PR template](.github/pull_request_template.md), in short, active sentences:
-  Thinking Path, Linked Issues or Issue Description, What Changed, Verification,
-  Risks, Model Used, Checklist. A PR created through the API gets no template,
-  so paste it in. `docs`, `chore`, `build`, `ci`, `style`, `test` and `revert`
-  PRs need no linked issue and no duplicate-search tick. The `pr-lint` check
-  fails an empty body; the other body rules warn until open PRs migrate.
+- **Body.** Use the [PR template](.github/pull_request_template.md), in short,
+  active sentences. `pr-lint` requires two sections: Linked Issues or Issue
+  Description, and Verification (the commands you ran and their results).
+  What Changed and Notes for reviewers are optional. A PR created through the
+  API gets no template, so paste it in. `docs`, `chore`, `build`, `ci`, `style`,
+  `test` and `revert` PRs need no linked issue. The `pr-lint` check fails an
+  empty body and, on a public repo, a tracker id, instance UI link or the
+  internal host in the title or body; the other body rules warn until open
+  PRs migrate.
 - **Search first.** Look for an open or recent PR that touches the same area,
-  and link what you find. Tick the duplicate-search line in the checklist.
+  and link what you find.
 - **No internal references.** This repo is public: put no internal ticket id,
   instance link, localhost URL or private host in any title, body, commit,
   comment or branch name. Link public GitHub issues as `Closes #123` and say
-  the rest in plain words. `pr-lint` warns when it sees one.
-- **Honest disclosure.** Name the exact model ID in Model Used, or write "None —
-  human-authored". Report only test runs you saw, and say what you did not run.
+  the rest in plain words. `pr-lint` fails the title or body when it holds a
+  tracker id, an instance UI link or the internal host, and follows
+  `PR_STANDARDS_MODE` for the other references and branch names.
+- **Honest disclosure.** Report only test runs you saw, and say what you did not run.
 - **Review.** Address every review finding, or reply with why it does not apply.
   Re-request review after you push.
 - **Credit.** Credit the contributors whose work you build on.
@@ -43,15 +46,18 @@ and force-pushes. `ci-ok`, `gitleaks` and `pr-lint` are required checks on `main
 `ci-ok` runs from `check.yml`; the other two run from `supply-chain.yml`.
 `pr-lint` runs `.github/scripts/pr_standards.py` (tests beside it): it checks
 the title format, the 100-character limit, the trailing period and a non-empty
-body as errors, and the template sections, duplicate search and internal
-references in warn mode (`PR_STANDARDS_MODE: "warn"`). On a push to `main` it
+body as errors, and the two required template sections (Linked Issues and
+Verification), the advisory title/body remainder and branch names in warn mode
+(`PR_STANDARDS_MODE: "warn"`). The strict title/body subset (tracker id,
+instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
 
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
-(unit, integration and doc tests) and two database lanes, `ignored db (stores)`
-and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
+(unit, integration and doc tests), `rust nextest` (workspace lib/bins under
+cargo-nextest with one retry, JUnit and a flake ledger) and two database lanes,
+`ignored db (stores)` and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
 (`job-inputs` and `container-inputs`), every selected lane, `worker check`, the
 SBOM dry-run and standalone database jobs. Both selectors and lint must always
 succeed; a heavy lane may skip only when selection explicitly deselects it.
@@ -61,12 +67,35 @@ in `scripts/ci/test_required_checks.py`. Only advisory `container smoke` is
 exempt: it can take up to 30 minutes, and image security stays gated through
 the SBOM job. The legacy `required-checks` aggregate is removed.
 
+Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
+HARD, required voice synthetic, test-target inventory HARD) run as steps of
+the `check` lane on the existing routed runner; see
+[`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs in
+`rust-tests` with the disposable Postgres service and ignored database-backed
+tests. New checks start in WARN (report, never fail) and flip to HARD only with
+their backlog burned down.
+
 Every Rust setup step in `check.yml` installs the exact version from
 `rust-toolchain.toml`, including fmt/clippy components where required. Do not use
 floating `stable`: Cargo still follows the repository pin, so differing versions
 can cause component-install conflicts before fmt runs. The offline workflow
 policy suite pins all nine installers to the repository version; bump them and
 the toolchain and builder-image pins together.
+
+### Pull-request size labels (advisory)
+
+`.github/workflows/pr-size.yml` labels every pull request `size/S` (up to 100
+counted lines), `size/M` (up to 400), `size/L` (up to 1000) or `size/XL`, and
+keeps one advisory comment on pull requests over the 400-line threshold.
+Counted lines are additions + deletions excluding lockfiles, generated files
+and fixtures (plus `migrations.lock`, the generated migration inventory; the
+hand-written migration SQL stays counted). The labeller lives once in the org
+[TogetherWeOwn/.github](https://github.com/TogetherWeOwn/.github) repository
+(CI-STANDARD.md, "Advisory PR-size labels"); the workflow here is a thin
+caller pinned to a central SHA and passes only this repo's generated paths.
+This is advisory only: it is not a required check and never blocks a merge.
+A Monday run of the same workflow prints the weekly tally of merged pull
+requests per size; the labels are the durable record behind it.
 
 ### Issues
 
@@ -76,27 +105,18 @@ issue. Blank issues are off. Report a vulnerability privately; see
 
 ## Releases
 
-Releases are automated with [release-please](https://github.com/googleapis/release-please)
-(`release-please-config.json` + `.release-please-manifest.json`, release-type
-`rust`, single `.` package). The root package has a small release-metadata
-library at `src/lib.rs` so it is a valid Cargo package, not a targetless
-manifest. The native Rust strategy synchronizes the root and all workspace member
-versions, local dependency requirements, and `Cargo.lock`. Using one root
-strategy includes changes anywhere in the repository and produces one flat
-`vX.Y.Z` tag, not one release per crate.
+Each successful production promote tags the deployed commit `vX.Y.Z` and
+publishes a GitHub Release from the Conventional Commit subjects since the
+previous tag (`release.yml`, called by `deploy-production`). There is no release
+PR and no freeze. One flat `vX.Y.Z` tag covers the whole repository, not one
+release per crate. See [`docs/releases.md`](docs/releases.md). Never tag or
+release by hand.
 
-A release PR containing the version and root `CHANGELOG.md` updates is
-regenerated by the `release` workflow on a weekly schedule or a manual dispatch,
-not on every merge to `main` (a push only publishes). Merging that PR publishes
-the tag and GitHub Release. Cut one with the short freeze procedure in
-[`docs/releases.md`](docs/releases.md#release-triggers-and-procedure). Never tag
-or release by hand.
-
-`CHANGELOG.md` uses the [Common Changelog](https://common-changelog.org/)
+Release notes use the [Common Changelog](https://common-changelog.org/)
 categories, in its order: **Changed** (`perf`, `revert`), **Added** (`feat`),
 **Fixed** (`fix`). `chore`, `docs`, `test`, `ci`, `build`, `refactor` and
-`style` stay out of the changelog. Each squash-merged PR title becomes one
-entry, so write it for a reader of the changelog: imperative mood, one
+`style` stay out of the notes. Each squash-merged PR title becomes one
+entry, so write it for a reader of the release notes: imperative mood, one
 user-facing change.
 
 Versioning is SemVer, starting at `0.1.0`; `1.0.0` marks the production
@@ -164,7 +184,7 @@ workspace's release version:
 
 ```toml
 [dev-dependencies]
-two-bot-testsupport = { path = "../testsupport", version = "0.3.0" } # x-release-please-version
+two-bot-testsupport = { path = "../testsupport", version = "0.4.0" } # x-release-please-version
 ```
 
 ```rust,ignore

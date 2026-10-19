@@ -28,7 +28,7 @@ struct EventCap {
 }
 
 /// One row per `metrics::EVENTS` entry, in the same order.
-const EVENT_CAPS: [EventCap; 18] = [
+const EVENT_CAPS: [EventCap; 21] = [
     EventCap {
         label: "READY",
         class: VolumeClass::Session,
@@ -67,7 +67,7 @@ const EVENT_CAPS: [EventCap; 18] = [
     EventCap {
         label: "GUILD_MEMBER_UPDATE",
         class: VolumeClass::Hot,
-        shed_order: Some(5),
+        shed_order: Some(7),
     },
     EventCap {
         label: "MESSAGE_CREATE",
@@ -85,9 +85,24 @@ const EVENT_CAPS: [EventCap; 18] = [
         shed_order: Some(3),
     },
     EventCap {
+        label: "MESSAGE_REACTION_ADD",
+        class: VolumeClass::Hot,
+        shed_order: Some(5),
+    },
+    EventCap {
+        label: "MESSAGE_REACTION_REMOVE",
+        class: VolumeClass::Hot,
+        shed_order: Some(6),
+    },
+    EventCap {
         label: "VOICE_STATE_UPDATE",
         class: VolumeClass::Hot,
         shed_order: Some(4),
+    },
+    EventCap {
+        label: "PRESENCE_UPDATE",
+        class: VolumeClass::Hot,
+        shed_order: Some(8),
     },
     EventCap {
         label: "INVITE_CREATE",
@@ -117,7 +132,7 @@ const EVENT_CAPS: [EventCap; 18] = [
     EventCap {
         label: "other",
         class: VolumeClass::Hot,
-        shed_order: Some(6),
+        shed_order: Some(9),
     },
 ];
 
@@ -129,7 +144,7 @@ struct JobCap {
 
 /// One row per `metrics::JOBS` entry, in the same order. The hourly
 /// presence probe parks first; the durable checkpoint marker never sheds.
-const JOB_CAPS: [JobCap; 12] = [
+const JOB_CAPS: [JobCap; 16] = [
     JobCap {
         job: "invite_snapshot",
         shed_order: None,
@@ -175,6 +190,22 @@ const JOB_CAPS: [JobCap; 12] = [
         shed_order: Some(5),
     },
     JobCap {
+        job: "feeds",
+        shed_order: None,
+    },
+    JobCap {
+        job: "self_role_recovery",
+        shed_order: None,
+    },
+    JobCap {
+        job: "member_unban_sweep",
+        shed_order: None,
+    },
+    JobCap {
+        job: "automod_expiry",
+        shed_order: None,
+    },
+    JobCap {
         job: "other",
         shed_order: None,
     },
@@ -186,6 +217,77 @@ const JOB_CAPS: [JobCap; 12] = [
 /// refused admits are counted, never silently dropped.
 const DB_ERROR_CAP_OPS: [&str; 2] = ["admission", "other"];
 const SEND_ADMISSION_CAP_OUTCOMES: [&str; 4] = ["admitted", "blocked", "storage_error", "other"];
+const PREFIX_TRIGGER_REFUSED_CAP_REASONS: [&str; 2] = ["verdict", "other"];
+/// One row per `metrics::DISPATCH_LANES` entry, in the same order. A new
+/// dispatch lane fails here until it gets a budget row in the guard doc.
+const DISPATCH_LANE_CAPS: [&str; 6] = [
+    "messages",
+    "interactions",
+    "registry",
+    "privileged",
+    "busy",
+    "reactions",
+];
+/// One row per `metrics::VOICE_VOTE_KICK_OUTCOMES` entry, in the same order.
+/// A new vote-kick outcome fails here until it gets a budget row in the guard
+/// doc.
+const VOTE_KICK_CAP_OUTCOMES: [&str; 26] = [
+    "started",
+    "evidence_unavailable",
+    "not_a_room",
+    "initiator_not_occupant",
+    "target_not_occupant",
+    "self_target",
+    "protected_target",
+    "privileged_target",
+    "authority_unavailable",
+    "active_vote_exists",
+    "cooldown",
+    "initiator_limited",
+    "reused_vote_id",
+    "unknown_vote",
+    "wrong_vote_boundary",
+    "ineligible_voter",
+    "repeated_vote",
+    "invalid_time",
+    "connect_denied_and_disconnected",
+    "connect_denied_target_absent",
+    "skipped_room_gone",
+    "skipped_target_protected",
+    "permission_missing",
+    "discord_error",
+    "gave_up",
+    "other",
+];
+/// One row per `metrics::INTERNAL_ACTION_FAMILIES` entry, in the same order.
+/// A new receiver family fails here until it gets a budget row in the guard
+/// doc. Unknown verbs collapse to the trailing `other`.
+const INTERNAL_ACTION_CAP_FAMILIES: [&str; 6] = [
+    "announcement",
+    "event",
+    "settings",
+    "moderation",
+    "membership",
+    "other",
+];
+/// One row per `metrics::INTERNAL_ACTION_OUTCOMES` entry, in the same order.
+/// A new receiver outcome fails here until it gets a budget row in the guard
+/// doc. Unknown outcomes collapse to the trailing `internal`, never to a
+/// dynamic label or secret.
+const INTERNAL_ACTION_CAP_OUTCOMES: [&str; 12] = [
+    "executed",
+    "auth_failure",
+    "unknown_key",
+    "clock_skew",
+    "nonce_replay",
+    "rate_limit",
+    "unknown_action",
+    "action_disabled",
+    "malformed_body",
+    "conflict",
+    "upstream",
+    "internal",
+];
 
 #[test]
 fn storage_and_send_gate_labels_match_their_caps() {
@@ -198,6 +300,31 @@ fn storage_and_send_gate_labels_match_their_caps() {
         metrics::SEND_ADMISSION_OUTCOMES,
         &SEND_ADMISSION_CAP_OUTCOMES[..],
         "SEND_ADMISSION_OUTCOMES grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::PREFIX_TRIGGER_REFUSED_REASONS,
+        &PREFIX_TRIGGER_REFUSED_CAP_REASONS[..],
+        "PREFIX_TRIGGER_REFUSED_REASONS grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::DISPATCH_LANES,
+        &DISPATCH_LANE_CAPS[..],
+        "DISPATCH_LANES grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::VOICE_VOTE_KICK_OUTCOMES,
+        &VOTE_KICK_CAP_OUTCOMES[..],
+        "VOICE_VOTE_KICK_OUTCOMES grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::INTERNAL_ACTION_FAMILIES,
+        &INTERNAL_ACTION_CAP_FAMILIES[..],
+        "INTERNAL_ACTION_FAMILIES grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::INTERNAL_ACTION_OUTCOMES,
+        &INTERNAL_ACTION_CAP_OUTCOMES[..],
+        "INTERNAL_ACTION_OUTCOMES grew without a budget row; update docs/log-volume-guard.md"
     );
 }
 
@@ -220,11 +347,11 @@ const LOG_SCOPED_SOURCES: [(&str, &str); 6] = [
     ("voice_rooms.rs", include_str!("voice_rooms.rs")),
 ];
 
-/// (file, message) for the 30 catalog session-path rows: the 28 traced
+/// (file, message) for the 33 catalog session-path rows: the 31 traced
 /// messages plus the 2 drain outcomes that surface as error text. Every row
 /// is class `session` in the guard doc, so the table records presence, not
 /// a second class column. A cataloged line without a row here fails closed.
-const SESSION_LOG_CAPS: [(&str, &str); 30] = [
+const SESSION_LOG_CAPS: [(&str, &str); 33] = [
     (
         "gateway.rs",
         "cold resume committed; requesting voice snapshot via identify",
@@ -235,6 +362,9 @@ const SESSION_LOG_CAPS: [(&str, &str); 30] = [
     ),
     ("gateway.rs", "gateway shard loop started"),
     ("gateway.rs", "gateway leveling dispatch failed"),
+    ("gateway.rs", "gateway community facts dispatch failed"),
+    ("gateway.rs", "gateway community facts dispatch timed out"),
+    ("gateway.rs", "gateway onboarding job invalid"),
     ("gateway.rs", "gateway ready; checkpoint committed"),
     (
         "gateway.rs",
@@ -338,8 +468,8 @@ fn hot_events_shed_first_and_session_events_never_shed() {
     shed.sort_unstable();
     assert_eq!(
         shed,
-        vec![1, 2, 3, 4, 5, 6],
-        "hot shed orders must be unique priorities 1-6; see docs/log-volume-guard.md"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "hot shed orders must be unique priorities 1-9; see docs/log-volume-guard.md"
     );
     let first = EVENT_CAPS
         .iter()
@@ -398,6 +528,10 @@ fn job_caps_cover_every_job_label_and_presence_sheds_first() {
                         | "rank"
                         | "scheduled_events"
                         | "settings"
+                        | "feeds"
+                        | "self_role_recovery"
+                        | "member_unban_sweep"
+                        | "automod_expiry"
                         | "other"
                 ),
                 "{} never sheds; shed it only through its feature flag, not the log guard",
@@ -422,6 +556,11 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         "voice reconcile family grew; update the cardinality budget and the guard doc"
     );
     assert_eq!(
+        metrics::VOICE_JOIN_OCCUPANCY_BUCKETS.len(),
+        8,
+        "join-occupancy bucket family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
         metrics::VOICE_DEAD_ACTIONS.len(),
         9,
         "voice dead-letter family grew; update the cardinality budget and the guard doc"
@@ -436,6 +575,51 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         4,
         "send-admission family grew; update the cardinality budget and the guard doc"
     );
+    assert_eq!(
+        metrics::PREFIX_TRIGGER_REFUSED_REASONS.len(),
+        2,
+        "prefix-refused family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::DISPATCH_LANES.len(),
+        6,
+        "dispatch-lane family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::VOICE_VOTE_KICK_OUTCOMES.len(),
+        26,
+        "vote-kick outcome family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::CHECKPOINT_FAILURE_STAGES.len(),
+        2,
+        "checkpoint-failure family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::INTERNAL_ACTION_FAMILIES.len(),
+        6,
+        "internal-action family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::INTERNAL_ACTION_OUTCOMES.len(),
+        12,
+        "internal-action outcome family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::COMMUNITY_FACTS_DRAIN_REASONS.len(),
+        3,
+        "community-facts drain-reason family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::MODERATION_VERBS.len(),
+        9,
+        "moderation verb family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::MODERATION_ENFORCEMENT_OUTCOMES.len(),
+        5,
+        "moderation enforcement outcome family grew; update the cardinality budget and the guard doc"
+    );
     for (allowlist, name) in [
         (metrics::EVENTS, "EVENTS"),
         (metrics::REST_ROUTES, "routes"),
@@ -443,6 +627,24 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         (metrics::VOICE_DEAD_ACTIONS, "dead-letter"),
         (metrics::DB_ERROR_OPS, "db-errors"),
         (metrics::SEND_ADMISSION_OUTCOMES, "send-admissions"),
+        (metrics::VOICE_VOTE_KICK_OUTCOMES, "vote-kick"),
+        (metrics::VOICE_NAME_OUTCOMES, "voice-names"),
+        (
+            metrics::PREFIX_TRIGGER_REFUSED_REASONS,
+            "prefix-trigger-refused",
+        ),
+        (
+            metrics::INTERNAL_ACTION_FAMILIES,
+            "internal-action families",
+        ),
+        (
+            metrics::COMMUNITY_FACTS_DRAIN_REASONS,
+            "community-facts drain reasons",
+        ),
+        (
+            metrics::MODERATION_ENFORCEMENT_OUTCOMES,
+            "moderation-enforcement-outcomes",
+        ),
     ] {
         assert_eq!(
             allowlist.last(),
@@ -450,25 +652,80 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
             "{name} lost its `other` collapse trapdoor; unknowns must never become series"
         );
     }
+    assert_eq!(
+        metrics::INTERNAL_ACTION_OUTCOMES.last(),
+        Some(&"internal"),
+        "internal-action outcomes lost its `internal` collapse trapdoor; unknowns must never become series"
+    );
 }
 
 /// Any new series anywhere in the exposition fails here until the
 /// cardinality budget in the guard doc is updated with it.
 #[test]
 fn exposition_series_count_matches_the_cardinality_budget() {
-    assert_eq!(metrics::EVENTS.len(), 18, "event family changed the budget");
+    assert_eq!(metrics::EVENTS.len(), 21, "event family changed the budget");
     assert_eq!(
         metrics::REST_ROUTES.len(),
-        26,
+        30,
         "route family changed the budget"
     );
-    assert_eq!(metrics::JOBS.len(), 12, "job family changed the budget");
+    assert_eq!(metrics::JOBS.len(), 16, "job family changed the budget");
+    assert_eq!(
+        metrics::PREFIX_TRIGGER_REFUSED_REASONS.len(),
+        2,
+        "prefix-refused family changed the budget"
+    );
+    assert_eq!(
+        metrics::DISPATCH_LANES.len(),
+        6,
+        "dispatch-lane family changed the budget"
+    );
+    assert_eq!(
+        metrics::EVENTSUB_RECONCILE_OUTCOMES.len(),
+        3,
+        "reconcile-pass family changed the budget"
+    );
+    assert_eq!(
+        metrics::EVENTSUB_RECONCILE_ACTIONS.len(),
+        2,
+        "reconcile-action family changed the budget"
+    );
+    assert_eq!(
+        metrics::EVENTSUB_RECONCILE_ERROR_CLASSES.len(),
+        5,
+        "reconcile-error family changed the budget"
+    );
+    assert_eq!(
+        metrics::FEED_FETCH_OUTCOMES.len(),
+        4,
+        "feed-fetch outcome family changed the budget"
+    );
+    assert_eq!(
+        metrics::FEED_FETCH_ERROR_CLASSES.len(),
+        12,
+        "feed-fetch error-class family changed the budget"
+    );
+    assert_eq!(
+        metrics::AUTOMOD_DECISION_OUTCOMES.len(),
+        8,
+        "automod-decision family changed the budget"
+    );
     let text = metrics::Metrics::default().render(None);
+    let help_headers = text
+        .lines()
+        .filter(|line| line.starts_with("# HELP "))
+        .count();
+    let type_headers = text
+        .lines()
+        .filter(|line| line.starts_with("# TYPE "))
+        .count();
+    assert_eq!(help_headers, 72, "rendered HELP family count changed");
+    assert_eq!(type_headers, 72, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 279,
-        "exposition grew past the 279-sample budget (18 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 48 jobs + 31 voice + 2 db-errors + 4 send-admissions + 4 pool); \
+        series, 711,
+        "exposition grew past the 711-sample budget (21 events + 4 scalars + 1 latency \
+         + 22 histograms + 180 rest + 11 REST guard + 64 jobs + 112 job-last-error-class + 55 voice + 8 join-occupancy + 26 vote-kick + 16 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 45 moderation-enforcements + 3 facts-drain + 3 presence-capture + 8 automod-decisions + 4 pool + 1 audit-halt + 1 event-store-lag + 1 eventsub-received + 6 eventsub-classified + 4 eventsub-posts + 3 reconcile-passes + 2 reconcile-actions + 5 reconcile-errors + 1 retention-replay-needed + 4 feed-fetches + 12 feed-fetch-errors); \
          update docs/log-volume-guard.md with the new series"
     );
 }

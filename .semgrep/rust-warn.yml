@@ -1,0 +1,48 @@
+rules:
+  - id: rust-todo-unimplemented
+    languages: [rust]
+    severity: WARNING
+    message: "todo!/unimplemented! left in non-test code; finish it or file a task"
+    pattern-either:
+      - pattern: todo!(...)
+      - pattern: unimplemented!(...)
+    paths:
+      include: ['crates/**', 'src/**']
+      exclude: ['**/*_tests.rs', '**/tests.rs', '**/tests/**', '**/*_tests/**']
+  - id: rust-empty-expect
+    languages: [rust]
+    severity: WARNING
+    message: ".expect() with an empty message carries no context; say what was assumed"
+    pattern: $X.expect("")
+    paths:
+      include: ['crates/**', 'src/**']
+      exclude: ['**/*_tests.rs', '**/tests.rs', '**/tests/**', '**/*_tests/**']
+  - id: rust-empty-expect-in-macros
+    languages: [rust]
+    severity: WARNING
+    message: ".expect() with an empty message inside a macro carries no context; say what was assumed"
+    patterns:
+      - pattern-regex: \.expect\s*\(\s*""\s*\)
+      - pattern-not-regex: (?m)^[ \t]*//[^\n]*
+    paths:
+      include: ['crates/**', 'src/**']
+      exclude: ['**/*_tests.rs', '**/tests.rs', '**/tests/**', '**/*_tests/**']
+  - id: rust-panic-in-prod
+    languages: [rust]
+    severity: WARNING
+    message: "panic! in non-test code; prefer a typed error the caller can handle"
+    pattern: panic!(...)
+    paths:
+      include: ['crates/**', 'src/**']
+      exclude: ['**/*_tests.rs', '**/tests.rs', '**/tests/**', '**/*_tests/**']
+  - id: rust-process-exit-in-lib
+    languages: [rust]
+    severity: WARNING
+    message: "std::process::exit in library code kills the whole process; return a status instead (bins are exempt)"
+    pattern-either:
+      - pattern: std::process::exit(...)
+      - pattern: process::exit(...)
+    paths:
+      include: ['crates/*/src/*.rs', 'crates/*/src/**/*.rs']
+      exclude: ['**/bin/**', '**/main.rs', '**/*_cli.rs', '**/cli.rs', '**/shutdown.rs',
+                '**/*_tests.rs', '**/tests.rs', '**/tests/**', '**/*_tests/**']

@@ -30,6 +30,8 @@ use crate::funnel::Snowflake;
 pub const MAX_CHANNEL_NAME_LEN: u32 = 100;
 /// Largest voice user limit (`/limit`, 0 = unlimited, max 99).
 pub const MAX_USER_LIMIT: i64 = 99;
+/// Longest `/inheritpermissions` source choice (`category`).
+pub const MAX_PERMISSION_SOURCE_CHARS: u32 = 8;
 /// Largest first room number (`/position first-number`): the V11 export codec
 /// stores it as `u32`, so anything above `u32::MAX` breaks `/export` and
 /// `/import` with "Could not read the voice configuration" and can overflow
@@ -44,6 +46,10 @@ pub const RENAME_MIN_INTERVAL_MS: u64 = 300_000;
 /// A queued action is dead-lettered after this many failed attempts; the
 /// `/setup` panel surfaces dead letters as recent failures (V10).
 pub const QUEUE_MAX_ATTEMPTS: u32 = 10;
+/// Newest dead letters kept per queue; older entries drop and count toward
+/// [`ActionQueue::failed_dropped`]. Bounds `/setup` recent-failures memory
+/// when a guild-wide outage dead-letters every write.
+pub const MAX_FAILED_ACTIONS: usize = 100;
 
 // --- creator channels -------------------------------------------------------
 
@@ -699,6 +705,20 @@ impl RenameCoalescer {
     pub fn pending_count(&self) -> usize {
         self.inner.lock().expect("coalescer lock").pending.len()
     }
+
+    /// The still-queued rename for one channel, if any. The folded-duplicate
+    /// guard (legacy 38041a1) counts only renames that are really pending —
+    /// coalescer, queued, in-flight or retry — never a stale last-proposed
+    /// name, so a diverged entry cannot hold a name forever.
+    #[must_use]
+    pub fn pending_for(&self, channel_id: Snowflake) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("coalescer lock")
+            .pending
+            .get(&channel_id)
+            .map(|pending| pending.name.clone())
+    }
 }
 
 // --- action queue -----------------------------------------------------------
@@ -757,6 +777,16 @@ pub enum RoomAction {
     RenameRoom {
         channel_id: Snowflake,
         name: String,
+    },
+    /// Deferred post-move channel respacing for one room. Enqueued when its
+    /// creator move succeeds and the room does not already render at its
+    /// planned slot; the dispatch rebuilds the position plan from a fresh
+    /// snapshot under the same lock as its guard, so a gateway interleave
+    /// cannot pair an old plan with newer-state evidence. Cosmetic: a 429
+    /// holds only the reorder route, never the guild, and a refusal or an
+    /// unknown outcome drops the action without touching the room.
+    RespaceChannels {
+        room_channel_id: Snowflake,
     },
     /// V3 `/limit` and `/unlimit`: set the room channel's user limit
     /// (`0` is unlimited, at most [`MAX_USER_LIMIT`]). The worker has already
@@ -850,7 +880,7 @@ enum Lane {
 impl RoomAction {
     fn lane(&self) -> Lane {
         match self {
-            Self::RenameRoom { .. } => Lane::Deferred,
+            Self::RenameRoom { .. } | Self::RespaceChannels { .. } => Lane::Deferred,
             _ => Lane::Urgent,
         }
     }
@@ -881,6 +911,9 @@ impl RoomAction {
             | Self::DeleteRoom { channel_id }
             | Self::UpdateOwnership { channel_id, .. }
             | Self::RenameRoom { channel_id, .. }
+            | Self::RespaceChannels {
+                room_channel_id: channel_id,
+            }
             | Self::SetUserLimit { channel_id, .. }
             | Self::SetEveryoneConnect { channel_id, .. }
             | Self::SavePrivacy { channel_id }
@@ -967,9 +1000,19 @@ struct QueueInner {
     deferred: HashMap<Snowflake, VecDeque<QueuedAction>>,
     /// Per-guild 429 backoff: nothing for the guild runs before this.
     guild_not_before_ms: HashMap<Snowflake, u64>,
+    /// Per-guild reorder-route 429 backoff (`PATCH /guilds/{id}/channels`):
+    /// every pending reorder waits it out while other routes keep flowing.
+    respace_not_before_ms: HashMap<Snowflake, u64>,
     /// (guild, channel) pairs with lost access: actions touching them wait.
     suspended: HashSet<(Snowflake, Snowflake)>,
     failed: Vec<FailedAction>,
+    /// Dead letters evicted by the [`MAX_FAILED_ACTIONS`] cap (oldest first).
+    /// Monotonic; `clear_failed` leaves it set.
+    failed_dropped: u64,
+    /// First-enqueue time by action id, for the oldest-pending-age gauge.
+    /// Entries survive dispatch and requeue (age spans retries) and are
+    /// removed at terminal completion or channel drain.
+    enqueued_at: HashMap<u64, std::time::Instant>,
 }
 
 impl QueueInner {
@@ -994,8 +1037,10 @@ impl QueueInner {
 /// Per-guild ordered action queue with 429 retry-after (spec "Discord API
 /// notes": per-guild ordered queues, honour retry-after on 429).
 ///
-/// Two FIFO lanes per guild: urgent (create/move/delete) drains before
-/// deferred (rename). A backed-off delete may be bypassed only by actions
+/// Two lanes per guild: urgent (create/move/delete) drains before deferred
+/// (rename). A persisted room's creator move precedes unrelated urgent work
+/// and companion creation, but not earlier writes scoped to its own room. Other
+/// actions retain FIFO order. A backed-off delete may be bypassed only by actions
 /// for other known room channels, never its own follow-ups or an unscoped
 /// create. Other backoffs retain lane order; urgent 429s still hold the guild.
 #[derive(Debug, Default)]
@@ -1022,7 +1067,27 @@ impl ActionQueue {
                 return pending.id;
             }
         }
+        // The dispatch recomputes the positions fresh, so a newer respace
+        // for the same room supersedes a still-queued one.
+        if let RoomAction::RespaceChannels { room_channel_id } = &action {
+            if let Some(pending) = inner.deferred.get_mut(&guild_id).and_then(|queue| {
+                queue.iter_mut().find(|queued| {
+                    matches!(
+                        queued.action,
+                        RoomAction::RespaceChannels { room_channel_id: id }
+                        if id == *room_channel_id
+                    )
+                })
+            }) {
+                pending.action = action;
+                return pending.id;
+            }
+        }
         inner.next_id += 1;
+        let enqueued_id = inner.next_id;
+        inner
+            .enqueued_at
+            .insert(enqueued_id, std::time::Instant::now());
         let queued = QueuedAction {
             id: inner.next_id,
             dispatch_id: 0,
@@ -1035,7 +1100,20 @@ impl ActionQueue {
             Lane::Urgent => &mut inner.urgent,
             Lane::Deferred => &mut inner.deferred,
         };
-        lane.entry(guild_id).or_default().push_back(queued);
+        let queue = lane.entry(guild_id).or_default();
+        // Complete a persisted room's join before unrelated work or companion
+        // creation, without overtaking prior writes to the same room (notably
+        // a backed-off delete). Companion creation has no channel_id scope.
+        // pop_due still enforces suspension, the single-writer fence and 429s.
+        if let RoomAction::MoveMember { channel_id, .. } = action {
+            let index = queue
+                .iter()
+                .rposition(|pending| pending.action.channel_id() == Some(channel_id))
+                .map_or(0, |index| index + 1);
+            queue.insert(index, queued);
+        } else {
+            queue.push_back(queued);
+        }
         inner.next_id
     }
 
@@ -1062,6 +1140,11 @@ impl ActionQueue {
         let suspended: Vec<(Snowflake, Snowflake)> = inner.suspended.iter().copied().collect();
         // Carry waiting room scopes into the deferred lane too: a rename
         // must not overtake that room's delayed lifecycle action.
+        // The reorder-route backoff is snapshotted for the same reason.
+        let respace_held = inner
+            .respace_not_before_ms
+            .get(&guild_id)
+            .is_some_and(|t| now_ms < *t);
         let mut waiting_channels = HashSet::new();
         for urgent in [true, false] {
             let queue = if urgent {
@@ -1074,6 +1157,11 @@ impl ActionQueue {
             };
             let mut idx = None;
             for (i, queued) in queue.iter().enumerate() {
+                // A backed-off reorder route waits out every pending reorder
+                // while renames, moves and creates keep flowing past it.
+                if respace_held && matches!(queued.action, RoomAction::RespaceChannels { .. }) {
+                    continue;
+                }
                 if queued
                     .action
                     .channel_id()
@@ -1114,7 +1202,11 @@ impl ActionQueue {
     /// Release a successful write. Duplicate/stale completions are ignored.
     pub fn mark_succeeded(&self, action: &QueuedAction) -> bool {
         let mut inner = self.inner.lock().expect("queue lock");
-        Self::release(&mut inner, action)
+        let ok = Self::release(&mut inner, action);
+        if ok {
+            inner.enqueued_at.remove(&action.id);
+        }
+        ok
     }
 
     fn release(inner: &mut QueueInner, action: &QueuedAction) -> bool {
@@ -1141,7 +1233,9 @@ impl ActionQueue {
             return false;
         }
         let not_before_ms = now_ms.saturating_add(retry_after_ms);
-        if action.action.lane() == Lane::Urgent {
+        if matches!(action.action, RoomAction::RespaceChannels { .. }) {
+            inner.respace_not_before_ms.insert(guild_id, not_before_ms);
+        } else if action.action.lane() == Lane::Urgent {
             inner.guild_not_before_ms.insert(guild_id, not_before_ms);
         }
         inner.requeue(QueuedAction {
@@ -1160,11 +1254,17 @@ impl ActionQueue {
         }
         let attempts = action.attempts.saturating_add(1);
         if attempts >= QUEUE_MAX_ATTEMPTS {
+            inner.enqueued_at.remove(&action.id);
             inner.failed.push(FailedAction {
                 action: QueuedAction { attempts, ..action },
                 reason,
                 failed_at_ms: now_ms,
             });
+            if inner.failed.len() > MAX_FAILED_ACTIONS {
+                let excess = inner.failed.len() - MAX_FAILED_ACTIONS;
+                inner.failed.drain(..excess);
+                inner.failed_dropped = inner.failed_dropped.saturating_add(excess as u64);
+            }
             return true;
         }
         inner.requeue(QueuedAction {
@@ -1175,22 +1275,64 @@ impl ActionQueue {
         true
     }
 
+    /// True while a room-scoped kick enforcement for this vote is still queued
+    /// (either lane, including backed-off, suspended or not-yet-due entries).
+    /// The worker keeps the vote's initiator until the enforcement audit runs,
+    /// so pruning past the retention horizon never drops an unresolved
+    /// enforcement fence (VK-03). An action being dispatched cannot coincide
+    /// with this read: the single-threaded actor holds the worker mutably
+    /// across the whole dispatch, so in-flight needs no fence of its own.
+    #[must_use]
+    pub fn has_queued_kick(&self, vote_id: Snowflake) -> bool {
+        let inner = self.inner.lock().expect("queue lock");
+        [&inner.urgent, &inner.deferred].iter().any(|lanes| {
+            lanes.values().any(|queue| {
+                queue.iter().any(|queued| {
+                    matches!(
+                        queued.action,
+                        RoomAction::KickMember { vote_id: id, .. } if id == vote_id
+                    )
+                })
+            })
+        })
+    }
+
+    /// The still-queued rename for one room channel, if any (deferred lane
+    /// only; renames never ride the urgent lane). Part of the really-pending
+    /// set the folded-duplicate guard counts: a rename drained from the
+    /// coalescer but not yet dispatched still blocks a folded duplicate.
+    #[must_use]
+    pub fn queued_rename_for(&self, guild_id: Snowflake, channel_id: Snowflake) -> Option<String> {
+        let inner = self.inner.lock().expect("queue lock");
+        inner.deferred.get(&guild_id).and_then(|queue| {
+            queue.iter().find_map(|queued| match &queued.action {
+                RoomAction::RenameRoom {
+                    channel_id: id,
+                    name,
+                } if *id == channel_id => Some(name.clone()),
+                _ => None,
+            })
+        })
+    }
+
     /// Access lost on a room (spec V1): its actions wait, nothing retries.
-    pub fn suspend(&self, guild_id: Snowflake, channel_id: Snowflake) {
+    /// Returns true only when the lane changes from active to suspended.
+    pub fn suspend(&self, guild_id: Snowflake, channel_id: Snowflake) -> bool {
         self.inner
             .lock()
             .expect("queue lock")
             .suspended
-            .insert((guild_id, channel_id));
+            .insert((guild_id, channel_id))
     }
 
     /// Access restored: pending actions for the room may run again.
-    pub fn resume(&self, guild_id: Snowflake, channel_id: Snowflake) {
+    /// Returns true only when the lane changes from suspended to active.
+    pub fn resume(&self, guild_id: Snowflake, channel_id: Snowflake) -> bool {
         self.inner
             .lock()
             .expect("queue lock")
             .suspended
-            .remove(&(guild_id, channel_id));
+            .remove(&(guild_id, channel_id))
     }
 
     #[must_use]
@@ -1227,6 +1369,9 @@ impl ActionQueue {
             }
             *queue = kept;
         }
+        for id in &dropped {
+            inner.enqueued_at.remove(id);
+        }
         dropped
     }
 
@@ -1234,6 +1379,29 @@ impl ActionQueue {
     /// or forgotten by reconcile). Returns the dropped count.
     pub fn drop_for_channel(&self, guild_id: Snowflake, channel_id: Snowflake) -> usize {
         self.drain_for_channel(guild_id, channel_id).len()
+    }
+
+    /// Whether the guild is waiting out a Discord rate limit.
+    #[must_use]
+    pub fn backed_off(&self, guild_id: Snowflake, now_ms: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("queue lock")
+            .guild_not_before_ms
+            .get(&guild_id)
+            .is_some_and(|t| now_ms < *t)
+    }
+
+    /// Whether the guild's reorder route is waiting out a Discord 429.
+    /// Every pending reorder honours it; other routes are unaffected.
+    #[must_use]
+    pub fn respace_backed_off(&self, guild_id: Snowflake, now_ms: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("queue lock")
+            .respace_not_before_ms
+            .get(&guild_id)
+            .is_some_and(|t| now_ms < *t)
     }
 
     /// Pending (urgent, deferred) counts for the guild. Diagnostics/tests.
@@ -1246,13 +1414,38 @@ impl ActionQueue {
         (len(&inner.urgent), len(&inner.deferred))
     }
 
-    /// Dead-lettered writes for `/setup` recent failures (V10).
+    /// Age of the oldest still-queued (not in-flight) action for the guild,
+    /// measured from first enqueue across retries. `None` when nothing is
+    /// queued. Feeds the queue-age gauge and the stuck-worker watchdog.
+    #[must_use]
+    pub fn oldest_pending_age(&self, guild_id: Snowflake) -> Option<std::time::Duration> {
+        let inner = self.inner.lock().expect("queue lock");
+        let now = std::time::Instant::now();
+        [&inner.urgent, &inner.deferred]
+            .iter()
+            .filter_map(|lanes| lanes.get(&guild_id))
+            .flat_map(|queue| queue.iter())
+            .filter_map(|queued| inner.enqueued_at.get(&queued.id))
+            .map(|at| now.saturating_duration_since(*at))
+            .max()
+    }
+
+    /// Dead-lettered writes for `/setup` recent failures (V10): the newest
+    /// [`MAX_FAILED_ACTIONS`] entries, oldest dropped (see
+    /// [`Self::failed_dropped`]).
     #[must_use]
     pub fn failed(&self) -> Vec<FailedAction> {
         self.inner.lock().expect("queue lock").failed.clone()
     }
 
-    /// Clear dead letters (after `/setup` shows them, V10).
+    /// Dead letters evicted by the cap so far; `clear_failed` does not reset it.
+    #[must_use]
+    pub fn failed_dropped(&self) -> u64 {
+        self.inner.lock().expect("queue lock").failed_dropped
+    }
+
+    /// Clear dead letters (after `/setup` shows them, V10). Keeps
+    /// [`Self::failed_dropped`] so the eviction total survives the clear.
     pub fn clear_failed(&self) {
         self.inner.lock().expect("queue lock").failed.clear();
     }
@@ -1438,7 +1631,8 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 "channel",
                 "Notice channel; leave empty to use the automatic fallback",
                 CommandOptionType::Channel,
-            )]),
+            )
+            .channel_types(vec![0])]),
             CommandOption::new(
                 "mention",
                 "Set or clear the role mentioned on errors",
@@ -1536,6 +1730,7 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::String,
             )
             .required()
+            .max_length(MAX_PERMISSION_SOURCE_CHARS)
             .choices(vec![
                 CommandChoice {
                     name: "Creator".to_owned(),
@@ -1660,12 +1855,14 @@ mod tests {
     use super::*;
     use crate::commands::merge_commands;
     use crate::feature_commands::feature_commands;
-    use crate::funnel::now_iso;
     use crate::moderation::moderation_commands;
 
     const GUILD: Snowflake = 100;
     const CREATOR: Snowflake = 200;
     const MEMBER: Snowflake = 300;
+    /// One creation stamp for every fixture, so two builds of the same
+    /// fixture stay equal.
+    const NOW: &str = "2026-01-01T00:00:00.000Z";
 
     fn creator() -> CreatorChannel {
         CreatorChannel::new(GUILD, CREATOR)
@@ -1680,7 +1877,7 @@ mod tests {
             category_id: Some(400),
             category_channel_count: 3,
             seed,
-            now: now_iso(),
+            now: NOW.to_owned(),
         }
     }
 
@@ -1692,8 +1889,19 @@ mod tests {
             owner_id: owner,
             original_creator_id: owner,
             name_seed: 7,
-            created_at: now_iso(),
+            created_at: NOW.to_owned(),
         }
+    }
+
+    #[test]
+    fn fixtures_do_not_read_the_clock() {
+        // Equality assertions build the same fixture more than once; a
+        // wall-clock stamp made them differ when a millisecond ticked over.
+        let room = tracked(500, MEMBER);
+        let join = join_req(MEMBER, 1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(tracked(500, MEMBER), room);
+        assert_eq!(join_req(MEMBER, 1), join);
     }
 
     #[test]
@@ -1977,7 +2185,9 @@ mod tests {
             },
         );
         q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
-        q.suspend(GUILD, 501);
+        assert!(!q.resume(GUILD, 501));
+        assert!(q.suspend(GUILD, 501));
+        assert!(!q.suspend(GUILD, 501));
         assert!(q.is_suspended(GUILD, 501));
         // The suspended delete waits; the rename still runs.
         assert_eq!(
@@ -1991,7 +2201,8 @@ mod tests {
             })
         );
         assert_eq!(q.pop_due(GUILD, 0), None);
-        q.resume(GUILD, 501);
+        assert!(q.resume(GUILD, 501));
+        assert!(!q.resume(GUILD, 501));
         assert_eq!(
             q.pop_due(GUILD, 0).map(|a| {
                 q.mark_succeeded(&a);
@@ -2041,6 +2252,84 @@ mod tests {
     }
 
     #[test]
+    fn respace_429_backs_off_every_pending_reorder_not_the_guild() {
+        let q = ActionQueue::new();
+        q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 500 });
+        q.enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: 501,
+            },
+        );
+        q.enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: 502,
+            },
+        );
+        // Lifecycle writes drain first; the cosmetic respace waits its turn.
+        let delete = q.pop_due(GUILD, 0).expect("delete due");
+        assert!(matches!(delete.action, RoomAction::DeleteRoom { .. }));
+        q.mark_succeeded(&delete);
+        let first = q.pop_due(GUILD, 0).expect("respace due");
+        assert!(matches!(first.action, RoomAction::RespaceChannels { .. }));
+        // A 429 on one room's reorder holds every pending reorder on the
+        // route, while lifecycle writes for other rooms still flow.
+        q.mark_rate_limited(GUILD, 1500, 0, first);
+        assert!(q.respace_backed_off(GUILD, 1499));
+        assert!(
+            !q.backed_off(GUILD, 1499),
+            "a cosmetic reorder never holds the guild"
+        );
+        q.enqueue(
+            GUILD,
+            RoomAction::MoveMember {
+                member_id: MEMBER,
+                channel_id: 503,
+            },
+        );
+        let moved = q
+            .pop_due(GUILD, 1499)
+            .expect("move bypasses the route backoff");
+        assert!(matches!(moved.action, RoomAction::MoveMember { .. }));
+        q.mark_succeeded(&moved);
+        assert_eq!(
+            q.pop_due(GUILD, 1499),
+            None,
+            "the other room's reorder waits out the same route backoff"
+        );
+        let second = q.pop_due(GUILD, 1500).expect("route backoff elapsed");
+        assert!(matches!(second.action, RoomAction::RespaceChannels { .. }));
+    }
+
+    #[test]
+    fn respace_enqueue_coalesces_per_room() {
+        let q = ActionQueue::new();
+        q.enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: 501,
+            },
+        );
+        q.enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: 501,
+            },
+        );
+        q.enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: 502,
+            },
+        );
+        assert_eq!(q.pending_counts(GUILD), (0, 2));
+        // A forgotten room drops its pending respace with everything else.
+        assert_eq!(q.drop_for_channel(GUILD, 501), 1);
+        assert_eq!(q.pending_counts(GUILD), (0, 1));
+    }
+
+    #[test]
     fn queue_dead_letters_after_max_attempts() {
         let q = ActionQueue::new();
         q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 500 });
@@ -2064,6 +2353,63 @@ mod tests {
         assert_eq!(fail_backoff_ms(100), 60_000);
         q.clear_failed();
         assert!(q.failed().is_empty());
+    }
+
+    #[test]
+    fn dead_letter_list_caps_at_10k_oldest_drop() {
+        const TOTAL: u64 = 10_000;
+        let q = ActionQueue::new();
+        for i in 0..TOTAL {
+            q.enqueue(
+                GUILD,
+                RoomAction::DeleteRoom {
+                    channel_id: 1_000_000 + i,
+                },
+            );
+            let mut action = q.pop_due(GUILD, u64::MAX).expect("due");
+            for step in 1..=QUEUE_MAX_ATTEMPTS {
+                if step < QUEUE_MAX_ATTEMPTS {
+                    let now = action.not_before_ms;
+                    assert!(q.mark_failed(action.clone(), format!("boom-{i}"), now));
+                    let due = now.saturating_add(fail_backoff_ms(step));
+                    action = q.pop_due(GUILD, due).expect("retry exactly when due");
+                    assert_eq!(action.attempts, step);
+                } else {
+                    assert!(q.mark_failed(action.clone(), format!("boom-{i}"), i));
+                }
+            }
+        }
+        let failed = q.failed();
+        assert_eq!(failed.len(), MAX_FAILED_ACTIONS, "cap holds at 10k entries");
+        let dropped = TOTAL - MAX_FAILED_ACTIONS as u64;
+        assert_eq!(q.failed_dropped(), dropped);
+        assert!(
+            failed
+                .windows(2)
+                .all(|w| w[0].failed_at_ms < w[1].failed_at_ms),
+            "newest entries retained in order"
+        );
+        assert_eq!(
+            failed.first().expect("capped").reason,
+            format!("boom-{dropped}")
+        );
+        assert_eq!(
+            failed.last().expect("capped").reason,
+            format!("boom-{}", TOTAL - 1)
+        );
+        assert!(
+            failed
+                .iter()
+                .all(|f| f.action.attempts == QUEUE_MAX_ATTEMPTS),
+            "only exhausted writes are dead-lettered"
+        );
+        q.clear_failed();
+        assert!(q.failed().is_empty());
+        assert_eq!(
+            q.failed_dropped(),
+            dropped,
+            "clear keeps the eviction total"
+        );
     }
 
     #[test]
@@ -2404,7 +2750,7 @@ mod tests {
                 configured_name: Some("Lounge".to_owned()),
                 viewer_role_id: Some(GUILD),
             },
-            created_at: crate::funnel::now_iso(),
+            created_at: NOW.to_owned(),
         };
         assert_eq!(store.companion_for(GUILD, 500), None);
         store.add_companion(companion.clone());
@@ -2747,6 +3093,7 @@ mod tests {
             ["channel", "source", "source-channel"]
         );
         assert!(inherit.options[1].required == Some(true));
+        assert_eq!(inherit.options[1].max_length, Some(8));
         // `/defaultlimit` bounds match the import validation (0-99).
         let limit = defs.iter().find(|def| def.name == "defaultlimit").unwrap();
         assert_eq!(limit.options[1].min_value, Some(0));
@@ -2844,5 +3191,31 @@ mod tests {
             .into_iter()
             .collect();
         assert!(VoiceGates::from_map(&vars).enabled);
+    }
+
+    #[test]
+    fn oldest_pending_age_tracks_first_enqueue_across_retries() {
+        // Stall-observability (TOG prod stall follow-up): the queue-age gauge
+        // must reflect the oldest still-queued action, measured from its
+        // first enqueue, so a requeued-but-never-dispatched action keeps
+        // ageing instead of looking fresh.
+        let queue = ActionQueue::new();
+        assert_eq!(queue.oldest_pending_age(GUILD), None);
+        queue.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+        let age = queue
+            .oldest_pending_age(GUILD)
+            .expect("queued action has an age");
+        assert!(age < std::time::Duration::from_secs(60));
+        // A pop/requeue cycle (the retry path) does not reset the age, and
+        // completing the action after a second pop clears it.
+        let action = queue.pop_due(GUILD, 0).expect("action is due");
+        assert!(queue.mark_rate_limited(GUILD, 1_000, 0, action));
+        assert!(queue.oldest_pending_age(GUILD).is_some());
+        let action = queue
+            .pop_due(GUILD, 1_001)
+            .expect("action is due after the backoff");
+        assert!(queue.mark_succeeded(&action));
+        assert_eq!(queue.oldest_pending_age(GUILD), None);
+        assert_eq!(queue.pending_counts(GUILD), (0, 0));
     }
 }

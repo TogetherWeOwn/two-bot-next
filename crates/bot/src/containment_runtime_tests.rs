@@ -2,8 +2,9 @@
 //! tests are ignored and run only on agent-testdb / the CI service container.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -13,7 +14,7 @@ use twilight_model::gateway::payload::incoming::GuildAuditLogEntryCreate;
 use twilight_model::guild::audit_log::{AuditLogEntry, AuditLogEventType};
 use twilight_model::id::Id;
 use two_bot_core::backup::guild_config::STAGING_BOT_APPLICATION_ID;
-use two_bot_core::containment::DestructiveAction;
+use two_bot_core::containment::{ContainmentPolicy, DestructiveAction};
 use two_bot_core::containment_store::ContainmentStore;
 use two_bot_cutover::parse::date_to_snowflake;
 use two_bot_discord::{ActionExecutor, AuditEntryObserver, AuditLogObservation, MemPipeline};
@@ -122,6 +123,47 @@ fn containment_settings_defaults_and_bad_values() {
         let parsed =
             ContainmentSettings::from_vars(&vars(&[("DISCORD_STAFF_ALERT_CHANNEL_ID", bad)]));
         assert_eq!(parsed.staff_channel, None, "{bad}");
+    }
+}
+
+#[test]
+fn containment_seconds_refuse_values_that_are_not_whole_positive_milliseconds() {
+    let defaults = ContainmentSettings::from_vars(&vars(&[]));
+    let cases: [(&str, Option<i64>); 13] = [
+        ("0.0004", None),
+        ("1e-9", None),
+        ("0.0009999", None),
+        ("0.001", Some(1)),
+        ("0.0015", Some(1)),
+        ("1.0005", Some(1_000)),
+        ("9223372036854774", Some(((1_u64 << 63) - 2_048) as i64)),
+        ("9223372036854775.808", None),
+        ("9200000000000000", Some(9_200 * 10_i64.pow(15))),
+        ("9300000000000000", None),
+        ("1e300", None),
+        ("1e306", None),
+        ("1e308", None),
+    ];
+    for (raw, expected) in cases {
+        let parsed = ContainmentSettings::from_vars(&vars(&[
+            ("TWO_ANTI_NUKE_WINDOW_SECONDS", raw),
+            ("TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS", raw),
+        ]));
+        assert_eq!(
+            parsed.window_ms,
+            expected.unwrap_or(defaults.window_ms),
+            "window {raw}"
+        );
+        assert_eq!(
+            parsed.max_age_ms,
+            expected.unwrap_or(defaults.max_age_ms),
+            "max age {raw}"
+        );
+        assert!(
+            ContainmentPolicy::new(parsed.window_ms, parsed.max_age_ms, parsed.heat_threshold)
+                .is_ok(),
+            "{raw}"
+        );
     }
 }
 
@@ -272,6 +314,22 @@ fn posted_contents(mock: &MockRest) -> Vec<String> {
         .collect()
 }
 
+static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
+fn schema_name_at(nanos: u128) -> String {
+    format!(
+        "tog10430_contain_{}_{}_{}",
+        std::process::id(),
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
+        nanos
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -279,11 +337,16 @@ struct TestSchema {
 
 impl TestSchema {
     async fn new() -> Self {
-        let stamp = SystemTime::now()
+        // PID + counter + nanos: wall-clock nanos can repeat across parallel
+        // tests on a coarse clock (run 39175965289 attempt 1: duplicate
+        // schema `tog10430_*` -> 23505). The counter keeps same-tick
+        // names distinct, the PID separates test binaries, and nanos keeps a
+        // leaked schema plus PID reuse from ever repeating a name.
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("tog10430_contain_{stamp}");
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let schema = schema_name_at(nanos);
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");
@@ -589,6 +652,102 @@ async fn containment_worker_armed_partial_failure_is_uncertain_and_blocks() {
     );
     assert!(bodies[0].contains("uncertain"), "{bodies:?}");
     assert!(bodies[0].contains("`77`"), "{bodies:?}");
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// The first guild-roles reads (one whole read budget) never answer; later
+/// ones are prompt.
+async fn discord_first_roles_read_stalls() -> MockRest {
+    let roles_reads = std::sync::atomic::AtomicUsize::new(0);
+    MockRest::with_responder(move |request: &RestRequest| {
+        let path = request.path.strip_prefix("/api/v10").unwrap();
+        match (request.method.as_str(), path) {
+            ("GET", "/users/@me") => {
+                ScriptedResponse::json(200, json!({"id":"999","bot":true,"username":"bot"}))
+            }
+            ("GET", "/applications/@me") => {
+                ScriptedResponse::json(200, json!({"id": STAGING_BOT_APPLICATION_ID}))
+            }
+            ("GET", "/guilds/22") => {
+                ScriptedResponse::json(200, json!({"id":"22","owner_id":"888"}))
+            }
+            ("GET", "/guilds/22/roles") => {
+                let roles = ScriptedResponse::json(
+                    200,
+                    json!([
+                        {"id":"22","permissions":"3072","position":0,"managed":false},
+                        {"id":"77","permissions":"8","position":1,"managed":false},
+                        {"id":"88","permissions":"0","position":5,"managed":false},
+                    ]),
+                );
+                if roles_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    < two_bot_core::MAX_HTTP_TRIES as usize
+                {
+                    roles.delayed(Duration::from_secs(600))
+                } else {
+                    roles
+                }
+            }
+            ("GET", "/guilds/22/members/999") => {
+                ScriptedResponse::json(200, json!({"user":{"id":"999"},"roles":["88"]}))
+            }
+            ("GET", "/guilds/22/members/5001") => {
+                ScriptedResponse::json(200, json!({"user":{"id":"5001"},"roles":["77"]}))
+            }
+            ("GET", "/guilds/22/members/5002") => {
+                ScriptedResponse::json(200, json!({"user":{"id":"5002"},"roles":["77"]}))
+            }
+            ("GET", "/channels/12") => ScriptedResponse::json(
+                200,
+                json!({"id":"12","guild_id":"22","type":0,"permission_overwrites":[]}),
+            ),
+            ("POST", "/channels/12/messages") => ScriptedResponse::json(201, json!({"id":"99"})),
+            _ => panic!("unexpected mock Discord route: {} {}", request.method, path),
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn containment_worker_survives_a_stalled_roles_read_and_handles_the_next_entry() {
+    let db = TestSchema::new().await;
+    let store = ContainmentStore::from_pool(db.pool.clone());
+    let mock = discord_first_roles_read_stalls().await;
+    let other_executor = |entry_id| AuditLogObservation {
+        executor_id: Some(5002),
+        ..entry(entry_id)
+    };
+
+    // Executor 5001 opens an incident whose roles read never answers. The
+    // worker must give up once the five-try read budget is spent (real time,
+    // about 32.5 s: five 5 s bounds plus 0.5+1+2+4 s backoff), then plan
+    // executor 5002's incident from the same queue.
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        run(
+            Scripted(settings(Some(CHANNEL))),
+            store,
+            &mock,
+            [
+                entry(fresh_entry_id(0)),
+                entry(fresh_entry_id(1_000)),
+                other_executor(fresh_entry_id(2_000)),
+                other_executor(fresh_entry_id(3_000)),
+            ],
+            false,
+        ),
+    )
+    .await
+    .expect("a stalled roles read must not park the containment worker");
+    let bodies = posted_contents(&mock);
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert!(bodies[0].contains("failed"), "stalled incident: {bodies:?}");
+    assert!(
+        bodies[1].contains("dry_run"),
+        "next entry planned: {bodies:?}"
+    );
     mock.shutdown().await;
     db.close().await;
 }

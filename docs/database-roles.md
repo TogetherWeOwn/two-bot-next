@@ -12,23 +12,33 @@ holds no membership path into the migrator group.
 | Group | Database | Bot schema | Bot tables | Sequences | `web_v1` |
 | --- | --- | --- | --- | --- | --- |
 | `two_bot_migrator` | CONNECT, CREATE; no TEMP | Owner (DDL) | Owner | Owner | Owner |
-| `two_bot_runtime` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | SELECT, INSERT, UPDATE, DELETE | USAGE, SELECT; no UPDATE | No access |
+| `two_bot_runtime` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | Ordinary tables: SELECT, INSERT, UPDATE, DELETE; admission lanes: SELECT, INSERT, UPDATE only | USAGE, SELECT; no UPDATE | No access |
 | `two_web_reader` | CONNECT; no CREATE/TEMP | No access | No access | No access | USAGE; SELECT on nine reviewed views |
-| `two_bot_migrator_ro` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | SELECT on bot tables, admission lane and SQLx ledger; no DML | No access | USAGE; no view or function access |
+| `two_bot_migrator_ro` | CONNECT; no CREATE/TEMP | USAGE, no CREATE | SELECT on bot tables, admission lanes and SQLx ledger; no DML | No access | USAGE; no view or function access |
+
+The owner-grant journal (`voice_owner_grants`) is an ordinary `table`-kind
+entry under this policy: the runtime group holds SELECT, INSERT, UPDATE and
+DELETE on it, the migrator owns it, the read-only migrator group holds SELECT
+only, and the web reader has no access.
 
 No runtime, reader or read-only migrator grants carry grant options. Runtime cannot create schemas,
 tables, temporary tables or functions, alter tables, truncate them, or read the
 SQLx migration ledger. The `two_bot_migrator_ro` group exists for the
-read-only migration-plan step: it reads bot tables, the admission lane and the
+read-only migration-plan step: it reads bot tables, the admission lanes and the
 ledger through SELECT only, with no DML, DDL, sequence, function or default
 privileges, so a plan run can never change data or schema. Migrator-only tables
 stay unreadable to it, exactly as for runtime and reader.
 
 Existing append-only audit triggers continue to constrain
-DML; a grant does not disable those controls. The `discord_send_admission`
-lane is a restricted exception: runtime has SELECT, INSERT and UPDATE only,
-never DELETE/TRUNCATE; reader and PUBLIC receive no lane access. The verifier
-requires these three privileges and rejects extra erase privileges.
+DML; a grant does not disable those controls. Both `discord_send_admission` and
+`voice_create_reservations` are restricted admission lanes: runtime has SELECT,
+INSERT and UPDATE only, never DELETE/TRUNCATE. The reservation rows preserve
+accepted room-create history across rollback, deletion and restart; runtime can
+settle a hold but cannot erase that durable history. Reader and PUBLIC receive
+no admission-lane access. The verifier requires these three runtime privileges,
+read-only SELECT for the migrator-plan role, and rejects extra erase or public access.
+Member erasure is the operator-only path that writes the migrator-only audit
+table, so it deletes reservation rows as the migrator, never as runtime.
 
 Two tables are migrator-only (`migrator` kind): `member_erasure_audit`
 (operator accountability written by the operator-only erasure path) and
@@ -43,6 +53,19 @@ tables to the migrator and grants the migrator ALL with no runtime or reader
 grant; the verifier requires migrator ownership/privileges and rejects any
 runtime/reader access, including TOAST-storage ownership drift.
 
+The three opt-out tables (`privacy_opt_outs`, `guild_analytics_settings`,
+`privacy_opt_out_audit`, plus the audit `id` sequence) are ordinary `table`
+kind instead: the always-on runtime reads suppression and switches on its
+hot write paths, and operator opt-outs execute through the app pool, so the
+runtime needs SELECT/INSERT/UPDATE/DELETE there. See `docs/privacy.md` for
+what those rows mean.
+
+The game-activity aggregates table (`game_activity_guild_aggregates`) is
+ordinary `table` kind for the same reason: the hourly voice-boot flush loop
+upserts per-(guild, game) counters through the app pool, and the operator
+trend report reads them back through it. The table carries no member column,
+so there is nothing to erase and no reader grant beyond the app pool.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not
@@ -51,6 +74,35 @@ needs EXECUTE on exactly `_ts(text)`, `_iso(timestamptz)` and `_json(text)` in
 `web_v1`, the invoker-rights formatting/parsing helpers used by those views. No
 other application function may be executable by the runtime or reader. Trigger
 functions do not need runtime EXECUTE once their triggers have been created.
+
+## Channel lane reconciliation access
+
+The local operator-only `two-bot moderation release-channel` command uses existing
+grants; it never migrates or creates roles. Use an already approved,
+environment-bound operator login, not a runtime-owned credential recovered from a
+process. `--operator` is attribution; the audit additionally records the actual
+PostgreSQL login and effective role. No public/slash/website release route exists.
+
+| Table | Inspection | Explicit confirmed release | Existing group |
+| --- | --- | --- | --- |
+| `moderation_channel_executions` | SELECT | SELECT, DELETE | `two_bot_runtime` DML; `two_bot_migrator_ro` inspection only |
+| `moderation_idempotency` | SELECT | SELECT, UPDATE | `two_bot_runtime` DML; `two_bot_migrator_ro` inspection only |
+| `moderation_audit` | None | INSERT (strict, same transaction) | `two_bot_runtime` DML |
+| `moderation_lockdowns` | Reconciliation reads outside the CLI | **No access/write by this command** | Existing recovery policy unchanged |
+
+The ledger is retained as a terminal replay tombstone, not deleted, and the
+member-erasure plan skips it (`done` / `operator_released`), so the personal audit
+rows can be erased without re-arming the old key. The caller-supplied key may
+itself be a member snowflake; if so, it remains as an identity-bearing replay
+fence because changing it could let delayed delivery repeat the uncertain
+mutation. The linked audit row, including matching keys and free-text reasons,
+remains covered by the erasure manifest. Release replaces the obsolete ownership
+token and actor-derived request hash with fixed `operator_released` markers; the
+original token and hash are redacted from inspection and audit snapshots. A
+read-only login cannot confirm release; `two_web_reader` cannot inspect or
+release these base tables. No new privilege is required. Follow the
+[channel reconciliation checklist](channel-lane-reconciliation.md) before any
+confirmation; a database grant is not incident approval.
 
 ## Plan and verify
 
@@ -61,16 +113,28 @@ two-bot db roles plan --phase bootstrap > database-roles-bootstrap.sql
 two-bot db roles verify
 ```
 
-Both phases start, after the group-creation guard, with an ephemeral
-membership block: when the executing identity cannot SET or USE
-`two_bot_migrator`, the plan grants the membership to `current_user` for this
-transaction only (`WITH INHERIT TRUE, SET TRUE` on PostgreSQL 16+, plain
-`GRANT` on 15) and revokes it before `COMMIT`, refusing the plan when the
-membership is still absent. A non-superuser provisioning identity otherwise
-fails at `ALTER SCHEMA public OWNER TO two_bot_migrator` and loses `public`
-access once ownership flips. The bootstrap render differs from the default
-(`full`) render only by the skip lines; neither render contains a password or
-a login grant.
+Both phases snapshot whether `current_user` already had a direct
+`two_bot_migrator` membership before any group is created. If the identity
+already has usable SET/USAGE, the plan leaves that membership and its grantor,
+ADMIN, INHERIT and SET options untouched. If a temporary membership is needed,
+it is granted explicitly as `CURRENT_USER` (`WITH INHERIT TRUE, SET TRUE` on
+PostgreSQL 16+, plain `GRANT` on 15) and only that grant is revoked before
+`COMMIT`; the plan refuses when the membership is still unusable. Without it a
+non-superuser provisioning identity fails at `ALTER SCHEMA public OWNER TO
+two_bot_migrator` and loses `public` access once ownership flips. If the
+identity's own unusable grant (granted by itself) would need its options changed
+for the plan to proceed, the plan refuses without changing the membership.
+PostgreSQL 16+ automatically gives a CREATEROLE creator an ADMIN-only membership
+on a newly created role; that membership is distinct from the plan's temporary
+grant and is preserved. When the identity held no direct membership before the
+plan, the plan also revokes any membership granted by the identity itself at
+the end, which covers the usable self-grant that `CREATE ROLE` adds when the
+identity's `createrole_self_grant` setting is non-empty (PostgreSQL 16+); that
+row is never one the operator put there. Memberships the same setting adds in
+the runtime, web reader and read-only migrator groups are outside this rule and
+are not touched. The bootstrap render differs from
+the default (`full`) render only by the skip lines; neither render contains a
+password or a login grant.
 
 `plan` prints SQL without opening a connection, reading a database URL or executing
 anything. There is deliberately **no apply subcommand or --apply flag**. This is
@@ -91,11 +155,11 @@ never returns PASS. Verification checks missing groups/objects, group attributes
 and memberships, database/schema privileges, ownership/object kinds, effective
 table/column/sequence/function privileges (including PUBLIC), grant options, parsed
 boolean view invoker settings and unsafe future grants. Explicit grants cover the
-current migrations' 76 ordinary bot tables plus the restricted admission lane,
-SQLx ledger, two migrator-only tables, eleven sequences,
+current migrations' 89 ordinary bot tables plus two restricted admission lanes,
+SQLx ledger, two migrator-only tables, twelve sequences,
 nine web views and six functions (three trigger helpers plus three `web_v1`
 helpers). The read-only migrator group additionally reads the ordinary tables,
-the admission lane and the ledger; it reads no migrator-only table, sequence,
+the admission lanes and the ledger; it reads no migrator-only table, sequence,
 view or function. This includes
 `gateway_onboarding_jobs` and its sequence: the DML-only gateway must recover and
 write this queue, while the web reader must not access it. A detached SERIAL
@@ -111,6 +175,11 @@ through PUBLIC or with grant options. Such grants (e.g. `session_replication_rol
 can disable audit triggers without a superuser attribute. They are cluster-wide:
 the plan does not revoke them automatically; any correction needs an independently
 reviewed operator change.
+
+Functions in a schema a group cannot use (no USAGE) are not callable by it and are
+not drift. Managed Postgres installs extension helpers this way: PlanetScale puts
+`hypopg` in its own `pscale_extensions` schema with default PUBLIC EXECUTE and no
+USAGE for other roles. A USAGE grant on such a schema makes its functions count again.
 
 Normal PUBLIC catalog reads/functions remain available. No group may own a
 system-schema relation, function or schema (ownership grants implicit DDL and
@@ -150,11 +219,18 @@ their login status or silently removing memberships. It contains no passwords.
    migrations with `SET ROLE two_bot_migrator`, so new objects are
    migrator-owned from creation; (e) the provisioning identity applies the
    full phase (`two-bot db roles plan`, the default), idempotently; (f) verify
-   reads 0 findings. For later migrations, the dedicated migrator login must
-   `SET ROLE two_bot_migrator` before creating objects: creator-specific
-   default ACLs belong to the group, not automatically to a member login.
-   Reapply the reviewed full plan after migrations and view updates, then
-   verify. `sql/web_v1.sql` is applied with `public` as the bot-table search
+   reads 0 findings. For later migrations, the order is fixed: (a) dispatch the
+   matching migration workflow plan (`staging-migrate.yml` with
+   `--target staging` for staging, `production-migrate.yml` with
+   `--target production` for PlanetScale main `two_bot`, passing
+   `production_branch_id` (required for `*.psdb.cloud` hosts; it must match
+   the binding username's `{role}.{branch_id}` suffix)) and review
+   the pending set; (b) dispatch apply through the reviewed environment so the dedicated
+   migrator login creates objects with `SET ROLE two_bot_migrator` from the
+   start: creator-specific default ACLs belong to the group, not automatically
+   to a member login; (c) the provisioning identity reapplies the reviewed full
+   plan after migrations and view updates, then `verify` reads 0 findings.
+   `sql/web_v1.sql` is applied with `public` as the bot-table search
    path before the bootstrap phase; functions stay strict in both phases.
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated

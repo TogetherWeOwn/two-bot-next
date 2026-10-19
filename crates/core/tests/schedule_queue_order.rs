@@ -441,12 +441,14 @@ fn prefix_resolution_refuses_missing_and_ambiguous_ids() {
     );
     assert_eq!(
         resolve(""),
-        IdResolution::Ambiguous,
-        "an empty prefix never picks an arbitrary row"
+        IdResolution::Missing,
+        "an empty prefix never matches rows"
     );
+    assert_eq!(resolve_scheduled_id(["only"], ""), IdResolution::Missing);
     assert_eq!(
-        resolve_scheduled_id(["only"], ""),
-        IdResolution::Unique("only")
+        resolve_scheduled_id(["only"], &"x".repeat(129)),
+        IdResolution::Missing,
+        "an overlong prefix is refused"
     );
 
     // Both refusals share one reply naming the input and the way out.

@@ -1,14 +1,30 @@
-# Cutover migration ledger (offline)
+# Cutover migration ledger (historical; 2026-10-04 baseline)
+
+> Historical record, not today's database state. The baseline below
+> inventories the 70 migration files present at `origin/main` (`96ff8512`),
+> read 2026-10-04, before the production cutover (production cutover happened
+> on 2026-10-10, see [releases.md](releases.md)). Rows for 0414, 0415, 0416,
+> 0417, 0418, 0419, 0420, 0422, 0424 and 0425 name files absent at that
+> baseline (verified via `git ls-tree 96ff8512`): they were appended by later
+> edits and were not re-verified against a stated revision. Later edits also
+> changed existing text in place (the 0406 backout note, the Notes voice-row
+> list). The ledger also
+> does not include 0413, 0421, 0423 or 0426, which are present in the repo.
+> This file makes no claim about which migrations have applied to any
+> database. For current-state verification, see the [Production migration
+> runner](runbook.md#production-migration-runner).
 
 Baseline: `origin/main` at `96ff8512`, read 2026-10-04. No staging, no live
 database, no secrets were touched to produce this file.
 
-"Pending" means every migration file present in the repo at that revision and
-not yet applied to the production cutover target. The cutover has not run, so
-the ledger lists all 70 files across both chains: 8 in
+"Pending" meant, at that baseline date, every migration file present in the
+repo at that revision and not yet applied to the production cutover target.
+The cutover had not run as of 2026-10-04, so the baseline listed all 70 files
+across both chains: 8 in
 `crates/store/migrations/` (applied by the bot runtime via
 `crates/store/src/migrations.rs`) and 62 in `crates/cutover/migrations/`
 (applied by the cutover tooling via `crates/cutover/src/staging_migrate.rs`).
+Rows appended afterwards are outside that baseline.
 
 All migrations are up-only; there are no down files. The `direction` column is
 `up` throughout.
@@ -36,6 +52,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0405_timestamptz_and_boolean | up | events, members | backout-script | Type rewrite: backout is `is_bot USING is_bot::smallint` plus restoring the old defaults; `recorded_at` default must be set back explicitly. |
 | 0406_rollback_journal | up | rollback_journal, rollback_watermarks | re-runnable | Drop both tables; journal rows are cutover evidence, re-capturable. Both tables and the store chain's `_two_bot_migrations` ledger are excluded from backups (`EXCLUDED_TABLES`): journal rows are re-capturable watch-window evidence, and restoring old watermarks could mark post-backup writes as journaled. |
 | 0407_invite_campaigns | up | invite_campaigns | re-runnable | Drop the table; no other migration reads it. |
+| 0408_backfill_cursors | up | backfill_cursors | re-runnable | Drop the table; cursors re-checkpoint on the next worker run. |
 
 ## Cutover chain (`crates/cutover/migrations/`)
 
@@ -110,10 +127,19 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0418_voice_join_grants | up | voice_join_grants | re-runnable | Drop the table; approved Connect grants lose their revocation witness (rooms keep their Discord overwrites until `/public` re-derives them). |
 | 0419_send_admission_lease | up | discord_send_admission | re-runnable | Drop column `in_flight_since_ms`; lanes revert to hold-forever (a stuck lane needs the manual release again). |
 | 0420_send_admission_lease_backfill | up | discord_send_admission | re-runnable | Data-only stamp of legacy-held rows; nothing to undo (re-apply only moves rows still at the legacy default). |
+| 0422_voice_create_reservations | up | voice_create_reservations | re-runnable | Drop the table; room creates lose their rolling burst and cooldown history (in-flight creates stop holding cap slots). |
+| 0424_internal_action_outcome | up | internal_idempotency | backout-script | Unguarded `ADD COLUMN` with a closed-set `CHECK`. Backout: disable the receiver and deploy the previous binary, then drop the column; dropping it under the outcome-aware binary fails every finish and every success replay. No member PII in the column; no seed writes to the table. |
+| 0425_internal_action_audit_resources | up | internal_action_log | backout-script | Unguarded `ADD COLUMN` with format/closed-set `CHECK`s. Backout: drop the three columns (terminal audits lose their resource witness until re-recorded; the columns hold no member PII beyond the receipt's own snowflakes and counts). |
+| 0427_event_store_voice_capture | up | event_store | re-runnable | Drop the table; the provisioned voice-capture shape (ids including nullable `message_id` for S1 coexistence, session, timestamps, enum flags only) carries no writer yet, so nothing is reconstructible once dropped. S1's exact-column pin stays owned by the S1 build card to relax to required-present/forbidden-absent. |
+| 0435_backfill_cursors | up | backfill_cursors | re-runnable | Drop the table; cutover mirror of store 0408, cursors re-checkpoint on the next worker run. |
+| 0436_member_catchup | up | member_catchup_members, member_catchup_cursors | re-runnable | Drop both tables; per-guild member rows and resume cursors re-capture from the Discord API on the next worker run, and the members frontier re-checkpoints into backfill_cursors. |
+| 0438_retention_queues | up | retention_guild_purge_queue, retention_deletion_requests | re-runnable | Drop both tables; queued guild purges and pending deletion requests are lost and must be re-enqueued, completed receipts are the only durable record. |
+| 0440_stream_live_claims | up | stream_live_claims | re-runnable | Drop the table; go-live dedup claims re-claim on the next `stream.online` event (delivered rows lose their restart-proof fence until re-posted). |
+| 0443_stream_live_send_started | up | stream_live_claims | re-runnable | Drop `send_started_at` and `claim_token`; in-flight sending markers and ownership tokens are lost (stale started rows become reclaimable until re-marked), delivered fences survive. |
 
 ## Notes
 
-- Voice rows (0224-0229, 0412, 0414, 0417, 0418) are listed here for completeness; their runtime
+- Voice rows (0224-0229, 0412, 0414, 0416-0418, 0422, 0427) are listed here for completeness; their runtime
   rollback disposition belongs to the voice rollback card, not this ledger.
 - Unguarded DDL (`CREATE TABLE` / `ADD COLUMN` without `IF NOT EXISTS`) is
   classed `backout-script` even when the change is additive, because a

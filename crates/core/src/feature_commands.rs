@@ -35,9 +35,15 @@
 use std::collections::{HashMap, HashSet};
 
 use super::commands::{
-    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, OCCURRENCE_ID_MAX_CHARS,
-    PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, MAX_RESOURCE_ID_CHARS,
+    OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
 };
+use super::custom_commands::{
+    MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
+};
+use super::feeds_http::MAX_FEED_SOURCE_BYTES;
+use super::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
+use super::scheduled::MAX_BODY_CHARS;
 
 /// Scorecard check-in command (parity #12). Keeps the `attendance` name; the
 /// RSVP-totals variant is the one that renames.
@@ -51,7 +57,7 @@ pub fn scorecard_attendance_command() -> CommandDefinition {
     .options(vec![
         CommandOption::new(
             "event-occurrence",
-            "Event id (number in the event URL) or occurrence id, e.g. 12345 or weekly-standup-2026-10-03",
+            "Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly",
             CommandOptionType::String,
         )
         .required()
@@ -79,23 +85,27 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                     "Command name, a-z 0-9 _ -",
                     CommandOptionType::String,
                 )
-                .required(),
+                .required()
+                .max_length(MAX_COMMAND_NAME_CHARS as u32),
                 CommandOption::new(
                     "template",
                     "What the bot replies; {user} {username} {server} {channel}",
                     CommandOptionType::String,
                 )
-                .required(),
+                .required()
+                .max_length(MAX_TEMPLATE_CHARS as u32),
                 CommandOption::new(
                     "description",
                     "Shown in the command picker",
                     CommandOptionType::String,
-                ),
+                )
+                .max_length(MAX_DESCRIPTION_CHARS as u32),
                 CommandOption::new(
                     "text-trigger",
                     "Optional !trigger form, e.g. !faq",
                     CommandOptionType::String,
-                ),
+                )
+                .max_length(MAX_TEXT_TRIGGER_CHARS as u32),
             ]),
         CommandDefinition::new("command-remove", "Delete a custom command")
             .permissions(PERM_MANAGE_GUILD)
@@ -104,13 +114,16 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 "Command to delete",
                 CommandOptionType::String,
             )
-            .required()]),
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32)]),
         CommandDefinition::new("command-list", "List this server's custom commands")
             .permissions(PERM_MANAGE_GUILD),
         CommandDefinition::new("schedule", "Schedule a message, once or recurring")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
-                CommandOption::new("body", "Message text", CommandOptionType::String).required(),
+                CommandOption::new("body", "Message text", CommandOptionType::String)
+                    .required()
+                    .max_length(MAX_BODY_CHARS as u32),
                 CommandOption::new(
                     "in-minutes",
                     "Fire this many minutes from now",
@@ -131,13 +144,22 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 "Scheduled message id",
                 CommandOptionType::String,
             )
-            .required()]),
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
         CommandDefinition::new("schedule-list", "List scheduled messages for this server")
-            .permissions(PERM_MANAGE_GUILD),
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![CommandOption::new(
+                "page",
+                "Page of the schedule list (1-based)",
+                CommandOptionType::Integer,
+            )
+            .min_value(1)]),
         CommandDefinition::new("sticky", "Set this channel's sticky message")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
-                CommandOption::new("body", "Sticky text", CommandOptionType::String).required(),
+                CommandOption::new("body", "Sticky text", CommandOptionType::String)
+                    .required()
+                    .max_length(MAX_BODY_CHARS as u32),
                 CommandOption::new(
                     "debounce",
                     "Quiet seconds before re-posting (default 5, max 300)",
@@ -194,7 +216,8 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             .permissions(PERM_MANAGE_EVENTS)
             .options(vec![
                 CommandOption::new("title", "Event or group title", CommandOptionType::String)
-                    .required(),
+                    .required()
+                    .max_length(MAX_TITLE_CHARS as u32),
                 CommandOption::new(
                     "starts-at",
                     "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
@@ -206,7 +229,8 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                     "Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6",
                     CommandOptionType::String,
                 )
-                .required(),
+                .required()
+                .max_length(MAX_ROLE_SPEC_CHARS as u32),
             ]),
         CommandDefinition::new("lfg-close", "Close a raid/LFG signup")
             .permissions(PERM_MANAGE_EVENTS)
@@ -215,7 +239,8 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 "LFG id from the posted signup",
                 CommandOptionType::String,
             )
-            .required()]),
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
         CommandDefinition::new(
             "feed-add",
             "Relay an RSS, YouTube, or Twitch feed into this channel",
@@ -243,7 +268,8 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 "HTTPS URL or YouTube channel id",
                 CommandOptionType::String,
             )
-            .required(),
+            .required()
+            .max_length(MAX_FEED_SOURCE_BYTES as u32),
         ]),
         CommandDefinition::new("feed-remove", "Remove a feed relay")
             .permissions(PERM_MANAGE_GUILD)
@@ -252,7 +278,8 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 "Feed id",
                 CommandOptionType::String,
             )
-            .required()]),
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
         CommandDefinition::new("feed-list", "List this server's feed relays")
             .permissions(PERM_MANAGE_GUILD),
     ]
@@ -401,11 +428,11 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 3 core + 1 scorecard + 8 automation + 7 announcement.
-        assert_eq!(merged.len(), 19);
+        // 4 core + 1 scorecard + 8 automation + 7 announcement.
+        assert_eq!(merged.len(), 20);
         assert_eq!(
-            &names(&merged)[..4],
-            ["rank", "leaderboard", "help", "attendance"]
+            &names(&merged)[..5],
+            ["rank", "leaderboard", "help", "privacy", "attendance"]
         );
         assert!(!merged.iter().any(|d| d.dm_permission));
     }
@@ -457,6 +484,23 @@ mod tests {
                 .expect("command exists")
         }
         let auto = automation_commands();
+        for (command, option, max_length) in [
+            ("command", 0, 32),
+            ("command", 1, 2000),
+            ("command", 2, 100),
+            ("command", 3, 33),
+            ("command-remove", 0, 32),
+            ("schedule", 0, 2000),
+            ("schedule-remove", 0, 128),
+            ("sticky", 0, 2000),
+        ] {
+            assert_eq!(
+                get(&auto, command).options[option].max_length,
+                Some(max_length),
+                "{command} option {} max_length",
+                get(&auto, command).options[option].name
+            );
+        }
         // /schedule: one timing option required, both bounded.
         let sched = get(&auto, "schedule").options.clone();
         assert!(sched[0].required == Some(true));
@@ -478,6 +522,20 @@ mod tests {
         assert!(sticky[1].required.is_none());
         // /rsvp status choices.
         let ann = announcement_commands();
+        for (command, option, max_length) in [
+            ("lfg", 0, 100),
+            ("lfg", 2, 2339),
+            ("lfg-close", 0, 128),
+            ("feed-add", 1, 2048),
+            ("feed-remove", 0, 128),
+        ] {
+            assert_eq!(
+                get(&ann, command).options[option].max_length,
+                Some(max_length),
+                "{command} option {} max_length",
+                get(&ann, command).options[option].name
+            );
+        }
         let status = get(&ann, "rsvp").options[1].clone();
         let values: Vec<_> = status.choices.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, ["going", "interested", "declined"]);
@@ -496,6 +554,121 @@ mod tests {
             score.options[0].max_length,
             Some(OCCURRENCE_ID_MAX_CHARS as u32)
         );
+    }
+
+    #[test]
+    fn custom_command_option_lengths_match_runtime_caps() {
+        use crate::custom_commands::{validate_put_input, validate_template, PutCommandInput};
+        use std::collections::HashSet;
+
+        // Pinned literals: tampering with any shared bound trips this test.
+        // A const change must update the slash-option advertisement, the
+        // validators and docs/commands.md together.
+        assert_eq!(MAX_COMMAND_NAME_CHARS, 32);
+        assert_eq!(MAX_TEMPLATE_CHARS, 2000);
+        assert_eq!(MAX_DESCRIPTION_CHARS, 100);
+        assert_eq!(MAX_TEXT_TRIGGER_CHARS, 33);
+        assert_eq!(MAX_TEXT_TRIGGER_CHARS, MAX_COMMAND_NAME_CHARS + 1);
+
+        fn get<'a>(defs: &'a [CommandDefinition], name: &str) -> &'a CommandDefinition {
+            defs.iter()
+                .find(|d| d.name == name)
+                .expect("command exists")
+        }
+        fn option<'a>(
+            defs: &'a [CommandDefinition],
+            command: &str,
+            option: &str,
+        ) -> &'a crate::commands::CommandOption {
+            get(defs, command)
+                .options
+                .iter()
+                .find(|o| o.name == option)
+                .expect("option exists")
+        }
+        let auto = automation_commands();
+        // Advertised bounds come from the same constants the validators use.
+        assert_eq!(
+            option(&auto, "command", "name").max_length,
+            Some(MAX_COMMAND_NAME_CHARS as u32)
+        );
+        assert_eq!(
+            option(&auto, "command", "template").max_length,
+            Some(MAX_TEMPLATE_CHARS as u32)
+        );
+        assert_eq!(
+            option(&auto, "command", "description").max_length,
+            Some(MAX_DESCRIPTION_CHARS as u32)
+        );
+        assert_eq!(
+            option(&auto, "command", "text-trigger").max_length,
+            Some(MAX_TEXT_TRIGGER_CHARS as u32)
+        );
+        assert_eq!(
+            option(&auto, "command-remove", "name").max_length,
+            Some(MAX_COMMAND_NAME_CHARS as u32)
+        );
+        // Pinned wire values: a silent advertisement change trips here too.
+        assert_eq!(option(&auto, "command", "name").max_length, Some(32));
+        assert_eq!(option(&auto, "command", "template").max_length, Some(2000));
+        assert_eq!(
+            option(&auto, "command", "description").max_length,
+            Some(100)
+        );
+        assert_eq!(
+            option(&auto, "command", "text-trigger").max_length,
+            Some(33)
+        );
+        assert_eq!(option(&auto, "command-remove", "name").max_length, Some(32));
+
+        // Runtime agrees at the boundary: name shape, trigger shape, template
+        // ceiling and description bounds.
+        assert!(crate::leveling::valid_command_name(
+            &"a".repeat(MAX_COMMAND_NAME_CHARS)
+        ));
+        assert!(!crate::leveling::valid_command_name(
+            &"a".repeat(MAX_COMMAND_NAME_CHARS + 1)
+        ));
+        let trigger_at_ceiling = format!("!{}", "a".repeat(MAX_COMMAND_NAME_CHARS));
+        let trigger_past_ceiling = format!("!{}", "a".repeat(MAX_COMMAND_NAME_CHARS + 1));
+        assert!(crate::leveling::valid_text_trigger(&trigger_at_ceiling));
+        assert!(!crate::leveling::valid_text_trigger(&trigger_past_ceiling));
+        assert_eq!(MAX_TEXT_TRIGGER_CHARS, trigger_at_ceiling.len());
+        validate_template(&"x".repeat(MAX_TEMPLATE_CHARS)).expect("ceiling ok");
+        assert!(validate_template(&"x".repeat(MAX_TEMPLATE_CHARS + 1)).is_err());
+
+        // End-to-end through the shared validator: ceilings pass, one past
+        // any ceiling fails. A tampered constant that moves the advertisement
+        // without moving validation (or vice versa) trips either the pinned
+        // literals above or these boundary rejections.
+        let builtins = HashSet::new();
+        let ceiling = PutCommandInput {
+            name: "a".repeat(MAX_COMMAND_NAME_CHARS),
+            description: "x".repeat(MAX_DESCRIPTION_CHARS),
+            template: "x".repeat(MAX_TEMPLATE_CHARS),
+            text_trigger: Some(trigger_at_ceiling.clone()),
+        };
+        assert!(validate_put_input(&ceiling, &builtins).is_ok());
+        for tampered in [
+            PutCommandInput {
+                name: "a".repeat(MAX_COMMAND_NAME_CHARS + 1),
+                ..ceiling.clone()
+            },
+            PutCommandInput {
+                description: "x".repeat(MAX_DESCRIPTION_CHARS + 1),
+                ..ceiling.clone()
+            },
+            PutCommandInput {
+                template: "x".repeat(MAX_TEMPLATE_CHARS + 1),
+                ..ceiling.clone()
+            },
+            PutCommandInput {
+                text_trigger: Some(trigger_past_ceiling.clone()),
+                ..ceiling.clone()
+            },
+        ] {
+            assert!(validate_put_input(&tampered, &builtins).is_err());
+        }
     }
 
     #[test]

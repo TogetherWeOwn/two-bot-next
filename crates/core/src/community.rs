@@ -27,7 +27,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 
-use super::funnel::{format_iso_millis, parse_iso_millis};
+use super::funnel::{format_iso_millis, parse_iso_millis, Snowflake};
+use super::handlers::ChannelClass;
+use super::internal_actions::is_snowflake;
 
 /// Fact streams, in legacy heartbeat order (legacy `COMMUNITY_FACT_TYPES`).
 pub const COMMUNITY_FACT_TYPES: [&str; 6] = [
@@ -37,6 +39,55 @@ pub const COMMUNITY_FACT_TYPES: [&str; 6] = [
     "member_joined",
     "event_attended",
     "rules_accepted",
+];
+
+/// Streams with a live production writer: the only streams `scorecard_once`
+/// may mark covered. That is `event_attended` (host check-in via
+/// `rsvp_store::record_checkin`), `voice_session_started` /
+/// `voice_session_ended` (gateway voice frames via
+/// `community_store::record_voice_started_fact` /
+/// `community_store::record_voice_ended_fact`), `message_created`
+/// (gateway `MessageCreate` via `community_store::record_message_fact`),
+/// `rules_accepted` (gate-clear drain via the community-facts sink) and
+/// `member_joined` (gateway joins via `handlers::on_join`, buffered in the
+/// community-facts sink and persisted with `community_store::member_join_fact` +
+/// `record_fact`). This must
+/// always equal the `Some` rows of [`STREAM_WRITERS`]; the
+/// `captured_streams_match_live_writers` guard fails otherwise.
+pub const CAPTURED_STREAMS: [&str; 6] = [
+    "event_attended",
+    "voice_session_started",
+    "voice_session_ended",
+    "message_created",
+    "rules_accepted",
+    "member_joined",
+];
+
+/// Capture registry: every fact stream with the production writer that appends
+/// it, or `None` while no live path writes it. Single source of truth for both
+/// directions of the guard: a stream in [`CAPTURED_STREAMS`] whose row is
+/// `None` has no writer, and a `Some` row missing from [`CAPTURED_STREAMS`]
+/// is a writer the scorecard does not claim. Landing a writer flips its row
+/// and grows [`CAPTURED_STREAMS`] in the same PR.
+pub const STREAM_WRITERS: [(&str, Option<&str>); 6] = [
+    (
+        "message_created",
+        Some("community_store::record_message_fact"),
+    ),
+    (
+        "voice_session_started",
+        Some("community_store::record_voice_started_fact"),
+    ),
+    (
+        "voice_session_ended",
+        Some("community_store::record_voice_ended_fact"),
+    ),
+    ("member_joined", Some("handlers::on_join")),
+    ("event_attended", Some("rsvp_store::record_checkin")),
+    (
+        "rules_accepted",
+        Some("leveling_runtime::DeferredCommunityFacts::drain"),
+    ),
 ];
 
 /// Exclusion buckets (legacy `COMMUNITY_CLASSIFICATIONS`). Contract
@@ -75,6 +126,28 @@ pub const FIRST_REPLY_BREACH_MS: i64 = 86_400_000;
 pub const MIN_EVIDENCE_HUMANS: usize = 5;
 /// Weekly-active voice line: 600 deduplicated voice seconds counts as active.
 pub const VOICE_ACTIVE_SECONDS: f64 = 600.0;
+/// Abuse detector: `burst` fires above this many eligible messages from one
+/// member in any rolling 10-minute window (AC4, observe-only).
+pub const ABUSE_BURST_WINDOW_MESSAGES: usize = 30;
+/// Abuse detector: rolling burst window in millis (AC4).
+pub const ABUSE_BURST_WINDOW_MS: i64 = 600_000;
+/// Abuse detector: `burst` also fires above this many eligible messages from
+/// one member in a single UTC day (AC4, observe-only).
+pub const ABUSE_BURST_DAY_MESSAGES: usize = 60;
+/// Abuse detector: `copy_paste` fires on this many same-channel messages with
+/// lengths within ±2 chars inside an hour (AC4, observe-only).
+pub const ABUSE_COPY_PASTE_COUNT: usize = 5;
+/// Abuse detector: copy/paste hour window in millis (AC4).
+pub const ABUSE_COPY_PASTE_WINDOW_MS: i64 = 3_600_000;
+/// Abuse detector: `voice_afk` fires on this many ≥600 s solo sessions (AC4,
+/// observe-only). Without occupancy data the detector reports
+/// `insufficient_data`, never a verdict.
+pub const ABUSE_VOICE_AFK_SESSIONS: usize = 3;
+/// Voice-AFK session floor in seconds (AC4).
+pub const ABUSE_VOICE_AFK_MIN_SECONDS: f64 = 600.0;
+/// Week-level watch candidate raised when any burst flag fires (AC4,
+/// observe-only: never an intervention on its own).
+pub const SPAM_TO_EARN_WATCH: &str = "SPAM_TO_EARN_WATCH";
 
 /// Intervention codes (legacy `COMMUNITY_INTERVENTION_CODES`, kept verbatim —
 /// the runs-table CHECK and legacy fixtures name all seven). `EVENT_AT_RISK`
@@ -99,6 +172,8 @@ pub struct ClassifierConfig {
     pub staging_guild_ids: HashSet<String>,
     pub staging_actor_ids: HashSet<String>,
     pub test_actor_ids: HashSet<String>,
+    pub human_channel_ids: HashSet<String>,
+    pub welcome_channel_ids: HashSet<String>,
 }
 
 impl Default for ClassifierConfig {
@@ -110,6 +185,8 @@ impl Default for ClassifierConfig {
             staging_guild_ids: HashSet::new(),
             staging_actor_ids: HashSet::new(),
             test_actor_ids: HashSet::new(),
+            human_channel_ids: HashSet::new(),
+            welcome_channel_ids: HashSet::new(),
         }
     }
 }
@@ -172,6 +249,16 @@ fn id_set(vars: &HashMap<String, String>, key: &str) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// Channel sets keep only Discord snowflakes (17-20 ASCII digits, the
+/// [`is_snowflake`] rule): malformed entries drop silently and never
+/// reject their valid siblings, so `from_map` stays infallible.
+fn snowflake_id_set(vars: &HashMap<String, String>, key: &str) -> HashSet<String> {
+    id_set(vars, key)
+        .into_iter()
+        .filter(|id| is_snowflake(id))
+        .collect()
+}
+
 impl ClassifierConfig {
     /// Read classifier config from the process environment (legacy
     /// `loadCommunityClassifierConfig`).
@@ -192,6 +279,23 @@ impl ClassifierConfig {
             staging_guild_ids: id_set(vars, "TWO_COMMUNITY_STAGING_GUILD_IDS"),
             staging_actor_ids: id_set(vars, "TWO_COMMUNITY_STAGING_ACTOR_IDS"),
             test_actor_ids: id_set(vars, "TWO_COMMUNITY_TEST_ACTOR_IDS"),
+            human_channel_ids: snowflake_id_set(vars, "TWO_COMMUNITY_HUMAN_CHANNEL_IDS"),
+            welcome_channel_ids: snowflake_id_set(vars, "TWO_COMMUNITY_WELCOME_CHANNEL_IDS"),
+        }
+    }
+
+    /// Channel class for message attribution: `Welcome` when the channel
+    /// is in the welcome set, else `Human` when in the human set, else
+    /// `Other`. Welcome wins for a channel present in both sets.
+    #[must_use]
+    pub fn channel_class(&self, channel_id: Snowflake) -> ChannelClass {
+        let id = channel_id.to_string();
+        if self.welcome_channel_ids.contains(&id) {
+            ChannelClass::Welcome
+        } else if self.human_channel_ids.contains(&id) {
+            ChannelClass::Human
+        } else {
+            ChannelClass::Other
         }
     }
 }
@@ -371,8 +475,53 @@ pub struct Intervention {
     pub reason: String,
 }
 
+/// One observe-only abuse flag (AC4): a detector code (`burst`,
+/// `copy_paste`, `voice_afk`), the member it fired for, and a human-readable
+/// detail. Flags never punish: they ride the scorecard JSON for operator
+/// review, and under incomplete coverage no detector runs at all
+/// (fail-closed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AbuseFlag {
+    pub detector: String,
+    pub member_id: String,
+    pub detail: String,
+}
+
+/// Input coverage for one message detector: `eligible` counts
+/// `message_created` facts classified `eligible_human` (the denominator
+/// both message detectors draw from); `with_input` counts how many of
+/// those the detector could actually consume (for `burst`, messages with
+/// an actor and a parseable timestamp; for `copy_paste`, the detector's
+/// existing usable-`contentLength` counter). A clean week and a mostly
+/// blind week are distinguishable only through these counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DetectorInputCoverage {
+    pub eligible: usize,
+    pub with_input: usize,
+}
+
+/// Per-detector input coverage for the message detectors, serialized as
+/// the literal snake_case `detector_inputs` object with exactly the keys
+/// `burst` and `copy_paste`. Voice denominators are out of scope here.
+/// Populated under the same complete-coverage gate that runs the
+/// detectors; under incomplete coverage it is present with zeros so the
+/// JSON shape stays stable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DetectorInputs {
+    pub burst: DetectorInputCoverage,
+    pub copy_paste: DetectorInputCoverage,
+}
+
 /// The weekly scorecard (legacy `CommunityScorecard`, camelCase JSON keys so
-/// serialized output matches the legacy fixture byte-for-shape).
+/// serialized output matches the legacy fixture byte-for-shape). The
+/// anti-gaming additions (`abuse_flags`, `abuse_candidates`,
+/// `abuse_data_quality`, `detector_inputs`, `season_id`,
+/// `season_watermarks`) keep snake_case
+/// keys via explicit renames: operators and the acceptance suite read them
+/// literally.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Scorecard {
@@ -400,6 +549,32 @@ pub struct Scorecard {
     pub intervention: Intervention,
     pub recommendations_enabled: bool,
     pub kill_switch_active: bool,
+    /// Observe-only per-member abuse flags (AC4). Empty under incomplete
+    /// coverage (fail-closed) and on clean weeks.
+    #[serde(rename = "abuse_flags")]
+    pub abuse_flags: Vec<AbuseFlag>,
+    /// Week-level watch candidates, e.g. `SPAM_TO_EARN_WATCH` when any burst
+    /// flag fires (AC4, observe-only).
+    #[serde(rename = "abuse_candidates")]
+    pub abuse_candidates: Vec<String>,
+    /// Detector data-quality notes, e.g. `voice_occupancy:insufficient_data`
+    /// when voice sessions carry no occupancy signal (AC4). A quality note is
+    /// never a verdict.
+    #[serde(rename = "abuse_data_quality")]
+    pub abuse_data_quality: Vec<String>,
+    /// Per-detector input coverage (`{eligible, with_input}` for `burst`
+    /// and `copy_paste`). Present with zeros under incomplete coverage.
+    #[serde(rename = "detector_inputs")]
+    pub detector_inputs: DetectorInputs,
+    /// Season scope (`YYYY-QN`) of the scorecard week start (event time, AC3).
+    #[serde(rename = "season_id")]
+    pub season_id: String,
+    /// Season transition watermarks. Only the scorecard week whose Monday
+    /// start is a season boundary (Monday 00:00 UTC on/after a quarter's
+    /// first day) reports both `season_close` and `season_open`; every other
+    /// week carries neither (AC3).
+    #[serde(rename = "season_watermarks")]
+    pub season_watermarks: Vec<String>,
 }
 
 /// Builder outcome (legacy `CommunityScorecardResult`): `alert_key` is the
@@ -557,6 +732,267 @@ pub fn scorecard_tick(now_ms: i64, last_attempted_week: Option<&str>) -> Option<
         return None;
     }
     Some(key)
+}
+
+/// Solo-occupancy signal for one voice session's metadata (AC4): explicit
+/// `alone`, an `occupantCount` of one or fewer, or a `participantIds` list
+/// with at most one entry. `None` when the session carries no occupancy
+/// signal at all.
+fn voice_alone(meta: &serde_json::Map<String, serde_json::Value>) -> Option<bool> {
+    if let Some(alone) = meta.get("alone").and_then(|v| v.as_bool()) {
+        return Some(alone);
+    }
+    if let Some(count) = meta.get("occupantCount").and_then(|v| v.as_u64()) {
+        return Some(count <= 1);
+    }
+    if let Some(ids) = meta.get("participantIds").and_then(|v| v.as_array()) {
+        return Some(ids.len() <= 1);
+    }
+    None
+}
+
+/// Burst detector (AC4, observe-only): `burst` fires above
+/// [`ABUSE_BURST_WINDOW_MESSAGES`] eligible messages from one member in any
+/// rolling 10 minutes, or above [`ABUSE_BURST_DAY_MESSAGES`] in one UTC day.
+/// Any burst flag raises the week-level [`SPAM_TO_EARN_WATCH`] candidate.
+fn detect_burst(
+    facts: &[ParsedFact<'_>],
+    flags: &mut Vec<AbuseFlag>,
+    candidates: &mut Vec<String>,
+) -> DetectorInputCoverage {
+    let mut coverage = DetectorInputCoverage::default();
+    let mut by_actor: HashMap<&str, Vec<i64>> = HashMap::new();
+    let mut per_day: HashMap<(&str, String), usize> = HashMap::new();
+    for f in facts {
+        if f.row.event_type != "message_created" || f.classification != "eligible_human" {
+            continue;
+        }
+        coverage.eligible += 1;
+        let Some(actor) = f.row.actor_id.as_deref().filter(|a| !a.is_empty()) else {
+            continue;
+        };
+        let Some(ms) = parse_iso_millis(&f.row.occurred_at) else {
+            continue;
+        };
+        coverage.with_input += 1;
+        by_actor.entry(actor).or_default().push(ms);
+        let day = f
+            .row
+            .occurred_at
+            .get(..10)
+            .unwrap_or(f.row.occurred_at.as_str())
+            .to_owned();
+        *per_day.entry((actor, day)).or_default() += 1;
+    }
+    for (actor, mut times) in by_actor {
+        times.sort_unstable();
+        let mut start = 0usize;
+        for end in 0..times.len() {
+            while times[end] - times[start] > ABUSE_BURST_WINDOW_MS {
+                start += 1;
+            }
+            if end + 1 - start > ABUSE_BURST_WINDOW_MESSAGES {
+                flags.push(AbuseFlag {
+                    detector: "burst".to_owned(),
+                    member_id: actor.to_owned(),
+                    detail: format!(
+                        "{} messages in a rolling 10 minutes (line {})",
+                        end + 1 - start,
+                        ABUSE_BURST_WINDOW_MESSAGES
+                    ),
+                });
+                break;
+            }
+        }
+    }
+    for ((actor, day), count) in per_day {
+        if count > ABUSE_BURST_DAY_MESSAGES {
+            flags.push(AbuseFlag {
+                detector: "burst".to_owned(),
+                member_id: actor.to_owned(),
+                detail: format!(
+                    "{count} messages on {day} (UTC day line {ABUSE_BURST_DAY_MESSAGES})"
+                ),
+            });
+        }
+    }
+    if flags.iter().any(|f| f.detector == "burst")
+        && !candidates.iter().any(|c| c == SPAM_TO_EARN_WATCH)
+    {
+        candidates.push(SPAM_TO_EARN_WATCH.to_owned());
+    }
+    coverage
+}
+
+/// Copy/paste detector (AC4, observe-only): `copy_paste` fires on
+/// [`ABUSE_COPY_PASTE_COUNT`] or more same-channel messages with lengths
+/// within ±2 chars inside an hour. Lengths come from the `contentLength`
+/// metadata on message facts; facts without one cannot participate. The
+/// writer records a length only when the gateway delivered content (the
+/// `MESSAGE_CONTENT` intent), so a week whose lengths cover fewer than half
+/// of the eligible messages reports `copy_paste:insufficient_data` instead
+/// of a verdict — the same fail-closed shape as the voice-AFK occupancy
+/// gap. A sparse sample (for example the few bot-mention messages Discord
+/// delivers content for without the intent) must never clear that note.
+fn detect_copy_paste(
+    facts: &[ParsedFact<'_>],
+    flags: &mut Vec<AbuseFlag>,
+    quality: &mut Vec<String>,
+) -> DetectorInputCoverage {
+    let mut eligible = 0usize;
+    let mut groups: HashMap<(&str, String), Vec<(i64, u64)>> = HashMap::new();
+    let mut messages = 0usize;
+    let mut with_length = 0usize;
+    for f in facts {
+        if f.row.event_type != "message_created" || f.classification != "eligible_human" {
+            continue;
+        }
+        eligible += 1;
+        let Some(actor) = f.row.actor_id.as_deref().filter(|a| !a.is_empty()) else {
+            continue;
+        };
+        let channel = meta_str(&f.meta, "channelId").unwrap_or_default();
+        if channel.is_empty() {
+            continue;
+        }
+        messages += 1;
+        let Some(len) = f.meta.get("contentLength").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        with_length += 1;
+        let Some(ms) = parse_iso_millis(&f.row.occurred_at) else {
+            continue;
+        };
+        groups.entry((actor, channel)).or_default().push((ms, len));
+    }
+    // The reported counts are these same counters: `eligible` is every
+    // eligible human message; `with_input` reuses `with_length` (usable
+    // unsigned-integer `contentLength` after the actor/channel gates).
+    let coverage = DetectorInputCoverage {
+        eligible,
+        with_input: with_length,
+    };
+    // Fail closed on sparse coverage, not only on none: when most eligible
+    // messages carry no length, the few that do are not a representative
+    // sample and no verdict (clean or flagged) is honest.
+    if messages > 0 && with_length * 2 < messages {
+        quality.push("copy_paste:insufficient_data".to_owned());
+        return coverage;
+    }
+    for ((actor, channel), mut items) in groups {
+        items.sort_unstable();
+        let mut start = 0usize;
+        let mut fired = false;
+        for end in 0..items.len() {
+            while items[end].0 - items[start].0 > ABUSE_COPY_PASTE_WINDOW_MS {
+                start += 1;
+            }
+            if end + 1 - start >= ABUSE_COPY_PASTE_COUNT {
+                let mut lens: Vec<u64> = items[start..=end].iter().map(|(_, len)| *len).collect();
+                lens.sort_unstable();
+                let mut inner = 0usize;
+                for outer in 0..lens.len() {
+                    while lens[outer] - lens[inner] > 4 {
+                        inner += 1;
+                    }
+                    if outer + 1 - inner >= ABUSE_COPY_PASTE_COUNT {
+                        flags.push(AbuseFlag {
+                            detector: "copy_paste".to_owned(),
+                            member_id: actor.to_owned(),
+                            detail: format!(
+                                "{} same-channel messages within ±2 chars in an hour (channel {channel})",
+                                outer + 1 - inner
+                            ),
+                        });
+                        fired = true;
+                        break;
+                    }
+                }
+                if fired {
+                    break;
+                }
+            }
+        }
+    }
+    coverage
+}
+
+/// Voice-AFK detector (AC4, observe-only): `voice_afk` fires on
+/// [`ABUSE_VOICE_AFK_SESSIONS`] or more sessions of at least
+/// [`ABUSE_VOICE_AFK_MIN_SECONDS`] seconds while alone. Solo-occupancy comes
+/// from the session metadata (see [`voice_alone`]); when sessions exist but
+/// none carries occupancy, the week reports `insufficient_data` and never a
+/// verdict.
+fn detect_voice_afk(
+    facts: &[ParsedFact<'_>],
+    flags: &mut Vec<AbuseFlag>,
+    quality: &mut Vec<String>,
+) {
+    let mut sessions = 0usize;
+    let mut with_occupancy = 0usize;
+    let mut solo_long: HashMap<&str, usize> = HashMap::new();
+    for f in facts {
+        if f.row.event_type != "voice_session_ended" || f.classification != "eligible_human" {
+            continue;
+        }
+        let Some(actor) = f.row.actor_id.as_deref().filter(|a| !a.is_empty()) else {
+            continue;
+        };
+        let duration = voice_duration_seconds(&f.meta);
+        if duration.is_none_or(|d| !d.is_finite() || d < 0.0) {
+            continue;
+        }
+        sessions += 1;
+        match voice_alone(&f.meta) {
+            Some(true) => {
+                with_occupancy += 1;
+                if duration.is_some_and(|d| d >= ABUSE_VOICE_AFK_MIN_SECONDS) {
+                    *solo_long.entry(actor).or_default() += 1;
+                }
+            }
+            Some(false) => {
+                with_occupancy += 1;
+            }
+            None => {}
+        }
+    }
+    if sessions > 0 && with_occupancy == 0 {
+        quality.push("voice_occupancy:insufficient_data".to_owned());
+        return;
+    }
+    for (actor, count) in solo_long {
+        if count >= ABUSE_VOICE_AFK_SESSIONS {
+            flags.push(AbuseFlag {
+                detector: "voice_afk".to_owned(),
+                member_id: actor.to_owned(),
+                detail: format!(
+                    "{count} sessions of at least {} s while alone",
+                    ABUSE_VOICE_AFK_MIN_SECONDS as u64
+                ),
+            });
+        }
+    }
+}
+
+/// Run the observe-only abuse detectors (AC4): burst, copy/paste and
+/// voice-AFK per-member flags, the week-level watch candidates, and the
+/// data-quality notes. Fail-closed: the caller runs this only under complete
+/// coverage.
+fn detect_abuse(
+    facts: &[ParsedFact<'_>],
+) -> (Vec<AbuseFlag>, Vec<String>, Vec<String>, DetectorInputs) {
+    let mut flags = Vec::new();
+    let mut candidates = Vec::new();
+    let mut quality = Vec::new();
+    let burst = detect_burst(facts, &mut flags, &mut candidates);
+    let copy_paste = detect_copy_paste(facts, &mut flags, &mut quality);
+    detect_voice_afk(facts, &mut flags, &mut quality);
+    (
+        flags,
+        candidates,
+        quality,
+        DetectorInputs { burst, copy_paste },
+    )
 }
 
 /// Build one weekly scorecard (legacy `buildCommunityScorecard`).
@@ -1002,6 +1438,34 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
     };
 
     let complete = coverage_state == "complete";
+
+    // Anti-gaming observe-only layer (AC3/AC4): the event-time season scope, the
+    // season transition watermarks, and the abuse detectors. Detectors run
+    // only under complete coverage (fail-closed); voice-AFK without occupancy
+    // data yields `insufficient_data`, never a verdict.
+    let (abuse_flags, abuse_candidates, abuse_data_quality, detector_inputs) = if complete {
+        detect_abuse(&facts)
+    } else {
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            DetectorInputs::default(),
+        )
+    };
+    // Event-time season (AC3): the scorecard stays in its week's season even
+    // when rebuilt after a quarter change. Watermarks fire only when the week
+    // start itself is a season boundary: seasons start Monday 00:00 UTC, so
+    // the instant before a boundary week still belongs to the old season.
+    let season_id = super::leveling::season_id_for_ms(week_start_ms);
+    let season_watermarks = if super::leveling::season_id_for_ms(week_start_ms)
+        != super::leveling::season_id_for_ms(week_start_ms.saturating_sub(1))
+    {
+        vec!["season_close".to_owned(), "season_open".to_owned()]
+    } else {
+        Vec::new()
+    };
+
     let scorecard = Scorecard {
         guild_id: inputs.guild_id.clone(),
         week_start: inputs.week_start.clone(),
@@ -1044,6 +1508,12 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
         intervention,
         recommendations_enabled,
         kill_switch_active,
+        abuse_flags,
+        abuse_candidates,
+        abuse_data_quality,
+        detector_inputs,
+        season_id,
+        season_watermarks,
     };
 
     // Threshold alerts (legacy): HOLD and insufficient-evidence never notify;
@@ -1116,6 +1586,31 @@ mod tests {
         assert!(!is_scorecard_run_time(ms("2026-09-07T07:00:00.000Z")));
         assert!(!is_scorecard_run_time(ms("2026-09-08T06:15:00.000Z")));
         assert!(!is_scorecard_run_time(ms("2026-09-06T06:15:00.000Z")));
+    }
+
+    #[test]
+    fn captured_streams_match_live_writers() {
+        // The scorecard claims exactly the streams the runtime captures: a
+        // stream in `CAPTURED_STREAMS` with no writer would invent coverage,
+        // and a writer missing from the list would leave its stream unmarked.
+        let registry: Vec<&str> = STREAM_WRITERS.iter().map(|(s, _)| *s).collect();
+        assert_eq!(registry.len(), COMMUNITY_FACT_TYPES.len());
+        for stream in COMMUNITY_FACT_TYPES {
+            assert!(registry.contains(&stream), "{stream} has no registry row");
+        }
+        let claimed: HashSet<&str> = CAPTURED_STREAMS.iter().copied().collect();
+        assert_eq!(
+            claimed.len(),
+            CAPTURED_STREAMS.len(),
+            "CAPTURED_STREAMS lists a stream twice"
+        );
+        for (stream, writer) in STREAM_WRITERS {
+            assert_eq!(
+                claimed.contains(stream),
+                writer.is_some(),
+                "stream {stream}: claimed without a writer, or written without a claim"
+            );
+        }
     }
 
     #[test]
@@ -1481,5 +1976,54 @@ mod tests {
         let gates = ScorecardGates::from_map(&vars).expect("parses");
         assert!(gates.enabled && !gates.recommendations_enabled);
         assert_eq!(gates.correction_cycles, 2);
+    }
+
+    #[test]
+    fn copy_paste_sparse_lengths_stay_insufficient_data() {
+        // Mixed coverage: most eligible messages carry no length and only a
+        // few do (the bot-mention shape a deployment without MESSAGE_CONTENT
+        // would produce if mentions were measured). Even though the five
+        // length-carrying messages would flag on their own, the detector
+        // must report insufficient data and no verdict.
+        let rows: Vec<FactRow> = (0..15)
+            .map(|i| FactRow {
+                id: i + 1,
+                guild_id: GUILD.to_owned(),
+                event_type: "message_created".to_owned(),
+                source_event_id: format!("msg-{i}"),
+                actor_id: Some("member-1".to_owned()),
+                occurred_at: format!("2026-09-01T10:{:02}:00.000Z", i * 2),
+                source: "gateway".to_owned(),
+                classifier_version: VERSION.to_owned(),
+                classification: "eligible_human".to_owned(),
+                matched_rule: String::new(),
+                metadata: None,
+                idempotency_key: format!("msg-{i}"),
+            })
+            .collect();
+        let facts: Vec<ParsedFact<'_>> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let meta = if i < 5 {
+                    serde_json::json!({"channelId": "chan-1", "contentLength": 12})
+                } else {
+                    serde_json::json!({"channelId": "chan-1"})
+                };
+                ParsedFact {
+                    row,
+                    classification: "eligible_human",
+                    meta: meta.as_object().expect("object").clone(),
+                }
+            })
+            .collect();
+        let mut flags = Vec::new();
+        let mut quality = Vec::new();
+        detect_copy_paste(&facts, &mut flags, &mut quality);
+        assert!(
+            flags.is_empty(),
+            "sparse lengths give no verdict: {flags:?}"
+        );
+        assert_eq!(quality, vec!["copy_paste:insufficient_data".to_owned()]);
     }
 }

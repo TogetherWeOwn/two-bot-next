@@ -29,6 +29,7 @@
 //! production guild or tokens.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use twilight_cache_inmemory::{DefaultInMemoryCache, InMemoryCache};
@@ -36,9 +37,9 @@ use twilight_model::gateway::event::Event;
 use twilight_model::util::Timestamp;
 use two_bot_core::automod_runtime::FunnelDisposition;
 use two_bot_core::{
-    ChannelClass, ExpectedJoins, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput,
-    InviteSnapshotStore, InviteState, InviteTracker, JoinInput, LevelingHook, MessageInput,
-    Snowflake, VoiceInput,
+    ChannelClass, ClassifierConfig, ExpectedJoins, FactsSink, FunnelHandlers, FunnelStore,
+    GateClearedInput, InviteSnapshotStore, InviteState, InviteTracker, JoinInput, LevelingHook,
+    MessageInput, Snowflake, VoiceInput,
 };
 
 /// Legacy `occurred_at` shape: millis precision with a `Z` suffix
@@ -205,6 +206,48 @@ impl ChannelClassifier for NoClassification {
     }
 }
 
+/// Settings-backed classifier: a shared handle over the live
+/// [`ClassifierConfig`] channel sets. Every clone reads the same config,
+/// and [`Self::refresh`] replaces it for all clones, so a settings change
+/// reclassifies without rebuilding the pipeline that holds a clone.
+#[derive(Debug, Clone, Default)]
+pub struct SettingsChannelClassifier(Arc<Mutex<ClassifierConfig>>);
+
+impl SettingsChannelClassifier {
+    #[must_use]
+    pub fn new(config: ClassifierConfig) -> Self {
+        Self(Arc::new(Mutex::new(config)))
+    }
+
+    /// Replace the live config for every clone. Unchanged configs are a
+    /// no-op so per-delivery refreshes stay cheap after comparison.
+    pub fn refresh(&self, config: ClassifierConfig) {
+        let mut live = self.0.lock().expect("channel classifier lock");
+        if *live != config {
+            *live = config;
+        }
+    }
+}
+
+impl ChannelClassifier for SettingsChannelClassifier {
+    fn classify(&self, channel_id: Snowflake) -> ChannelClass {
+        self.0
+            .lock()
+            .expect("channel classifier lock")
+            .channel_class(channel_id)
+    }
+}
+
+/// Idle backstop for voice chains: entries untouched this long are dropped
+/// by [`VoiceChains::prune_idle`]. Leave-removal handles clean disconnects;
+/// this covers missed leaves (gateway gaps, restarts). Thirty minutes keeps a
+/// normal session's chain alive between frames without pinning members who
+/// never return.
+const VOICE_CHAIN_IDLE_MS: u64 = 30 * 60_000;
+/// Above this many chains, join and move frames prune idle entries so a burst
+/// of missed leaves cannot grow the map without bound.
+const VOICE_CHAIN_PRUNE_AT: usize = 2_048;
+
 /// Per-member serial chains for voice frames (TOG-5981): the shard loop is
 /// single-threaded per shard, but S4 slow paths (automod, audit REST) may
 /// yield between a move's leave and join. The mutex per member keeps the
@@ -212,8 +255,19 @@ impl ChannelClassifier for NoClassification {
 /// member; a stuck write for A never stalls B. The guard is a blocking
 /// `std` mutex: if `handle` ever awaits inside the voice critical section,
 /// switch this to an async mutex first.
+///
+/// Entries live only while the member is in voice (removed on full leave) or
+/// until [`VoiceChains::prune_idle`] drops them as idle, so the map no longer
+/// grows one entry per member who ever moved channel.
 type VoiceChainKey = (Snowflake, Snowflake);
-type VoiceChainMap = HashMap<VoiceChainKey, Arc<Mutex<()>>>;
+
+#[derive(Debug, Default)]
+struct ChainEntry {
+    mutex: Arc<Mutex<()>>,
+    last_seen_ms: i64,
+}
+
+type VoiceChainMap = HashMap<VoiceChainKey, ChainEntry>;
 
 #[derive(Debug, Default)]
 struct VoiceChains {
@@ -221,13 +275,44 @@ struct VoiceChains {
 }
 
 impl VoiceChains {
-    fn lock_for(&self, guild_id: Snowflake, member_id: Snowflake) -> Arc<Mutex<()>> {
-        self.inner
-            .lock()
-            .expect("chains lock")
-            .entry((guild_id, member_id))
-            .or_default()
-            .clone()
+    fn lock_for(&self, guild_id: Snowflake, member_id: Snowflake, now_ms: i64) -> Arc<Mutex<()>> {
+        let mut chains = self.inner.lock().expect("chains lock");
+        let entry = chains.entry((guild_id, member_id)).or_default();
+        entry.last_seen_ms = now_ms;
+        entry.mutex.clone()
+    }
+
+    /// Drop the member's chain after a full voice leave. Kept while another
+    /// frame holds a handle (inside the critical section or queued on it), so
+    /// end/start stays serial. Pointer-checked so a recreated entry survives.
+    fn remove_after_leave(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        chain: &Arc<Mutex<()>>,
+    ) {
+        let mut chains = self.inner.lock().expect("chains lock");
+        let key = (guild_id, member_id);
+        // The map and this frame each hold one handle; more belong to another frame.
+        let keep = chains.get(&key).is_some_and(|entry| {
+            !Arc::ptr_eq(&entry.mutex, chain) || Arc::strong_count(&entry.mutex) > 2
+        });
+        if !keep {
+            chains.remove(&key);
+        }
+    }
+
+    /// Drop entries idle longer than `max_idle_ms` at `now_ms`. Returns the
+    /// removed count. Hot entries (touched within the window) are untouched.
+    fn prune_idle(&self, now_ms: i64, max_idle_ms: i64) -> usize {
+        let mut chains = self.inner.lock().expect("chains lock");
+        let before = chains.len();
+        chains.retain(|_, entry| now_ms.saturating_sub(entry.last_seen_ms) <= max_idle_ms);
+        before - chains.len()
+    }
+
+    fn len(&self) -> usize {
+        self.inner.lock().expect("chains lock").len()
     }
 }
 
@@ -263,6 +348,14 @@ pub struct Pipeline<
     /// Set once at startup by the runtime that wants audit entries
     /// (containment).
     audit_entry_observer: OnceLock<Arc<dyn AuditEntryObserver>>,
+    /// Whether the shard subscribed privileged `MESSAGE_CONTENT`, so
+    /// `msg.content` is actually delivered for ordinary guild messages.
+    /// Without it Discord sends content only for messages that mention the
+    /// bot, and measuring those would record a biased handful of lengths.
+    /// Direct pipelines (replay, tests) feed already-delivered events and
+    /// default to measuring; the live wrapper starts unmeasured and the
+    /// gateway runtime declares the real subscription before the shard runs.
+    message_content_delivered: AtomicBool,
 }
 
 impl<S, L, F, I, C, P> std::fmt::Debug for Pipeline<S, L, F, I, C, P> {
@@ -324,7 +417,21 @@ impl<
             vanity_guilds: Mutex::new(HashSet::new()),
             join_observer: OnceLock::new(),
             audit_entry_observer: OnceLock::new(),
+            message_content_delivered: AtomicBool::new(true),
         }
+    }
+
+    /// Declare whether the shard feeding this pipeline subscribed
+    /// `MESSAGE_CONTENT`. The gateway runtime sets this from the exact
+    /// intents it builds the shard with, before the shard runs; lengths are
+    /// measured only when content is delivered for ordinary messages.
+    pub fn set_message_content_delivered(&self, delivered: bool) {
+        self.message_content_delivered
+            .store(delivered, Ordering::Release);
+    }
+
+    fn content_delivered(&self) -> bool {
+        self.message_content_delivered.load(Ordering::Acquire)
     }
 
     /// Register the join observer. First registration wins; a second call is
@@ -528,12 +635,33 @@ impl<
                     .lock()
                     .expect("vanity lock")
                     .contains(&guild_id);
+                let expected_won = expected.is_some();
                 let source = expected.unwrap_or_else(|| self.invites.attribute(&grew, has_vanity));
-                let inviter_id = if grew.len() == 1 {
+                // The web path's expected join has no inviter: a concurrently
+                // growing code belongs to some other join, never this one.
+                let inviter_id = if !expected_won && grew.len() == 1 {
                     self.invites.inviter_for(guild_id, &grew[0])
                 } else {
                     None
                 };
+                // Per-edge attribution log (snapshot-diff contract): exactly one
+                // INFO event per handled join, carrying the filed source and the
+                // joining member; the credited inviter rides along if and only
+                // if a single code grew for this (non-expected) join.
+                if let Some(inviter) = inviter_id {
+                    tracing::info!(
+                        source = %source,
+                        member_id = member_id,
+                        inviter_id = inviter,
+                        "invite attribution"
+                    );
+                } else {
+                    tracing::info!(
+                        source = %source,
+                        member_id = member_id,
+                        "invite attribution"
+                    );
+                }
                 let joined_at_ms = add.member.joined_at.map_or_else(
                     || two_bot_core::parse_iso_millis(observed_at),
                     |at| Some(at.as_micros().div_euclid(1000)),
@@ -624,6 +752,18 @@ impl<
                     return; // DMs dropped.
                 };
                 let channel_id = msg.channel_id.get();
+                // Minimal transient shape for the short-message rule: the
+                // trimmed scalar count plus an embed/attachment bit. The body
+                // itself is dropped with this statement and never persisted
+                // or logged. Lengths are measured only when MESSAGE_CONTENT
+                // was subscribed: without it Discord delivers content solely
+                // for bot mentions, whose lengths would be a biased sample.
+                // `None` is unknown shape (existing award preserved); `Some`
+                // includes zero for a known empty message.
+                let has_embed_or_attachment = !msg.attachments.is_empty() || !msg.embeds.is_empty();
+                let content_length = self
+                    .content_delivered()
+                    .then(|| msg.content.trim().chars().count());
                 let input = MessageInput {
                     guild_id,
                     member_id: msg.author.id.get(),
@@ -635,6 +775,8 @@ impl<
                     channel_class: self.classifier.classify(channel_id),
                     capture_only: eligibility.capture_only,
                     occurred_at: Some(legacy_stamp(msg.timestamp)),
+                    content_length,
+                    has_embed_or_attachment,
                 };
                 self.cache.update(event);
                 if deliver {
@@ -667,26 +809,36 @@ impl<
                 // mutex across end(A)→start(B) so the pair stays atomic for
                 // this member. One timestamp for both halves so a move reads
                 // as one instant, not a gap.
-                let chain = self.voice_chains.lock_for(guild_id, member_id);
-                let _guard = chain.lock().expect("voice chain");
-                let at = observed_at.to_owned();
-                if let Some(old) = old_channel {
-                    self.handlers.on_voice_leave(VoiceInput {
-                        guild_id,
-                        member_id,
-                        is_bot,
-                        channel_id: old,
-                        occurred_at: Some(at.clone()),
-                    });
+                let now_ms = two_bot_core::parse_iso_millis(observed_at).unwrap_or(0);
+                let chain = self.voice_chains.lock_for(guild_id, member_id, now_ms);
+                {
+                    let _guard = chain.lock().expect("voice chain");
+                    let at = observed_at.to_owned();
+                    if let Some(old) = old_channel {
+                        self.handlers.on_voice_leave(VoiceInput {
+                            guild_id,
+                            member_id,
+                            is_bot,
+                            channel_id: old,
+                            occurred_at: Some(at.clone()),
+                        });
+                    }
+                    if let Some(channel) = new_channel {
+                        self.handlers.on_voice_join(VoiceInput {
+                            guild_id,
+                            member_id,
+                            is_bot,
+                            channel_id: channel,
+                            occurred_at: Some(at.clone()),
+                        });
+                    }
                 }
-                if let Some(channel) = new_channel {
-                    self.handlers.on_voice_join(VoiceInput {
-                        guild_id,
-                        member_id,
-                        is_bot,
-                        channel_id: channel,
-                        occurred_at: Some(at.clone()),
-                    });
+                if new_channel.is_none() {
+                    self.voice_chains
+                        .remove_after_leave(guild_id, member_id, &chain);
+                } else if self.voice_chains.len() > VOICE_CHAIN_PRUNE_AT {
+                    self.voice_chains
+                        .prune_idle(now_ms, VOICE_CHAIN_IDLE_MS as i64);
                 }
             }
             Event::InviteCreate(invite) => {
@@ -697,6 +849,8 @@ impl<
                         uses: u64::from(invite.uses),
                         inviter_id: invite.inviter.as_ref().map(|user| user.id.get()),
                         channel_id: Some(invite.channel_id.get()),
+                        max_uses: invite.max_uses,
+                        temporary: invite.temporary,
                     },
                     observed_at,
                 );
@@ -760,4 +914,123 @@ pub fn build_cache() -> DefaultInMemoryCache {
     DefaultInMemoryCache::builder()
         .resource_types(cache_resource_types())
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GUILD: Snowflake = 7;
+
+    #[test]
+    fn idle_chains_prune_at_10k_hot_untouched() {
+        const TOTAL: u64 = 10_000;
+        const HOT: u64 = 100;
+        const NOW: i64 = 2 * VOICE_CHAIN_IDLE_MS as i64;
+        let chains = VoiceChains::default();
+        let mut hot: Vec<(Snowflake, Arc<Mutex<()>>)> = Vec::new();
+        for member in 0..TOTAL {
+            // Idle entries last touched long ago; hot entries at `NOW`.
+            let seen = if member < HOT { NOW } else { 0 };
+            let chain = chains.lock_for(GUILD, member, seen);
+            if member < HOT {
+                hot.push((member, chain));
+            }
+        }
+        assert_eq!(chains.len(), TOTAL as usize);
+        let removed = chains.prune_idle(NOW, VOICE_CHAIN_IDLE_MS as i64);
+        assert_eq!(removed, (TOTAL - HOT) as usize, "idle chains pruned");
+        assert_eq!(chains.len(), HOT as usize);
+        for (member, chain) in &hot {
+            let live = chains.lock_for(GUILD, *member, NOW);
+            assert!(Arc::ptr_eq(&live, chain), "hot entry untouched");
+        }
+        assert_eq!(chains.len(), HOT as usize, "re-touching hot adds nothing");
+    }
+
+    #[test]
+    fn leave_removes_chain_unless_contended() {
+        let chains = VoiceChains::default();
+        let chain = chains.lock_for(GUILD, 1, 0);
+        chains.remove_after_leave(GUILD, 1, &chain);
+        assert_eq!(chains.len(), 0, "full leave drops the chain");
+
+        // Another frame's handle (inside the critical section or queued on it) keeps the entry.
+        let chain = chains.lock_for(GUILD, 2, 0);
+        let other = chains.lock_for(GUILD, 2, 0);
+        chains.remove_after_leave(GUILD, 2, &chain);
+        assert_eq!(chains.len(), 1, "contended chain survives the leave");
+        drop(other);
+        chains.remove_after_leave(GUILD, 2, &chain);
+        assert_eq!(chains.len(), 0, "uncontended retry drops it");
+
+        // A recreated entry is a different chain and is never dropped by a
+        // stale leave for the old one.
+        let old = chains.lock_for(GUILD, 3, 0);
+        chains.remove_after_leave(GUILD, 3, &old);
+        let fresh = chains.lock_for(GUILD, 3, 1);
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        chains.remove_after_leave(GUILD, 3, &old);
+        assert_eq!(chains.len(), 1, "stale leave keeps the fresh chain");
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLengths(Arc<Mutex<Vec<Option<usize>>>>);
+
+    impl FactsSink for CapturedLengths {
+        fn record_member_join(&self, _fact: two_bot_core::MemberJoinFact<'_>) {}
+
+        fn record_rules_accepted(&self, _fact: two_bot_core::RulesAcceptedFact<'_>) {}
+
+        fn record_message(&self, fact: two_bot_core::MessageFact<'_>) {
+            self.0.lock().expect("capture").push(fact.content_length);
+        }
+
+        fn record_voice_started(
+            &self,
+            _fact: two_bot_core::VoiceStartedFact<'_>,
+        ) -> Option<String> {
+            None
+        }
+
+        fn record_voice_ended(&self, _fact: two_bot_core::VoiceEndedFact<'_>) {}
+    }
+
+    #[test]
+    fn lengths_measured_only_when_content_delivered() {
+        let message: twilight_model::channel::Message = serde_json::from_value(serde_json::json!({
+            "id": "10",
+            "guild_id": "7",
+            "channel_id": "8",
+            "type": 0,
+            "author": {"id": "9", "username": "member", "discriminator": "0", "avatar": null},
+            "content": "hello world",
+            "timestamp": "2026-09-01T10:00:00.000000+00:00",
+            "edited_timestamp": null,
+            "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
+            "attachments": [], "embeds": [], "pinned": false
+        }))
+        .expect("fixture message deserializes");
+        let event = Event::MessageCreate(Box::new(
+            twilight_model::gateway::payload::incoming::MessageCreate(message),
+        ));
+
+        for (delivered, expected) in [(true, Some(11)), (false, None)] {
+            let captured = CapturedLengths::default();
+            let pipeline = Pipeline::new(
+                two_bot_core::MemStore::new(),
+                Some(two_bot_core::NoopLeveling),
+                Some(captured.clone()),
+                ScriptedInvites::new(),
+                NoClassification,
+            );
+            pipeline.set_message_content_delivered(delivered);
+            pipeline.handle_at(&event, "2026-09-01T10:00:01.000Z");
+            assert_eq!(
+                *captured.0.lock().expect("capture"),
+                vec![expected],
+                "delivered={delivered}"
+            );
+        }
+    }
 }

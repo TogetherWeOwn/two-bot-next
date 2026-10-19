@@ -64,7 +64,7 @@ const HEAT_KEY: &str = "TWO_ANTI_NUKE_HEAT_THRESHOLD";
 const TRUSTED_KEY: &str = "TWO_ANTI_NUKE_TRUSTED_USER_IDS";
 const PROTECTED_KEY: &str = "TWO_ANTI_NUKE_PROTECTED_USER_IDS";
 const CHANNEL_KEY: &str = "DISCORD_STAFF_ALERT_CHANNEL_ID";
-const HOT_KEYS: [&str; 3] = [WINDOW_KEY, MAX_AGE_KEY, HEAT_KEY];
+const HOT_KEYS: [&str; 4] = [WINDOW_KEY, MAX_AGE_KEY, HEAT_KEY, CHANNEL_KEY];
 
 /// Discord audit-log action to legacy destructive weight. Unsupported actions
 /// never acquire a weight and are skipped before any claim.
@@ -97,9 +97,9 @@ impl ContainmentSettings {
     pub(crate) fn from_vars(vars: &HashMap<String, String>) -> Self {
         let seconds = |key: &str, default_ms: i64| match vars.get(key).map(|raw| raw.trim()) {
             None | Some("") => default_ms,
-            Some(raw) => match raw.parse::<f64>() {
-                Ok(value) if value.is_finite() && value > 0.0 => (value * 1000.0) as i64,
-                _ => {
+            Some(raw) => match raw.parse::<f64>().ok().and_then(seconds_to_ms) {
+                Some(ms) => ms,
+                None => {
                     warn!(key, "containment setting unusable; using the default");
                     default_ms
                 }
@@ -132,6 +132,14 @@ impl ContainmentSettings {
     }
 }
 
+/// Whole positive i64 milliseconds; sub-millisecond, overflow and non-finite input give `None`.
+fn seconds_to_ms(seconds: f64) -> Option<i64> {
+    // Upper bound is 2^63: the first f64 that no longer fits in an i64.
+    let ms = seconds * 1000.0;
+    let upper = (1_u64 << 63) as f64;
+    (1.0..upper).contains(&ms).then_some(ms as i64)
+}
+
 fn is_snowflake(value: &str) -> bool {
     (17..=20).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
@@ -156,9 +164,9 @@ pub(crate) trait SettingsSource: Send + Sync + 'static {
     fn current(&mut self) -> impl Future<Output = ContainmentSettings> + Send;
 }
 
-/// Tuning is store-first (hot rows win over the deployment environment) and
-/// re-read at most every [`SETTINGS_MAX_AGE`]; a failed refresh keeps the last
-/// good values. The staff channel is the deployment value read once at boot.
+/// Tuning and the staff channel are store-first (hot rows win over the
+/// deployment environment) and re-read at most every [`SETTINGS_MAX_AGE`]; a
+/// failed refresh keeps the last good values.
 pub(crate) struct StoreSettings {
     pool: PgPool,
     guild_id: String,
@@ -217,8 +225,9 @@ impl SettingsSource for StoreSettings {
         self.refresh().await;
         let mut vars = self.deployment.clone();
         if let Some(cache) = &self.cache {
-            // Only the three containment keys are live (`HOT_WIRED`); the
-            // staff channel stays the boot-time deployment value.
+            // Tuning and the staff channel are live (`HOT_WIRED`): a stored
+            // row moves the next observation, a delete hands the key back to
+            // the boot-time deployment value.
             vars.extend(
                 cache
                     .env_snapshot(Some(self.guild_id.as_str()))
@@ -768,16 +777,13 @@ pub(crate) fn start_from_env(
         armed = fences.armed,
         "containment_fences: dry-run default; removals execute only when armed"
     );
-    let mut deployment: HashMap<String, String> = HOT_KEYS
+    let deployment: HashMap<String, String> = HOT_KEYS
         .iter()
         .filter_map(|key| {
             vars.get(*key)
                 .map(|value| ((*key).to_owned(), value.clone()))
         })
         .collect();
-    if let Some(channel) = vars.get(CHANNEL_KEY) {
-        deployment.insert(CHANNEL_KEY.to_owned(), channel.clone());
-    }
     let (runtime, _worker) = start(
         guild_id,
         StoreSettings::new(pool.clone(), guild_id, deployment),

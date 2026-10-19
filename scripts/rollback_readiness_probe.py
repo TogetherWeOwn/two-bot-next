@@ -4,14 +4,14 @@
 Four checks, one PASS/FAIL line each; exit 1 if any fails, 0 if all pass:
 
   manifest       the newest `two-funnel-*.ndjson.gz` in the backup directory
-                 (the drill's `ls -1t` selector) has a parseable v3/v4 manifest
+                 (the drill's `ls -1t` selector) has a parseable v3/v4/v5/v6/v7/v8 manifest
                  and an end marker whose row total matches the manifest counts.
   sequences      every live serial/identity sequence, from a saved result of
                  SEQUENCES_QUERY, has a manifest high-water at or past its live
                  `last_value`. A restore restarts allocators from the archive,
                  so anything less rewinds them (docs/cutover.md, allocator gate).
   readyz         the staging Worker answers /readyz with the bot's truthful
-                 process/gateway breakdown (wrangler/scripts/check-readyz.mjs).
+                 component breakdown (wrangler/scripts/check-readyz.mjs).
   deploy-config  each named environment in wrangler.toml declares the required
                  TWO_* vars, non-empty (vars are not inherited).
 
@@ -22,6 +22,13 @@ GET to an origin matching the staging Worker pattern; anything else, including
 a redirect, is refused before or instead of being followed. This is a screen,
 not a restore verification: `two-bot restore --dry-run` remains the full
 archive inspection (docs/backup.md).
+
+Body-cap refusal contract: the transport reads at most READYZ_BODY_CAP+1
+bytes on both the normal and HTTPError paths so a hidden suffix is detected.
+Any body longer than READYZ_BODY_CAP (64 KiB) is refused before JSON parsing
+with the fixed message "/readyz answered over the body cap"; exact-cap valid
+input passes, and the extra byte never reaches a successful JSON path.
+Refusals never echo the body, headers, URL or parse exceptions.
 
 Usage:
   python3 scripts/rollback_readiness_probe.py --backup-dir DIR \\
@@ -47,7 +54,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "wrangler/wrangler.toml"
 ARCHIVE_PREFIX = "two-funnel-"
 ARCHIVE_SUFFIX = ".ndjson.gz"
-DUMP_VERSIONS = (3, 4)
+DUMP_VERSIONS = (3, 4, 5, 6, 7, 8)
 # Same budgets as the Rust reader (crates/core/src/backup/dump_file.rs).
 COMPRESSED_CAP = 1 << 30
 LINE_CAP = 8 << 20
@@ -63,6 +70,15 @@ READYZ_BODY_CAP = 64 << 10
 # Cloudflare rejects the default "Python-urllib/x.y" agent at the edge with 403
 # (error 1010), so an explicit agent is required for the probe to reach the Worker.
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
+# Component names from crates/bot/src/server.rs; the drift test pins them to the source.
+# Per-surface allowlist: exactly the four components the container serves.
+# Anything else is refused with fixed vocabulary naming no component data.
+READYZ_STATES = ("ready", "starting", "down")
+READYZ_REQUIRED = ("process", "gateway", "database", "token_invalid")
+READYZ_ALLOWED = frozenset({"process", "gateway", "database", "token_invalid"})
+# Only the gateway parks: a 503 is accepted only with it starting or down. A database ping failure or a
+# latched bot token is a fault for this process (docs/runbook.md, docs/rest-guard.md), never parked.
+READYZ_PARKED = {"gateway": ("down", "starting")}
 # Owned serial/identity sequences via pg_get_serial_sequence, plus the standalone
 # guild_settings_version_seq (guarded by to_regclass), mirroring the restore
 # (crates/core/src/backup/dump.rs). Also reports whether last_value is readable:
@@ -186,11 +202,12 @@ def read_manifest(path):
         raise
     except (OSError, EOFError, zlib.error) as e:
         raise ProbeError(f"{path.name} is not a complete gzip archive ({e.__class__.__name__})")
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (ValueError, RecursionError):
+        # ValueError also carries bad UTF-8 and the int-digit cap; refuse all as non-JSON.
         raise ProbeError(f"{path.name} manifest line is not JSON")
     try:
         end = json.loads(last) if last else None
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (ValueError, RecursionError):
         end = None
     if not isinstance(end, dict) or end.get("kind") != "end" or not is_int(end.get("rows"), high=(1 << 64) - 1):
         raise ProbeError(f"{path.name} has no end marker: truncated, treat it as lost")
@@ -212,7 +229,8 @@ def load_live_sequences(path):
         rows = json.loads(Path(path).read_text())
     except OSError as e:
         raise ProbeError(f"cannot read {path} ({e.__class__.__name__})")
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
+        # Excessively nested input exhausts the decoder's recursion budget.
         raise ProbeError(f"{path} is not JSON; expected the SEQUENCES_QUERY result")
     if not isinstance(rows, list):
         raise ProbeError(f"{path} is not a JSON array; expected the SEQUENCES_QUERY result")
@@ -281,9 +299,35 @@ def fetch(url):
         with opener.open(urllib.request.Request(url, headers={"User-Agent": USER_AGENT},
                                                method="GET"),
                          timeout=READYZ_TIMEOUT_SECONDS) as response:
-            return response.status, response.read(READYZ_BODY_CAP)
+            return response.status, response.read(READYZ_BODY_CAP + 1)
     except urllib.error.HTTPError as e:
-        return e.code, e.read(READYZ_BODY_CAP)
+        return e.code, e.read(READYZ_BODY_CAP + 1)
+
+
+def readyz_state(status, body):
+    if len(body) > READYZ_BODY_CAP:
+        raise ProbeError("/readyz answered over the body cap")
+    try:
+        report = json.loads(body)
+    except (ValueError, RecursionError):
+        # Excessively nested input exhausts the decoder's recursion budget
+        # below READYZ_BODY_CAP; grade it as no breakdown, never a crash.
+        report = None
+    components = report.get("components") if isinstance(report, dict) else None
+    if (not isinstance(components, list) or "error" in report
+            or not all(isinstance(c, list) and len(c) == 2 and isinstance(c[0], str)
+                       and c[1] in READYZ_STATES for c in components)):
+        raise ProbeError(f"/readyz {status} without the bot's component breakdown "
+                         "(ownership refusal or broken deploy)")
+    state = dict(components)
+    if len(state) != len(components):
+        raise ProbeError(f"/readyz {status} repeats a component name")
+    if any(name not in READYZ_ALLOWED for name in state):
+        raise ProbeError(f"/readyz {status} carries an unknown component name")
+    missing = [name for name in READYZ_REQUIRED if name not in state]
+    if missing:
+        raise ProbeError(f"/readyz {status} lacks {', '.join(missing)}")
+    return state
 
 
 def check_readyz(url, fetch_fn):
@@ -292,23 +336,16 @@ def check_readyz(url, fetch_fn):
         status, body = fetch_fn(endpoint)
     except (OSError, http.client.HTTPException) as e:
         raise ProbeError(f"{endpoint} did not respond ({e.__class__.__name__})")
-    try:
-        report = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        report = None
-    components = report.get("components") if isinstance(report, dict) else None
-    if (not isinstance(components, list) or len(components) != 2
-            or not all(isinstance(c, list) and len(c) == 2 and isinstance(c[0], str) for c in components)
-            or report.get("error")):
-        raise ProbeError(f"/readyz {status} without the bot's process/gateway breakdown "
-                         "(ownership refusal or broken deploy)")
-    state = dict(components)
-    if len(state) == 2 and state.get("process") == "ready":
-        if status == 200 and state.get("gateway") == "ready":
-            return "/readyz 200: process and gateway ready"
-        if status == 503 and state.get("gateway") in ("down", "starting"):
-            return f"/readyz 503: process ready, gateway {state['gateway']} (parked, not E2E approval)"
-    raise ProbeError(f"/readyz {status} with unexpected components {components!r:.80}")
+    state = readyz_state(status, body)
+    not_ready = sorted((name, value) for name, value in state.items() if value != "ready")
+    if status == 200 and not not_ready:
+        return f"/readyz 200: all {len(state)} components ready"
+    if status == 503 and not_ready and all(value in READYZ_PARKED.get(name, ())
+                                           for name, value in not_ready):
+        summary = ", ".join(f"{name} {value}" for name, value in not_ready)
+        return f"/readyz 503: process ready, {summary} (parked, not E2E approval)"
+    shown = ", ".join(f"{name} {value}" for name, value in not_ready or sorted(state.items()))
+    raise ProbeError(f"/readyz {status} with unexpected components: {shown:.200}")
 
 
 def check_deploy_config(config, envs, extra_keys):
@@ -317,7 +354,8 @@ def check_deploy_config(config, envs, extra_keys):
             cfg = tomllib.load(f)
     except OSError as e:
         raise ProbeError(f"cannot read {config} ({e.__class__.__name__})")
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError):
+        # tomllib raises a plain ValueError for integers past the digit cap.
         raise ProbeError(f"{config} is not valid TOML")
     required = sorted(set(REQUIRED_TWO_KEYS) | set(extra_keys)
                       | {k for k in cfg.get("vars", {}) if k.startswith("TWO_")})

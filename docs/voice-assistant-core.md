@@ -42,13 +42,21 @@ fails on any new `TWO_*` literal in neither list.
 
 ## Residual parent work
 
+Before adding the handler or HTTP transport, satisfy the
+[template-assistant security gates](command-wiring-security.md#templateassistant):
+HTTPS to an approved environment-fixed destination, no redirects, credential
+binding and redaction, runtime authority and per-user limits. The permissive
+pure-core endpoint predicate and command publication do not satisfy these gates.
+
 The per-guild monthly-cap DB column (the V12a `voice_assistant_cap` ledger
 consumes the persisted row), the endpoint call with the validated V12b
 payload, the V12c six-scenario validation before the admin sees output, the
-Apply/Refine/Cancel flow, the endpoint credential binding, and publish
-wiring for this command alongside the V1 `voice_command_set` path all remain
-outside this slice. Unit tests establish domain behavior only, not runtime
-parity or staging readiness.
+Apply/Refine/Cancel flow and the endpoint credential binding remain outside
+this slice. Publication itself is wired: `InteractionRouter::publish_set`
+merges `assistant_commands()` after the voice set when both gates are on.
+Until the handler lands, an invocation gets the router's unknown-command
+reply. Unit tests establish domain behavior only, not runtime parity or
+staging readiness.
 
 ## Hermetic verification
 

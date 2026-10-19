@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Offline self-test for gitleaks-scan.sh: a pull request must not be able to
-# silence the secret scan that gates it.
+# Offline self-test for gitleaks-scan.sh: a pull request or merge-queue commit
+# must not be able to silence the secret scan that gates it.
 #
 # Builds throwaway git repos (a "base" commit on main plus a PR commit on top,
 # with refs/remotes/origin/main standing in for the fetched base branch) and
@@ -226,6 +226,63 @@ write_stock_config
 plant_token
 base_commit
 expect "push: planted token is detected" 1 "$(scan_rc push)"
+
+# -- merge_group runs honour the base policy, never the queue commit's own ---
+# BASE_REF arrives as a full ref (refs/heads/main) on merge_group, so every
+# case below passes it that way to prove the wrapper strips the prefix.
+new_repo mg-clean
+write_stock_config
+base_commit
+printf 'more docs\n' >> "${repo}/README.md"
+pr_commit
+expect "merge_group: clean change passes" 0 "$(scan_rc merge_group refs/heads/main)"
+
+new_repo mg-plain
+write_stock_config
+base_commit
+plant_token
+pr_commit
+expect "merge_group: planted token is detected" 1 "$(scan_rc merge_group refs/heads/main)"
+
+new_repo mg-config
+write_stock_config
+base_commit
+plant_token
+write_allowlist_config
+pr_commit
+expect "merge_group: allowlist added in .gitleaks.toml does not silence the scan" 1 \
+  "$(scan_rc merge_group refs/heads/main)"
+
+new_repo mg-ignore
+write_stock_config
+base_commit
+plant_token
+pr_commit
+fp="$(fingerprint_of "${work}/stock.toml")"
+if [[ -z "${fp}" ]]; then
+  failures=$((failures + 1))
+  echo "FAIL merge_group: could not derive the fingerprint of the planted token"
+else
+  printf '%s\n' "${fp}" > "${repo}/.gitleaksignore"
+  pr_commit
+  expect "merge_group: fingerprint added in .gitleaksignore does not silence the scan" 1 \
+    "$(scan_rc merge_group refs/heads/main)"
+fi
+
+new_repo mg-base-allowlist
+write_allowlist_config
+base_commit
+plant_token
+pr_commit
+expect "merge_group: allowlist already on the base branch is honoured" 0 \
+  "$(scan_rc merge_group refs/heads/main)"
+
+new_repo mg-no-base-ref
+base_commit
+printf 'more docs\n' >> "${repo}/README.md"
+pr_commit
+expect "merge_group: unfetched base branch fails the scan" 2 \
+  "$(scan_rc merge_group refs/heads/missing-branch)"
 
 printf '\n%d cases, %d failed\n' "${cases}" "${failures}"
 [[ "${failures}" -eq 0 ]]

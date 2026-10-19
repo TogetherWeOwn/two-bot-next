@@ -81,36 +81,89 @@ pub struct Mee6CommandInput {
     pub response: String,
 }
 
+/// Fail-closed bounds for one untrusted export row, in characters (Unicode
+/// scalar values, matching the downstream `chars().take(..)` truncation
+/// units). Each bound sits inside the corpus-pinned gap: downstream sizes
+/// (command 32, response 2000, description 100) must parse, while 1,000,000
+/// must not. Real exports get headroom; hostile huge values fail closed.
+const MAX_MEE6_COMMAND_CHARS: usize = 256;
+const MAX_MEE6_RESPONSE_CHARS: usize = 10_000;
+const MAX_MEE6_DESCRIPTION_CHARS: usize = 1_000;
+
 /// Parse an MEE6 export body into raw inputs (legacy `parseMee6Export`).
 /// Accepts the three known field spellings (`command`/`name`,
 /// `response`/`message`/`content`) and nothing else; a missing description
 /// defaults to empty (translation substitutes the standard default).
-/// Throws (errors) on anything that is not an array of command-shaped
-/// objects; translation itself happens in [`translate_export`] so each step
-/// stays testable alone.
+/// Fail-closed: unknown fields, ambiguous duplicate spellings, empty or
+/// whitespace-only required strings, over-long strings, wrong types,
+/// missing fields, and non-object entries all return `None` with no row
+/// content echo. Throws (errors) on anything that is not an array of
+/// command-shaped objects; translation itself happens in [`translate_export`]
+/// so each step stays testable alone.
 #[must_use]
 pub fn parse_mee6_entry(value: &serde_json::Value) -> Option<Mee6CommandInput> {
     let entry = value.as_object()?;
-    let command = entry
+    // Strict shape: only the known spellings plus `description` may appear.
+    // Any extra key — including lookalike casings, padded keys, payloads,
+    // huge arrays, nested values, or thousands of keys — fails closed.
+    for key in entry.keys() {
+        match key.as_str() {
+            "command" | "name" | "response" | "message" | "content" | "description" => {}
+            _ => return None,
+        }
+    }
+    // Ambiguous duplicate spellings fail closed even when values agree; a
+    // present-but-null spelling counts as present so it cannot fall through
+    // to its alias.
+    if entry.contains_key("command") && entry.contains_key("name") {
+        return None;
+    }
+    let response_spellings = u8::from(entry.contains_key("response"))
+        + u8::from(entry.contains_key("message"))
+        + u8::from(entry.contains_key("content"));
+    if response_spellings > 1 {
+        return None;
+    }
+    let command_raw = entry
         .get("command")
         .or_else(|| entry.get("name"))?
-        .as_str()?
-        .to_owned();
-    let response = entry
+        .as_str()?;
+    // Empty or whitespace-only required text is a half record, not an entry.
+    // Surrounding whitespace on otherwise non-empty text is preserved
+    // verbatim; only the emptiness check trims.
+    if command_raw.is_empty() || command_raw.trim().is_empty() {
+        return None;
+    }
+    if command_raw.chars().count() > MAX_MEE6_COMMAND_CHARS {
+        return None;
+    }
+    let response_raw = entry
         .get("response")
         .or_else(|| entry.get("message"))
         .or_else(|| entry.get("content"))?
-        .as_str()?
-        .to_owned();
-    let description = entry
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+        .as_str()?;
+    if response_raw.is_empty() || response_raw.trim().is_empty() {
+        return None;
+    }
+    if response_raw.chars().count() > MAX_MEE6_RESPONSE_CHARS {
+        return None;
+    }
+    let description = match entry.get("description") {
+        None => String::new(),
+        Some(serde_json::Value::String(text)) => {
+            if text.chars().count() > MAX_MEE6_DESCRIPTION_CHARS {
+                return None;
+            }
+            text.clone()
+        }
+        // A missing, null, or non-string description defaults to empty;
+        // translation substitutes the standard default downstream.
+        Some(_) => String::new(),
+    };
     Some(Mee6CommandInput {
-        command,
+        command: command_raw.to_owned(),
         description,
-        response,
+        response: response_raw.to_owned(),
     })
 }
 
@@ -271,6 +324,23 @@ mod tests {
                 .map(|e| e.description),
             Some(String::new())
         );
+    }
+
+    #[test]
+    fn whitespace_only_response_spellings_rejected() {
+        // Pins mee6.rs:145: a whitespace-only response is a half record,
+        // not an entry, for every response spelling. Without the trim
+        // check a blank template would import as a valid command.
+        for key in ["response", "message", "content"] {
+            let mut row = serde_json::Map::new();
+            row.insert("command".to_owned(), serde_json::json!("faq"));
+            row.insert(key.to_owned(), serde_json::json!(" \t\n"));
+            assert_eq!(
+                parse_mee6_entry(&serde_json::Value::Object(row)),
+                None,
+                "whitespace-only {key} must fail closed"
+            );
+        }
     }
 
     #[test]

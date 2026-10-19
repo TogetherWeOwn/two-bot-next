@@ -1,8 +1,8 @@
 //! S5/S6 integration: all effects, including invite baselines and bot flags,
 //! must roll back with a failed checkpoint. Only test-container schemas.
 use super::*;
-use two_bot_core::gateway_funnel::SnapshotWrite;
-use two_bot_core::{InviteSnapshotStore, InviteState};
+use two_bot_core::gateway_funnel::{ActivityTouch, SnapshotWrite};
+use two_bot_core::{analytics_family::AnalyticsCategory, InviteSnapshotStore, InviteState};
 use two_bot_discord::MessageEligibility;
 
 fn invite(uses: u64) -> InviteState {
@@ -11,6 +11,8 @@ fn invite(uses: u64) -> InviteState {
         uses,
         inviter_id: Some(9),
         channel_id: Some(8),
+        max_uses: 0,
+        temporary: false,
     }
 }
 
@@ -33,7 +35,12 @@ async fn snapshot_bot_activity_and_checkpoint_commit_or_roll_back_together() {
     let bad = FunnelBatch {
         bots: vec![(2222, 77)],
         snapshots: vec![SnapshotWrite::StoreAll(2222, vec![invite(2)])],
-        activity: vec![(2222, 88, "2026-09-30T04:00:00.000Z".into())],
+        activity: vec![ActivityTouch {
+            guild_id: 2222,
+            member_id: 88,
+            at: "2026-09-30T04:00:00.000Z".into(),
+            family: AnalyticsCategory::Activity,
+        }],
         events: vec![event(EventType::MemberLeave, "not-a-timestamp")],
         ..Default::default()
     };
@@ -60,7 +67,12 @@ async fn snapshot_bot_activity_and_checkpoint_commit_or_roll_back_together() {
             FunnelBatch {
                 bots: vec![(2222, 77)],
                 snapshots: vec![SnapshotWrite::StoreAll(2222, vec![invite(2)])],
-                activity: vec![(2222, 88, "2026-09-30T04:00:00.000Z".into())],
+                activity: vec![ActivityTouch {
+                    guild_id: 2222,
+                    member_id: 88,
+                    at: "2026-09-30T04:00:00.000Z".into(),
+                    family: AnalyticsCategory::Activity,
+                }],
                 events: vec![event(EventType::MemberLeave, "2026-09-30T04:00:01.000Z")],
                 ..Default::default()
             },

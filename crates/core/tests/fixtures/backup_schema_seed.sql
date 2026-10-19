@@ -179,6 +179,9 @@ VALUES ('100000000000000001', '100000000000000020', 'create', FALSE, repeat('7',
 INSERT INTO member_levels (guild_id, member_id, xp, message_xp, voice_xp, imported_xp, updated_at)
 VALUES ('100000000000000001', '100000000000000002', 9007199254740991,
         31, 60, 9007199254740900, '2026-08-01T10:00:00Z');
+-- Seasonal projection (0100): one quarter row mirroring the member above.
+INSERT INTO member_season_xp (guild_id, season_id, member_id, seasonal_xp, updated_at)
+VALUES ('100000000000000001', '2026-Q4', '100000000000000002', 91, '2026-08-01T10:00:00Z');
 -- Excluded: must be cleared by successful restore, preserved on failed restore.
 INSERT INTO xp_cooldowns (guild_id, member_id, source, last_awarded_at)
 VALUES ('100000000000000001', '100000000000000002', 'message', '2026-08-01T10:00:00Z');
@@ -254,6 +257,14 @@ INSERT INTO presence_probe
     (guild_id, observed_at, approximate_presence_count, bot_floor, bot_floor_scan_truncated)
 VALUES ('100000000000000001', '2026-08-01T10:00:00.000Z', 31, 3, TRUE),
        ('100000000000000001', '2026-08-01T10:01:00.000Z', 30, NULL, FALSE);
+-- Game-activity guild aggregates (0441/0442): one titled row, one untitled
+-- row (`''` game key), and one row in another guild. Guild keys only, so the
+-- roundtrip asserts archive coverage, not an empty seed.
+INSERT INTO game_activity_guild_aggregates
+    (guild_id, game, total_play_ms, in_voice_ms, session_count, updated_at)
+VALUES ('100000000000000001', 'Apex', 1800000, 60000, 1, '2026-08-01T10:00:00.000Z'),
+       ('100000000000000001', '', 60000, 0, 1, '2026-08-01T10:00:00.000Z'),
+       ('100000000000000002', 'Apex', 5940000, 0, 9, '2026-08-01T11:00:00.000Z');
 
 INSERT INTO community_stream_heartbeats (guild_id, stream, covered_from, covered_through, updated_at)
 VALUES ('100000000000000001', 'event_attended', '2026-07-27T00:00:00.000Z',
@@ -333,6 +344,11 @@ VALUES (repeat('3', 64), '2026-08-01T10:00:00.123456Z');
 INSERT INTO internal_event_keys (guild_id, event_key, event_id, created_at, updated_at)
 VALUES ('100000000000000001', 'backup:launch', '100000000000000002',
         '2026-08-01T10:00:00.123456Z', '2026-08-01T10:00:00.123456Z');
+INSERT INTO stream_live_claims
+    (dedup_key, broadcaster_id, started_at, channel_id, content, claimed_at, delivered_at, message_id)
+VALUES (repeat('a', 64), '123456', '2026-08-01T10:00:00Z', '100000000000000003',
+        'LIVE: backup is live on Twitch!', '2026-08-01T10:00:01Z', '2026-08-01T10:00:02Z',
+        '100000000000000006');
 
 INSERT INTO self_role_audit
     (event_id, guild_id, panel_id, member_id, source_id, option_key, role_id, source,
@@ -400,6 +416,31 @@ VALUES ('100000000000000001', '100000000000000033', '100000000000000030',
         '2026-08-01T10:00:00.123456Z'),
        ('100000000000000001', '100000000000000034', '100000000000000035',
         '100000000000000003', '100000000000000002', '7', '2026-08-02T10:00:00Z');
+-- Accepted create reservations (0422): one bound to the room above, one
+-- rolled back (no channel), both settled; plus one still in flight.
+INSERT INTO voice_create_reservations (guild_id, user_id, created_at, channel_id, settled_at)
+VALUES ('100000000000000001', '100000000000000002', '2026-08-01T09:59:58Z',
+        '100000000000000033', '2026-08-01T10:00:00Z'),
+       ('100000000000000001', '100000000000000003', '2026-08-02T09:59:58Z',
+        NULL, '2026-08-02T10:00:00Z'),
+       ('100000000000000001', '100000000000000002', '2026-08-03T10:00:00Z',
+        NULL, NULL);
+-- S2 member capture (0432): append-only gateway deltas; one ADD with the
+-- nick_changed flag and role ids, one REMOVE without deltas. The REMOVE keys
+-- on the gateway envelope (session + sequence) because the dispatch carries
+-- no timestamp; nicknames are never stored, only the flag.
+INSERT INTO event_store
+    (event_type, guild_id, user_id, event_time, received_at, dedup_key,
+     premium_since, nick_changed, roles)
+VALUES ('GUILD_MEMBER_ADD', '100000000000000001', '100000000000000002',
+        '2026-08-01T10:00:00Z', '2026-08-01T10:00:01Z',
+        'GUILD_MEMBER_ADD:100000000000000001:100000000000000002:2026-08-01T10:00:00Z',
+        NULL, FALSE,
+        '["100000000000000010"]'),
+       ('GUILD_MEMBER_REMOVE', '100000000000000001', '100000000000000004',
+        '2026-08-02T10:00:00Z', '2026-08-02T10:00:01Z',
+        'GUILD_MEMBER_REMOVE:100000000000000001:100000000000000004:seed-session:7',
+        NULL, NULL, '[]');
 -- V3 privacy (0416): the second room is private with a Join channel and one
 -- blocked member; the first stays public with an empty block list.
 UPDATE voice_rooms
@@ -484,3 +525,108 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
        ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
+-- Retention queues (0438): one queued guild purge plus one pending and one
+-- completed user-deletion request, so the dump/restore round trip covers both
+-- the pending-NULL and completed-receipt shapes.
+INSERT INTO retention_guild_purge_queue (guild_id, enqueued_at)
+VALUES ('100000000000000001', '2026-08-03T10:06:00.123456Z');
+INSERT INTO retention_deletion_requests
+  (request_id, guild_id, user_id, requested_at, status, completed_at, receipt_id)
+VALUES ('backup-del-pending', '100000000000000001', '100000000000000002',
+        '2026-08-01T10:00:00.123456Z', 'pending', NULL, NULL),
+       ('backup-del-completed', '100000000000000001', '100000000000000003',
+        '2026-08-01T09:00:00Z', 'completed', '2026-08-01T10:00:00Z',
+        'rcpt-backup-del-completed');
+-- Privacy opt-out control plane (0433/0434): one suppressed pair plus one
+-- untouched pair, per-guild toggles with one category disabled, and one
+-- audit receipt per suppression. Every table carries rows so the roundtrip
+-- asserts archive coverage, not an empty seed.
+INSERT INTO privacy_opt_outs (guild_id, member_id, opted_out_at)
+VALUES ('100000000000000001', '100000000000000005', '2026-08-03T10:00:00Z'),
+       ('100000000000000002', '100000000000000005', '2026-08-03T11:00:00Z');
+INSERT INTO guild_analytics_settings (guild_id, presence_enabled, activity_enabled,
+  voice_enabled, updated_at)
+VALUES ('100000000000000001', TRUE, FALSE, TRUE, '2026-08-03T10:00:00Z'),
+       ('100000000000000002', TRUE, TRUE, TRUE, '2026-08-03T11:00:00Z');
+INSERT INTO privacy_opt_out_audit (guild_id, member_id, actor, opted_out_at)
+VALUES ('100000000000000001', '100000000000000005', 'backup-operator',
+        '2026-08-03T10:00:00Z'),
+       ('100000000000000002', '100000000000000005', 'backup-operator',
+        '2026-08-03T11:00:00Z');
+-- Event-store S8 stage/interaction-observe/audit-log capture (0431): one
+-- stage-instance row and one audit-log-entry row, ids and enums only.
+INSERT INTO event_store (event_type, guild_id, channel_id, stage_instance_id,
+  privacy_level, interaction_id, interaction_type, application_id, command_id,
+  audit_log_entry_id, action_type, actor_id, target_id, event_time, received_at,
+  dedup_key)
+VALUES ('stage_instance', '100000000000000001', '100000000000000033',
+        'stage-100000000000000060', 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        NULL, '2026-08-03T10:00:00.123456Z', '2026-08-03T10:00:01Z',
+        'STAGE_INSTANCE:100000000000000001:stage-100000000000000060:2026-08-03T10:00:00.123456Z'),
+       ('audit_log_entry', '100000000000000001', NULL, NULL, NULL,
+        '100000000000000061', 2, '100000000000000062', '100000000000000063',
+        'audit-100000000000000064', 3, '100000000000000003', '100000000000000004',
+        '2026-08-03T10:00:00.123456Z', '2026-08-03T10:00:02Z',
+        'AUDIT_LOG_ENTRY:100000000000000001:audit-100000000000000064:2026-08-03T10:00:00.123456Z');
+-- Event-store S3 presence capture (0428): append-only presence rows with the
+-- best-effort dedup key PRESENCE_UPDATE:<guild_id>:<user_id>:<event_time>
+-- (receive time; same-key retries insert nothing).
+INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
+  presence_status, activity_type, application_id)
+VALUES ('PRESENCE_UPDATE', '100000000000000001', '100000000000000002',
+        '2026-08-03T10:00:00Z',
+        'PRESENCE_UPDATE:100000000000000001:100000000000000002:2026-08-03T10:00:00Z',
+        'online', 0, NULL),
+       ('PRESENCE_UPDATE', '100000000000000001', '100000000000000003',
+        '2026-08-03T10:05:00Z',
+        'PRESENCE_UPDATE:100000000000000001:100000000000000003:2026-08-03T10:05:00Z',
+        'idle', 2, '123456789012345678');
+-- Event-store S4 voice capture (0427): one voice-state row with session and
+-- enum flags; token/endpoint/audio columns never exist. Distinct dedup key
+-- from the presence rows above, so both slices seed together.
+INSERT INTO event_store (event_type, guild_id, user_id, channel_id, session_id,
+  event_time, dedup_key, mute, deaf, self_mute, self_deaf, self_video, self_stream, suppress)
+VALUES ('voice_state_update', '100000000000000001', '100000000000000002', '100000000000000033',
+        'session-fixture-1', '2026-08-03T10:00:00Z', 'event-store-seed-1',
+        FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE);
+-- S5 message/reaction capture (0430): append-only gateway deltas, one message
+-- update plus one unicode reaction (NULL custom id, codepoint reference).
+INSERT INTO event_store (event_type, guild_id, channel_id, message_id, user_id,
+  emoji_id, emoji_name, event_time, received_at, dedup_key)
+VALUES ('MESSAGE_UPDATE', '100000000000000001', '100000000000000003',
+        '100000000000000006', '100000000000000002', NULL, NULL,
+        '2026-08-01T10:00:00Z', '2026-08-01T10:00:01Z', 'backup:event-store:message-update'),
+       ('REACTION_ADD', '100000000000000001', '100000000000000003',
+        '100000000000000006', '100000000000000004', NULL, 'U+1F44D',
+        '2026-08-02T10:00:00Z', '2026-08-02T10:00:01Z', 'backup:event-store:reaction-add');
+-- Event-store thread lifecycle + member deltas (0429 S6): one lifecycle row
+-- with state enums and no member id, one member-delta row with a member id.
+INSERT INTO event_store (event_type, guild_id, thread_id, parent_id, user_id,
+  event_time, dedup_key, archived, locked, invitable)
+VALUES ('THREAD_CREATE', '100000000000000001', '100000000000000060',
+        '100000000000000033', NULL, '2026-08-03T10:00:00Z',
+        'THREAD_CREATE:100000000000000001:100000000000000060:2026-08-03T10:00:00Z',
+        FALSE, FALSE, TRUE),
+       ('THREAD_MEMBER_UPDATE', '100000000000000001', '100000000000000060',
+        NULL, '100000000000000002', '2026-08-03T10:01:00Z',
+        'THREAD_MEMBER_UPDATE:100000000000000001:100000000000000060:2026-08-03T10:01:00Z:100000000000000002',
+        NULL, NULL, NULL);
+-- Event-store S7 invite + scheduled-event capture (0439): one invite row
+-- with the code hash (never the raw code) plus the inviter id, and one
+-- scheduled-event lifecycle row with the status/entity-type enums. The hash
+-- below is hash-shaped seed data; the sha256 property itself is pinned by
+-- the S7 acceptance suite, not the backup roundtrip.
+INSERT INTO event_store (event_type, guild_id, channel_id, invite_code_hash,
+  inviter_id, event_time, received_at, dedup_key)
+VALUES ('INVITE_CREATE', '100000000000000001', '100000000000000033',
+        repeat(md5('backup:event-store:invite'), 2), '100000000000000002',
+        '2026-08-03T10:00:00Z', '2026-08-03T10:00:01Z',
+        'INVITE_CREATE:100000000000000001:100000000000000033:' ||
+          repeat(md5('backup:event-store:invite'), 2) ||
+          ':2026-08-03T10:00:00Z');
+INSERT INTO event_store (event_type, guild_id, channel_id, scheduled_event_id,
+  event_status, entity_type, event_time, received_at, dedup_key)
+VALUES ('GUILD_SCHEDULED_EVENT_CREATE', '100000000000000001',
+        '100000000000000033', '100000000000000065', 1, 2,
+        '2026-08-03T10:00:00Z', '2026-08-03T10:00:01Z',
+        'GUILD_SCHEDULED_EVENT_CREATE:100000000000000001:100000000000000065:2026-08-03T10:00:00Z');

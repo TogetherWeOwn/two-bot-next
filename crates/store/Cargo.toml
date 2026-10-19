@@ -1,6 +1,6 @@
 [package]
 name = "two-bot-store"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -14,7 +14,7 @@ license.workspace = true
 # path): cargo-deny `wildcards = "deny"` rejects version-less deps.
 
 [dependencies]
-two-bot-core = { version = "0.3.0", path = "../core", features = ["db"] }
+two-bot-core = { version = "0.4.0", path = "../core", features = ["db"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
@@ -24,7 +24,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-two-bot-discord = { version = "0.3.0", path = "../discord" }
+two-bot-discord = { version = "0.4.0", path = "../discord" }
 twilight-model = { workspace = true }
 
 [lints]

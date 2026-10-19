@@ -55,7 +55,7 @@ COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot
 
 # Liveness + readiness (also the DO keepalive targets, see wrangler/).
 EXPOSE 8080
-ENV LISTEN_ADDR=0.0.0.0:8080
+ENV LISTEN_ADDR=0.0.0.0:8080 LOG_FORMAT=json
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/home/nonroot/two-bot", "--healthcheck"]

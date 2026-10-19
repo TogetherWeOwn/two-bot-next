@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Pool, Postgres};
-use two_bot_core::{EventType, FunnelEvent, FunnelStore, InviteSnapshotStore, InviteState};
+use two_bot_core::{
+    analytics_family::AnalyticsCategory, EventType, FunnelEvent, FunnelStore, InviteSnapshotStore,
+    InviteState,
+};
 use two_bot_store::{migrate, PgFunnelStore, PgInviteSnapshots, DB_POOL_MAX};
 
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
@@ -329,7 +332,12 @@ async fn insert_first_projection_rungs_and_rollback() {
         store.next_message_rung(123, 456, "2026-09-29T12:00:03.000Z"),
         None
     );
-    store.touch_activity(123, 456, "2026-09-29T11:00:00.000Z");
+    store.touch_activity(
+        123,
+        456,
+        "2026-09-29T11:00:00.000Z",
+        AnalyticsCategory::Activity,
+    );
     let recency: String = sqlx::query_scalar("SELECT to_char(last_active_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM members WHERE guild_id = '123' AND member_id = '456'")
         .fetch_one(&f.pool).await.unwrap();
     assert_eq!(recency, "2026-09-29T12:00:02.000Z");
@@ -375,6 +383,8 @@ async fn invite_snapshots_survive_reconstruction_and_delete_is_guild_scoped() {
         uses: 5,
         inviter_id: Some(789),
         channel_id: Some(321),
+        max_uses: 0,
+        temporary: false,
     };
     snapshots.store_all(123, &[invite.clone()]);
     snapshots.store_all(124, &[invite.clone()]);
@@ -389,6 +399,8 @@ async fn invite_snapshots_survive_reconstruction_and_delete_is_guild_scoped() {
             uses: 0,
             inviter_id: None,
             channel_id: None,
+            max_uses: 0,
+            temporary: false,
         },
     );
     assert_eq!(
@@ -513,6 +525,8 @@ async fn mock_gateway_join_records_funnel_and_persisted_attribution() {
         uses: 5,
         inviter_id: Some(789),
         channel_id: None,
+        max_uses: 0,
+        temporary: false,
     };
     pipeline.invite_source().push(123, vec![invite.clone()]);
     pipeline.prime_invite_snapshot(123);
@@ -539,5 +553,76 @@ async fn mock_gateway_join_records_funnel_and_persisted_attribution() {
         ]
     );
     assert_eq!(PgInviteSnapshots::new(f.pool.clone()).load(123)[0].uses, 6);
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires authorized TEST_DATABASE_URL"]
+async fn suppressed_pair_drops_funnel_writes_while_others_persist() {
+    let f = Fixture::new().await;
+    migrate(&f.pool).await.unwrap();
+    sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ('123', '456')")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO guild_analytics_settings (guild_id, presence_enabled, activity_enabled, voice_enabled)
+         VALUES ('123', TRUE, FALSE, TRUE)",
+    )
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let store = PgFunnelStore::new(f.pool.clone());
+    let at = "2026-10-13T00:00:00.000Z";
+    // Suppressed member: record, touch and mark all drop with no members row.
+    assert!(
+        !store
+            .try_record(&event(EventType::FirstMessage, at))
+            .await
+            .unwrap()
+            .inserted,
+        "suppressed pair drops"
+    );
+    store.touch_activity(123, 456, at, AnalyticsCategory::Activity);
+    store.mark_bot(123, 456);
+    let suppressed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM members WHERE guild_id = '123' AND member_id = '456'",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(suppressed, 0, "bumps create no row for the pair");
+    // Other member: the disabled activity family drops the message ...
+    let mut other = event(EventType::FirstMessage, "2026-10-13T00:01:00.000Z");
+    other.member_id = Some(789);
+    assert!(
+        !store.try_record(&other).await.unwrap().inserted,
+        "disabled activity drops funnel writes"
+    );
+    // ... while a non-family write still persists.
+    let mut join = event(EventType::MemberJoin, "2026-10-13T00:02:00.000Z");
+    join.member_id = Some(789);
+    assert!(store.try_record(&join).await.unwrap().inserted);
+    // Snapshots keep the aggregate uses with a blanked inviter.
+    let snapshots = PgInviteSnapshots::new(f.pool.clone());
+    snapshots.store_all(
+        123,
+        &[InviteState {
+            code: "seam".to_owned(),
+            uses: 3,
+            inviter_id: Some(456),
+            channel_id: None,
+            max_uses: 0,
+            temporary: false,
+        }],
+    );
+    let row: (i32, Option<String>) = sqlx::query_as(
+        "SELECT uses, inviter_id FROM invite_snapshots WHERE guild_id = '123' AND code = 'seam'",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, 3, "aggregate uses keep counting");
+    assert_eq!(row.1, None, "suppressed inviter blanked");
     f.finish().await;
 }

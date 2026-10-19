@@ -56,10 +56,48 @@ pub struct FactWrite {
 
 /// Insert one fact. Returns `true` when inserted, `false` when the idempotency
 /// key already held it (legacy `ON CONFLICT DO NOTHING RETURNING id`).
+///
+/// Privacy gate, inside the write transaction: a suppressed `(guild, actor)`
+/// pair drops the fact, and a guild-disabled analytics family drops
+/// message/voice facts ([`crate::privacy::community_category`]; join/rules
+/// facts are suppression-only, like other lifecycle rows). A suppressed
+/// inviter's attribution is stripped from `member_joined` metadata while the
+/// joiner's own fact still lands. Anonymous facts (`actor_id = None`) are
+/// never gated. Returns `false` for every dropped fact.
 pub async fn record_fact(
     pool: &Pool<Postgres>,
     fact: &FactWrite,
 ) -> Result<bool, CommunityStoreError> {
+    let mut tx = pool.begin().await?;
+    // Serialize with concurrent opt-outs (which take SHARE ROW EXCLUSIVE
+    // over these tables): the lock order matches `opt_out_member`, and ROW
+    // EXCLUSIVE never blocks other writers.
+    sqlx::query("LOCK TABLE community_facts, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    let mut metadata = fact.metadata.clone();
+    if let Some(actor) = fact.actor_id.as_deref() {
+        if crate::privacy::suppressed_in(&mut tx, &fact.guild_id, actor).await? {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if let Some(category) = crate::privacy::community_category(&fact.event_type) {
+            if crate::privacy::category_off_in(&mut tx, &fact.guild_id, category).await? {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+        }
+        if fact.event_type == "member_joined" {
+            if let Some(inviter) = crate::privacy::inviter_in_metadata(metadata.as_deref()) {
+                if crate::privacy::suppressed_in(&mut tx, &fact.guild_id, &inviter).await? {
+                    metadata = crate::privacy::scrubbed_member_join_metadata(
+                        metadata.as_deref(),
+                        &inviter,
+                    );
+                }
+            }
+        }
+    }
     let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO community_facts
            (guild_id, event_type, source_event_id, actor_id, occurred_at, source,
@@ -76,24 +114,48 @@ pub async fn record_fact(
     .bind(&fact.classification.classifier_version)
     .bind(&fact.classification.classification)
     .bind(&fact.classification.matched_rule)
-    .bind(&fact.metadata)
+    .bind(&metadata)
     .bind(&fact.idempotency_key)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(inserted.is_some())
 }
 
-/// Message fact (legacy `recordMessage` inputs, minus the classifier).
+/// Inputs for [`message_fact`] (legacy `recordMessage` inputs, minus the
+/// classifier). A struct, not positional parameters: the function already
+/// sat at the argument-count limit before `content_length` arrived.
+/// `content_length` is the Unicode scalar count measured where the gateway
+/// content was in hand; only the integer is threaded here, never content.
+pub struct MessageFactInput<'a> {
+    pub guild_id: &'a str,
+    pub message_id: &'a str,
+    pub channel_id: &'a str,
+    pub channel_class: &'a str,
+    pub actor: &'a ClassifyInput,
+    pub occurred_at: &'a str,
+    pub content_length: Option<usize>,
+    pub classification: Classification,
+}
+
 #[must_use]
-pub fn message_fact(
-    guild_id: &str,
-    message_id: &str,
-    channel_id: &str,
-    channel_class: &str,
-    actor: &ClassifyInput,
-    occurred_at: &str,
-    classification: Classification,
-) -> FactWrite {
+pub fn message_fact(input: MessageFactInput<'_>) -> FactWrite {
+    let MessageFactInput {
+        guild_id,
+        message_id,
+        channel_id,
+        channel_class,
+        actor,
+        occurred_at,
+        content_length,
+        classification,
+    } = input;
+    // A measured length is recorded; absent or zero records no key at all,
+    // so an unknown length never masquerades as a measured zero.
+    let length_part = match content_length {
+        Some(n) if n > 0 => format!(",\"contentLength\":{n}"),
+        _ => String::new(),
+    };
     FactWrite {
         guild_id: guild_id.to_owned(),
         event_type: "message_created".to_owned(),
@@ -103,12 +165,54 @@ pub fn message_fact(
         source: format!("channel:{channel_id}"),
         classification,
         metadata: Some(format!(
-            "{{\"channelId\":\"{channel_id}\",\"channelClass\":\"{channel_class}\",\"webhookId\":{},\"discordBot\":{}}}",
+            "{{\"channelId\":\"{channel_id}\",\"channelClass\":\"{channel_class}\",\"webhookId\":{},\"discordBot\":{}{}}}",
             actor.webhook_id.as_deref().map_or("null".to_owned(), |w| format!("\"{w}\"")),
-            actor.is_bot
+            actor.is_bot,
+            length_part
         )),
         idempotency_key: format!("discord-message:{message_id}"),
     }
+}
+
+/// Record one gateway `MessageCreate` fact: build via [`message_fact`] and
+/// insert via [`record_fact`]. Returns `true` when inserted, `false` when the
+/// `discord-message:{message_id}` key already held it (duplicate delivery).
+/// Content-minimized by construction: [`message_fact`] carries IDs, the
+/// classifier verdict, the channel class, and the measured content-length
+/// integer only, never message content.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_message_fact(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    message_id: &str,
+    channel_id: &str,
+    channel_class: &str,
+    actor: &ClassifyInput,
+    occurred_at: &str,
+    content_length: Option<usize>,
+    classification: Classification,
+) -> Result<bool, CommunityStoreError> {
+    let write = message_fact(MessageFactInput {
+        guild_id,
+        message_id,
+        channel_id,
+        channel_class,
+        actor,
+        occurred_at,
+        content_length,
+        classification,
+    });
+    record_fact(pool, &write).await
+}
+
+/// Member-join invite metadata (legacy `recordMemberJoin` inviter shape):
+/// `{"inviterId":"<snowflake>"}` when the gateway invite tracker attributed
+/// the join, otherwise no metadata. The funnel row carries the same object;
+/// the fact keeps it so the Monday tick can audit attribution without
+/// re-reading invites.
+#[must_use]
+pub fn member_join_metadata(inviter_id: Option<u64>) -> Option<String> {
+    inviter_id.map(|id| format!("{{\"inviterId\":\"{id}\"}}"))
 }
 
 /// Member-join fact (legacy `recordMemberJoin`).
@@ -218,6 +322,61 @@ pub fn voice_ended_fact(
         metadata: Some(metadata),
         idempotency_key: format!("voice-end:{session_key}"),
     }
+}
+
+/// Record one gateway voice-start fact: build via [`voice_started_fact`] and
+/// insert via [`record_fact`]. Returns the durable session key plus whether
+/// the `voice-start:{session_key}` row was newly inserted (`false` when the
+/// same join redelivers and the key already holds it).
+pub async fn record_voice_started_fact(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    actor: &super::community::ClassifyInput,
+    channel_id: &str,
+    occurred_at: &str,
+    session_key: Option<String>,
+    classification: super::community::Classification,
+) -> Result<(String, bool), CommunityStoreError> {
+    let (key, write) = voice_started_fact(
+        guild_id,
+        actor,
+        channel_id,
+        occurred_at,
+        session_key,
+        classification,
+    );
+    let inserted = record_fact(pool, &write).await?;
+    Ok((key, inserted))
+}
+
+/// Record one gateway voice-end fact: build via [`voice_ended_fact`] and
+/// insert via [`record_fact`]. Returns `true` when inserted, `false` when the
+/// `voice-end:{session_key}` key already held it (duplicate leave delivery).
+/// An end without a seen start carries `startedAt: null`,
+/// `durationSeconds: null`, `startKnown: false` — never a fabricated start.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_voice_ended_fact(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    actor: &super::community::ClassifyInput,
+    session_key: &str,
+    channel_id: &str,
+    occurred_at: &str,
+    started_at: Option<&str>,
+    duration_seconds: Option<i64>,
+    classification: super::community::Classification,
+) -> Result<bool, CommunityStoreError> {
+    let write = voice_ended_fact(
+        guild_id,
+        actor,
+        session_key,
+        channel_id,
+        occurred_at,
+        started_at,
+        duration_seconds,
+        classification,
+    );
+    record_fact(pool, &write).await
 }
 
 /// Upsert one stream heartbeat (legacy `markStreamCoverage`).
@@ -598,6 +757,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn member_join_fact_keys_on_guild_actor_and_time() {
+        // The idempotency key is `member-join:{guild}:{actor}:{occurred_at}`:
+        // a redelivered gateway burst shares the key and loses, while a later
+        // rejoin is a new fact.
+        let actor_obj = actor("m1");
+        let first = member_join_fact(
+            GUILD,
+            &actor_obj,
+            "2026-09-02T10:00:00.000Z",
+            "1:2:2026-09-02T10:00:00.000Z",
+            "invite:abc",
+            verdict("eligible_human"),
+            member_join_metadata(Some(9)),
+        );
+        assert_eq!(first.event_type, "member_joined");
+        assert_eq!(
+            first.idempotency_key,
+            "member-join:guild-a:m1:2026-09-02T10:00:00.000Z"
+        );
+        assert_eq!(first.source, "invite:abc");
+        assert_eq!(
+            first.metadata.as_deref(),
+            Some("{\"inviterId\":\"9\"}"),
+            "invite attribution survives the fact shape"
+        );
+        let later = member_join_fact(
+            GUILD,
+            &actor_obj,
+            "2026-09-03T10:00:00.000Z",
+            "1:2:2026-09-03T10:00:00.000Z",
+            "invite:abc",
+            verdict("eligible_human"),
+            None,
+        );
+        assert_ne!(
+            first.idempotency_key, later.idempotency_key,
+            "a later rejoin is a new fact, not a dedupe hit"
+        );
+        assert_eq!(member_join_metadata(None), None);
+    }
+
     async fn seed_fixture(pool: &Pool<Postgres>) {
         // The mixed legacy fixture: 7 messages (1 human + 6 excluded), 2
         // joins, 3 human voice ends (incl. an overlapping 600s union pair).
@@ -618,7 +819,16 @@ mod tests {
                 "2026-09-01T11:00:00.000Z"
             };
             let input = actor(who);
-            let write = message_fact(GUILD, id, "general", "human", &input, at, verdict(class));
+            let write = message_fact(MessageFactInput {
+                guild_id: GUILD,
+                message_id: id,
+                channel_id: "general",
+                channel_class: "human",
+                actor: &input,
+                occurred_at: at,
+                content_length: None,
+                classification: verdict(class),
+            });
             record_fact(pool, &write).await.expect("seed message");
         }
         for (id, who, at, class) in [
@@ -792,6 +1002,296 @@ mod tests {
         assert_eq!(scorecard["weeklyActiveHumans"], serde_json::Value::Null);
         assert_eq!(scorecard["humanMessages"], serde_json::Value::Null);
         assert_eq!(scorecard["intervention"]["code"], "INGESTION_INCOMPLETE");
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[test]
+    fn voice_session_key_and_end_metadata_shapes_are_honest() {
+        // Session-key shape: the start keys on guild, member, stamp and
+        // channel, so a redelivered join dedupes on the same idempotency key.
+        let input = actor("human-1");
+        let at = "2026-09-02T10:00:00.000Z";
+        let (key, start) = voice_started_fact(
+            GUILD,
+            &input,
+            "voice-9",
+            at,
+            None,
+            verdict("eligible_human"),
+        );
+        assert_eq!(key, format!("{GUILD}:human-1:{at}:voice-9"));
+        assert_eq!(start.event_type, "voice_session_started");
+        assert_eq!(start.source_event_id, key);
+        assert_eq!(start.idempotency_key, format!("voice-start:{key}"));
+        assert_eq!(start.source, "channel:voice-9");
+        let start_meta = start.metadata.expect("start metadata");
+        assert!(
+            start_meta.contains(&format!("\"sessionKey\":\"{key}\"")),
+            "start carries its session key"
+        );
+
+        // A supplied key survives (the gateway tracker's durable key), so a
+        // move's end and the next start never share a row.
+        let (supplied, _) = voice_started_fact(
+            GUILD,
+            &input,
+            "voice-9",
+            at,
+            Some("durable-key".to_owned()),
+            verdict("eligible_human"),
+        );
+        assert_eq!(supplied, "durable-key");
+
+        // Measured end: all four metadata fields travel together.
+        let end = voice_ended_fact(
+            GUILD,
+            &input,
+            &key,
+            "voice-9",
+            "2026-09-02T10:05:30.000Z",
+            Some(at),
+            Some(330),
+            verdict("eligible_human"),
+        );
+        assert_eq!(end.event_type, "voice_session_ended");
+        assert_eq!(end.source_event_id, key);
+        assert_eq!(end.idempotency_key, format!("voice-end:{key}"));
+        let end_meta = end.metadata.expect("end metadata");
+        for field in [
+            format!("\"sessionKey\":\"{key}\"").as_str(),
+            "\"startedAt\":\"2026-09-02T10:00:00.000Z\"",
+            "\"durationSeconds\":330",
+            "\"startKnown\":true",
+        ] {
+            assert!(end_meta.contains(field), "end carries expected field");
+        }
+
+        // End without a seen start: honest unknown, never a fabricated start.
+        let orphan = voice_ended_fact(
+            GUILD,
+            &input,
+            "guild:member:unknown-start:2026-09-02T10:05:30.000Z:voice-9",
+            "voice-9",
+            "2026-09-02T10:05:30.000Z",
+            None,
+            None,
+            verdict("eligible_human"),
+        );
+        let orphan_meta = orphan.metadata.expect("orphan end metadata");
+        assert!(
+            orphan_meta.contains("\"startedAt\":null")
+                && orphan_meta.contains("\"durationSeconds\":null")
+                && orphan_meta.contains("\"startKnown\":false"),
+            "orphan end is honestly unknown"
+        );
+        assert!(
+            !orphan_meta.contains("2026-09-02T10:00:00.000Z"),
+            "no start is invented"
+        );
+    }
+
+    #[test]
+    fn message_fact_carries_ids_and_verdict_without_content() {
+        // Idempotency shape plus content minimization: the row keys on the
+        // Discord message id, carries the classifier verdict, and stores no
+        // message text.
+        let input = actor("human-1");
+        let write = message_fact(MessageFactInput {
+            guild_id: GUILD,
+            message_id: "msg-1",
+            channel_id: "chan-9",
+            channel_class: "human",
+            actor: &input,
+            occurred_at: "2026-09-02T10:00:00.000Z",
+            content_length: None,
+            classification: verdict("eligible_human"),
+        });
+        assert_eq!(write.event_type, "message_created");
+        assert_eq!(write.source_event_id, "msg-1");
+        assert_eq!(write.idempotency_key, "discord-message:msg-1");
+        assert_eq!(write.source, "channel:chan-9");
+        assert_eq!(write.classification.classification, "eligible_human");
+        assert_eq!(write.classification.classifier_version, VERSION);
+        let metadata = write.metadata.expect("message metadata");
+        assert!(
+            metadata.contains("\"channelClass\":\"human\""),
+            "channel class travels: {metadata}"
+        );
+        assert!(
+            !metadata.contains("hello")
+                && !metadata.contains("\"content\":")
+                && !metadata.contains("contentLength"),
+            "no message content stored, and no length key when unmeasured: {metadata}"
+        );
+    }
+
+    /// Voice session start→end round-trip (TOG-19605): one session inserts a
+    /// start and an honestly-measured end, a duplicate start dedupes on
+    /// `voice-start:{session_key}`, and both stream heartbeats are present.
+    /// Routed to a `check.yml` ignored-db-runtime step.
+    #[tokio::test]
+    #[ignore = "needs a disposable test database; routed to a check.yml step"]
+    async fn voice_session_start_end_round_trip_is_idempotent() {
+        let Some((pool, schema)) = test_pool("tog_19605_voice")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping community_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let at = "2026-09-02T10:00:00.000Z";
+        let end_at = "2026-09-02T10:05:30.000Z";
+        let input = actor("human-1");
+        let (key, first) = record_voice_started_fact(
+            &pool,
+            GUILD,
+            &input,
+            "voice",
+            at,
+            None,
+            verdict("eligible_human"),
+        )
+        .await
+        .expect("first start inserts");
+        assert!(first, "first join inserts");
+        assert_eq!(key, format!("{GUILD}:human-1:{at}:voice"));
+        // Duplicate join redelivery: the same session key dedupes to false.
+        let (dup_key, retry) = record_voice_started_fact(
+            &pool,
+            GUILD,
+            &input,
+            "voice",
+            at,
+            None,
+            verdict("eligible_human"),
+        )
+        .await
+        .expect("duplicate start");
+        assert_eq!(dup_key, key, "duplicate delivery reuses the session key");
+        assert!(!retry, "duplicate join returns false");
+        // Honest duration math: 330 whole seconds for the 5.5-minute session.
+        let inserted = record_voice_ended_fact(
+            &pool,
+            GUILD,
+            &input,
+            &key,
+            "voice",
+            end_at,
+            Some(at),
+            Some(330),
+            verdict("eligible_human"),
+        )
+        .await
+        .expect("measured end inserts");
+        assert!(inserted, "measured end inserts");
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT event_type, source_event_id, metadata FROM community_facts
+             WHERE guild_id = $1 ORDER BY id",
+        )
+        .bind(GUILD)
+        .fetch_all(&pool)
+        .await
+        .expect("voice rows");
+        assert_eq!(rows.len(), 2, "one start plus one end, no double row");
+        assert_eq!(rows[0].0, "voice_session_started");
+        assert_eq!(rows[0].1, key);
+        assert_eq!(rows[1].0, "voice_session_ended");
+        assert_eq!(rows[1].1, key);
+        assert!(
+            rows[1].2.contains(&format!("\"sessionKey\":\"{key}\""))
+                && rows[1]
+                    .2
+                    .contains("\"startedAt\":\"2026-09-02T10:00:00.000Z\"")
+                && rows[1].2.contains("\"durationSeconds\":330")
+                && rows[1].2.contains("\"startKnown\":true"),
+            "end row carries honest measurement: {}",
+            rows[1].2
+        );
+        for stream in ["voice_session_started", "voice_session_ended"] {
+            mark_stream_coverage(&pool, GUILD, stream, WEEK_START, WEEK_END, GENERATED_AT)
+                .await
+                .expect("voice heartbeat");
+        }
+        let beats: Vec<(String,)> = sqlx::query_as(
+            "SELECT stream FROM community_stream_heartbeats WHERE guild_id = $1 AND stream LIKE 'voice_%' ORDER BY stream",
+        )
+        .bind(GUILD)
+        .fetch_all(&pool)
+        .await
+        .expect("voice heartbeats present");
+        assert_eq!(beats.len(), 2, "both voice stream heartbeats present");
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// Gateway `MessageCreate` round-trip (TOG-19603): one fact inserts, the
+    /// duplicate delivery returns `false`, and the stream heartbeat is
+    /// present. Routed to a `check.yml` ignored-db-runtime step.
+    #[tokio::test]
+    #[ignore = "needs a disposable test database; routed to a check.yml step"]
+    async fn message_created_fact_round_trip_is_idempotent() {
+        let Some((pool, schema)) = test_pool("tog_19603_message")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping community_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let at = "2026-09-02T10:00:00.000Z";
+        let input = actor("human-1");
+        let first = record_message_fact(
+            &pool,
+            GUILD,
+            "msg-dup",
+            "general",
+            "human",
+            &input,
+            at,
+            None,
+            verdict("eligible_human"),
+        )
+        .await
+        .expect("first insert");
+        assert!(first, "first delivery inserts");
+        let retry = record_message_fact(
+            &pool,
+            GUILD,
+            "msg-dup",
+            "general",
+            "human",
+            &input,
+            at,
+            None,
+            verdict("eligible_human"),
+        )
+        .await
+        .expect("duplicate insert");
+        assert!(!retry, "duplicate delivery returns false");
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM community_facts WHERE guild_id = $1")
+                .bind(GUILD)
+                .fetch_one(&pool)
+                .await
+                .expect("count facts");
+        assert_eq!(count.0, 1, "no double row");
+        mark_stream_coverage(
+            &pool,
+            GUILD,
+            "message_created",
+            WEEK_START,
+            WEEK_END,
+            GENERATED_AT,
+        )
+        .await
+        .expect("heartbeat");
+        let beats: Vec<(String,)> = sqlx::query_as(
+            "SELECT stream FROM community_stream_heartbeats WHERE guild_id = $1 AND stream = $2",
+        )
+        .bind(GUILD)
+        .bind("message_created")
+        .fetch_all(&pool)
+        .await
+        .expect("heartbeat present");
+        assert_eq!(beats.len(), 1, "stream heartbeat present");
         drop_schema(&pool, &schema).await;
     }
 }

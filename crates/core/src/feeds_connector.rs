@@ -28,7 +28,8 @@
 //! sees parsed XML. Concatenated gzip members all decode; stacked
 //! `Content-Encoding` layers are refused; non-ASCII policy headers
 //! (content-type, content-encoding, location) fail closed while unrelated
-//! headers stay lenient. The absolute deadline also governs the blocking
+//! headers stay lenient. Repeated `location` or `content-type` headers are
+//! refused as ambiguous instead of reading the first value. The absolute deadline also governs the blocking
 //! decode and is re-checked before success is returned.
 //!
 //! Tests inject [`FeedResolver`]/[`FeedConnector`] doubles; there is no seam
@@ -99,6 +100,76 @@ pub enum FeedConnectError {
     /// Server answered an encoding we did not advertise (e.g. `br`).
     #[error("feed body uses unsupported content encoding {0:?}")]
     UnsupportedEncoding(String),
+}
+
+impl FeedConnectError {
+    /// Bounded `error_class` for `two_bot_feed_fetch_errors_total` (TOG-28423).
+    /// Policy errors delegate to [`FetchError::metrics_error_class`]; every
+    /// other variant maps to a member of
+    /// [`crate::metrics::FEED_FETCH_ERROR_CLASSES`]. Transport strings,
+    /// encodings and io errors never become labels.
+    pub fn metrics_error_class(&self) -> &'static str {
+        match self {
+            Self::Policy(policy) => policy.metrics_error_class(),
+            Self::Resolve(_) => "resolve",
+            Self::Transport(_) => "transport",
+            Self::Deadline(_) => "deadline",
+            Self::UnsupportedEncoding(_) => "unsupported_encoding",
+        }
+    }
+
+    /// Bounded `outcome` for `two_bot_feed_fetches_total` (TOG-28423).
+    /// Policy outcomes delegate to [`FetchError::metrics_outcome`]; every
+    /// other connector failure is a generic failure.
+    pub fn metrics_outcome(&self) -> &'static str {
+        match self {
+            Self::Policy(policy) => policy.metrics_outcome(),
+            Self::Resolve(_)
+            | Self::Transport(_)
+            | Self::Deadline(_)
+            | Self::UnsupportedEncoding(_) => "failure",
+        }
+    }
+}
+
+/// Bounded outcome for one fetch result (TOG-28423): `success` for a 2xx
+/// fetch, the error's outcome for an `Err`, and `failure` for a completed
+/// non-2xx fetch. Per-outcome, never per-feed.
+pub fn feed_fetch_outcome(result: &Result<FetchedFeed, FeedConnectError>) -> &'static str {
+    match result {
+        Ok(fetched) if fetched.status.is_success() => "success",
+        Ok(_) => "failure",
+        Err(error) => error.metrics_outcome(),
+    }
+}
+
+/// Bounded error class for one fetch result, or `None` on success (TOG-28423).
+/// A completed non-2xx fetch reports `http_error`; successes record no error
+/// series. The returned value is always a member of
+/// [`crate::metrics::FEED_FETCH_ERROR_CLASSES`].
+pub fn feed_fetch_error_class(
+    result: &Result<FetchedFeed, FeedConnectError>,
+) -> Option<&'static str> {
+    match result {
+        Ok(fetched) if fetched.status.is_success() => None,
+        Ok(_) => Some("http_error"),
+        Err(error) => Some(error.metrics_error_class()),
+    }
+}
+
+/// Record one fetch against the existing metrics registry (TOG-28423): exactly
+/// one `two_bot_feed_fetches_total{outcome}` increment per call, plus exactly
+/// one `two_bot_feed_fetch_errors_total{error_class}` increment on failure.
+/// No source URL, host, header or body reaches a label; cardinality is the
+/// fixed outcome × error-class vocabulary.
+pub fn record_feed_fetch(
+    metrics: &crate::metrics::Metrics,
+    result: &Result<FetchedFeed, FeedConnectError>,
+) {
+    metrics.feed_fetch(feed_fetch_outcome(result));
+    if let Some(error_class) = feed_fetch_error_class(result) {
+        metrics.feed_fetch_error(error_class);
+    }
 }
 
 /// One decompressed-or-raw response body chunk, or a transport error that
@@ -367,16 +438,31 @@ async fn read_wire(mut stream: FeedBodyStream) -> Result<Vec<u8>, FeedConnectErr
 /// Headers that drive policy: content-type, content-encoding, redirect
 /// location. Non-ASCII bytes in these are a policy refusal — silently mapping
 /// them to empty would turn a declared `br` into `identity`, drop the
-/// content-type gate, or join a garbage redirect. The caller picks the
-/// matching [`FetchError`] so a bad Location reads as a refused redirect,
-/// not a bad body. All other headers stay lenient.
+/// content-type gate, or join a garbage redirect. Repeated policy headers are
+/// also refused: reading only the first value would silently ignore a
+/// conflicting second one, so any duplicate `location` or `content-type`
+/// (matched case-insensitively) fails closed before redirect or body
+/// processing. The caller picks the matching [`FetchError`] so a bad Location
+/// reads as a refused redirect, not a bad body. All other headers stay
+/// lenient.
 impl FeedResponse {
     fn policy_header(
         &self,
         name: &str,
         refusal: FetchError,
     ) -> Result<Option<&str>, FeedConnectError> {
-        self.header(name)
+        let mut found: Option<&str> = None;
+        for (header_name, value) in &self.headers {
+            if header_name.eq_ignore_ascii_case(name) {
+                if found.is_some() {
+                    // Ambiguous: two values for one policy header. Refuse
+                    // rather than reading the first and ignoring the rest.
+                    return Err(FeedConnectError::Policy(refusal));
+                }
+                found = Some(value.as_str());
+            }
+        }
+        found
             .map(|value| {
                 if value.is_ascii() {
                     Ok(value)

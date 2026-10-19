@@ -1,0 +1,8 @@
+# Commits release-please cannot parse and that are accepted for the next release.
+# One full 40-character SHA per line, then the reason. See docs/releases.md,
+# "Unparseable commits". An entry means the change is handled by hand in the
+# release notes; remove it once the release that carries the note has shipped.
+#
+# feat(rsvp): wire commands through shared interaction runtime (#67): dropped
+# from the generated 0.4.0 notes; the release owner adds its note by hand.
+271703cc081bde4972db68199c7de46d663b7cc5 feat(rsvp) #67 dropped from the generated 0.4.0 notes

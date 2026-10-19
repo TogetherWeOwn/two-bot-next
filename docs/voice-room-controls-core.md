@@ -55,9 +55,9 @@ through `/access restrict` like every other voice command.
 
 The parent still owns bitrate preferences and their persistence, the `/name`
 panel with template expansion and the unique-names check, `/private`,
-`/public` and the Join-channel wiring, and the registry publish of the
-`/limit` and `/unlimit` definitions (they are in `voice_commands()` but not yet
-published to a guild). No live channel update is performed or verified by this
+`/public` and the Join-channel wiring. The `/limit` and `/unlimit` definitions
+publish through the normal registry sync when the voice gate is on (see above).
+No live channel update is performed or verified by this
 component's tests.
 
 `/name` is wired: see [`voice-name-panel.md`](voice-name-panel.md). `/private`
@@ -65,9 +65,12 @@ and `/public` are wired with the Join channel: see
 [`voice-private-core.md`](voice-private-core.md#runtime-wiring-private-and-public).
 The join-request buttons are wired too: see
 [`voice-private-core.md`](voice-private-core.md#runtime-wiring-join-requests).
-`/limit` and `/unlimit` are runtime-wired as described above but not yet
-guild-published (see the residual parent integration note); the bitrate
-preference is not wired.
+`/limit` and `/unlimit` are runtime-wired as described above, defined in
+`voice_commands()` (`crates/core/src/voice_rooms.rs:1646-1660`), merged into
+the publish set when the voice gate is on (`crates/core/src/router.rs:717-719`),
+and synced to the registry on ready
+(`crates/bot/src/command_runtime.rs:1009-1020`); the bitrate preference is not
+wired. Re-checked at `86a6668a7`.
 
 ## Hermetic verification
 

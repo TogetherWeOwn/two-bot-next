@@ -68,7 +68,10 @@ The tool never falls back to an application `DATABASE_URL`, `.pgpass`, or anothe
 credential after failure. Inherited libpq connection settings (`PGHOST`, `PGUSER`,
 `PGPASSWORD`, `PGOPTIONS`, client keys, etc.) are refused. Each explicit URL must
 include host, username and database; omitted password means empty password.
-Only the `sslmode` URL query parameter is accepted. Database errors and URLs are
+Only the `sslmode` URL query parameter is accepted. TLS policy
+(`docs/database-tls.md`): unset `TWO_DATABASE_TLS` means `required` (remote
+host plus TLS `sslmode`); disposable `agent-testdb` runs need
+`TWO_DATABASE_TLS=local-only`. Database errors and URLs are
 not printed. Protect reports: samples contain data identifiers.
 
 ```sh
@@ -139,6 +142,7 @@ cargo fmt --all -- --check
 python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib legacy_
 python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --bin legacy_verify
 TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test \
+  TWO_DATABASE_TLS=local-only \
   python3 scripts/cargo_cache.py run -- test -p two-bot-cutover \
   --test legacy_verify_db -- --ignored
 python3 scripts/cargo_cache.py run -- clippy -p two-bot-cutover --all-targets -- -D warnings

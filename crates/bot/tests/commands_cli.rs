@@ -341,6 +341,47 @@ async fn real_opt_in_boot_fetches_matching_registry_without_put_before_local_db_
 }
 
 #[tokio::test]
+async fn opt_in_boot_with_voice_on_keeps_the_voice_set_in_the_put() {
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, matching_registry()),
+            ScriptedResponse::json(200, matching_registry()),
+        ],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let mut command = bot(&mock);
+    credentials(&mut command);
+    command
+        .env("TWO_COMMANDS_PUBLISH_ON_BOOT", "1")
+        .env("TWO_VOICE", "1")
+        .env("DATABASE_URL", INVALID_DB)
+        .env("RUST_LOG", "two_bot=info");
+    // The scripted PUT answer is not a full receipt, so boot exits at the sync;
+    // the request body is what this test pins.
+    let output = run(command).await;
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2, "GET shows drift, so one PUT follows");
+    assert_get(&requests[0]);
+    assert_eq!(requests[1].method, "PUT");
+    let body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let names: Vec<_> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|command| command["name"].as_str().unwrap().to_owned())
+        .collect();
+    // The early sync runs before the voice sink exists. Dropping the voice set
+    // here would delete and recreate it on every healthy restart.
+    for definition in two_bot_core::voice_rooms::voice_commands() {
+        assert!(names.contains(&definition.name), "{}", definition.name);
+    }
+    assert!(!names.iter().any(|name| name == "templateassistant"));
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn boot_without_opt_in_sends_no_registry_requests() {
     let mock = MockRest::start(vec![], ScriptedResponse::status(403)).await;
     let mut command = bot(&mock);

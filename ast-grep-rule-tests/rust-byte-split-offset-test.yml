@@ -1,0 +1,5 @@
+id: rust-byte-split-offset
+valid:
+- 'fn parse(digits: &str) { let parts = digits.get(..digits.len().saturating_sub(2)); }'
+invalid:
+- 'fn parse(digits: &str) { let parts = digits.split_at(digits.len() - 2); }'

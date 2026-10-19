@@ -16,11 +16,10 @@ const metricsMd = read("docs/metrics.md");
 const gatewayFailureRs = read("crates/bot/src/gateway_failure.rs");
 const workerIndex = read("wrangler/src/index.ts");
 
-/** Heading-slug index for one checked-in doc (mirrors alert-rules.test.ts). */
-function docAnchors(doc: string): Set<string> {
-  const text = read(`docs/${doc}`);
+/** GitHub-style heading slugs for a doc's text (mirrors alert-rules.test.ts). */
+function headingAnchors(text: string): Set<string> {
   return new Set([...text.matchAll(/^#+ (.+)$/gm)].map((m) =>
-    m[1]!.toLowerCase().replace(/[^a-z0-9 -]/g, "").replace(/ /g, "-")));
+    m[1]!.toLowerCase().replace(/[^a-z0-9 _-]/g, "").replace(/ /g, "-")));
 }
 
 /** `Self::Variant => "token"` arms of `FailureClass::as_str`. */
@@ -94,11 +93,32 @@ test("a missing worker emission fails the catalog", () => {
   assert.ok(gaps.some((g) => g.includes("wrangler/src/index.ts")));
 });
 
-test("the catalog entry links to an existing startup-diagnostics heading", () => {
-  const slugs = docAnchors("startup-diagnostics.md");
-  const links = [...metricsMd.matchAll(/startup-diagnostics\.md#([A-Za-z0-9-]+)/g)].map((m) => m[1]!);
-  assert.ok(links.length > 0, "docs/metrics.md: no startup-diagnostics.md#anchor link");
-  for (const anchor of links) {
-    assert.ok(slugs.has(anchor), `docs/metrics.md: missing startup-diagnostics heading for #${anchor}`);
+const DIAGNOSTIC_DOCS = ["metrics.md", "worker-gateway-failure-alerts.md"] as const;
+
+/** Anchors of every `startup-diagnostics.md#…` link in a doc's text. */
+function diagnosticAnchors(text: string): string[] {
+  return [...text.matchAll(/startup-diagnostics\.md#([A-Za-z0-9_-]+)/g)].map((m) => m[1]!);
+}
+
+function brokenAnchors(anchors: readonly string[], slugs: ReadonlySet<string>): string[] {
+  return anchors.filter((anchor) => !slugs.has(anchor));
+}
+
+test("the diagnostic-doc links resolve to an existing startup-diagnostics heading", () => {
+  const slugs = headingAnchors(read("docs/startup-diagnostics.md"));
+  for (const doc of DIAGNOSTIC_DOCS) {
+    const anchors = diagnosticAnchors(read(`docs/${doc}`));
+    assert.ok(anchors.length > 0, `docs/${doc}: no startup-diagnostics.md#anchor link`);
+    assert.deepEqual(brokenAnchors(anchors, slugs), [], `docs/${doc}: broken startup-diagnostics.md#anchor link`);
   }
+});
+
+test("a startup-diagnostics link that drops the underscore is reported, not skipped", () => {
+  const slugs = headingAnchors("## Self-diagnosing gateway failures (`/readyz` `gateway_failure`)\n");
+  const stale = "[startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gatewayfailure)";
+  const fixed = "[startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gateway_failure)";
+  assert.deepEqual(diagnosticAnchors(stale), ["self-diagnosing-gateway-failures-readyz-gatewayfailure"]);
+  assert.deepEqual(brokenAnchors(diagnosticAnchors(stale), slugs), ["self-diagnosing-gateway-failures-readyz-gatewayfailure"]);
+  assert.deepEqual(diagnosticAnchors(fixed), ["self-diagnosing-gateway-failures-readyz-gateway_failure"]);
+  assert.deepEqual(brokenAnchors(diagnosticAnchors(fixed), slugs), []);
 });

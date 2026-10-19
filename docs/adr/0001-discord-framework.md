@@ -104,9 +104,10 @@ Neither framework changes the keepalive requirement below.
 Framework-neutral, recorded so the choice is auditable:
 
 - Both candidates idle at <20% of `lite`'s 256 MiB; **target `lite`, fall
-  back to `basic` only if measured RSS exceeds ~200 MiB** (same gate as
-  TOG-9408). CPU at this load is noise (<2% of 1/16 vCPU — inside the
-  included 375 vCPU-min).
+  back to `basic` only if measured RSS exceeds ~200 MiB** as a separate
+  placement decision, not a B2 soak criterion. B2 requires flat memory and has
+  no accepted numeric RSS threshold. CPU at this load is noise (<2% of 1/16
+  vCPU — inside the included 375 vCPU-min).
 - **Keepalive risk ([TOG-9408](/TOG/issues/TOG-9408) caveat 1):** Container
   billing/sleep is driven by *inbound* requests; the gateway is an
   *outbound* WebSocket that generates no inbound traffic. An always-on bot
@@ -190,7 +191,7 @@ proves the pattern once.
 ## Feature-port checklist (sliced into TWO Bot Next cards)
 
 - [ ] S1 scaffold: Cargo workspace, `check` CI (fmt/clippy/test), Dockerfile, wrangler Container + DO-alarm keepalive, secrets via Worker env
-- [ ] S2 measured prototype: gateway connect + one slash command against `tools/mock-discord`, RSS/CPU recorded; **gate: RSS <200 MiB confirms `lite`**
+- [ ] S2 measured prototype: gateway connect + one slash command against `tools/mock-discord`, RSS/CPU recorded; **separate placement gate: RSS <200 MiB supports `lite`, not B2 soak acceptance**
 - [ ] S3 gateway + intents + funnel pipeline (join/leave/gate-clear, message milestones, voice sessions, invite attribution)
 - [ ] S4 commands: leveling/rank, onboarding welcome, self-roles, tickets, moderation/containment/anti-nuke, announcements/automations/temp-voice
 - [ ] S5 jobs + audit sink + moderation-audit MAC + restart session persistence
@@ -201,7 +202,8 @@ proves the pattern once.
 - Prototype must run against **mock Discord + agent-testdb only**; never
   the production guild or tokens.
 - RSS/CPU/10x-load figures above are estimates; S2 measurement confirms or
-  reopens the `lite` placement (not the framework choice — both fit).
+  reopens the separate `lite` placement decision (not B2 soak acceptance or
+  the framework choice — both candidates fit).
 - Revisit triggers: twilight archived/inactive >6 months; Discord API
   change twilight doesn't cover; measured RSS forcing `basic` *and* a
   serenity port proving materially smaller (unlikely); voice-audio feature

@@ -9,7 +9,13 @@
 //! [`Metrics::default`] so parallel tests never share state.
 
 use two_bot_core::metrics::{
-    Metrics, REST_ROUTES, VOICE_DEAD_ACTIONS, VOICE_OPERATIONS, VOICE_RECONCILE_ACTIONS,
+    Metrics, REST_ROUTES, VOICE_DEAD_ACTIONS, VOICE_OPERATIONS, VOICE_OUTCOMES,
+    VOICE_RECONCILE_ACTIONS, VOICE_VOTE_KICK_OUTCOMES,
+};
+use two_bot_core::voice_vote_kick::VoteKickError;
+use two_bot_core::voice_vote_kick_audit::{
+    refusal_outcome, EnforcementOutcome, OUTCOME_EVIDENCE_UNAVAILABLE, OUTCOME_NOT_A_ROOM,
+    OUTCOME_STARTED,
 };
 
 /// Every series line for one metric family, in render order.
@@ -35,7 +41,7 @@ fn series_for(text: &str, family: &str) -> Vec<(String, u64)> {
 /// The cutover health queries name exact `op`/`outcome` pairs; every
 /// emission site must survive to exposition. The grid below mirrors the
 /// worker's call sites: `success` for create/move/delete, `category_full`
-/// for create, `discord` for create/move/delete, `persistence` for
+/// and `refused` for create, `discord` for create/move/delete, `persistence` for
 /// create/delete, and `cancelled` for create/delete.
 #[test]
 fn full_operation_outcome_grid_renders_every_cutover_series() {
@@ -48,6 +54,7 @@ fn full_operation_outcome_grid_renders_every_cutover_series() {
                 "category_full",
                 "discord",
                 "persistence",
+                "refused",
                 "cancelled",
             ],
         ),
@@ -64,8 +71,8 @@ fn full_operation_outcome_grid_renders_every_cutover_series() {
     }
     let text = metrics.render(None);
     let series = series_for(&text, "two_bot_voice_operations_total{");
-    // Fixed cardinality: 3 ops x 5 outcomes, zeros included.
-    assert_eq!(series.len(), VOICE_OPERATIONS.len() * 5);
+    // Fixed cardinality: 3 ops x 6 outcomes, zeros included.
+    assert_eq!(series.len(), VOICE_OPERATIONS.len() * VOICE_OUTCOMES.len());
     for (op, outcomes) in grid {
         for outcome in *outcomes {
             let line =
@@ -88,7 +95,7 @@ fn repeated_outcomes_accumulate_without_new_series() {
     }
     let text = metrics.render(None);
     let series = series_for(&text, "two_bot_voice_operations_total{");
-    assert_eq!(series.len(), VOICE_OPERATIONS.len() * 5);
+    assert_eq!(series.len(), VOICE_OPERATIONS.len() * VOICE_OUTCOMES.len());
     assert!(text.contains("two_bot_voice_operations_total{op=\"delete\",outcome=\"success\"} 7\n"));
 }
 
@@ -167,6 +174,23 @@ fn orphans_accumulate_until_manual_cleanup() {
         .contains("two_bot_voice_orphans_total 2\n"));
 }
 
+#[test]
+fn voice_name_skip_outcomes_are_distinct_and_bounded() {
+    let metrics = Metrics::default();
+    for reason in [
+        "rename_room_gone",
+        "rename_superseded",
+        "rename_already_applied",
+    ] {
+        assert!(two_bot_core::metrics::VOICE_NAME_OUTCOMES.contains(&reason));
+        metrics.voice_name(reason);
+        assert!(metrics.render(None).contains(&format!(
+            "two_bot_voice_names_total{{outcome=\"{reason}\"}} 1\n"
+        )));
+    }
+    assert!(!two_bot_core::metrics::VOICE_NAME_OUTCOMES.contains(&"rename_stale"));
+}
+
 // ---- (5) REST outcomes under the voice templates ----
 
 /// The RoomHttp send path records one `rest_response` per wire send; the
@@ -178,6 +202,7 @@ fn voice_rest_outcomes_land_under_allowlisted_templates() {
         "POST /guilds/:guild/channels",
         "DELETE /channels/:channel",
         "PATCH /guilds/:guild/members/:member",
+        "PUT /channels/:channel/voice-status",
     ] {
         assert!(
             REST_ROUTES.contains(&template),
@@ -192,6 +217,8 @@ fn voice_rest_outcomes_land_under_allowlisted_templates() {
         ("DELETE /channels/:channel", Some(403), "4xx"),
         ("DELETE /channels/:channel", Some(503), "5xx"),
         ("PATCH /guilds/:guild/members/:member", None, "transport"),
+        ("PUT /channels/:channel/voice-status", Some(200), "2xx"),
+        ("PUT /channels/:channel/voice-status", Some(429), "429"),
     ];
     for (route, status, _) in exchanges {
         metrics.rest_response(route, *status);
@@ -202,4 +229,139 @@ fn voice_rest_outcomes_land_under_allowlisted_templates() {
             "two_bot_rest_requests_total{{route=\"{route}\",result=\"{result}\"}} 1\n"
         )));
     }
+}
+
+// ---- (6) vote-kick starts, refusals and enforcements (M4.30) ----
+
+const VOTE_KICK_REFUSALS: [VoteKickError; 15] = [
+    VoteKickError::InitiatorNotOccupant,
+    VoteKickError::TargetNotOccupant,
+    VoteKickError::SelfTarget,
+    VoteKickError::ProtectedTarget,
+    VoteKickError::PrivilegedTarget,
+    VoteKickError::AuthorityUnavailable,
+    VoteKickError::ActiveVoteExists,
+    VoteKickError::Cooldown,
+    VoteKickError::InitiatorLimited,
+    VoteKickError::ReusedVoteId,
+    VoteKickError::UnknownVote,
+    VoteKickError::WrongVoteBoundary,
+    VoteKickError::IneligibleVoter,
+    VoteKickError::RepeatedVote,
+    VoteKickError::InvalidTime,
+];
+
+/// Every audit outcome the voice-kick paths count must be an allowlisted
+/// metric outcome: one `started`, every refusal code (including `cooldown`
+/// and `initiator_limited` plus the two worker-level refusals) and every
+/// terminal enforcement code. Vote results stay audit-only.
+#[test]
+fn vote_kick_audit_outcomes_are_all_metric_covered() {
+    let mut expected = vec![
+        OUTCOME_STARTED,
+        OUTCOME_EVIDENCE_UNAVAILABLE,
+        OUTCOME_NOT_A_ROOM,
+    ];
+    expected.extend(VOTE_KICK_REFUSALS.map(refusal_outcome));
+    expected.extend(EnforcementOutcome::ALL.map(|outcome| outcome.as_str()));
+    for outcome in &expected {
+        assert!(
+            VOICE_VOTE_KICK_OUTCOMES.contains(outcome),
+            "vote-kick outcome missing from metric allowlist: {outcome}"
+        );
+    }
+    assert_eq!(
+        VOICE_VOTE_KICK_OUTCOMES.last(),
+        Some(&"other"),
+        "vote-kick family lost its `other` collapse trapdoor"
+    );
+    // No audit code smuggles a guild-kick/ban word into a label.
+    for outcome in &expected {
+        for banned in ["kick", "ban", "token"] {
+            assert!(
+                !outcome.contains(banned),
+                "{outcome} names {banned}; enforcement vocabulary stays room-scoped"
+            );
+        }
+    }
+}
+
+/// The full vote-kick outcome grid renders one series per allowlisted
+/// outcome, with an initiator-spam wave (`cooldown` / `initiator_limited`)
+/// landing on its own series.
+#[test]
+fn vote_kick_starts_refusals_and_enforcements_render_every_series() {
+    let metrics = Metrics::default();
+    for outcome in VOICE_VOTE_KICK_OUTCOMES {
+        if *outcome != "other" {
+            metrics.voice_vote_kick(outcome);
+        }
+    }
+    // An initiator-spam wave is two more refusals, not new series.
+    metrics.voice_vote_kick("cooldown");
+    metrics.voice_vote_kick("initiator_limited");
+    let text = metrics.render(None);
+    let series = series_for(&text, "two_bot_voice_vote_kick_total{");
+    assert_eq!(series.len(), VOICE_VOTE_KICK_OUTCOMES.len());
+    assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"started\"} 1\n"));
+    assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"cooldown\"} 2\n"));
+    assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"initiator_limited\"} 2\n"));
+    assert!(text.contains(
+        "two_bot_voice_vote_kick_total{outcome=\"connect_denied_and_disconnected\"} 1\n"
+    ));
+    assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"gave_up\"} 1\n"));
+    assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"other\"} 0\n"));
+}
+
+/// Docs-claims-subset conformance (M4.3/M4.23 pattern): `docs/metrics.md`
+/// names exactly the vote-kick outcomes exposition renders. The allowlist
+/// bullet beside the voice rows claims the set; this test fails when the doc
+/// invents a series or the code ships one the doc does not name.
+#[test]
+fn vote_kick_docs_claims_are_a_subset_of_exposition() {
+    let docs = include_str!("../../../docs/metrics.md");
+    assert!(
+        docs.contains("two_bot_voice_vote_kick_total{outcome}"),
+        "docs/metrics.md must document the vote-kick counter beside the voice rows"
+    );
+    for outcome in VOICE_VOTE_KICK_OUTCOMES {
+        assert!(
+            docs.contains(outcome),
+            "docs/metrics.md must name vote-kick outcome `{outcome}` in the row or allowlist"
+        );
+    }
+    let text = Metrics::default().render(None);
+    for outcome in VOICE_VOTE_KICK_OUTCOMES {
+        assert!(
+            text.contains(&format!(
+                "two_bot_voice_vote_kick_total{{outcome=\"{outcome}\"}} 0\n"
+            )),
+            "exposition must render allowlisted vote-kick outcome `{outcome}` at zero"
+        );
+    }
+    // Reverse direction: the allowlist bullet (up to its source citation)
+    // must not invent an outcome. Every backticked code it names is the
+    // series, the label, or an allowlisted outcome — nothing else.
+    let anchor = "- `two_bot_voice_vote_kick_total{outcome}`";
+    let start = docs
+        .find(anchor)
+        .expect("docs must carry the vote-kick allowlist bullet");
+    let tail = &docs[start..];
+    let end = tail
+        .find("`crates/core/src/metrics.rs`")
+        .expect("vote-kick allowlist bullet must cite its source");
+    let mut claimed: Vec<&str> = tail[..end]
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|token| !token.contains('{') && *token != "outcome")
+        .collect();
+    claimed.sort_unstable();
+    claimed.dedup();
+    let mut expected = VOICE_VOTE_KICK_OUTCOMES.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        claimed, expected,
+        "vote-kick allowlist bullet must name exactly the exposition outcomes"
+    );
 }

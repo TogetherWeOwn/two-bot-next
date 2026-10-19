@@ -26,6 +26,7 @@ fn runtime(mock: &MockRest) -> (Arc<CommandRuntime>, Arc<TicketRuntime>) {
                 staff_role_id: "300".into(),
                 cooldown_seconds: 15,
             },
+            std::collections::HashMap::new(),
         )
         .unwrap(),
     );
@@ -83,6 +84,22 @@ async fn resumed_without_ready_initializes_bot_user_and_wakes_tickets_independen
         .iter()
         .filter(|r| r.method == "GET")
         .all(|r| { r.path == "/api/v10/users/@me" || r.path == "/api/v10/applications/@me" }));
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn ordered_rsvp_dispatch_preserves_ticket_resume_without_duplicate_registry() {
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, json!({"id":"400","bot":true})),
+    )
+    .await;
+    let (runtime, tickets) = runtime(&mock);
+    runtime.dispatch_remaining(&Event::Resumed);
+    wait_for(|| tickets.readiness_for_test() == (400, 1)).await;
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(mock.requests()[0].path, "/api/v10/users/@me");
+    assert!(!*runtime.registry_synced.lock().await);
     mock.shutdown().await;
 }
 

@@ -77,8 +77,11 @@ fn render_text(owed: &OwedReleases, overridden: bool, gates: &DisableGates) {
 }
 
 pub async fn dispatch(args: &[String]) -> i32 {
+    if args.first().is_some_and(|arg| arg == "release-channel") {
+        return crate::moderation_release_cli::dispatch(&args[1..]).await;
+    }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print!("{USAGE}");
+        print!("{USAGE}{}", crate::moderation_release_cli::USAGE);
         return 0;
     }
     let mut json = false;

@@ -1,6 +1,6 @@
 [package]
 name = "two-bot"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,13 +16,17 @@ path = "src/main.rs"
 # path): cargo-deny `wildcards = "deny"` rejects version-less deps, and the
 # version pins the API contract between crates at a glance.
 [dependencies]
-two-bot-core = { version = "0.3.0", path = "../core", features = ["db"] }
-two-bot-discord = { version = "0.3.0", path = "../discord", features = ["db"] }
-two-bot-store = { version = "0.3.0", path = "../store" }
-two-bot-cutover = { version = "0.3.0", path = "../cutover" }
+two-bot-core = { version = "0.4.0", path = "../core", features = ["db"] }
+two-bot-discord = { version = "0.4.0", path = "../discord", features = ["db"] }
+two-bot-store = { version = "0.4.0", path = "../store" }
+two-bot-cutover = { version = "0.4.0", path = "../cutover" }
 # Relay/audit ids: 16 CSPRNG bytes hex-encoded (same shape as core's
 # internal_actions nonces).
 hex = { workspace = true }
+# ops_backfill verifies the existing listener's path-bound HMAC signatures
+# (same envelope as the internal-action receiver, bound to GET /ops/backfill/progress).
+hmac = { workspace = true }
+sha2 = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 time = { workspace = true }
@@ -38,6 +42,7 @@ tokio = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
+tracing-log = { workspace = true }
 tracing-subscriber = { workspace = true }
 twilight-cache-inmemory = { workspace = true }
 twilight-gateway = { workspace = true }
@@ -45,9 +50,13 @@ twilight-http = { workspace = true }
 twilight-model = { workspace = true }
 
 [dev-dependencies]
-two-bot-discord = { version = "0.3.0", path = "../discord", features = ["test-support"] }
+two-bot-discord = { version = "0.4.0", path = "../discord", features = ["test-support"] }
 # The shared loopback Discord fixture uses SinkExt only in integration tests.
 futures-util = { workspace = true, features = ["sink"] }
-two-bot-testsupport = { version = "0.3.0", path = "../testsupport" }
+two-bot-testsupport = { version = "0.4.0", path = "../testsupport" }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-websockets = { workspace = true }
+# ops_backfill acceptance mints the existing listener's path-bound HMAC
+# signatures in-test (test-only signing; versions already locked via core).
+hmac = { workspace = true }
+sha2 = { workspace = true }

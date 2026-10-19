@@ -1,7 +1,12 @@
 use super::*;
 use tokio::sync::Notify;
-use twilight_model::gateway::payload::incoming::{GuildCreate, Ready, VoiceStateUpdate};
+use twilight_model::gateway::payload::incoming::{
+    ChannelCreate, ChannelDelete, ChannelUpdate, GuildCreate, Ready, VoiceStateUpdate,
+};
 use two_bot_discord::MemPipeline;
+
+#[path = "voice_actor_init_recovery_tests.rs"]
+mod init_recovery;
 
 impl RoomPersistence for Arc<Store> {
     async fn creators(&self, guild: u64) -> Result<Vec<CreatorChannel>, StoreError> {
@@ -73,6 +78,41 @@ impl RoomPersistence for Arc<Store> {
     }
     async fn forget(&self, guild: u64, channel: u64) -> Result<(), StoreError> {
         self.as_ref().forget(guild, channel).await
+    }
+    async fn claim_create(
+        &self,
+        guild: u64,
+        user: u64,
+        leaving: &[u64],
+        config: &CreateAdmissionConfig,
+        now_secs: i64,
+    ) -> Result<CreateClaim, StoreError> {
+        self.as_ref()
+            .claim_create(guild, user, leaving, config, now_secs)
+            .await
+    }
+    async fn bind_create_channel(
+        &self,
+        guild: u64,
+        reservation_id: &str,
+        channel: u64,
+    ) -> Result<(), StoreError> {
+        self.as_ref()
+            .bind_create_channel(guild, reservation_id, channel)
+            .await
+    }
+    async fn orphaned_create_channels(&self, guild: u64) -> Result<Vec<(String, u64)>, StoreError> {
+        self.as_ref().orphaned_create_channels(guild).await
+    }
+    async fn persist_create(
+        &self,
+        reservation_id: &str,
+        room: &VoiceRoom,
+    ) -> Result<(), StoreError> {
+        self.as_ref().persist_create(reservation_id, room).await
+    }
+    async fn settle_create(&self, reservation_id: &str) -> Result<bool, StoreError> {
+        self.as_ref().settle_create(reservation_id).await
     }
     async fn config_snapshot(&self, guild: u64) -> Result<VoiceConfiguration, StoreError> {
         self.as_ref().config_snapshot(guild).await
@@ -298,6 +338,33 @@ fn voice_event(member: u64, channel: Option<u64>) -> Event {
         "member": {"user": {"id": member.to_string(), "username": "human", "discriminator": "0"},
             "roles": [], "deaf": false, "mute": false, "flags": 0, "joined_at": NOW}
     })).unwrap()))
+}
+
+fn game_activity_delta(
+    member_id: u64,
+    game: Option<&str>,
+    observed_at_ms: i64,
+) -> two_bot_core::game_activity::PresenceDelta {
+    let activities = game
+        .into_iter()
+        .map(|name| two_bot_core::game_activity::ActivitySnapshot {
+            activity_type: two_bot_core::game_activity::ActivityType::Playing,
+            name: name.to_owned(),
+            application_id: None,
+            details: None,
+            state: None,
+            party_size: None,
+            assets: false,
+            button_labels: Vec::new(),
+            button_urls: Vec::new(),
+            stream_url: None,
+        })
+        .collect();
+    two_bot_core::game_activity::PresenceDelta {
+        user_key: member_id.to_string(),
+        observed_at_ms,
+        activities,
+    }
 }
 
 fn feed(runtime: &Runtime, pipeline: &MemPipeline, event: Event) {
@@ -544,4 +611,471 @@ async fn bot_member_role_assignment_resumes_room_and_removal_revokes_access() {
     assert!(!can_manage_room(
         actor.live.inner.read().unwrap().permissions(GUILD, CREATOR)
     ));
+}
+
+#[tokio::test]
+async fn poisoned_live_lock_does_not_restart_the_gateway() {
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    let actor = runtime.live_actor(GUILD).unwrap();
+    // Poison the room lock from another thread: panic while holding the
+    // write guard, as a crashed holder would.
+    let live = actor.live.clone();
+    std::thread::spawn(move || {
+        let _guard = live.write_state();
+        panic!("poison the live voice lock for test");
+    })
+    .join()
+    .expect_err("poisoning thread must panic");
+    // The dispatch worker (`gateway.rs` `voice.handle(...)`) still returns.
+    feed(&runtime, &pipeline, voice_event(MEMBER, Some(CREATOR)));
+    feed(&runtime, &pipeline, voice_event(MEMBER, None));
+    // The recovered lock still serves reads and writes.
+    assert!(actor.live.read_state().ready);
+    actor.live.disconnect();
+    assert!(!actor.live.read_state().ready);
+    status(&runtime).await;
+}
+
+#[tokio::test]
+async fn actor_load_failure_bumps_counter_and_arms_warn_throttle() {
+    let series = "two_bot_db_errors_total{op=\"other\"} ";
+    let before = global_series(series);
+    observe_voice_actor_load_failure(GUILD, &StoreError::Unavailable);
+    observe_voice_actor_load_failure(GUILD, &StoreError::Unavailable);
+    // Global counters are monotonic and shared with parallel tests, so assert
+    // a lower bound, not an exact value (see `global_series` convention).
+    assert!(
+        global_series(series) >= before + 2,
+        "two load failures bump the `other` counter"
+    );
+    // The first failure arms the throttle timestamp; the immediate second
+    // call stays silent. (Warn text itself is covered by the observability
+    // event catalog and its conformance allowlist entry.)
+    assert_ne!(
+        super::super::VOICE_ACTOR_LOAD_WARN_LAST_SECS.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "first failure arms the warn throttle"
+    );
+}
+
+#[tokio::test]
+async fn guild_create_closes_open_voice_span_for_absent_member() {
+    const MIN: i64 = 60_000;
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    let collector = runtime.game_activity_collector();
+    let now = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+    let start = now - 10 * MIN;
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, Some("Apex"), start));
+    collector.observe_join(GUILD, MEMBER, start);
+
+    feed(&runtime, &pipeline, guild_event(&[], permissions()));
+
+    let stop = now + 10 * MIN;
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, None, stop));
+    collector.observe_leave(GUILD, MEMBER, stop);
+    let rows = collector.flush(GUILD, 15 * MIN, stop);
+    let apex = rows
+        .iter()
+        .find(|row| row.game.as_deref() == Some("Apex"))
+        .expect("Apex row");
+    assert!(
+        (9 * MIN..15 * MIN).contains(&apex.in_voice_ms),
+        "the guild snapshot closes at reconnect, not the later presence stop: {:?}",
+        apex
+    );
+}
+
+#[test]
+fn disconnect_closes_open_voice_spans() {
+    const MIN: i64 = 60_000;
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let collector = runtime.game_activity_collector();
+    let now = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+    let start = now - 10 * MIN;
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, Some("Apex"), start));
+    collector.observe_join(GUILD, MEMBER, start);
+
+    runtime.disconnect();
+
+    let stop = now + 10 * MIN;
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, None, stop));
+    collector.observe_leave(GUILD, MEMBER, stop);
+    let rows = collector.flush(GUILD, 15 * MIN, stop);
+    let apex = rows
+        .iter()
+        .find(|row| row.game.as_deref() == Some("Apex"))
+        .expect("Apex row");
+    assert!(
+        (9 * MIN..15 * MIN).contains(&apex.in_voice_ms),
+        "voice time ends at disconnect rather than covering the reconnect gap: {:?}",
+        apex
+    );
+}
+
+#[tokio::test]
+async fn warm_resume_reopens_voice_span_for_cached_member() {
+    const MIN: i64 = 60_000;
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    let collector = runtime.game_activity_collector();
+    let now = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+    let start = now - 10 * MIN;
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, Some("Apex"), start));
+    // The span opens at `start` for determinism; the voice frame populates
+    // the gateway cache (its idempotent join keeps the earlier join).
+    collector.observe_join(GUILD, MEMBER, start);
+    feed(&runtime, &pipeline, voice_event(MEMBER, Some(CREATOR)));
+
+    runtime.disconnect();
+    feed(&runtime, &pipeline, Event::Resumed);
+
+    let stop = now + 10 * MIN;
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, None, stop));
+    collector.observe_leave(GUILD, MEMBER, stop);
+    let rows = collector.flush(GUILD, 15 * MIN, stop);
+    let apex = rows
+        .iter()
+        .find(|row| row.game.as_deref() == Some("Apex"))
+        .expect("Apex row");
+    assert_eq!(
+        apex.total_play_ms,
+        20 * MIN,
+        "play spans the resume, got {apex:?}"
+    );
+    assert!(
+        (19 * MIN..21 * MIN).contains(&apex.in_voice_ms),
+        "voice resumes after RESUMED instead of staying shut: {apex:?}",
+    );
+}
+
+fn live_ready(runtime: &Runtime) -> bool {
+    runtime
+        .live_actor(GUILD)
+        .expect("guild actor")
+        .live
+        .read_state()
+        .ready
+}
+
+async fn wait_moves(trace: &Trace, member: u64, count: usize) {
+    let prefix = format!("move:{member}:");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.starts_with(&prefix))
+            .count()
+            < count
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("member {member} moved {count} time(s); trace: {trace:?}"));
+}
+
+/// Production regression (build e18e9938, 2026-10-17 22:15Z to 10-18 14:38Z):
+/// once the guild's last voice member left, Twilight dropped the guild's
+/// voice-state set from the cache. The next transport loss cleared `ready`,
+/// and the warm RESUME that followed found no complete cached snapshot, so
+/// nothing was published: the live view stayed `ready == false` and every
+/// later creator join was silently ignored (no accept, no refusal, flat
+/// `two_bot_voice_joins_received_total`) until a restart re-ran
+/// GUILD_CREATE. Every RESUMED must restore the live view and joins must
+/// keep producing tickets, however many RESUMEs the process has seen.
+#[tokio::test]
+async fn warm_resume_after_guild_voice_empties_keeps_moving_creator_joins() {
+    const LAST_LEAVER: u64 = 301;
+    const PLAIN_VOICE: u64 = 700;
+    let (store, http, trace) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[PLAIN_VOICE]);
+    assert!(live_ready(&runtime));
+    // The guild's last voice member leaves; Twilight removes the now-empty
+    // guild entry from its voice-state index (re-created on the next join).
+    feed(
+        &runtime,
+        &pipeline,
+        voice_event(LAST_LEAVER, Some(PLAIN_VOICE)),
+    );
+    feed(&runtime, &pipeline, voice_event(LAST_LEAVER, None));
+    assert!(
+        pipeline
+            .cache()
+            .guild_voice_states(Id::new(GUILD))
+            .is_none(),
+        "fixture precondition: Twilight drops the empty guild voice-state set"
+    );
+    // Production saw ~10 transport losses, each followed by a warm RESUME.
+    for resume in 1..=3 {
+        runtime.disconnect();
+        assert!(!live_ready(&runtime));
+        feed(&runtime, &pipeline, Event::Resumed);
+        assert!(
+            live_ready(&runtime),
+            "live view must be ready again after warm RESUMED #{resume}"
+        );
+    }
+    // The owner joins "Create a Lobby": the join must be ticketed and moved.
+    feed(&runtime, &pipeline, voice_event(MEMBER, Some(CREATOR)));
+    wait_moves(&trace, MEMBER, 1).await;
+}
+
+fn self_heals() -> u64 {
+    let text = two_bot_core::metrics::global().render(None);
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("two_bot_voice_live_self_heal_total "))
+        .expect("self-heal counter rendered");
+    line.rsplit_once(' ').unwrap().1.parse().unwrap()
+}
+
+/// Self-correction: whatever leaves a live view not ready on a connected
+/// gateway (here a RESUMED whose cache cannot build a snapshot), the view
+/// reports its not-ready age for the watchdog, and the next dispatch
+/// republishes from the cache so the join that carries it is still moved.
+#[tokio::test]
+async fn connected_gateway_republishes_a_not_ready_view_and_moves_the_join() {
+    let (store, http, trace) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    let live = runtime.live_actor(GUILD).expect("guild actor").live;
+    let later = |secs| tokio::time::Instant::now() + Duration::from_secs(secs);
+    assert_eq!(live.not_ready_secs(later(90)), 0);
+    runtime.disconnect();
+    // RESUMED handled against a cache that cannot build this guild.
+    let cold = MemPipeline::for_replay();
+    runtime.handle(&Event::Resumed, cold.cache());
+    assert!(!live_ready(&runtime));
+    let stamped = later(90);
+    assert!(
+        live.not_ready_secs(stamped) >= 89,
+        "not ready on a connected gateway must be visible to the watchdog"
+    );
+    // A dispatch whose cache still cannot build the guild keeps the view
+    // not ready, and the retry does not restart the watchdog clock.
+    runtime.handle(&voice_event(301, None), cold.cache());
+    assert!(!live_ready(&runtime));
+    assert!(live.not_ready_secs(stamped) >= 89);
+    let healed = self_heals();
+    // The join's own dispatch heals the view and is still ticketed.
+    feed(&runtime, &pipeline, voice_event(MEMBER, Some(CREATOR)));
+    assert!(live_ready(&runtime));
+    assert_eq!(live.not_ready_secs(later(90)), 0);
+    assert!(self_heals() > healed);
+    wait_moves(&trace, MEMBER, 1).await;
+}
+
+/// The heal is only for a connected gateway: during an outage a not-ready
+/// view is correct (cached occupancy is not authoritative until RESUMED),
+/// so no dispatch republishes it and the watchdog clock stays at zero.
+#[tokio::test]
+async fn transport_down_never_heals_or_counts_the_live_view() {
+    let (store, http, trace) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    let live = runtime.live_actor(GUILD).expect("guild actor").live;
+    runtime.disconnect();
+    feed(&runtime, &pipeline, voice_event(MEMBER, Some(CREATOR)));
+    assert!(!live_ready(&runtime));
+    assert_eq!(
+        live.not_ready_secs(tokio::time::Instant::now() + Duration::from_secs(90)),
+        0
+    );
+    status(&runtime).await;
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry == "create" || entry.starts_with("move:")));
+}
+
+#[test]
+fn guild_delete_drops_unflushed_game_activity_state() {
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    let collector = runtime.game_activity_collector();
+    let now = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, Some("Apex"), now));
+    collector.observe_join(GUILD, MEMBER, now);
+
+    let deleted = Event::GuildDelete(
+        serde_json::from_value::<twilight_model::gateway::payload::incoming::GuildDelete>(json!({
+            "id": GUILD.to_string(), "unavailable": false
+        }))
+        .unwrap(),
+    );
+    feed(&runtime, &pipeline, deleted);
+    assert!(
+        collector.guilds().is_empty(),
+        "guild removal must discard all buffered and open collector state"
+    );
+}
+
+#[tokio::test]
+async fn guild_create_seeds_display_names_for_restarted_rooms() {
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    feed(&runtime, &pipeline, ready_event());
+    let mut guild: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json")).unwrap();
+    guild["roles"][0]["permissions"] = json!(permissions().bits().to_string());
+    guild["members"].as_array_mut().unwrap().push(json!({
+        "user": {"id": MEMBER.to_string(), "username": "alex", "global_name": "Alex", "discriminator": "0"},
+        "roles": [], "deaf": false, "mute": false, "flags": 0, "joined_at": NOW
+    }));
+    // Without the presence intent Discord's GuildCreate carries the members
+    // in voice together with their voice states.
+    guild["voice_states"] = json!([{
+        "channel_id": CREATOR.to_string(), "user_id": MEMBER.to_string(), "session_id": "voice",
+        "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
+        "self_video": false, "suppress": false
+    }]);
+    feed(
+        &runtime,
+        &pipeline,
+        Event::GuildCreate(Box::new(GuildCreate::Available(
+            serde_json::from_value(guild).unwrap(),
+        ))),
+    );
+    let (_, directory) = tokio::time::timeout(Duration::from_secs(5), runtime.naming_probe(GUILD))
+        .await
+        .expect("probe deadline")
+        .expect("actor exists");
+    assert!(directory.knows(MEMBER));
+}
+
+async fn creator_ids(runtime: &Runtime) -> Vec<u64> {
+    tokio::time::timeout(Duration::from_secs(5), runtime.creators_probe(GUILD))
+        .await
+        .expect("probe deadline")
+        .expect("actor exists")
+}
+
+async fn settle_first_merge(runtime: &Runtime) {
+    // Let the spawned actor load and run its first (interval) merge, so a
+    // row pushed afterwards can only converge via a flagged refresh.
+    for _ in 0..50 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        if creator_ids(runtime).await.contains(&CREATOR) {
+            return;
+        }
+    }
+    panic!("the actor must load its creator view before the test row lands");
+}
+
+/// Drive one channel event through the gateway sink and prove the worker
+/// merges a store row its view was missing: without the event hook (or its
+/// caller) the row stays absent past the debounce. The probe reads the
+/// worker view directly, never a join, so the join read-through cannot
+/// mask a dead event hook.
+async fn channel_event_merges_a_missing_creator_row(make_event: impl FnOnce(Channel) -> Event) {
+    const ADDED: u64 = 201;
+    let (store, http, _) = fixture();
+    let runtime = runtime(store.clone(), http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    settle_first_merge(&runtime).await;
+    store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, ADDED));
+    assert!(
+        !creator_ids(&runtime).await.contains(&ADDED),
+        "the pushed row must start outside the worker view"
+    );
+    feed(
+        &runtime,
+        &pipeline,
+        make_event(channel(ADDED, 2, Some(CATEGORY))),
+    );
+    for _ in 0..120 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        creator_ids(&runtime).await.contains(&ADDED),
+        "a channel event must merge a missing creator row past the debounce"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn sink_channel_create_merges_a_missing_creator_row() {
+    channel_event_merges_a_missing_creator_row(|channel| {
+        Event::ChannelCreate(Box::new(ChannelCreate(channel)))
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn sink_channel_update_merges_a_missing_creator_row() {
+    channel_event_merges_a_missing_creator_row(|channel| {
+        Event::ChannelUpdate(Box::new(ChannelUpdate(channel)))
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn sink_channel_delete_merges_a_missing_creator_row() {
+    channel_event_merges_a_missing_creator_row(|channel| {
+        Event::ChannelDelete(Box::new(ChannelDelete(channel)))
+    })
+    .await;
+}
+
+/// A nickname change renders into `@@owner@@` rooms: the gateway sink must
+/// forward it as a display update so the worker's name directory (which the
+/// background custom-name re-render reads) learns the fresh nickname.
+#[tokio::test(start_paused = true)]
+async fn member_nick_update_reaches_the_worker_name_directory() {
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    let _ = status(&runtime).await;
+    feed(
+        &runtime,
+        &pipeline,
+        Event::MemberUpdate(Box::new(
+            serde_json::from_value(json!({
+                "guild_id": GUILD.to_string(), "roles": [],
+                "nick": "Bob",
+                "user": {"id": MEMBER.to_string(), "username": "alex", "discriminator": "0"}
+            }))
+            .unwrap(),
+        )),
+    );
+    let mut directory = None;
+    for _ in 0..50 {
+        let probed = tokio::time::timeout(Duration::from_secs(5), runtime.naming_probe(GUILD))
+            .await
+            .expect("probe deadline")
+            .expect("actor exists")
+            .1;
+        if format!("{probed:?}").contains("Bob") {
+            directory = Some(probed);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let directory = directory.expect("worker directory must learn Bob from the nick update");
+    assert!(directory.knows(MEMBER));
 }

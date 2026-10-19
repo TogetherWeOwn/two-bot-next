@@ -82,6 +82,7 @@ pub const MAX_MESSAGE_CHARS: usize = 2000;
 pub const MAX_EVENT_NAME_CHARS: usize = 100;
 /// Discord's own event-description ceiling.
 pub const MAX_EVENT_DESCRIPTION_CHARS: usize = 1000;
+pub const MAX_EVENT_LOCATION_CHARS: usize = 100;
 /// Ceiling on one stored setting: a dashboard field needing more is not a
 /// setting, and the cap keeps one signed request from filling the table.
 pub const MAX_SETTING_VALUE_BYTES: usize = 8192;
@@ -631,6 +632,27 @@ impl ActionError {
     pub fn status(&self) -> u16 {
         self.code.status()
     }
+
+    /// Bounded metrics outcome for `two_bot_moderation_enforcements_total`
+    /// (TOG-28482): `refused` for malformed/forbidden/definitive Discord
+    /// rejections, `discord_error` for uncertain Discord failures,
+    /// `storage_error` for persistence failures, `other` for anything else
+    /// (auth, stale, in-progress, version conflicts, replays). The caller
+    /// passes a `ModerationAction::command_name` verb; no user id, reason
+    /// text or free-form detail ever becomes a label.
+    #[must_use]
+    pub fn enforcement_outcome(&self) -> &'static str {
+        match self.code {
+            ErrorCode::Malformed | ErrorCode::ActionNotAllowed | ErrorCode::DiscordRejected => {
+                "refused"
+            }
+            ErrorCode::UpstreamTimeout | ErrorCode::RateLimited | ErrorCode::DiscordUnavailable => {
+                "discord_error"
+            }
+            ErrorCode::Internal => "storage_error",
+            _ => "other",
+        }
+    }
 }
 
 /// Every auth failure is this one error: same code, same message, detail only
@@ -1173,6 +1195,48 @@ pub enum EventPlace {
     Location(String),
 }
 
+/// One game night awaiting its Discord-native scheduled event.
+///
+/// Timestamps render in UTC-millis ISO-8601, the same rendering
+/// [`EventInput`] carries; the location becomes the EXTERNAL event's written
+/// place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameNight {
+    pub name: String,
+    pub starts_at: String,
+    pub ends_at: String,
+    pub location: String,
+}
+
+/// Discord cap on active scheduled events per guild.
+///
+/// Discord allows at most 100 active scheduled events per guild; the planner
+/// below truncates against this so a full calendar files nothing instead of
+/// failing halfway.
+pub const MAX_ACTIVE_SCHEDULED_EVENTS: usize = 100;
+
+/// Plan one EXTERNAL [`EventInput`] per game night.
+///
+/// Each night becomes an [`EventPlace::Location`] input with its name, times
+/// and location carried over and no description. The plan is truncated from
+/// the tail so that `active_count + returned.len() <=
+/// MAX_ACTIVE_SCHEDULED_EVENTS`: a guild at the cap files nothing.
+#[must_use]
+pub fn plan_game_night_creates(nights: &[GameNight], active_count: usize) -> Vec<EventInput> {
+    let capacity = MAX_ACTIVE_SCHEDULED_EVENTS.saturating_sub(active_count);
+    nights
+        .iter()
+        .take(capacity)
+        .map(|night| EventInput {
+            name: night.name.clone(),
+            starts_at: night.starts_at.clone(),
+            ends_at: night.ends_at.clone(),
+            description: None,
+            place: EventPlace::Location(night.location.clone()),
+        })
+        .collect()
+}
+
 pub fn validate_event_input(
     body: &Map<String, Value>,
     channel_keys: &HashMap<String, String>,
@@ -1233,7 +1297,15 @@ pub fn validate_event_input(
             }
         }
     } else {
-        EventPlace::Location(require_field_str(body, "location")?.to_owned())
+        let location = require_field_str(body, "location")?;
+        if utf16_len(location) > MAX_EVENT_LOCATION_CHARS {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                format!(r#""location" is longer than {MAX_EVENT_LOCATION_CHARS} characters"#),
+                "location_too_long",
+            ));
+        }
+        EventPlace::Location(location.to_owned())
     };
     Ok(EventInput {
         name: name.to_owned(),
@@ -1518,6 +1590,21 @@ pub fn assert_private_bind(host: &str) -> Result<String, BindError> {
 
 /// Crockford base-32 alphabet (legacy `CROCKFORD`; I/L/O/U excluded).
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// End-to-end correlation header: the Worker stamps it, the Durable Object
+/// forwards it, and the container receivers honor it when it has a generated
+/// shape (otherwise they mint a fresh [`new_request_id`]). Lowercase on the
+/// wire; Axum header lookup is case-insensitive.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// True only for values [`new_request_id`] could have generated: exactly
+/// [`REQUEST_ID_LEN`] Crockford characters. Anything else (bearer tokens,
+/// URLs, UUIDs, free text) is never honored or logged as an id, so a
+/// caller-supplied secret cannot become a join key in logs or metrics.
+#[must_use]
+pub fn is_request_id(value: &str) -> bool {
+    value.len() == REQUEST_ID_LEN && value.bytes().all(|b| CROCKFORD.contains(&b))
+}
 
 /// A ULID-ish request id: time-ordered, so a grep of the log sorts naturally,
 /// and random enough not to collide. Randomness arrives as a parameter (16
@@ -2739,15 +2826,25 @@ mod tests {
 
     #[test]
     fn catalog_counts_match_legacy_census() {
-        // Shared legacy census: hot 41 / cold 28 / env_only 48, plus the
+        // Shared legacy census: hot 42 / cold 27 / env_only 48, plus the
         // receiver's combined bind, caller mapping and container marker
         // (all env-only), plus the two template-assistant endpoint keys
         // (both env-only). Count actual entries, not just representatives
-        // of each class.
+        // of each class. TOG-19027 moves TWO_FEED_POLL_SECONDS from cold
+        // to hot, shifting one entry between those classes. The staging
+        // voice synthetic adds one env-only key (TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS).
+        // TOG-23387 adds five env-only EventSub keys (TWO_EVENTSUB,
+        // TWO_EVENTSUB_BIND, TWO_TWITCH_CLIENT_ID, TWO_TWITCH_CLIENT_SECRET,
+        // TWO_TWITCH_WEBHOOK_SECRET). This change adds two env-only keys
+        // (TWO_TWITCH_BROADCASTERS, TWO_TWITCH_CALLBACK_URL). The delivery
+        // provisioning slice adds three env-only keys (TWO_EVENTSUB_DELIVERY,
+        // TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID, TWO_EVENTSUB_INVITE_URL).
+        // TOG-29862 moves TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS from cold to hot,
+        // shifting one entry between those classes.
         for (class, expected) in [
-            (SettingClass::Hot, 41),
-            (SettingClass::Cold, 28),
-            (SettingClass::EnvOnly, 53),
+            (SettingClass::Hot, 43),
+            (SettingClass::Cold, 26),
+            (SettingClass::EnvOnly, 64),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
@@ -3267,6 +3364,26 @@ mod tests {
         // Time-ordered: a later timestamp sorts later.
         let later = new_request_id(1_720_000_000_001, &[0u8; 16]);
         assert!(later > id);
+    }
+
+    #[test]
+    fn inbound_request_ids_accept_only_generated_shapes() {
+        assert!(is_request_id(&new_request_id(
+            1_720_000_000_000,
+            &[1u8; 16]
+        )));
+        for bad in [
+            "",
+            "short",
+            "01J9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ!", // 26 chars but `!` is outside the alphabet
+            "01j9zq9zq9zq9zq9zq9zq9zq9zq",  // lowercase is never generated
+            "01J9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQI", // `I` is excluded from Crockford
+            "01J9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9ZQ9", // 27 chars
+            "Bearer synthetic-token-value",
+            "https://example.invalid/with-credentials",
+        ] {
+            assert!(!is_request_id(bad), "{bad:?} must not be honored");
+        }
     }
 
     fn signed_headers<'a>(

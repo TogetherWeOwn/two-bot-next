@@ -236,6 +236,11 @@ pub fn log_refresh_report(report: &RefreshReport) {
     for change in &report.hot {
         log_key_change(change);
     }
+    tracing::info!(
+        msg = "settings_applied",
+        revision = report.to_revision,
+        hot_keys = report.hot.len()
+    );
     for change in &report.cold {
         tracing::info!(
             key = change.key.as_str(),

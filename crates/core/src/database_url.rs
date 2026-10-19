@@ -182,6 +182,24 @@ mod tests {
     }
 
     #[test]
+    fn planetscale_production_shapes_validate() {
+        // Synthetic PlanetScale production shapes: dotted `{role}.{branch_id}`
+        // logins on the direct `*.pg.psdb.cloud:5432` and
+        // `*.horizon.psdb.cloud:5432` endpoints with allowlisted keys only.
+        // Synthetic hostnames: no real cluster id, host or credential.
+        for raw in [
+            "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require",
+            "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=verify-full",
+            "postgresql://fixture-role.cnfixture02:fixture-password@psdb-fixture-2.pg.psdb.cloud:5432/two_bot?sslmode=require&channel_binding=require",
+            "postgresql://migrator.cnfixture01@psdb-fixture-1.horizon.psdb.cloud:5432/postgres?sslmode=require",
+            "postgres://fixture-role.cnfixture02:fixture-password@psdb-fixture-2.horizon.psdb.cloud/db?sslmode=verify-ca",
+            "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require&options[statement_timeout]=5000",
+        ] {
+            assert!(validate(raw).is_ok(), "{raw}");
+        }
+    }
+
+    #[test]
     fn neon_channel_binding_is_removed_without_changing_sslmode() {
         for query in [
             "sslmode=require&channel_binding=require",
@@ -224,5 +242,149 @@ mod tests {
             assert_eq!(error, "unsupported database URL parameter");
             assert!(!error.contains("fixture"));
         }
+    }
+
+    #[test]
+    fn hostile_inputs_never_panic_and_stay_fixed_vocabulary() {
+        const INVALID_URL: &str = "invalid database URL";
+        const UNSUPPORTED_PARAM: &str = "unsupported database URL parameter";
+        let overlong = "a".repeat(70_000);
+        let many_unsupported = format!(
+            "postgres://agent-testdb/db?{}",
+            "x=fixture-secret&".repeat(1_000)
+        );
+        let cases: Vec<String> = vec![
+            String::new(),
+            " ".to_owned(),
+            "\0".to_owned(),
+            "postgres://agent-testdb/db?sslmode=require\r\nInjected: fixture-secret".to_owned(),
+            "postgres://agent-testdb/db?api_key=fixture-secret".to_owned(),
+            "postgres://agent-testdb/db?fixture-key-secret=fixture-value-secret".to_owned(),
+            "postgres://agent-testdb/db?api%5Fkey=fixture-query-secret".to_owned(),
+            "postgres://agent-testdb/db?options[bad=fixture-query-secret".to_owned(),
+            "postgres://user:fixture-secret@agent-testdb/db?sslmode=require".to_owned(),
+            "😀postgres://agent-testdb/db?sslmode=require".to_owned(),
+            "postgres://agent-testdb/db?sslmode=\0fixture-secret".to_owned(),
+            overlong,
+            many_unsupported,
+            "http://agent-testdb/db?api_key=fixture-secret".to_owned(),
+            "postgres://agent-testdb:99999999999999999999/db".to_owned(),
+            "postgres://[::1/db".to_owned(),
+            "postgres://agent-testdb/db?sslmode=require%00fixture-secret".to_owned(),
+            "postgres://agent-testdb/db?%0d%0a=fixture-secret".to_owned(),
+        ];
+        for raw in &cases {
+            let first = validate(raw);
+            // Determinism: repeated parses agree, so no hidden state escapes.
+            assert_eq!(
+                validate(raw),
+                first,
+                "validate must parse deterministically"
+            );
+            match first {
+                Ok(()) => {}
+                Err(message) => {
+                    assert!(
+                        message == INVALID_URL || message == UNSUPPORTED_PARAM,
+                        "validate escaped a non-fixed error string"
+                    );
+                    // Failing input is never echoed: sentinel bytes from the
+                    // hostile matrix must not appear in the fixed refusal, and
+                    // refusals stay single-line.
+                    assert!(!message.contains("fixture"));
+                    assert!(!message.contains("SENTINEL"));
+                    assert!(!message.contains('\r'));
+                    assert!(!message.contains('\n'));
+                    assert!(!message.contains('\0'));
+                }
+            }
+        }
+        // Valid secrets in supported positions still validate: the hold is
+        // about error text, not about refusing credentials themselves.
+        assert!(validate("postgres://user:fixture-secret@agent-testdb/db?sslmode=require").is_ok());
+        // Unsupported refuses before SQLx can WARN-log key and value: the
+        // refusal is the fixed pre-parse string, never a driver message.
+        assert_eq!(
+            validate("postgres://agent-testdb/db?api_key=fixture-secret"),
+            Err(UNSUPPORTED_PARAM)
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn connect_options_hostile_inputs_stay_fixed_vocabulary() {
+        const INVALID_URL: &str = "invalid database URL";
+        const UNSUPPORTED_PARAM: &str = "unsupported database URL parameter";
+        fn message(error: &sqlx::Error) -> &str {
+            assert!(
+                matches!(error, sqlx::Error::InvalidArgument(_)),
+                "connect_options escaped a non-fixed variant: {error:?}"
+            );
+            match error {
+                sqlx::Error::InvalidArgument(message) => message,
+                // Assert above already fails the test; return fixed vocabulary
+                // to satisfy types without introducing a prod-panic site (the
+                // semgrep rule cannot tell inline test helpers apart).
+                _ => "invalid database URL",
+            }
+        }
+        let many_unsupported = format!(
+            "postgres://agent-testdb/db?{}",
+            "x=fixture-secret&".repeat(1_000)
+        );
+        let cases: Vec<String> = vec![
+            String::new(),
+            "not a database url".to_owned(),
+            "postgres://agent-testdb/db?api_key=fixture-secret&sslmode=require".to_owned(),
+            "postgres://agent-testdb/db?fixture-key-secret=fixture-value-secret".to_owned(),
+            "postgres://agent-testdb/db?sslmode=require\r\nInjected: fixture-secret".to_owned(),
+            "postgres://agent-testdb/db?sslmode=invalid".to_owned(),
+            "postgres://agent-testdb/db?sslmode=\0fixture-secret".to_owned(),
+            "😀postgres://agent-testdb/db?sslmode=require".to_owned(),
+            many_unsupported,
+            "postgres://agent-testdb:99999999999999999999/db".to_owned(),
+        ];
+        for raw in &cases {
+            let validated = validate(raw);
+            let connected = connect_options(raw);
+            // Determinism across the tracing-scoped parse.
+            assert_eq!(
+                connect_options(raw).is_ok(),
+                connected.is_ok(),
+                "connect_options must parse deterministically"
+            );
+            match validated {
+                Err(expected) => {
+                    // Refusal before SQLx: the pre-parse message propagates
+                    // unchanged, so unsupported values never reach the driver.
+                    let error =
+                        connected.expect_err("validate refusal must refuse connect_options");
+                    assert_eq!(message(&error), expected);
+                }
+                Ok(()) => match connected {
+                    Ok(_) => {}
+                    Err(error) => {
+                        assert_eq!(message(&error), INVALID_URL);
+                    }
+                },
+            }
+            if let Err(error) = connect_options(raw) {
+                let text = message(&error);
+                assert!(
+                    text == INVALID_URL || text == UNSUPPORTED_PARAM,
+                    "connect_options escaped a non-fixed error string"
+                );
+                assert!(!text.contains("fixture"));
+                assert!(!text.contains("SENTINEL"));
+                assert!(!text.contains('\r'));
+                assert!(!text.contains('\n'));
+            }
+        }
+        // The driver-value failure stays fixed too: a bad but supported value
+        // never echoes the rejected text.
+        let error = connect_options("postgres://agent-testdb/db?sslmode=fixture-secret")
+            .expect_err("bad sslmode value must refuse");
+        assert_eq!(message(&error), INVALID_URL);
+        assert!(!message(&error).contains("fixture"));
     }
 }

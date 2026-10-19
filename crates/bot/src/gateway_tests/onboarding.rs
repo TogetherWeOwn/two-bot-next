@@ -288,7 +288,7 @@ async fn discord(paused: Arc<AtomicBool>, pause_at: PauseAt) -> MockRest {
 }
 
 async fn spawn_onboarding(db: &TestDb, mock: &MockRest, url: &str, mode: &str) -> Runner {
-    spawn_onboarding_with_store(db, mock, url, mode, &db.store).await
+    spawn_onboarding_with_store(db, mock, url, mode, &db.store, None).await
 }
 
 async fn spawn_onboarding_with_store(
@@ -297,6 +297,7 @@ async fn spawn_onboarding_with_store(
     url: &str,
     mode: &str,
     store: &GatewaySessionStore,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Runner {
     ensure_crypto_provider();
     let vars = HashMap::from([
@@ -337,11 +338,17 @@ async fn spawn_onboarding_with_store(
         pipeline.clone(),
         state.clone(),
         store.clone(),
+        None,
         Some(runtime),
         None,
         None,
         None,
-        std::future::pending(),
+        async move {
+            match shutdown {
+                Some(receiver) => crate::server::shutdown_requested(receiver).await,
+                None => std::future::pending().await,
+            }
+        },
     ));
     Runner {
         task,
@@ -1181,7 +1188,8 @@ async fn onboarding_gateway_feature_pool_exhaustion_preserves_checkpoint_and_hea
             two_bot_cutover::DB_POOL_MAX_DEFAULT,
         );
         let mut ws = gateway_with_heartbeat(false, 2000).await;
-        let runner = spawn_onboarding_with_store(&db, &mock, &ws.mock.url, "legacy", &store).await;
+        let runner =
+            spawn_onboarding_with_store(&db, &mock, &ws.mock.url, "legacy", &store, None).await;
         assert_eq!(ws.mock.authentication().await["op"], 2);
         wait_sequence(&store, 1).await;
         ws.heartbeats.recv().await.expect("connected heartbeat");
@@ -1257,7 +1265,8 @@ async fn onboarding_gateway_worker_admission_bounds_held_game_transactions() {
     .await;
     let result = bounded(async {
         let mut ws = gateway_with_heartbeat(false, 2000).await;
-        let runner = spawn_onboarding_with_store(&db, &mock, &ws.mock.url, "legacy", &store).await;
+        let runner =
+            spawn_onboarding_with_store(&db, &mock, &ws.mock.url, "legacy", &store, None).await;
         assert_eq!(ws.mock.authentication().await["op"], 2);
         wait_sequence(&store, 1).await;
         // Saturate admission with distinct members, not waiters on one lock.

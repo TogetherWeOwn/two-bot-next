@@ -158,14 +158,12 @@ impl MemberRuntime {
         self.store.clone()
     }
 
-    /// Policy stamped with the resolved bot identity. `None` keeps the
-    /// service's owner fallback for sweep audit rows; commands always pass
-    /// the resolved id (an unresolvable bot refuses instead).
-    fn policy(&self, bot_id: Option<&str>) -> ModerationPolicy {
+    /// Policy stamped with the resolved bot identity; callers resolve it first.
+    fn policy(&self, bot_id: &str) -> ModerationPolicy {
         ModerationPolicy {
             owen_user_id: self.policy.owen_user_id.clone(),
             protected_role_ids: self.policy.protected_role_ids.clone(),
-            bot_user_id: bot_id.map(str::to_owned),
+            bot_user_id: Some(bot_id.to_owned()),
         }
     }
 
@@ -377,9 +375,22 @@ fn error_text(err: MemberError) -> String {
         MemberError::Discord(MemberDiscordError::Rejected(detail)) => {
             format!("Discord refused the request: {detail}")
         }
+        MemberError::Discord(MemberDiscordError::RateLimited) => {
+            "Discord rate-limited the request; nothing was applied. Try again shortly.".to_owned()
+        }
         MemberError::Discord(_) => UNCERTAIN_REPLY.to_owned(),
-        MemberError::Store(_) => FAILURE_REPLY.to_owned(),
+        MemberError::Store(_) | MemberError::BotIdentityUnknown => FAILURE_REPLY.to_owned(),
     }
+}
+
+/// Record a definitive preflight refusal: no `MemberExecution` was built, so
+/// the service boundary below never saw this request. Actor cooldowns and
+/// indeterminate preflight failures (facts/fetch/bot reads) emit no sample:
+/// cooldowns are rate-limit backoffs, not outcomes, and indeterminate reads
+/// prove nothing about the enforcement.
+fn preflight_refused(action: ModerationAction, reply: &str) -> String {
+    two_bot_core::metrics::global().moderation_enforcement(action.command_name(), "refused");
+    reply.to_owned()
 }
 
 /// Build the execution and run it exactly once. Every `Err(String)` here is
@@ -420,7 +431,7 @@ async fn execute(
     let actor = ModerationActor {
         user_id: actor_id,
         highest_role_position: top_position(&actor_roles, &facts)
-            .ok_or_else(|| FAILURE_REPLY.to_owned())?,
+            .ok_or_else(|| preflight_refused(action, FAILURE_REPLY))?,
         role_ids: with_everyone(actor_roles, &guild_id),
         permissions: partial
             .permissions
@@ -439,12 +450,12 @@ async fn execute(
             let (roles, is_bot) = match resolved_or_fetched {
                 Some(pair) => pair,
                 None if action == ModerationAction::Ban => (vec![guild_id.clone()], false),
-                None => return Err(NO_MEMBER_REPLY.to_owned()),
+                None => return Err(preflight_refused(action, NO_MEMBER_REPLY)),
             };
             Some(ModerationTarget {
                 user_id: target_id.clone(),
                 highest_role_position: top_position(&roles, &facts)
-                    .ok_or_else(|| FAILURE_REPLY.to_owned())?,
+                    .ok_or_else(|| preflight_refused(action, FAILURE_REPLY))?,
                 role_ids: with_everyone(roles, &guild_id),
                 is_bot,
                 is_guild_owner: target_id == facts.owner_id,
@@ -461,11 +472,11 @@ async fn execute(
         .map_err(|_| FAILURE_REPLY.to_owned())?;
     // The policy requires a resolved bot position; unknown roles refuse here.
     let bot_highest_role_position =
-        top_position(&bot_roles, &facts).ok_or_else(|| FAILURE_REPLY.to_owned())?;
+        top_position(&bot_roles, &facts).ok_or_else(|| preflight_refused(action, FAILURE_REPLY))?;
     let service = MemberModerationService::new(
         executor.clone(),
         member.store(),
-        member.policy(Some(bot_id)),
+        member.policy(bot_id),
         now_millis_i64,
     );
     let execution = MemberExecution {
@@ -481,7 +492,18 @@ async fn execute(
         // stored outcome instead of moderating twice.
         idempotency_key: interaction.id.get().to_string(),
     };
-    service.execute(&execution).await.map_err(error_text)
+    match service.execute(&execution).await {
+        Ok(result) => {
+            two_bot_core::metrics::global()
+                .moderation_enforcement(action.command_name(), "success");
+            Ok(result)
+        }
+        Err(err) => {
+            two_bot_core::metrics::global()
+                .moderation_enforcement(action.command_name(), err.enforcement_outcome());
+            Err(error_text(err))
+        }
+    }
 }
 
 fn with_everyone(mut roles: Vec<String>, guild_id: &str) -> Vec<String> {
@@ -527,6 +549,7 @@ pub(crate) fn sweep_job(member: Arc<MemberRuntime>, rest: ActionExecutor) -> Job
     Job {
         name: NAMES[0],
         cadence,
+        cadence_source: None,
         startup_jitter: jobs::startup_jitter(cadence, rand::random()),
         timeout: SWEEP_TIMEOUT,
         action: Arc::new(move || {
@@ -538,9 +561,8 @@ pub(crate) fn sweep_job(member: Arc<MemberRuntime>, rest: ActionExecutor) -> Job
 }
 
 async fn tick(member: &MemberRuntime, rest: &ActionExecutor) -> Result<(), ErrorClass> {
-    // Best-effort bot identity for sweep audit rows; dispatch itself needs no
-    // hierarchy decision, so an unresolvable bot still sweeps.
-    let bot_id = member.bot_id(rest).await.ok();
+    // Scheduled unbans are attributed to the bot, so no identity means no sweep.
+    let bot_id = member.bot_id(rest).await.map_err(|()| ErrorClass::Rest)?;
     let service = MemberModerationService::new(
         rest.clone(),
         member.store(),
@@ -600,5 +622,160 @@ mod tests {
         assert_eq!(cooldowns.actors.len(), ACTOR_COOLDOWN_CAPACITY);
         assert!(cooldowns.admit("overflow", 1, now + ACTOR_COOLDOWN));
         assert_eq!(cooldowns.actors.len(), 1);
+    }
+
+    #[test]
+    fn rate_limited_reply_is_retry_safe_while_uncertain_stays_fenced() {
+        assert_eq!(
+            error_text(MemberError::Discord(MemberDiscordError::RateLimited)),
+            "Discord rate-limited the request; nothing was applied. Try again shortly."
+        );
+        assert_eq!(
+            error_text(MemberError::Discord(MemberDiscordError::Timeout)),
+            UNCERTAIN_REPLY
+        );
+    }
+
+    #[test]
+    fn ban_success_confirmation_copy_is_pinned() {
+        // Reply layer only: `MemberResult` carries no member data, so the
+        // pinned copy cannot paste any.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Banned,
+                replayed: false,
+            }),
+            "Banned."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Banned,
+                replayed: true,
+            }),
+            "Banned. Already applied."
+        );
+    }
+
+    #[test]
+    fn tempban_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact `/tempban` success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::TemporarilyBanned,
+                replayed: false,
+            }),
+            "Temporarily banned."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::TemporarilyBanned,
+                replayed: true,
+            }),
+            "Temporarily banned. Already applied."
+        );
+    }
+
+    #[test]
+    fn kick_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact `/kick` success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Kicked,
+                replayed: false,
+            }),
+            "Kicked."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Kicked,
+                replayed: true,
+            }),
+            "Kicked. Already applied."
+        );
+    }
+
+    #[test]
+    fn timeout_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact `/timeout` success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::TimedOut,
+                replayed: false,
+            }),
+            "Timed out."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::TimedOut,
+                replayed: true,
+            }),
+            "Timed out. Already applied."
+        );
+    }
+
+    #[test]
+    fn warn_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact `/warn` success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Warned,
+                replayed: false,
+            }),
+            "Warned."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Warned,
+                replayed: true,
+            }),
+            "Warned. Already applied."
+        );
+    }
+
+    #[test]
+    fn unban_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact unban-sweep success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Unbanned,
+                replayed: false,
+            }),
+            "Unbanned."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Unbanned,
+                replayed: true,
+            }),
+            "Unbanned. Already applied."
+        );
+    }
+
+    #[test]
+    fn replay_suffix_confirmation_copy_is_pinned() {
+        // The replay suffix is one uniform arm: every outcome replays by
+        // appending exactly ` Already applied.` to its fresh copy.
+        let fresh = [
+            (MemberOutcome::Banned, "Banned."),
+            (MemberOutcome::TemporarilyBanned, "Temporarily banned."),
+            (MemberOutcome::Kicked, "Kicked."),
+            (MemberOutcome::TimedOut, "Timed out."),
+            (MemberOutcome::Warned, "Warned."),
+            (MemberOutcome::Unbanned, "Unbanned."),
+        ];
+        for (outcome, base) in fresh {
+            assert_eq!(
+                outcome_text(&MemberResult {
+                    outcome,
+                    replayed: true,
+                }),
+                format!("{base} Already applied.")
+            );
+        }
     }
 }

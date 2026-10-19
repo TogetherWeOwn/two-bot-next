@@ -96,12 +96,20 @@ export class OwnershipFence {
    * teardown permits release. A crash/write/stop failure leaves durable denial.
    * Record and audit are written atomically, with an optimistic epoch check.
    */
-  async change(id: string, change: OwnershipChange, destroy: () => Promise<void>): Promise<OwnerRecord> {
+  async change(id: string, change: OwnershipChange, destroy: () => Promise<void>, opts?: { force?: boolean }): Promise<OwnerRecord> {
     deploymentId(id);
     const old = await this.read();
     const oldEpoch = old?.epoch ?? 0;
     if (oldEpoch !== change.expectedEpoch) throw new OwnershipRefused("epoch_conflict");
     if (oldEpoch === Number.MAX_SAFE_INTEGER) throw new OwnershipRefused("epoch_exhausted");
+    // Idempotent repeat: the deployment that already owns the active singleton,
+    // re-posting at its own epoch, gets the stored record back unchanged: no
+    // write, no audit row, no destroy. A fenced (crash-recovery) record and an
+    // explicit recovery pass (force) still commit, and any other deployment
+    // still takes over at the fresh epoch.
+    if (!opts?.force && change.action === "takeover" && old?.phase === "active" && old.deploymentId === id) {
+      return old;
+    }
     const pending: OwnerRecord = {
       deploymentId: change.action === "takeover" ? id : null,
       epoch: oldEpoch + 1,
@@ -133,22 +141,33 @@ export class OwnershipFence {
   }
 }
 
+/** Whole-body deadline mirroring the receiver convention (internal-actions BODY_TIMEOUT_MS). */
+export const CONTROL_BODY_TIMEOUT_MS = 5_000;
+
 /** Bound control input independently of the untrusted Content-Length header. */
 export async function readChange(request: Request): Promise<OwnershipChange | null> {
   const reader = request.body?.getReader();
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
   let size = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), CONTROL_BODY_TIMEOUT_MS);
+  });
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > 1024) {
-        await reader.cancel();
+    for (;;) {
+      const step = await Promise.race([reader.read(), timeout]);
+      if (step === "timeout") {
+        void reader.cancel().catch(() => {});
         return null;
       }
-      chunks.push(value);
+      if (step.done) break;
+      size += step.value.byteLength;
+      if (size > 1024) {
+        void reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(step.value);
     }
     const bytes = new Uint8Array(size);
     let offset = 0;
@@ -156,6 +175,8 @@ export async function readChange(request: Request): Promise<OwnershipChange | nu
     return parseChange(JSON.parse(new TextDecoder().decode(bytes)));
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

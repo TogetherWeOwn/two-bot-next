@@ -46,7 +46,15 @@ raw result cells without text casts. Unsupported native composite cells refuse
 at restore rather than silently becoming SQL NULL. Legacy JSON `null` cannot
 distinguish JSON null from SQL NULL; the legacy contract maps it to SQL NULL.
 
-`backup_schema_seed.sql` is the separate migration-backed v4 fixture for
+`pre-reservation-v4.ndjson` is a synthetic text-encoded compatibility archive
+with the exact 85-table inventory from the Rust writer before reservation
+persistence, plus one voice room row. Empty entries have no columns. It is not a production dump or an
+execution of that historical binary: it pins the previous format/inventory
+independently of the current `DUMP_TABLES`. Unit inspection and a migrated-schema
+restore test prove that v4 recovery points still work, while v5 requires the new
+reservation table and unrelated missing v4 tables still refuse.
+
+`backup_schema_seed.sql` is the separate migration-backed complete-schema fixture for
 `backup_schema_roundtrip.rs`. It seeds every active covered table, including
 FK chains, durable dedupe/lease state, settings revision/audit history, gapped
 serial IDs and difficult text/null/JSON/timestamp values. Those tests create
@@ -60,3 +68,16 @@ This fixture does not replace the frozen-writer compatibility bytes above.
 credential. The full PUT signature is independently reconstructed with Python
 `hashlib`/`hmac`, and the loopback S3 verifier rejects unordered SignedHeaders
 before checking the HMAC (the old fake accepted a self-consistent wrong order).
+
+# Authorization matrix
+
+`authz_matrix.json` is the role x route x expected-outcome table behind
+`crates/core/tests/authz_matrix.rs`. Ten named roles carry literal Discord
+permission bits (not the production constants) and each of the 29 retained
+builtin slash commands lists the roles it admits and the refusal everyone else
+gets, checked through `InteractionRouter::route_slash` with every feature gate
+on. `context_cases` pin the configured-guild fence and unresolved permission
+bits; `moderation_policy` pins the `assert_moderation_allowed` refusal order.
+A command added to `COMMAND_PERMISSIONS` without a row fails the test. Edit the
+table deliberately: a change to who may run a command is an authorization
+change and belongs in the PR description.

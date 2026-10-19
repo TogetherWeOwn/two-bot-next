@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use tracing::warn;
 use two_bot_core::self_roles::{
     event_order_from_snowflake, plan_select_delta, plan_self_role_change, PanelMode, PlanRejection,
     RoleOperation, SelfRolePanel, SelfRolePlan, SettledOutcome,
@@ -28,7 +29,11 @@ use two_bot_discord::{
     ActionExecutor,
 };
 
+#[cfg(not(test))]
 const STORE_TIMEOUT: Duration = Duration::from_secs(5);
+// Shared CI databases can stall for seconds; fixtures assert state, not latency.
+#[cfg(test)]
+const STORE_TIMEOUT: Duration = Duration::from_secs(60);
 const LANE_WAIT: Duration = Duration::from_secs(20);
 const LANE_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -117,9 +122,19 @@ pub(crate) struct SelfRoleRequest {
 }
 
 /// Scalar diagnostics only. Store/provider detail and claim tokens never escape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreErrorKind {
+    Timeout,
+    Database,
+    /// Receipt completion matched zero rows: the database answered
+    /// successfully but token, generation or disposition did not match.
+    /// Deliberately not `Stale` and not `Database`.
+    UnmatchedReceipt,
+}
+
 #[derive(Debug)]
 pub(crate) enum RuntimeError {
-    Store,
+    Store(StoreErrorKind),
     Rest(SelfRoleRestError),
     Stale,
     InvalidSnapshot,
@@ -131,12 +146,23 @@ async fn store_io<T>(
 ) -> Result<T, RuntimeError> {
     tokio::time::timeout(STORE_TIMEOUT, operation)
         .await
-        .map_err(|_| RuntimeError::Store)?
+        .map_err(|_| RuntimeError::Store(StoreErrorKind::Timeout))?
         .map_err(|error| match error {
             StoreError::StaleClaim => RuntimeError::Stale,
             StoreError::PendingExchange => RuntimeError::PendingExchange,
-            _ => RuntimeError::Store,
+            _ => RuntimeError::Store(StoreErrorKind::Database),
         })
+}
+
+async fn release_lane_or_warn(store: &SelfRoleStore, lane: &PanelClaim, event_id: &str) {
+    match store_io(store.release_panel_claim(lane)).await {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            event_id = %event_id,
+            "self-role panel claim release matched no current claim"
+        ),
+        Err(error) => warn!(?error, event_id = %event_id, "self-role panel claim release failed"),
+    }
 }
 
 /// Renewal is concurrent with REST/pacing/pool waits. Failure latches a shared
@@ -444,7 +470,7 @@ impl SelfRoleRuntime {
     ) -> Result<(), RuntimeError> {
         if let Some(receipt) = step_receipt(exchange) {
             if !store_io(self.store.complete_role_exchange(ticket, receipt)).await? {
-                return Err(RuntimeError::Store);
+                return Err(RuntimeError::Store(StoreErrorKind::UnmatchedReceipt));
             }
         }
         Ok(())
@@ -673,7 +699,7 @@ impl SelfRoleRuntime {
         // The write above is authoritative. Release failure must not falsely
         // turn an already committed success into a rejected audit/user reply.
         if let Some(lane) = &prepared.panel {
-            let _ = store_io(self.store.release_panel_claim(lane)).await;
+            release_lane_or_warn(&self.store, lane, &prepared.audit.event_id).await;
         }
         prepared._event_keeper.0.abort();
         prepared._panel_keeper.take();
@@ -712,7 +738,7 @@ impl SelfRoleRuntime {
         .await?;
         // Keep the last actual committed target, not the simulated intention.
         if let Some(lane) = &prepared.panel {
-            let _ = store_io(self.store.release_panel_claim(lane)).await;
+            release_lane_or_warn(&self.store, lane, &prepared.audit.event_id).await;
         }
         prepared._event_keeper.0.abort();
         prepared._panel_keeper.take();
@@ -725,7 +751,7 @@ impl SelfRoleRuntime {
         prepared._event_keeper.0.abort();
         prepared._panel_keeper.take();
         if let Some(lane) = &prepared.panel {
-            let _ = store_io(self.store.release_panel_claim(lane)).await;
+            release_lane_or_warn(&self.store, lane, &prepared.audit.event_id).await;
         }
     }
 
@@ -873,7 +899,7 @@ impl SelfRoleRuntime {
             _keeper: keeper,
         };
         let result = self.repair_terminal_owned(&mut owner, panel, &lane).await;
-        let _ = store_io(self.store.release_panel_claim(&lane.claim)).await;
+        release_lane_or_warn(&self.store, &lane.claim, &candidate.event_id).await;
         result
     }
 
@@ -1268,7 +1294,7 @@ impl SelfRoleRuntime {
             Ok(Err(code)) => return self.reject(audit, &event, lane.as_ref(), code).await,
             Err(err) => {
                 if let Some(lane) = &lane {
-                    let _ = store_io(self.store.release_panel_claim(lane)).await;
+                    release_lane_or_warn(&self.store, lane, &request.event_id).await;
                 }
                 return Err(err);
             }

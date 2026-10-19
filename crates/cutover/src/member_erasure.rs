@@ -2,9 +2,23 @@
 //!
 //! The embedded plan is reviewed code, never operator input. Count and delete
 //! use the same predicate; a row matching several identity columns counts once.
+//!
+//! One row is deliberately never selected: a `moderation_idempotency` request
+//! an operator reconciled and released (`done` / `operator_released`). Its
+//! Discord effect was never proven, so that row is the replay fence that stops a
+//! delayed delivery of the same key from claiming afresh and repeating the
+//! mutation. It retains guild/key scope, action, terminal state/outcome, generic
+//! result, timestamps and fixed non-identity `claim_token` / `request_hash`
+//! markers. The caller-supplied key may itself be a member snowflake; that
+//! identity-bearing exception remains because changing it would let a delayed
+//! delivery claim afresh. The linked `moderation_audit` row, including matching
+//! key and free-text reason, remains covered by the erasure manifest.
 
 use serde::Deserialize;
 use sqlx::{PgConnection, PgPool};
+
+pub(crate) const SCHEMA_GAP_REFUSAL: &str = "erasure schema coverage incomplete";
+pub(crate) const REPLAY_GUARD_REFUSAL: &str = "unresolved erasure replay guard";
 
 #[derive(Debug, Deserialize)]
 pub struct ErasurePlan {
@@ -119,6 +133,101 @@ pub async fn schema_gaps(conn: &mut PgConnection) -> Result<Vec<String>, sqlx::E
     Ok(gaps)
 }
 
+/// Guard fences shared by the per-member probe below and the guild-wide
+/// probe used by the guild-purge path. Every table here is guild-keyed, so
+/// the guild-wide probe scopes on `guild_id` alone.
+const REPLAY_GUARDS: &[(&str, &str)] = &[
+    ("internal_idempotency", "state <> 'completed'"),
+    ("moderation_idempotency", "state <> 'done'"),
+    (
+        "self_role_audit",
+        "outcome NOT IN ('assigned', 'removed', 'switched', 'already_held', 'already_absent', 'rejected') OR unresolved_added_role_ids::jsonb <> '[]'::jsonb OR unresolved_removed_role_ids::jsonb <> '[]'::jsonb",
+    ),
+    (
+        "self_role_panel_claims",
+        "processing_expires_at > clock_timestamp()",
+    ),
+    // Only a settled claim (result recorded) is a receipt. Every
+    // other state - fresh, started-uncertain, counted, released - must
+    // keep its row or a gateway retry could sanction twice.
+    ("automod_delivery_claims", "result_json IS NULL"),
+    // An in-flight or uncertain incident is the anti-nuke block and
+    // receipt: removing it could release a block or let a retry
+    // re-contain. Only settled incidents are erased.
+    ("containment_incidents", "state IN ('containing', 'uncertain')"),
+];
+
+/// Shared unresolved replay-guard probe used by both `erase_member` and the
+/// retention user-deletion path. Returns true when any guard fence is
+/// unresolved for (guild, member): in-flight idempotency intents, unsettled
+/// self-role effects/leases, unsettled automod claims, or active containment.
+/// Callers must refuse deletion while this returns true, leaving rows untouched.
+pub async fn has_unresolved_guards(
+    conn: &mut PgConnection,
+    guild: &str,
+    member: &str,
+) -> Result<bool, sqlx::Error> {
+    let plan = plan();
+    for &(table, unresolved_predicate) in REPLAY_GUARDS {
+        let entry = plan
+            .tables
+            .iter()
+            .find(|entry| entry.table == table)
+            .expect("replay guards must be in the erasure plan");
+        let sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM {table} WHERE ({}) AND ({unresolved_predicate}))",
+            entry.predicate
+        );
+        let unresolved = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql))
+            .bind(guild)
+            .bind(member)
+            .fetch_one(&mut *conn)
+            .await?;
+        if unresolved {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Guild-wide unresolved replay-guard probe for the guild-purge path.
+/// Returns true when any guard fence is unresolved anywhere in the guild
+/// (any member): in-flight idempotency intents, unsettled self-role
+/// effects/leases, unsettled automod claims, or active containment. The purge
+/// path must leave a guarded guild queued with rows untouched until the
+/// guards settle: wiping an in-flight intent row could let a still-pending
+/// request complete and double-apply on gateway retry, or release an active
+/// containment block.
+pub async fn has_unresolved_guild_guards(
+    conn: &mut PgConnection,
+    guild: &str,
+) -> Result<bool, sqlx::Error> {
+    let plan = plan();
+    for &(table, unresolved_predicate) in REPLAY_GUARDS {
+        plan.tables
+            .iter()
+            .find(|entry| entry.table == table)
+            .expect("replay guards must be in the erasure plan");
+        // Table names and predicates come from reviewed code, never caller input.
+        // No member exclusions: any unresolved guard anywhere in the guild
+        // defers the purge, including guards of members with a pending
+        // user-deletion request. Those rows are replay fences, not stale data,
+        // and the plan's per-member predicates go NULL on nullable columns, so
+        // an exclusion would hide other members' guards (NOT NULL is NULL).
+        let sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM {table} WHERE guild_id = $1 AND ({unresolved_predicate}))"
+        );
+        let unresolved = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql))
+            .bind(guild)
+            .fetch_one(&mut *conn)
+            .await?;
+        if unresolved {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Execute takes bounded locks before counting so concurrent inserts/updates
 /// cannot slip between count and delete. Child tables precede parents in the
 /// plan; execute rejects any count mismatch and rolls back, including audit.
@@ -175,9 +284,7 @@ pub async fn erase_member(
             .await?;
     }
     if !schema_gaps(&mut tx).await?.is_empty() {
-        return Err(sqlx::Error::InvalidArgument(
-            "erasure schema coverage incomplete".into(),
-        ));
+        return Err(sqlx::Error::InvalidArgument(SCHEMA_GAP_REFUSAL.into()));
     }
     let mut counts = Vec::new();
     for entry in &plan.tables {
@@ -198,45 +305,9 @@ pub async fn erase_member(
     if let ErasureMode::Execute { actor } = mode {
         // An unresolved intent is a replay/side-effect safety guard, not stale
         // member data. Preserve it and fail the whole operation until resolved.
-        for (table, unresolved_predicate) in [
-            ("internal_idempotency", "state <> 'completed'"),
-            ("moderation_idempotency", "state <> 'done'"),
-            (
-                "self_role_audit",
-                "outcome NOT IN ('assigned', 'removed', 'switched', 'already_held', 'already_absent', 'rejected') OR unresolved_added_role_ids::jsonb <> '[]'::jsonb OR unresolved_removed_role_ids::jsonb <> '[]'::jsonb",
-            ),
-            (
-                "self_role_panel_claims",
-                "processing_expires_at > clock_timestamp()",
-            ),
-            // Only a settled claim (result recorded) is a receipt. Every
-            // other state - fresh, started-uncertain, counted, released - must
-            // keep its row or a gateway retry could sanction twice.
-            ("automod_delivery_claims", "result_json IS NULL"),
-            // An in-flight or uncertain incident is the anti-nuke block and
-            // receipt: removing it could release a block or let a retry
-            // re-contain. Only settled incidents are erased.
-            ("containment_incidents", "state IN ('containing', 'uncertain')"),
-        ] {
-            let entry = plan
-                .tables
-                .iter()
-                .find(|entry| entry.table == table)
-                .expect("replay guards must be in the erasure plan");
-            let sql = format!(
-                "SELECT EXISTS (SELECT 1 FROM {table} WHERE ({}) AND ({unresolved_predicate}))",
-                entry.predicate
-            );
-            let unresolved = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql))
-                .bind(guild)
-                .bind(member)
-                .fetch_one(&mut *tx)
-                .await?;
-            if unresolved {
-                return Err(sqlx::Error::InvalidArgument(
-                    "unresolved erasure replay guard".into(),
-                ));
-            }
+        // Shared with the retention user-deletion path via has_unresolved_guards.
+        if has_unresolved_guards(&mut tx, guild, member).await? {
+            return Err(sqlx::Error::InvalidArgument(REPLAY_GUARD_REFUSAL.into()));
         }
         for (entry, count) in plan.tables.iter().zip(&counts) {
             let sql = format!("DELETE FROM {} WHERE {}", entry.table, entry.predicate);

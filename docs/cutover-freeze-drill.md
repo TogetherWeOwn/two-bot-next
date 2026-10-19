@@ -20,6 +20,9 @@ checks are `scripts/test_cutover_freeze_drill.py`.
   announcement or rules channel.
 - Drill slowmode is 30 seconds (inside the 0–21600 planner bound).
 - The drill never kicks, bans, deletes channels, or touches roles.
+- Authenticated Discord reads and writes refuse every redirect before a
+  follow-up request, even to the same origin. The fixed failure message and
+  receipt omit the bot token, redirect Location, headers and response body.
 - On any step failure the harness best-effort restores slowmode, the
   overwrite seed and the notice, then reports the failing step. A restore
   mismatch is `NEEDS WORK`, never a silent waiver.

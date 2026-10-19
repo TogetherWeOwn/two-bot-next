@@ -21,6 +21,9 @@
 //! * [`watermark_for`] / [`restorable_point`]: the restorable cursors. The
 //!   global restorable point is `MAX(id)`; per-table cursors advance with
 //!   `GREATEST`, so concurrent writers keep them monotonic.
+//! * [`snapshot`]: point, cursors and tips for the read-only `/ops`
+//!   roll-ups in one statement and one snapshot (per-table seeks, no full
+//!   journal scan).
 //! * [`entries_since`]: the replay read path — every journal row for a
 //!   table after a baseline id, in journal order.
 //! * [`COVERED_TABLES`]: the affected-table inventory the cutover procedure
@@ -29,9 +32,12 @@
 //!
 //! What this module is not: the rollback procedure itself (that stays in the
 //! runbook), and wiring into every writer (follow-up slices call [`record`]
-//! from their own write paths). Pre-images are TEXT JSON blobs, matching the
+//! for standalone writes, or [`record_in`] from inside their own write
+//! transaction, from their own write paths). Pre-images are TEXT JSON blobs, matching the
 //! funnel `events.metadata` convention — the journal is a restore source,
 //! not a query index, so there is no JSONB and no secondary parsing.
+
+use std::collections::BTreeMap;
 
 use sqlx::{Pool, Postgres, Transaction};
 use thiserror::Error;
@@ -218,6 +224,21 @@ pub enum JournalError {
 pub async fn record(pool: &Pool<Postgres>, entry: &JournalEntry) -> Result<i64, JournalError> {
     entry.validate()?;
     let mut tx = pool.begin().await?;
+    let id = record_in(&mut tx, entry).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Append `entry` and advance its table watermark inside the caller's
+/// transaction. Same inserts as [`record`], but the caller owns the commit:
+/// writers journaling inside their primary transaction call this under a
+/// savepoint, so the row and its evidence commit atomically and a journal
+/// failure rolls back only the savepoint.
+pub async fn record_in(
+    tx: &mut Transaction<'_, Postgres>,
+    entry: &JournalEntry,
+) -> Result<i64, JournalError> {
+    entry.validate()?;
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO rollback_journal (table_name, row_identity, op, pre_image)
          VALUES ($1, $2, $3, $4)
@@ -227,10 +248,9 @@ pub async fn record(pool: &Pool<Postgres>, entry: &JournalEntry) -> Result<i64, 
     .bind(&entry.row_identity)
     .bind(entry.op.as_str())
     .bind(entry.pre_image.as_deref())
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
-    advance_in(&mut tx, &entry.table_name, id).await?;
-    tx.commit().await?;
+    advance_in(&mut *tx, &entry.table_name, id).await?;
     Ok(id)
 }
 
@@ -286,6 +306,82 @@ pub async fn watermark_for(
             .fetch_optional(pool)
             .await?;
     Ok(id)
+}
+
+/// Every committed per-table cursor in one read, for the read-only `/ops`
+/// roll-ups. Tables without a committed watermark are absent from the map
+/// (see [`watermark_for`]).
+pub async fn watermarks(pool: &Pool<Postgres>) -> Result<BTreeMap<String, i64>, JournalError> {
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT table_name, last_journal_id FROM rollback_watermarks")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Newest journal id per table, for the read-only `/ops` roll-ups. Served
+/// by one per-table backward seek on `idx_rollback_journal_table_seq`
+/// (never a `GROUP BY` over the whole journal: PostgreSQL has no loose
+/// index scan for `GROUP BY ... MAX`, so the grouped form degrades to a
+/// full scan on a large append-only journal). Tables with no journal rows
+/// are absent from the map. Per-table lag is tip minus watermark: the
+/// global point minus the watermark would count other tables' writes, not
+/// this table's backlog. Implemented as [`snapshot`] so tips share one
+/// snapshot with cursors and the point.
+pub async fn table_tips(pool: &Pool<Postgres>) -> Result<BTreeMap<String, i64>, JournalError> {
+    Ok(snapshot(pool).await?.tips)
+}
+
+/// Point, cursors and tips for the read-only `/ops` roll-ups in one
+/// statement and therefore one snapshot. Per-table tips are correlated
+/// `MAX(id)` seeks over `idx_rollback_journal_table_seq` (one backward
+/// index seek per covered table); the point is the global `MAX(id)` from
+/// the same snapshot via the primary key. A single statement matters:
+/// separate reads each take their own `READ COMMITTED` snapshot, so a
+/// commit between them can pair a new tip with an old watermark and report
+/// a lag that counts other tables' writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub point: i64,
+    pub cursors: BTreeMap<String, i64>,
+    pub tips: BTreeMap<String, i64>,
+}
+
+/// Read [`Snapshot`] in a single statement over [`COVERED_TABLES`].
+pub async fn snapshot(pool: &Pool<Postgres>) -> Result<Snapshot, JournalError> {
+    let tables: Vec<String> = COVERED_TABLES
+        .iter()
+        .map(|table| (*table).to_owned())
+        .collect();
+    let rows: Vec<(String, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
+        "SELECT t.name,
+                w.last_journal_id,
+                (SELECT MAX(j.id) FROM rollback_journal j WHERE j.table_name = t.name),
+                p.point
+         FROM unnest($1::text[]) AS t(name)
+         LEFT JOIN rollback_watermarks w ON w.table_name = t.name
+         CROSS JOIN (SELECT COALESCE(MAX(id), 0) AS point FROM rollback_journal) p",
+    )
+    .bind(&tables)
+    .fetch_all(pool)
+    .await?;
+    let mut cursors = BTreeMap::new();
+    let mut tips = BTreeMap::new();
+    let mut point = 0;
+    for (table, watermark, tip, row_point) in rows {
+        point = row_point;
+        if let Some(mark) = watermark {
+            cursors.insert(table.clone(), mark);
+        }
+        if let Some(tip) = tip {
+            tips.insert(table, tip);
+        }
+    }
+    Ok(Snapshot {
+        point,
+        cursors,
+        tips,
+    })
 }
 
 /// The global restorable point: the newest journal id across all tables.

@@ -16,6 +16,7 @@
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, PgPool, Row};
+use tracing::warn;
 
 use crate::containment::{
     ClaimedContainmentEvent, ContainmentDisposition, ContainmentEventState, ContainmentIncident,
@@ -208,9 +209,9 @@ impl ContainmentStore {
         let heat_column =
             i32::try_from(heat).map_err(|_| ContainmentStoreError::Invalid("incident heat"))?;
         let now = iso_in_range(now_ms).ok_or(ContainmentStoreError::Invalid("processing time"))?;
-        let cooldown_until_ms = now_ms.saturating_add(policy.window_ms());
-        let cooldown = iso_in_range(cooldown_until_ms)
-            .ok_or(ContainmentStoreError::Invalid("cooldown time"))?;
+        let requested_cooldown_ms = now_ms.saturating_add(policy.window_ms());
+        let cooldown_until_ms = requested_cooldown_ms.min(MAX_ISO_MS);
+        let cooldown = format_iso_millis(cooldown_until_ms);
         let guild = trigger.event.guild_id.as_str();
         let id = trigger.event.audit_entry_id.as_str();
 
@@ -271,6 +272,12 @@ impl ContainmentStore {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        if requested_cooldown_ms > MAX_ISO_MS {
+            warn!(
+                incident_id = id,
+                "containment_cooldown_capped: window ends past the store's last instant"
+            );
+        }
         Ok(IncidentClaim::Started(ContainmentIncident {
             id: id.to_owned(),
             guild_id: guild.to_owned(),

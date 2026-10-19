@@ -1,0 +1,6 @@
+id: rust-wildcard-access-denied
+valid:
+- fn f() { match result { Err(RoomHttpError::AccessDenied) => RoomHttpError::AccessDenied, Err(e) => e, Ok(v) => v } }
+invalid:
+- fn f() { match result { Err(_) => RoomHttpError::AccessDenied, Ok(v) => v } }
+- fn f() { match result { Err(_) => return Err(RoomHttpError::AccessDenied), Ok(v) => v } }

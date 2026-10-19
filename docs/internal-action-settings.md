@@ -4,6 +4,10 @@ The settings executor is independent of the HTTP receiver and runtime hot-reload
 application. Its caller must enforce the signed action allowlist and claim the
 outer durable idempotency key before executing `settings.set`. Replaying that
 stored result must not execute another write, audit row or version increment.
+Re-checked at `86a6668a7`: the receiver now does exactly this — `write_setting`
+claims (`crates/bot/src/internal_action_http.rs:1287`) before
+`execute_settings` (`:1298`), and a replay returns the stored result without
+re-writing (`:1289-1290`).
 
 ## Legacy response contract
 
@@ -35,6 +39,9 @@ at the action boundary because database errors can include row values. Decoded
 U+0000 in any value string or nested object key is refused before SQL with a
 non-retryable `malformed`/400 result; Postgres JSONB cannot store it. The refusal
 contains no submitted value. A literal backslash-u escape is not a decoded NUL.
+`TWO_ONBOARDING_DRY_RUN` and `TWO_SELF_ROLE_DRY_RUN` accept only a boolean, `0`
+or `1`; any other value is refused before SQL with a non-retryable
+`malformed`/400 result (`settings_value_invalid`) that names no submitted value.
 
 ## Execution and optimistic concurrency
 
@@ -96,7 +103,20 @@ activation. This executor does not provision roles or credentials.
 The outer durable store and this transaction are separate. A receiver must not
 re-execute an ambiguous write after losing a terminal-response commit. Its
 terminal-response adapter must preserve the value-free `{key,outcome}` result;
-HTTP/durable-result integration belongs to the receiver slice.
+HTTP/durable-result integration belongs to the receiver slice. Re-checked at
+`86a6668a7`: that integration has since landed in
+`crates/bot/src/internal_action_http.rs:1255-1310` (`write_setting`;
+`read_setting` at `:1228-1242`).
+
+Replaying a stored `settings.set` success rebuilds the value-free
+`{key,outcome}` result from the claimed body and re-reads the current CAS
+token for the `version` envelope metadata. A failed version side-read
+(unparsable claimed body or store error) fails closed with HTTP 409
+`needs_reconciliation` (`retryable: false`, no `idempotent-replay` marker),
+never a fabricated `version: 0` success. `version: 0` means only an absent
+override (for example after deletion), never an unknown store state. Pinned by
+`settings_set_replay_side_read_failure_needs_reconciliation` in
+`crates/bot/src/internal_action_http/tests/settings.rs`.
 
 ## Verification
 

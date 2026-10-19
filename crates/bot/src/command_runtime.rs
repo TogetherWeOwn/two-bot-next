@@ -62,6 +62,7 @@ use twilight_model::{
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
+    automod_runtime::FunnelDisposition,
     commands::PERM_MANAGE_GUILD,
     feeds::{
         feed_list_text, feed_removed_text, plan_command, FeedCommand, FeedCommandContext,
@@ -87,7 +88,12 @@ use two_bot_discord::{
 };
 
 use crate::activation::BootActivation;
-use crate::interaction_admission::{accepts_busy_reply, is_privileged, UserSlots, BUSY_REPLY};
+use crate::db_log::{
+    channel_response_class, db_class, discord_class, feed_store_class, leveling_class,
+};
+use crate::interaction_admission::{
+    accepts_busy_reply, is_privileged, UserSlots, BUSY_REPLY, PER_USER_IN_FLIGHT,
+};
 
 /// Audit-log reason for retiring the previous sticky (legacy audits carry a
 /// free-text reason; kept short — `audit_reason` caps at 512 chars).
@@ -143,18 +149,67 @@ pub type VoiceKickVote =
 /// `PRIVILEGED` is reserved for permission-gated slash commands from members who
 /// hold the permission; open interactions never enter it, so a burst of them
 /// cannot starve moderation. `BUSY` carries the one-call "busy" replies.
-const DISPATCH_LIMITS: [usize; 5] = [16, 16, 1, 8, 8];
-const LANE_MESSAGES: usize = 0;
+/// `REACTIONS` keeps self-role reaction bursts off the message lane, so neither
+/// burst can discard the other's automations.
+pub(crate) const DISPATCH_LIMITS: [usize; 6] = [16, 16, 1, 8, 8, 8];
+pub(crate) const LANE_MESSAGES: usize = 0;
 const LANE_INTERACTIONS: usize = 1;
 const LANE_REGISTRY: usize = 2;
 const LANE_PRIVILEGED: usize = 3;
-const LANE_BUSY: usize = 4;
+pub(crate) const LANE_BUSY: usize = 4;
+pub(crate) const LANE_REACTIONS: usize = 5;
+
+// A single member's reaction burst must leave room for other members: the
+// per-member budget stays strictly below the lane cap, so fairness holds even
+// before the saturation drop is reached.
+const _: () = assert!(
+    PER_USER_IN_FLIGHT < DISPATCH_LIMITS[LANE_REACTIONS],
+    "per-member reaction budget must leave room for other members"
+);
+
+/// Seconds between saturation `warn!` lines per runtime (TOG-19878). The
+/// drop counter increments on every event; the log samples the first drop in
+/// each window so a burst is O(1) lines.
+const SATURATION_LOG_WINDOW_SECS: u64 = 60;
 
 #[derive(Default)]
 struct DispatchTasks {
     stopped: bool,
     lanes: [Vec<tokio::task::AbortHandle>; DISPATCH_LIMITS.len()],
+    /// Per-lane drops (test-visible mirror of the global
+    /// `two_bot_dispatch_drops_total{lane}` counter, incremented alongside by
+    /// `DispatchTasks::record_drop`; fairness drops share their lane's
+    /// counter).
+    drops: [u64; DISPATCH_LIMITS.len()],
+    last_drop_log: Option<std::time::Instant>,
 }
+
+impl DispatchTasks {
+    /// Record a refused event on `lanes`: increment each lane's drop counter
+    /// (test-visible mirror of the global `two_bot_dispatch_drops_total{lane}`
+    /// counter, incremented alongside) and emit at most one `warn!` per 60 s
+    /// per runtime. Fairness drops share their lane's counter so every refused
+    /// event stays observable through one path; each caller keeps its own
+    /// sampled message so existing log filters keep matching.
+    fn record_drop(&mut self, lanes: &[usize], reason: &'static str, message: &'static str) {
+        for &lane in lanes {
+            self.drops[lane] = self.drops[lane].saturating_add(1);
+            two_bot_core::metrics::global()
+                .dispatch_drop(two_bot_core::metrics::DISPATCH_LANES[lane]);
+        }
+        let now = std::time::Instant::now();
+        let due = self
+            .last_drop_log
+            .is_none_or(|at| now.duration_since(at).as_secs() >= SATURATION_LOG_WINDOW_SECS);
+        if due {
+            self.last_drop_log = Some(now);
+            warn!(?lanes, reason, "{message}");
+        }
+    }
+}
+
+// Lane labels stay in `DISPATCH_LIMITS` order with the global metric allowlist.
+const _: () = assert!(two_bot_core::metrics::DISPATCH_LANES.len() == DISPATCH_LIMITS.len());
 
 /// Cancels admitted work on gateway exit, including supervisor cancellation.
 /// Interrupted channel effects retain their durable claims for reconciliation.
@@ -275,6 +330,7 @@ impl CommandRuntime {
             pool.clone(),
             executor.clone(),
             0,
+            two_bot_core::ClassifierConfig::from_env(),
         );
         let channel = ChannelModerationRuntime::new(
             ChannelModerationStore::from_pool(pool.clone()),
@@ -303,6 +359,12 @@ impl CommandRuntime {
         })
     }
 
+    /// Test-only access to the shared interaction surface for identity assertions.
+    #[cfg(test)]
+    pub(crate) fn test_interactions(&self) -> &two_bot_discord::interactions::InteractionRuntime {
+        &self.interactions
+    }
+
     pub(crate) fn published_commands(&self) -> Option<Arc<[two_bot_core::CommandDefinition]>> {
         if let Some(custom) = self.gateway_commands.get() {
             return custom.published_commands();
@@ -325,8 +387,11 @@ impl CommandRuntime {
     /// boot-composed service shared with the recovery job; only its presence
     /// opens the self-role router surface. `member` is the boot-composed
     /// member-moderation consumer shared with the unban sweep; only its
-    /// presence opens the five member verbs.
+    /// presence opens the five member verbs. `voice_live` is whether the voice
+    /// sink actually built (not just `TWO_VOICE=1`): the voice commands publish
+    /// only while something is there to answer them.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn from_env(
         pool: Pool<Postgres>,
         token: &str,
@@ -335,11 +400,12 @@ impl CommandRuntime {
         onboarding: two_bot_core::OnboardingGates,
         member: Option<Arc<MemberRuntime>>,
         activation: &BootActivation,
+        voice_live: bool,
     ) -> Option<Arc<Self>> {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
             Err(err) => {
-                warn!(error = %err, "feature gates invalid; command runtime disabled");
+                warn!(reason = %err, "feature gates invalid; command runtime disabled");
                 return None;
             }
         };
@@ -351,7 +417,7 @@ impl CommandRuntime {
                 match ModerationGates::from_env() {
                     Ok(moderation) => moderation,
                     Err(err) => {
-                        warn!(error = %err, "moderation gates invalid; command runtime disabled");
+                        warn!(reason = %err, "moderation gates invalid; command runtime disabled");
                         return None;
                     }
                 }
@@ -369,6 +435,9 @@ impl CommandRuntime {
             &moderation,
             SurfaceFlags {
                 scorecard: std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|value| value == "1"),
+                voice: voice_live,
+                voice_assistant: two_bot_core::voice_assistant::AssistantConfig::from_env()
+                    .is_some(),
                 session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
                 tickets: ticket_config.is_some(),
                 self_roles: self_roles.is_some(),
@@ -382,14 +451,14 @@ impl CommandRuntime {
             match two_bot_core::send_admission::PgSendAdmission::new(pool.clone(), token) {
                 Ok(admission) => Arc::new(admission),
                 Err(err) => {
-                    warn!(error = %err, "send admission invalid; command runtime disabled");
+                    warn!(reason = %err, "send admission invalid; command runtime disabled");
                     return None;
                 }
             };
         let executor = match ActionExecutor::with_admission(token.to_owned(), proxy, admission) {
             Ok(executor) => executor,
             Err(err) => {
-                warn!(error = %err, "REST executor failed to build; command runtime disabled");
+                warn!(reason = %err, "REST executor failed to build; command runtime disabled");
                 return None;
             }
         };
@@ -402,6 +471,9 @@ impl CommandRuntime {
                     pool.clone(),
                     executor.clone(),
                     config,
+                    std::env::vars()
+                        .filter(|(key, _)| crate::ticket_runtime::LIVE_KEYS.contains(&key.as_str()))
+                        .collect(),
                 ) {
                     Ok(runtime) => Some(Arc::new(runtime)),
                     Err(_) => return None,
@@ -495,6 +567,20 @@ impl CommandRuntime {
             .map(|_| ())
     }
 
+    #[cfg(test)]
+    pub(crate) fn initialize_custom_commands_for_test(
+        &self,
+        config: crate::gateway_commands::GatewayCommandConfig,
+    ) {
+        let commands = crate::gateway_commands::GatewayCommands::for_test(
+            self.pool.clone(),
+            self.executor.clone(),
+            config,
+            Arc::clone(&self.interactions.router),
+        );
+        assert!(self.gateway_commands.set(commands).is_ok());
+    }
+
     /// Test constructor: skips env gate reads so tests inject their own
     /// router, executor (mock REST), and automations flag directly.
     #[cfg(test)]
@@ -561,13 +647,56 @@ impl CommandRuntime {
         runtime
     }
 
+    /// Dispatch alongside ordered RSVP execution. That path owns RSVP replies
+    /// (including refusals) and publishes the full registry before polling.
+    /// Keep the standalone dispatch fallback for gateway callers without it.
+    pub(crate) fn dispatch_remaining(self: &Arc<Self>, event: &Event) {
+        match event {
+            Event::Ready(ready) => {
+                // The ordered surface owns registry publication; identity still
+                // initializes here so LFG keeps READY's ids without a REST read.
+                // A READY-supplied id never overwrites the boot pin on faith.
+                let ready_application = ready.application.id.get();
+                let pinned = self.application_id.load(Ordering::Relaxed);
+                if pinned == 0 || pinned == ready_application {
+                    self.set_identity(ready.user.id.get(), ready_application);
+                } else {
+                    warn!(
+                        application_id = ready_application,
+                        "READY identity differs from boot token; identity not armed"
+                    );
+                }
+                self.dispatch_ticket_connection(event);
+                return;
+            }
+            Event::Resumed => {
+                self.dispatch_ticket_connection(event);
+                return;
+            }
+            Event::InteractionCreate(interaction)
+                if self
+                    .executor
+                    .command_identities()
+                    .slash_name(&interaction.0)
+                    .is_some_and(|name| {
+                        matches!(name.as_str(), "rsvp" | "rsvp-attendance" | "attendance")
+                    }) =>
+            {
+                return;
+            }
+            _ => {}
+        }
+        self.dispatch(event);
+    }
+
     pub(crate) fn dispatch_guard(self: &Arc<Self>) -> CommandDispatchGuard {
         CommandDispatchGuard(Arc::clone(self))
     }
 
     /// The one process executor (admission lane and pacing included); other
-    /// runtimes (onboarding, automod) render through a clone, never a private
-    /// client.
+    /// runtimes (onboarding, automod) and the ordered interaction surface
+    /// render through a clone, never a private client. One token key, one
+    /// pacing lane, one governed admission for both surfaces.
     pub fn executor(&self) -> ActionExecutor {
         self.executor.clone()
     }
@@ -580,7 +709,10 @@ impl CommandRuntime {
         self.spawn_first(&[lane], work)
     }
 
-    /// Admit `work` into the first of `lanes` that has room.
+    /// Admit `work` into the first of `lanes` that has room. A drop with
+    /// every attempted lane full increments each attempted lane's saturation
+    /// counter (single-lane calls stay 1:1; the privileged spill pair counts
+    /// both lanes) and emits at most one `warn!` per 60 s per runtime.
     fn spawn_first(
         &self,
         lanes: &[usize],
@@ -599,7 +731,11 @@ impl CommandRuntime {
                 return true;
             }
         }
-        warn!(?lanes, "command dispatch saturated; event not admitted");
+        tasks.record_drop(
+            lanes,
+            "lane saturated",
+            "command dispatch saturated; event not admitted (sampled; see two_bot_dispatch_drops_total)",
+        );
         false
     }
 
@@ -667,7 +803,11 @@ impl CommandRuntime {
                 .answer_interaction(target.interaction_id, &target.token, &ephemeral(BUSY_REPLY))
                 .await
             {
-                warn!(interaction_id = target.interaction_id, %error, "busy reply failed");
+                warn!(
+                    interaction_id = target.interaction_id.to_string(),
+                    reason = discord_class(&error),
+                    "busy reply failed"
+                );
             }
         });
     }
@@ -700,6 +840,44 @@ impl CommandRuntime {
         runtime
     }
 
+    /// Test-only lane depth: prunes finished tasks, then reports the live
+    /// count for `lane`. Reactions run on `LANE_REACTIONS`; the bound test
+    /// asserts this never exceeds `DISPATCH_LIMITS[LANE_REACTIONS]`.
+    #[cfg(test)]
+    pub(crate) fn lane_in_flight(&self, lane: usize) -> usize {
+        let mut tasks = self.tasks.lock().expect("command task scope");
+        tasks.lanes[lane].retain(|handle| !handle.is_finished());
+        tasks.lanes[lane].len()
+    }
+
+    /// Test-only lane occupant: holds one slot for `duration` so the bound
+    /// test can saturate the lane without database or REST work.
+    #[cfg(test)]
+    pub(crate) fn hold_lane_for_test(&self, lane: usize, duration: std::time::Duration) -> bool {
+        self.spawn(lane, async move {
+            tokio::time::sleep(duration).await;
+        })
+    }
+
+    /// Test-only per-member occupancy: claims one [`PER_USER_IN_FLIGHT`] slot
+    /// for `user` without touching any lane, so the fairness test can pin a
+    /// single-member burst deterministically instead of racing task settle.
+    #[cfg(test)]
+    pub(crate) fn acquire_user_slot_for_test(
+        &self,
+        user: u64,
+    ) -> Option<crate::interaction_admission::UserSlot> {
+        self.user_slots.acquire(user)
+    }
+
+    /// Test-only saturation count for `lane`: every `spawn_first` drop
+    /// increments it alongside the global metric, so the pin stays
+    /// deterministic under parallel suites that share the global registry.
+    #[cfg(test)]
+    pub(crate) fn dispatch_drops_total(&self, lane: usize) -> u64 {
+        self.tasks.lock().expect("command task scope").drops[lane]
+    }
+
     #[cfg(test)]
     pub(crate) fn with_tickets(
         pool: Pool<Postgres>,
@@ -713,6 +891,8 @@ impl CommandRuntime {
             automations: false,
             announcements: false,
             moderation: false,
+            voice: false,
+            voice_assistant: false,
             self_roles: false,
             onboarding_picker: false,
             session_picker: false,
@@ -739,6 +919,17 @@ impl CommandRuntime {
         self.tickets.as_ref().and_then(|tickets| tickets.start())
     }
 
+    fn voice_owns_interaction(&self, interaction: &Interaction) -> bool {
+        let application_id = self.application_id.load(Ordering::Relaxed);
+        if application_id != 0 && interaction.application_id.get() != application_id {
+            return false;
+        }
+        self.executor
+            .command_identities()
+            .slash_name(interaction)
+            .is_some_and(|name| self.interactions.router.voice_owns_command(&name))
+    }
+
     /// Admit before spawning, without waiting on SQL/REST in the shard loop.
     /// Saturated lanes drop events without effects, queued waiters or tokens in
     /// logs. READY/RESUMED publication has independent capacity; overlapping
@@ -746,6 +937,29 @@ impl CommandRuntime {
     /// Custom commands answer first and report ownership, so sticky/feed
     /// routing never sends a second response after an acknowledgement.
     pub fn dispatch(self: &Arc<Self>, event: &Event) -> bool {
+        self.dispatch_with_verdict(event, None)
+    }
+
+    /// Record a refused prefix candidate without dispatching the message.
+    /// Called by the ordered gateway worker when its capture-only gate stops a
+    /// create before the detached handler can account for the refusal.
+    pub(crate) fn record_refused_prefix_trigger(&self, event: &Event) {
+        if let Event::MessageCreate(message) = event {
+            if let Some(custom) = self.gateway_commands.get() {
+                custom.record_refused_prefix_trigger(&message.0);
+            }
+        }
+    }
+
+    /// Message dispatch with the automod verdict for this create. `None` keeps
+    /// the configured acceptance (the `TWO_AUTOMOD=0` fast path); the gateway
+    /// worker passes its verdict once automod has decided, and the trigger
+    /// handler fails a missing verdict closed.
+    pub fn dispatch_with_verdict(
+        self: &Arc<Self>,
+        event: &Event,
+        verdict: Option<FunnelDisposition>,
+    ) -> bool {
         if let Some(custom) = self.gateway_commands.get() {
             custom.observe(event);
         }
@@ -758,14 +972,27 @@ impl CommandRuntime {
                 let message = message.0.clone();
                 self.spawn(LANE_MESSAGES, async move {
                     if let Some(custom) = runtime.gateway_commands.get() {
-                        custom.handle_message(&message).await;
+                        custom.handle_message(&message, verdict).await;
                     }
                     runtime.on_message(&message).await;
                 })
             }
             Event::InteractionCreate(interaction) => {
+                let Some(interaction) = self
+                    .executor
+                    .command_identities()
+                    .resolve_interaction(&interaction.0)
+                else {
+                    return true;
+                };
+                // The gateway also delivers these to the live voice sink. Yield
+                // before user-slot/lane admission so overload cannot answer a
+                // voice-owned command with the shared runtime's busy callback.
+                if self.voice_owns_interaction(&interaction) {
+                    return true;
+                }
                 let runtime = Arc::clone(self);
-                let interaction = interaction.0.clone();
+                let interaction = interaction.into_owned();
                 let is_ticket = matches!(
                     interaction.data.as_ref(),
                     Some(twilight_model::application::interaction::InteractionData::MessageComponent(component))
@@ -780,14 +1007,8 @@ impl CommandRuntime {
                     self.admit_interaction(interaction)
                 }
             }
-            Event::ReactionAdd(reaction) => {
-                self.dispatch_self_role_reaction(&reaction.0, false);
-                true
-            }
-            Event::ReactionRemove(reaction) => {
-                self.dispatch_self_role_reaction(&reaction.0, true);
-                true
-            }
+            Event::ReactionAdd(reaction) => self.dispatch_self_role_reaction(&reaction.0, false),
+            Event::ReactionRemove(reaction) => self.dispatch_self_role_reaction(&reaction.0, true),
             Event::Ready(ready) => {
                 // A READY-supplied application id never overwrites the boot
                 // pin on faith: arm identity only when the token-derived pin
@@ -813,17 +1034,10 @@ impl CommandRuntime {
                 })
             }
             Event::Resumed => {
-                if let Some(tickets) = &self.tickets {
-                    let runtime = Arc::clone(self);
-                    // Saved sessions emit RESUMED without READY. Resolve the
-                    // authenticated USER through the shared executor before
-                    // waking maintenance; application ids are not author ids.
-                    // Keep the lookup in the ticket shutdown scope, independent
-                    // of registry publication and its success/dedup gate.
-                    tickets.spawn(async move {
-                        runtime.ready_tickets_after_resume().await;
-                    });
-                }
+                // Saved sessions emit RESUMED without READY: wake ticket
+                // maintenance through the shared ticket scope before the
+                // registry sync, exactly as the ordered surface does.
+                self.dispatch_ticket_connection(event);
                 let runtime = Arc::clone(self);
                 self.spawn(LANE_REGISTRY, async move {
                     runtime.publish_registry(None).await;
@@ -833,19 +1047,55 @@ impl CommandRuntime {
         }
     }
 
-    fn dispatch_self_role_reaction(&self, reaction: &GatewayReaction, remove: bool) {
-        if !self.interactions.router.gates().self_roles {
+    /// Ticket identity is independent of which runtime owns registry publication.
+    fn dispatch_ticket_connection(self: &Arc<Self>, event: &Event) {
+        let Some(tickets) = &self.tickets else {
             return;
+        };
+        match event {
+            Event::Ready(ready) => tickets.on_ready(ready.user.id.get()),
+            Event::Resumed => {
+                let runtime = Arc::clone(self);
+                // Application ids are not author ids. Keep this lookup within
+                // the ticket shutdown scope, independent of registry sync.
+                tickets.spawn(async move {
+                    runtime.ready_tickets_after_resume().await;
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Reactions run on their own lane: a reaction burst must consume neither
+    /// message automation capacity nor interaction acknowledgement capacity.
+    /// Per-member fairness mirrors the interaction lane: one member holds at
+    /// most [`PER_USER_IN_FLIGHT`] reaction slots, so a single-member burst
+    /// cannot fill `LANE_REACTIONS` and starve other members. Excess reactions
+    /// drop (`false`) through the same counted, log-sampled path as saturated
+    /// lanes; no busy reply exists on the reaction path, which carries no
+    /// interaction token.
+    fn dispatch_self_role_reaction(&self, reaction: &GatewayReaction, remove: bool) -> bool {
+        if !self.interactions.router.gates().self_roles {
+            return true;
         }
         let Some(service) = self.self_roles.as_ref().cloned() else {
-            return;
+            return true;
         };
         let Some(input) = service.reaction_input(reaction, remove) else {
-            return;
+            return true;
         };
-        drop(tokio::spawn(async move {
+        let Some(slot) = self.user_slots.acquire(reaction.user_id.get()) else {
+            self.tasks.lock().expect("command task scope").record_drop(
+                &[LANE_REACTIONS],
+                "reaction per-member cap reached",
+                "command dispatch fairness drop; event not admitted (sampled; see two_bot_dispatch_drops_total)",
+            );
+            return false;
+        };
+        self.spawn(LANE_REACTIONS, async move {
+            let _slot = slot;
             let _ = service.handle(&input).await;
-        }));
+        })
     }
 
     async fn self_role_component(&self, interaction: &Interaction) {
@@ -998,13 +1248,21 @@ impl CommandRuntime {
         if application_id != 0 && interaction.application_id.get() != application_id {
             return;
         }
+        let Some(interaction) = self
+            .executor
+            .command_identities()
+            .resolve_interaction(interaction)
+        else {
+            return;
+        };
+        let interaction = interaction.as_ref();
         if ChannelModerationRuntime::accepts(interaction) {
             if let Err(error) = self
                 .channel
                 .respond(&self.interactions.router, interaction)
                 .await
             {
-                warn!(interaction_id = %interaction.id.get(), error = %error, "channel response failed; no effect retry");
+                warn!(interaction_id = %interaction.id.get(), reason = channel_response_class(&error), "channel response failed; no effect retry");
             }
             return;
         }
@@ -1030,7 +1288,7 @@ impl CommandRuntime {
                 .is_err()
             {
                 warn!(
-                    interaction_id = interaction.id.get(),
+                    interaction_id = interaction.id.get().to_string(),
                     "LFG execution failed; details withheld"
                 );
             }
@@ -1098,7 +1356,7 @@ impl CommandRuntime {
             // Leveling owns its immediate rank-ephemeral/leaderboard-public
             // callback. Never send the generic ephemeral defer as well.
             if let Err(error) = self.leveling.handle_interaction(interaction, handler).await {
-                warn!(interaction_id = %interaction.id.get(), command = %name, error = %error, "leveling interaction failed");
+                warn!(interaction_id = %interaction.id.get(), command = %name, reason = leveling_class(&error), "leveling interaction failed");
             }
             return;
         }
@@ -1114,6 +1372,7 @@ impl CommandRuntime {
         }
         let owner = match name.as_str() {
             "help" => Some(HandlerId::Help),
+            "privacy" => Some(HandlerId::Privacy),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
             }
@@ -1143,6 +1402,10 @@ impl CommandRuntime {
             return;
         }
         match name.as_str() {
+            "privacy" => {
+                crate::privacy_command::privacy_command(&self.pool, &self.executor, interaction)
+                    .await;
+            }
             "sticky" => self.sticky_set(interaction).await,
             "sticky-remove" => self.sticky_remove(interaction).await,
             "feed-add" => self.feed_add(interaction).await,
@@ -1224,7 +1487,7 @@ impl CommandRuntime {
         }
         if self
             .executor
-            .answer_interaction(
+            .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
                 &interaction.token,
                 &InteractionResponse {
@@ -1250,7 +1513,11 @@ impl CommandRuntime {
         };
         if self
             .executor
-            .edit_interaction_response(interaction.application_id.get(), &interaction.token, &reply)
+            .edit_interaction_response_with_blocked_retry(
+                interaction.application_id.get(),
+                &interaction.token,
+                &reply,
+            )
             .await
             .is_err()
         {
@@ -1272,7 +1539,10 @@ impl CommandRuntime {
         let state = match store::get_sticky(&self.pool, &guild_id, &channel_id).await {
             Ok(state) => state,
             Err(err) => {
-                warn!(error = %err, "sticky lookup failed; skipping activity");
+                warn!(
+                    reason = db_class(&err),
+                    "sticky lookup failed; skipping activity"
+                );
                 return ActivityOutcome::None;
             }
         };
@@ -1292,7 +1562,10 @@ impl CommandRuntime {
             {
                 Ok(grant) => grant,
                 Err(err) => {
-                    warn!(error = %err, "sticky claim failed; skipping activity");
+                    warn!(
+                        reason = db_class(&err),
+                        "sticky claim failed; skipping activity"
+                    );
                     return ActivityOutcome::None;
                 }
             })
@@ -1348,7 +1621,10 @@ impl CommandRuntime {
                         // Record failed — the post may be live but unrecorded,
                         // so roll back what we can: release our claim and
                         // delete the orphan, then audit post_failed.
-                        warn!(error = %err, "sticky record failed; rolling back");
+                        warn!(
+                            reason = db_class(&err),
+                            "sticky record failed; rolling back"
+                        );
                         self.release(&guild_id, &channel_id, &claim_token).await;
                         self.delete_quiet(&channel_id, &message_id, ORPHAN_REASON)
                             .await;
@@ -1471,7 +1747,7 @@ impl CommandRuntime {
                 self.finish(interaction, reply).await;
             }
             Err(err) => {
-                warn!(error = %err, "sticky put failed");
+                warn!(reason = db_class(&err), "sticky put failed");
                 self.finish(interaction, STORE_FAILURE_REPLY).await;
             }
         }
@@ -1519,7 +1795,7 @@ impl CommandRuntime {
                 self.finish(interaction, sticky_removed_reply(false)).await;
             }
             Err(err) => {
-                warn!(error = %err, "sticky delete failed");
+                warn!(reason = db_class(&err), "sticky delete failed");
                 self.finish(interaction, STORE_FAILURE_REPLY).await;
             }
         }
@@ -1556,8 +1832,12 @@ impl CommandRuntime {
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Add(relay)) => {
                 if let Err(err) = add_feed(&self.pool, &relay).await {
-                    warn!(error = %err, "feed insert failed");
-                    self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    if let two_bot_core::feeds_store::FeedStoreError::Capacity(quota) = err {
+                        self.finish(interaction, quota.to_string()).await;
+                    } else {
+                        warn!(reason = feed_store_class(&err), "feed insert failed");
+                        self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
+                    }
                     return;
                 }
                 self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str())
@@ -1599,7 +1879,7 @@ impl CommandRuntime {
                         self.finish(interaction, feed_removed_text(removed)).await;
                     }
                     Err(err) => {
-                        warn!(error = %err, "feed remove failed");
+                        warn!(reason = feed_store_class(&err), "feed remove failed");
                         self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
                     }
                 }
@@ -1623,7 +1903,7 @@ impl CommandRuntime {
                 match list_feeds(&self.pool, &guild_id, false).await {
                     Ok(feeds) => self.finish(interaction, feed_list_text(&feeds)).await,
                     Err(err) => {
-                        warn!(error = %err, "feed list failed");
+                        warn!(reason = feed_store_class(&err), "feed list failed");
                         self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
                     }
                 }
@@ -1668,7 +1948,12 @@ impl CommandRuntime {
             now_ms: now_millis_for_test(),
         };
         if let Err(err) = write_audit(&self.pool, &row).await {
-            warn!(action, outcome, error = %err, "feed audit write failed");
+            warn!(
+                action,
+                outcome,
+                reason = feed_store_class(&err),
+                "feed audit write failed"
+            );
         }
     }
 
@@ -1677,7 +1962,7 @@ impl CommandRuntime {
     async fn defer(&self, interaction: &Interaction, command: &str) -> bool {
         match self
             .executor
-            .answer_interaction(
+            .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
                 &interaction.token,
                 &InteractionResponse {
@@ -1692,7 +1977,7 @@ impl CommandRuntime {
         {
             Ok(()) => true,
             Err(err) => {
-                warn!(interaction_id = %interaction.id.get(), command, error = %err, "command defer failed");
+                warn!(interaction_id = %interaction.id.get(), command, reason = discord_class(&err), "command defer failed");
                 false
             }
         }
@@ -1701,10 +1986,14 @@ impl CommandRuntime {
     async fn answer(&self, interaction: &Interaction, response: InteractionResponse) {
         if let Err(err) = self
             .executor
-            .answer_interaction(interaction.id.get(), &interaction.token, &response)
+            .answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &response,
+            )
             .await
         {
-            warn!(interaction_id = %interaction.id.get(), error = %err, "sticky reply failed");
+            warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "sticky reply failed");
         }
     }
 
@@ -1712,14 +2001,14 @@ impl CommandRuntime {
     async fn finish(&self, interaction: &Interaction, content: impl AsRef<str>) {
         if let Err(err) = self
             .executor
-            .edit_interaction_response(
+            .edit_interaction_response_with_blocked_retry(
                 interaction.application_id.get(),
                 &interaction.token,
                 content.as_ref(),
             )
             .await
         {
-            warn!(interaction_id = %interaction.id.get(), error = %err, "sticky reply edit failed");
+            warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "sticky reply edit failed");
         }
     }
 
@@ -1731,7 +2020,10 @@ impl CommandRuntime {
             .delete_message(channel_id, message_id, reason)
             .await
         {
-            warn!(error = %err, "sticky cleanup delete failed; continuing");
+            warn!(
+                reason = discord_class(&err),
+                "sticky cleanup delete failed; continuing"
+            );
         }
     }
 
@@ -1740,7 +2032,10 @@ impl CommandRuntime {
         if let Err(err) =
             store::release_sticky_post(&self.pool, guild_id, channel_id, claim_token).await
         {
-            warn!(error = %err, "sticky claim release failed; expiry will clear it");
+            warn!(
+                reason = db_class(&err),
+                "sticky claim release failed; expiry will clear it"
+            );
         }
     }
 
@@ -1766,7 +2061,12 @@ impl CommandRuntime {
             at_ms: now_millis_for_test(),
         };
         if let Err(err) = store::audit_sticky(&self.pool, &row).await {
-            warn!(action = action.as_str(), outcome = outcome.as_str(), error = %err, "sticky audit write failed");
+            warn!(
+                action = action.as_str(),
+                outcome = outcome.as_str(),
+                reason = db_class(&err),
+                "sticky audit write failed"
+            );
         }
     }
 }
@@ -1897,6 +2197,9 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     // `/help` discovery is never activation-fenced either: it renders from
     // the live publish set, so gated-off features simply do not appear.
     router.register(Box::new(SliceHandler(HandlerId::Help)));
+    // `/privacy` member self-serve is never activation-fenced either: every
+    // member may opt out of analytics in any guild.
+    router.register(Box::new(SliceHandler(HandlerId::Privacy)));
     router
 }
 

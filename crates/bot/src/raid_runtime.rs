@@ -99,9 +99,9 @@ pub(crate) trait SettingsSource: Send + 'static {
     fn current(&mut self) -> impl Future<Output = RaidSettings> + Send;
 }
 
-/// Tuning is store-first (hot rows win over the deployment environment) and
-/// re-read at most every [`SETTINGS_MAX_AGE`]; a failed refresh keeps the last
-/// good values. The staff channel is the deployment value read once at boot.
+/// Tuning and the staff channel are store-first (hot rows win over the
+/// deployment environment) and re-read at most every [`SETTINGS_MAX_AGE`]; a
+/// failed refresh keeps the last good values.
 pub(crate) struct StoreSettings {
     pool: PgPool,
     guild_id: String,
@@ -167,13 +167,14 @@ impl SettingsSource for StoreSettings {
         self.refresh().await;
         let mut vars = self.deployment.clone();
         if let Some(cache) = &self.cache {
-            // Only the two tuning keys are live (`HOT_WIRED`); the staff channel
-            // stays the boot-time deployment value, as legacy read `cfg`.
+            // Tuning and the staff channel are live (`HOT_WIRED`): a stored
+            // row moves the next observation, a delete hands the key back to
+            // the boot-time deployment value.
             vars.extend(
                 cache
                     .env_snapshot(Some(self.guild_id.as_str()))
                     .into_iter()
-                    .filter(|(key, _)| key == THRESHOLD_KEY || key == WINDOW_KEY),
+                    .filter(|(key, _)| SETTING_KEYS.contains(&key.as_str())),
             );
         }
         let settings = RaidSettings::from_vars(&vars);

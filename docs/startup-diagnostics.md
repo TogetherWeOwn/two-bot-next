@@ -32,6 +32,7 @@ Rust logs fixed `startup_phase` / `error_class` fields before fatal exits:
 | Milestone read | `milestones_load_failed` |
 | Automod configuration rejected | `automod_config_invalid` |
 | Automod REST executor build | `automod_executor_failed` |
+| Raid-watch REST executor build | `raid_executor_failed` |
 | Running gateway operation | `gateway_runtime_failed` |
 | Gateway task panicked | `gateway_task_panicked` |
 | HTTP/gateway supervisor termination | `container_service_failed` |
@@ -41,8 +42,9 @@ No SQLx source chain, URL, credential, or arbitrary exception text is formatted.
 
 ## Self-diagnosing gateway failures (`/readyz` `gateway_failure`)
 
-Container stdout is not in Workers Logs, so the gateway task's class is also
-published where a probe can read it. The gateway task rows above (`store_unavailable`
+Container stdout is not in the `cloudflare-workers` Workers Logs dataset (it is in
+the `containers` one, see [Reading container stdout](#reading-container-stdout)),
+so the gateway task's class is also published where a probe can read it. The gateway task rows above (`store_unavailable`
 through `gateway_task_panicked`) are an enum in `crates/bot/src/gateway_failure.rs`;
 no free-form text can reach the field. After a failure `/readyz` adds
 
@@ -50,13 +52,16 @@ no free-form text can reach the field. After a failure `/readyz` adds
 {"gateway_failure":{"phase":"durable_gateway","class":"checkpoint_load_failed"}}
 ```
 
-(omitted while there is none) and keeps serving for 15 seconds
-(`shutdown::FAILURE_LINGER`) before the drain and exit-1 restart. A shutdown
-signal ends the linger at once. Readers:
+(omitted while there is none) and keeps serving for 15 seconds after a
+startup failure (`shutdown::FAILURE_LINGER`) or 75 seconds after a
+running-gateway failure (`shutdown::RUNTIME_FAILURE_LINGER`) before the drain
+and exit-1 restart. A shutdown signal ends the linger at once. Readers:
 
 - Worker keepalive: one `console.warn` JSON line
-  `{"event":"container_gateway_failure","phase":…,"class":…}` per tick, only when
-  both values are `[a-z0-9_]{1,32}` tokens, so it reaches Workers Logs.
+  `{"event":"container_gateway_failure","phase":…,"class":…,"release":…,"worker_version":…}`
+  per tick, only when both values are `[a-z0-9_]{1,32}` tokens, so it reaches
+  Workers Logs. `release` is the container git SHA (`"unknown"` when the probe
+  answer has none); `worker_version` is the platform Worker version id.
 - `scripts/staging_rollout.py`: the rollout gate's `last observation before
   timeout` line ends with `gateway_failure=<phase>:<class>`. The gate also
   probes `/readyz` while this build's rollout exists but has not converged,
@@ -64,6 +69,58 @@ signal ends the linger at once. Readers:
 
 `database_init`, `listener_bind` and the other pre-gateway exits happen before the
 HTTP server runs, so they remain visible only in container logs.
+
+## Reading container stdout
+
+The Rust process's stdout/stderr (the JSON lifecycle lines in
+[`logging.md`](logging.md), including `durable gateway failed` with its
+`error_class`) reaches Workers Observability as its own **`containers`** dataset,
+not the Worker's `cloudflare-workers` one. The `service` is the Container
+application's id, not the Worker name. A read-only `CLOUDFLARE_API_TOKEN` can query
+it with the same call as the Worker logs
+(`POST /accounts/<id>/workers/observability/telemetry/query`); only the dataset
+differs:
+
+```json
+{"queryId":"<uuid>","timeframe":{"from":<ms>,"to":<ms>},"view":"events","limit":100,
+ "parameters":{"datasets":["containers"],"filters":[],"calculations":[],"groupBys":[],
+               "orderBy":{"value":"timestamp","order":"desc"}}}
+```
+
+`scripts/container_stdout_read.py` runs that query for you, read-only: it needs only
+`CLOUDFLARE_API_TOKEN`, sends nothing but the accounts list and this query (so it
+cannot start the container; the observability API stores the query run itself),
+and prints the newest lines oldest-first as JSON with
+secret-like values redacted and only a short allowlist of structured fields kept:
+
+```sh
+python3 scripts/container_stdout_read.py --service <container-application-id> \
+    --minutes 5 [--end 2026-10-11T12:00:00Z] [--contains "durable gateway failed"]
+```
+
+Zero events means "not observed in this window". Offline fixtures
+(`scripts/test_container_stdout_read.py`) pin the request body to the example above.
+
+Structured fields are filterable by key (`error_class exists`, `startup_phase exists`);
+the message is `$metadata.message`. Each process start logs `listening` first, with a
+fresh `run_id`, so one run's events share a `run_id` and a start-to-ready time is
+`listening` to `gateway ready; checkpoint committed`. Telemetry returns the newest 100
+events per query: keep windows under a few minutes around a deploy. Lines logged before
+the JSON format (`logging.md`) arrive as one ANSI-coloured text message each.
+
+## Gateway bootstrap and the send lane
+
+After a start, `custom_commands_init_failed` or `gateway_runtime_failed` within
+about ten seconds of `listening`, followed 15 s later by `container service
+failed`, was the durable send lane being held while the gateway's first reads
+asked for it (see [send admission](discord-send-admission.md#boot-window)): each
+refusal cost a full container restart (about 25-30 s) and a staging redeploy
+needed two or three. The bootstrap reads and registry publish now wait out a held
+lane inside the boot window. A wait logs one warn, `boot send admission was held;
+waited for the lane`, with `blocked_attempts`, `waited_ms` and `recovered`; a read
+that still fails logs `gateway bootstrap read failed` with the read (`step`) and a
+fixed `cause` token (`admission_blocked`, `timeout`, `rate_limited`,
+`unavailable`, `rejected`, `guard_*`).
 
 ## Worker readiness boundary
 

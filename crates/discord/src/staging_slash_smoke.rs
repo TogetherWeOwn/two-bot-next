@@ -347,6 +347,8 @@ pub async fn run_offline<T: SmokeTransports, S: SmokeFixtures>(
         automations: false,
         announcements: false,
         moderation: false,
+        voice: false,
+        voice_assistant: false,
         tickets: false,
         self_roles: false,
         onboarding_picker: false,

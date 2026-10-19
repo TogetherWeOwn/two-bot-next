@@ -88,7 +88,9 @@ fn config() -> TicketConfig {
 fn runtime(pool: PgPool, mock: &MockRest) -> Arc<TicketRuntime> {
     let executor =
         ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
-    let runtime = Arc::new(TicketRuntime::new(pool, executor, config()).unwrap());
+    let runtime = Arc::new(
+        TicketRuntime::new(pool, executor, config(), std::collections::HashMap::new()).unwrap(),
+    );
     runtime.set_bot_id(400);
     runtime
 }
@@ -863,8 +865,15 @@ async fn cold_resumed_dispatch_recovers_controls_panel_and_purges_without_ready(
     .await;
     let executor =
         ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
-    let tickets =
-        Arc::new(TicketRuntime::new(db.pool.clone(), executor.clone(), config()).unwrap());
+    let tickets = Arc::new(
+        TicketRuntime::new(
+            db.pool.clone(),
+            executor.clone(),
+            config(),
+            std::collections::HashMap::new(),
+        )
+        .unwrap(),
+    );
     active(&tickets, "expired-resume").await;
     tickets
         .store
@@ -1021,8 +1030,15 @@ async fn failed_cold_resumed_identity_retries_during_recovery_without_another_ga
     .await;
     let executor =
         ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
-    let tickets =
-        Arc::new(TicketRuntime::new(db.pool.clone(), executor.clone(), config()).unwrap());
+    let tickets = Arc::new(
+        TicketRuntime::new(
+            db.pool.clone(),
+            executor.clone(),
+            config(),
+            std::collections::HashMap::new(),
+        )
+        .unwrap(),
+    );
     let commands = CommandRuntime::with_tickets(db.pool.clone(), executor, Arc::clone(&tickets));
     commands.suppress_registry_for_test().await;
     commands.dispatch(&twilight_model::gateway::event::Event::Resumed);
@@ -1054,4 +1070,229 @@ async fn failed_cold_resumed_identity_retries_during_recovery_without_another_ga
     );
     mock.shutdown().await;
     db.close().await;
+}
+
+// Pins the three success-path literals through one real open/claim/close
+// lifecycle: open reserves, creates channel 600 and posts controls; claim and
+// close then run against that same ticket. Any copy change fails here.
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn ticket_copy_success_confirmation_claim_and_close_are_pinned() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"id":"200","guild_id":"100","type":4})),
+            ScriptedResponse::json(201, json!({"id":"600"})),
+            ScriptedResponse::json(200, json!({"id":"900"})),
+            ScriptedResponse::json(200, channel()),
+            ScriptedResponse::status(204),
+            ScriptedResponse::json(200, json!([history(1)])),
+            ScriptedResponse::json(200, channel()),
+            ScriptedResponse::status(204),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(db.pool.clone(), &mock);
+    let open_reply = match runtime
+        .execute(
+            &button(TicketAction::Open, "100", "500", vec![], 0),
+            TicketAction::Open,
+        )
+        .await
+    {
+        Ok(reply) => reply,
+        Err(error) => panic!("open succeeds: {}", error.reply()),
+    };
+    assert_eq!(open_reply, "Your ticket is ready: <#600>.");
+    let claim_reply = match runtime
+        .execute(
+            &button(TicketAction::Claim, "100", "501", vec!["300"], 0),
+            TicketAction::Claim,
+        )
+        .await
+    {
+        Ok(reply) => reply,
+        Err(error) => panic!("claim succeeds: {}", error.reply()),
+    };
+    assert_eq!(claim_reply, "Ticket claimed.");
+    let close_reply = match runtime
+        .execute(
+            &button(TicketAction::Close, "100", "501", vec!["300"], 0),
+            TicketAction::Close,
+        )
+        .await
+    {
+        Ok(reply) => reply,
+        Err(error) => panic!("close succeeds: {}", error.reply()),
+    };
+    assert_eq!(
+        close_reply,
+        "Ticket closed; transcript saved for up to 90 days."
+    );
+    assert_eq!(
+        runtime
+            .store
+            .by_channel("600")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TicketStatus::Closed
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+// Pins the three open-refusal literals through the real reserve path. Each
+// refusal still fetches the category first, so the script holds three
+// category documents: one per refused open.
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn ticket_copy_duplicate_and_cooldown_refusals_are_pinned() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"id":"200","guild_id":"100","type":4})),
+            ScriptedResponse::json(200, json!({"id":"200","guild_id":"100","type":4})),
+            ScriptedResponse::json(200, json!({"id":"200","guild_id":"100","type":4})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(db.pool.clone(), &mock);
+    // Existing open ticket with a channel: the duplicate names it.
+    active(&runtime, "dup-open").await;
+    let duplicate = match runtime
+        .execute(
+            &button(TicketAction::Open, "100", "500", vec![], 0),
+            TicketAction::Open,
+        )
+        .await
+    {
+        Ok(reply) => reply,
+        Err(error) => panic!("duplicate refusal is Ok: {}", error.reply()),
+    };
+    assert_eq!(duplicate, "You already have a ticket: <#600>.");
+    // Creating reservation without a channel yet: recovery is still working.
+    runtime
+        .store
+        .reserve("creating-1", "501", now_millis_for_test(), 0)
+        .await
+        .unwrap();
+    let creating = match runtime
+        .execute(
+            &button(TicketAction::Open, "100", "501", vec![], 0),
+            TicketAction::Open,
+        )
+        .await
+    {
+        Ok(reply) => reply,
+        Err(error) => panic!("creating refusal is Ok: {}", error.reply()),
+    };
+    assert_eq!(creating, "Your ticket is still being created or recovered.");
+    // Closed ticket created moments ago: the cooldown still applies.
+    let now = now_millis_for_test();
+    match runtime
+        .store
+        .reserve("cool-closed", "502", now, 0)
+        .await
+        .unwrap()
+    {
+        OpenResult::Created(_) => {}
+        _ => panic!("expected reservation"),
+    }
+    runtime
+        .store
+        .record_channel("cool-closed", "601")
+        .await
+        .unwrap();
+    runtime.store.activate("cool-closed", "601").await.unwrap();
+    let closing = runtime
+        .store
+        .begin_close("cool-closed", now + 1)
+        .await
+        .unwrap();
+    runtime
+        .store
+        .save_transcript(
+            "cool-closed",
+            closing.closing_started_at.unwrap(),
+            now + 2,
+            format_transcript(vec![]),
+        )
+        .await
+        .unwrap();
+    runtime
+        .store
+        .finish_cleanup("cool-closed", now + 3)
+        .await
+        .unwrap();
+    let cooldown = match runtime
+        .execute(
+            &button(TicketAction::Open, "100", "502", vec![], 0),
+            TicketAction::Open,
+        )
+        .await
+    {
+        Ok(reply) => reply,
+        Err(error) => panic!("cooldown refusal is Ok: {}", error.reply()),
+    };
+    assert_eq!(cooldown, "Please wait before opening another ticket.");
+    assert_eq!(mock.requests().len(), 3);
+    mock.shutdown().await;
+    db.close().await;
+}
+
+// Pins the generic failure fallback through two real failure paths: a failed
+// category fetch on open and a failed channel fetch on close. Both surface
+// the same non-domain copy, never a Discord payload or a transcript.
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn ticket_copy_generic_failure_fallback_is_pinned() {
+    const FALLBACK: &str =
+        "Ticket action failed; recovery will retry unfinished work. Try again later.";
+    let open_db = TestDb::new().await;
+    let open_mock = MockRest::start(
+        vec![ScriptedResponse::status(500)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let open_runtime = runtime(open_db.pool.clone(), &open_mock);
+    let open_error = open_runtime
+        .execute(
+            &button(TicketAction::Open, "100", "500", vec![], 0),
+            TicketAction::Open,
+        )
+        .await
+        .expect_err("failed category fetch errors");
+    assert_eq!(open_error.reply(), FALLBACK);
+    assert!(open_runtime.store.recoverable().await.unwrap().is_empty());
+    open_mock.shutdown().await;
+    open_db.close().await;
+
+    let close_db = TestDb::new().await;
+    let close_mock = MockRest::start(
+        vec![ScriptedResponse::status(500)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let close_runtime = runtime(close_db.pool.clone(), &close_mock);
+    active(&close_runtime, "failing-close").await;
+    let close_error = close_runtime
+        .execute(
+            &button(TicketAction::Close, "100", "501", vec!["300"], 0),
+            TicketAction::Close,
+        )
+        .await
+        .expect_err("failed channel fetch errors");
+    assert_eq!(close_error.reply(), FALLBACK);
+    assert!(close_mock.requests().iter().all(|r| r.method != "DELETE"));
+    assert!(!close_runtime
+        .store
+        .transcript_exists("failing-close")
+        .await
+        .unwrap());
+    close_mock.shutdown().await;
+    close_db.close().await;
 }

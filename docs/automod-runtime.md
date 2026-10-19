@@ -204,9 +204,38 @@ otherwise the loop is unchanged.
 - **Maintenance.** `expire_repeat_history` runs on the existing periodic-job
   supervisor (`automod_expiry`, every 60 s, no I/O); no private timer.
 - **Text automations.** The command runtime's message hook is no longer fired at
-  reception for creates while automod is active; the worker fires it only for an
-  accepted create (`Accept`). Matched, unavailable and timed-out creates are
-  rejected for automations as well as for XP/activity.
+  reception for creates while automod is active; the worker fires it only when
+  the trigger verdict is `Accept` (an inspected clean create). Matched,
+  unavailable, timed-out and uninspected (`Bypassed`) creates are rejected for
+  automations as well as for XP/activity.
+- **Funnel-vs-trigger verdicts.** Each delivery gets one `WorkerVerdict`
+  (`crates/bot/src/automod_gateway.rs:269-272`): `funnel` is its single call
+  into the funnel and `trigger` is the verdict prefix triggers act on. A
+  delivery automod did not inspect, or whose completion was not recorded, keeps
+  its funnel disposition but its trigger verdict is capture-only
+  (`crates/bot/src/automod_gateway.rs:264-267`).
+  `verdict_of` (`crates/bot/src/automod_gateway.rs:274-283`) forces the trigger to `CaptureOnly` when the
+  outcome is `Bypassed` or `Retained(_)`, and otherwise copies the funnel. A
+  `process` timeout keeps raw capture only for both (`crates/bot/src/automod_gateway.rs:294-303`). The worker
+  hands the funnel disposition to
+  `handle_at_with_message_disposition` exactly once (`crates/bot/src/gateway.rs:699-710`) and fires the message hook
+  only when `runs_text_automations` passes the trigger verdict — `None`
+  (automod inactive) or `Accept` (`crates/bot/src/automod_gateway.rs:307-311`,
+  `crates/bot/src/gateway.rs:56-70`, `crates/bot/src/gateway.rs:721-729`). The hook carries
+  the trigger verdict into the trigger handler, where a missing verdict fails
+  closed (`crates/bot/src/command_runtime.rs:954-975`, `crates/bot/src/gateway_commands.rs:89-100`). Per outcome class
+  (`ActivationOutcome` in `crates/discord/src/automod_activation.rs:74-86`):
+
+  | Outcome | `funnel` | `trigger` | Text automations run? |
+  | --- | --- | --- | --- |
+  | `Bypassed` (outside the fence) | ordinary disposition: clean create → `Accept` (`crates/discord/src/automod_activation.rs:158`) | `CaptureOnly` | no (trigger is capture-only) |
+  | `Completed` (incl. enforce, dry-run, accepted) | activation disposition | = `funnel` | iff `Accept` |
+  | `Retained(_)` (needs recorded reconciliation) | disposition | `CaptureOnly` | no (trigger is capture-only) |
+  | `Duplicate(Some(receipt))` (settled replay) | from the receipt: matched → capture-only, clean → accept (`crates/discord/src/automod_activation.rs:107-113`) | = `funnel` | iff the receipt was clean (`Accept`) |
+  | `Duplicate(None)` (in-flight replay) | capture-only for a create, `None` for an update | = `funnel` | no for a create |
+  | `Unavailable` (enrichment/claim/target failed) | `CaptureOnly` for a create, `None` for an update (`crates/discord/src/automod_activation.rs:161`) | = `funnel` | no |
+  | `process` timeout | `kind.funnel(true)`: capture-only for a create, `None` for an update | same | no |
+  | automod inactive (no verdict) | — | — | yes (`None` passes the gate) |
 - **Funnel once-per-message.** The funnel's writes commit with the gateway
   checkpoint, so a dispatch reaching `process` is not yet in the funnel. A
   replay after a crash between the claim write and the checkpoint finds a
@@ -223,6 +252,12 @@ Staging soak remains a separate gate; this change supplies no live approval.
 ## Gates and evidence
 
 - `TWO_AUTOMOD=1` enables inspection; absent `TWO_AUTOMOD_ENFORCE=1` is dry-run.
+- Only exact `TWO_AUTOMOD_ENFORCE=1` enforces. A deployment value other than `0`
+  or `1` stays dry-run at boot and logs one warning that does not echo the
+  value. The "automod activation wired" line reports the boot-resolved `mode`
+  (`dry_run` or `enforce`); a later live override is not reflected in it. The
+  boot warning reads the deployment environment only, so a stored live value is
+  not warned.
 - Scope is staging `1545644954272137297`; live `326474832151838730` also requires
   explicit externally supplied approval. This code supplies no live approval.
 - Domain tests cover pre-delete protection, dry-run, sanction planning, blocked

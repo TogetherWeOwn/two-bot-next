@@ -209,15 +209,63 @@ that the bot has never tracked:
   then the `TWO_VOICE=1` binding ships, then the voice commands publish.
   The live smoke additionally needs a second human account.
 
+### Live staging rehearsal (2026-10-04, read-only)
+
+Revision `5a42c357` (main at run time); the staging Worker served build
+`37240415572-1`. Staging guild only: the guild fence passed (the configured
+guild id equals the pinned staging id, not the live one). The only
+credential was the staging bot token, used for GET requests. No writes, no
+interactions, no database access, no live guild queries.
+
+| Step | Result |
+|---|---|
+| Staging readiness | `scripts/qa_cutover_probes.py --expect-ready`: 5/5. `process`, `gateway`, `database` and `token_invalid` all `ready`; 12 jobs reported. The deploy pipeline that was red on 2026-10-03 is green and the gateway is up. |
+| Dual-run detection | The guild member list holds one bot: the staging application, matching the pinned application id. No second bot account is in the guild, so nothing else can be managing voice channels. This is the negative baseline only: staging never had an interim voice bot, so the positive case (two voice-managing bots) cannot be rehearsed here. At cutover the same read must show the interim bot until it is removed, then only ours. |
+| Command failover | Not exercisable. The staging guild registry holds 17 commands (rank, leaderboard, lfg, rsvp, schedule, feed, sticky, custom `command` family) and the global registry is empty. None of the voice commands (`/create`, `/setup`, `/export`, `/import`, `/limit` and the rest) is registered. They publish only behind `TWO_VOICE=1`, which the committed staging config already sets (`[env.staging.vars]` in `wrangler/wrangler.toml`); the registry wiring is still open in PR #559. With nothing published there is no command surface to fail over to, and no name collision with the interim bot's commands can be observed. |
+| Ghost baseline | The guild lists the same three permanent voice channels as 2026-10-03 (`Lobby`, `Squad`, `Voice 1`, created 2026-09-06 and 2026-09-07); nothing new appeared. The `report voice-ghosts` count was not run: the staging database binding available to the operator tooling is the legacy staging database, where `voice_rooms` does not exist. The arithmetic matches the documented residual baseline above: `untracked_present=[3]`, `clean=false` accepted, and `clean=true` unreachable on this guild by design. |
+| Handoff checklist (template export/map, quiet hours, stop/remove interim, enable creators, create/move/delete verify, token revoke, secret delete) | Not executed. `/export`, `/import` and `/create` are unpublished; the staging guild has one human member and no identity that can join a voice channel on demand; stop/remove interim and the credential steps are production steps that the cutover card gates. Quiet-hours selection needs live voice activity, which staging (two members) cannot show. |
+
+Tooling finding: `scripts/qa_cutover_probes.py` sent urllib's default agent,
+which the staging edge refuses (Cloudflare error 1010, every route 403), so
+the probe could not grade the staging Worker at all. It now names itself
+(`two-bot-next-staging-rollout/1.0`, shared with `scripts/staging_rollout.py`);
+a loopback regression test pins the agent.
+
+Verdict: **NO-GO** for retiring the interim bot. Staging is healthy again,
+but the live steps this rehearsal exists to practice are blocked by four
+things, in order:
+
+1. Voice commands must publish on staging: merge PR #559 (`TWO_VOICE=1` is already set in the committed staging config).
+2. The ghost count needs the staging database binding that carries the
+   migrated `voice_*` tables.
+3. A staging identity with Manage Server (for `/export`/`/import`) that can
+   also join and leave a voice channel on demand.
+4. A written residual baseline naming `Lobby`, `Squad` and `Voice 1` — recorded above (expected `untracked_present=[3]`, `clean=false`; `clean=true` unreachable by design); apply its pass rule to the live run.
+
+When all four hold, run §4 live and record timestamps in this section.
+
+Re-check at `86a6668a7`: the 2026-10-04 registry observation above is history,
+not current state. The code wiring it waited on has since landed — the voice
+set is defined in `voice_commands()` (`crates/core/src/voice_rooms.rs:1292-1660`),
+merged when the voice gate is on (`crates/core/src/router.rs:717-719`), and
+synced on ready (`crates/bot/src/command_runtime.rs:1009-1020`). Re-read the
+staging guild registry before the next rehearsal instead of reusing the
+17-command snapshot.
+
 ## 6. Gaps
 
 Each gap below is filed as its own card and linked from the rehearsal
-issue. Live staging practice (§4 live run) is a follow-up blocked on
-staging returning to healthy; it is not listed here as a code gap.
+issue. Live staging practice (§4 live run) is a follow-up blocked on the
+four items in the 2026-10-04 verdict above; it is not listed here as a code
+gap.
 
-1. Shared/category numbering (`/group`) is stored but not honored: the
+1. ~~Shared/category numbering (`/group`) is stored but not honored: the
    room planner hardcodes ungrouped placement, so an import carrying
-   `group_by_category` changes nothing at runtime.
+   `group_by_category` changes nothing at runtime~~ Resolved in code:
+   `group_by_category` is honored (`crates/bot/src/voice_rooms.rs:3427-3444`,
+   `crates/bot/src/voice_room_plan.rs:206-212`). Still open: staging practice
+   of shared numbering on the staging guild (§4 live run). Re-checked at
+   `86a6668a7`.
 2. ~~No dedicated ghost-channel count for cutover verification~~ Shipped:
    `report voice-ghosts --guild <id>` is the pollable read-only count
    (tracked-present, tracked-gone, untracked-present plus a `clean` flag),
@@ -237,7 +285,7 @@ The staging Worker binds `TWO_VOICE = "1"` under `[env.staging.vars]` in
 `wrangler/wrangler.toml`. The var is forwarded into the container
 (`FORWARDED_FLAGS`, `wrangler/src/container-env.ts`) and `build_voice_runtime`
 attaches the voice sink to the gateway only when it is exactly `1`.
-`scripts/check-env-bindings.py` fails a top-level or production declaration,
+`wrangler/scripts/check-env-bindings.py` fails a top-level or production declaration,
 so production voice stays an Operator-approved binding.
 
 - **Order matters.** The voice store reads the migrated voice tables, so the
@@ -245,15 +293,22 @@ so production voice stays an Operator-approved binding.
   0412-0414 and 0416-0418) before the var ships: apply through `staging-migrate`,
   then re-apply the role plan so the runtime role holds the new tables. Merge
   the flip only after a post-apply plan shows no pending migrations.
+- **Check the custom-command count first.** The 100-command guild limit leaves
+  room for 50 stored custom commands beside the published builtins, voice set
+  and `/templateassistant`. A guild that already stores more makes the gateway
+  registry sync refuse (`TotalLimit`) and the gateway task fail at boot, rather
+  than degrading; trim the extra rows before the flip.
 - **Permanent channels stay untouched.** `reconcile` iterates the rooms the
   store tracks and nothing else, so the guild's three permanent voice
   channels (`Lobby`, `Squad`, `Voice 1`) are never deleted: with zero tracked
   rows the live ghost count reads `untracked_present=[3]`, which is the
   documented residual baseline for staging until a creator channel exists.
-- **No commands yet.** The gate attaches the sink and the reconciler; the
-  guild registry only gains the voice commands once the registry wiring
-  publishes them behind the same gate. Live create/move/delete practice (§4)
-  needs both that and a second human account in the staging guild.
+- **Commands publish with the sink.** The gate attaches the sink and the
+  reconciler, and the guild registry gains the voice commands through
+  `InteractionRouter::publish_set` (`RouterGates::voice`) while the sink is
+  built. The deployed registry read-back is staging acceptance. Live
+  create/move/delete practice (§4) also needs a second human account in the
+  staging guild.
 - **Rollback.** Delete the `TWO_VOICE` line and redeploy `deploy-staging`.
   Tracked rooms stay in the database; any whose channel has gone are
   forgotten by the first reconcile after the gate is back on.

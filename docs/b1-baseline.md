@@ -37,8 +37,10 @@ Peak measured RSS ≈ 153 MiB < 200 MiB nominally passes the lite gate — but t
 mock guild is ~3% of the real member count and discord.js caches (members,
 messages, voice states) grow with it. TOG-9408 already flagged "RSS likely
 >256 MiB → moves to basic ≈ $7–9". One OOM-kill of the gateway drops joins;
-the $5.30/mo lite→basic step is not worth that risk. **Ship `basic`.** Revisit
-`lite` only after the B2 staging-guild soak measures a real 107-member cache.
+the $5.30/mo lite→basic step is not worth that risk. **Ship `basic`.** Any
+later placement decision requires separate review; B2's four-ACTIVE-hour
+evidence does not establish numeric RSS acceptance criteria or authorize a
+placement change.
 
 ## Cost (Cloudflare Container pricing, per TOG-9408/ADR-0001 model)
 
@@ -58,8 +60,10 @@ Guild: ~84 humans / 107 members. Bot subscribes to 11 gateway event families
 ~1.5k–3.5k gateway dispatches/day (presence/typing noise excluded; Discord
 does not send those for these intents). At 2.5 dispatches/s in this soak, one
 day of traffic ≈ 10–25 min of processing; CPU is noise either way (<1% of even
-the 1/16-vCPU lite slice). B2's 7-day staging soak should replace this estimate
-with a counted number.
+the 1/16-vCPU lite slice). This remains a historical planning estimate, not a B2
+acceptance criterion. The four-ACTIVE-hour policy supersedes the former seven-day
+plan; any later verified counts belong in a separate record and do not replace
+this estimate retroactively.
 
 ## Container keepalive verdict: DO-alarm keepalive REQUIRED
 
@@ -107,10 +111,18 @@ route; no workflow dispatch is needed for this repair. The existing required
 job summary and fails above these calibrated ceilings. The measurements and
 headroom below are historical, not measurements of the current PR head:
 
-| Artifact | Historical definition | Measured | Maximum | Headroom |
+| Artifact | Metric / provenance | Measured | Maximum | Headroom |
 |---|---|---|---|---|
-| Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
-| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 10.30 MiB / 10,805,344 bytes | 15 MiB / 15,728,640 bytes | 4.70 MiB / 45.6% |
+| Runtime image | Historical Docker image inspect `Size` from 2026-09-30 PR #78 (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
+| Release binary | `stat` of `/home/two-bot/two-bot` in the final image, event-executors head | 15.04 MiB / 15,770,928 bytes (2026-10-10; [event-executors CI smoke](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38062362788/job/114254309361)) | 16 MiB / 16,777,216 bytes | 0.96 MiB / 6.4% |
+| Release binary — automation-only head before event-executor merge | `stat` of `/home/two-bot/two-bot` in the final image | 15.04 MiB / 15,769,872 bytes | 16 MiB / 16,777,216 bytes | 0.96 MiB / 6.0% |
+
+The runtime-image row above is the historical inspect `Size` result, not the
+current gate metric. The linked event-executors job measured the current metric,
+summed uncompressed Docker history layers, at 43,481,068 bytes (41.47 MiB).
+Against the 112 MiB / 117,440,512-byte ceiling, that run had 73,959,444 bytes
+(70.53 MiB) of headroom. This is evidence for that source head, not a size claim
+for the current PR head.
 
 The baseline used the classic Docker image store. The gate now sums exact
 `docker image history --human=false --format '{{.Size}}'` layer bytes after
@@ -119,20 +131,61 @@ With the containerd store, inspect `Size` includes compressed blobs **plus**
 unpacked snapshots and is logged separately, not compared to that ceiling.
 See [Docker's store documentation](https://docs.docker.com/engine/storage/containerd/)
 and [Moby's layer-history implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_history.go).
-Neither the 112 MiB image nor the 10 MiB binary budget is increased.
+The 112 MiB image ceiling is unchanged. The binary budget was 15 MiB at the
+2026-10-01 calibration and is now 17 MiB (2026-10-17 recalibration below);
+the 2026-10-10 measurements record the tighter tripwire it replaced.
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
-at source `307b50708ec42e8fc4744c1b804216a22a17625e`. Ceilings allow roughly
-25% image growth rounded up to the next 8 MiB, and roughly 40% binary growth
-rounded up to the next MiB. Base-image/toolchain changes must remeasure and
-justify any future budget increase. Recalibrated 2026-10-01 for the S4 self-role
-runtime (TOG-10292): PR head measured 10,805,344 bytes (10.30 MiB) on the
-ephemeral runner vs main baseline 10,377,112 bytes (9.90 MiB) at `ec49663`;
-growth is linked runtime/handlers/REST plus previously-dead domain/store code
-with no new dependencies, release profile already minimal (opt-level=z, lto,
-strip). Per calibration (measured * 1.4 rounded up to the next MiB):
-10.30 * 1.4 = 14.42 -> 15 MiB. Docker is not available in the controller
-workspace; offline fixture sizes are not measurements.
+at source `307b50708ec42e8fc4744c1b804216a22a17625e`. The 2026-09-30
+calibration allowed roughly 25% image growth and 40% binary growth, rounded up
+to the next 8 MiB and 1 MiB respectively. Base-image/toolchain changes must be
+remeasured and any future budget increase justified. The 2026-10-01 S4
+self-role runtime measured 10,805,344 bytes (10.30 MiB), against the main
+baseline of 10,377,112 bytes (9.90 MiB) at `ec49663`; growth was linked
+runtime/handlers/REST plus previously-dead domain/store code, with no new
+dependencies and the same minimal release profile (opt-level=z, lto, strip).
+Applying that historical binary calibration: 10.30 * 1.4 = 14.42 -> 15 MiB.
+Docker is not available in the controller workspace; offline fixture sizes are
+not measurements.
+
+On 2026-10-10, the main binary measured 15,712,080 bytes (14.98 MiB), leaving
+about 16 KiB under the 15 MiB guard. The RSVP bound-admissions slice (PR #709)
+measured 15,734,960 bytes (15.01 MiB) with no new dependencies; the x1.4 rule
+would yield 22 MiB, but the budget was set to 16 MiB instead to retain a useful
+tripwire without wedging ordinary code changes. A later event-executors head
+measured 15,770,928 bytes (15.04 MiB) in the [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38062362788/job/114254309361),
+42,288 bytes above the former ceiling. The internal-actions families (event
+executors plus channel-moderation union) measured 15,741,344 bytes (15.01 MiB).
+The then-current 16 MiB working tripwire left 1,006,288 bytes (0.96 MiB, 6.4%) above the
+event-executors measurement. No new dependencies or release-profile changes;
+revisit if the binary approaches the limit. The 112 MiB image ceiling is
+unchanged.
+
+On 2026-10-17 the 16 MiB ceiling was reached: main at `f2baa19` measured
+16,776,096 bytes (1,120 bytes of headroom), and the stream delivered-dedup
+expiry slice (PR #1079, `ac8fd66`) added 1,280 bytes with no new dependencies,
+measuring 16,777,376 bytes — 160 bytes over the ceiling on hosted CI and
+failing the check workflow on main twice, including a re-run of the failed
+jobs. The release profile is already minimal (opt-level=z, lto, strip), so
+the binary ceiling moves to 17 MiB; revisit if the binary approaches it. The
+112 MiB image ceiling is unchanged (42.43 MiB measured on the same builds).
+
+On 2026-10-17, the landed slices since the 16 MiB bump consumed its headroom:
+main at `89c859b1` measured 16,777,376 bytes (16.00 MiB), 160 bytes over the
+ceiling, so the gate trips on main itself. The PR-1093 merge_group against
+the same base measured the identical 16,777,376 bytes in [its container smoke
+job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39061090833),
+confirming the trip is main-red, not PR-introduced. The
+moderation-enforcement-outcomes
+head measured 16,778,152 bytes (16.00 MiB), 936 bytes over, with no new
+dependencies and the same minimal release profile. The budget is therefore
+rebumped to 17 MiB, leaving about 1 MiB of headroom above the measured heads;
+revisit if the binary approaches it. The 112 MiB image ceiling is unchanged.
+
+This branch's automation-only head separately measured 15,769,872 bytes
+(15.04 MiB) before the event-executor merge. This PR raises the binary
+ceiling to 17 MiB; the combined exact-head CI measurement is still
+required.
 
 ### Docker history image measurement and immutable-ID pinning
 
@@ -170,9 +223,10 @@ The unused streamed-archive helper and its archive-specific builders/tests
 have been removed in favor of main's history metric; the smoke/runtime
 contract fixtures remain.
 
-The **112 MiB image and 10 MiB binary ceilings are unchanged**. Real current-head
-CI must still record the corrected image size and pass the runtime contract and
-both one-byte-budget negative checks; fixture success alone cannot establish
+The 112 MiB image ceiling is unchanged; the release-binary ceiling is 17 MiB
+(see the current calibration above). CI on this PR's exact head must still
+record the corrected image size and pass the runtime contract and both
+one-byte-budget negative checks; fixture success alone cannot establish
 compliance. No current-head image-fit claim is made here. This measurement
 repair does not change the Dockerfile, runtime base, CA assets or configured user.
 

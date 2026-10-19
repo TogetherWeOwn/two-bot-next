@@ -17,15 +17,24 @@ shell source. The deploy job does not restore caches from PR checks.
 
 AUTOMATED staging deployment is ACTIVE (TOG-12856, unblocking the TOG-12852
 rehearsal): the `deploy` job in `deploy-staging.yml` runs unconditionally on
-every push to `main` and on manual `workflow_dispatch`, in the GitHub
-`staging` environment, with the single fenced `release_fence` dispatch input
-(opt-in boolean, defaults to false). There is no job-level `if:` — a condition
-there (including the old `if: ${{ false }}` suspension, removed here) would
-silently skip deploys on some SHAs and leave the production guard refusing
-those SHAs with no deploy ever running. A skipped job is **not** deployment,
-readiness, protected-environment or E2E success; only a `success` conclusion
-with the intended-rollout evidence counts. Existing running staging resources
-are unchanged; no alternate manual deploy route is authorized.
+every push to `main` that changes a runtime input, and on manual
+`workflow_dispatch`, in the GitHub `staging` environment, with the single
+fenced `release_fence` dispatch input (opt-in boolean, defaults to false). The
+push trigger carries a workflow-level `paths-ignore` deny-list of non-runtime
+paths (`docs/**`, root `*.md`, license, editor/ignore/gitleaks config, issue and
+PR templates, CODEOWNERS, dependabot config). GitHub skips the run only when
+every changed path matches, so a mixed push, an unclassified path or any
+workflow, Cargo, `crates/**` or `wrangler/**` change still deploys, and a
+skipped push creates **no run at all** (not a skipped job). There is no
+job-level `if:` — a condition there (including the old `if: ${{ false }}`
+suspension, removed here) would silently skip deploys on some SHAs and leave
+the production guard refusing those SHAs with no deploy ever running. The
+deny-list is the one reviewed exception: it skips only SHAs whose diff cannot
+change the Worker or container, and `scripts/ci/test_workflows.py` pins it
+against sample runtime paths. A skipped job is **not** deployment, readiness,
+protected-environment or E2E success; only a `success` conclusion with the
+intended-rollout evidence counts. Existing running staging resources are
+unchanged; no alternate manual deploy route is authorized.
 
 CISO accepted the prior disabled CI-only scope in TOG-10958 and TOG-11179 plan
 revision 2. This re-activation ships as a reviewed workflow PR with exact-head
@@ -58,6 +67,41 @@ environment-scoped with no unintended fallback:
 - The existing deployment/approval principal can still deploy and the
   `STAGING_WORKER_URL` variable resolves in that environment.
 
+## Staging schema-drift gate (automatic, plan-only)
+
+Every `deploy-staging` run starts with the `schema-gate` job, and `deploy`
+needs it, so a staging database behind the source fails the run before any
+deploy step instead of staying red silently. The gate job runs only in the
+`staging-migrate-plan` environment with `contents: read`, builds the reviewed
+`staging-migrate` binary at the exact deploy SHA, and runs
+`scripts/ci/staging_schema_gate.py`, which invokes the binary's read-only
+`--plan` through the plan environment's existing
+`TWO_BOT_STAGING_PLAN_DATABASE_URL` binding (a login holding only
+`two_bot_migrator_ro`). It never applies migrations, never reads the migrator
+binding, and never creates or grants roles: non-empty `pending_before` exits
+non-zero naming the pending versions and the manual `staging-migrate` apply
+dispatch that fixes them, and the reviewed-apply fence is unchanged.
+
+The expected staging identity is pinned independently of that secret: the
+non-secret variables `TWO_BOT_STAGING_HOST`, `TWO_BOT_STAGING_DATABASE` and
+`TWO_BOT_STAGING_BRANCH_ID`, scoped to the `staging-migrate-plan` environment
+and Operator-owned. The gate (and then the binary's own `verify_target`)
+refuses before any plan when the binding's host, database or PlanetScale
+branch suffix does not match those pins, when a pin is empty, production-like
+or a pooler endpoint, or when a PlanetScale pin carries no branch id; refusal
+messages are fixed strings that echo neither the URL nor the pins. PlanetScale
+hosts remain supported through the explicit branch pin — there is no blanket
+host-suffix rejection. Until the three variables are set, the gate fails
+closed on every deploy.
+
+The plan manifest's `audit.connection_usage` (sessions summed from
+`pg_stat_database.numbackends`, which the unprivileged plan login can read in
+full, against `effective_max_connections`, or `max_connections` minus
+`superuser_reserved_connections` when the effective field is absent) also
+drives a warning, never a failure, when usage is strictly above 80% of that
+non-superuser ceiling; older manifests without the effective/reserved fields
+fall back to raw `max_connections` and label the ceiling as such.
+
 ## Staging rollback drill (manual)
 
 `staging-rollback-drill.yml` is a manual, staging-only workflow that runs the
@@ -80,29 +124,75 @@ Cloudflare deployment request, hands ownership to it, times the first `/readyz`
 The deployment request never sends `force`, so a target whose secrets changed
 since it was deployed is refused; Wrangler's non-interactive rollback would
 answer yes to that prompt. The request sets `code_update_strategy` to
-`immediate` because Wrangler 4.147's default is `deferred` with a 300 s maximum
+`immediate` because Wrangler 4.151's default is `deferred` with a 300 s maximum
 delay, which would keep the old Durable Object code serving for up to five
 minutes. A 401/403 stops the run and skips the restore; it never retries with
 another credential. Recovery then is a `deploy-staging` dispatch with
 `release_fence=true` once the binding is fixed. Only allowlisted ids, integers,
 statuses and timestamps reach the log, the job summary and the evidence file.
 
+## Staging events read (manual)
+
+`staging-events-read.yml` is a manual, staging-only, read-only workflow that
+gives the B2 soak its processed-side evidence ([evidence-route.md](evidence-route.md)
+step 2) without handing any agent a database credential. The regression pins it
+as `workflow_dispatch`-only with exactly two required string inputs
+(`window_start`, `window_end`; no member, guild or default). Its single `read`
+job runs only from `main`, in the `staging-events-read` environment, on the
+routed runner for job `read`, with `contents: read`, a 5-minute timeout and its
+own non-cancelling concurrency group. It has exactly three unconditional steps:
+pinned checkout without persisted credentials, one Run step that passes the
+inputs through the environment (never an inline expression) to
+`scripts/staging_events_read.py`, and the 14-day upload of
+`staging-events-read-<run_id>.json`. Its three secrets are
+`TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL` (role `two_bot_events_ro`, column-limited
+`SELECT` on `events`), `STAGING_EVENTS_READ_EXPECTED_HOST` (independently pinned
+staging endpoint hostname), and `STAGING_FIXTURE_MEMBER_ID`, scoped to that Run
+step. The host and member are secrets rather than variables because a step's
+`env` block prints variable values on the public run page. No `set -x`, no
+wrangler, no production path.
+
+The script refuses before connecting unless the window is a past UTC window of
+at most 15 minutes, the guild is the pinned TWO Staging guild (the live guild
+refuses), the login names role `two_bot_events_ro` on database `two_bot`, and
+the URL host exactly matches the independent staging-host pin. It forces
+libpq `sslmode=verify-full` with the runner's system CA bundle, so the server
+certificate must authenticate that host. It keeps the password out of the
+process list, runs every statement in a `READ ONLY` transaction, never echoes
+the client's error text, and writes only an ordinal, `event_type` and
+`recorded_at` per row.
+
 ## Production route
 
 `deploy-production.yml` (main #243) is the one live deployment workflow. The
-regression pins it as `workflow_dispatch`-only. Its `production` job must need
-`guard`, run in GitHub environment `production` and carry no job condition. The
-`guard` job may not have an environment, call a reusable workflow, or contain
+regression pins it to `workflow_dispatch`, a completed `deploy-staging` run on
+`main`, and the daily schedule backstop — never push or PR. Its `production`
+job must need `guard`, `soak`, `recheck`, `schema-gate` and `roles-gate`, run in GitHub environment `production`
+and carry exactly the pinned condition (not cancelled, guard success, no skip, a completed soak, a fresh recheck pass — or a
+skipped recheck on manual runs only — and both gates green unless a
+rollback or live-SHA redeploy waives them); any other condition fails the regression. The `recheck`
+job must need `guard`, `soak`, `schema-gate` and `roles-gate` so its fresh hold/live/dispatch read happens after the last long build,
+and must skip while an operator dispatch is active (the lane's single pending slot would otherwise let the
+automatic arrival cancel a queued recovery run). Only
+`production` and `release` hold the `deploy-production` lane (a job-level
+concurrency group, never workflow-level); the guard, gates, soak and recheck
+carry none, so a sleeping promotion can never delay a rollback behind it.
+The `guard` job may not have an environment, call a reusable workflow, or contain
 deploy/probe steps. Its script must still require a deploy-staging run with
 `status="success"` on the SHA, plus required reviewers on the production
 Environment. Negative fixtures cover extra triggers, removed `needs` or
 environment, a bypass condition, deploy steps in the guard, and dropping those
 checks.
 
-With staging active (TOG-12856), every `main` push runs deploy-staging on its
-SHA; the guard accepts only a run that concluded `success` on that SHA, so a
-`skipped` or failed run still refuses production for that SHA. This fails
-closed. This change does not authorize a production bypass.
+With staging active (TOG-12856), every `main` push that changes a runtime input
+runs deploy-staging on its SHA; the guard accepts only a run that concluded
+`success` on that SHA, so a `skipped` or failed run still refuses production
+for that SHA. A docs-only push (the `paths-ignore` list above) starts no run, so
+the guard also refuses a docs-only head with `deploy-staging has no successful
+run`. This fails closed and is the intended trade: pin the latest
+runtime-affecting commit, or dispatch `deploy-staging` for the head you need
+([production-deploy.md](production-deploy.md)). This change does not authorize
+a production bypass.
 
 `supply-chain.yml` holds the required `pr-lint` and `gitleaks` jobs (main #187).
 The permitted same-repo reusable calls are the `pipeline-benchmark` call in
@@ -124,7 +214,7 @@ python3 scripts/ci/check-src-snowflakes.py
 python3 scripts/ci/verify-codeowners.py
 ```
 
-The snowflake gate scans `crates/*/src/**/*.rs` for decimal literals/strings with
+The snowflake gate scans `crates/*/src/**/*.rs` alongside `src/**/*.rs` for decimal literals/strings with
 17–20 digits, including numeric separators and raw strings. Comments and exact
 `#[cfg(test)]` inline modules are excluded. External test modules must start with
 an explicit `#![cfg(test)]`; filenames alone do not exempt source. Integration-test
@@ -168,12 +258,20 @@ branch protection. The existing advisory ownership policy is unchanged.
 
 ## Static audit exceptions
 
-The existing `release-please@17.6.0` API-double fixture install has one inline
-`adhoc-packages` suppression. The direct package is pinned to the release
-Action's bundled library; lifecycle scripts are disabled and its check job has
+The `release-please@17.6.0` commit-parser fixture install (commit-parse guard)
+has one inline `adhoc-packages` suppression. The direct package is pinned; lifecycle scripts are disabled and its check job has
 no write grant. Transitive dependencies remain unlocked. A future fixture
 lockfile can remove this exception; it is not an exception for deployment
 package installation.
+
+`deploy-production.yml` carries two inline suppressions for its automatic
+promotion trigger. `dangerous-triggers` on the `workflow_run` notifier: the
+trigger only wakes the run, and the guard re-resolves the SHA from the API
+and refuses unless it is on `origin/main` with green `ci-ok`, `worker
+check` and a successful `deploy-staging` run, inside the protected
+`production` Environment. `github-env` on the deploy-config render step:
+the only value written is a fixed `$RUNNER_TEMP` path, with no trigger,
+input or API data reaching `GITHUB_ENV`.
 
 The former `if: ${{ false }}` staging suspension (and its narrow
 `obfuscation` suppression) is removed by this re-activation; the workflow

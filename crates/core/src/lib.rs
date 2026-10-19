@@ -7,13 +7,17 @@
 
 pub mod action_outcomes;
 pub mod activation;
+pub mod analytics_family;
 pub mod anchor_event;
+pub mod assistant_transport;
 pub mod audit;
 pub mod audit_mirror;
 #[cfg(feature = "db")]
 pub mod audit_service;
 #[cfg(feature = "db")]
 pub mod audit_store;
+#[cfg(feature = "db")]
+pub mod automation_quota;
 pub mod automation_transfer;
 pub mod automod;
 pub mod automod_runtime;
@@ -21,6 +25,8 @@ pub mod automod_runtime;
 pub mod automod_store;
 pub mod backup;
 pub mod channel_moderation;
+#[cfg(feature = "db")]
+pub mod channel_moderation_release;
 #[cfg(feature = "db")]
 pub mod channel_moderation_store;
 pub mod classify;
@@ -47,9 +53,13 @@ pub mod database_tls;
 pub mod database_url;
 pub mod disable_preflight;
 pub mod e2e_matrix;
+pub mod error_chain;
 pub mod events;
+pub mod eventsub_delivery_config;
+pub mod eventsub_receiver_config;
 pub mod evidence;
 pub mod expected_joins;
+pub mod fb_page_events;
 pub mod feature_commands;
 pub mod feeds;
 pub mod feeds_connector;
@@ -57,11 +67,15 @@ pub mod feeds_http;
 #[cfg(feature = "db")]
 pub mod feeds_store;
 pub mod funnel;
+pub mod game_activity;
+#[cfg(feature = "db")]
+pub mod game_activity_store;
 pub mod gateway_funnel;
 pub mod gateway_session;
 pub mod handlers;
 pub mod health;
 pub mod help;
+pub mod hotzone;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
@@ -95,11 +109,15 @@ pub mod onboarding_store;
 pub mod presence;
 #[cfg(feature = "db")]
 pub mod presence_store;
+#[cfg(feature = "db")]
+pub mod privacy;
 pub mod raid;
 pub mod raid_removal;
+pub mod referral_rewards;
 pub mod rejection_telemetry;
 pub mod router;
 pub mod rsvp;
+pub mod rsvp_conversion;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
 pub mod scheduled;
@@ -112,7 +130,13 @@ pub mod self_roles;
 pub mod send_admission;
 pub mod settings;
 pub mod sticky;
+pub mod stream_funnel;
+pub mod stream_live;
+#[cfg(feature = "db")]
+pub mod stream_live_store;
 pub mod tickets;
+pub mod twitch_eventsub;
+pub mod twitch_helix;
 pub mod voice;
 pub mod voice_access;
 pub mod voice_alias;
@@ -136,6 +160,7 @@ pub mod voice_ownership;
 pub mod voice_permission_health;
 pub mod voice_permissions;
 pub mod voice_placement;
+pub mod voice_presence;
 pub mod voice_private;
 pub mod voice_reconcile;
 pub mod voice_rename_coalescer;
@@ -146,6 +171,7 @@ pub mod voice_style;
 pub mod voice_template;
 pub mod voice_template_lint;
 pub mod voice_text_channel;
+pub mod voice_time_zone;
 pub mod voice_utilities;
 pub mod voice_vote_kick;
 pub mod voice_vote_kick_audit;
@@ -154,9 +180,10 @@ pub mod website_store;
 
 pub use action_outcomes::{
     backoff_ms, classify_kick_status, clear_send_bit, lockdown_overwrite, pace_wait_ms,
-    parse_retry_after_secs, retry_after_ms, set_send_bit, unlock_overwrite, ActionOutcome,
-    KickOutcome, KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_HTTP_TRIES,
-    MAX_RETRY_AFTER_MS, RETRY_AFTER_PADDING_MS,
+    parse_retry_after_secs, retry_after_ms, retry_after_ms_unclamped, set_send_bit,
+    unlock_overwrite, ActionOutcome, KickOutcome, KickResult, KickStatus, ModerationExecution,
+    BACKOFF_BASE_MS, MAX_BACKFILL_RETRY_AFTER_MS, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS,
+    RETRY_AFTER_PADDING_MS,
 };
 pub use automation_transfer::{
     diff_import, export_document, max_import_entries, parse_import_document, ExportDocument,
@@ -186,13 +213,14 @@ pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryErr
 pub use community::{
     build_scorecard, classify, is_scorecard_run_time, previous_closed_week, scorecard_tick,
     week_start_ms, Classification, ClassifierConfig, ClassifyInput, FactRow, ScorecardGates,
-    ScorecardInputs, ScorecardOutcome, StreamCoverage, COMMUNITY_CLASSIFICATIONS,
-    COMMUNITY_FACT_TYPES, SCORECARD_TICK_INTERVAL_MS,
+    ScorecardInputs, ScorecardOutcome, StreamCoverage, CAPTURED_STREAMS, COMMUNITY_CLASSIFICATIONS,
+    COMMUNITY_FACT_TYPES, SCORECARD_TICK_INTERVAL_MS, STREAM_WRITERS,
 };
 pub use community_snapshots::{
-    build_community_snapshot, build_counter_reading, match_rank_roles, window_bounds,
-    CommunitySnapshot, CounterReading, CounterSkip, JobGate, JobGuard, MemberRank, RaidAnomaly,
-    RaidWindow, RankKey, RankRole, RankRow, RankSkip, RosterMember, LIVE_COUNTER_INTERVAL_MS,
+    build_community_snapshot, build_counter_reading, diagnose_rank_roles, match_rank_roles,
+    plan_rank_heal, window_bounds, CommunitySnapshot, CounterReading, CounterSkip, JobGate,
+    JobGuard, MemberRank, RaidAnomaly, RaidWindow, RankHeal, RankKey, RankRole, RankRow,
+    RankRungFailure, RankRungProblem, RankSkip, RosterMember, LIVE_COUNTER_INTERVAL_MS,
     RAID_ANOMALIES, RANK_SNAPSHOT_INTERVAL_MS,
 };
 pub use config::Config;
@@ -217,14 +245,15 @@ pub use custom_commands::{
     validate_put_input, validate_template, AuditRecord, CommandError, DeleteDecision,
     PutCommandInput, PutDecision, RunOutcome, StoredCommand, TemplateContext, TemplateError,
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS,
-    TEMPLATE_PLACEHOLDERS,
+    MAX_TEXT_TRIGGER_CHARS, TEMPLATE_PLACEHOLDERS,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use evidence::{
-    evidence_packet_filename, family_of, Disposition, EventFamily, EvidenceLedger, ExpectedAction,
-    ReceiptingStore, ReconciledItem, Reconciliation, StoreReceipt, ALERT_RULE_IDS,
-    EVIDENCE_SCHEMA_VERSION, MATCH_WINDOW_MS, MAX_EXPECTED_ACTIONS, MAX_RECEIPTS,
-    SOAK_LEDGER_RULE_ID,
+    build_soak_ledger, evidence_packet_filename, family_of, parse_expected_actions,
+    parse_sanitized_rows, Disposition, EventFamily, EvidenceLedger, ExpectedAction, ExpectedInput,
+    ParsedSanitizedRows, ReceiptingStore, ReconciledItem, Reconciliation, SanitizedRow,
+    SanitizedRowsFile, StoreReceipt, ALERT_RULE_IDS, EVIDENCE_SCHEMA_VERSION, MATCH_WINDOW_MS,
+    MAX_EXPECTED_ACTIONS, MAX_RECEIPTS, SOAK_LEDGER_RULE_ID,
 };
 pub use expected_joins::{ExpectedJoins, EXPECTED_JOIN_TTL_SECONDS, WEB_ONE_CLICK_SOURCE};
 pub use feature_commands::{
@@ -238,8 +267,8 @@ pub use funnel::{
 pub use handlers::{
     ChannelClass, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput, HandlerOutcome,
     JoinInput, LevelOutcome, LevelingHook, MemStore, MemberJoinFact, MessageFact, MessageInput,
-    NoopFacts, NoopLeveling, RecordOutcome, RulesAcceptedFact, StoredRow, VoiceEndedFact,
-    VoiceInput, VoiceStartedFact,
+    MessageShape, NoopFacts, NoopLeveling, RecordOutcome, RulesAcceptedFact, StoredRow,
+    VoiceEndedFact, VoiceInput, VoiceStartedFact,
 };
 pub use health::{
     classify_voice_error, ComponentStatus, HealthReport, VoiceComponent, VoiceDiagnostic,
@@ -254,32 +283,32 @@ pub use inactivity::{
 pub use internal_actions::{
     assert_allowed, assert_private_bind, auth_failure, authorize, body_hash, build_channel_keys,
     build_key_map, build_role_keys, canonical_string, check_setting_value_size, is_private_address,
-    new_request_id, normalise_bind_host, parse_body_object, parse_keys, require_field_str,
-    require_reason, require_settings_key, require_snowflake, require_timestamp, sign,
-    signatures_match, utf16_len, valid_idempotency_key, valid_nonce_format, validate_announcement,
-    validate_event_input, validate_guild_add_member, validate_idempotency_key,
-    validate_moderation_numbers, validate_role_assign, within_skew, ActionError, AuthDecision,
-    AuthHeaders, BindError, BucketDecision, BucketSpec, ErrorCode, EventInput, EventPlace,
-    InternalFlags, KeyMapError, KeyRing, KeySpecError, NonceCache, SigningKey, TokenBuckets,
-    ACTIONS_PATH, ADD_MEMBER_BUCKET, AUTH_FAILURE_MESSAGE, CLAIM_STALE_SECONDS, DEFAULT_BUCKET,
-    IMPLEMENTED_ACTIONS, MAX_BODY_BYTES, MAX_EVENT_DESCRIPTION_CHARS, MAX_EVENT_NAME_CHARS,
-    MAX_MESSAGE_CHARS, MAX_SETTING_KEY_LEN, MAX_SETTING_VALUE_BYTES, MIN_KEY_SECRET_LEN,
-    MODERATION_ACTIONS, NEEDS_IDEMPOTENCY_KEY, NEEDS_SETTINGS_STORE, NONCE_TTL_SECONDS,
-    REQUEST_ID_LEN, SKEW_SECONDS,
+    is_request_id, new_request_id, normalise_bind_host, parse_body_object, parse_keys,
+    require_field_str, require_reason, require_settings_key, require_snowflake, require_timestamp,
+    sign, signatures_match, utf16_len, valid_idempotency_key, valid_nonce_format,
+    validate_announcement, validate_event_input, validate_guild_add_member,
+    validate_idempotency_key, validate_moderation_numbers, validate_role_assign, within_skew,
+    ActionError, AuthDecision, AuthHeaders, BindError, BucketDecision, BucketSpec, ErrorCode,
+    EventInput, EventPlace, InternalFlags, KeyMapError, KeyRing, KeySpecError, NonceCache,
+    SigningKey, TokenBuckets, ACTIONS_PATH, ADD_MEMBER_BUCKET, AUTH_FAILURE_MESSAGE,
+    CLAIM_STALE_SECONDS, DEFAULT_BUCKET, IMPLEMENTED_ACTIONS, MAX_BODY_BYTES,
+    MAX_EVENT_DESCRIPTION_CHARS, MAX_EVENT_NAME_CHARS, MAX_MESSAGE_CHARS, MAX_SETTING_KEY_LEN,
+    MAX_SETTING_VALUE_BYTES, MIN_KEY_SECRET_LEN, MODERATION_ACTIONS, NEEDS_IDEMPOTENCY_KEY,
+    NEEDS_SETTINGS_STORE, NONCE_TTL_SECONDS, REQUEST_ID_HEADER, REQUEST_ID_LEN, SKEW_SECONDS,
 };
 pub use invites::{
     attribute_joins, attribution_category, count_downtime_unknown_joins, invite_growth,
-    is_snapshot_stale, summarize_attribution_split, AttributionCategory, AttributionSplit,
-    DowntimeWindow, DowntimeWindowCount, InviteSnapshotStore, InviteState, InviteTracker,
-    JoinAttribution, MemSnapshots, INVITE_SNAPSHOT_STALENESS_BOUND_MS,
+    is_snapshot_stale, referral_counts, summarize_attribution_split, AttributionCategory,
+    AttributionSplit, DowntimeWindow, DowntimeWindowCount, InviteSnapshotStore, InviteState,
+    InviteTracker, JoinAttribution, MemSnapshots, INVITE_SNAPSHOT_STALENESS_BOUND_MS,
 };
 #[cfg(feature = "db")]
 pub use leveling_store::{
-    award as award_leveling_xp, award_message as award_leveling_message,
-    award_voice as award_leveling_voice, current_award as current_leveling_award,
-    leaderboard as leveling_leaderboard, profile as leveling_profile,
-    replace_role_rewards as replace_leveling_role_rewards, role_rewards as leveling_role_rewards,
-    LevelingStoreError,
+    apply_seasonal_decay as apply_leveling_seasonal_decay, award as award_leveling_xp,
+    award_message as award_leveling_message, award_voice as award_leveling_voice,
+    current_award as current_leveling_award, leaderboard as leveling_leaderboard,
+    profile as leveling_profile, replace_role_rewards as replace_leveling_role_rewards,
+    role_rewards as leveling_role_rewards, LevelingStoreError,
 };
 pub use lfg::{
     adjudicate_signup, close_reply, created_reply, iso_millis_utc, leave_reply, lfg_content,
@@ -349,25 +378,35 @@ pub use router::{
 };
 pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,
-    checkin_idempotency_key, checkin_metadata_json, checkin_recorded_text, checkin_source,
-    checkin_source_event_id, is_snowflake, partition_rsvps, require_manage_events, rsvp_saved_text,
-    validate_event_id, validate_occurrence_id, AttendanceClassification, AttendanceProof,
-    CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition,
-    ATTENDANCE_EVENT_TYPE, RSVP_AUDIT_ACTION,
+    checkin_idempotency_key, checkin_metadata_json, checkin_occurrence_full_text,
+    checkin_recorded_text, checkin_source, checkin_source_event_id, is_snowflake,
+    parse_attendance_occurrence, partition_rsvps, require_manage_events, rsvp_event_full_text,
+    rsvp_rate_limited_text, rsvp_saved_text, validate_event_id, validate_occurrence_id,
+    AttendanceClassification, AttendanceOccurrence, AttendanceProof, CheckinError, RsvpAudit,
+    RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition, ATTENDANCE_EVENT_TYPE,
+    AUDIT_RETENTION_DAYS, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
+    MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
+};
+pub use rsvp_conversion::{
+    assign_variant, compute_conversion, reminders_due, render_report_text, AnnouncementVariant,
+    ConversionReport, ReminderKind,
 };
 #[cfg(feature = "db")]
 pub use rsvp_store::{
-    list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+    compensate_checkin_write, compensate_rsvp_write, list_rsvps, prune_rsvp_history, put_rsvp,
+    put_rsvp_with_audit, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
 };
 pub use scheduled::{
     advance_next_run_iso, advance_next_run_ms, clamp_retry_delay_ms, format_iso_ms, lease_until_ms,
-    next_run_at_ms, no_such_schedule_text, no_unique_match_text, parse_iso_ms,
-    post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text, schedule_confirm_text,
-    schedule_list_line, schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome,
-    ScheduleError, ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX,
-    EVERY_MINUTES_MIN, INTERVAL_SECONDS_MAX, INTERVAL_SECONDS_MIN, IN_MINUTES_MAX, IN_MINUTES_MIN,
+    neutralize_scheduled_body, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
+    parse_iso_ms, post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text,
+    schedule_confirm_text, schedule_list_line, schedule_list_page, schedule_list_page_indicator,
+    schedule_list_page_out_of_range_text, schedule_list_page_underflow_text, schedule_list_pages,
+    schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome, ScheduleError,
+    ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX, EVERY_MINUTES_MIN,
+    INTERVAL_SECONDS_MAX, INTERVAL_SECONDS_MIN, IN_MINUTES_MAX, IN_MINUTES_MIN,
     MAX_BODY_CHARS as SCHEDULED_MAX_BODY_CHARS, RETRY_DEFAULT_MS, RETRY_MAX_MS, RETRY_MIN_MS,
-    SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
+    SCHEDULER_TICK_MS, SCHEDULE_LIST_MESSAGE_LIMIT, TICKER_BATCH_LIMIT,
 };
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,
@@ -432,11 +471,14 @@ pub use voice_rooms::{
     PermissionSource, ProposeOutcome, QueuedAction, ReconcilePlan, RenameCoalescer, RoomAction,
     RoomJoinDecision, RoomJoinRequest, RoomLeaveDecision, RoomLeaveReport, RoomPosition, RoomStore,
     SeenChannel, TextCompanion, VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY,
-    MAX_CHANNEL_NAME_LEN, MAX_USER_LIMIT, QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
+    MAX_CHANNEL_NAME_LEN, MAX_FAILED_ACTIONS, MAX_USER_LIMIT, QUEUE_MAX_ATTEMPTS,
+    RENAME_MIN_INTERVAL_MS,
 };
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
-    VoteKickRef, VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts, VOTE_KICK_TTL_MS,
+    VoteKickRef, VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts,
+    VOTE_KICK_COOLDOWN_MS, VOTE_KICK_INITIATOR_LIMIT, VOTE_KICK_INITIATOR_WINDOW_MS,
+    VOTE_KICK_TTL_MS,
 };
 #[cfg(feature = "db")]
 pub use website_store::{

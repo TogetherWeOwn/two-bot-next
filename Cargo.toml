@@ -8,7 +8,7 @@ default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/c
 # library exposes release metadata; it is not a crates.io distribution.
 [package]
 name = "two-bot-next"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -22,6 +22,9 @@ workspace = true
 [workspace.lints.clippy]
 print_stdout = "deny"
 dbg_macro = "deny"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
 
 [workspace.package]
 edition = "2021"
@@ -71,6 +74,8 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 # (sqlx 0.9: `mod macros` is `#[cfg(feature = "macros")]`, so `migrate`
 # alone does not export the macro). TOG-9882 cutover migrations embed via
 # `sqlx::migrate!`.
+# On any sqlx bump: re-audit crates/core/src/database_url.rs allowlist +
+# suppressed pgpass target per SECURITY.md before merging.
 sqlx = { version = "0.9", default-features = false, features = [
     "postgres",
     "runtime-tokio",
@@ -102,7 +107,11 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tower-service = "0.3"
 tower-http = { version = "0.7", default-features = false, features = ["trace"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# `log` records bridged by tracing-subscriber's default `tracing-log` feature
+# carry a synthetic `log` target; the JSON formatter normalizes it back.
+# Already in the lockfile transitively (MIT, deny.toml-allowed).
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 # S2 prototype only (dev-dependency of two-bot-discord): mock Discord gateway
 # double. Same WS stack twilight-gateway itself uses; `server` for the mock
 # listener, `sha1_smol` (BSD-3-Clause, allowed in deny.toml) for the handshake.

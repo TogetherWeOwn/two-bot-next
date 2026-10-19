@@ -28,6 +28,8 @@ fn gates(enabled: bool) -> RouterGates {
         configured_guild: Some(2222),
         automations: enabled,
         moderation: false,
+        voice: false,
+        voice_assistant: false,
         scorecard: false,
         announcements: false,
         tickets: false,
@@ -74,6 +76,13 @@ fn message(id: u64, content: &str) -> Message {
         "attachments": [], "embeds": [], "pinned": false
     }))
     .expect("valid Twilight message fixture")
+}
+
+async fn expire_actor_window() {
+    // Pause only between calls: a paused clock auto-advances during socket I/O.
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    tokio::time::resume();
 }
 
 async fn seed_text_command(pool: &sqlx::PgPool, template: &str) {
@@ -163,9 +172,32 @@ fn registry_receipt(count: usize, first_id: u64) -> ScriptedResponse {
     )
 }
 
+/// Serializes the two tests that touch the process-global refused series.
+/// Exact delta asserts are only race-free while the sibling test (which also
+/// drives refused prefix candidates through `handle_message`) cannot run.
+static PREFIX_REFUSED_SERIES_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn refused_verdict_total() -> u64 {
+    // Callers must hold `PREFIX_REFUSED_SERIES_GUARD`: the global counter is
+    // monotonic but shared, so exact delta asserts are only safe serialized.
+    two_bot_core::metrics::global()
+        .render(None)
+        .lines()
+        .find(|line| {
+            line.starts_with("two_bot_gateway_prefix_trigger_refused_total{reason=\"verdict\"} ")
+        })
+        .expect("refused series")
+        .rsplit_once(' ')
+        .expect("sample")
+        .1
+        .parse()
+        .expect("count")
+}
+
 #[tokio::test]
 async fn rejected_prefix_inputs_never_access_database_or_discord() {
     use AutomationMessageAcceptance::*;
+    let _series_guard = PREFIX_REFUSED_SERIES_GUARD.lock().await;
     let pool = PgPoolOptions::new().connect_lazy_with(test_options());
     // A missed early gate fails immediately instead of trying a live connection.
     pool.close().await;
@@ -177,7 +209,7 @@ async fn rejected_prefix_inputs_never_access_database_or_discord() {
                 .handle_message(&message(50, "!faq"), acceptance, true, None)
                 .await
                 .unwrap(),
-            TextCommandOutcome::Ignored
+            TextCommandOutcome::Refused
         );
     }
     for content in ["hello !faq", " !faq", "!", "! faq", "!RaNk ignored"] {
@@ -227,6 +259,81 @@ async fn rejected_prefix_inputs_never_access_database_or_discord() {
 }
 
 #[tokio::test]
+async fn verdict_refusal_counts_separately_from_unmatched() {
+    use AutomationMessageAcceptance::*;
+    let _series_guard = PREFIX_REFUSED_SERIES_GUARD.lock().await;
+    let pool = PgPoolOptions::new().connect_lazy_with(test_options());
+    pool.close().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    // A verdict refusal of a prefix candidate returns a distinct outcome and
+    // bumps the refused counter; unmatched content stays `Ignored` with no
+    // increment.
+    let before = refused_verdict_total();
+    assert_eq!(
+        runtime
+            .handle_message(&message(70, "!faq"), Matched, true, None)
+            .await
+            .unwrap(),
+        TextCommandOutcome::Refused
+    );
+    assert_eq!(refused_verdict_total(), before + 1);
+    assert_eq!(
+        runtime
+            .handle_message(&message(71, "hello"), Unmatched, true, None)
+            .await
+            .unwrap(),
+        TextCommandOutcome::Ignored
+    );
+    assert_eq!(refused_verdict_total(), before + 1);
+    // Scope mismatches and disabled-gate silence stay `Ignored` and never
+    // count as verdict refusals.
+    let mut webhook = message(72, "!faq");
+    webhook.webhook_id = Some(Id::new(6666));
+    assert_eq!(
+        runtime
+            .handle_message(&webhook, Unmatched, true, None)
+            .await
+            .unwrap(),
+        TextCommandOutcome::Ignored
+    );
+    assert_eq!(refused_verdict_total(), before + 1);
+    // A verdict refusal still returns `Refused` for non-candidates, but only
+    // prefix candidates increment the series: non-prefix content, webhook
+    // prefixes and out-of-scope guild prefixes stay uncounted.
+    assert_eq!(
+        runtime
+            .handle_message(&message(73, "hello world"), Matched, true, None)
+            .await
+            .unwrap(),
+        TextCommandOutcome::Refused
+    );
+    assert_eq!(refused_verdict_total(), before + 1);
+    let mut refused_webhook = message(74, "!faq");
+    refused_webhook.webhook_id = Some(Id::new(6666));
+    assert_eq!(
+        runtime
+            .handle_message(&refused_webhook, CaptureOnly, true, None)
+            .await
+            .unwrap(),
+        TextCommandOutcome::Refused
+    );
+    assert_eq!(refused_verdict_total(), before + 1);
+    let mut foreign = message(75, "!faq");
+    foreign.guild_id = Some(Id::new(7777));
+    assert_eq!(
+        runtime
+            .handle_message(&foreign, Unavailable, true, None)
+            .await
+            .unwrap(),
+        TextCommandOutcome::Refused
+    );
+    assert_eq!(refused_verdict_total(), before + 1);
+    assert!(mock.requests().is_empty());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 #[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn explicitly_accepted_prefixes_render_audit_and_suppress_mentions() {
     use AutomationMessageAcceptance::*;
@@ -235,6 +342,7 @@ async fn explicitly_accepted_prefixes_render_audit_and_suppress_mentions() {
     let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "9000"}))).await;
     let runtime = runtime(pool.clone(), &mock, true);
     for (id, acceptance) in [(51, AutomodDisabled), (52, Unmatched), (53, Exempt)] {
+        expire_actor_window().await;
         assert_eq!(
             runtime
                 .handle_message(
@@ -248,6 +356,7 @@ async fn explicitly_accepted_prefixes_render_audit_and_suppress_mentions() {
             TextCommandOutcome::Delivered
         );
     }
+    expire_actor_window().await;
     assert_eq!(
         runtime
             .handle_message(
@@ -260,6 +369,7 @@ async fn explicitly_accepted_prefixes_render_audit_and_suppress_mentions() {
             .unwrap(),
         TextCommandOutcome::Ignored
     );
+    expire_actor_window().await;
     sqlx::query("UPDATE automation_commands SET enabled = FALSE WHERE name = 'faq'")
         .execute(&pool)
         .await
@@ -327,6 +437,7 @@ async fn prefix_attempt_survives_concurrency_restart_and_unknown_outcomes() {
         TextCommandOutcome::AlreadyAttempted
     );
     // Crash/cancellation after committing the attempt, before recording a result.
+    expire_actor_window().await;
     assert!(
         store::claim_text_attempt(&pool, "2222", "3333", "faq", 61, &two_bot_core::now_iso())
             .await
@@ -358,6 +469,7 @@ async fn prefix_delivery_and_render_failures_are_audited_without_retry() {
         (63, None, "context_unavailable"),
         (64, Some(oversized.as_str()), "render_failed"),
     ] {
+        expire_actor_window().await;
         assert!(runtime
             .handle_message(&message(id, "!faq"), Unmatched, true, server)
             .await
@@ -457,6 +569,7 @@ async fn prefix_storage_failure_never_permits_an_untracked_or_repeated_post() {
         .execute(&pool)
         .await
         .unwrap();
+    expire_actor_window().await;
     sqlx::query("ALTER TABLE automation_audit_log ADD CONSTRAINT refuse_result CHECK (action <> 'command.run')")
         .execute(&pool).await.unwrap();
     assert!(runtime
@@ -843,6 +956,189 @@ async fn disabled_and_unknown_dynamic_rows_and_failed_delivery() {
         2,
         "ambiguous delivery is not retried"
     );
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+fn patch_contents(mock: &MockRest) -> Vec<Value> {
+    mock.requests()
+        .iter()
+        .filter(|request| request.method == "PATCH")
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn manage_missing_options_reply_exact_copy() {
+    let pool = PgPoolOptions::new().connect_lazy_with(test_options());
+    // A missed early gate fails immediately instead of trying a live connection.
+    pool.close().await;
+    for (id, name, expected) in [
+        (110u64, "command", "A command name is required."),
+        (111u64, "command-remove", "A command name is required."),
+        (112u64, "command", "A template is required."),
+    ] {
+        let options: &[(&str, &str)] = if id == 112 { &[("name", "faq")] } else { &[] };
+        let mock = MockRest::start(
+            vec![
+                ScriptedResponse::status(204),
+                ScriptedResponse::json(200, json!({"id": "9000"})),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let runtime = runtime(pool.clone(), &mock, true);
+        assert!(
+            runtime
+                .handle_interaction(&slash(id, name, 32, options), None)
+                .await
+                .unwrap(),
+            "{expected}"
+        );
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2, "{expected}");
+        assert!(
+            requests.iter().all(|request| request.method != "PUT"),
+            "missing options must not republish: {expected}"
+        );
+        let patches = patch_contents(&mock);
+        assert_eq!(patches.len(), 1, "{expected}");
+        assert_eq!(patches[0]["content"], expected);
+        assert_eq!(patches[0]["allowed_mentions"]["parse"], json!([]));
+        mock.shutdown().await;
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn manage_save_remove_absent_replies_are_pinned() {
+    let pool = test_pool().await;
+    let base = InteractionRouter::new(gates(true))
+        .publish_set(&[])
+        .expect("base registry size")
+        .len();
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),                      // #120 defer
+            registry_receipt(base + 1, 7100),                   // create PUT
+            ScriptedResponse::json(200, json!({"id": "9001"})), // #120 complete
+            ScriptedResponse::status(204),                      // #121 defer
+            registry_receipt(base, 7200),                       // remove PUT
+            ScriptedResponse::json(200, json!({"id": "9001"})), // #121 complete
+            ScriptedResponse::status(204),                      // #122 defer
+            ScriptedResponse::json(200, json!({"id": "9001"})), // #122 complete
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(
+            &slash(
+                120,
+                "command",
+                32,
+                &[("name", "faq"), ("template", "saved")]
+            ),
+            None
+        )
+        .await
+        .unwrap());
+    assert!(runtime
+        .handle_interaction(&slash(121, "command-remove", 32, &[("name", "faq")]), None)
+        .await
+        .unwrap());
+    assert!(runtime
+        .handle_interaction(&slash(122, "command-remove", 32, &[("name", "faq")]), None)
+        .await
+        .unwrap());
+    let requests = mock.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "PUT")
+            .count(),
+        2,
+        "absent delete does not republish"
+    );
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 3);
+    assert_eq!(patches[0]["content"], "Saved /faq.");
+    assert_eq!(patches[1]["content"], "Removed /faq.");
+    assert_eq!(patches[2]["content"], "No command /faq found.");
+    for body in &patches {
+        assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+    }
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn manage_registry_publish_failure_suffix_is_pinned() {
+    const SUFFIX: &str = "Registry publication failed; the command picker is not yet synchronized.";
+    let pool = test_pool().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),                      // defer
+            ScriptedResponse::status(403),                      // registry publish (no retry)
+            ScriptedResponse::json(200, json!({"id": "9000"})), // honest partial-result edit
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    runtime
+        .handle_interaction(
+            &slash(
+                130,
+                "command",
+                32,
+                &[("name", "faq"), ("template", "saved")],
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store::get_command(&pool, "2222", "faq")
+            .await
+            .unwrap()
+            .is_some(),
+        "the write commits despite the publish failure"
+    );
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0]["content"], format!("Saved /faq. {SUFFIX}"),);
+    assert_eq!(mock.requests().len(), 3, "no hidden reads or retry PUTs");
+    mock.shutdown().await;
+
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(403),
+            ScriptedResponse::json(200, json!({"id": "9000"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = self::runtime(pool.clone(), &mock, true);
+    runtime
+        .handle_interaction(&slash(131, "command-remove", 32, &[("name", "faq")]), None)
+        .await
+        .unwrap();
+    assert!(
+        store::get_command(&pool, "2222", "faq")
+            .await
+            .unwrap()
+            .is_none(),
+        "the delete commits despite the publish failure"
+    );
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0]["content"], format!("Removed /faq. {SUFFIX}"),);
+    assert_eq!(mock.requests().len(), 3, "no hidden reads or retry PUTs");
     mock.shutdown().await;
     pool.close().await;
 }

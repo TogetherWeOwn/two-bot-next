@@ -10,11 +10,50 @@ The router publishes one complete set: first definition wins, built-in names
 are reserved, and Discord's 100-command limit applies. Database-backed custom
 commands and optional text triggers are dynamic and are not listed here.
 
+The voice commands publish only while `TWO_VOICE=1`, and `/templateassistant`
+also needs `TWO_ASSISTANT_ENDPOINT`; both are enabled here. The voice `kick`
+loses first-wins to moderation `/kick`, so the `/kick` below is the moderation
+command and the vote-kick shape is not listed.
+
 Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 28.
+Built-in commands: 51.
+
+## `/access`
+
+Set who can create voice rooms and use room commands
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `show` | subcommand | false | — | — | — | — | Show the current voice-room access settings |
+| `creation` | subcommand | false | — | — | — | — | Turn temporary room creation on or off |
+| `creation enabled` | boolean | true | — | — | — | — | On allows new rooms, off stops them (existing rooms keep working) |
+| `role` | subcommand | false | — | — | — | — | Set or clear the role required to use room commands |
+| `role role` | role | false | — | — | — | — | Required role; leave empty to clear it |
+| `restrict` | subcommand | false | — | — | — | — | Limit a room command to specific roles (no role = admins only) |
+| `restrict command` | string | true | — | — | 32 | — | The command name without the slash, e.g. kick |
+| `restrict role` | role | false | — | — | — | — | Allowed role |
+| `restrict role2` | role | false | — | — | — | — | Another allowed role |
+| `restrict role3` | role | false | — | — | — | — | Another allowed role |
+| `unrestrict` | subcommand | false | — | — | — | — | Lift a room command's role restriction |
+| `unrestrict command` | string | true | — | — | 32 | — | The command name without the slash, e.g. kick |
+
+## `/alwaysprivate`
+
+Start new rooms from one creator as private
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
+| `enabled` | boolean | false | — | — | — | — | Start new rooms private (default on) |
 
 ## `/attendance`
 
@@ -25,7 +64,7 @@ Check in a verified human attendee for a scheduled event (scorecard)
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `event-occurrence` | string | true | — | — | 128 | — | Event id (number in the event URL) or occurrence id, e.g. 12345 or weekly-standup-2026-10-03 |
+| `event-occurrence` | string | true | — | — | 128 | — | Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly |
 | `member` | user | true | — | — | — | — | Human member who attended. |
 
 ## `/ban`
@@ -49,10 +88,10 @@ Define or replace a custom command
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `name` | string | true | — | — | — | — | Command name, a-z 0-9 _ - |
-| `template` | string | true | — | — | — | — | What the bot replies; {user} {username} {server} {channel} |
-| `description` | string | false | — | — | — | — | Shown in the command picker |
-| `text-trigger` | string | false | — | — | — | — | Optional !trigger form, e.g. !faq |
+| `name` | string | true | — | — | 32 | — | Command name, a-z 0-9 _ - |
+| `template` | string | true | — | — | 2000 | — | What the bot replies; {user} {username} {server} {channel} |
+| `description` | string | false | — | — | 100 | — | Shown in the command picker |
+| `text-trigger` | string | false | — | — | 33 | — | Optional !trigger form, e.g. !faq |
 
 ## `/command-list`
 
@@ -72,7 +111,39 @@ Delete a custom command
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `name` | string | true | — | — | — | — | Command to delete |
+| `name` | string | true | — | — | 32 | — | Command to delete |
+
+## `/create`
+
+Create a new creator channel for temporary voice rooms
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `name` | string | true | — | — | 100 | — | Name for the new creator channel |
+
+## `/defaultlimit`
+
+Set the starting user limit for new rooms
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
+| `limit` | integer | false | 0 | 99 | — | — | Starting limit 0-99 (0 is unlimited; leave empty to inherit) |
+
+## `/export`
+
+Download this server's voice configuration as a versioned JSON file
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+No options.
 
 ## `/feed-add`
 
@@ -84,7 +155,7 @@ Relay an RSS, YouTube, or Twitch feed into this channel
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `kind` | string | true | — | — | — | RSS = `"rss"`; YouTube = `"youtube"`; Twitch = `"twitch"` | Feed kind |
-| `source` | string | true | — | — | — | — | HTTPS URL or YouTube channel id |
+| `source` | string | true | — | — | 2048 | — | HTTPS URL or YouTube channel id |
 
 ## `/feed-list`
 
@@ -104,11 +175,56 @@ Remove a feed relay
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `id` | string | true | — | — | — | — | Feed id |
+| `id` | string | true | — | — | 128 | — | Feed id |
+
+## `/group`
+
+Toggle shared numbering per category for one creator channel
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
+| `enabled` | boolean | false | — | — | — | — | Share numbering across the category (default on) |
 
 ## `/help`
 
 Show this server's live commands, grouped by who can use them.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
+
+## `/import`
+
+Preview a voice configuration file before applying it
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `file` | attachment | true | — | — | — | — | Voice configuration JSON file from /export |
+
+## `/inheritpermissions`
+
+Set where new rooms copy permission overrides from
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
+| `source` | string | true | — | — | 8 | Creator = `"creator"`; Category = `"category"`; Channel = `"channel"` | Copy overrides from the creator, the category, or a channel |
+| `source-channel` | channel | false | — | — | — | — | Channel to copy overrides from (only with source channel) |
+
+## `/invite`
+
+Show this server's invite link
 
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
@@ -145,9 +261,9 @@ Post a raid/LFG signup with role slots
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `title` | string | true | — | — | — | — | Event or group title |
+| `title` | string | true | — | — | 100 | — | Event or group title |
 | `starts-at` | string | true | — | — | — | — | ISO-8601 start time, e.g. 2026-10-04T18:00:00Z |
-| `roles` | string | true | — | — | — | — | Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6 |
+| `roles` | string | true | — | — | 2339 | — | Role slots as role:Label:count, comma-separated, e.g. tank:Tank:2,dps:DPS:6 |
 
 ## `/lfg-close`
 
@@ -158,7 +274,18 @@ Close a raid/LFG signup
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `id` | string | true | — | — | — | — | LFG id from the posted signup |
+| `id` | string | true | — | — | 128 | — | LFG id from the posted signup |
+
+## `/limit`
+
+Set your room's user limit (no number locks it at the current headcount)
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `count` | integer | false | 0 | 99 | — | — | Limit 0-99 (0 is unlimited; leave empty to lock at who is here now) |
 
 ## `/lockdown`
 
@@ -170,6 +297,85 @@ Prevent @everyone from sending messages
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/logging`
+
+Set where room health notices go and how much they say
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `show` | subcommand | false | — | — | — | — | Show the current logging settings |
+| `level` | subcommand | false | — | — | — | — | Set how much the bot logs, or turn logging off |
+| `level level` | string | true | — | — | — | Off = `"off"`; Brief = `"brief"`; Full = `"full"` | How much to log |
+| `channel` | subcommand | false | — | — | — | — | Set or clear the channel notices are sent to |
+| `channel channel` | channel | false | — | — | — | — | Notice channel; leave empty to use the automatic fallback |
+| `mention` | subcommand | false | — | — | — | — | Set or clear the role mentioned on errors |
+| `mention role` | role | false | — | — | — | — | Role to mention; leave empty to clear it |
+
+## `/name`
+
+Set a custom name for your temporary voice room, or restore the template name
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
+
+## `/ping`
+
+Show the bot's response latency
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
+
+## `/position`
+
+Set where new rooms appear and the first room number
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
+| `position` | string | false | — | — | — | Above = `"above"`; Below = `"below"` | New rooms go above or below the creator channel |
+| `first-number` | integer | false | 1 | 4294967295 | — | — | First room number (numbering starts here) |
+
+## `/privacy`
+
+Manage your analytics privacy for this server.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `opt-out` | subcommand | false | — | — | — | — | Delete your stored activity for this server and stop future analytics persistence. |
+| `opt-in` | subcommand | false | — | — | — | — | Resume analytics persistence for this server (already-deleted rows are not restored). |
+| `status` | subcommand | false | — | — | — | — | Show whether you are opted out and this server's analytics switches. |
+
+## `/private`
+
+Deny new members from joining your voice room and open a Join channel
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
+
+## `/public`
+
+Let anyone join your voice room again and remove its Join channel
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
 
 ## `/purge`
 
@@ -193,6 +399,15 @@ Show your XP, level and server rank.
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `member` | user | false | — | — | — | — | Show another member. |
+
+## `/reclaim`
+
+Take back ownership of your temporary voice room
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
 
 ## `/rsvp`
 
@@ -226,7 +441,7 @@ Schedule a message, once or recurring
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `body` | string | true | — | — | — | — | Message text |
+| `body` | string | true | — | — | 2000 | — | Message text |
 | `in-minutes` | integer | false | 1 | 525600 | — | — | Fire this many minutes from now |
 | `every-minutes` | integer | false | 60 | 525600 | — | — | Recur at this interval (60 min minimum) |
 
@@ -237,7 +452,9 @@ List scheduled messages for this server
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of the schedule list (1-based) |
 
 ## `/schedule-remove`
 
@@ -248,7 +465,16 @@ Cancel a scheduled message
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `id` | string | true | — | — | — | — | Scheduled message id |
+| `id` | string | true | — | — | 128 | — | Scheduled message id |
+
+## `/setup`
+
+Show voice-room status, health and creator channels
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
 
 ## `/slowmode`
 
@@ -271,7 +497,7 @@ Set this channel's sticky message
 
 | Option | Type | Required | Min | Max | Max length | Choices | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `body` | string | true | — | — | — | — | Sticky text |
+| `body` | string | true | — | — | 2000 | — | Sticky text |
 | `debounce` | integer | false | 1 | 300 | — | — | Quiet seconds before re-posting (default 5, max 300) |
 
 ## `/sticky-remove`
@@ -296,6 +522,31 @@ Temporarily ban a member
 | `duration_seconds` | integer | true | 60 | 31536000 | — | — | Duration in seconds |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
 
+## `/templateassistant`
+
+Describe the voice-room naming you want; the bot drafts a name template
+
+- Default permissions: ManageGuild (`32`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `request` | string | true | — | — | 2000 | — | Plain-language description of the naming you want, in any language |
+
+## `/textchannels`
+
+Toggle companion text channels for one creator channel
+
+- Default permissions: ManageChannels (`16`)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `channel` | channel | true | — | — | — | — | Creator voice channel to configure |
+| `enabled` | boolean | false | — | — | — | — | Turn companion text channels on or off (default on) |
+| `name` | string | false | — | — | 100 | — | Companion channel name (default voice-chat) |
+| `viewer-role` | role | false | — | — | — | — | Extra role that may view companions (@everyone for all) |
+
 ## `/timeout`
 
 Timeout a member
@@ -308,6 +559,26 @@ Timeout a member
 | `target` | user | true | — | — | — | — | Member to moderate |
 | `duration_seconds` | integer | true | 60 | 2419200 | — | — | Duration in seconds |
 | `reason` | string | true | — | — | 512 | — | Mandatory audit reason |
+
+## `/transfer`
+
+Hand your temporary voice room to a member in it
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `member` | user | true | — | — | — | — | Member in the room to make the new owner |
+
+## `/unlimit`
+
+Remove your room's user limit
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+No options.
 
 ## `/unlock`
 

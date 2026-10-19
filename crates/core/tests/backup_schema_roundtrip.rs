@@ -623,6 +623,8 @@ async fn assert_default_inserts(
         ("internal_idempotency", "intent_id", "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('4', 64), repeat('5', 64), 'event.read', repeat('6', 64), 'in_flight') RETURNING intent_id"),
         ("internal_action_log", "audit_id", "INSERT INTO internal_action_log (intent_id, phase, caller_hash, action, resolved_role_id) VALUES (83, 'intent', repeat('b', 64), 'role.assign', '100000000000000010') RETURNING audit_id"),
         ("moderation_member_bans", "generation", "INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('post-restore:ban', '100000000000000001', '100000000000000012', 'prepared', now()) RETURNING generation"),
+        ("privacy_opt_out_audit", "id", "INSERT INTO privacy_opt_out_audit (guild_id, member_id) VALUES ('100000000000000001', '100000000000000002') RETURNING id"),
+        ("event_store", "id", "INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key, presence_status, activity_type) VALUES ('PRESENCE_UPDATE', '100000000000000001', 'post-restore-member', now(), 'post-restore:event-store', 'online', 0) RETURNING id"),
     ];
     let cases: BTreeSet<(String, String)> = inserts
         .iter()
@@ -1387,6 +1389,67 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
     assert_eq!(cas_tokens(pool).await, tokens);
     assert!(next_cas_token(pool).await <= cas_before);
     assert_guards_work(pool).await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_create_reservations")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(count > 0, "target contains newer reservation history");
+    let directory = ArchiveDirectory::new();
+    let source = directory.path("pre-reservation-v4.ndjson.gz");
+    let mut encoder = two_bot_core::backup::dump_file::new_encoder();
+    use std::io::Write as _;
+    encoder
+        .write_all(include_bytes!("fixtures/pre-reservation-v4.ndjson"))
+        .unwrap();
+    std::fs::write(
+        &source,
+        two_bot_core::backup::dump_file::finish_gzip(encoder).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(inspect(&source).unwrap().manifest.version, 4);
+    // Restore fences a destination holding moderation history; this scenario
+    // deliberately replaces a reused rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &source).await.unwrap();
+    assert!(report.ok);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_create_reservations")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "old archives must not retain newer target history"
+    );
+    for table in [
+        "retention_guild_purge_queue",
+        "retention_deletion_requests",
+        "event_store",
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "v4 archives predate the v6/v7 tables; restore must clear newer {table} rows"
+        );
+    }
+    let channel: String = sqlx::query_scalar("SELECT channel_id FROM voice_rooms")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(channel, "500", "the archived room is restored");
     db.close().await.unwrap();
 }
 

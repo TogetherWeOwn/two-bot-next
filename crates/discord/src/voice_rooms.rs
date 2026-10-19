@@ -137,6 +137,13 @@ pub struct RoomChannelAttributes {
     pub user_limit: u16,
     /// Create-time sorting position (V8 placement); `None` lets Discord append.
     pub position: Option<u64>,
+    /// Bulk reorder of the category's channels the caller applies first,
+    /// opening a free `position` (empty when it is free already). Not sent
+    /// by `create_room`.
+    pub respace: Vec<(Snowflake, u64)>,
+    /// Position the caller uses instead of `position` when that reorder is
+    /// refused (`None`: create without a position).
+    pub fallback_position: Option<u64>,
     /// Empty means "include no overrides": the room syncs to its category.
     pub overwrites: Vec<PermissionOverwrite>,
 }
@@ -171,6 +178,8 @@ impl RoomChannelAttributes {
             nsfw: channel.nsfw.unwrap_or(false),
             user_limit,
             position: None,
+            respace: Vec::new(),
+            fallback_position: None,
             overwrites,
         })
     }
@@ -249,6 +258,16 @@ pub fn companion_view_grant(member_id: Snowflake) -> Option<PermissionOverwrite>
 }
 
 /// Sanitized errors: never surface HTTP bodies/tokens/member data in diagnostics.
+/// Upper bound for one rename request (admission plus Discord round trip).
+pub const RENAME_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound for one voice-status request (send admission plus the
+/// Discord round trip).
+pub const VOICE_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Discord's voice channel status limit.
+pub const MAX_VOICE_STATUS_CHARS: usize = 500;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RoomHttpError {
     #[error("Discord rate limit; retry after {retry_after_ms}ms")]
@@ -279,6 +298,71 @@ pub struct MessageRef {
     pub message_id: Snowflake,
 }
 
+/// A global rate-limit wait longer than this never parks the guild actor:
+/// the call returns RateLimited so the action queue backs off tick-driven
+/// (visible in gauges) instead of sleeping silently inside the worker loop.
+const GLOBAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// In-flight voice REST attempts, for the in-flight-age gauge.
+#[derive(Debug, Default)]
+struct InFlightRest {
+    next_id: u64,
+    live: std::collections::HashMap<u64, Instant>,
+}
+
+impl InFlightRest {
+    fn begin(slots: &Arc<Mutex<Self>>) -> InFlightGuard {
+        let (id, slots) = {
+            let mut inner = slots.lock().expect("in-flight lock");
+            inner.next_id += 1;
+            let id = inner.next_id;
+            inner.live.insert(id, Instant::now());
+            (id, Arc::clone(slots))
+        };
+        publish_rest_age(&slots);
+        InFlightGuard {
+            slots: Some(slots),
+            id,
+        }
+    }
+}
+
+/// Oldest live REST attempt in whole seconds. Pure computation behind
+/// [`publish_rest_age`]: tests assert on this return value instead of the
+/// process-global gauge, which is last-writer-wins and flakes when another
+/// test's begin/drop lands between the publish and the read.
+fn oldest_age_secs(slots: &Arc<Mutex<InFlightRest>>) -> u64 {
+    slots
+        .lock()
+        .expect("in-flight lock")
+        .live
+        .values()
+        .map(|started| started.elapsed().as_secs())
+        .max()
+        .unwrap_or(0)
+}
+
+fn publish_rest_age(slots: &Arc<Mutex<InFlightRest>>) {
+    let age_secs = oldest_age_secs(slots);
+    two_bot_core::metrics::global().set_voice_rest_in_flight_age_secs(age_secs);
+}
+
+/// Removes one in-flight attempt and republishes the gauge on drop, so
+/// timeouts and early returns cannot leak the slot.
+struct InFlightGuard {
+    slots: Option<Arc<Mutex<InFlightRest>>>,
+    id: u64,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Some(slots) = self.slots.take() {
+            slots.lock().expect("in-flight lock").live.remove(&self.id);
+            publish_rest_age(&slots);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RoomHttp {
     // Twilight builds and validates requests, but its ResponseFuture retries
@@ -288,8 +372,14 @@ pub struct RoomHttp {
     transport: HyperClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
     authorization: HeaderValue,
     origin: String,
+    // Scheme/authority used for attachment downloads after the user URL has
+    // been validated against the CDN allowlist. Production is the Discord
+    // CDN itself, so the rewrite is the identity; tests point it at a
+    // loopback server, mirroring the `origin` seam for API requests.
+    cdn_origin: String,
     global_not_before: Arc<Mutex<Option<Instant>>>,
     unauthorized: Arc<AtomicBool>,
+    in_flight: Arc<Mutex<InFlightRest>>,
 }
 
 impl std::fmt::Debug for RoomHttp {
@@ -301,6 +391,20 @@ impl std::fmt::Debug for RoomHttp {
 impl RoomHttp {
     pub fn new(token: String) -> Result<Self, RoomHttpError> {
         Self::with_origin(token, "https://discord.com/api/v10".to_owned(), false)
+    }
+
+    /// Whether a 401 permanently latched this writer: every later write
+    /// refuses immediately until a restart rebuilds the client, so a healthy
+    /// store re-probe must never clear a halt this latch caused.
+    pub fn is_unauthorized(&self) -> bool {
+        self.unauthorized.load(Ordering::Relaxed)
+    }
+
+    /// Recompute the in-flight-age gauge from attempts still live, so a
+    /// per-tick publish shows a currently-stalled request instead of the age
+    /// at begin (always 0) or after drop (already removed).
+    pub fn republish_rest_age(&self) {
+        publish_rest_age(&self.in_flight);
     }
 
     fn with_origin(token: String, origin: String, allow_http: bool) -> Result<Self, RoomHttpError> {
@@ -324,8 +428,10 @@ impl RoomHttp {
             transport,
             authorization,
             origin,
+            cdn_origin: "https://cdn.discordapp.com".to_owned(),
             global_not_before: Arc::new(Mutex::new(None)),
             unauthorized: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(Mutex::new(InFlightRest::default())),
         })
     }
 
@@ -345,6 +451,10 @@ impl RoomHttp {
     ) -> Result<Bytes, RoomHttpError> {
         // Interaction callbacks/webhooks use their own token, not the bot
         // credential or its global rate limit. Never log their request paths.
+        // A stale join must not sleep out a backoff it will never use.
+        if !still_valid() {
+            return Err(RoomHttpError::Cancelled);
+        }
         loop {
             if !bot_authenticated {
                 break;
@@ -354,12 +464,33 @@ impl RoomHttp {
             }
             let until = *self.global_not_before.lock().expect("global backoff lock");
             match until {
-                Some(until) if until > Instant::now() => tokio::time::sleep_until(until).await,
+                Some(until) if until > Instant::now() => {
+                    let wait = until.saturating_duration_since(Instant::now());
+                    if wait > GLOBAL_BACKOFF_MAX {
+                        // Never park the guild actor on a far-future global
+                        // limit: hand the remaining wait to the action queue,
+                        // which backs off tick-driven (gauges stay live)
+                        // instead of sleeping silently in the worker loop.
+                        two_bot_core::metrics::global().voice_global_backoff_capped();
+                        tracing::warn!(
+                            wait_secs = wait.as_secs(),
+                            "voice global backoff capped; returning RateLimited for queue backoff"
+                        );
+                        return Err(RoomHttpError::RateLimited {
+                            retry_after_ms: wait.as_millis().min(u128::from(u64::MAX)) as u64,
+                            global: true,
+                        });
+                    }
+                    if wait > Duration::from_secs(1) {
+                        tracing::info!(wait_secs = wait.as_secs(), "voice global backoff wait");
+                    }
+                    tokio::time::sleep_until(until).await;
+                    if !still_valid() {
+                        return Err(RoomHttpError::Cancelled);
+                    }
+                }
                 _ => break,
             }
-        }
-        if !still_valid() {
-            return Err(RoomHttpError::Cancelled);
         }
         let mut wire = Request::builder()
             .method(request.method().name())
@@ -384,6 +515,9 @@ impl RoomHttp {
         // body is broken; transport failures and outer timeouts fall back to
         // `transport` via `Drop`.
         let mut attempt = crate::executor_metrics::Attempt::new(&request);
+        // Tracked for the in-flight-age gauge; the guard removes the slot on
+        // drop so timeouts cannot leak it.
+        let _in_flight = InFlightRest::begin(&self.in_flight);
         let response = tokio::time::timeout(Duration::from_secs(10), async {
             let response = self
                 .transport
@@ -494,8 +628,20 @@ impl RoomHttp {
     /// Download a Discord-hosted `/import` file, capped at `max_bytes`.
     /// Only the Discord CDN host is fetched, over HTTPS and without the bot
     /// credential: attachment URLs are signed and need no authorization.
-    /// Oversized bodies, non-2xx statuses and transport failures surface as
-    /// errors with no partial bytes.
+    ///
+    /// One ten-second elapsed-time budget covers the request, the status
+    /// check and collection of the whole body together, measured from the
+    /// start of the download; it is never restarted when headers arrive, so
+    /// a response that returns valid headers and then stalls or drips
+    /// chunks still fails at the deadline. The `max_bytes` cap bounds size
+    /// independently: a body of exactly `max_bytes` succeeds, one byte more
+    /// is refused. A deadline expiry, an oversized body, a non-2xx status
+    /// (redirects are classified, never followed) and transport failures
+    /// all surface as errors with no partial bytes. Failures never echo the
+    /// signed attachment URL. The request is marked `connection: close`:
+    /// a non-2xx body is deliberately never read, and this one-shot
+    /// download must not return a connection carrying that unread (and
+    /// possibly stalled) body to the shared pool for a later request.
     pub async fn download_attachment(
         &self,
         url: &str,
@@ -507,29 +653,45 @@ impl RoomHttp {
         {
             return Err(RoomHttpError::InvalidRequest);
         }
+        // The user URL is validated above exactly as supplied; only the
+        // transport target's scheme/authority come from `cdn_origin`
+        // (identity in production), preserving path and signed query.
+        let path_and_query = uri
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str);
+        let transport_uri: http::Uri =
+            format!("{}{path_and_query}", self.cdn_origin.trim_end_matches('/'))
+                .parse()
+                .map_err(|_| RoomHttpError::InvalidRequest)?;
         let request = Request::builder()
             .method("GET")
-            .uri(uri)
+            .uri(transport_uri)
+            .header(http::header::CONNECTION, "close")
             .body(Full::new(Bytes::new()))
             .map_err(|_| RoomHttpError::InvalidRequest)?;
-        let response =
-            tokio::time::timeout(Duration::from_secs(10), self.transport.request(request))
+        let download = async {
+            let response = self
+                .transport
+                .request(request)
+                .await
+                .map_err(|_| RoomHttpError::UnknownOutcome)?;
+            let status = response.status().as_u16();
+            if !(200..300).contains(&status) {
+                return Err(classify_response(status, &[]));
+            }
+            let body = Limited::new(response.into_body(), max_bytes.saturating_add(1))
+                .collect()
                 .await
                 .map_err(|_| RoomHttpError::UnknownOutcome)?
-                .map_err(|_| RoomHttpError::UnknownOutcome)?;
-        let status = response.status().as_u16();
-        if !(200..300).contains(&status) {
-            return Err(classify_response(status, &[]));
-        }
-        let body = Limited::new(response.into_body(), max_bytes.saturating_add(1))
-            .collect()
+                .to_bytes();
+            if body.len() > max_bytes {
+                return Err(RoomHttpError::InvalidRequest);
+            }
+            Ok(body.to_vec())
+        };
+        tokio::time::timeout(Duration::from_secs(10), download)
             .await
             .map_err(|_| RoomHttpError::UnknownOutcome)?
-            .to_bytes();
-        if body.len() > max_bytes {
-            return Err(RoomHttpError::InvalidRequest);
-        }
-        Ok(body.to_vec())
     }
 
     pub async fn create_room(
@@ -571,6 +733,31 @@ impl RoomHttp {
         let request = request.try_into_request().map_err(classify_http_error)?;
         let body = self.send(request, still_in_creator).await?;
         serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+    }
+
+    /// Discord's bulk `PATCH /guilds/{guild.id}/channels`: set each listed
+    /// channel's position in one request (Manage Channels).
+    pub async fn reorder_channels(
+        &self,
+        guild_id: Snowflake,
+        positions: &[(Snowflake, u64)],
+    ) -> Result<(), RoomHttpError> {
+        if guild_id == 0 || positions.iter().any(|(id, _)| *id == 0) {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let body: Vec<serde_json::Value> = positions
+            .iter()
+            .map(|(id, position)| serde_json::json!({ "id": id.to_string(), "position": position }))
+            .collect();
+        let request = twilight_http::request::RequestBuilder::raw(
+            twilight_http::request::Method::Patch,
+            format!("guilds/{guild_id}/channels"),
+        )
+        .json(&body)
+        .build()
+        .map_err(|_| RoomHttpError::InvalidRequest)?;
+        self.send(request, || true).await?;
+        Ok(())
     }
 
     // Source: https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/member/struct.UpdateGuildMember.html
@@ -947,25 +1134,28 @@ impl RoomHttp {
         Ok(())
     }
 
-    /// Atomic room-scoped overwrite replacement for an owner handoff.
-    /// Source: <https://docs.discord.com/developers/resources/channel#modify-channel>
-    pub async fn update_room_overwrites(
+    /// Set (or clear with `""`) a voice channel's status line: Discord's
+    /// `PUT /channels/{channel.id}/voice-status`, which needs Set Voice Channel
+    /// Status. Bounded like renames; the caller keeps only the latest text.
+    pub async fn set_room_voice_status(
         &self,
         channel_id: Snowflake,
-        overwrites: &[PermissionOverwrite],
-        still_valid: impl Fn() -> bool + Send + 'static,
-    ) -> Result<Channel, RoomHttpError> {
-        if channel_id == 0 {
+        status: &str,
+    ) -> Result<(), RoomHttpError> {
+        if channel_id == 0 || status.chars().count() > MAX_VOICE_STATUS_CHARS {
             return Err(RoomHttpError::InvalidRequest);
         }
-        let request = self
-            .http
-            .update_channel(Id::new(channel_id))
-            .permission_overwrites(overwrites)
-            .try_into_request()
-            .map_err(classify_http_error)?;
-        let body = self.send(request, still_valid).await?;
-        serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+        let request = twilight_http::request::RequestBuilder::raw(
+            twilight_http::request::Method::Put,
+            format!("channels/{channel_id}/voice-status"),
+        )
+        .json(&serde_json::json!({ "status": status }))
+        .build()
+        .map_err(|_| RoomHttpError::InvalidRequest)?;
+        tokio::time::timeout(VOICE_STATUS_REQUEST_TIMEOUT, self.send(request, || true))
+            .await
+            .map_err(|_| RoomHttpError::RenameDeferred)??;
+        Ok(())
     }
 
     pub async fn rename_room(
@@ -984,7 +1174,10 @@ impl RoomHttp {
             .map_err(classify_http_error)?;
         // Bounded even for a stalled transport: rename budgets are charged on
         // attempt, including an unknown outcome. The queue keeps its latest name.
-        tokio::time::timeout(Duration::from_secs(1), self.send(request, || true))
+        // The bound covers durable send admission plus the Discord round trip,
+        // which together exceed one second in production. The guild actor
+        // waits at most one second of it; the rest runs on its own task.
+        tokio::time::timeout(RENAME_REQUEST_TIMEOUT, self.send(request, || true))
             .await
             .map_err(|_| RoomHttpError::RenameDeferred)??;
         Ok(())
@@ -1087,6 +1280,10 @@ fn classify_response(status: u16, body: &[u8]) -> RoomHttpError {
 mod http_tests;
 
 #[cfg(test)]
+#[path = "voice_import_deadline_tests.rs"]
+mod voice_import_deadline_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -1146,6 +1343,8 @@ mod tests {
                 nsfw: true,
                 user_limit: 8,
                 position: None,
+                respace: Vec::new(),
+                fallback_position: None,
                 overwrites: overrides,
             }
         );
@@ -1402,5 +1601,96 @@ mod tests {
         }]);
         assert_eq!(companion_overwrites(&planned_bot, 999).len(), 1);
         assert_eq!(companion_overwrites(&plan, 0).len(), 1);
+    }
+
+    /// Read one counter series from the process-global metrics exposition.
+    fn global_series(prefix: &str) -> u64 {
+        two_bot_core::metrics::global()
+            .render(None)
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .map(|line| {
+                line.rsplit_once(' ')
+                    .unwrap_or_else(|| panic!("bad sample: {line}"))
+                    .1
+                    .parse::<u64>()
+                    .unwrap_or_else(|_| panic!("bad sample: {line}"))
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn far_future_global_backoff_returns_bounded_ratelimited() {
+        // Stall regression (TOG prod stall follow-up): a far-future global
+        // `retry-after` must never park the guild actor in a silent sleep.
+        // The call returns `RateLimited { global: true }` immediately so the
+        // action queue backs off tick-driven, and the cap is counted.
+        let http = RoomHttp::new("test-token".to_owned()).unwrap();
+        *http.global_not_before.lock().expect("global backoff lock") =
+            Some(Instant::now() + Duration::from_secs(3600));
+        let capped_before = global_series("two_bot_voice_global_backoff_capped_total");
+        let request = Client::new("Bot test-token".to_owned())
+            .create_message(Id::<twilight_model::id::marker::ChannelMarker>::new(1))
+            .content("ping")
+            .try_into_request()
+            .expect("request builds offline");
+        let started = Instant::now();
+        let error = http
+            .send_request(request, || true, true)
+            .await
+            .expect_err("far-future backoff never sends");
+        assert!(
+            started.elapsed() < Duration::from_secs(GLOBAL_BACKOFF_MAX.as_secs()),
+            "returned promptly instead of sleeping out the backoff"
+        );
+        match error {
+            RoomHttpError::RateLimited {
+                retry_after_ms,
+                global,
+            } => {
+                assert!(global);
+                assert!(retry_after_ms > 0);
+            }
+            other => panic!("expected global RateLimited, got {other:?}"),
+        }
+        assert_eq!(
+            global_series("two_bot_voice_global_backoff_capped_total"),
+            capped_before + 1
+        );
+        // A stale join still cancels before touching the backoff at all.
+        let request = Client::new("Bot test-token".to_owned())
+            .create_message(Id::<twilight_model::id::marker::ChannelMarker>::new(1))
+            .content("ping")
+            .try_into_request()
+            .expect("request builds offline");
+        let error = http
+            .send_request(request, || false, true)
+            .await
+            .expect_err("stale join cancels");
+        assert_eq!(error, RoomHttpError::Cancelled);
+    }
+
+    #[test]
+    fn republish_rest_age_reports_a_live_stalled_attempt() {
+        // The gauge must reflect attempts still live, not just the begin
+        // (always 0) and drop (already removed) snapshots: backdate one
+        // attempt 7 s and republish mid-flight. The assertion reads the pure
+        // computation, not the process-global gauge: the gauge is
+        // last-writer-wins and any concurrent test's begin/drop between the
+        // publish and the read fails an exact gauge read.
+        let slots = Arc::new(Mutex::new(InFlightRest::default()));
+        {
+            let mut inner = slots.lock().expect("in-flight lock");
+            inner.next_id += 1;
+            let id = inner.next_id;
+            inner.live.insert(
+                id,
+                Instant::now()
+                    .checked_sub(Duration::from_secs(7))
+                    .expect("stalled start 7s ago"),
+            );
+        }
+        assert_eq!(oldest_age_secs(&slots), 7);
+        publish_rest_age(&slots);
     }
 }

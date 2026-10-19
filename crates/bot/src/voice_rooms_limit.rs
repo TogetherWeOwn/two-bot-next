@@ -215,7 +215,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             );
         }
         let (channel, headcount, writable) = {
-            let live = self.live.inner.read().expect("live voice lock");
+            let live = self.live.read_state();
             if !live.ready {
                 return LimitReply::Done(
                     "The voice worker isn't warmed up yet — try again in a moment.".to_owned(),
@@ -293,7 +293,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         // publication below: gateway evidence that lands while the PATCH is
         // in flight is newer and must survive.
         let state = {
-            let live = self.live.inner.read().expect("live voice lock");
+            let live = self.live.read_state();
             match (
                 self.rooms.contains_key(&channel_id),
                 live.channels.get(&channel_id),
@@ -330,7 +330,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             Ok(()) => {
                 self.queue.mark_succeeded(&action);
                 {
-                    let mut live = self.live.inner.write().expect("live voice lock");
+                    let mut live = self.live.write_state();
                     // A gateway update, disconnect or republication that landed
                     // while the PATCH was in flight is newer evidence: keep it
                     // instead of rolling the cache back to the just-written
@@ -371,7 +371,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 // failure budget so a reconnect retries it. A room that is
                 // truly gone stays gone.
                 let still_tracked = {
-                    let live = self.live.inner.read().expect("live voice lock");
+                    let live = self.live.read_state();
                     self.rooms.contains_key(&channel_id) && live.channels.contains_key(&channel_id)
                 };
                 if still_tracked {

@@ -6,13 +6,14 @@ use thiserror::Error;
 use url::{Host, Url};
 
 pub const MAX_FEED_BYTES: usize = 2_000_000;
+pub const MAX_FEED_SOURCE_BYTES: usize = 2048;
 pub const MAX_REDIRECT_HOPS: usize = 3;
 pub const FEED_READ_TIMEOUT_MS: u64 = 15_000;
 pub const FEED_USER_AGENT: &str = "Owen/1.0 (+https://two.gg)";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FetchError {
-    #[error("Feed source must be an HTTPS URL without embedded credentials.")]
+    #[error("Feed source must be an HTTPS URL on port 443, without credentials, and at most 2048 bytes.")]
     InvalidSource,
     #[error("Feed source must resolve only to public IP addresses.")]
     NonPublicAddress,
@@ -26,12 +27,45 @@ pub enum FetchError {
     UnsupportedContentType,
 }
 
+impl FetchError {
+    /// Bounded `error_class` for `two_bot_feed_fetch_errors_total` (TOG-28423).
+    /// Every variant maps to a member of
+    /// [`crate::metrics::FEED_FETCH_ERROR_CLASSES`]; no URL, host or header
+    /// text ever becomes a label.
+    pub fn metrics_error_class(&self) -> &'static str {
+        match self {
+            Self::InvalidSource => "invalid_source",
+            Self::NonPublicAddress => "non_public_address",
+            Self::RedirectRefused => "redirect_refused",
+            Self::TooLarge => "too_large",
+            Self::InvalidEncoding => "invalid_encoding",
+            Self::UnsupportedContentType => "unsupported_content_type",
+        }
+    }
+
+    /// Bounded `outcome` for `two_bot_feed_fetches_total` (TOG-28423).
+    /// Sources refused before dialling stay distinct from refused redirects;
+    /// every other policy refusal is a generic failure.
+    pub fn metrics_outcome(&self) -> &'static str {
+        match self {
+            Self::InvalidSource | Self::NonPublicAddress => "invalid_source",
+            Self::RedirectRefused => "refused_redirect",
+            Self::TooLarge | Self::InvalidEncoding | Self::UnsupportedContentType => "failure",
+        }
+    }
+}
+
 pub fn validate_source(source: &str) -> Result<Url, FetchError> {
+    if source.len() > MAX_FEED_SOURCE_BYTES {
+        return Err(FetchError::InvalidSource);
+    }
     let url = Url::parse(source.trim()).map_err(|_| FetchError::InvalidSource)?;
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
         || url.host().is_none()
+        || url.port_or_known_default() != Some(443)
+        || url.as_str().len() > MAX_FEED_SOURCE_BYTES
     {
         return Err(FetchError::InvalidSource);
     }
@@ -157,11 +191,30 @@ pub fn redirect_target(current: &Url, location: &str, hops: usize) -> Result<Url
 }
 
 pub fn validate_content_type(content_type: Option<&str>) -> Result<(), FetchError> {
-    let kind = content_type.unwrap_or("").trim().to_ascii_lowercase();
-    if kind.is_empty() || kind.contains("xml") || kind.contains("rss") || kind.contains("atom") {
-        Ok(())
-    } else {
-        Err(FetchError::UnsupportedContentType)
+    let raw = content_type.unwrap_or("").trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+    // Media type only: parameters (e.g. `; charset=utf-8`) never grant
+    // acceptance. A substring in a parameter (`text/html; foo=atom`) must
+    // not read as a feed type. The `x-` and `text/rss+xml` variants are
+    // legacy media types some servers still send for real feeds.
+    let media = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match media.as_str() {
+        "application/rss+xml"
+        | "application/x-rss+xml"
+        | "text/rss+xml"
+        | "application/atom+xml"
+        | "application/x-atom+xml"
+        | "application/rdf+xml"
+        | "application/xml"
+        | "text/xml" => Ok(()),
+        _ => Err(FetchError::UnsupportedContentType),
     }
 }
 

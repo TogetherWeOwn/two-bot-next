@@ -36,6 +36,8 @@ fn ctx(owner: &str, members: u32, room_number: u32, seed: u64) -> RoomContext {
         members_playing: 0,
         parties: Vec::new(),
         timestamp: 1_790_683_200, // 2026-09-29 12:00:00 UTC (a Tuesday).
+        room_minutes: 0,
+        game_minutes: 0,
         tz_offset_minutes: 0,
         seed,
         named_lists: HashMap::new(),
@@ -183,8 +185,10 @@ fn seeded_picks_stable_across_rerenders_through_queue() {
 
     // Same seed, so the emoji/list head is untouched; only the counts moved
     // (`@@num@@` and the plural sit after the seeded picks in the template).
-    let solo_head: Vec<&str> = solo.split(' ').take(2).collect();
-    let busy_head: Vec<&str> = busy.split(' ').take(2).collect();
+    // The leading emoji now joins the list pick with 〢, so the stable head
+    // is the first space-separated token.
+    let solo_head: Vec<&str> = solo.split(' ').take(1).collect();
+    let busy_head: Vec<&str> = busy.split(' ').take(1).collect();
     assert_eq!(
         solo_head, busy_head,
         "membership change re-rolled the seeded pick: {solo:?} vs {busy:?}"

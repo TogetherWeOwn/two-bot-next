@@ -336,7 +336,7 @@ class Drill:
         self.log(f"{name} {iso(moment)}")
         return moment
 
-    def deploy_image(self, image, label):
+    def deploy_image(self, image, label, source_sha):
         """Full-container deploy of the pinned pre-built image, no rebuild.
 
         The deploy config is generated from the reviewed `wrangler.toml` on
@@ -344,12 +344,14 @@ class Drill:
         registry reference (Cloudflare docs: for a registry image
         `wrangler deploy` uses the configured reference without building).
         Old source is never checked out and no Dockerfile is rebuilt.
+        The version is stamped with the pinned source SHA (`--message`) so
+        the drill leg keeps its provenance receipt.
         Wrangler's own output may carry paths or gleamed config, so it is
         discarded: only the exit code and duration are recorded.
         """
         generate_deploy_config(self.deploy_path, image, self.wrangler_dir)
         started = self.now()
-        returncode = self.deploy(self.deploy_path)
+        returncode = self.deploy(self.deploy_path, source_sha)
         elapsed = round(self.now() - started, 1)
         require(returncode == 0, "deploy_failed",
                 f"elapsed={elapsed} code={returncode}")
@@ -609,14 +611,15 @@ class Drill:
             # the baseline then verify instead.
             current = None
         if current != pin["image"]:
-            deployed, deploy_elapsed = self.deploy_image(pin["image"], name)
+            deployed, deploy_elapsed = self.deploy_image(pin["image"], name, pin["source_sha"])
             expect_rollout = True
         else:
             # Restore after a refused backout deploy: the baseline still serves.
             deployed, deploy_elapsed, expect_rollout = fenced, 0.0, False
         leg["deployed"] = iso(deployed)
         leg["deploy_elapsed_seconds"] = deploy_elapsed
-        self.control("deployment-takeover", release_fence=True)
+        self.control("deployment-takeover", release_fence=True,
+                     expected_deployment=pin["worker_version"])
         taken = self.stamp(f"{name}: ownership taken")
         leg["takeover"] = iso(taken)
         target_worker = serving_version(self.client)
@@ -761,14 +764,24 @@ def generate_deploy_config(path, image, wrangler_dir):
     Path(path).write_text(json.dumps(config, indent=2) + "\n")
 
 
-def wrangler_deploy(wrangler_bin, wrangler_dir):
-    """Deploy closure: pinned wrangler binary, discarded output, exit code only."""
+# Wrangler gets PATH, HOME and its Cloudflare deploy credentials only; never the ownership token.
+WRANGLER_ENV_KEYS = ("PATH", "HOME", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID")
 
-    def deploy(config_path):
+
+def wrangler_deploy(wrangler_bin, wrangler_dir, environ):
+    """Deploy closure: pinned wrangler binary, discarded output, exit code only.
+
+    The deployed version is stamped with the pinned source SHA (`--message`)
+    so the drill leg keeps its provenance receipt.
+    """
+    child_env = {key: environ[key] for key in WRANGLER_ENV_KEYS if key in environ}
+
+    def deploy(config_path, message_sha):
         try:
             result = subprocess.run(
-                [wrangler_bin, "deploy", "--config", config_path, "--env", "staging"],
-                cwd=wrangler_dir, capture_output=True,
+                [wrangler_bin, "deploy", "--config", config_path, "--env", "staging",
+                 "--message", message_sha],
+                cwd=wrangler_dir, env=child_env, capture_output=True,
                 timeout=WRANGLER_TIMEOUT_SECONDS)
         except (OSError, subprocess.SubprocessError):
             raise GateError("deploy_unavailable") from None
@@ -858,7 +871,7 @@ def main(argv=None, *, environ=None, make_control=ownership_control,
                                 env.get("CLOUDFLARE_API_TOKEN"))
         drill = Drill(client, make_control(token, url, actor), url, run_id,
                       (args.deploy_config,
-                       deploy_factory(args.wrangler_bin, wrangler_dir),
+                       deploy_factory(args.wrangler_bin, wrangler_dir, env),
                        wrangler_dir),
                       log=print)
         failures = drill.run(pin, attestation)

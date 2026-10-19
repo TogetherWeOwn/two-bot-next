@@ -84,48 +84,41 @@ class Body(unittest.TestCase):
             self.assertIn(("error", "PR body"), levels(f))
 
     def test_missing_section_follows_mode(self):
-        body = GOOD_BODY.replace("## Risks", "## Notes")
+        body = GOOD_BODY.replace("## Verification", "## Notes")
         self.assertIn(("error", "PR template"), levels(ps.evaluate(env(BODY=body))))
         self.assertIn(("warning", "PR template"), levels(ps.evaluate(env(BODY=body, PR_STANDARDS_MODE="warn"))))
         self.assertNotIn("PR template", [t for _, t in levels(ps.evaluate(env(BODY=GOOD_BODY)))])
 
-    def test_placeholder_thinking_path_does_not_count(self):
-        thin = GOOD_BODY.split("## Linked")[0]
-        placeholder = ("## Thinking Path\n\n> - This repo does a thing\n> - [Which subsystem is involved]\n"
-                       "> - [What problem exists]\n> - This pull request ...\n> - The benefit is ...\n\n")
-        body = GOOD_BODY.replace(thin, placeholder)
-        msgs = [f.message for f in ps.evaluate(env(BODY=body))]
-        self.assertTrue(any("Thinking Path" in m and "at least 3" in m for m in msgs), msgs)
+    def test_optional_prose_sections_are_not_required(self):
+        # Pipeline review 2026-10-10: only the linked card/issue and the test evidence are required.
+        body = ("## Linked Issues or Issue Description\n\nRefs: TOG-1234\n\n"
+                "## Verification\n\n- `npm test` passes: 41 passed, 0 failed\n")
+        self.assertEqual([], ps.evaluate(env(BODY=body)))
 
     def test_bare_dash_section_is_empty(self):
-        body = GOOD_BODY.replace("- Low risk. One extra key fetch on the failure path only.", "-")
+        body = GOOD_BODY.replace("- `npm test` passes: 41 passed, 0 failed", "-")
         msgs = [f.message for f in ps.evaluate(env(BODY=body))]
-        self.assertTrue(any("Risks" in m for m in msgs), msgs)
-
-    def test_model_placeholder_rejected_and_human_authored_accepted(self):
-        bad = GOOD_BODY.replace("- Example Model 1.0, 200k context, tool use", "- <model>")
-        self.assertTrue(any("Model Used" in f.message for f in ps.evaluate(env(BODY=bad))))
-        ok = GOOD_BODY.replace("- Example Model 1.0, 200k context, tool use", "- None - human-authored")
-        self.assertEqual([], ps.evaluate(env(BODY=ok)))
+        self.assertTrue(any("Verification" in m for m in msgs), msgs)
 
     def test_comment_blocks_do_not_satisfy_a_section(self):
-        body = GOOD_BODY.replace("- Refresh the signing key on a failed signature check",
-                                 "<!-- - Refresh the signing key on a failed signature check -->")
+        body = GOOD_BODY.replace("- `npm test` passes: 41 passed, 0 failed",
+                                 "<!-- - `npm test` passes: 41 passed, 0 failed -->")
         msgs = [f.message for f in ps.evaluate(env(BODY=body))]
-        self.assertTrue(any("What Changed" in m for m in msgs), msgs)
+        self.assertTrue(any("Verification" in m for m in msgs), msgs)
 
-    def test_light_types_skip_linked_issue_and_dedup_tick(self):
+    def test_light_types_skip_linked_issue(self):
         body = (GOOD_BODY.replace("## Linked Issues or Issue Description\n\nRefs: TOG-1234\n\n", "")
                 .replace("- [x] I searched for duplicate or related PRs and linked them above", "- [ ] done")
                 + "\nRefs: TOG-9\n")
         self.assertEqual([], ps.evaluate(env(TITLE="docs(readme): explain setup", BODY=body)))
         f = ps.evaluate(env(TITLE="fix(auth): refresh the key", BODY=body))
         self.assertIn(("error", "PR template"), levels(f))
-        self.assertIn(("error", "Duplicate search"), levels(f))
+        self.assertNotIn("Duplicate search", [t for _, t in levels(f)])
 
-    def test_unticked_dedup_box_fails_for_code_types(self):
+    def test_unticked_dedup_box_is_not_required(self):
+        # Pipeline review 2026-10-10: the duplicate-search tick is optional prose now.
         body = GOOD_BODY.replace("- [x] I searched", "- [ ] I searched")
-        self.assertIn(("error", "Duplicate search"), levels(ps.evaluate(env(BODY=body))))
+        self.assertEqual([], ps.evaluate(env(BODY=body)))
 
     def test_bots_and_generated_prs_are_exempt(self):
         f = ps.evaluate(env(AUTHOR="dependabot[bot]", TITLE="chore(deps): bump x", BODY="Bumps x."))
@@ -172,6 +165,45 @@ class CardAndInternalRefs(unittest.TestCase):
             f = ps.evaluate(env(BODY=clean, REPO_PRIVATE="false", HEAD_REF=ref))
             self.assertEqual([], f, ref)
 
+    def test_public_branch_all_fixed_patterns_follow_mode(self):
+        # FIXED_INTERNAL is now consumed only by the branch/commit gates (title/body
+        # go through strict_hits/other_hits), so the branch gate must pin every
+        # non-ticket-id pattern. Each ref carries only its own pattern.
+        clean = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12")
+        refs = ("fix/x-agent://abc", "fix/x-(/TOG/issues/abc)", "fix/x-localhost-y",
+                "fix/x-10.0.0.5-y", "fix/x-box.tail1234.ts.net-y",
+                "fix/x-workforce.infextion.net-y")
+        for mode, level in (("warn", "warning"), ("error", "error")):
+            for ref in refs:
+                f = ps.evaluate(env(BODY=clean, REPO_PRIVATE="false",
+                                    PR_STANDARDS_MODE=mode, HEAD_REF=ref))
+                self.assertEqual([(level, "Internal reference")], levels(f), (mode, ref))
+                self.assertIn("branch name", f[0].message, (mode, ref))
+
+    def test_public_title_body_strict_subset_always_errors(self):
+        # Tracker id, instance UI link and internal host fail the title/body even in warn mode.
+        # Each fixture carries only its own pattern, so demoting one strict pattern fails this test.
+        # Hostnames are case-insensitive and instance links stay links inside inline code.
+        clean = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12")
+        for leak in ("TOG-123", "(/TOG/issues/abc)", "`/TOG/issues/abc`",
+                     "https://workforce.infextion.net/x", "https://WORKFORCE.INFEXTION.NET/x"):
+            for where in ("TITLE", "BODY"):
+                body = clean if where == "TITLE" else GOOD_BODY.replace("Refs: TOG-1234", leak)
+                title = "fix(auth): refresh the key " + leak if where == "TITLE" else "fix(auth): refresh the key"
+                f = ps.evaluate(env(TITLE=title, BODY=body, REPO_PRIVATE="false",
+                                    PR_STANDARDS_MODE="warn"))
+                self.assertIn(("error", "Internal reference"), levels(f), (where, leak))
+
+    def test_public_title_body_advisory_subset_follows_mode(self):
+        # Agent links, localhost, private nets and tailnet names stay advisory in warn mode
+        for leak in ("agent://abc", "http://localhost:3100/x", "http://10.0.0.5/x",
+                     "https://box.tail1234.ts.net/x"):
+            body = GOOD_BODY.replace("Refs: TOG-1234", leak)
+            f = ps.evaluate(env(BODY=body, REPO_PRIVATE="false", PR_STANDARDS_MODE="warn"))
+            self.assertEqual([("warning", "Internal reference")], levels(f), leak)
+            f = ps.evaluate(env(BODY=body, REPO_PRIVATE="false", PR_STANDARDS_MODE="error"))
+            self.assertEqual([("error", "Internal reference")], levels(f), leak)
+
     def test_private_repo_allows_lowercase_ids_in_branch(self):
         self.assertEqual([], ps.evaluate(env(HEAD_REF="qa/tog-123-example")))
 
@@ -180,7 +212,7 @@ class CardAndInternalRefs(unittest.TestCase):
         self.assertEqual([], ps.evaluate(env(BODY=body, REPO_PRIVATE="false")))
 
     def test_public_repo_catches_instance_links_and_hosts(self):
-        for leak in ("see /TOG/issues/TOG-1", "agent://abc", "http://localhost:3100/x", "http://10.0.0.5/x",
+        for leak in ("(/TOG/issues/abc)", "agent://abc", "http://localhost:3100/x", "http://10.0.0.5/x",
                      "http://192.168.1.4", "https://box.tail1234.ts.net/x", "https://workforce.infextion.net/x"):
             body = GOOD_BODY.replace("Refs: TOG-1234", leak)
             f = ps.evaluate(env(BODY=body, REPO_PRIVATE="false"))
@@ -190,9 +222,17 @@ class CardAndInternalRefs(unittest.TestCase):
         body = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12. Mentions CVE-2026-1234, UTF-8, SHA-256, GPT-4 and 172.32.0.1.")
         self.assertEqual([], ps.evaluate(env(BODY=body, REPO_PRIVATE="false")))
 
-    def test_html_comments_are_not_scanned(self):
-        body = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12\n<!-- do not write TOG-123 or localhost here -->")
+    def test_html_comments_are_not_scanned_for_advisory(self):
+        body = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12\n<!-- do not write localhost here -->")
         self.assertEqual([], ps.evaluate(env(BODY=body, REPO_PRIVATE="false")))
+
+    def test_strict_hits_inside_html_comments_still_fail(self):
+        # Comment text is still stored and served, so the fail-closed subset scans raw text.
+        for leak in ("TOG-123", "(/TOG/issues/abc)", "https://workforce.infextion.net/x"):
+            body = GOOD_BODY.replace("Refs: TOG-1234", f"Fixes #12\n<!-- hidden {leak} -->")
+            self.assertIn(("error", "Internal reference"),
+                          levels(ps.evaluate(env(BODY=body, REPO_PRIVATE="false", PR_STANDARDS_MODE="warn"))),
+                          leak)
 
     def test_prefixes_are_configurable(self):
         body = GOOD_BODY.replace("Refs: TOG-1234", "Refs ACME-77")
@@ -219,8 +259,35 @@ class Push(unittest.TestCase):
                          levels(ps.evaluate(env(EVENT="push", COMMITS=c, REPO_PRIVATE="false"))))
         self.assertEqual([], ps.evaluate(env(EVENT="push", COMMITS=c, REPO_PRIVATE="true")))
 
+    def test_public_history_all_fixed_patterns_follow_mode(self):
+        # Same pin as the branch gate: every non-ticket-id entry in FIXED_INTERNAL
+        # must warn/error on push. Each message carries only its own pattern.
+        leaks = ("agent://abc", "(/TOG/issues/abc)", "http://localhost:3100/x",
+                 "http://10.0.0.5/x", "https://box.tail1234.ts.net/x",
+                 "https://workforce.infextion.net/x")
+        for leak in leaks:
+            c = self.commits(f"fix(auth): refresh the key (#12)\n\nSee {leak}")
+            for mode, level in (("warn", "warning"), ("error", "error")):
+                f = ps.evaluate(env(EVENT="push", COMMITS=c, REPO_PRIVATE="false",
+                                    PR_STANDARDS_MODE=mode))
+                self.assertEqual([(level, "Internal reference")], levels(f), (mode, leak))
+
     def test_garbage_commits_json_does_not_crash(self):
         self.assertEqual([], ps.evaluate(env(EVENT="push", COMMITS="not json")))
+
+    def test_bot_long_title_is_a_warning_not_an_error(self):
+        long_title = ("ci(deps): bump dtolnay/rust-toolchain from "
+                      "7e38f4b43b4db5c8dd498af069a4f6196df1d067 to "
+                      "e2a55d2ffb04f378e9626c28d38b36d230d1e12f (#808)")
+        self.assertGreater(len(long_title), 100)
+        commits = json.dumps([{"id": "0" * 40, "message": long_title,
+                               "author": {"username": "dependabot[bot]", "name": "dependabot[bot]"}}])
+        f = ps.evaluate(env(EVENT="push", COMMITS=commits))
+        self.assertEqual([("warning", "Commit on main")], levels(f))
+        # Same long title from a human is still an error.
+        commits = json.dumps([{"id": "0" * 40, "message": long_title}])
+        f = ps.evaluate(env(EVENT="push", COMMITS=commits))
+        self.assertEqual([("error", "Commit on main")], levels(f))
 
 
 class Template(unittest.TestCase):
@@ -235,15 +302,15 @@ class Template(unittest.TestCase):
         for heading, _, _ in ps.REQUIRED_SECTIONS:
             self.assertIn(heading.lower(), sections, heading)
 
-    def test_template_carries_the_dedup_checkbox(self):
-        self.assertIsNotNone(ps.DEDUP_CHECKBOX.search(ps.strip_comments(self.text)))
-
     def test_unfilled_template_fails_in_error_mode(self):
         f = ps.evaluate(env(BODY=self.text, PR_STANDARDS_MODE="error"))
-        self.assertTrue(any(x.level == "error" and x.title in ("PR template", "Duplicate search") for x in f), f)
+        self.assertTrue(any(x.level == "error" and x.title == "PR template" for x in f), f)
 
     def test_template_has_no_internal_references_outside_comments(self):
         self.assertEqual([], ps.internal_hits(self.text, "TOG|PAP|PAPA"))
+        # The strict subset scans raw text (including comments), so the shipped
+        # template must carry no strict hit at all.
+        self.assertEqual([], ps.strict_hits(self.text, "TOG|PAP|PAPA"))
 
 
 class Main(unittest.TestCase):
@@ -258,7 +325,7 @@ class Main(unittest.TestCase):
         rc, out = self.run_main(env(TITLE="nope"))
         self.assertEqual(1, rc)
         self.assertTrue(out.startswith("::error title=PR title::"), out)
-        rc, out = self.run_main(env(BODY=GOOD_BODY.replace("## Risks", "## Notes"), PR_STANDARDS_MODE="warn"))
+        rc, out = self.run_main(env(BODY=GOOD_BODY.replace("## Verification", "## Notes"), PR_STANDARDS_MODE="warn"))
         self.assertEqual(0, rc)
         self.assertIn("::warning title=PR template::", out)
 

@@ -10,7 +10,15 @@ import { readdirSync, readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { FORWARDED_FLAGS, NOT_FORWARDED, forwardedFlagVars } from "../src/container-env.ts";
+import {
+  FORWARDED_DISCORD_IDS,
+  FORWARDED_FLAGS,
+  NOT_FORWARDED,
+  forwardedDiscordIdVars,
+  forwardedFlagVars,
+  isSnowflake,
+  isSnowflakeList,
+} from "../src/container-env.ts";
 import { TwoBotContainer, type Env } from "../src/index.ts";
 
 const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
@@ -96,6 +104,18 @@ test("unlisted names, secrets and non-string values are dropped", () => {
   assert.deepEqual(forwardedFlagVars(env), { TWO_ANNOUNCEMENTS: "1" });
 });
 
+test("hostile settings-map typo keys stay test-only and never reach the Container", () => {
+  const env = {
+    TWO_ASSISTANT_ENDPOINTS: "https://fixture.invalid/not-a-runtime-endpoint",
+    TWO_OWEN_USER_IDS: "123456789012345678",
+  };
+  for (const name of Object.keys(env)) {
+    assert.match(NOT_FORWARDED[name] ?? "", /test-only/, name);
+  }
+  assert.deepEqual(forwardedFlagVars(env), {});
+  assert.deepEqual(containerEnv(env), { LISTEN_ADDR: "0.0.0.0:8080" });
+});
+
 test("the existing 4 Container vars are unchanged and cannot be overridden", () => {
   const base = {
     DISCORD_TOKEN: "synthetic-discord-token",
@@ -119,6 +139,114 @@ test("the existing 4 Container vars are unchanged and cannot be overridden", () 
   }
 });
 
+test("gateway readiness failure injection forwards only under the staging marker", () => {
+  const key = "TWO_GATEWAY_READINESS_FAIL_INJECTION";
+  // The switch is never on the generic flag allowlist.
+  assert.equal(forwardedFlagVars({ [key]: "1", TWO_DEPLOY_ENV: "staging" })[key], undefined);
+  // Production shape: no marker (or a non-staging one) forwards nothing,
+  // even with the switch set on the Worker.
+  for (const env of [
+    { [key]: "1" },
+    { [key]: "1", TWO_DEPLOY_ENV: "production" },
+    { [key]: "1", TWO_DEPLOY_ENV: "staging " },
+    { [key]: "true", TWO_DEPLOY_ENV: "staging" },
+    { [key]: "0", TWO_DEPLOY_ENV: "staging" },
+    { TWO_DEPLOY_ENV: "staging" },
+  ]) {
+    assert.equal(containerEnv(env)[key], undefined, JSON.stringify(env));
+  }
+  // The one armed shape: staging marker + exact "1" (marker forwarded too,
+  // so the Rust fence can repeat the check in the Container).
+  const armed = containerEnv({ [key]: "1", TWO_DEPLOY_ENV: "staging" });
+  assert.equal(armed[key], "1");
+  assert.equal(armed["TWO_DEPLOY_ENV"], "staging");
+});
+
+test("remediation-drill switches never reach the Container: Worker-only trigger input", () => {
+  for (const key of ["TWO_VOICE_STALL_FAULT_INJECTION", "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"]) {
+    // Never on the generic flag allowlist, even armed.
+    assert.equal(forwardedFlagVars({ [key]: "1", TWO_DEPLOY_ENV: "staging" })[key], undefined, key);
+    // No Worker shape forwards them: the fault injector reads them in the
+    // keepalive tick, so the Container must never see them.
+    for (const env of [
+      { [key]: "1" },
+      { [key]: "1", TWO_DEPLOY_ENV: "staging" },
+      { [key]: "1", TWO_DEPLOY_ENV: "production" },
+    ]) {
+      assert.equal(containerEnv(env)[key], undefined, `${key} ${JSON.stringify(env)}`);
+    }
+  }
+});
+
+test("eventsub reconcile inputs and Helix credentials reach the Container on explicit lines while forwarded", () => {
+  const env = {
+    TWO_EVENTSUB: "1",
+    TWO_TWITCH_WEBHOOK_SECRET: "fixture",
+    TWO_TWITCH_CALLBACK_URL: "https://hooks.example.com/twitch",
+    TWO_TWITCH_BROADCASTERS: "111,222",
+    TWO_TWITCH_CLIENT_ID: "synthetic-operator-client-id-01",
+    TWO_TWITCH_CLIENT_SECRET: ["synthetic", "operator", "client", "secret", "01"].join("-"),
+  };
+  const forwarded = containerEnv(env);
+  for (const name of [
+    "TWO_EVENTSUB",
+    "TWO_TWITCH_WEBHOOK_SECRET",
+    "TWO_TWITCH_CALLBACK_URL",
+    "TWO_TWITCH_BROADCASTERS",
+    "TWO_TWITCH_CLIENT_ID",
+    "TWO_TWITCH_CLIENT_SECRET",
+  ] as const) {
+    assert.equal(forwarded[name], env[name], name);
+  }
+  // Dark without the signing secret: none of the six travel.
+  const dark = containerEnv({ TWO_EVENTSUB: "1" });
+  for (const name of [
+    "TWO_EVENTSUB",
+    "TWO_TWITCH_WEBHOOK_SECRET",
+    "TWO_TWITCH_CALLBACK_URL",
+    "TWO_TWITCH_BROADCASTERS",
+    "TWO_TWITCH_CLIENT_ID",
+    "TWO_TWITCH_CLIENT_SECRET",
+  ]) {
+    assert.equal(dark[name], undefined, name);
+  }
+});
+
+test("eventsub delivery gate and its inputs travel only with an exactly-1 delivery gate inside the receiver forward", () => {
+  const receiver = {
+    TWO_EVENTSUB: "1",
+    TWO_TWITCH_WEBHOOK_SECRET: "fixture",
+    TWO_TWITCH_BROADCASTERS: "111,222",
+  };
+  const delivery = {
+    TWO_EVENTSUB_DELIVERY: "1",
+    TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID: "777",
+    TWO_EVENTSUB_INVITE_URL: "https://discord.gg/example",
+  };
+  const forwarded = containerEnv({ ...receiver, ...delivery });
+  for (const name of Object.keys(delivery) as (keyof typeof delivery)[]) {
+    assert.equal(forwarded[name], delivery[name], name);
+  }
+  // Gate not exactly "1": none of the three travel, inputs included.
+  for (const gate of [undefined, "0", "true", ""]) {
+    const dark = containerEnv({ ...receiver, ...delivery, TWO_EVENTSUB_DELIVERY: gate });
+    for (const name of Object.keys(delivery)) {
+      assert.equal(dark[name], undefined, `${name} with gate ${String(gate)}`);
+    }
+  }
+  // Receiver dark (no signing secret): delivery never travels alone.
+  const unforwarded = containerEnv({ TWO_EVENTSUB: "1", ...delivery });
+  for (const name of Object.keys(delivery)) {
+    assert.equal(unforwarded[name], undefined, name);
+  }
+  // Half-provisioned enable: the gate still travels and the missing inputs
+  // stay absent, so the Container refuses startup instead of staying dark.
+  const half = containerEnv({ ...receiver, TWO_EVENTSUB_DELIVERY: "1" });
+  assert.equal(half["TWO_EVENTSUB_DELIVERY"], "1");
+  assert.equal(half["TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID"], undefined);
+  assert.equal(half["TWO_EVENTSUB_INVITE_URL"], undefined);
+});
+
 test("configured voice infrastructure IDs reach the Container unchanged", () => {
   const vars = {
     DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID: "600",
@@ -130,6 +258,140 @@ test("configured voice infrastructure IDs reach the Container unchanged", () => 
   assert.equal(containerEnv({}).DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID, undefined);
 });
 
+// TOG-19025 (M3.6): the non-secret DISCORD_* IDs the Rust loaders read.
+const DISCORD_ID_FIXTURES: Record<string, string> = {
+  DISCORD_AUDIT_LOG_CHANNEL_ID: "111111111111111111",
+  DISCORD_VOICE_LOG_CHANNEL_ID: "222222222222222222",
+  DISCORD_MODERATION_LOG_CHANNEL_ID: "333333333333333333",
+  DISCORD_STAFF_ALERT_CHANNEL_ID: "444444444444444444",
+  DISCORD_TICKET_CATEGORY_ID: "555555555555555555",
+  DISCORD_TICKET_PANEL_CHANNEL_ID: "666666666666666666",
+  DISCORD_TICKET_STAFF_ROLE_ID: "777777777777777777",
+  DISCORD_LANDING_CHANNEL_IDS: "888888888888888888, 999999999999999999",
+  DISCORD_GOODBYE_CHANNEL_IDS: "101010101010101010",
+  DISCORD_ANCHOR_WELCOME_CHANNEL_ID: "121212121212121212",
+  DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID: "600",
+  DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID: "131313131313131313",
+};
+
+test("the Discord ID allowlist holds exactly the M3.6 loader inputs", () => {
+  assert.deepEqual(
+    [...FORWARDED_DISCORD_IDS].sort(),
+    Object.keys(DISCORD_ID_FIXTURES).sort(),
+    "allowlist and fixtures must stay in step",
+  );
+});
+
+test("snowflake validation matches the Rust loaders", () => {
+  for (const valid of ["1", "600", "2222", "111222333444555666", "18446744073709551615", " 123 ", "00123"]) {
+    assert.equal(isSnowflake(valid), true, valid);
+  }
+  for (const invalid of ["", "   ", "0", "00", "-1", "abc", "voice", "secret-not-an-id", "12.5", "18446744073709551616", "99999999999999999999"]) {
+    assert.equal(isSnowflake(invalid), false, invalid);
+  }
+  assert.equal(isSnowflakeList("111, 222"), true);
+  assert.equal(isSnowflakeList(" 12, ,13 "), true);
+  assert.equal(isSnowflakeList("secret-not-an-id"), false);
+  assert.equal(isSnowflakeList("111, abc"), false);
+  assert.equal(isSnowflakeList("0"), false);
+});
+
+test("each forwarded Discord ID reaches the Container verbatim when valid", () => {
+  assert.deepEqual(forwardedDiscordIdVars(DISCORD_ID_FIXTURES), DISCORD_ID_FIXTURES);
+  assert.deepEqual(
+    containerEnv(DISCORD_ID_FIXTURES),
+    { ...DISCORD_ID_FIXTURES, LISTEN_ADDR: "0.0.0.0:8080" },
+  );
+});
+
+test("invalid, empty and non-string Discord IDs are dropped, never forwarded", () => {
+  const env = {
+    ...DISCORD_ID_FIXTURES,
+    DISCORD_AUDIT_LOG_CHANNEL_ID: "not-a-snowflake",
+    DISCORD_VOICE_LOG_CHANNEL_ID: "   ",
+    DISCORD_MODERATION_LOG_CHANNEL_ID: "",
+    DISCORD_STAFF_ALERT_CHANNEL_ID: "secret-not-an-id",
+    DISCORD_TICKET_CATEGORY_ID: "0",
+    DISCORD_TICKET_PANEL_CHANNEL_ID: 123,
+    DISCORD_TICKET_STAFF_ROLE_ID: null,
+    DISCORD_LANDING_CHANNEL_IDS: "111, abc",
+    DISCORD_GOODBYE_CHANNEL_IDS: ", ,",
+    DISCORD_ANCHOR_WELCOME_CHANNEL_ID: undefined,
+    DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID: "18446744073709551616",
+    DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID: "-5",
+  };
+  // Drops are loud (see next test); keep this test's output clean.
+  const warnings = captureWarnings(() => {
+    assert.deepEqual(forwardedDiscordIdVars(env), {});
+  });
+  assert.ok(warnings.length > 0, "expected drop warnings");
+  let forwarded: Record<string, string> = {};
+  captureWarnings(() => {
+    forwarded = containerEnv(env);
+  });
+  for (const name of FORWARDED_DISCORD_IDS) {
+    assert.equal(forwarded[name], undefined, name);
+  }
+});
+
+/** Run `fn` with console.warn captured; returns the joined messages. */
+function captureWarnings(fn: () => void): string[] {
+  const messages: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    messages.push(args.map(String).join(" "));
+  };
+  try {
+    fn();
+  } finally {
+    console.warn = original;
+  }
+  return messages;
+}
+
+test("dropped Discord IDs warn with the variable name, never the value", () => {
+  const warnings = captureWarnings(() => {
+    assert.deepEqual(
+      forwardedDiscordIdVars({
+        DISCORD_AUDIT_LOG_CHANNEL_ID: "not-a-snowflake",
+        DISCORD_LANDING_CHANNEL_IDS: "111, abc",
+        DISCORD_VOICE_LOG_CHANNEL_ID: "   ",
+        DISCORD_GOODBYE_CHANNEL_IDS: ", ,",
+        DISCORD_MODERATION_LOG_CHANNEL_ID: "",
+      }),
+      {},
+    );
+  });
+  // Loud drops: the two invalid values. Silent drops: unset-equivalents
+  // (empty, whitespace-only, all-empty list) and absent names.
+  assert.equal(warnings.length, 2, warnings.join("\n"));
+  assert.ok(warnings[0]!.includes("DISCORD_AUDIT_LOG_CHANNEL_ID"), warnings[0]);
+  assert.ok(warnings[1]!.includes("DISCORD_LANDING_CHANNEL_IDS"), warnings[1]);
+  for (const message of warnings) {
+    assert.doesNotMatch(message, /not-a-snowflake|111, abc/, `value leaked: ${message}`);
+  }
+});
+
+test("no secret rides the Discord ID allowlist", () => {
+  const env = {
+    DISCORD_TOKEN: "synthetic-discord-token",
+    DISCORD_BOT_TOKEN: "synthetic-bot-token",
+    DISCORD_STAGING_BOT_TOKEN: "synthetic-staging-token",
+    DISCORD_API_BASE: "https://not-forwarded.invalid",
+    DISCORD_GATEWAY_URL: "ws://not-forwarded.invalid",
+    DISCORD_PREFLIGHT_API_BASE: "http://127.0.0.1:9",
+    ...DISCORD_ID_FIXTURES,
+  };
+  const forwarded = forwardedDiscordIdVars(env);
+  assert.deepEqual(forwarded, DISCORD_ID_FIXTURES);
+  const container = containerEnv(env);
+  for (const secret of ["DISCORD_BOT_TOKEN", "DISCORD_STAGING_BOT_TOKEN", "DISCORD_API_BASE", "DISCORD_GATEWAY_URL", "DISCORD_PREFLIGHT_API_BASE"]) {
+    assert.equal(container[secret], undefined, secret);
+  }
+  // DISCORD_TOKEN stays on its own explicit secret line, never the allowlist.
+  assert.ok(!(FORWARDED_DISCORD_IDS as readonly string[]).includes("DISCORD_TOKEN"));
+});
+
 test("the allowlist is explicit, non-secret and disjoint from NOT_FORWARDED", () => {
   assert.equal(new Set(FORWARDED_FLAGS).size, FORWARDED_FLAGS.length, "duplicate allowlist name");
   for (const name of FORWARDED_FLAGS) {
@@ -137,6 +399,13 @@ test("the allowlist is explicit, non-secret and disjoint from NOT_FORWARDED", ()
     assert.ok(!name.startsWith("TWO_INTERNAL_"), `${name}: capability gates are not flags`);
     assert.doesNotMatch(name, /TOKEN|SECRET|PASSWORD|DATABASE_URL|_URL$|_KEY$|ACCESS_KEY/, `${name} looks secret`);
     assert.ok(!Object.hasOwn(NOT_FORWARDED, name), `${name} is in both lists`);
+  }
+  assert.equal(new Set(FORWARDED_DISCORD_IDS).size, FORWARDED_DISCORD_IDS.length, "duplicate Discord ID name");
+  for (const name of FORWARDED_DISCORD_IDS) {
+    assert.match(name, /^DISCORD_[A-Z0-9_]*[A-Z0-9]$/, name);
+    assert.doesNotMatch(name, /TOKEN|SECRET|PASSWORD|DATABASE_URL|API_BASE|GATEWAY_URL|PREFLIGHT|STAGING|_KEY$/, `${name} looks secret`);
+    assert.ok(!Object.hasOwn(NOT_FORWARDED, name), `${name} is in both lists`);
+    assert.ok(!(FORWARDED_FLAGS as readonly string[]).includes(name), `${name} is in both allowlists`);
   }
   for (const [name, reason] of Object.entries(NOT_FORWARDED)) {
     assert.match(name, /^TWO_[A-Z0-9_]*[A-Z0-9]$/, name);

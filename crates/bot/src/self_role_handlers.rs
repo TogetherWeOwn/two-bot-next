@@ -31,7 +31,9 @@ use two_bot_discord::ActionExecutor;
 use crate::{
     command_runtime::new_id,
     jobs::{self, ErrorClass, Job},
-    self_role_runtime::{Admission, RuntimeError, Selection, SelfRoleRequest, SelfRoleRuntime},
+    self_role_runtime::{
+        Admission, RuntimeError, Selection, SelfRoleRequest, SelfRoleRuntime, StoreErrorKind,
+    },
 };
 
 pub(crate) const RECOVERY_JOB_NAME: &str = "self_role_recovery";
@@ -109,7 +111,10 @@ impl SelfRoleService {
             Ok(gates) => gates,
             Err(err) => {
                 // Parked, not ignored: old panels stay unserved until fixed.
-                tracing::error!(error = %err, "TWO_SELF_ROLE_PANELS invalid; self-roles disabled");
+                tracing::error!(
+                    error = %err,
+                    "TWO_SELF_ROLE_PANELS or TWO_SELF_ROLE_DRY_RUN invalid; self-roles disabled"
+                );
                 return None;
             }
         };
@@ -306,6 +311,7 @@ impl SelfRoleService {
         Job {
             name: RECOVERY_JOB_NAME,
             cadence,
+            cadence_source: None,
             startup_jitter: jobs::startup_jitter(cadence, rand::random()),
             timeout: Duration::from_secs(25),
             action: Arc::new(move || {
@@ -315,11 +321,7 @@ impl SelfRoleService {
                         .recover_once()
                         .await
                         .map(|_| ())
-                        .map_err(|error| match error {
-                            RuntimeError::Store => ErrorClass::Database,
-                            RuntimeError::Rest(_) => ErrorClass::Rest,
-                            _ => ErrorClass::Configuration,
-                        })
+                        .map_err(recovery_error_class)
                 })
             }),
         }
@@ -435,6 +437,19 @@ impl SelfRoleService {
                 SelfRoleResult::Pending
             }
         }
+    }
+}
+
+/// Scalar job-metric class for a recovery sweep failure. Every store kind
+/// maps explicitly so a timeout never reports as a database failure and a
+/// zero-row receipt completion never conflates with real database errors.
+pub(crate) fn recovery_error_class(error: RuntimeError) -> ErrorClass {
+    match error {
+        RuntimeError::Store(StoreErrorKind::Timeout) => ErrorClass::Timeout,
+        RuntimeError::Store(StoreErrorKind::Database) => ErrorClass::Database,
+        RuntimeError::Store(StoreErrorKind::UnmatchedReceipt) => ErrorClass::Configuration,
+        RuntimeError::Rest(_) => ErrorClass::Rest,
+        _ => ErrorClass::Configuration,
     }
 }
 

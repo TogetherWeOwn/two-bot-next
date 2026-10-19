@@ -1,0 +1,22 @@
+id: no-unwrap-request-paths
+language: rust
+severity: warning
+message: "no .unwrap() in request-path source files, including inline test modules; handle the error or use .expect() with context"
+rule:
+  pattern: $X.unwrap()
+files:
+  - 'crates/*/src/**/*route*.rs'
+  - 'crates/*/src/**/*handler*.rs'
+  - 'crates/*/src/**/*interaction*.rs'
+  - 'crates/*/src/**/*command*.rs'
+  - 'crates/*/src/**/*webhook*.rs'
+  - 'src/**/*route*.rs'
+  - 'src/**/*handler*.rs'
+  - 'src/**/*interaction*.rs'
+  - 'src/**/*command*.rs'
+  - 'src/**/*webhook*.rs'
+ignores:
+  - '**/*_tests.rs'
+  - '**/tests.rs'
+  - '**/tests/**'
+  - '**/*_tests/**'

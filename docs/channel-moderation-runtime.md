@@ -36,9 +36,10 @@ executor and synchronizes once per process. Failed publication remains retryable
 on a later connection event. The current registry has no custom-command store;
 when that slice lands, its reader must join the shared full-set publication.
 
-Gateway dispatch admits tasks synchronously into five independently bounded
+Gateway dispatch admits tasks synchronously into six independently bounded
 lanes: 16 message workers, 16 interaction workers, one registry worker, eight
-reserved interaction workers and eight busy-reply workers. It never waits for
+reserved interaction workers, eight busy-reply workers and eight self-role
+reaction workers. It never waits for
 command SQL/REST or creates queued/spawned waiters. At saturation, events are not
 admitted and cannot cause effects.
 
@@ -67,6 +68,15 @@ channel lane only for a current in-flight ticket, excluding different request
 keys as well as duplicate retries. There is deliberately no expiry: ambiguous
 HTTP outcomes or process loss require reconciliation, not another mutation.
 The runtime DML role explicitly includes this table; the web-reader role does not.
+
+For a genuinely wedged lane, the local operator-only
+[`moderation release-channel` CLI](channel-lane-reconciliation.md) prints the
+matching rows before explicit confirmation, compares the inspected generation,
+audits the previous state and operator, and preserves the lockdown recovery seed.
+It retires the old key as `done/operator_released` rather than allowing redelivery
+to repeat an uncertain effect. Operators must quiesce original workers, establish
+old REST settlement, and read actual Discord overwrites and slowmode first; the
+CLI cannot cancel a delayed unlock or prove it safe.
 
 `finish` atomically performs generation-fenced completion, audit insertion,
 confirmed unlock recovery cleanup and lane release. False means no finalization

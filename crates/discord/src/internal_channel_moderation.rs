@@ -91,6 +91,24 @@ impl InternalChannelRequest {
             "durationSeconds": self.duration_seconds, "count": self.count, "seconds": self.seconds,
         }).to_string().as_bytes())
     }
+
+    /// Website receiver accessors: the HTTP layer owns auth, claims and audit
+    /// subjects and must read the validated routing fields without reaching
+    /// into executor internals.
+    #[must_use]
+    pub fn action(&self) -> ModerationAction {
+        self.action
+    }
+
+    #[must_use]
+    pub fn actor_id(&self) -> &str {
+        &self.actor_id
+    }
+
+    #[must_use]
+    pub fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
 }
 
 /// Runtime-only configuration. `enabled` must reflect BOTH TWO_MODERATION and
@@ -153,7 +171,34 @@ impl InternalChannelExecutor {
     /// resolver.actor), NEVER built from caller-supplied roles/permissions. IDs,
     /// policy and enablement are checked before claiming or making any wire call.
     /// request_id/time are server-generated, not website body values.
+    ///
+    /// Records one `two_bot_moderation_enforcements_total` sample per terminal
+    /// call (TOG-28482): `success` for completed enforcements including
+    /// idempotent replays, otherwise the bounded
+    /// `ActionError::enforcement_outcome` class. The verb is the request's
+    /// `ModerationAction::command_name`; no user id, reason text or free-form
+    /// detail ever becomes a label.
     pub async fn execute(
+        &self,
+        request: &InternalChannelRequest,
+        actor: &ModerationActor,
+        request_id: &str,
+        idempotency_key: &str,
+        now: &str,
+    ) -> Result<InternalChannelResult, ActionError> {
+        let result = self
+            .execute_inner(request, actor, request_id, idempotency_key, now)
+            .await;
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(err) => err.enforcement_outcome(),
+        };
+        two_bot_core::metrics::global()
+            .moderation_enforcement(request.action.command_name(), outcome);
+        result
+    }
+
+    async fn execute_inner(
         &self,
         request: &InternalChannelRequest,
         actor: &ModerationActor,
@@ -215,7 +260,7 @@ impl InternalChannelExecutor {
             ChannelClaim::Mismatch => {
                 return Err(error(
                     ErrorCode::Malformed,
-                    "idempotency key was used for different moderation content",
+                    "idempotency key is already used or retired; use a new key",
                 ))
             }
             ChannelClaim::Claimed { ticket } => ticket,
@@ -444,7 +489,7 @@ impl InternalChannelExecutor {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(failure) => {
-                if failure.is_safe_pre_mutation() {
+                if failure.proves_no_effect() {
                     self.abort(&ticket, &audit, clear_on_rejection.as_deref())
                         .await?;
                 } else {

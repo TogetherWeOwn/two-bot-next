@@ -1,12 +1,19 @@
 # Error-budget burn alerts (48h watch)
 
-Paging thresholds for error-budget consumption on the bot container during
-the 48h production watch. Log volume and cardinality are covered by a
-separate guard; this page says when to wake someone. The burn math below
-is pinned by the offline
-test `crates/bot/src/burn_rate_tests.rs`; a threshold change here without
-the matching test change fails the suite. No staging, secret or live
-paging test is involved.
+Error-budget burn policy for the bot container during the 48h production
+watch. **Status: both burns are installed** (`error_budget_fast_burn` pages
+and `error_budget_slow_burn` tickets in `wrangler/src/alert-rules.ts`,
+evaluated on the keepalive schedule against the shared Worker snapshot ring
+covering the 2 h / 15 min / 2 min windows); the manual checkpoint below is
+the fallback when forwarding is off or history is incomplete.
+The absence claim covers this REST/gateway watch SLO only: the creator-join
+burn alerts (`voice_join_fast_burn`, `voice_join_slow_burn`) are separate
+installed rules over a different budget. An installed rule is not proof that
+a page was delivered; silence is not health. Log volume and cardinality are
+covered by a separate guard. The Rust burn constants and math are pinned by
+the offline test `crates/bot/src/burn_rate_tests.rs`; this document must stay
+aligned with them (the test does not parse this page). No staging, secret or
+live paging test is involved.
 
 ## SLO and budget
 
@@ -22,14 +29,16 @@ paging test is involved.
 
 ## Alert thresholds
 
-Two multi-window alerts. Each fires only when both its long window (the
-burn rate) and its short window (the confirmation) exceed the burn rate,
-so a single bad minute pages nobody and a sustained bleed tickets fast.
+Two multi-window thresholds. Both are **installed automatic alerts**;
+the manual checkpoint below remains the fallback at each watch checkpoint
+(+15 min, +1 h, +6 h, +24 h, +48 h). Escalate manually only when both windows
+of either threshold meet their rate; one bad minute alone is
+not a burn trigger.
 
 | Alert | Severity | Burn rate | Long window | Short window | Budget spent if sustained |
 | --- | --- | --- | --- | --- | --- |
-| Fast burn | page | 12 | 15 min | 2 min | 6.25% per 15 min |
-| Slow burn | ticket | 3 | 2 h | 15 min | 12.5% per 2 h |
+| Fast burn (installed page) | page | 12 | 15 min | 2 min | 6.25% per 15 min |
+| Slow burn (installed ticket) | ticket | 3 | 2 h | 15 min | 12.5% per 2 h |
 
 Budget math: fraction spent = burn x window / period.
 
@@ -37,8 +46,8 @@ Budget math: fraction spent = burn x window / period.
 - Slow: 3 x 7,200 s / 172,800 s = 0.125 (12.5%).
 
 At full fast burn the 48h budget lasts 4 hours (48 / 12); at full slow
-burn it lasts 16 hours (48 / 3). Either alert firing means the watch
-budget is on track to exhaust before cutover completes.
+burn it lasts 16 hours (48 / 3). Either manually confirmed threshold means
+the watch budget is on track to exhaust before cutover completes.
 
 ## Worked example (10,000 eligible events/hour)
 
@@ -46,24 +55,151 @@ Assumed rate ~2.8 events/s. 48h gives 480,000 eligible events, so the
 watch budget is 480 errors. Allowed errors per window = burn x 0.001 x
 window events:
 
-- Fast burn pages at 30 errors in 15 minutes (12 x 0.001 x 2,500),
-  confirmed by 4 errors in 2 minutes (12 x 0.001 x ~333, rounded up).
-- Slow burn tickets at 60 errors in 2 hours (3 x 0.001 x 20,000),
-  confirmed by 8 errors in 15 minutes (3 x 0.001 x 2,500, rounded up).
+- Fast burn triggers the automatic `error_budget_fast_burn` page at 30 errors
+  in 15 minutes (12 x 0.001 x 2,500), confirmed by 4 errors in 2 minutes
+  (12 x 0.001 x ~333, rounded up). Manual evaluation is only the checkpoint
+  fallback below, not the routine fast-burn path.
+- Slow burn files the automatic `error_budget_slow_burn` ticket at 60 errors
+  in 2 hours (3 x 0.001 x 20,000), confirmed by 8 errors in 15 minutes
+  (3 x 0.001 x 2,500, rounded up).
 
 Scale to real traffic by replacing 10,000/hour with the observed
 `two_bot_rest_requests_total` rate; the ratios and windows do not change.
 
+## Manual checkpoint evaluation
+
+Use a Prometheus-compatible store already scraping the authenticated Worker
+`/ops/metrics` read path ([metrics read path](metrics.md#off-container-scrape-and-alert-rules)),
+scoped to **one deployment/environment**. `/ops/metrics` itself returns a current
+snapshot, not a PromQL query service or a historical window. At each checkpoint,
+record the evaluation time, window coverage, request/error counts and both burn
+values in the [watch log](production-deploy.md#watch-rows-one-per-finding-and-per-checkpoint).
+Do not call a missing, incomplete or zero-traffic window green; record it as
+unknown and extend the watch. In particular, +15 min and +1 h do not yet cover
+a full 2 h watch window.
+
+These queries evaluate the **REST portion only**, with `4xx`/`429` contributing
+requests but not errors. They do not certify the combined REST/gateway SLO:
+raw disconnect counts do not say whether a disconnect later resumed, and there
+is no eligible gateway-session outcome denominator in these series. Correlate
+gateway failures separately before recording a budget disposition.
+
+```promql
+# 15 min: fast long window and slow short window
+sum(increase(two_bot_rest_requests_total{result=~"5xx|transport"}[15m]))
+/ (0.001 * sum(increase(two_bot_rest_requests_total[15m])))
+```
+
+```promql
+# 2 min: fast short window
+sum(increase(two_bot_rest_requests_total{result=~"5xx|transport"}[2m]))
+/ (0.001 * sum(increase(two_bot_rest_requests_total[2m])))
+```
+
+```promql
+# 2 h: slow long window
+sum(increase(two_bot_rest_requests_total{result=~"5xx|transport"}[2h]))
+/ (0.001 * sum(increase(two_bot_rest_requests_total[2h])))
+```
+
+Fast burn requires 15 min **and** 2 min values >= 12; slow burn requires 2 h
+**and** 15 min values >= 3. Inspect `sum(increase(two_bot_rest_requests_total[15m]))`
+(and the corresponding `[2m]` / `[2h]` queries) to verify each denominator is
+positive. Counter resets are handled by `increase`, but scrape gaps or a
+missing error series are unknown, not zero. Without an existing history store,
+retain timestamped read-only snapshots at the normal scrape cadence and compute
+each window's error/request deltas by hand; split on resets and reject uncovered
+windows. The Worker keeps about 2 h of snapshot history for both burns; use
+these manual queries when forwarding is off or the ring is incomplete.
+
+For gateway evidence, inspect these counts at the same evaluation time
+(repeat with `[2m]` / `[2h]` for the other windows):
+
+```promql
+sum(increase(two_bot_gateway_disconnects_total[15m]))
+sum(increase(two_bot_gateway_resumes_total[15m]))
+sum(increase(two_bot_gateway_events_total{event="READY"}[15m]))
+sum(increase(two_bot_gateway_missed_events_total[15m]))
+```
+
+Treat these as four separate queries, not a ratio: correlate each disconnect
+with a later RESUMED/READY receipt and moderator-observed recovery in the same
+window. Never subtract total resumes/READYs from disconnects to certify pairing.
+Any unpaired loss or missed-event increase needs its own finding; absence of
+identity-paired evidence leaves the combined budget unknown.
+
 ## Response
 
-- Fast-burn page: acknowledge, check recent deploys and the Discord API
-  status, then follow the rollback one-pager. Silence the page only with
-  a recorded decision.
-- Slow-burn ticket: triage within the watch shift. Escalate to a page if
-  half the 48h budget (240 errors at the example rate) is spent, or if
-  the slow burn persists across two consecutive long windows.
-- Both alerts reset when neither window exceeds its burn rate. A
-  re-firing alert opens a new ticket; it never reopens a closed one.
+- Fast-burn automatic page (`error_budget_fast_burn`): the page carries the
+  build SHA and the log-query URL and links its runbook section
+  ([runbook](runbook.md#alert-error-budget-fast-burn)). Acknowledge as the
+  watch responder, check recent deploys and the Discord API status, then
+  follow the rollback one-pager. Record the acknowledgement and disposition
+  in the watch log. If the page never arrives (forwarding off, no history
+  yet), fall back to the manual 15 min / 2 min queries above.
+- Slow-burn automatic ticket (`error_budget_slow_burn`): triage it within
+  the watch shift. Escalate manually to a page if half the 48h budget
+  (240 errors at the example rate) is spent, or if slow burn persists
+  across two consecutive long windows.
+- Record recovery when neither window meets its burn threshold. If burn
+  recurs after a closed disposition, the rule re-tickets on the next
+  covered burn; there is no manual reset.
+
+## Related immediate alerts (not burn)
+
+Unlike the slow-burn ticket and fast-burn page above (both installed
+automatic rules), these five **installed Worker rules** evaluate keepalive
+samples independently of the burn math.
+They fire on their own conditions; notification additionally requires the
+configured [alert-forwarding path](metrics.md#off-container-scrape-and-alert-rules).
+An installed rule is not proof that a page was delivered:
+
+- `gateway_missed_events`: any increase of
+  `two_bot_gateway_missed_events_total` between two keepalive samples
+  pages at once (zero threshold), because a sequence gap fails the
+  zero-missed-events acceptance outright. Runbook:
+  [runbook](runbook.md#alert-gateway-missed-events).
+- `ticker_stale`: a 15 s ticker (`scheduled_messages`, `settings`) with no
+  success for more than 10 minutes pages at once, because skipped busy
+  deadlines are neither success nor failure and never spend burn budget.
+  Runbook: [runbook](runbook.md#alert-ticker-stale).
+- `receiver_refusals:<family>`: refused `two_bot_internal_actions_total`
+  outcomes rising in 3 consecutive keepalive samples pages (a single
+  forged pre-auth probe, always family `other`, stays silent), because a
+  receiver-abuse or refusal storm stays quiet through the burn math.
+  Runbook: [runbook](runbook.md#alert-receiver-refusals).
+- `gateway_checkpoint_failures`: any increase of
+  `two_bot_gateway_checkpoint_failures_total` summed over every `stage`
+  between two keepalive samples pages at once (zero threshold), because
+  every checkpoint failure stops the dispatch worker. The 75 s runtime
+  linger leaves ~3 s margin over a 60 s tick plus two 6 s probes for a scrape
+  to land before the restart resets the counter.
+  Runbook: [runbook](runbook.md#alert-checkpoint-failures).
+- `gateway_unpaired_disconnect`: `two_bot_gateway_disconnects_total` grew
+  with no RESUMED or fresh READY growth for 3 consecutive keepalive samples,
+  because a disconnect that never pairs with a session recovery means the
+  gateway is stuck off-session. Any recovery growth clears it at once.
+  Runbook: [runbook](runbook.md#alert-gateway-unpaired-disconnect).
+
+None of these rules changes the burn thresholds, windows or budget above.
+
+## Related sustained dispatch ticket (not burn)
+
+`dispatch_drops:<lane>` raises a **ticket, never a page**, when
+`two_bot_dispatch_drops_total{lane}` grows in three consecutive completed
+keepalive sample windows after a baseline. The fixed lanes are `messages`,
+`interactions`, `registry`, `privileged`, `busy` and `reactions`; each has its
+own streak. Reaction drops include per-member fairness refusals, so sustained
+growth is not by itself proof of undersizing, nor of gateway packet loss.
+
+A single burst stays silent. Flat or backwards counter windows clear the
+streak and resolve an active ticket. Missing/invalid series and unsuccessful
+scrapes break the streak and invalidate the baseline without falsely resolving
+an active ticket. The next valid sample establishes a baseline, not recovery;
+a subsequent valid flat/reset window is required to resolve. Old DO state
+without the new fields starts unbaselined. Triage within the watch shift using
+[dispatch drops](runbook.md#alert-dispatch-drops); no paging escalation or
+fast/slow burn math is added or changed by this rule.
 
 ## Maintenance
 

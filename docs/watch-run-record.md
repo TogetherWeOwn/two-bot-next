@@ -101,7 +101,7 @@ only (never raw text); warn/page values live in the companion docs.
 | | | `db_pool_saturated` | checklist; runbook pool section | max + zero idle x3 samples | | on-call operator | | |
 | | | `container_unready_alert` / `_recovery` | checklist §3; container-readiness runbook | 10 consecutive failing samples / first ready sample after alert | | on-call operator | | |
 | | | `container_keepalive_arm_failed` | checklist §3 | monitoring outage, not a readiness sample | | watch lead | | |
-| | | `container_unready_webhook_failed` | checklist §3 | type + HTTP status only; fall back to transition log line | | watch lead | | |
+| | | `container_unready_webhook_failed` | checklist §3 | type, status, release, log URL (no binding or body); fall back to transition log line | | watch lead | | |
 | | | `external_health` | external-uptime sheet | non-2xx / timeout / TLS-DNS x10 consecutive | | on-call operator | | |
 | | | `error-class` | production-deploy watch log | one fixed class only, no raw text | | watcher on shift | | |
 | | | expected-down note | external-uptime §expected-down | deploy / ownership-changeover single samples with deployment id (note, not incident) | | watcher on shift | | |
@@ -129,7 +129,10 @@ gateway, no credential substitution).
 ## 5. Checkpoint go/no-go annotations
 
 Checkpoints sit at +15 min, +1 h, +6 h, +24 h, +48 h from `T_0`. One row
-each on the execution card.
+each on the execution card. The ``readyz`` + revision match cell comes from
+`scripts/cutover_watch_checkpoint.py` output (one call per checkpoint — see
+the [48-hour watch log](production-deploy.md#48-hour-watch-log-tog-9699)),
+not hand-filled; the verdict, decider, and deadline cells stay human.
 
 | Checkpoint | UTC time | `readyz` + revision match | Open incidents (name or none) | Verdict | Decider | New deadline (EXTEND only) |
 | --- | --- | --- | --- | --- | --- | --- |

@@ -689,6 +689,18 @@ class RetentionTests(unittest.TestCase):
         with self.assertRaisesRegex(cache.Refusal, 'ambiguous target'):
             self.audit()
 
+    def test_non_file_maps_deleted_clears_audit(self):
+        # The read-only audit applies the same identity exclusion, so a host
+        # whose only unattributed deleted references are SYSV shm mappings
+        # does not refuse the whole audit. Per-candidate classification stays
+        # strict (the entry still marks its candidate ineligible); only the
+        # global refusal is lifted.
+        shm = os.makedev(0x00, 0x01)
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/SYSV00000000', shm, 1, False)])):
+            receipt = self.audit()
+        self.assertIn('candidates', receipt)
+
     def test_deleted_container_reference_vetoes_or_refuses(self):
         # An unlinked artifact opened under a container spelling matches
         # neither the host path nor a live workspace inode. When the path
@@ -815,6 +827,564 @@ class RetentionTests(unittest.TestCase):
         (shared / 'keep').write_text('shared')
         self.assertEqual(len(self.audit()['candidates']), 1)
         self.assertEqual((shared / 'keep').read_text(), 'shared')
+
+
+class SharedPoolRetainTests(unittest.TestCase):
+    """Shared-pool lock-through-mutation retention: exact slot paths only."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=os.environ.get('PAPERCLIP_RUN_SCRATCH_DIR'))
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.pool = self.root / 'pool'
+        self.pool.mkdir()
+        self.policy = {'version': 1, 'slots': 2, 'slot_budget_bytes': 256 * 1024,
+                       'min_available_bytes': 1, 'hard_limit_bytes': 1024 * 1024,
+                       'quota_receipt': 'synthetic fixture; not a real quota receipt',
+                       'scratch_coverage_receipt': 'synthetic fixture; not host coverage'}
+        (self.pool / 'policy.json').write_text(json.dumps(self.policy))
+        for number in range(2):
+            slot = self.pool / f'slot-{number}'
+            slot.mkdir()
+            target = slot / 'target'
+            target.mkdir()
+            (target / 'debug').mkdir()
+            (target / 'debug' / 'fixture').write_bytes(b'x' * 4096)
+            (target / '.rustc_info.json').write_text('{}')
+            scratch = slot / 'scratch'
+            scratch.mkdir()
+            (scratch / 'tmp-out').write_bytes(b'x' * 4096)
+            (slot / 'lock').touch()
+            (slot / 'lease.json').write_text(json.dumps(
+                {'workspace': str(self.root), 'wrapper_pid': 99999999,
+                 'started_at': 0, 'cargo_pgid': 99999998}))
+        self.proc = self.root / 'proc'
+        self.proc.mkdir()
+        self.now = time.time()
+        self.inventory = {'version': 1, 'complete': True, 'process_scope': 'host',
+                          'captured_at_unix': self.now,
+                          'slots': [self.row(f'slot-{n}') for n in range(2)]}
+
+    def row(self, name):
+        return {'path': str(self.pool / name), 'issue_id': 'fixture-terminal',
+                'status': 'done', 'live_run': False, 'referenced': False,
+                'target_provenance': 'build_output_only'}
+
+    def retain(self, **kwargs):
+        kwargs.setdefault('proc_root', self.proc)
+        kwargs.setdefault('now', self.now)
+        return cache.shared_pool_retain(self.pool, self.inventory, **kwargs)
+
+    def by_slot(self, receipt):
+        return {row['slot']: row for row in receipt['slots']}
+
+    def fake_pid(self):
+        pid = self.proc / '123'
+        if not pid.exists():
+            pid.mkdir()
+            (pid / 'fd').mkdir()
+            (pid / 'stat').write_text('123 (fixture) S 1 123 123 0 -1 0\n')
+            (pid / 'cwd').symlink_to(self.root)
+            (pid / 'exe').symlink_to(sys.executable)
+            (pid / 'maps').write_text('')
+        return pid
+
+    def test_eligible_slots_reclaimed_lock_inode_preserved(self):
+        locks_before = {n: (self.pool / f'slot-{n}' / 'lock').stat()
+                        for n in range(2)}
+        policy_before = (self.pool / 'policy.json').read_bytes()
+        receipt = self.retain()
+        self.assertTrue(receipt['retain'])
+        by_slot = self.by_slot(receipt)
+        for number in range(2):
+            row = by_slot[f'slot-{number}']
+            self.assertTrue(row['eligible'], row)
+            self.assertGreater(row['reclaimed_bytes'], 0)
+            self.assertTrue(row['lock_held_through_mutation'])
+            slot = self.pool / f'slot-{number}'
+            self.assertFalse((slot / 'lease.json').exists())
+            self.assertEqual(list((slot / 'target').iterdir()), [])
+            self.assertEqual(list((slot / 'scratch').iterdir()), [])
+            after = (slot / 'lock').stat()
+            self.assertEqual((after.st_dev, after.st_ino),
+                             (locks_before[number].st_dev, locks_before[number].st_ino))
+        self.assertEqual((self.pool / 'policy.json').read_bytes(), policy_before)
+
+    def test_lock_held_through_mutation(self):
+        seen = {}
+
+        def hook(slot, fd):
+            fd_stat = os.fstat(fd)
+            path_stat = os.stat(slot / 'lock')
+            seen[slot.name] = ((fd_stat.st_dev, fd_stat.st_ino)
+                               == (path_stat.st_dev, path_stat.st_ino))
+            probe = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+
+        receipt = cache.shared_pool_retain(self.pool, self.inventory, self.proc,
+                                           now=self.now, _before_mutation=hook)
+        self.assertEqual(seen, {'slot-0': True, 'slot-1': True})
+        self.assertTrue(all(row['eligible'] for row in receipt['slots']))
+
+    def test_lock_replaced_before_mutation_skips_without_deletion(self):
+        def hook(slot, fd):
+            if slot.name == 'slot-0':
+                (slot / 'lock').unlink()
+                (slot / 'lock').touch()
+
+        receipt = cache.shared_pool_retain(self.pool, self.inventory, self.proc,
+                                           now=self.now, _before_mutation=hook)
+        by_slot = self.by_slot(receipt)
+        self.assertFalse(by_slot['slot-0']['eligible'])
+        self.assertIn('lock', by_slot['slot-0']['reason'])
+        self.assertTrue((self.pool / 'slot-0' / 'target' / 'debug' / 'fixture').exists())
+        self.assertTrue(by_slot['slot-1']['eligible'])
+
+    def test_held_lock_skips_and_keeps_lease(self):
+        slot = self.pool / 'slot-0'
+        held = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        receipt = self.retain()
+        by_slot = self.by_slot(receipt)
+        self.assertFalse(by_slot['slot-0']['eligible'])
+        self.assertIn('lock held', by_slot['slot-0']['reason'])
+        self.assertTrue((slot / 'lease.json').exists())
+        self.assertTrue(by_slot['slot-1']['eligible'])
+
+    def test_target_and_scratch_provenance_vetoes_skip(self):
+        slot = self.pool / 'slot-0'
+        target = slot / 'target'
+        (target / 'evidence').mkdir()
+        (target / 'evidence' / 'incident.md').write_bytes(b'x' * 64)
+        receipt = self.retain()
+        by_slot = self.by_slot(receipt)
+        self.assertFalse(by_slot['slot-0']['eligible'])
+        self.assertIn('preserved', by_slot['slot-0']['reason'])
+        self.assertTrue((slot / 'lease.json').exists())
+        self.assertTrue(by_slot['slot-1']['eligible'])
+        shutil.rmtree(target / 'evidence')
+        (target / 'debug' / 'stashed-source.rs').write_bytes(b'x' * 64)
+        receipt = self.retain()
+        self.assertIn('preserved', self.by_slot(receipt)['slot-0']['reason'])
+        (target / 'debug' / 'stashed-source.rs').unlink()
+        (target / 'foreign-top').write_text('foreign')
+        receipt = self.retain()
+        self.assertIn('foreign', self.by_slot(receipt)['slot-0']['reason'])
+        (target / 'foreign-top').unlink()
+        scratch = slot / 'scratch'
+        (scratch / 'stashed-source.rs').write_bytes(b'x' * 64)
+        receipt = self.retain()
+        self.assertIn('preserved', self.by_slot(receipt)['slot-0']['reason'])
+        (scratch / 'stashed-source.rs').unlink()
+        (scratch / 'evidence').mkdir()
+        receipt = self.retain()
+        self.assertIn('preserved', self.by_slot(receipt)['slot-0']['reason'])
+
+    def test_unclassified_live_referenced_unattributed_skip(self):
+        self.inventory['slots'][0]['target_provenance'] = 'mixed'
+        self.assertIn('provenance', self.by_slot(self.retain())['slot-0']['reason'])
+        self.inventory['slots'][0]['target_provenance'] = 'build_output_only'
+        self.inventory['slots'][0]['live_run'] = True
+        self.assertIn('live run', self.by_slot(self.retain())['slot-0']['reason'])
+        self.inventory['slots'][0]['live_run'] = False
+        self.inventory['slots'][0]['referenced'] = True
+        self.assertIn('reference', self.by_slot(self.retain())['slot-0']['reason'])
+        self.inventory['slots'][0]['referenced'] = False
+        self.inventory['slots'][0]['status'] = 'in_progress'
+        self.assertIn('nonterminal', self.by_slot(self.retain())['slot-0']['reason'])
+        self.inventory['slots'][0]['status'] = 'done'
+        del self.inventory['slots'][0]
+        row = self.by_slot(self.retain())['slot-0']
+        self.assertFalse(row['eligible'])
+        self.assertIn('unattributed', row['reason'])
+
+    def test_ambiguous_and_stale_inventory_refuses_whole_without_mutation(self):
+        for update in ({'complete': False}, {'process_scope': 'container'},
+                       {'captured_at_unix': self.now - 61},
+                       {'captured_at_unix': self.now + 1},
+                       {'slots': 'not-a-list'}):
+            with self.subTest(update=update), self.assertRaises(cache.Refusal):
+                cache.shared_pool_retain(self.pool, self.inventory | update,
+                                         self.proc, now=self.now)
+        dup = dict(self.inventory['slots'][0])
+        with self.assertRaisesRegex(cache.Refusal, 'ambiguous'):
+            cache.shared_pool_retain(self.pool,
+                                     self.inventory | {'slots': [dup, dup]},
+                                     self.proc, now=self.now)
+        alias = str(self.pool / 'slot-0') + '/.'
+        with self.assertRaisesRegex(cache.Refusal, 'ambiguous'):
+            cache.shared_pool_retain(
+                self.pool,
+                self.inventory | {'slots': [self.row('slot-0') | {'path': alias},
+                                            self.row('slot-1')]},
+                self.proc, now=self.now)
+        # No mutation on whole-run refusal.
+        self.assertTrue((self.pool / 'slot-0' / 'target' / 'debug' / 'fixture').exists())
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_process_cwd_fd_mmap_cmdline_veto_retention(self):
+        pid = self.fake_pid()
+        target = self.pool / 'slot-0' / 'target'
+        (pid / 'cwd').unlink()
+        (pid / 'cwd').symlink_to(target / 'debug')
+        row = self.by_slot(self.retain())['slot-0']
+        self.assertFalse(row['eligible'])
+        self.assertIn('process', row['reason'])
+        (pid / 'cwd').unlink()
+        (pid / 'cwd').symlink_to(self.root)
+        (pid / 'fd' / '7').symlink_to(target / 'debug' / 'fixture')
+        row = self.by_slot(self.retain())['slot-0']
+        self.assertFalse(row['eligible'])
+        self.assertIn('process', row['reason'])
+        (pid / 'fd' / '7').unlink()
+        info = (target / 'debug' / 'fixture').stat()
+        (pid / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(info.st_dev):x}:{os.minor(info.st_dev):x} '
+            f'{info.st_ino} /different/container/mount/cache\n')
+        row = self.by_slot(self.retain())['slot-0']
+        self.assertFalse(row['eligible'])
+        self.assertIn('process', row['reason'])
+        (pid / 'maps').write_text('')
+        (pid / 'cmdline').write_bytes(str(target / 'debug' / 'fixture').encode() + b'\0')
+        row = self.by_slot(self.retain())['slot-0']
+        self.assertFalse(row['eligible'])
+        self.assertIn('process', row['reason'])
+        (pid / 'cmdline').write_bytes(b'/usr/bin/python\0')
+        by_slot = self.by_slot(self.retain())
+        self.assertTrue(by_slot['slot-0']['eligible'])
+        self.assertTrue(by_slot['slot-1']['eligible'])
+
+    def test_cmdline_lexical_only_reference_vetoes(self):
+        pid = self.fake_pid()
+        missing = self.pool / 'slot-0' / 'target' / 'debug' / 'future-output'
+        self.assertFalse(missing.exists())
+        (pid / 'cmdline').write_bytes(str(missing).encode() + b'\0')
+        by_slot = self.by_slot(self.retain())
+        self.assertFalse(by_slot['slot-0']['eligible'])
+        self.assertTrue(by_slot['slot-1']['eligible'])
+
+    def test_deleted_artifact_vetoes_or_refuses_whole(self):
+        pid = self.fake_pid()
+        target = self.pool / 'slot-0' / 'target'
+        gone = target / 'debug' / 'replaced.so'
+        gone.write_bytes(b'x' * 64)
+        (pid / 'fd' / '7').symlink_to(gone)
+        real_readlink = os.readlink
+
+        def deleted_readlink(link):
+            if str(link).endswith('fd/7'):
+                return str(gone) + ' (deleted)'
+            return real_readlink(link)
+
+        with patch.object(cache.os, 'readlink', side_effect=deleted_readlink):
+            row = self.by_slot(self.retain())['slot-0']
+            self.assertFalse(row['eligible'])
+            self.assertIn('deleted', row['reason'])
+        (pid / 'fd' / '7').unlink()
+        stale = self.proc / '999'
+        stale.mkdir()
+        (stale / 'fd').mkdir()
+        (stale / 'stat').write_text('999 (fixture) S 1 999 999 0 -1 0\n')
+        (stale / 'cwd').symlink_to(self.root)
+        (stale / 'exe').symlink_to(sys.executable)
+        # Same-filesystem deleted entry outside every slot path, with an
+        # inode in no slot traversal: indistinguishable from a deleted slot
+        # file held open, so the whole run still refuses with no mutation.
+        # Maps provenance, so device comparison could not exclude it anyway.
+        pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
+        (stale / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'999999991 /different/container/mount/stale.so (deleted)\n')
+        with self.assertRaisesRegex(cache.Refusal, 'unresolved deleted'):
+            self.retain()
+        self.assertTrue((target / 'debug' / 'fixture').exists())
+
+    def test_different_filesystem_deleted_excluded(self):
+        # Multi-tenant host shape: unrelated stat-backed (fd/cwd/exe) deleted
+        # artifacts on filesystems holding no slot output are provably unable
+        # to alias slot output, so they are excluded (and counted) instead of
+        # refusing the whole run.
+        observed = {os.stat(self.pool / f'slot-{n}' / sub).st_dev
+                    for n in range(2) for sub in ('target', 'scratch')}
+        foreign = os.makedev(0xAB, 0xCD)
+        self.assertNotIn(foreign, observed)
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/other/tenant/stale.so', foreign, 999999991, True),
+                                             ('/other/tenant/old.so', foreign, 999999992, True)])):
+            receipt = self.retain()
+        self.assertTrue(all(row['eligible'] for row in receipt['slots']))
+        self.assertEqual(receipt['excluded_deleted_references'], 2)
+        self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_maps_deleted_never_device_excluded(self):
+        # Maps devices are kernel-printed superblock numbers, which need not
+        # equal the stat device for the same file (btrfs per-subvolume
+        # anon_dev, pre-6.8 overlayfs). A maps deleted entry whose device is
+        # in no slot output therefore proves nothing -- e.g. a replaced slot
+        # proc-macro .so still mapped by a live process -- so it stays
+        # fail-closed and refuses the whole run with no mutation.
+        target = self.pool / 'slot-0' / 'target'
+        observed = {os.stat(self.pool / f'slot-{n}' / sub).st_dev
+                    for n in range(2) for sub in ('target', 'scratch')}
+        foreign = os.makedev(0xAB, 0xCD)
+        self.assertNotIn(foreign, observed)
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/other/tenant/stale.so', foreign, 999999991, False)])):
+            with self.assertRaisesRegex(cache.Refusal, 'unresolved deleted'):
+                self.retain()
+        self.assertTrue((target / 'debug' / 'fixture').exists())
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_non_file_maps_deleted_excluded_by_identity(self):
+        # Shared-host shape: PostgreSQL backends map SYSV IPC segments and
+        # /dev/zero, shown deleted on device 00:01. Those paths denote kernel
+        # objects that can never be regular files, so they cannot alias slot
+        # output and are excluded (and counted) by identity -- never by
+        # device comparison. Real-path maps entries still refuse (above).
+        shm = os.makedev(0x00, 0x01)
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/SYSV00000000', shm, 1, False),
+                                             ('/dev/zero', shm, 2, False)])):
+            receipt = self.retain()
+        self.assertTrue(all(row['eligible'] for row in receipt['slots']))
+        self.assertEqual(receipt['excluded_deleted_references'], 2)
+        self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_is_non_file_reference_predicate(self):
+        # Kernel-object identity must accept every anonymous form the
+        # multi-tenant host shows while never matching a real file path:
+        # slot outputs always carry absolute paths under slot target/scratch.
+        for anon in ('/SYSV00000000', '/dev/zero', '/memfd:shared-memory-region',
+                     '/memfd:memory-backend-memfd', 'memfd:jit-cache',
+                     '/[aio]', '[aio]', '[anon:thread stack]',
+                     '[heap]', '[stack]', 'anon_inode:[eventfd]',
+                     '/anon_inode:[signalfd]'):
+            self.assertTrue(cache.is_non_file_reference(anon), anon)
+        for real in ('/dev/shm/sem.fixture', '/tmp/.org.chromium.fixture',
+                     '/usr/lib/x86_64-linux-gnu/libc.so.6',
+                     str(self.pool / 'slot-0' / 'target' / 'debug' / 'fixture')):
+            self.assertFalse(cache.is_non_file_reference(real), real)
+
+    def test_anon_kernel_deleted_excluded_by_identity(self):
+        # Multi-tenant host residual shape: memfd anonymous files, aio
+        # contexts and anon_inode objects alongside the SYSV/zero pair. All
+        # denote kernel objects that can never be regular slot output, so
+        # they are excluded (and counted) by identity -- never by device.
+        shm = os.makedev(0x00, 0x01)
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/memfd:shared-memory-region', shm, 11, False),
+                                             ('/[aio]', shm, 12, False),
+                                             ('anon_inode:[eventfd]', shm, 13, False),
+                                             ('/SYSV00000000', shm, 14, False),
+                                             ('/dev/zero', shm, 15, False)])):
+            receipt = self.retain()
+        self.assertTrue(all(row['eligible'] for row in receipt['slots']))
+        self.assertEqual(receipt['excluded_deleted_references'], 5)
+        self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_map_files_stat_backs_maps_deleted(self):
+        # The scanner re-grounds a file-backed maps deleted entry through
+        # /proc/PID/map_files/<range>: the symlink stat reports the mapped
+        # file's real device/inode (stat_backed=True), unlike the
+        # kernel-printed maps superblock device.
+        pid = self.fake_pid()
+        backing = self.root / 'backing.so'
+        backing.write_bytes(b'y' * 64)
+        info = backing.stat()
+        (pid / 'map_files').mkdir()
+        (pid / 'map_files' / '100-200').symlink_to(backing)
+        pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
+        (pid / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'123456789 /elsewhere/stale.so (deleted)\n')
+        _refs, deleted = cache.process_references(self.proc)
+        self.assertEqual(len(deleted), 1)
+        path, device, inode, stat_backed = deleted[0]
+        self.assertEqual(path, '/elsewhere/stale.so')
+        self.assertTrue(stat_backed)
+        self.assertEqual((device, inode), (info.st_dev, info.st_ino))
+
+    def test_map_files_missing_stays_fail_closed(self):
+        # No map_files entry (anonymous object without one, hidepid, or an
+        # exit/munmap race): the kernel-printed identity is kept and stays
+        # fail-closed -- the whole run refuses with no mutation.
+        pid = self.fake_pid()
+        target = self.pool / 'slot-0' / 'target'
+        pool_dev = os.stat(target).st_dev
+        (pid / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'999999991 /different/container/mount/stale.so (deleted)\n')
+        with self.assertRaisesRegex(cache.Refusal, 'unresolved deleted'):
+            self.retain()
+        self.assertTrue((target / 'debug' / 'fixture').exists())
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    @contextlib.contextmanager
+    def map_files_denied(self):
+        real_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if 'map_files' in path.parts:
+                raise PermissionError('map_files needs CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE')
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(Path, 'stat', stat):
+            yield
+
+    def test_map_files_resolves_zero_padded_maps_range(self):
+        # /proc/PID/maps zero-pads ranges to 8 hex digits, but the kernel names
+        # map_files entries unpadded and rejects the padded spelling (ENOENT).
+        pid = self.fake_pid()
+        backing = self.root / 'node'
+        backing.write_bytes(b'n' * 64)
+        info = backing.stat()
+        (pid / 'map_files').mkdir()
+        (pid / 'map_files' / '400000-420000').symlink_to(backing)
+        pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
+        (pid / 'maps').write_text(
+            f'00400000-00420000 r-xp 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'123456789 /usr/local/bin/node (deleted)\n')
+        _refs, deleted = cache.process_references(self.proc)
+        self.assertEqual(deleted, [('/usr/local/bin/node', info.st_dev, info.st_ino, True)])
+
+    def test_denied_map_files_keeps_unproven_identity_without_aborting(self):
+        # Denied map_files reads are a capability limit, not lost visibility:
+        # the entry keeps the kernel-printed identity (stat_backed=False).
+        pid = self.fake_pid()
+        backing = self.root / 'backing.so'
+        backing.write_bytes(b'y' * 64)
+        (pid / 'map_files').mkdir()
+        (pid / 'map_files' / '100-200').symlink_to(backing)
+        pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
+        (pid / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'123456789 /elsewhere/stale.so (deleted)\n')
+        with self.map_files_denied():
+            _refs, deleted = cache.process_references(self.proc)
+        self.assertEqual(deleted, [('/elsewhere/stale.so', pool_dev, 123456789, False)])
+
+    def test_denied_map_files_vetoes_only_attributed_slot(self):
+        pid = self.fake_pid()
+        target = self.pool / 'slot-0' / 'target'
+        pool_dev = os.stat(target).st_dev
+        (pid / 'map_files').mkdir()
+        (pid / 'map_files' / '100-200').symlink_to(target / 'debug' / 'fixture')
+        (pid / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'123456789 {target}/debug/gone.so (deleted)\n')
+        with self.map_files_denied():
+            by_slot = self.by_slot(self.retain())
+        self.assertFalse(by_slot['slot-0']['eligible'])
+        self.assertIn('deleted artifact', by_slot['slot-0']['reason'])
+        self.assertTrue(by_slot['slot-1']['eligible'])
+
+    def test_map_files_stat_enables_foreign_filesystem_exclusion(self):
+        # End-to-end multi-tenant shape: a map_files-backed maps deleted
+        # entry on a filesystem holding no slot output is provably unable to
+        # alias slot output (stat device vs stat device), so it is excluded
+        # and counted exactly like a stat-backed fd entry.
+        observed = {os.stat(self.pool / f'slot-{n}' / sub).st_dev
+                    for n in range(2) for sub in ('target', 'scratch')}
+        foreign = os.makedev(0xAB, 0xCD)
+        self.assertNotIn(foreign, observed)
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/var/tmp/chromium.so', foreign, 999999991, True)])):
+            receipt = self.retain()
+        self.assertTrue(all(row['eligible'] for row in receipt['slots']))
+        self.assertEqual(receipt['excluded_deleted_references'], 1)
+        self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_host_shape_mixed_residual_clears_or_refuses(self):
+        # Generic form of the shared-host residual: anonymous kernel objects
+        # plus foreign-filesystem file-backed mappings clear together; one
+        # same-filesystem file-backed maps entry (indistinguishable from a
+        # deleted slot file held open) still refuses the whole run.
+        shm = os.makedev(0x00, 0x01)
+        foreign = os.makedev(0xAB, 0xCD)
+        observed = {os.stat(self.pool / f'slot-{n}' / sub).st_dev
+                    for n in range(2) for sub in ('target', 'scratch')}
+        self.assertNotIn(foreign, observed)
+        clearable = [('/memfd:shared-memory-region', shm, 11, False),
+                     ('/[aio]', shm, 12, False),
+                     ('/SYSV00000000', shm, 13, False),
+                     ('/dev/zero', shm, 14, False),
+                     ('/var/tmp/chromium.so', foreign, 999999991, True),
+                     ('/dev/shm/sem.stale', foreign, 999999992, True)]
+        pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
+        # Refusal first: nothing mutates, so the clearable case below runs
+        # on the same fresh fixture.
+        with patch.object(cache, 'process_references',
+                          return_value=([], list(clearable) + [
+                              ('/replaced/system.so', pool_dev, 999999993, False)])):
+            with self.assertRaisesRegex(cache.Refusal, 'unresolved deleted'):
+                self.retain()
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+        self.assertTrue((self.pool / 'slot-0' / 'target' / 'debug' / 'fixture').exists())
+        with patch.object(cache, 'process_references',
+                          return_value=([], list(clearable))):
+            receipt = self.retain()
+        self.assertTrue(all(row['eligible'] for row in receipt['slots']))
+        self.assertEqual(receipt['excluded_deleted_references'], 6)
+        self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_device_unknown_deleted_refuses_whole(self):
+        # A deleted entry with no usable device identity cannot prove
+        # non-aliasing, so it stays fail-closed and refuses the whole run.
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/elsewhere/stale.so', None, 7, True)])):
+            with self.assertRaisesRegex(cache.Refusal, 'unresolved deleted'):
+                self.retain()
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_denied_process_scan_refuses_whole_without_mutation(self):
+        self.fake_pid()
+        with patch.object(os, 'readlink', side_effect=PermissionError('denied')):
+            with self.assertRaisesRegex(cache.Refusal, 'visibility'):
+                self.retain()
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_unexpected_slot_contents_and_symlink_skip(self):
+        slot = self.pool / 'slot-0'
+        (slot / 'extra').mkdir()
+        row = self.by_slot(self.retain())['slot-0']
+        self.assertFalse(row['eligible'])
+        self.assertIn('unexpected', row['reason'])
+        shutil.rmtree(slot / 'extra')
+        (slot / 'target' / 'debug' / 'link').symlink_to(self.root)
+        row = self.by_slot(self.retain())['slot-0']
+        self.assertFalse(row['eligible'])
+        self.assertIn('incomplete slot scan', row['reason'])
+        self.assertTrue((slot / 'lease.json').exists())
+        (slot / 'target' / 'debug' / 'link').unlink()
+        # A symlinked target directory itself must skip only that slot (with
+        # a receipt for the healthy slot), never refuse the whole run: the
+        # name check above passes while real_directory raises Refusal.
+        shutil.rmtree(slot / 'target')
+        (slot / 'target').symlink_to(self.root, target_is_directory=True)
+        receipt = self.retain()
+        by_slot = self.by_slot(receipt)
+        self.assertFalse(by_slot['slot-0']['eligible'])
+        self.assertIn('real slot directory', by_slot['slot-0']['reason'])
+        self.assertTrue((slot / 'lease.json').exists())
+        # The healthy slot is still processed (earlier retains in this test
+        # already emptied it, so bytes need not move here).
+        self.assertTrue(by_slot['slot-1']['eligible'])
+
+    def test_external_tmp_is_never_touched(self):
+        scratch = self.root / 'container-tmp'
+        scratch.mkdir()
+        for name in ('tog-10078-fixes-target', 'tog-10078-db-target', 'two-bot-next-s2'):
+            target = scratch / name
+            target.mkdir()
+            (target / 'fixture').write_bytes(b'x' * 4096)
+        receipt = self.retain()
+        self.assertTrue(all(row['eligible'] for row in receipt['slots']))
+        self.assertEqual(len(list(scratch.glob('*/fixture'))), 3)
 
 
 if __name__ == '__main__':

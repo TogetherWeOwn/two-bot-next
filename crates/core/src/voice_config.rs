@@ -134,7 +134,9 @@ pub struct GuildSettings {
     pub no_game_label: String,
     pub force_single_game: bool,
     pub count_members_without_activity: bool,
-    /// IANA name interpretation is deferred to the runtime's timezone provider.
+    /// Guild time zone for the name time tokens; see
+    /// [`crate::voice_time_zone`] for the accepted values. Imports refuse a new
+    /// unsupported value ([`validate_time_zone_change`]).
     pub time_zone: String,
     pub text_channel_name: String,
     #[serde(deserialize_with = "Option::deserialize")]
@@ -194,6 +196,10 @@ pub enum VoiceConfigError {
     UnknownReference { field: String, kind: &'static str },
     #[error("cross-guild {kind} reference at {field}")]
     CrossGuildReference { field: String, kind: &'static str },
+    #[error(
+        "the configuration is {bytes} bytes even as compact JSON, over the {limit}-byte limit /import accepts, so it could not be imported back. Remove some entries, then export again."
+    )]
+    ExportTooLarge { bytes: usize, limit: usize },
 }
 
 impl From<serde_json::Error> for VoiceConfigError {
@@ -217,6 +223,25 @@ pub fn import_configuration(
     Ok(config)
 }
 
+/// Import-time time-zone rule: a new `settings.time_zone` must be one
+/// [`crate::voice_time_zone::offset_minutes`] understands. A value equal to
+/// the one already stored is accepted as is, so a guild whose earlier zone is
+/// unsupported (its names render in UTC) can still re-import its own export.
+/// Not part of [`validate_configuration`], which `/export` also runs.
+pub fn validate_time_zone_change(
+    previous: &str,
+    candidate: &VoiceConfiguration,
+) -> Result<(), VoiceConfigError> {
+    let zone = &candidate.settings.time_zone;
+    if zone.trim() == previous.trim() || crate::voice_time_zone::is_known(zone) {
+        return Ok(());
+    }
+    Err(invalid(
+        "settings.time_zone",
+        "must be UTC, a fixed offset such as UTC-5, or a supported IANA zone such as America/New_York",
+    ))
+}
+
 /// Strict decode only: size cap, an object at the document and every nested
 /// DTO boundary (no positional arrays), no duplicate keys, no trailing data.
 /// It does not validate against an inventory, so callers that must report and
@@ -235,12 +260,25 @@ pub fn decode_configuration(json: &[u8]) -> Result<VoiceConfiguration, VoiceConf
 
 /// Export uses the same validation contract as import and retains list order,
 /// strings and optional values. It does not include runtime room/owner state.
+/// Pretty JSON when it fits [`MAX_IMPORT_BYTES`], else compact; refuses with
+/// [`VoiceConfigError::ExportTooLarge`] only when even compact is over the cap.
 pub fn export_configuration(
     config: &VoiceConfiguration,
     inventory: &GuildInventory,
 ) -> Result<Vec<u8>, VoiceConfigError> {
     validate_configuration(config, inventory)?;
-    Ok(serde_json::to_vec_pretty(config)?)
+    let pretty = serde_json::to_vec_pretty(config)?;
+    if pretty.len() <= MAX_IMPORT_BYTES {
+        return Ok(pretty);
+    }
+    let compact = serde_json::to_vec(config)?;
+    if compact.len() > MAX_IMPORT_BYTES {
+        return Err(VoiceConfigError::ExportTooLarge {
+            bytes: compact.len(),
+            limit: MAX_IMPORT_BYTES,
+        });
+    }
+    Ok(compact)
 }
 
 pub fn validate_configuration(

@@ -7,16 +7,20 @@
 
 pub mod adapter;
 pub mod audit_mirror;
+#[cfg(feature = "db")]
+mod automation_admission;
 pub mod automod;
 pub mod automod_activation;
 pub mod channel_access;
 #[cfg(feature = "db")]
 pub mod channel_moderation;
+pub mod command_identity;
 pub mod command_registry;
 #[cfg(feature = "db")]
 pub mod custom_commands;
 pub mod executor;
 mod executor_metrics;
+pub mod funnel_invites;
 
 #[cfg(feature = "db")]
 pub use channel_moderation::{
@@ -42,6 +46,8 @@ pub mod onboarding_messages;
 pub mod onboarding_permissions;
 pub mod pipeline;
 pub mod ratelimit_guard;
+#[cfg(feature = "db")]
+pub mod rsvp;
 #[cfg(any(test, feature = "test-support"))]
 pub mod staging_slash_smoke;
 #[cfg(test)]
@@ -49,14 +55,17 @@ mod test_clock;
 pub mod voice_rooms;
 
 #[cfg(feature = "db")]
-pub use leveling_runtime::{LevelingRuntime, OrderedLevelingPipeline};
+pub use leveling_runtime::{
+    CommunityFactsError, DeferredCommunityFacts, LevelingRuntime, OrderedLevelingPipeline,
+    RulesAcceptedWrite,
+};
 
 pub use adapter::event_to_core;
 pub use executor::{
-    lockdown_masks, pace_delay_ms, paced_step, throw_for_status, timeout_until_iso, unlock_masks,
-    ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordCall, DiscordError, EveryoneOverwrite,
-    PacedStep, RawResponse, KICK_INTERVAL_MS, MAX_AUDIT_REASON_CHARS, MAX_MESSAGE_CHARS,
-    MODERATION_TIMEOUT_MS, PACE_INTERVAL_MS,
+    is_definitive_rejection, lockdown_masks, pace_delay_ms, paced_step, throw_for_status,
+    timeout_until_iso, unlock_masks, ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordCall,
+    DiscordError, EveryoneOverwrite, PacedStep, RawResponse, KICK_INTERVAL_MS,
+    MAX_AUDIT_REASON_CHARS, MAX_MESSAGE_CHARS, MODERATION_TIMEOUT_MS, PACE_INTERVAL_MS,
 };
 pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
 pub use interactions::{
@@ -68,5 +77,5 @@ pub use internal_events::{event_status_name, scheduled_event_body, EventActionEr
 pub use pipeline::{
     build_cache, AuditEntryObserver, AuditLogObservation, ChannelClassifier, InviteSource,
     JoinObservation, JoinObserver, MemPipeline, MessageEligibility, NoClassification, NoInvites,
-    Pipeline, PipelineSnapshots, ScriptedInvites,
+    Pipeline, PipelineSnapshots, ScriptedInvites, SettingsChannelClassifier,
 };

@@ -11,7 +11,12 @@ mod admission_test_support;
 mod audit_gateway;
 mod audit_runtime;
 mod automod_gateway;
+#[cfg(test)]
+mod backfill_error_chain_acceptance_tests;
+mod backfill_retention_chains;
 mod backup_cli;
+#[cfg(test)]
+mod backup_cli_pool_open_tests;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.
 #[allow(dead_code)]
 mod burn_rate;
@@ -26,43 +31,75 @@ mod containment_runtime;
 #[cfg(test)]
 mod containment_runtime_tests;
 mod database_roles_cli;
+mod db_log;
 #[cfg(test)]
 #[allow(dead_code)]
 #[path = "../../discord/tests/common/mod.rs"]
 mod discord_test_common;
 mod dispatch;
 mod erasure_cli;
+mod event_cli;
+mod eventsub_delivery;
+mod eventsub_http;
+mod eventsub_reconcile;
+#[cfg(test)]
+mod fast_burn_page_tests;
 mod feed_jobs;
 mod gateway;
+#[cfg(test)]
+mod slow_burn_ticket_tests;
+// Bounded reconnect schedule and runner: no runtime caller yet. Test-only
+// until the gateway loop adopts it, so it lives in test builds instead of
+// shipping dead code to the container.
+#[cfg(test)]
+mod gateway_backoff;
 mod gateway_commands;
 mod gateway_failure;
 mod gateway_metrics;
 #[cfg(test)]
 mod gateway_tests;
 mod interaction_admission;
+#[cfg(test)]
+mod interaction_composition_tests;
 mod internal_action_http;
+#[cfg(test)]
+mod job_emission_conformance_tests;
 mod jobs;
 mod join_risk_runtime;
 #[cfg(test)]
 mod join_risk_runtime_tests;
 #[cfg(test)]
+mod join_risk_tuning_refusal_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod log_volume_guard_tests;
+mod logging;
 mod member_cli;
 mod member_runtime;
 mod metrics_http;
 mod moderation_cli;
+mod moderation_release_cli;
 #[cfg(test)]
 mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
+#[cfg(test)]
+mod onboarding_unknown_only_acceptance_tests;
+mod ops_backfill;
+mod ops_http;
 mod preflight;
+mod privacy_command;
 mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
 mod restore_drill;
+#[cfg(test)]
+mod retention_error_chain_acceptance_tests;
+mod retention_jobs;
+#[cfg(test)]
+mod retention_runtime_tests;
 mod schedule_runtime;
 mod scheduled_jobs;
 mod server;
@@ -85,7 +122,7 @@ mod website_jobs;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, Instrument};
 use two_bot_core::{ComponentStatus, Config, VoiceGates};
 
 use futures_util::FutureExt as _;
@@ -130,13 +167,11 @@ async fn main() {
         print_backup_help_and_exit().await;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "two_bot=info".into()),
-        )
-        .init();
+    logging::init();
+    run(&cli_args).instrument(logging::run_span()).await;
+}
 
+async fn run(cli_args: &[String]) {
     let receiver_config = two_bot_core::internal_action_config::InternalActionConfig::from_env()
         .unwrap_or_else(|_| {
             tracing::error!(
@@ -145,6 +180,35 @@ async fn main() {
             );
             std::process::exit(1);
         });
+    let eventsub_config = two_bot_core::eventsub_receiver_config::EventsubReceiverConfig::from_env(
+    )
+    .unwrap_or_else(|_| {
+        tracing::error!(
+            error_class = "receiver_config_invalid",
+            "eventsub startup refused"
+        );
+        std::process::exit(1);
+    });
+    // Go-live delivery is a second, independent gate on the receiver: an
+    // enabled-but-invalid delivery config (including delivery without the
+    // receiver) refuses startup, never silently acks only.
+    let eventsub_delivery_config =
+        two_bot_core::eventsub_delivery_config::EventsubDeliveryConfig::from_env().unwrap_or_else(
+            |_| {
+                tracing::error!(
+                    error_class = "receiver_config_invalid",
+                    "eventsub startup refused"
+                );
+                std::process::exit(1);
+            },
+        );
+    if eventsub_delivery_config.is_some() && eventsub_config.is_none() {
+        tracing::error!(
+            error_class = "receiver_config_invalid",
+            "eventsub startup refused"
+        );
+        std::process::exit(1);
+    }
     let config = Config::from_env().unwrap_or_else(|err| {
         if receiver_config.is_some() {
             tracing::error!(
@@ -153,7 +217,7 @@ async fn main() {
             );
             std::process::exit(1);
         }
-        tracing::warn!(error = %err, "config invalid; continuing with safe defaults");
+        tracing::warn!(msg = "config_invalid", reason = %err, "config invalid; continuing with safe defaults");
         Config {
             discord_token: None,
             database_url: None,
@@ -214,7 +278,7 @@ async fn main() {
     // no-op and preserves existing server behavior.
     if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
         if let Err(error) = commands_cli::publish_on_boot(token, guild_id).await {
-            tracing::error!(error = %error, "boot command registry synchronization failed");
+            tracing::error!(reason = %error, "boot command registry synchronization failed");
             std::process::exit(1);
         }
     }
@@ -246,7 +310,16 @@ async fn main() {
     let state = SharedState::new(
         Arc::clone(&gateway),
         store.as_ref().map(|s| s.pool().clone()),
-    );
+    )
+    .with_gateway_fail_injection(server::gateway_failure_injection_from_env());
+    if state.gateway_fail_injected {
+        // Staging rollback drill only (the fence refuses everywhere else):
+        // loud once at boot so the drill is unmistakable in the deploy logs.
+        tracing::warn!(
+            msg = "gateway_readiness_failure_injection_active",
+            "gateway readiness failure injection active; /readyz reports gateway down for the staging rollback drill"
+        );
+    }
 
     // Disable guard: refuse to boot with moderation/automation disabled
     // while releases are still owed (pending tempban unbans, active
@@ -257,7 +330,7 @@ async fn main() {
         let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
         let gates = two_bot_core::disable_preflight::DisableGates::from_map(&vars);
         if !gates.moderation || !gates.automations {
-            let overridden = two_bot_core::disable_preflight::override_active(&vars, &cli_args);
+            let overridden = two_bot_core::disable_preflight::override_active(&vars, cli_args);
             match two_bot_core::disable_preflight::boot_check(&pool, &gates, overridden).await {
                 Ok(two_bot_core::disable_preflight::BootVerdict::Proceed) => {}
                 Ok(two_bot_core::disable_preflight::BootVerdict::Refused(owed)) => {
@@ -310,6 +383,66 @@ async fn main() {
         None => None,
     };
 
+    // Private EventSub listener: verified deliveries only. While delivery
+    // stays dark boot injects no dependencies and notifications are
+    // acknowledged without a send; with delivery enabled boot builds the
+    // production deps (bot pool ledger plus an admission-backed executor,
+    // the same send-admission construction as the command runtime) or
+    // refuses startup — see `eventsub_delivery`. The identity activation
+    // fence is evaluated first, like every other bot-identity posting job:
+    // a refused Announcements capability refuses startup rather than
+    // posting go-lives under an uncleared identity. Enabled failures never
+    // fall back; a bound listener that later fails stops the container.
+    let eventsub_receiver = match eventsub_config {
+        Some(eventsub_config) => {
+            let delivery = eventsub_delivery_config.map(|delivery_config| {
+                let refuse = |error_class: &'static str| -> ! {
+                    tracing::error!(error_class, "eventsub startup refused");
+                    std::process::exit(1);
+                };
+                let Some(db) = store.as_ref() else {
+                    refuse("receiver_prerequisites_invalid")
+                };
+                let pool = db.pool().clone();
+                let Some(token) = config
+                    .discord_token
+                    .as_ref()
+                    .map(|secret| secret.expose().as_str())
+                    .filter(|token| !token.is_empty())
+                else {
+                    refuse("receiver_prerequisites_invalid")
+                };
+                let proxy = std::env::var("DISCORD_API_BASE")
+                    .ok()
+                    .filter(|value| !value.is_empty());
+                // One-line delegation: the capability choice lives in the
+                // tested `go_live_delivery_permitted` helper so a swap to a
+                // live-cleared capability cannot slip past the delivery tests.
+                let announcements_permitted = activation.go_live_delivery_permitted();
+                eventsub_delivery::build_delivery_deps(
+                    pool,
+                    token,
+                    proxy,
+                    &delivery_config,
+                    announcements_permitted,
+                )
+                .unwrap_or_else(|error_class| refuse(error_class))
+            });
+            Some(
+                eventsub_http::bind_with_delivery(eventsub_config, delivery)
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::error!(
+                            error_class = "receiver_bind_failed",
+                            "eventsub startup refused"
+                        );
+                        std::process::exit(1);
+                    }),
+            )
+        }
+        None => None,
+    };
+
     // ONE optional self-role service: gateway dispatch and the supervised
     // recovery job share this Arc. Empty/invalid catalogues, non-staging guilds
     // and failed identity reads leave the surface and the job unregistered.
@@ -338,6 +471,13 @@ async fn main() {
     let voice = build_voice_runtime(&config, VoiceGates::from_env().enabled).await;
 
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
+
+    // M3.3 reconcile: once at startup plus a bounded interval while
+    // `TWO_EVENTSUB` is exactly `1`. Dark parks with an info log;
+    // enabled-but-invalid configuration logs with an error class and never
+    // mutates.
+    eventsub_reconcile::spawn_if_enabled(shutdown.subscribe());
+
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
     let gateway_task = if let Ok((token, url, guild_id)) = gateway_prerequisites(&config) {
@@ -349,7 +489,8 @@ async fn main() {
         let self_roles = self_roles.clone();
         let member = member.clone();
         let linger_stop = stopping.clone();
-        Some(tokio::spawn(async move {
+        let gateway_span = logging::gateway_span(guild_id);
+        let task = async move {
             // A panic is caught only to name it on /readyz; the task still ends
             // in `Err`, which the supervisor treats exactly like a JoinError.
             let outcome: Result<Result<(), gateway_failure::StepFailure>, _> =
@@ -359,6 +500,7 @@ async fn main() {
                     let db = store.ok_or_else(|| {
                         step_failure(
                             FailureClass::StoreUnavailable,
+                            "store_unavailable",
                             sqlx::Error::InvalidArgument(
                                 "DATABASE_URL required for gateway checkpoint".into(),
                             ),
@@ -371,7 +513,11 @@ async fn main() {
                         two_bot_cutover::connect(&url, gateway::GATEWAY_POOL_MAX, true)
                             .await
                             .map_err(|error| {
-                                step_failure(FailureClass::GatewayPoolConnectFailed, error)
+                                step_failure(
+                                    FailureClass::GatewayPoolConnectFailed,
+                                    "gateway_pool_connect",
+                                    error,
+                                )
                             })?;
                     let pool = db.pool().clone();
                     let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
@@ -379,13 +525,14 @@ async fn main() {
                         guild_id.to_string(),
                         0,
                     );
-                    let saved = gateway::load_boot_session(&store)
-                        .await
-                        .map_err(|error| step_failure(FailureClass::CheckpointLoadFailed, error))?;
+                    let saved = gateway::load_boot_session(&store).await.map_err(|error| {
+                        step_failure(FailureClass::CheckpointLoadFailed, "checkpoint_load", error)
+                    })?;
                     let gates = two_bot_core::OnboardingGates::from_env().map_err(|_| {
                         step_failure(
                             FailureClass::OnboardingGatesInvalid,
-                            sqlx::Error::InvalidArgument("invalid onboarding mode".into()),
+                            "onboarding_gates",
+                            sqlx::Error::InvalidArgument("invalid onboarding gates".into()),
                         )
                     })?;
                     // ONE router + REST executor + sqlx stores over the feature pool.
@@ -400,20 +547,47 @@ async fn main() {
                         gates,
                         member,
                         &activation,
+                        voice.is_some(),
                     );
-                    if let Some(runtime) = &runtime {
-                        let config = gateway_commands::GatewayCommandConfig::from_map(
+                    // Ordered RSVP surface over the runtime's governed executor.
+                    // `None` whenever the command runtime is parked; the gateway
+                    // and funnel still boot.
+                    let interactions = runtime.as_ref().and_then(|runtime| {
+                        build_interaction_runtime(
+                            &pool,
                             guild_id,
-                            &std::env::vars().collect(),
+                            &gates,
+                            runtime.executor(),
+                            &activation,
                         )
-                        .map_err(|error| {
-                            step_failure(FailureClass::CustomCommandsInitFailed, error)
-                        })?;
+                    });
+                    if let Some(runtime) = &runtime {
+                        let vars: std::collections::HashMap<String, String> =
+                            std::env::vars().collect();
+                        let config =
+                            gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                                guild_id,
+                                &vars,
+                                activation.permitted(
+                                    two_bot_core::activation::LiveCapability::Moderation,
+                                ),
+                            )
+                            .map_err(|error| {
+                                step_failure(
+                                    FailureClass::CustomCommandsInitFailed,
+                                    "custom_commands_config",
+                                    error,
+                                )
+                            })?;
                         runtime
                             .initialize_custom_commands(config)
                             .await
                             .map_err(|error| {
-                                step_failure(FailureClass::CustomCommandsInitFailed, error)
+                                step_failure(
+                                    FailureClass::CustomCommandsInitFailed,
+                                    "custom_commands_init",
+                                    error,
+                                )
                             })?;
                     }
                     // Onboarding renders through that same executor: one shared
@@ -432,6 +606,7 @@ async fn main() {
                             .map_err(|_| {
                                 step_failure(
                                     FailureClass::OnboardingInitFailed,
+                                    "onboarding_init",
                                     sqlx::Error::InvalidArgument(
                                         "onboarding initialization failed".into(),
                                     ),
@@ -448,9 +623,19 @@ async fn main() {
                         build_persistent_pipeline(&store, guild_id, token.clone(), leveling)
                             .await
                             .map_err(|error| {
-                                step_failure(FailureClass::MilestonesLoadFailed, error)
+                                step_failure(
+                                    FailureClass::MilestonesLoadFailed,
+                                    "milestones_load",
+                                    error,
+                                )
                             })?,
                     );
+                    // Community voice + message capture: arm the Postgres
+                    // facts sink only when the scorecard job is enabled, so a
+                    // staging-gated rollout captures exactly while it scores.
+                    if std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1") {
+                        pipeline.enable_community_facts(pool.clone());
+                    }
                     // Join-burst watch is always on, as legacy raid watch was (TWO-56),
                     // and independent of the anti-nuke flags. It shares the command
                     // runtime's REST executor and runs behind the funnel's join row.
@@ -465,6 +650,7 @@ async fn main() {
                         .map_err(|_| {
                             step_failure(
                                 FailureClass::RaidExecutorFailed,
+                                "raid_executor",
                                 sqlx::Error::InvalidArgument("raid REST executor failed".into()),
                             )
                         })?,
@@ -506,6 +692,7 @@ async fn main() {
                             tracing::error!(reason, "automod configuration rejected");
                             step_failure(
                                 FailureClass::AutomodConfigInvalid,
+                                "automod_config",
                                 sqlx::Error::InvalidArgument(reason.into()),
                             )
                         })?
@@ -525,15 +712,17 @@ async fn main() {
                                 .map_err(|_| {
                                     step_failure(
                                         FailureClass::AutomodExecutorFailed,
+                                        "automod_executor",
                                         sqlx::Error::InvalidArgument(
                                             "automod REST executor failed".into(),
                                         ),
                                     )
                                 })?,
                             };
+                            let mode = resolved.mode();
                             let automod = automod_gateway::build(resolved, pool, executor);
                             let _ = slot.set(Arc::clone(&automod));
-                            info!("automod activation wired into the gateway loop");
+                            info!(mode, "automod activation wired into the gateway loop");
                             Some(automod)
                         }
                         None => None,
@@ -550,13 +739,27 @@ async fn main() {
                         }));
                     }
 
-                    let shard = build_shard(
-                        token,
-                        intents_from_env(&activation),
-                        saved.as_ref(),
-                        gateway_url.as_deref(),
-                    );
+                    let intents = intents_from_env(&activation);
+                    // Voice-room game names need GUILD_PRESENCES; record
+                    // whether this boot requested it so a missing game
+                    // rename is diagnosable from logs alone (the flag may
+                    // be a secret binding whose value is never printed).
                     info!(
+                        msg = "gateway_intents",
+                        voice_presences =
+                            intents.contains(twilight_model::gateway::Intents::GUILD_PRESENCES),
+                        "gateway intents resolved"
+                    );
+                    // One intents value drives both the shard subscription
+                    // and the pipeline's length measurement: without
+                    // MESSAGE_CONTENT, Discord delivers content only for
+                    // bot mentions, so the pipeline must not measure it.
+                    pipeline.set_message_content_delivered(
+                        intents.contains(twilight_gateway::Intents::MESSAGE_CONTENT),
+                    );
+                    let shard = build_shard(token, intents, saved.as_ref(), gateway_url.as_deref());
+                    info!(
+                        msg = "gateway_connecting",
                         resume = saved.is_some(),
                         "durable gateway initialized; shard connecting"
                     );
@@ -565,6 +768,7 @@ async fn main() {
                         pipeline,
                         Arc::clone(&state),
                         store,
+                        interactions,
                         onboarding,
                         runtime,
                         automod,
@@ -574,7 +778,9 @@ async fn main() {
                         },
                     )
                     .await
-                    .map_err(|error| step_failure(FailureClass::GatewayRuntimeFailed, error))
+                    .map_err(|error| {
+                        step_failure(FailureClass::GatewayRuntimeFailed, "gateway_run", error)
+                    })
                 })
                 .catch_unwind()
                 .await;
@@ -583,27 +789,28 @@ async fn main() {
                 Ok(Err(failed)) => Some(failed),
                 Err(_) => Some(step_failure(
                     FailureClass::GatewayTaskPanicked,
+                    "gateway_panic",
                     sqlx::Error::InvalidArgument("gateway task panicked".into()),
                 )),
             };
             match failed {
                 None => Ok(()),
                 Some(failed) => {
-                    publish_gateway_failure(
-                        &state,
-                        &failure_slot,
-                        failed.class,
-                        linger_stop,
-                        shutdown::FAILURE_LINGER,
-                    )
-                    .await;
+                    // Only a running-gateway failure lingers 75 s so a
+                    // keepalive scrape sees the checkpoint counter; startup
+                    // failures keep the short 15 s linger.
+                    let linger = shutdown::failure_linger(failed.class);
+                    publish_gateway_failure(&state, &failure_slot, &failed, linger_stop, linger)
+                        .await;
                     Err(failed.error)
                 }
             }
-        }))
+        };
+        Some(tokio::spawn(task.instrument(gateway_span)))
     } else {
         *gateway.write().await = GatewayState::Unconfigured;
         info!(
+            msg = "gateway_parked",
             missing = gateway_prerequisites(&config).unwrap_err(),
             status = ?ComponentStatus::Down,
             "gateway prerequisites missing; gateway parked, /readyz reports down"
@@ -619,6 +826,7 @@ async fn main() {
         self_roles,
         automod_slot,
         receiver,
+        eventsub_receiver,
         member,
     );
     let result = match gateway_task {
@@ -627,12 +835,77 @@ async fn main() {
     };
     if result.is_err() {
         tracing::error!(
+            msg = "shutdown_failed",
             startup_phase = "service_supervisor",
             error_class = "container_service_failed",
             "container service failed"
         );
         std::process::exit(1);
     }
+}
+
+/// Ordered RSVP surface over the command runtime's governed REST executor:
+/// one shared executor (one token key, one pacing lane) serves both the
+/// detached command dispatch and the ordered interaction completion. Returns
+/// `None` — gateway and funnel still boot — when command-gate parsing fails,
+/// so bad env parks only this surface. Mirrors
+/// [`command_runtime::CommandRuntime::from_env`]: no permissive defaults,
+/// no loopback broadening, no live probe.
+fn build_interaction_runtime(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    guild_id: u64,
+    onboarding: &two_bot_core::OnboardingGates,
+    executor: two_bot_discord::ActionExecutor,
+    activation: &activation::BootActivation,
+) -> Option<Arc<two_bot_discord::interactions::InteractionRuntime>> {
+    let features = match two_bot_core::FeatureGates::from_env() {
+        Ok(features) => features,
+        Err(err) => {
+            tracing::warn!(reason = %err, "feature gates invalid; ordered interaction surface parked");
+            return None;
+        }
+    };
+    // Mirror `CommandRuntime::from_env`: a denied capability never reaches its
+    // feature-specific validation, so stale moderation env cannot re-enable a
+    // refused surface on this path.
+    let moderation = if activation.permitted(two_bot_core::activation::LiveCapability::Moderation) {
+        match two_bot_core::ModerationGates::from_env() {
+            Ok(moderation) => moderation,
+            Err(err) => {
+                tracing::warn!(reason = %err, "moderation gates invalid; ordered interaction surface parked");
+                return None;
+            }
+        }
+    } else {
+        two_bot_core::ModerationGates {
+            enabled: false,
+            owen_user_id: String::new(),
+            protected_role_ids: Default::default(),
+        }
+    };
+    let gates = two_bot_core::RouterGates::from_slices(
+        Some(guild_id),
+        &features,
+        &moderation,
+        two_bot_core::SurfaceFlags {
+            session_picker: onboarding.mode == two_bot_core::OnboardingMode::Session,
+            tickets: ticket_runtime::TicketConfig::from_env(guild_id).is_some(),
+            scorecard: std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1"),
+            ..Default::default()
+        },
+    );
+    // Apply the exact boot activation narrowing so the ordered router carries
+    // the same capability policy as the shared command runtime. Never widen.
+    let router = two_bot_core::InteractionRouter::new(activation.constrain_router(gates));
+    Some(Arc::new(
+        two_bot_discord::interactions::InteractionRuntime::with_router(
+            router,
+            pool.clone(),
+            executor,
+            0,
+            two_bot_core::ClassifierConfig::from_env(),
+        ),
+    ))
 }
 
 /// This receiver slice is staging-only, not authority to enable production.
@@ -647,22 +920,36 @@ fn internal_receiver_prerequisites(config: &Config) -> Result<&str, &'static str
 /// Publish why the gateway task stopped, then keep serving `/readyz` for
 /// `linger` before the task returns (and the supervisor drains and exits). The
 /// Worker's 60 s keepalive and the rollout gate's 5 s poll can only report the
-/// class while the listener is still up. A shutdown request ends the linger at
-/// once, so SIGTERM never waits on it. Only the fixed class is logged or
-/// stored: SQLx errors can carry a connection URL.
+/// failure while the listener is still up. A shutdown request ends the linger
+/// at once, so SIGTERM never waits on it. The log line carries the failing
+/// step, the sanitized reason and the SQLSTATE alongside the fixed class, and
+/// `/readyz` serves the same step plus the SQLSTATE code — the class alone
+/// could not explain the prod crash loop; the raw SQLx error is never
+/// formatted, since it can carry a connection URL.
 async fn publish_gateway_failure(
     state: &RwLock<GatewayState>,
     slot: &FailureSlot,
-    class: FailureClass,
+    failed: &gateway_failure::StepFailure,
     stopping: tokio::sync::watch::Receiver<bool>,
     linger: std::time::Duration,
 ) {
+    let class = failed.class;
+    let reason = db_log::failure_reason(&failed.error);
+    let code = db_log::error_code(&failed.error);
     tracing::error!(
+        msg = "gateway_failed",
         startup_phase = gateway_failure::FailurePhase::DurableGateway.as_str(),
         error_class = class.as_str(),
+        failed_step = failed.step,
+        reason = %reason,
+        error_code = code.as_deref().unwrap_or("none"),
         "durable gateway failed; checkpoint unchanged, readiness unavailable"
     );
-    slot.record(GatewayFailure::durable_gateway(class));
+    slot.record(GatewayFailure::durable_gateway(
+        class,
+        failed.step,
+        code.as_deref().unwrap_or("none"),
+    ));
     {
         let mut state = state.write().await;
         if *state != GatewayState::Draining {

@@ -6,7 +6,8 @@ This is the **unexecuted** B4 coverage plan for [TOG-9699](/TOG/issues/TOG-9699)
 
 ## Safety and execution contract
 
-- Follow [staging-soak.md](staging-soak.md) for lifecycle and rollback mechanics: its S2 acceptance is seven consecutive days with zero missed events and redeploy gap <60s. B4 separately requires its 48h watch log; neither substitutes for the other. [gateway-recovery.md](gateway-recovery.md) is the current session-persistence reference. Verify the deployed SHA, staging guild allowlist, permitted disposable accounts/channels and enabled slice before any Discord action. A missing slice, unapproved destructive scenario or missing fixture is NEEDS WORK, not a silent waiver.
+- Follow [staging-soak.md](staging-soak.md) for lifecycle and rollback mechanics: B2 acceptance is four ACTIVE hours with zero missed events across joins, voice, messages and slash; actual outage-start-to-verified-recovery must be under 60s. Hours 3–4 require 120 expected one-minute samples. Deploy-finish-to-first-ready is a separate workflow interval, not outage recovery. B4 separately requires its 48h watch log; neither substitutes for the other. [gateway-recovery.md](gateway-recovery.md) is the current session-persistence reference. Verify the deployed SHA, staging guild allowlist, permitted disposable accounts/channels and enabled slice before any Discord action. A missing slice, unapproved destructive scenario or missing fixture is NEEDS WORK, not a silent waiver.
+- B2 cannot be accepted on the current documentation: the policy does not define an operational ACTIVE hour, the source/shape for the 120 expected one-minute samples in hours 3–4, or a sample cadence for hours 1–2. The existing evidence seam is offline, not wired into the running bot, and omits slash; no verified live route establishes the required four-family evidence or samples. Keep the 120-sample requirement mandatory, leave B2 NOT VERIFIED and T unset, and do not infer a collector or measurement method.
 - **No tests, SQL, probes, migrations, imports, backup or restore against staging/production databases.** Only agent-testdb/agent-testredis or ephemeral CI service containers may be used for data assertions. No alternate credential after an auth failure: stop, record the exact error and owner; never log credentials. Discord fixture actions require the separate soak authorization and must never target real members/live guilds.
 - Negative/destructive/retry/clock/SSRF scenarios use local mock fixtures. Do not change the host clock, manufacture raids, delete real roles/channels, change live enforcement, or call live internal-action mutation endpoints. Restore approved disposable configuration through its normal UI/API after evidence; no database reset.
 - Voice is owned by [TOG-10119](/TOG/issues/TOG-10119): consume its exact-SHA receipt, do not duplicate voice join/leave/restart steps here. Mixed rows still require their non-voice assertions.
@@ -17,7 +18,7 @@ This is the **unexecuted** B4 coverage plan for [TOG-9699](/TOG/issues/TOG-9699)
 
 JSON is authoritative; each `parity.section` + `parity.row` copies every source table cell except Map. Repeated ClientReady, attendance and member-event surfaces remain separate. Only DROP-prefixed Maps without an S/B/NEW slice or TOG owner are excluded; mixed mapped/DROP rows remain covered in either order, including mapped replacement work. §7 is prose: one explicit catalogue entry covers env_only/cold/hot. Adding a table there also requires entries. §12 copies every cell of its addition and Redirect tables except the disposition, under the same DROP rule. §13 covers each `ported`/`carded`/`gap` ledger row (commit link, area, change and status); `dropped` rows, including every history-rewrite replay, are excluded because their features stay mapped in §§1–8. Each §12/§13 entry lists `owner`: exactly the TOG cards its disposition names, in order (a `ported` row without a card names its owning slice); a changed status, row or owner card is stale until the entry is updated.
 
-Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, missing or stale owner cards, empty steps/evidence, invalid statuses, waivers missing reason or approver, missing automated commands, automated Cargo commands naming an unknown `-p` package, a missing test target or no matching test (read offline from source, never run), missing voice links or Markdown drift fail the gate.
+Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, missing or stale owner cards, empty steps/evidence, invalid statuses, waivers missing reason or approver, missing automated commands, automated Cargo commands naming an unknown `-p` package, a missing test target or no matching test (read offline from source, never run), operative `scripts/` paths in checklist evidence that do not exist (unless the entry lists them under `historical` with a reason), missing voice links or Markdown drift fail the gate.
 
 ## Existing fixture entry points
 
@@ -153,8 +154,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-18: 19 — `/schedule-list`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /schedule-list before and after creation/removal of the fixture schedule, and as an unprivileged actor.
-- **Expected:** Only guild-scoped schedules listed to permitted actor, with matching IDs/cadences.
+- **Action:** Invoke /schedule-list before and after creation/removal of the fixture schedule, and as an unprivileged actor; walk page:1 and an out-of-range page.
+- **Expected:** Only guild-scoped schedules listed to permitted actor, with matching IDs/cadences; every page fits Discord limits with a page indicator and out-of-range pages are refused.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-19: 20 — `/sticky`
@@ -689,8 +690,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s5-15: `community_facts`, `community_stream_heartbeats`, `community_scorecard_runs/alerts` — scorecard facts/runs/alerts
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** Run fact/heartbeat/weekly-scorecard fixtures on test DB, excluding dropped rota extensions.
-- **Expected:** Facts and stream liveness yield one weekly run/alert; dropped rota tables are not required.
+- **Action:** Run fact/heartbeat/weekly-scorecard fixtures on test DB with only the captured event-attended, message-created and rules-accepted streams marked, excluding dropped rota extensions.
+- **Expected:** One weekly run/alert fails closed as incomplete and names the uncaptured streams; dropped rota tables are not required.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
@@ -754,10 +755,10 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Owen/1.0 UA, public-IP SSRF guard and MAX_FEED_BYTES enforced; one relay per item.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
-### s6-05: Website → bot `POST /internal/actions` (HMAC-SHA256 `sha256=` over `POST\npath\nts\nnonce\nsha256(body)`; `TWO_INTERNAL_KEYS`; skew+nonce replay guard; buckets 20 burst/1/s, `guild.add_member` 10/0.5s; 18 actions: `role.assign`, `guild.add_member`, `announcement.post`, `event.upsert/cancel`, `automations.import/export`, `settings.get/set`, `moderation.*` ×9) — web callbacks incl. `identify guilds.join` auto-join path
+### s6-05: Website → bot `POST /internal/actions` (HMAC-SHA256 `sha256=` over `POST\npath\nts\nnonce\nsha256(body)`; `TWO_INTERNAL_KEYS`; skew+nonce replay guard; buckets 20 burst/1/s, `guild.add_member` 10/0.5s; 19 actions: `role.assign`, `guild.add_member`, `announcement.post`, `event.upsert/cancel/read`, `automations.import/export`, `settings.get/set` (`settings.set` carries compare-and-set via `expected_version`), `moderation.*` ×9) — web callbacks incl. `identify guilds.join` auto-join path
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** In local mock/CI replay all 18 signed internal actions plus bad signature, stale timestamp, reused nonce and rate-bound fixtures; do not call live mutation endpoints.
+- **Action:** In local mock/CI replay all 19 signed internal actions plus bad signature, stale timestamp, reused nonce and rate-bound fixtures; do not call live mutation endpoints.
 - **Expected:** POST canonical HMAC, replay/skew rejection, durable idempotency; 20 burst/1s and add_member 10/0.5s buckets; nine moderation actions keep protection.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
@@ -820,7 +821,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s7-01: Config / env catalogue
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD), a cold key (TWO_FEED_POLL_SECONDS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.
+- **Action:** With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD or TWO_FEED_POLL_SECONDS), a cold key (TWO_TICKET_COOLDOWN_SECONDS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.
 - **Expected:** Catalogued hot and cold keys are writable, versioned and audited; wired hot keys apply live, cold and hot-but-unwired keys are marked next-restart and do not apply live. Env_only and unknown writes are refused before persistence/audit; env-only values remain private.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
@@ -1029,15 +1030,16 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 - **Owner:** [TOG-9699](/TOG/issues/TOG-9699)
 
-### s12-16: Bootstrap migration accepts the `Security` release-notes section in `migrate-release-notes`
+### s12-16: Historical, retired and no longer runnable: bootstrap migration that accepted the `Security` release-notes section in `migrate-release-notes`
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** Run the `migrate-release-notes` bootstrap fixture with a hand-written `Security` section in Unreleased: confirm the migration preserves the Security tail, removes Unreleased, and stays idempotent; confirm any other section still fails closed.
-- **Expected:** `Security` migrates alongside Added/Fixed/Changed/Notes; unknown sections fail closed; later releases do not repeat the bootstrap tail.
-- **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.
+- **Action:** Historical only, not runnable: `scripts/migrate-release-notes.cjs` and its bootstrap fixture were removed in `6032fc72a`, so no fixture runs for this row and no check replaces it. Do not read the current promote-time release path as satisfying it; that path is documented in [releases.md](releases.md).
+- **Expected:** Historical record of the retired bootstrap contract only: `Security` migrated alongside Added/Fixed/Changed/Notes, unknown sections failed closed, and later releases did not repeat the bootstrap tail. No current check asserts this.
+- **Evidence:** Historical record only: the fixture receipt cannot be reproduced because the script is gone, so none is attached. The #329 bootstrap documentation is in `docs/releases.md` at `6032fc72a^`; the removal is commit `6032fc72a`. Waiver decision and approver stay on [TOG-9699](/TOG/issues/TOG-9699); this checklist records no PASS.
 - **Owner:** [TOG-12801](/TOG/issues/TOG-12801)
 - **Reason:** Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Historical:** `scripts/migrate-release-notes.cjs` — Removed in 6032fc72a; cited only as the retired bootstrap's historical evidence, not as a runnable check.
 
 ### s12-17: Guild room access-controls store (0227 migration, whole-row upsert with fail-closed validation)
 
@@ -1163,6 +1165,31 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized reply text or screenshots and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 - **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
 
+### s12-30: Private Twitch EventSub receiver inside the container network (#973)
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** On staging with the Operator-provisioned webhook secret, enable the receiver dark-flag exactly as configured, deliver a signed Twitch challenge and one signed notification through the Worker ingress, then repeat with a bad signature and with the flag unset.
+- **Expected:** The challenge is echoed only after verification, signed notifications are accepted with scalar-only logs, bad signatures are refused before parsing, the receiver is not served while the flag is unset, and enabled-but-invalid configuration stops startup instead of downgrading.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+
+### s12-31: Voice creator-view merge on gateway reconnect plus join-time creator-map refusal naming (#976)
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** On the disposable staging guild, register a creator channel, force a gateway reconnect, then join the creator channel; also join once against a deliberately stale creator map.
+- **Expected:** The creator view merges stored rows after the reconnect generation change (debounced, failed reads keep the old generation), the join succeeds without a restart, and any refusal names its reason with the join-time map state in the log.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119), [TOG-13123](/TOG/issues/TOG-13123)
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+
+### s12-32: EventSub subscription reconcile at startup plus a bounded hourly interval (#989, open)
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** After the open reconcile slice merges, first re-verify the flag names and cited file:line at its merge head and refresh the parity row; then on staging with the receiver enabled, restart the container and observe one bounded reconcile interval tick with an empty and a populated broadcaster allowlist.
+- **Expected:** Reconcile runs at startup and on the hourly interval only while the receiver flag is exactly on, an empty allowlist parks without subscriptions, and no reconcile runs while the flag is off; until the slice lands, HEAD runs no reconcile (library-only planner; the receiver only acks revocations).
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+
 ## 13. Post-freeze ledger obligations (non-dropped rows)
 
 ### s13-f114c44: f114c44 — TOG-3052: temp-voice generator (join-to-create), staging only
@@ -1199,39 +1226,41 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s13-847fbf8: 847fbf8 — TOG-3471: serialize guild reservations and enforce overwrite preflight
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Have two disposable members join the creator channel together; take the overwrite-preflight refusal from TOG-10093’s fixture.
-- **Expected:** Each member gets one distinct room with no duplicate reservation; a create whose overwrites exceed bot permissions is refused before any channel exists.
-- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Partial offline fixture evidence, not a PASS: the `verification` command covers only the two refusal cases (missing Manage Channels; private default without Manage Roles) and sequential distinct-room dispatch. The capped durable guild reservation and the general overwrite-bit permission preflight are unverified.
-- **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-15336](/TOG/issues/TOG-15336), [TOG-10119](/TOG/issues/TOG-10119)
-- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- refused_creation_plan_records_a_failure_before_any_channel_is_created two_simultaneous_members_get_distinct_persisted_rooms
+- **Action:** Have two disposable members join the creator channel together on the staging fixture guild (attach the TOG-10119 temp-voice scenario; do not run a second voice scenario here). Take the overwrite-bit preflight refusal from TOG-20913's fixture: a create whose overwrites exceed the bot's permission bits must be refused before any channel exists.
+- **Expected:** Each member gets one distinct room with no duplicate reservation (durable per-guild claim); a create whose overwrites exceed bot permissions is refused before any channel exists.
+- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Partial offline fixture evidence, not a PASS: the `verification` command covers the concurrent-cap admission across two pools plus the three refusal cases (missing Manage Channels; private default without Manage Roles; creator-channel overwrite denying the bot Connect, refused at the creator-channel guard before the plan runs) and sequential distinct-room dispatch. The general overwrite-bit permission preflight is unverified (see TOG-20913).
+- **Owner:** [TOG-20913](/TOG/issues/TOG-20913), [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test voice_create_admission_store -- concurrent_claims_across_stores_cannot_both_pass_the_guild_cap --ignored && python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- refused_creation_plan_records_a_failure_before_any_channel_is_created two_simultaneous_members_get_distinct_persisted_rooms
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-a891063: a891063 — TOG-3471: reconcile settings, command registry, and source citations
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. List the deployed `/voice` subcommands and temp-voice settings in the staging guild.
-- **Expected:** Registry and settings match TOG-10091’s config/registry golden; no orphan or missing subcommand.
-- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the voice publish pins: the router merge and yield tests in `crates/core/src/router.rs`, the staging manifest drift tests in `crates/core/tests/staging_publish_manifest.rs`, and the generated command reference check in `crates/core/tests/reference_docs.rs`.
+- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 29 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` only with the assistant gate too, names and default permissions equal the manifest, and none publish with the gate off.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only. Deployed `/voice` registry read-back and the temp-voice staging scenario stay on [TOG-10119](/TOG/issues/TOG-10119) and are not covered by this row.
 - **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
-- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::voice && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::templateassistant && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs committed_references_match_compiled_metadata
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — deployed registry read-back and temp-voice scenario evidence; the offline publish pins above are this row's automated proof.
 
 ### s13-50c3e9f: 50c3e9f — TOG-3471: retain temp-voice provenance after rollback failure
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** In TOG-10093’s mock-Discord fixture, fail a create and then its rollback.
-- **Expected:** The room keeps its provenance so a later sweep removes it; no unmanaged orphan channel.
-- **Evidence:** Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. No live fault injection, staging/production SQL or credentials. Partial offline fixture evidence, not a PASS: the `verification` command covers same-worker, in-memory retention only. Durable provenance, fresh-worker restart recovery, attachment retry, missing-channel cleanup and cap accounting retained until a guarded delete or 404 are unverified (the `#[ignore]`d restart test states the missing behaviour; it is skipped in CI until a durable witness exists).
-- **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-15336](/TOG/issues/TOG-15336), [TOG-10119](/TOG/issues/TOG-10119)
-- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the disposable-database store test `crates/cutover/tests/voice_create_admission_store.rs` (set `TWO_TEST_DATABASE_URL` to the agent-testdb CI service; it creates and drops its own database) plus the worker rollback-retention regression in `crates/bot/src/voice_rooms_tests.rs`. No live fault injection, staging/production SQL or credentials.
+- **Expected:** A channel whose persist failed and whose rollback delete was refused stays bound to its claim across a restart (fresh pool), keeps its cap slot until a confirmed delete or 404 settles it, and frees the slot only then; same-worker retention keeps owner/creator provenance until a later sweep removes it.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with the test names; fixture proof only. Staging proof (rollback-failure recovery across the TOG-10119 restart) stays on [TOG-10119](/TOG/issues/TOG-10119); do not infer PASS from this row.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test voice_create_admission_store -- bound_channel_witness_survives_restart_and_holds_the_slot_until_settled --ignored && python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-984175d: 984175d — TOG-3471: serialize and journal temp-voice ownership changes
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Transfer room ownership with the panel/`/voice` controls, then let the owner leave; take a failed transfer from TOG-10099’s fixture.
-- **Expected:** Ownership changes are serialized and journaled; a failed transfer rolls back to the prior owner.
-- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.
-- **Owner:** [TOG-10099](/TOG/issues/TOG-10099)
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Transfer room ownership with the panel/`/voice` controls, then let the owner leave; attempt a transfer from a non-owner and confirm refusal (NotOwner, ownership unchanged).
+- **Expected:** Ownership changes are serialized and journaled; a failed grant or commit is retried forward - the persisted owner stays the prior owner until the commit lands and a reload revokes uncommitted grants.
+- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Fixture half: the offline `verification` command at the exact head; the staging half above is unchanged.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- transfer_hands_room_to_occupant_and_remembers_creator owner_leave_hands_room_to_earliest_joiner_and_persists failed_owner_commit_reload_and_later_transfer_revoke_every_issued_recipient
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-0495e7d: 0495e7d — TOG-3186: one live-activation allowlist replacing five divergent staging fences
@@ -1465,11 +1494,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-e2ffdf0: e2ffdf0 — feat(tempvoice): enforce durable rolling create burst limits (#308)
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Create rooms past the configured rolling burst limit with disposable members, across the TOG-10119 restart.
-- **Expected:** Creates beyond the limit are refused with a named reason, and the count survives restart.
-- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the pure admission fixture `crates/core/tests/voice_create_admission.rs`, the worker admission regressions in `crates/bot/src/voice_rooms_tests.rs` and the disposable-database store test `crates/cutover/tests/voice_create_admission_store.rs` (set `TWO_TEST_DATABASE_URL` to the agent-testdb CI service; it creates and drops its own database).
+- **Expected:** Accepted creates persist one row each; a refusal never reaches Discord; burst history survives deletion/restart. Unsettled holds never expire by age, unknown creates never repost/refund, compensation retains capacity until absence, live-room transfers are atomic under the guild lock, and a created channel is bound to its claim before the room row so a restart rediscovers it and frees the slot only after a delete or confirmed absence. Credential-refused settlement halts writes. Fixture proof only, not staging acceptance.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with the test names; fixture proof only. Staging proof (refused creates past the limit across the TOG-10119 restart) stays on [TOG-10119](/TOG/issues/TOG-10119); do not infer PASS from this row.
 - **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_create_admission && python3 scripts/cargo_cache.py run -- test -p two-bot --lib voice_rooms::tests:: && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test voice_create_admission_store -- --ignored
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-3c3e7e8: 3c3e7e8 — fix(voice): treat malformed leave timestamp as unknown-start (#265)
@@ -1586,13 +1616,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-3400bb2: 3400bb2 — feat(analytics): add member_leave backfill gap sweep (#343)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run TOG-11152’s member_leave backfill gap sweep on a test-container fixture with leave gaps.
-- **Expected:** Each gap is reported read-only; nothing is backfilled.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
-- **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the leave-gap sweep pins in `crates/cutover/src/leave_gap.rs` and `crates/core/tests/voice_integrity_acceptance.rs`. The read-only CLI check `crates/cutover/tests/report_cli.rs::leave_gap_matches_legacy_fixtures_read_only` is DB-backed and is not part of this chain: it skips without the exported `TWO_TEST_DATABASE_URL` and runs in CI on a disposable agent-testdb database. No application, staging or production database.
+- **Expected:** Each gap is classified and reported with proposed fills only; nothing is backfilled. A skipped DB-backed CLI test is never counted as PASS here; its table-snapshot read-only assertion is CI evidence only.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib -- leave_gap::tests::seeded_gaps_cover_every_path && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_integrity_acceptance
 
 ### s13-f5e62b7: f5e62b7 — fix(redirect): resolve throttle bucket through trusted-proxy chain (#342)
 
@@ -1624,11 +1653,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-38041a1: 38041a1 — fix(temp-voice): refuse renames that collide with a sibling channel name (#361)
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Rename a room to the name of a sibling channel in the same category, then to a unique name.
-- **Expected:** The colliding rename is refused; the unique name is applied.
-- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.
-- **Owner:** [TOG-10101](/TOG/issues/TOG-10101)
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Rename a room to the name of a sibling channel in the same category, then to a unique name; a folded duplicate of a still-queued rename from another room is refused.
+- **Expected:** The colliding rename is refused; a folded duplicate of a queued-but-unlanded rename is refused and a rename that would now duplicate at flush is dropped with its never-landed override cleared (the room keeps its template name, counted as rename_duplicate); the unique name is applied.
+- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Fixture half: the offline `verification` command at the exact head; the staging half above is unchanged.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- unique_names_conflict_only_when_the_setting_is_on queued_rename_blocks_folded_duplicate_before_it_lands flush_recheck_drops_now_duplicate_rename_and_clears_override && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_name_collision
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-a40d4a5: a40d4a5 — fix(onboarding): plan session picks in catalog order (#258)
@@ -1688,13 +1718,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-35aac83: 35aac83 — fix(analytics): compare leave-gap timestamps by instant (#411)
 
-- **Method:** `waived` (not an execution verdict).
-- **Action:** Run TOG-11152’s leave-gap comparison on fixture timestamps with different offsets for one instant.
-- **Expected:** Timestamps compare by instant, not text.
-- **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
-- **Owner:** [TOG-11152](/TOG/issues/TOG-11152)
-- **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
-- **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the offset-spelling pins in `crates/cutover/src/leave_gap.rs` and `crates/core/src/member_leave_gap.rs`.
+- **Expected:** Timestamps that spell one instant with different UTC offsets classify, order and fill identically; comparison is by instant, not text.
+- **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with sanitized request/response timestamps or signature/integrity assertion; fixture proof only, not a deployed-network soak receipt.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib -- leave_gap::tests::coverage_uses_instants_for_equivalent_spellings leave_gap::tests::raid_uses_instants_for_equivalent_spellings leave_gap::tests::offset_joins_with_reversed_string_order_yield_chronological_fills leave_gap::tests::gap_members_sort_by_last_join_instant_with_member_tiebreak && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- member_leave_gap::tests::offset_timestamps_compare_by_instant_not_string
 
 ### s13-8b5d1e1: 8b5d1e1 — fix(lfg): reject reserved leave-action role keys (#414)
 
@@ -1737,11 +1766,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-a8d9f53: a8d9f53 — fix(announcements): defer interactions before service I/O (#424)
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke the LFG commands and select in the staging guild with a slow-service leg from a local mock; invoke /rsvp once TOG-10293 wires it.
-- **Expected:** Each interaction is deferred before service I/O, so no interaction-failed reply appears.
-- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the LFG defer-before-I/O fixtures and the ordered-RSVP defer fixtures on disposable fixtures: LFG commands and the select defer before service I/O, and queued RSVPs defer within three seconds and drain in order. The ignored RSVP half needs TWO_GATEWAY_TEST_DATABASE_URL pointed at the disposable agent-testdb/CI service, never staging or production.
+- **Expected:** Each interaction is deferred before service I/O, so no interaction-failed reply appears: one deferred callback first, one completion edit.
+- **Evidence:** Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion.
 - **Owner:** [TOG-10293](/TOG/issues/TOG-10293)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot -- lfg_sticky_and_feed_routes_coexist_without_db ordinary_member_lfg_select_reaches_the_feature_before_db && python3 scripts/cargo_cache.py run -- test -p two-bot -- queued_rsvp_is_deferred_within_three_seconds_and_drains_on_overflow sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending --include-ignored
 
 ### s13-f5edc70: f5edc70 — fix(leveling): show absent members as unranked (#429)
 

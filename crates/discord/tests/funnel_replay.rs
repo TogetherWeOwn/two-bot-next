@@ -45,7 +45,8 @@ use two_bot_core::{
     VoiceEndedFact, VoiceInput, VoiceStartedFact, WEB_ONE_CLICK_SOURCE,
 };
 use two_bot_discord::{
-    JoinObservation, JoinObserver, MemPipeline, NoClassification, Pipeline, ScriptedInvites,
+    DeferredCommunityFacts, JoinObservation, JoinObserver, MemPipeline, NoClassification, Pipeline,
+    ScriptedInvites,
 };
 
 const GUILD: u64 = 100_000_000_000_000_001;
@@ -347,6 +348,8 @@ fn handlers_replay_matches_legacy_oracle() {
             channel_class: ChannelClass::Human,
             capture_only: false,
             occurred_at: Some(stamp(at)),
+            content_length: None,
+            has_embed_or_attachment: false,
         });
     }
     h.on_voice_join(VoiceInput {
@@ -407,6 +410,8 @@ fn handlers_replay_matches_legacy_oracle() {
         channel_class: ChannelClass::Welcome,
         capture_only: false,
         occurred_at: Some(stamp("12:36:00")),
+        content_length: None,
+        has_embed_or_attachment: false,
     });
     h.on_voice_leave(VoiceInput {
         guild_id: GUILD,
@@ -500,6 +505,8 @@ fn invite_snapshot(uses: u64) -> Vec<InviteState> {
         uses,
         inviter_id: Some(INVITER),
         channel_id: Some(CH_TEXT),
+        max_uses: 0,
+        temporary: false,
     }]
 }
 
@@ -660,6 +667,132 @@ fn pipeline_gate_clear_on_pending_flip() {
         before,
         "non-transition update writes no funnel row"
     );
+}
+
+fn rules_pipeline() -> (
+    Pipeline<
+        two_bot_core::MemStore,
+        two_bot_core::NoopLeveling,
+        DeferredCommunityFacts,
+        ScriptedInvites,
+        NoClassification,
+    >,
+    DeferredCommunityFacts,
+) {
+    let buffer = DeferredCommunityFacts::new();
+    let pipeline = Pipeline::new(
+        two_bot_core::MemStore::new(),
+        Some(two_bot_core::NoopLeveling),
+        Some(buffer.clone()),
+        ScriptedInvites::new(),
+        NoClassification,
+    );
+    (pipeline, buffer)
+}
+
+fn member_update(member_id: u64, pending: bool, joined: &str, nick: Option<&str>) -> Event {
+    Event::MemberUpdate(Box::new(MemberUpdate {
+        avatar: None,
+        communication_disabled_until: None,
+        guild_id: Id::new(GUILD),
+        flags: None,
+        deaf: None,
+        joined_at: Some(ts(joined)),
+        mute: None,
+        nick: nick.map(str::to_owned),
+        pending,
+        premium_since: None,
+        roles: vec![],
+        user: user(member_id, false),
+    }))
+}
+
+/// Gate-clear buffers exactly one rules fact per member: the pending flip
+/// captures on the receipt stamp, and a burst of later updates adds nothing.
+#[test]
+fn pipeline_gate_clear_buffers_one_rules_fact_per_member() {
+    let (pipeline, buffer) = rules_pipeline();
+    let observed_at = stamp("12:35:00");
+
+    // Pending arrival buffers nothing.
+    pipeline.handle_at(&join_event(B, true, "12:30:00"), &observed_at);
+    assert!(buffer.is_empty());
+
+    // Pending true→false buffers one fact on the receipt stamp.
+    pipeline.handle_at(&member_update(B, false, "12:30:00", None), &observed_at);
+    assert_eq!(buffer.len(), 1);
+    let write = buffer.take().pop().expect("one buffered fact");
+    assert_eq!((write.guild_id, write.member_id), (GUILD, B));
+    assert!(!write.is_bot);
+    assert_eq!(write.occurred_at, observed_at);
+    assert_eq!(write.source, "gateway");
+    assert_eq!(write.source_event_id, format!("{GUILD}:{B}:rules"));
+
+    // A burst of non-transition updates buffers nothing more, and the funnel
+    // holds exactly one gate row for the member.
+    for nick in ["al", "bo"] {
+        pipeline.handle_at(
+            &member_update(B, false, "12:30:00", Some(nick)),
+            &observed_at,
+        );
+    }
+    assert!(buffer.is_empty());
+    assert_eq!(
+        pipeline
+            .handlers()
+            .store()
+            .rows()
+            .iter()
+            .filter(
+                |r| r.event_type == two_bot_core::EventType::GateCleared && r.member_id == Some(B)
+            )
+            .count(),
+        1,
+        "burst writes one funnel row"
+    );
+}
+
+/// The fastest members arrive with the gate already cleared: the fact carries
+/// Discord's `joined_at`, not the receipt time. Bots buffer too (captured,
+/// never funnel-counted).
+#[test]
+fn pipeline_instant_gate_clear_buffers_rules_fact_on_join_stamp() {
+    let (pipeline, buffer) = rules_pipeline();
+    let observed_at = stamp("12:10:00");
+    pipeline.handle_at(&join_event(A, false, "12:00:00"), &observed_at);
+    let mut bot_join = join_event(BOT, false, "12:00:30");
+    if let Event::MemberAdd(ref mut add) = bot_join {
+        add.member.user.bot = true;
+    }
+    pipeline.handle_at(&bot_join, &observed_at);
+
+    let writes = buffer.take();
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].occurred_at, stamp("12:00:00"));
+    assert_eq!(writes[0].source, "gateway");
+    assert!(!writes[0].is_bot);
+    assert_eq!((writes[1].member_id, writes[1].is_bot), (BOT, true));
+    assert!(
+        pipeline
+            .handlers()
+            .store()
+            .rows()
+            .iter()
+            .all(|r| r.member_id != Some(BOT)),
+        "bots write no funnel rows"
+    );
+}
+
+/// A cleared member seen for the first time (no cache entry, never joined)
+/// still clears: the missing pre-update flag reads as pending.
+#[test]
+fn pipeline_first_sighting_of_cleared_member_buffers_rules_fact() {
+    let (pipeline, buffer) = rules_pipeline();
+    pipeline.handle_at(
+        &member_update(C, false, "12:30:00", None),
+        &stamp("12:35:00"),
+    );
+    assert_eq!(buffer.len(), 1);
 }
 
 #[test]
@@ -929,6 +1062,143 @@ fn pipeline_leave_closes_voice_first() {
             && r.member_id == Some(A)),
         "leave row recorded"
     );
+}
+
+/// Voice community-facts capture (TOG-19605): a recording sink proves the
+/// handler seam every production writer uses — join/leave/move frames record
+/// start/end facts, mute-only frames write nothing, and an end without a seen
+/// start stays honestly unknown. The per-member serial chain (TOG-5981) holds
+/// the move's end(A)→start(B) pair atomic: both halves run inside one chain
+/// lock in `pipeline.rs`, so the concurrent case is covered by
+/// `pipeline_serializes_same_member_voice_frames` for the funnel rows and the
+/// facts share that same critical section.
+/// (member_id, channel_id, occurred_at, session_key).
+type RecordedVoiceStart = (u64, u64, String, String);
+/// (member_id, channel_id, occurred_at, started_at, duration_seconds,
+/// session_key).
+type RecordedVoiceEnd = (u64, u64, String, Option<String>, Option<i64>, String);
+
+#[derive(Debug, Default)]
+struct RecordingVoiceFacts {
+    starts: Mutex<Vec<RecordedVoiceStart>>,
+    ends: Mutex<Vec<RecordedVoiceEnd>>,
+}
+
+impl FactsSink for &RecordingVoiceFacts {
+    fn record_member_join(&self, _: MemberJoinFact<'_>) {}
+    fn record_rules_accepted(&self, _: RulesAcceptedFact<'_>) {}
+    fn record_message(&self, _: MessageFact<'_>) {}
+    fn record_voice_started(&self, fact: VoiceStartedFact<'_>) -> Option<String> {
+        let key = format!(
+            "{}:{}:{}:{}",
+            fact.guild_id, fact.member_id, fact.occurred_at, fact.channel_id
+        );
+        self.starts.lock().expect("starts lock").push((
+            fact.member_id,
+            fact.channel_id,
+            fact.occurred_at.to_owned(),
+            key.clone(),
+        ));
+        Some(key)
+    }
+    fn record_voice_ended(&self, fact: VoiceEndedFact<'_>) {
+        self.ends.lock().expect("ends lock").push((
+            fact.member_id,
+            fact.channel_id,
+            fact.occurred_at.to_owned(),
+            fact.started_at.map(str::to_owned),
+            fact.duration_seconds,
+            fact.session_key.clone(),
+        ));
+    }
+}
+
+#[test]
+fn voice_facts_move_is_one_atomic_end_plus_start_pair() {
+    let recording = RecordingVoiceFacts::default();
+    let pipeline = Pipeline::new(
+        MemStore::new(),
+        Some(NoopLeveling),
+        Some(&recording),
+        ScriptedInvites::new(),
+        NoClassification,
+    );
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_A)), &stamp("12:00:00"));
+    // A move is one frame: end(A) then start(B) at the same instant.
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_B)), &stamp("12:00:10"));
+    let starts = recording.starts.lock().expect("starts lock");
+    let ends = recording.ends.lock().expect("ends lock");
+    assert_eq!(starts.len(), 2, "join plus move-start");
+    assert_eq!(ends.len(), 1, "move-end");
+    assert_eq!(starts[0].1, CH_VOICE_A);
+    assert_eq!(ends[0].1, CH_VOICE_A, "end credits the session channel");
+    assert_eq!(starts[1].1, CH_VOICE_B);
+    assert_eq!(ends[0].2, stamp("12:00:10"));
+    assert_eq!(starts[1].2, stamp("12:00:10"), "one instant, not a gap");
+    assert_eq!(ends[0].3.as_deref(), Some(stamp("12:00:00").as_str()));
+    assert_eq!(ends[0].4, Some(10), "honest 10 s duration");
+    assert_eq!(ends[0].5, starts[0].3, "end reuses the start's session key");
+    assert_ne!(starts[1].3, starts[0].3, "move-start mints a fresh key");
+}
+
+#[test]
+fn voice_facts_mute_only_frames_write_nothing() {
+    let recording = RecordingVoiceFacts::default();
+    let pipeline = Pipeline::new(
+        MemStore::new(),
+        Some(NoopLeveling),
+        Some(&recording),
+        ScriptedInvites::new(),
+        NoClassification,
+    );
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_A)), &stamp("12:00:00"));
+    assert_eq!(recording.starts.lock().expect("starts lock").len(), 1);
+    // Same channel (mute/deafen/camera frame): no channel change, no facts.
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_A)), &stamp("12:00:05"));
+    assert_eq!(recording.starts.lock().expect("starts lock").len(), 1);
+    assert!(recording.ends.lock().expect("ends lock").is_empty());
+}
+
+#[test]
+fn voice_facts_end_without_start_is_honestly_unknown() {
+    let recording = RecordingVoiceFacts::default();
+    let pipeline = Pipeline::new(
+        MemStore::new(),
+        Some(NoopLeveling),
+        Some(&recording),
+        ScriptedInvites::new(),
+        NoClassification,
+    );
+    // No cached channel and no open session means no boundary at all:
+    // a leave with nothing seen writes nothing (not even an orphan end).
+    pipeline.handle_at(&voice_event(A, None), &stamp("12:00:05"));
+    assert!(
+        recording.ends.lock().expect("ends lock").is_empty(),
+        "leave with no cached channel writes nothing"
+    );
+    // Seed the cache with a join, clear only the tracker (reconnect drop),
+    // then leave: one honestly-unknown end, never a fabricated start.
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_A)), &stamp("12:00:00"));
+    pipeline
+        .handlers()
+        .voice_sessions
+        .lock()
+        .expect("voice lock")
+        .clear();
+    recording.starts.lock().expect("starts lock").clear();
+    recording.ends.lock().expect("ends lock").clear();
+    pipeline.handle_at(&voice_event(A, None), &stamp("12:00:05"));
+    let ends = recording.ends.lock().expect("ends lock");
+    assert_eq!(ends.len(), 1, "orphan leave records one end");
+    assert_eq!(ends[0].1, CH_VOICE_A, "credited to the leave frame channel");
+    assert_eq!(ends[0].3, None, "no start invented");
+    assert_eq!(ends[0].4, None, "no duration invented");
+    assert!(
+        ends[0].5.contains("unknown-start"),
+        "honest unknown-start key: {}",
+        ends[0].5
+    );
+    assert!(recording.starts.lock().expect("starts lock").is_empty());
 }
 
 /// Voice boundary rows (start/end only) in insert order.
@@ -1364,6 +1634,8 @@ fn pipeline_invite_create_seeds_baseline() {
             uses: 1,
             inviter_id: Some(INVITER),
             channel_id: Some(CH_TEXT),
+            max_uses: 0,
+            temporary: false,
         }],
     );
     pipeline.handle(&join_event(A, false, "12:00:00"));

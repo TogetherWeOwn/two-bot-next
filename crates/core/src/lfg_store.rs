@@ -15,6 +15,8 @@
 //! S6 store port, TOG-9811 — [`crate::lfg::SignupOutcome`] and the close/leave
 //! booleans carry everything those rows need).
 
+use crate::automation_quota::{lock_quota, AutomationQuota, QuotaWriteError};
+
 use super::lfg::{
     adjudicate_signup, iso_millis_utc, LfgPost, LfgRole, LfgSignup, LfgStatus, SignupOutcome,
 };
@@ -54,8 +56,34 @@ pub async fn put_lfg(
     post: &LfgPost,
     roles: &[LfgRole],
     replace_roles: bool,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), QuotaWriteError> {
     let mut tx = pool.begin().await?;
+    lock_quota(&mut tx, &post.guild_id, AutomationQuota::OpenLfgPosts).await?;
+    let existing: Option<(String, String)> =
+        sqlx::query_as("SELECT guild_id, status FROM lfg_posts WHERE id = $1")
+            .bind(&post.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if existing
+        .as_ref()
+        .is_some_and(|(guild, _)| guild != &post.guild_id)
+    {
+        return Err(sqlx::Error::RowNotFound.into());
+    }
+    let already_open = existing
+        .as_ref()
+        .is_some_and(|(_, status)| status == "open");
+    if post.status == LfgStatus::Open && !already_open {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM lfg_posts WHERE guild_id = $1 AND status = 'open'",
+        )
+        .bind(&post.guild_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if count >= AutomationQuota::OpenLfgPosts.limit() {
+            return Err(QuotaWriteError::Capacity(AutomationQuota::OpenLfgPosts));
+        }
+    }
     let result = sqlx::query(
         "INSERT INTO lfg_posts
            (id, guild_id, channel_id, message_id, title, starts_at, status, created_by, created_at, closed_at)
@@ -79,13 +107,13 @@ pub async fn put_lfg(
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
-        return Err(sqlx::Error::RowNotFound);
+        return Err(sqlx::Error::RowNotFound.into());
     }
     if replace_roles {
         if roles.iter().any(|role| role.lfg_id != post.id) {
-            return Err(sqlx::Error::Protocol(
-                "LFG roles must belong to the post".to_owned(),
-            ));
+            return Err(
+                sqlx::Error::Protocol("LFG roles must belong to the post".to_owned()).into(),
+            );
         }
         sqlx::query("DELETE FROM lfg_roles WHERE lfg_id = $1")
             .bind(&post.id)
@@ -105,7 +133,8 @@ pub async fn put_lfg(
             .await?;
         }
     }
-    tx.commit().await
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Save an accepted message without replacing roles, signups or a concurrent close.

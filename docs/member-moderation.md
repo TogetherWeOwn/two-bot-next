@@ -23,9 +23,10 @@ executor merged.
   `DiscordCall` describes the plain-data mutation. Each call must abort after
   **5 seconds**, without automatic retries. Preserve legacy success handling:
   ban 200/204, kick and unban 200/204/404, timeout 200.
-- Map definite Discord refusals to `Rejected`; timeouts, transport/5xx failures
-  and rate limits remain uncertain. Only a definite refusal permits releasing
-  a destructive claim or retrying an unban.
+- Map definite Discord refusals to `Rejected`; timeouts and transport/5xx
+  failures remain uncertain. A definite refusal or a rate limit (Discord did
+  not process the request, `DiscordError::proves_no_effect`) permits releasing
+  only the failed attempt's destructive claim or requeueing an unban.
 - Keep `TWO_MODERATION` off by default and restrict enabling it to staging.
   No production guild or token was used to verify this slice. The service is
   deliberately gate-independent: the shared router owns runtime gating.
@@ -40,6 +41,8 @@ executor merged.
   not in a bulk reservation before the first Discord await. A failure stops the
   sweep; a definite rejection is requeued under the member queue for the next
   tick, never retried within this sweep. Undispatched later jobs stay pending.
+  The policy must carry the resolved `bot_user_id`: without it the sweep returns
+  `BotIdentityUnknown` before claiming any job, so no unban runs unattributed.
 - Surface prepared/uncertain ban intents and `running` jobs for reconciliation.
   Never silently take them over. New permanent and temporary bans refuse while
   any prepared PUT or `running` DELETE exists for that guild/member. An unfinished
@@ -77,8 +80,9 @@ serialize through one set of local queues.
 (`crates/discord/src/member_moderation.rs`): one attempt per verb, the legacy
 5 s abort, no automatic retry. Kick and unban treat 404 as complete; definite
 refusals (including local guard refusals, which never reach the wire) map to
-`Rejected`, while timeouts, transport/5xx failures and rate limits stay
-uncertain and keep the claim fenced. The audit-log reason stays within the
+`Rejected`, while timeouts and transport/5xx failures stay
+uncertain and keep the claim fenced; a rate limit proves no effect and
+releases only the failed attempt. The audit-log reason stays within the
 512-unit bound, enforced before any I/O.
 
 Interaction-to-`MemberExecution` mapping resolves live role facts (guild
@@ -230,7 +234,15 @@ before both normal and failed completion writes. Audit loss is logged and
 cannot cause a duplicate mutation. A completion-write failure keeps the
 destructive claim uncertain. A definite pre-dispatch transaction rollback or
 no-write result releases the idempotency key for retry; ambiguous commit or
-post-dispatch failures never do.
+post-dispatch failures never do. If that release write itself fails, the caller
+still gets the original refusal and nothing is retried: the row stays
+`in_flight`, so a retry answers `in_progress` instead of repeating the
+mutation. The service logs one `moderation_idempotency_release_failed` error
+with only a fixed `action` and `cause` (`discord_rejected`,
+`discord_rate_limited`, or `store_rolled_back`), never a key, an id or the raw
+store error. Such a line means one caller-supplied key will keep answering
+`in_progress`; the signal does
+not name it, and no code expires or takes over the row.
 
 ## Verification
 

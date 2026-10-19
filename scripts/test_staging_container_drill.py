@@ -95,6 +95,7 @@ class World:
         self.t = 1_800_000_000.0
         self.calls = []
         self.deploys = []
+        self.messages = []
         self.fail_control = {}
         self.raise_on_api = {}  # path prefix -> error to raise
 
@@ -191,10 +192,10 @@ class FakeClient:
 
 
 def make_control(world):
-    def control(action, epoch=None, release_fence=False):
+    def control(action, epoch=None, release_fence=False, expected_deployment=None):
         world.tick(1)
         count = sum(1 for call in world.calls if call[0] == action) + 1
-        world.calls.append((action, epoch, release_fence))
+        world.calls.append((action, epoch, release_fence, expected_deployment))
         failure = world.fail_control.get((action, count))
         if failure:
             raise failure
@@ -244,11 +245,12 @@ def run_drill(world, raw_pin=None, attestation=COVERING_ATTESTATION, logs=None):
     (wrangler_dir / "wrangler.toml").write_text(WRANGLER_TOML)
     deploy_path = str(Path(directory) / "staging-container-deploy.json")
 
-    def deploy(config_path):
+    def deploy(config_path, message_sha):
         config = json.loads(Path(config_path).read_text())
         image = config["env"]["staging"]["containers"][0]["image"]
         world.tick(2)
         world.deploys.append(image)
+        world.messages.append(message_sha)
         if world.refuse_deploy:
             return 1
         world.serving_image = image
@@ -329,6 +331,9 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(failures, [])
         # Both legs deployed through the full-container path with different images.
         self.assertEqual(world.deploys, [BACKOUT_IMAGE, PRE_IMAGE])
+        # Each leg stamps the deployed version with the SHA its image reports:
+        # drill leg with the backout pin's SHA, restore leg with the baseline's.
+        self.assertEqual(world.messages, [BACKOUT_SHA, PRE_SHA])
         drill, restore = instance.evidence["drill"], instance.evidence["restore"]
         self.assertEqual(drill["intended_image"], BACKOUT_IMAGE)
         self.assertEqual(drill["running_image"], BACKOUT_IMAGE)
@@ -353,6 +358,9 @@ class HappyPathTests(unittest.TestCase):
                           "status", "fence", "deployment-takeover"])
         self.assertTrue(all(call[2] for call in world.calls
                             if call[0] == "deployment-takeover"))
+        self.assertEqual([call[3] for call in world.calls
+                          if call[0] == "deployment-takeover"],
+                         [BACKOUT_WORKER, PRE])
 
     def test_deploy_config_overrides_only_the_image(self):
         world = World()
@@ -646,9 +654,9 @@ class EvidenceTests(unittest.TestCase):
         world = World()
         control = make_control(world)
 
-        def hostile(action, epoch=None, release_fence=False):
-            state = control(action, epoch, release_fence)
-            if action == "status" and world.calls.count(("status", None, False)) >= 2:
+        def hostile(action, epoch=None, release_fence=False, expected_deployment=None):
+            state = control(action, epoch, release_fence, expected_deployment)
+            if action == "status" and world.calls.count(("status", None, False, None)) >= 2:
                 state["owner"]["phase"] = f"weird {SENTINEL}"
             return state
 
@@ -725,6 +733,27 @@ class ConfigTests(unittest.TestCase):
                 continue
             self.assertTrue(os.path.isabs(ref), ref)
             self.assertTrue(Path(ref).exists(), ref)
+
+
+class WranglerEnvTests(unittest.TestCase):
+    def test_deploy_child_gets_only_the_allowlisted_environment(self):
+        job_env = {"PATH": "/usr/bin:/bin", "HOME": "/home/runner",
+                   "CLOUDFLARE_API_TOKEN": "c" * 40, "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+                   "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
+                   "UNRELATED_JOB_SECRET": "unrelated-sentinel"}
+        deploy = container_drill.wrangler_deploy("node_modules/.bin/wrangler", "/work/wrangler",
+                                                 job_env)
+        with patch.object(container_drill.subprocess, "run",
+                          return_value=MagicMock(returncode=0)) as run:
+            self.assertEqual(deploy("staging-deploy.json", "f" * 40), 0)
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["node_modules/.bin/wrangler", "deploy", "--config",
+                                   "staging-deploy.json", "--env", "staging",
+                                   "--message", "f" * 40])
+        self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "HOME": "/home/runner",
+                                         "CLOUDFLARE_API_TOKEN": "c" * 40,
+                                         "CLOUDFLARE_ACCOUNT_ID": ACCOUNT})
+        self.assertNotIn(SENTINEL, repr(kwargs))
 
 
 class LagToleranceTests(unittest.TestCase):
@@ -830,11 +859,12 @@ class LagToleranceTests(unittest.TestCase):
         (wrangler_dir / "wrangler.toml").write_text(WRANGLER_TOML)
         deploy_path = str(Path(directory) / "staging-container-deploy.json")
 
-        def deploy(config_path):
+        def deploy(config_path, message_sha):
             config = json.loads(Path(config_path).read_text())
             image = config["env"]["staging"]["containers"][0]["image"]
             world.tick(2)
             world.deploys.append(image)
+            world.messages.append(message_sha)
             world.serving_image = image
             world.rollouts.append(rollout_row(world, f"r-{len(world.rollouts)}",
                                               image))
@@ -892,11 +922,12 @@ class MainTests(unittest.TestCase):
             summary = Path(directory) / "summary.md"
             env = {**env, "GITHUB_STEP_SUMMARY": str(summary)}
 
-            def deploy_factory(wrangler_bin, directory):
-                def deploy(config_path):
+            def deploy_factory(wrangler_bin, directory, environ):
+                def deploy(config_path, message_sha):
                     config = json.loads(Path(config_path).read_text())
                     world.deploys.append(
                         config["env"]["staging"]["containers"][0]["image"])
+                    world.messages.append(message_sha)
                     world.tick(2)
                     world.serving_image = config["env"]["staging"]["containers"][0]["image"]
                     world.rollouts.append(rollout_row(

@@ -32,6 +32,8 @@ sequences AS (
     JOIN objects o ON d.refobjid = o.oid AND o.kind = 'table'
     WHERE c.relkind = 'S' AND d.deptype IN ('a', 'i')
 ),
+-- Admission objects, including durable voice-create reservations, preserve
+-- SELECT/INSERT/UPDATE while never granting runtime DELETE.
 table_grants(role_name, oid, privilege) AS (
     SELECT 'two_bot_runtime', o.oid, p.name FROM objects o
     CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')) p(name)
@@ -223,6 +225,12 @@ findings AS (
     SELECT 'function privilege differs: ' || r.rolname || '/' || p.oid::regprocedure::text
     FROM roles r CROSS JOIN pg_proc p JOIN app_schemas n ON n.oid = p.pronamespace
     WHERE r.rolname <> 'two_bot_migrator'
+      -- A function in a schema the group cannot use is not callable by it.
+      -- Managed Postgres installs extension helpers (PlanetScale `hypopg` in
+      -- `pscale_extensions`) with PostgreSQL's default PUBLIC EXECUTE inside a
+      -- provider-owned schema with no USAGE for anyone else. Any USAGE grant
+      -- on such a schema makes its functions count again.
+      AND (n.nspname IN ('public', 'web_v1') OR has_schema_privilege(r.oid, n.oid, 'USAGE'))
       AND has_function_privilege(r.oid, p.oid, 'EXECUTE') IS DISTINCT FROM
         (r.rolname = 'two_web_reader' AND EXISTS (SELECT FROM objects o WHERE o.oid = p.oid AND o.kind = 'function' AND o.schema_name = 'web_v1'))
     UNION ALL

@@ -19,6 +19,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    analytics_family::AnalyticsCategory,
     funnel::{idempotency_key, now_iso, EventType, FunnelEvent, MESSAGE_RUNGS},
     voice::{resolve_voice_end, VoiceEnd, VoiceSessionTracker},
     Snowflake,
@@ -69,8 +70,16 @@ pub trait FunnelStore: Send + Sync {
     fn mark_bot(&self, guild_id: Snowflake, member_id: Snowflake);
     /// Insert-or-ignore by idempotency key.
     fn record(&self, event: FunnelEvent) -> RecordOutcome;
-    /// Monotonic recency bump (never moves backwards).
-    fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str);
+    /// Monotonic recency bump (never moves backwards). The `family` is the
+    /// analytics family of the touch that staged it, so the commit gate can
+    /// apply the matching guild toggle before touching `last_active_at`.
+    fn touch_activity(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        at: &str,
+        family: AnalyticsCategory,
+    );
     /// Lowest empty message rung for a message arriving at `at`, or `None`
     /// when the ladder is full — including the redelivery guard (a rung is
     /// filled only strictly after the rung below).
@@ -134,7 +143,15 @@ impl FunnelStore for MemStore {
         crate::membership::MembershipStore::record_observed(self, event, None)
     }
 
-    fn touch_activity(&self, guild_id: Snowflake, member_id: Snowflake, at: &str) {
+    fn touch_activity(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        at: &str,
+        _family: AnalyticsCategory,
+    ) {
+        // In-memory replay double: no guild settings row exists here, so the
+        // family gate lives at the durable commit, not in this map.
         let mut inner = self.inner.lock().expect("store lock");
         let entry = inner.activity.entry((guild_id, member_id)).or_default();
         if entry.is_empty() || entry.as_str() < at {
@@ -255,6 +272,7 @@ pub trait LevelingHook: Send + Sync {
         member_id: Snowflake,
         at: &str,
         channel_id: Snowflake,
+        shape: MessageShape,
     ) -> LevelOutcome;
     fn award_voice(
         &self,
@@ -277,6 +295,7 @@ impl LevelingHook for NoopLeveling {
         _member_id: Snowflake,
         _at: &str,
         _channel_id: Snowflake,
+        _shape: MessageShape,
     ) -> LevelOutcome {
         LevelOutcome {
             leveled_up: false,
@@ -355,6 +374,8 @@ pub struct MessageFact<'a> {
     pub channel_id: Snowflake,
     pub channel_class: ChannelClass,
     pub occurred_at: &'a str,
+    /// Unicode scalar count measured at capture; content is never threaded.
+    pub content_length: Option<usize>,
 }
 
 /// Voice-start fact (legacy `recordVoiceStarted`).
@@ -434,6 +455,29 @@ pub struct GateClearedInput {
     pub source: Option<String>,
 }
 
+/// Minimal transient message shape for the anti-gaming short-message rule.
+/// Only scalar counts and an embed/attachment bit travel; bodies are never
+/// threaded, persisted or logged. `content_length: None` means the shape is
+/// unknown (MESSAGE_CONTENT absent) and preserves existing award behavior;
+/// `Some(n)` is the trimmed Unicode scalar count (including zero for a known
+/// empty message).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageShape {
+    pub content_length: Option<usize>,
+    pub has_embed_or_attachment: bool,
+}
+
+impl MessageShape {
+    /// Unknown shape: content not delivered, rule cannot fire.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            content_length: None,
+            has_embed_or_attachment: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MessageInput {
     pub guild_id: Snowflake,
@@ -446,6 +490,25 @@ pub struct MessageInput {
     pub channel_class: ChannelClass,
     pub capture_only: bool,
     pub occurred_at: Option<String>,
+    /// Unicode scalar count measured at capture; content is never threaded.
+    /// `None` is unknown shape (MESSAGE_CONTENT absent); `Some(n)` is the
+    /// trimmed scalar count, including zero for a known empty message.
+    pub content_length: Option<usize>,
+    /// Whether the gateway message carried an embed or attachment. Threaded
+    /// alongside the length so the short-message rule can exempt such
+    /// messages; never carries body content.
+    pub has_embed_or_attachment: bool,
+}
+
+impl MessageInput {
+    /// Transient shape for the leveling hook: length plus embed bit only.
+    #[must_use]
+    pub fn shape(&self) -> MessageShape {
+        MessageShape {
+            content_length: self.content_length,
+            has_embed_or_attachment: self.has_embed_or_attachment,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -542,6 +605,12 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
         &self.store
     }
 
+    /// Access the facts sink (async runtimes drain deferred buffers).
+    #[must_use]
+    pub fn facts(&self) -> Option<&F> {
+        self.facts.as_ref()
+    }
+
     /// Member arrival. Bots are captured in facts but never write funnel rows.
     pub fn on_join(&self, i: JoinInput) -> HandlerOutcome {
         if i.is_bot {
@@ -632,16 +701,19 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
                     channel_id: i.channel_id,
                     channel_class: i.channel_class,
                     occurred_at: &at,
+                    content_length: i.content_length,
                 });
             }
         }
         if i.is_bot || i.webhook_id.is_some() || i.is_staff_automation || i.capture_only {
             return HandlerOutcome::none();
         }
-        self.store.touch_activity(i.guild_id, i.member_id, &at);
+        self.store
+            .touch_activity(i.guild_id, i.member_id, &at, AnalyticsCategory::Activity);
         let mut leveled_up_to = None;
         if let Some(leveling) = &self.leveling {
-            let award = leveling.award_message(i.guild_id, i.member_id, &at, i.channel_id);
+            let award =
+                leveling.award_message(i.guild_id, i.member_id, &at, i.channel_id, i.shape());
             if award.leveled_up {
                 leveled_up_to = Some(award.level);
             }
@@ -699,7 +771,8 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
         if i.is_bot {
             return HandlerOutcome::none();
         }
-        self.store.touch_activity(i.guild_id, i.member_id, &at);
+        self.store
+            .touch_activity(i.guild_id, i.member_id, &at, AnalyticsCategory::Voice);
         self.store.record(FunnelEvent {
             guild_id: i.guild_id,
             member_id: Some(i.member_id),
@@ -802,8 +875,12 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
         }
         // Leaving at T proves presence up to T: recency moves to the stamped
         // time, never raw garbage (which would throw on timestamptz).
-        self.store
-            .touch_activity(i.guild_id, i.member_id, &end.end_at);
+        self.store.touch_activity(
+            i.guild_id,
+            i.member_id,
+            &end.end_at,
+            AnalyticsCategory::Voice,
+        );
         HandlerOutcome {
             event: Some(event),
             leveled_up_to,
@@ -922,6 +999,87 @@ mod tests {
         assert!(bot.event.is_none());
     }
 
+    /// One captured join fact: (source, inviter_id, source_event_id).
+    type JoinRecord = (String, Option<Snowflake>, String);
+
+    /// Capturing scorecard sink: records every join fact, including bots.
+    #[derive(Debug, Default, Clone)]
+    struct JoinSpy {
+        joins: std::sync::Arc<Mutex<Vec<JoinRecord>>>,
+    }
+
+    impl FactsSink for JoinSpy {
+        fn record_member_join(&self, fact: MemberJoinFact<'_>) {
+            self.joins.lock().expect("spy lock").push((
+                fact.source.to_owned(),
+                fact.inviter_id,
+                fact.source_event_id.to_owned(),
+            ));
+        }
+
+        fn record_rules_accepted(&self, _fact: RulesAcceptedFact<'_>) {}
+
+        fn record_message(&self, _fact: MessageFact<'_>) {}
+
+        fn record_voice_started(&self, _fact: VoiceStartedFact<'_>) -> Option<String> {
+            None
+        }
+
+        fn record_voice_ended(&self, _fact: VoiceEndedFact<'_>) {}
+    }
+
+    fn spied() -> (FunnelHandlers<MemStore, NoopLeveling, JoinSpy>, JoinSpy) {
+        let spy = JoinSpy::default();
+        let h = FunnelHandlers::new(MemStore::new(), Some(NoopLeveling), Some(spy.clone()));
+        (h, spy)
+    }
+
+    #[test]
+    fn join_fact_preserves_invite_attribution() {
+        // The gateway's invite snapshot + expected-join + vanity attribution
+        // reaches the fact unchanged: source, inviter and the gateway
+        // `guild:member:joined_at` event id all survive `on_join`.
+        let (h, spy) = spied();
+        h.on_join(JoinInput {
+            source: "invite:abc".to_owned(),
+            inviter_id: Some(9),
+            source_event_id: Some("1:2:2026-09-20T12:00:00.000Z".to_owned()),
+            ..join_input("invite:abc")
+        });
+        assert_eq!(
+            spy.joins.lock().expect("spy lock").as_slice(),
+            [(
+                "invite:abc".to_owned(),
+                Some(9),
+                "1:2:2026-09-20T12:00:00.000Z".to_owned()
+            )],
+        );
+    }
+
+    #[test]
+    fn bot_join_is_captured_but_never_funnel_counted() {
+        // Bots are captured in facts but write no funnel row: the fact fires
+        // first and the bot gate returns before `store.record`.
+        let (h, spy) = spied();
+        let out = h.on_join(JoinInput {
+            is_bot: true,
+            source: "invite:abc".to_owned(),
+            inviter_id: Some(9),
+            source_event_id: Some("1:7:2026-09-20T12:00:00.000Z".to_owned()),
+            ..join_input("invite:abc")
+        });
+        assert!(out.event.is_none(), "bots write no funnel row");
+        assert_eq!(
+            spy.joins.lock().expect("spy lock").as_slice(),
+            [(
+                "invite:abc".to_owned(),
+                Some(9),
+                "1:7:2026-09-20T12:00:00.000Z".to_owned()
+            )],
+            "the bot join is still captured"
+        );
+    }
+
     #[test]
     fn gate_clear_defaults_source_gateway() {
         let h = handlers();
@@ -949,6 +1107,8 @@ mod tests {
             channel_class: ChannelClass::Human,
             capture_only: false,
             occurred_at: Some(at.to_owned()),
+            content_length: None,
+            has_embed_or_attachment: false,
         };
         let kinds: Vec<Option<EventType>> = [
             "2026-09-20T12:00:00.000Z",
@@ -1006,6 +1166,8 @@ mod tests {
             channel_class: ChannelClass::Other,
             capture_only: false,
             occurred_at: Some(at.to_owned()),
+            content_length: None,
+            has_embed_or_attachment: false,
         });
         assert_eq!(
             first.event.map(|e| e.event_type),
@@ -1023,6 +1185,8 @@ mod tests {
             channel_class: ChannelClass::Other,
             capture_only: false,
             occurred_at: Some(at.to_owned()),
+            content_length: None,
+            has_embed_or_attachment: false,
         });
         assert!(dup.event.is_none());
     }
@@ -1139,7 +1303,14 @@ mod tests {
     }
 
     impl LevelingHook for &RecordingLeveling {
-        fn award_message(&self, _: Snowflake, _: Snowflake, _: &str, _: Snowflake) -> LevelOutcome {
+        fn award_message(
+            &self,
+            _: Snowflake,
+            _: Snowflake,
+            _: &str,
+            _: Snowflake,
+            _: MessageShape,
+        ) -> LevelOutcome {
             LevelOutcome {
                 leveled_up: false,
                 level: 0,

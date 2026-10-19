@@ -136,6 +136,13 @@ impl<L: AutomodClaimLedger, F: AutomodFacts> AutomodActivation<L, F> {
         self.runtime().expire_repeat_history(now_ms);
     }
 
+    /// Hot-reload the content policy from a live-rebuilt config (TOG-19027).
+    /// Only the policy and the enforce flag move; the boot-time enabled gate,
+    /// guild scope and repeat history are preserved. Returns true on change.
+    pub fn apply_live_config(&self, config: &two_bot_core::AutomodConfig) -> bool {
+        self.runtime().apply_live_config(config)
+    }
+
     /// Process one delivery. Callers serialize deliveries in gateway order so
     /// repeat history observes creates in order. `at_iso` stamps the ledger.
     pub async fn process(&self, delivery: MessageDelivery, at_iso: &str) -> Activation {
@@ -341,7 +348,10 @@ impl<L: AutomodClaimLedger, F: AutomodFacts> AutomodActivation<L, F> {
         receipt: StoredOutcome,
     ) -> Activation {
         match self.ledger.ledger_complete(claim, &receipt).await {
-            Ok(true) => activation(funnel, ActivationOutcome::Completed(receipt)),
+            Ok(true) => {
+                two_bot_core::metrics::global().automod_decision(receipt.outcome.as_str());
+                activation(funnel, ActivationOutcome::Completed(receipt))
+            }
             Ok(false) => activation(
                 funnel,
                 ActivationOutcome::Retained(RetainReason::CompletionRefused),

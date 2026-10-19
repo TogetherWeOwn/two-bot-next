@@ -1,6 +1,7 @@
 //! SQLx persistence for feeds. Claims are fenced and guild-scoped; uncertain
 //! sends stay pending for nonce reconciliation rather than being blindly retried.
 
+use crate::automation_quota::{lock_quota, AutomationQuota};
 use crate::feeds::{
     DeliveryClaim, FeedError, FeedKind, FeedPost, FeedRelay, DELIVERY_CLAIM_LEASE_MS,
 };
@@ -14,12 +15,25 @@ pub enum FeedStoreError {
     Domain(#[from] FeedError),
     #[error("Feed claim token must not be empty.")]
     EmptyClaimToken,
+    #[error("{0}")]
+    Capacity(AutomationQuota),
 }
 
 /// Add is insert-only: an externally supplied id cannot hijack an existing
 /// relay, or change its source while retaining that source's delivery ledger.
+/// The guild's 25-definition cap includes disabled feeds, and is checked in
+/// the insert transaction under a guild-scoped capacity lock.
 pub async fn add_feed(pool: &Pool<Postgres>, feed: &FeedRelay) -> Result<(), FeedStoreError> {
     crate::feeds::normalize_source(feed.kind, &feed.source)?;
+    let mut tx = pool.begin().await?;
+    lock_quota(&mut tx, &feed.guild_id, AutomationQuota::Feeds).await?;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM feed_relays WHERE guild_id = $1")
+        .bind(&feed.guild_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if count >= AutomationQuota::Feeds.limit() {
+        return Err(FeedStoreError::Capacity(AutomationQuota::Feeds));
+    }
     sqlx::query(
         "INSERT INTO feed_relays
          (id, guild_id, channel_id, kind, source, enabled, last_checked_at, created_by, created_at, updated_at)
@@ -28,7 +42,8 @@ pub async fn add_feed(pool: &Pool<Postgres>, feed: &FeedRelay) -> Result<(), Fee
     )
     .bind(&feed.id).bind(&feed.guild_id).bind(&feed.channel_id).bind(feed.kind.as_str())
     .bind(&feed.source).bind(feed.enabled).bind(feed.last_checked_at).bind(&feed.created_by)
-    .bind(feed.created_at).bind(feed.updated_at).execute(pool).await?;
+    .bind(feed.created_at).bind(feed.updated_at).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }
 

@@ -1,7 +1,12 @@
 //! Callable internal-action effects, not an authenticated HTTP receiver.
 //!
 //! The caller must authorize and commit its durable execution claim first.
-//! Only `announcement.post` is implemented here; core feature flags are not
+//! `announcement.post` is implemented here; `event.upsert` and `event.cancel`
+//! run through [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event)
+//! (see [`crate::internal_events`]) with the receiver-owned claim and key
+//! mapping, and `settings.get`/`settings.set` are wired receiver verbs
+//! executed via the settings store (the receiver branches before this
+//! adapter), so this adapter never executes them. Core feature flags are not
 //! executor capabilities. No runtime flags, stores or listeners are installed.
 //! Every 429 feeds the caller-supplied per-token [`CooldownGovernor`].
 
@@ -27,7 +32,28 @@ use two_bot_core::send_admission::{
 mod governor;
 pub use governor::{Clock, CooldownGovernor, MAX_CHANNEL_HOLDS};
 
-pub const SUPPORTED_ACTIONS: &[&str] = &["announcement.post"];
+/// Every verb the receiver will run: the Discord send, the two event verbs
+/// (executed through [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event)
+/// behind the receiver's claim and key mapping, never via this adapter's
+/// transport) and the two settings verbs (executed via the settings store,
+/// never via this adapter's transport). `event.read` is a keyless read path,
+/// not listed. All other core verbs stay refused.
+pub const SUPPORTED_ACTIONS: &[&str] = &[
+    "announcement.post",
+    "event.upsert",
+    "event.cancel",
+    "settings.get",
+    "settings.set",
+];
+
+/// True for the two event verbs the receiver executes through
+/// [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event). The env-only
+/// flag gate itself stays with the receiver's `authorize` check: this only
+/// names which verbs have a wired mutation path.
+#[must_use]
+pub fn supports_event_mutation(action: &str) -> bool {
+    matches!(action, "event.upsert" | "event.cancel")
+}
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const BOT_USER_AGENT: &str = concat!(
     "DiscordBot (https://github.com/TogetherWeOwn/two-bot-next, ",
@@ -185,16 +211,22 @@ impl AnnouncementExecutor {
         Ok(self)
     }
 
+    /// This adapter owns only the announcement verb. Event verbs are listed in
+    /// [`SUPPORTED_ACTIONS`] but execute through
+    /// [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event); routing them
+    /// here would validate an event body as an announcement.
     #[must_use]
     pub fn supports(action: &str) -> bool {
-        SUPPORTED_ACTIONS.contains(&action)
+        action == "announcement.post"
     }
 
     /// Authorize first; this method intentionally owns neither the store claim
     /// nor its audit/finalization. Caller cancellation after invocation is also
-    /// an unknown outcome, even if this method never returns.
+    /// an unknown outcome, even if this method never returns. Only the Discord
+    /// send runs here: settings verbs are wired (see [`SUPPORTED_ACTIONS`]) but
+    /// executed via the settings store by the receiver, never via this transport.
     pub async fn execute(&self, action: &str, body: &Map<String, Value>) -> ExecutionOutcome {
-        if !Self::supports(action) {
+        if action != "announcement.post" {
             return ExecutionOutcome::NoEffect(Refusal::ActionNotAllowed);
         }
         let outcome = self.post(body).await;
@@ -316,10 +348,12 @@ impl AnnouncementExecutor {
         if let Some(ready) = &self.response_received {
             ready.notify_one();
         }
-        match response.status().as_u16() {
-            // Narrow confirmed-rejection allowlist. 408, other statuses,
+        let status = response.status().as_u16();
+        match status {
+            // Shared confirmed-rejection allowlist (see
+            // `crate::executor::is_definitive_rejection`). 408, other statuses,
             // redirects and 5xx are NOT proof of no message being created.
-            400 | 401 | 403 | 404 | 405 | 413 | 415 | 422 => {
+            status if crate::executor::is_definitive_rejection(status) => {
                 return ExecutionOutcome::NoEffect(Refusal::DiscordRejected);
             }
             429 => {

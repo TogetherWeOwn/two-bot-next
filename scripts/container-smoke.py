@@ -14,18 +14,65 @@ import uuid
 
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
-# Recalibrated for the linked S4 self-role runtime (TOG-10292): PR head
-# measured 10,805,344 bytes (10.30 MiB) on the ephemeral runner vs main
+# Recalibrated for the linked S4 self-role runtime: PR head measured
+# 10,805,344 bytes (10.30 MiB) on the ephemeral runner vs main
 # baseline 10,377,112 bytes (9.90 MiB) at ec49663. Growth is linked
 # runtime/handlers/REST + previously-dead domain/store code, no new
 # dependencies; release profile already minimal (opt-level=z, lto, strip).
 # Per b1-baseline calibration (measured * 1.4 rounded up to the next MiB):
 # 10.30 * 1.4 = 14.42 -> 15 MiB. Image still within budget (101.61/112).
-BINARY_MAX_BYTES = 15 * MIB
+# 16 MiB holds for the landed slices: the internal-actions families (event
+# executors plus channel-moderation union) measured 15,741,344 bytes
+# (15.01 MiB), and the RSVP bound-admissions slice (PR 709) measured
+# 15,734,960 bytes (15.01 MiB) vs main 15,712,080 bytes — each a few tens of
+# KiB over the old 15 MiB budget with no new dependencies. The settings
+# hot-reload head measured 15,730,600 bytes (15.00 MiB), also below this
+# limit. This branch's automation-only head measured 15,769,872 bytes
+# (15.04 MiB) before the event-executor merge; the combined-head
+# measurement comes from hosted CI on the merged head. 16 MiB trips on main
+# itself (main-red) with no new dependencies and the same minimal release
+# profile (opt-level=z, lto, strip). Main at d7774644 measured 16,768,848 bytes
+# (15.99 MiB), main tip 89503f71 measured 16,776,096 bytes (1,120 bytes of
+# headroom), and another calibration (main 89c859b1, run 39061354880,
+# byte-identical on main HEAD 89c859b) measured 16,777,376 bytes (160 over);
+# this head measured 16,778,152 bytes (936 over), including this branch's
+# feed-fetch outcome gauges (~2,240 bytes of bounded-vocabulary counters and
+# pure mapping functions; PR merge head 16,778,336 bytes, 1,120 over 16 MiB).
+# The stream retention-expiry slice (ac8fd66, fence-preserving expiry of
+# delivered go-live dedup rows) tipped the full 16 MiB budget with no new
+# dependencies and no release-profile change. The backfill rate-limit client
+# head measured 16,780,912 bytes (16.00 MiB) — the guard's bucket/pacing code.
+# The voice rename-decision logs add ~3,160 bytes (merged head 6a9c394e:
+# 16,779,256 bytes, 2,040 over 16 MiB). The game-activity aggregate-expiry
+# slice measured 16,782,608 bytes (16.01 MiB, 5,392 over) — store expiry plus
+# its per-guild stale listing and the retention-cadence driver. The go-live
+# receiver-ledger slice independently measured 16,801,560 bytes (16.02 MiB,
+# 24,344 over) on CI run 39056648109 job 117470241279 after ~450 lines of
+# ledger/receiver code. The landed slices since the 16 MiB bump consumed its
+# headroom, so 17 MiB restores a working tripwire with ~1 MiB of headroom;
+# revisit if the binary approaches it.
+# The voice actor-init retry measured 16,782,904 bytes (+6,808, no new dependencies).
+BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"
 CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+# Body-cap refusal contract (same shape as staging_probe.py MAX_BODY_BYTES and
+# the contract probe BODY_CAP): every response read takes at most
+# MAX_BODY_BYTES+1 bytes so a hidden suffix is detected. Any body longer than
+# MAX_BODY_BYTES (64 KiB) is refused before parsing with a fixed message;
+# exact-cap valid input passes, and the extra byte never reaches the JSON
+# path. The refusal never echoes the body, headers, URL or parse exceptions.
+MAX_BODY_BYTES = 64 * 1024
+USER_AGENT = "two-bot-next-container-smoke/1.0 (loopback)"
+
+
+class BodyTooLarge(RuntimeError):
+    """A loopback response body exceeds MAX_BODY_BYTES (fixed vocabulary only).
+
+    A RuntimeError so main() reports it as a smoke failure, and not a
+    transport miss the caller would retry until its deadline.
+    """
 
 
 def require(condition, message):
@@ -75,10 +122,20 @@ def http_response(url):
     parts = urlsplit(url)
     connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=2)
     try:
-        connection.request("GET", parts.path or "/")
+        connection.request("GET", parts.path or "/", headers={"User-Agent": USER_AGENT})
         response = connection.getresponse()
+        # Bounded read: a status line alone is an answer, a body past the cap
+        # is a refusal raised before any decoding (not caught below).
+        raw = response.read(MAX_BODY_BYTES + 1)
+        if len(raw) > MAX_BODY_BYTES:
+            raise BodyTooLarge("loopback response body exceeds the 64 KiB cap")
+        if response.length:
+            # read(amt) returns a short Content-Length body without raising
+            # (unlike an unbounded read); a connection dropped mid-body is
+            # still a transport miss for the caller to retry.
+            raise http.client.IncompleteRead(raw, response.length)
         try:
-            return response.status, json.loads(response.read())
+            return response.status, json.loads(raw)
         except ValueError:
             # A status with no JSON body (e.g. a bare 3xx) is still an
             # answer; the caller's exact status/body assertions reject it.
@@ -167,11 +224,11 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             ["token_invalid", "ready"],
         ], f"/readyz body must report a ready process, parked gateway, database down and valid token state; got status={code} body={json.dumps(body)[:2000]}")
         # The runtime always reports informational job status alongside
-        # readiness; with no credentials all twelve jobs must be parked,
+        # readiness; with no credentials all thirteen jobs must be parked,
         # non-running and never started. Jobs never flip the 503 above. The
-        # audit-retry, scheduled-messages, self-role recovery, feeds and
-        # settings-poll and member-unban-sweep entries are always listed
-        # (parked when their services are unregistered).
+        # audit-retry, scheduled-messages, self-role recovery, feeds,
+        # settings-poll, member-unban-sweep and retention entries are always
+        # listed (parked when their services are unregistered).
         parked = {"parked": True, "running": False, "last_start": None,
                   "last_success": None, "last_error_class": None,
                   "consecutive_failures": 0}
@@ -180,9 +237,9 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                 "counter", "rank", "scheduled_events", "settings", "presence_probe",
                 "community_scorecard", "inactivity", "audit_retry",
                 "self_role_recovery", "scheduled_messages", "feeds",
-                "member_unban_sweep",
+                "member_unban_sweep", "retention",
             )
-        }, "/readyz body must report all twelve jobs parked, non-running, never started")
+        }, "/readyz body must report all thirteen jobs parked, non-running, never started")
         # Check PID 1, not merely Docker's configured user or an exec helper.
         uid = pid1_uids(name)
         require(len(uid) == 4 and all(value != 0 for value in uid), "runtime PID 1 is root")
