@@ -235,6 +235,25 @@ are never substituted.
 
 ## 4. Failure-burst anchors
 
+Guild-channel discovery is required by both `backfill` and
+`backfill-messages`; active-thread discovery is also required by
+`backfill-messages`. An unavailable result (including 403/404, an unreadable
+response, or a request/transport error) stops the CLI immediately with exit 1
+and a fixed stderr diagnostic:
+
+- `Guild-channel discovery unavailable; backfill stopped.`
+- `Active-thread discovery unavailable; backfill stopped.`
+
+These failures do not print a completed scan report or an `exactly` claim,
+and diagnostics do not include remote error text, response bodies or
+credentials. Check access and REST/send-admission health before re-running.
+A valid empty discovery result is not a failure: it keeps the normal
+successful scan/count output. This refusal is not a rollback of earlier
+setup: the CLIs still open/migrate the database before discovery, and
+`backfill` may already have marked listed bots outside dry-run mode.
+Archived-thread discovery and its existing per-forum incomplete-history
+reporting are unchanged.
+
 A re-run report ends with a `scan completion` line plus one `INCOMPLETE`
 line per interrupted channel (`ScanReport::render`, `cli.rs:38-55`).
 The vocabulary is fixed (`ScanCompletion`, `rest.rs:722-752`):
