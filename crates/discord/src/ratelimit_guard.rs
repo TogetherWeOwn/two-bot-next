@@ -431,11 +431,11 @@ impl RateLimitGuard {
             .filter(|until| *until > now)
     }
 
-    /// Learn one response's per-route bucket state from its `X-RateLimit-*`
-    /// headers, or a bare `Retry-After` with no `X-RateLimit-*` headers.
-    /// Callers collecting a body classify it through `ResponseAccounting`
-    /// before installing that fallback. An exhausted bucket (`Remaining` 0
-    /// with a resolvable reset) installs a
+    /// Learn header-only per-route bucket state from `X-RateLimit-*`, or
+    /// treat `Retry-After` with no `X-RateLimit-*` headers as bare. Transports
+    /// collecting a body use `observe_bucket_headers` and `ResponseAccounting`
+    /// instead, so body timing/scope signals can exclude the bare fallback.
+    /// An exhausted bucket (`Remaining` 0 with a resolvable reset) installs a
     /// deadline; a response with remaining budget never
     /// retires a live one. A same-window straggler is indistinguishable from
     /// a newer window by its reset timing — the earlier-generated reply
