@@ -126,6 +126,7 @@ impl StoreSettings {
     }
 
     /// Re-read on every observation (tests).
+    #[cfg(test)]
     pub fn with_max_age(mut self, max_age: Duration) -> Self {
         self.max_age = max_age;
         self

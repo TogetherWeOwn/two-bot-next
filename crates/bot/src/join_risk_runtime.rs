@@ -195,7 +195,7 @@ pub trait SettingsSource: Send + 'static {
 
 /// Tuning, the bulk window and the staff channel are store-first (hot rows win
 /// over the deployment environment) and re-read at most every
-/// [`SETTINGS_MAX_AGE`]; a failed refresh keeps the last outcome (good
+/// `SETTINGS_MAX_AGE`; a failed refresh keeps the last outcome (good
 /// settings or the cached refusal).
 pub struct StoreSettings {
     pool: PgPool,
