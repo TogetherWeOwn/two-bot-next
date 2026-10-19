@@ -6602,14 +6602,27 @@ async fn schedule_list_store_failure_audits_one_rejected_row() {
     db.close().await;
 }
 
-/// Dead-pool control: with a pool that can never connect, the audit write
-/// is impossible by construction, so every schedule command must still
-/// finish with the fixed safe reply — no panic, no hang, no sqlx internals,
-/// pool address or credentials in the user text.
+/// Dead-pool control: with a closed pool, the audit write is impossible by
+/// construction, so every schedule command must still finish with the
+/// fixed safe reply — no panic, no hang, no sqlx internals, pool address
+/// or credentials in the user text. A closed pool fails every query
+/// immediately; an unreachable pool would hold each command for the full
+/// acquire timeout, so this control stays fast after the audit attempt
+/// adds a second store call per refusal.
 #[tokio::test]
 async fn schedule_store_failures_on_dead_pool_reply_safely() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
-    let runtime = runtime_without_db(gates(true, true), true, origin);
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let runtime = CommandRuntime::new(
+        pool,
+        executor_at(origin),
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
 
     runtime.on_interaction(&schedule_create_interaction()).await;
     runtime
