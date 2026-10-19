@@ -134,9 +134,9 @@ Scalar gateway series pair with the labels above:
 
 Source: `RestAutomodFacts::get` in `crates/discord/src/automod_activation.rs`.
 
-| Event | Level | Fields | Meaning |
-| --- | --- | --- | --- |
-| `automod_facts_read_failed` | WARN | `step`: `guild`, `bot_member`, `target_member` or `message`; `cause`: the fixed vocabulary from `DiscordError::cause()` in `crates/discord/src/executor.rs` | A strict Discord facts read failed; the caller still returns unavailable facts and preserves the existing fail-closed decision. Enrichment's author-member read uses `target_member`. |
+| Event | Callsite (stable anchor) | Level | Fields | Meaning |
+| --- | --- | --- | --- | --- |
+| `automod_facts_read_failed` | `crates/discord/src/automod_activation.rs` (`RestAutomodFacts::get`) | WARN | `step`: `guild`, `bot_member`, `target_member` or `message`; `cause`: the fixed vocabulary from `DiscordError::cause()` in `crates/discord/src/executor.rs` | A strict Discord facts read failed; the caller still returns unavailable facts and preserves the existing fail-closed decision. Enrichment's author-member read uses `target_member`. |
 
 Only `Err` emits: successful reads and 404 (`Ok(None)`) stay silent and do not
 consume the warning window. The first failure emits immediately, then at most
