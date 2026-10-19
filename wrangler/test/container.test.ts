@@ -799,7 +799,7 @@ for (const port of ["9090", "1", "65535", "09090"]) {
     worker_version: ID,
     log_url: LOG_QUERY_URL,
   })));
-        assert.ok(!h.logs.some((line) => line.includes("probe failed")));
+        assert.ok(!h.logs.some((line) => line.includes("probe_failed")));
       } else {
         const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`, {
           signal: AbortSignal.timeout(1000),
@@ -1896,7 +1896,7 @@ for (const status of [200, 503]) {
     assert.equal(h.bot["inflightRequests"], 0, "proxy pipe must settle cleanly");
     assert.equal(h.values.get("two-bot:readiness")?.lastStatus, status);
     assert.equal(h.values.get("two-bot:readiness")?.failures, status === 200 ? 0 : 1);
-    assert.ok(!h.logs.some((line) => line.includes("probe failed")));
+    assert.ok(!h.logs.some((line) => line.includes("probe_failed")));
     assert.equal(h.pending().length, 1, "onStart during a cold tick must not create another chain");
   });
 }

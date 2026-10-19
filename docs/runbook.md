@@ -152,7 +152,7 @@ Look for these literal messages:
   `container_gateway_failure` (see [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
 - Worker: `two-bot container started|stopped`, `container_readyz_unhealthy`,
-  `container_keepalive_probe_failed`, `two-bot container error`.
+  `container_keepalive_probe_failed`, `container_error`.
 
 The DO renews activity and probes `/readyz` every `KEEPALIVE_SECONDS` (default
 60); `sleepAfter` is 30 minutes. Outbound gateway traffic alone does not keep
