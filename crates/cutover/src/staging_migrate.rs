@@ -1213,6 +1213,73 @@ fn connection_warning_from_audit(audit: &Value) -> Option<String> {
     connection_warning(used, ceiling)
 }
 
+/// Bounded, non-secret cause class for a `connect` failure.
+///
+/// `connect` refuses before any DDL with one fixed message; without the cause
+/// every failure reads identically, forcing host forensics to guess transient
+/// connection loss from real membership loss. The cause carries only the error
+/// kind and, for database errors, the 5-character SQLSTATE code (fixed server
+/// vocabulary, e.g. `42501`): never the message, severity, statement, URL,
+/// host or login. Fail-closed is unchanged: the caller still refuses, only
+/// with a triageable `[cause=...]` suffix.
+fn connect_cause(error: &sqlx::Error) -> String {
+    match error {
+        sqlx::Error::Database(db) => {
+            let code = db.code().map(|c| c.into_owned()).unwrap_or_default();
+            match code.as_str() {
+                // `insufficient_privilege` from `SET ROLE`: the login is not a
+                // member of the role. Real binding/membership loss.
+                "42501" => "set-role-denied:42501".to_owned(),
+                // Authentication failures: wrong or rotated credential, not a
+                // network or membership event.
+                "28000" | "28P01" => format!("auth:{code}"),
+                _ if db.is_transient_in_connect_phase() => {
+                    format!("connect-transient:{code}")
+                }
+                _ if !code.is_empty() => format!("database:{code}"),
+                _ => "database:unknown".to_owned(),
+            }
+        }
+        sqlx::Error::Io(io) => match io.kind() {
+            std::io::ErrorKind::TimedOut => "connect-timeout".to_owned(),
+            std::io::ErrorKind::ConnectionRefused => "connect-refused".to_owned(),
+            std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected => "connect-reset".to_owned(),
+            std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::AddrInUse
+            | std::io::ErrorKind::NetworkDown
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable => "connect-unreachable".to_owned(),
+            std::io::ErrorKind::PermissionDenied => "connect-permission".to_owned(),
+            _ => "io-error".to_owned(),
+        },
+        // Pool checkout timed out (bounded acquire timeout): the host accepted
+        // connections but none became available. Transient, and distinct from
+        // a TCP connect timeout.
+        sqlx::Error::PoolTimedOut => "pool-timeout".to_owned(),
+        sqlx::Error::PoolClosed => "pool-closed".to_owned(),
+        sqlx::Error::Tls(_) => "tls".to_owned(),
+        // Our own post-connect check (`current_user != role`): `SET ROLE`
+        // succeeded syntactically but the role is not active. Real, fail-closed.
+        sqlx::Error::Protocol(message) if message.contains("expected role") => {
+            "role-verify".to_owned()
+        }
+        _ => "connect-error".to_owned(),
+    }
+}
+
+/// Fail-closed refusal for `connect`, with the triageable cause suffix.
+/// `role` is one of the two fixed group constants, never input.
+fn connect_refusal(role: &str, error: &sqlx::Error) -> RunError {
+    RunError::Refused(format!(
+        "could not connect and SET ROLE {role} (missing binding or membership) [cause={}]",
+        connect_cause(error)
+    ))
+}
+
 async fn connect(
     options: PgConnectOptions,
     role: &'static str,
@@ -1245,11 +1312,7 @@ async fn connect(
         })
         .connect_with(options)
         .await
-        .map_err(|_| {
-            RunError::Refused(format!(
-                "could not connect and SET ROLE {role} (missing binding or membership)"
-            ))
-        })
+        .map_err(|error| connect_refusal(role, &error))
 }
 
 /// Run the plan (read-only, RO binding and role) or apply (migrator binding
@@ -3314,6 +3377,165 @@ mod tests {
             !debug.contains("fixture"),
             "refusal echoed the URL: {debug}"
         );
+    }
+
+    /// Stand-in database error whose Display carries a fake secret: proves
+    /// the connect refusal never surfaces it.
+    #[derive(Debug)]
+    struct FakeConnectDbError {
+        code: Option<&'static str>,
+        transient: bool,
+    }
+
+    impl std::fmt::Display for FakeConnectDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fake database error with postgres://secret@localhost/db")
+        }
+    }
+
+    impl std::error::Error for FakeConnectDbError {}
+
+    impl sqlx::error::DatabaseError for FakeConnectDbError {
+        fn message(&self) -> &str {
+            "fake"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.map(std::borrow::Cow::Borrowed)
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn is_transient_in_connect_phase(&self) -> bool {
+            self.transient
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn connect_database(code: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(FakeConnectDbError {
+            code: Some(code),
+            transient: false,
+        }))
+    }
+
+    fn connect_io(kind: std::io::ErrorKind) -> sqlx::Error {
+        sqlx::Error::Io(std::io::Error::new(kind, "simulated transport failure"))
+    }
+
+    /// A simulated connect timeout and a real `SET ROLE` denial (SQLSTATE
+    /// 42501) surface distinct cause strings, so the next recurrence is
+    /// triageable from the log line.
+    #[test]
+    fn connect_refusal_distinguishes_timeout_from_set_role_denial() {
+        let timeout = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "simulated connect timeout",
+        ));
+        let denied = connect_database("42501");
+
+        let timeout_cause = connect_cause(&timeout);
+        let denied_cause = connect_cause(&denied);
+        assert_eq!(timeout_cause, "connect-timeout", "timeout cause");
+        assert_eq!(denied_cause, "set-role-denied:42501", "denial cause");
+        assert_ne!(timeout_cause, denied_cause, "causes must differ");
+
+        for (error, cause) in [
+            (&timeout, timeout_cause.as_str()),
+            (&denied, denied_cause.as_str()),
+        ] {
+            let RunError::Refused(message) = connect_refusal(READ_ONLY_ROLE, error) else {
+                panic!("connect failure must refuse, got cause {cause}");
+            };
+            assert!(
+                message.contains("could not connect and SET ROLE"),
+                "refusal must keep the historic prefix: {message}"
+            );
+            assert!(
+                message.contains(READ_ONLY_ROLE),
+                "refusal must name the role: {message}"
+            );
+            assert!(
+                message.contains(&format!("[cause={cause}]")),
+                "refusal must carry the cause: {message}"
+            );
+            assert!(
+                !message.contains("secret"),
+                "refusal leaked error detail: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_cause_covers_auth_refused_reset_and_pool_classes() {
+        assert_eq!(
+            connect_cause(&connect_io(std::io::ErrorKind::ConnectionRefused)),
+            "connect-refused"
+        );
+        assert_eq!(
+            connect_cause(&connect_io(std::io::ErrorKind::ConnectionReset)),
+            "connect-reset"
+        );
+        assert_eq!(
+            connect_cause(&connect_io(std::io::ErrorKind::HostUnreachable)),
+            "connect-unreachable"
+        );
+        assert_eq!(
+            connect_cause(&connect_io(std::io::ErrorKind::PermissionDenied)),
+            "connect-permission"
+        );
+        assert_eq!(
+            connect_cause(&connect_io(std::io::ErrorKind::InvalidData)),
+            "io-error"
+        );
+        assert_eq!(connect_cause(&connect_database("28P01")), "auth:28P01");
+        assert_eq!(connect_cause(&connect_database("28000")), "auth:28000");
+        let transient = sqlx::Error::Database(Box::new(FakeConnectDbError {
+            code: Some("53300"),
+            transient: true,
+        }));
+        assert_eq!(connect_cause(&transient), "connect-transient:53300");
+        assert_eq!(connect_cause(&connect_database("XX000")), "database:XX000");
+        let codeless = sqlx::Error::Database(Box::new(FakeConnectDbError {
+            code: None,
+            transient: false,
+        }));
+        assert_eq!(connect_cause(&codeless), "database:unknown");
+        assert_eq!(connect_cause(&sqlx::Error::PoolTimedOut), "pool-timeout");
+        assert_eq!(connect_cause(&sqlx::Error::PoolClosed), "pool-closed");
+        let tls = sqlx::Error::Tls(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "simulated tls failure",
+        )));
+        assert_eq!(connect_cause(&tls), "tls");
+        assert_eq!(
+            connect_cause(&sqlx::Error::Protocol(
+                "expected role two_bot_migrator_ro is not active".to_owned()
+            )),
+            "role-verify"
+        );
+        assert_eq!(
+            connect_cause(&sqlx::Error::Protocol("garbage".to_owned())),
+            "connect-error"
+        );
+        assert_eq!(
+            connect_cause(&sqlx::Error::InvalidArgument("literal step".to_owned())),
+            "connect-error"
+        );
+        assert_eq!(connect_cause(&sqlx::Error::WorkerCrashed), "connect-error");
     }
 
     #[test]
