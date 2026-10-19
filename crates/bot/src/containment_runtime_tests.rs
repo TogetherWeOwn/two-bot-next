@@ -1,6 +1,9 @@
 //! Containment runtime acceptance against the mock Discord double. The worker
 //! tests are ignored and run only on agent-testdb / the CI service container.
 
+#[path = "containment_tuning_refusal_acceptance_tests.rs"]
+mod tuning_refusal_acceptance;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

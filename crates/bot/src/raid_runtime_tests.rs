@@ -1,6 +1,9 @@
 //! Raid runtime acceptance against the mock Discord double. The one database
 //! test is ignored and runs only on agent-testdb / the CI service container.
 
+#[path = "raid_tuning_refusal_acceptance_tests.rs"]
+mod tuning_refusal_acceptance;
+
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
