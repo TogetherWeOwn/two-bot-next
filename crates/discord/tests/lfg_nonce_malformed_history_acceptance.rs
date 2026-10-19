@@ -20,7 +20,16 @@ const OTHER_CHANNEL: &str = "9999";
 const BOT: u64 = 1111;
 const OTHER_AUTHOR: u64 = 3333;
 fn nonce() -> String {
-    format!("{:024x}", 0x0123_4567_89ab_cdef_0123_4567_u128)
+    static NONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NONCE
+        .get_or_init(|| {
+            let value = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_else(|_| std::process::id() as u128);
+            format!("{value:032x}")
+        })
+        .clone()
 }
 /// Planted in hostile rows; the fixed uncertainty error must never echo it.
 const RAW_SENTINEL: &str = "raw-upstream-sentinel-7f3a";
