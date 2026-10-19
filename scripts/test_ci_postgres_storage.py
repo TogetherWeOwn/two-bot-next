@@ -15,6 +15,10 @@ from unittest import mock
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/check.yml"
 WORKFLOW_TEXT = WORKFLOW.read_text()
+NEXTEST_WORKFLOW = (
+    Path(__file__).resolve().parents[1] / ".github/workflows/reusable-rust-nextest.yml"
+)
+NEXTEST_WORKFLOW_TEXT = NEXTEST_WORKFLOW.read_text()
 # The three Rust test lanes (rust-tests, ignored-db-stores, ignored-db-runtime)
 # each run their own copy of this service; the first one in the file is the
 # reference and the others must match it exactly.
@@ -30,6 +34,10 @@ SCRIPTS = [
 ]
 PREPARES = [tail.split("\n      - name: ", 1)[0] for tail in PREPARE_TAILS]
 SCRIPT = SCRIPTS[0]
+NEXTEST_VERIFY_TAILS = NEXTEST_WORKFLOW_TEXT.split("      - name: Verify disposable Postgres defaults\n")[1:]
+NEXTEST_SCRIPT = textwrap.dedent(
+    NEXTEST_VERIFY_TAILS[0].split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+)
 POSTGRES_LANES = ("rust-tests", "ignored-db-stores", "ignored-db-runtime")
 
 
@@ -138,6 +146,15 @@ class PostgresStorageTests(unittest.TestCase):
                 self.assertIn("'min_wal_size': '64MB'", script)
                 scripts.append(script)
         self.assertEqual(len(set(scripts)), 1, "the lanes' verify probes drifted apart")
+        # The nextest lane carries a fourth copy of this probe in the reusable
+        # workflow. It must stay identical to the executed reference, so the
+        # rejection tests below cover it too: without this, deleting the
+        # comparison in the nextest copy alone stays green everywhere.
+        self.assertEqual(len(NEXTEST_VERIFY_TAILS), 1)
+        self.assertEqual(
+            NEXTEST_SCRIPT, SCRIPT,
+            "the nextest verify probe drifted from the executed reference",
+        )
 
     def test_probe_preserves_durability_and_uses_only_explicit_test_connection(self):
         output = io.StringIO()

@@ -2397,6 +2397,13 @@ class WorkflowTests(unittest.TestCase):
         ):
             self.assertIn(f"'{key}': '{value}'", verify["run"])
         self.assertIn("current_setting(", verify["run"])
+        # Pin the rejection itself, not just the expected values: deleting the
+        # comparison makes the step print whatever it fetches and exit 0.
+        self.assertIn("if settings != expected:", verify["run"])
+        self.assertIn(
+            "raise SystemExit('disposable Postgres data path or durability defaults changed')",
+            verify["run"],
+        )
         self.assertIn("Report Postgres storage headroom", names)
         report = next(
             step for step in steps
