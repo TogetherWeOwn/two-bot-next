@@ -221,10 +221,23 @@ fn stale_interaction(verb: &str, id: u64) -> Interaction {
         data.options
             .push(option("duration_seconds", CommandOptionValue::Integer(60)));
     }
+    let target_member = twilight_model::application::interaction::InteractionMember {
+        avatar: None,
+        avatar_decoration_data: None,
+        banner: None,
+        communication_disabled_until: None,
+        flags: MemberFlags::empty(),
+        joined_at: None,
+        nick: None,
+        pending: false,
+        permissions: Permissions::empty(),
+        premium_since: None,
+        roles: Vec::new(),
+    };
     let mut value = serde_json::to_value(interaction).expect("interaction JSON");
     value["data"]["resolved"] = json!({
         "users": {TARGET.to_string(): user(TARGET, false)},
-        "members": {TARGET.to_string(): {"roles": [], "deaf": false, "mute": false, "flags": 0, "pending": false}},
+        "members": {TARGET.to_string(): target_member},
     });
     serde_json::from_value(value).expect("resolved-target interaction")
 }
