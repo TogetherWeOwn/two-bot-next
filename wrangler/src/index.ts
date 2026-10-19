@@ -220,6 +220,12 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_TWITCH_CLIENT_ID?: string;
   /** Operator-set Helix client secret. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
   TWO_TWITCH_CLIENT_SECRET?: string;
+  /** Operator-set go-live delivery gate. Forwarded as exactly "1" on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
+  TWO_EVENTSUB_DELIVERY?: string;
+  /** Operator-set announcements channel for go-live posts. Forwarded on its own explicit containerEnvVars line while the delivery gate travels, never flag-forwarded. */
+  TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID?: string;
+  /** Operator-set Discord invite URL for go-live posts. Forwarded on its own explicit containerEnvVars line while the delivery gate travels, never flag-forwarded. */
+  TWO_EVENTSUB_INVITE_URL?: string;
   /** Staging rollback-drill switch (docs/staging-rollout-gate.md). Set only
    * in the generated staging deploy config by a manual deploy-staging
    * dispatch, never a committed var (check-env-bindings.py). Reaches the
@@ -743,6 +749,15 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     if (env.TWO_TWITCH_BROADCASTERS) vars["TWO_TWITCH_BROADCASTERS"] = env.TWO_TWITCH_BROADCASTERS;
     if (env.TWO_TWITCH_CLIENT_ID) vars["TWO_TWITCH_CLIENT_ID"] = env.TWO_TWITCH_CLIENT_ID;
     if (env.TWO_TWITCH_CLIENT_SECRET) vars["TWO_TWITCH_CLIENT_SECRET"] = env.TWO_TWITCH_CLIENT_SECRET;
+    // Go-live delivery is a second gate inside the receiver forward: only
+    // exactly "1" travels, with its channel and invite inputs on their own
+    // lines. Absent stays absent so a half-provisioned delivery enable
+    // fails loudly in the Container instead of silently staying ack-only.
+    if (env.TWO_EVENTSUB_DELIVERY === "1") {
+      vars["TWO_EVENTSUB_DELIVERY"] = "1";
+      if (env.TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID) vars["TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID"] = env.TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID;
+      if (env.TWO_EVENTSUB_INVITE_URL) vars["TWO_EVENTSUB_INVITE_URL"] = env.TWO_EVENTSUB_INVITE_URL;
+    }
   }
   return vars;
 }
