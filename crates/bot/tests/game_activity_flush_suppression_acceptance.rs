@@ -134,8 +134,11 @@ fn playing_delta(member: u64, at_ms: i64, game: &str) -> PresenceDelta {
     }
 }
 
-/// Buffer one play session for `member`: two sightings `minutes` apart,
-/// which sessionize into exactly that many minutes of play.
+/// Buffer one play session for `member`: two sightings `minutes` apart.
+/// Every caller flushes at `start_ms + minutes`, and at that horizon the
+/// session stores exactly `minutes` of play (a still-open session is
+/// closed at the flush time, so a shorter seed flushed later would store
+/// the longer span instead).
 fn seed_play(
     collector: &GameActivityCollector,
     member: u64,
@@ -209,11 +212,11 @@ async fn suppression_installed_mid_flush_contributes_zero() {
     };
     let collector = Arc::new(GameActivityCollector::new());
     // Member A: 30 minutes of Apex with 1 minute in voice. Control member B:
-    // 10 minutes of Zelda. After a correct mid-flush suppression of A, only
+    // 30 minutes of Zelda. After a correct mid-flush suppression of A, only
     // B's Zelda row may exist.
     seed_play(&collector, MEMBER_A, "Apex", T0, 30);
     seed_voice(&collector, MEMBER_A, T0, 1);
-    seed_play(&collector, MEMBER_B, "Zelda", T0, 10);
+    seed_play(&collector, MEMBER_B, "Zelda", T0, 30);
 
     // Park the flush at its gate read: an ACCESS EXCLUSIVE lock on the
     // suppression table blocks both a plain gate SELECT and a lock-first
@@ -225,7 +228,7 @@ async fn suppression_installed_mid_flush_contributes_zero() {
         .expect("lock suppression table");
     let persist_pool = pool.clone();
     let persist_collector = Arc::clone(&collector);
-    let mut persist = tokio::spawn(async move {
+    let persist = tokio::spawn(async move {
         persist_guild(
             &persist_pool,
             &persist_collector,
@@ -342,7 +345,7 @@ async fn suppression_installed_mid_flush_contributes_zero() {
             );
             assert_eq!(
                 stored_game(&pool, "Zelda").await,
-                Some((10 * MIN, 0, 1)),
+                Some((30 * MIN, 0, 1)),
                 "the un-suppressed member's session persists unchanged"
             );
         }
@@ -380,7 +383,7 @@ async fn suppression_installed_mid_flush_contributes_zero() {
             // not grow from post-suppression play.
             assert_eq!(
                 stored_game(&pool, "Zelda").await,
-                Some((10 * MIN, 0, 1)),
+                Some((30 * MIN, 0, 1)),
                 "the un-suppressed member's session persists unchanged"
             );
             let apex_before = stored_game(&pool, "Apex").await;
@@ -416,7 +419,7 @@ async fn suppression_before_flush_contributes_zero_and_control_persists() {
     let collector = GameActivityCollector::new();
     seed_play(&collector, MEMBER_A, "Apex", T0, 30);
     seed_voice(&collector, MEMBER_A, T0, 1);
-    seed_play(&collector, MEMBER_B, "Zelda", T0, 10);
+    seed_play(&collector, MEMBER_B, "Zelda", T0, 30);
     let outcome = persist_guild(&pool, &collector, GUILD, GAP_TIMEOUT_MS, T0 + 30 * MIN)
         .await
         .expect("sequential flush succeeds");
@@ -428,7 +431,7 @@ async fn suppression_before_flush_contributes_zero_and_control_persists() {
         }
     );
     assert_eq!(stored_game(&pool, "Apex").await, None);
-    assert_eq!(stored_game(&pool, "Zelda").await, Some((10 * MIN, 0, 1)));
+    assert_eq!(stored_game(&pool, "Zelda").await, Some((30 * MIN, 0, 1)));
     teardown(fixture, pool).await;
 }
 
@@ -444,7 +447,7 @@ async fn flush_then_purge_leaves_report_unchanged_and_later_flushes_add_zero() {
     let collector = GameActivityCollector::new();
     seed_play(&collector, MEMBER_A, "Apex", T0, 30);
     seed_voice(&collector, MEMBER_A, T0, 1);
-    seed_play(&collector, MEMBER_B, "Zelda", T0, 10);
+    seed_play(&collector, MEMBER_B, "Zelda", T0, 30);
     persist_guild(&pool, &collector, GUILD, GAP_TIMEOUT_MS, T0 + 30 * MIN)
         .await
         .expect("pre-opt-out flush succeeds");
@@ -452,7 +455,7 @@ async fn flush_then_purge_leaves_report_unchanged_and_later_flushes_add_zero() {
         .await
         .expect("read aggregates before purge");
     assert_eq!(stored_game(&pool, "Apex").await, Some((30 * MIN, MIN, 1)));
-    assert_eq!(stored_game(&pool, "Zelda").await, Some((10 * MIN, 0, 1)));
+    assert_eq!(stored_game(&pool, "Zelda").await, Some((30 * MIN, 0, 1)));
 
     let db = CutoverDb::from_pool(pool.clone());
     opt_out_member(&db, &guild_text(), &MEMBER_A.to_string(), "acceptance-test")
