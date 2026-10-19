@@ -691,6 +691,11 @@ mod tests {
         Delivered,
     }
 
+    /// Distinctive database-error text for the fake release failure.
+    /// Shared by the fake and `assert_unreleased_warn` so the forbidden
+    /// match in the warn helper cannot go stale if the fake text changes.
+    const FAKE_RELEASE_ERROR_SENTINEL: &str = "fake-release-error-sentinel";
+
     /// In-memory ledger mirroring the store's classification at the trait
     /// boundary: fresh insert claims, a never-started row is `InFlight`, a
     /// started/delivered row is `Duplicate`, release only frees a started
@@ -778,7 +783,9 @@ mod tests {
         ) -> LedgerFuture<'a, bool> {
             Box::pin(async move {
                 if self.fail_release_err {
-                    return Err(sqlx::Error::InvalidArgument("fake release failure".into()));
+                    return Err(sqlx::Error::InvalidArgument(
+                        FAKE_RELEASE_ERROR_SENTINEL.into(),
+                    ));
                 }
                 if self.fail_release_noop {
                     return Ok(false);
@@ -892,7 +899,7 @@ mod tests {
     /// The failed-release warn is a fixed class: a WARN line naming the
     /// `send_failed_unreleased` reason and carrying no delivery data
     /// (no broadcaster, login, channel, invite, claim token or dedup
-    /// key), so it is safe to alert on as-is.
+    /// key) and no database error text, so it is safe to alert on as-is.
     fn assert_unreleased_warn(capture: &WarnCapture) {
         let text = capture.text();
         assert!(
@@ -904,17 +911,18 @@ mod tests {
             .lines()
             .find(|line| line.contains("WARN") && line.contains("send_failed_unreleased"))
             .expect("warn line present (asserted above)");
-        for delivery_data in [
+        for forbidden in [
             "123456",
             "ourgamenight",
             "777",
             "discord.gg/example",
             "fake-token",
+            FAKE_RELEASE_ERROR_SENTINEL,
             &live_dedup_key(&stream()),
         ] {
             assert!(
-                !line.contains(delivery_data),
-                "warn must not carry delivery data ({delivery_data}): {line}"
+                !line.contains(forbidden),
+                "warn must not carry delivery data or database error text ({forbidden}): {line}"
             );
         }
     }
