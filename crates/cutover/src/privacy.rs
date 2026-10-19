@@ -27,9 +27,12 @@
 //!
 //! Like `erase_member`, execute takes bounded locks before counting so a
 //! concurrent write cannot slip between count and delete, with a 5-second
-//! lock timeout and a 15-second statement timeout. Repeating an opt-out is
-//! safe: the suppression install is idempotent and each invocation writes
-//! its own receipt for the purge it performed (possibly zero rows).
+//! lock timeout and a 15-second statement timeout. Opt-out and opt-in share
+//! a transaction-scoped advisory lock per pair. An already-suppressed pair
+//! skips the purge locks and writes no new receipt; a first opt-out still
+//! writes a receipt even when there are no stored rows to purge.
+
+use sqlx::{Postgres, Transaction};
 
 use crate::db::CutoverDb;
 use crate::member_erasure::{plan, TableCount};
@@ -51,9 +54,24 @@ fn valid_actor(actor: &str) -> bool {
     !actor.trim().is_empty() && actor.len() <= 128 && !actor.chars().any(char::is_control)
 }
 
+const SUPPRESSED_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)";
+const RECENT_OPT_OUT_SQL: &str = "SELECT EXISTS(SELECT 1 FROM privacy_opt_out_audit
+      WHERE guild_id = $1 AND member_id = $2
+      AND opted_out_at > clock_timestamp() - make_interval(mins => $3))";
+
+/// A decision made under the pair lock, not inferred from purged row counts.
+#[derive(Debug)]
+pub enum OptOutOutcome {
+    OptedOut(Vec<TableCount>),
+    AlreadyOptedOut,
+    Cooldown,
+}
+
 /// Purge the member's event-store rows for the guild, install guild-scoped
 /// suppression, and write exactly one audit receipt — all in one
-/// transaction. Returns the per-table purged counts. Never puts the subject
+/// transaction. Already-suppressed pairs return zero per-table counts and
+/// write no receipt. Operator calls have no cooldown. Never puts the subject
 /// ID, counts or content into the audit actor label: `actor` is
 /// operator-supplied attribution (nonempty, at most 128 characters, no
 /// control characters, never a secret).
@@ -63,6 +81,65 @@ pub async fn opt_out_member(
     member: &str,
     actor: &str,
 ) -> Result<Vec<TableCount>, sqlx::Error> {
+    match opt_out(db, guild, member, actor, None).await? {
+        OptOutOutcome::OptedOut(counts) => Ok(counts),
+        OptOutOutcome::AlreadyOptedOut | OptOutOutcome::Cooldown => Ok(PURGE_TABLES
+            .iter()
+            .map(|table| TableCount {
+                table: (*table).to_owned(),
+                rows: 0,
+            })
+            .collect()),
+    }
+}
+
+/// Member self-serve: the same atomic opt-out, with the existing receipt
+/// cooldown checked after suppression, under the same lock as opt-in.
+/// Callers must use the explicit outcome to choose their reply: an empty
+/// first purge is not an already-opted-out result.
+pub async fn opt_out_member_with_cooldown(
+    db: &CutoverDb,
+    guild: &str,
+    member: &str,
+    actor: &str,
+    cooldown_minutes: i32,
+) -> Result<OptOutOutcome, sqlx::Error> {
+    if cooldown_minutes <= 0 {
+        return Err(sqlx::Error::InvalidArgument(
+            "invalid opt-out cooldown".into(),
+        ));
+    }
+    opt_out(db, guild, member, actor, Some(cooldown_minutes)).await
+}
+
+async fn begin_member_change<'a>(
+    db: &'a CutoverDb,
+    guild: &str,
+    member: &str,
+) -> Result<Transaction<'a, Postgres>, sqlx::Error> {
+    let mut tx = db.pool().begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '15s'")
+        .execute(&mut *tx)
+        .await?;
+    // Always take this before table/row locks, including when no suppression
+    // row exists. Transaction scope releases it on commit, error or cancel.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("privacy:{guild}:{member}"))
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
+async fn opt_out(
+    db: &CutoverDb,
+    guild: &str,
+    member: &str,
+    actor: &str,
+    cooldown_minutes: Option<i32>,
+) -> Result<OptOutOutcome, sqlx::Error> {
     if !valid_identity(guild, member) {
         return Err(sqlx::Error::InvalidArgument(
             "invalid opt-out identity".into(),
@@ -84,13 +161,28 @@ pub async fn opt_out_member(
         };
         predicates.push((table, entry.predicate.clone()));
     }
-    let mut tx = db.pool().begin().await?;
-    sqlx::query("SET LOCAL lock_timeout = '5s'")
-        .execute(&mut *tx)
+    let mut tx = begin_member_change(db, guild, member).await?;
+    let suppressed: bool = sqlx::query_scalar(SUPPRESSED_SQL)
+        .bind(guild)
+        .bind(member)
+        .fetch_one(&mut *tx)
         .await?;
-    sqlx::query("SET LOCAL statement_timeout = '15s'")
-        .execute(&mut *tx)
-        .await?;
+    if suppressed {
+        tx.commit().await?;
+        return Ok(OptOutOutcome::AlreadyOptedOut);
+    }
+    if let Some(minutes) = cooldown_minutes {
+        let recent: bool = sqlx::query_scalar(RECENT_OPT_OUT_SQL)
+            .bind(guild)
+            .bind(member)
+            .bind(minutes)
+            .fetch_one(&mut *tx)
+            .await?;
+        if recent {
+            tx.commit().await?;
+            return Ok(OptOutOutcome::Cooldown);
+        }
+    }
     // One stable ordering for all opt-outs, audit table included so a
     // missing/denied receipt insert cannot lead to an unrecorded commit.
     let mut locked: Vec<&str> = Vec::with_capacity(PURGE_TABLES.len() + 2);
@@ -149,14 +241,14 @@ pub async fn opt_out_member(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(counts)
+    Ok(OptOutOutcome::OptedOut(counts))
 }
 
 /// Whether the pair has a purge receipt younger than `cooldown_minutes`.
-/// Member self-serve checks this before `opt_out_member` so a repeat tap or
-/// a rapid opt-in/opt-out loop cannot retake the purge's write-blocking
-/// locks on every invocation. Returns false when no receipt exists or the
-/// youngest receipt is older than the window. Read-only: no locks taken.
+/// Read-only inspection, not an authorization guard: member self-serve uses
+/// `opt_out_member_with_cooldown` to make the decision under the pair lock.
+/// Returns false when no receipt exists or the youngest receipt is older
+/// than the window. Read-only: no locks taken.
 pub async fn has_recent_opt_out(
     db: &CutoverDb,
     guild: &str,
@@ -173,16 +265,12 @@ pub async fn has_recent_opt_out(
             "invalid opt-out cooldown".into(),
         ));
     }
-    let recent: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM privacy_opt_out_audit
-          WHERE guild_id = $1 AND member_id = $2
-          AND opted_out_at > clock_timestamp() - make_interval(mins => $3))",
-    )
-    .bind(guild)
-    .bind(member)
-    .bind(cooldown_minutes)
-    .fetch_one(db.pool())
-    .await?;
+    let recent: bool = sqlx::query_scalar(RECENT_OPT_OUT_SQL)
+        .bind(guild)
+        .bind(member)
+        .bind(cooldown_minutes)
+        .fetch_one(db.pool())
+        .await?;
     Ok(recent)
 }
 
@@ -196,13 +284,15 @@ pub async fn opt_back_in(db: &CutoverDb, guild: &str, member: &str) -> Result<bo
             "invalid opt-out identity".into(),
         ));
     }
+    let mut tx = begin_member_change(db, guild, member).await?;
     let removed =
         sqlx::query("DELETE FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2")
             .bind(guild)
             .bind(member)
-            .execute(db.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
+    tx.commit().await?;
     Ok(removed == 1)
 }
 
@@ -215,13 +305,11 @@ pub async fn is_opted_out(db: &CutoverDb, guild: &str, member: &str) -> Result<b
             "invalid opt-out identity".into(),
         ));
     }
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
-    )
-    .bind(guild)
-    .bind(member)
-    .fetch_one(db.pool())
-    .await?;
+    let exists: bool = sqlx::query_scalar(SUPPRESSED_SQL)
+        .bind(guild)
+        .bind(member)
+        .fetch_one(db.pool())
+        .await?;
     Ok(exists)
 }
 
@@ -282,6 +370,27 @@ pub async fn set_analytics_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_cooldown_refuses_before_connecting() {
+        // No connection is opened: argument validation must finish first.
+        let db = CutoverDb::from_pool(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy_with(sqlx::postgres::PgConnectOptions::new()),
+        );
+        for minutes in [0, -1] {
+            let result = opt_out_member_with_cooldown(
+                &db,
+                "1545644954272137297",
+                "123456789012345678",
+                "member:self-serve",
+                minutes,
+            )
+            .await;
+            assert!(matches!(result, Err(sqlx::Error::InvalidArgument(_))));
+        }
+        db.close().await;
+    }
 
     #[test]
     fn purge_tables_come_from_the_reviewed_plan() {
