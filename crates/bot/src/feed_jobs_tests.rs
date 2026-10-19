@@ -1495,3 +1495,401 @@ async fn public_feed_fetch_records_failed_fetch_without_network() {
         "no feed id in any label, got:\n{text}"
     );
 }
+
+// ── Acceptance: removal serialized with delivery ──────────────────────────
+// Protected acceptance tests. Relay removal and delivery admission/send/
+// settlement must share one bounded guild/feed-scoped database fence across
+// separately constructed pools: removal refuses (retaining relay + ledger)
+// while any pending delivery evidence is unresolved, a stale polled relay
+// cannot POST after confirmed removal, and a held POST is never outlived by
+// a confirmed removal that cascades its recovery evidence away. Settled and
+// no-pending removal, not-found and foreign-guild behaviour stay as today.
+
+/// Attempt removal without pinning its return shape: the contract under
+/// test is the surviving database state and the command reply, so any
+/// outcome type the store returns must leave the rows asserted below.
+async fn attempt_remove(pool: &PgPool, guild: &str, id: &str) {
+    let _ = store::remove_feed(pool, guild, id).await;
+}
+
+async fn relay_count(pool: &PgPool, id: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM feed_relays WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// (item_key, nonce, state, message_id) for one relay, in ledger order.
+async fn delivery_rows(
+    pool: &PgPool,
+    feed_id: &str,
+) -> Vec<(String, String, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT item_key, nonce, state, message_id FROM feed_deliveries
+          WHERE feed_id = $1 ORDER BY item_key",
+    )
+    .bind(feed_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn seed_pending(pool: &PgPool, relay: &FeedRelay, index: usize) -> FeedPost {
+    let post = plan_post(relay, &item(index)).unwrap();
+    assert_eq!(
+        store::claim_delivery(
+            pool,
+            GUILD,
+            &post,
+            &format!("pending-seed-{index}"),
+            now_millis_for_test()
+        )
+        .await
+        .unwrap(),
+        Some(DeliveryClaim::Fresh),
+        "seed one pending delivery claim"
+    );
+    post
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn removal_with_pending_delivery_retains_relay_and_exact_ledger() {
+    let db = fixture().await;
+    let relay = feed("removal-pending");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let post = seed_pending(db.pool(), &relay, 0).await;
+    let before = delivery_rows(db.pool(), &relay.id).await;
+    assert_eq!(
+        before,
+        vec![(
+            post.item_key.clone(),
+            post.nonce.clone(),
+            "pending".to_owned(),
+            None
+        )]
+    );
+
+    // Removal runs on a separately constructed pool: only a database fence
+    // shared across store instances can refuse it, never in-process state.
+    let remover = db.independent_pool().await.unwrap();
+    attempt_remove(&remover, GUILD, &relay.id).await;
+
+    assert_eq!(
+        relay_count(&remover, &relay.id).await,
+        1,
+        "removal must be refused while pending delivery evidence is unresolved"
+    );
+    assert_eq!(
+        delivery_rows(&remover, &relay.id).await,
+        before,
+        "the exact pending ledger row must survive the refused removal"
+    );
+    remover.close().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn removal_of_settled_or_never_pending_relay_still_succeeds() {
+    let db = fixture().await;
+    let settled = feed("removal-settled");
+    store::add_feed(db.pool(), &settled).await.unwrap();
+    let post = seed_pending(db.pool(), &settled, 0).await;
+    assert!(
+        store::mark_delivered(
+            db.pool(),
+            GUILD,
+            &post,
+            "pending-seed-0",
+            "9001",
+            now_millis_for_test()
+        )
+        .await
+        .unwrap(),
+        "settle the only delivery"
+    );
+    let untouched = feed("removal-never-pending");
+    store::add_feed(db.pool(), &untouched).await.unwrap();
+
+    let remover = db.independent_pool().await.unwrap();
+    attempt_remove(&remover, GUILD, &settled.id).await;
+    attempt_remove(&remover, GUILD, &untouched.id).await;
+    attempt_remove(&remover, GUILD, "removal-absent").await;
+
+    assert_eq!(relay_count(&remover, &settled.id).await, 0);
+    assert_eq!(relay_count(&remover, &untouched.id).await, 0);
+    assert_eq!(
+        states(&remover).await,
+        (0, 0),
+        "settled/no-pending removal keeps its current cascade; absent id is a no-op"
+    );
+    remover.close().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn foreign_guild_removal_and_claim_cannot_touch_pending_evidence() {
+    let db = fixture().await;
+    let relay = feed("removal-foreign");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    seed_pending(db.pool(), &relay, 0).await;
+    let before = delivery_rows(db.pool(), &relay.id).await;
+
+    let foreign = db.independent_pool().await.unwrap();
+    attempt_remove(&foreign, "7777", &relay.id).await;
+    let foreign_post = plan_post(&relay, &item(1)).unwrap();
+    assert_eq!(
+        store::claim_delivery(
+            &foreign,
+            "7777",
+            &foreign_post,
+            "foreign-seed",
+            now_millis_for_test()
+        )
+        .await
+        .unwrap(),
+        None,
+        "a foreign guild can never claim against this relay"
+    );
+
+    assert_eq!(relay_count(&foreign, &relay.id).await, 1);
+    assert_eq!(delivery_rows(&foreign, &relay.id).await, before);
+    foreign.close().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn stale_polled_relay_cannot_post_after_confirmed_removal() {
+    let db = fixture().await;
+    store::add_feed(db.pool(), &feed("removal-stale"))
+        .await
+        .unwrap();
+    let stale = store::list_feeds(db.pool(), GUILD, true).await.unwrap();
+    assert_eq!(stale.len(), 1);
+    attempt_remove(db.pool(), GUILD, &stale[0].id).await;
+    assert_eq!(
+        relay_count(db.pool(), &stale[0].id).await,
+        0,
+        "control: the no-pending removal really confirmed"
+    );
+
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"9001"}))).await;
+    let rest = executor(&mock);
+    // Direct stale-relay poll and a fresh full pass alike: existence is
+    // revalidated at delivery admission, so neither may send or claim.
+    let _ = poll_relay(db.pool(), &rest, &stale[0], &FixtureHttp::items(1)).await;
+    run_once(db.pool(), &rest, GUILD, &FixtureHttp::items(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        post_count(&mock),
+        0,
+        "zero POSTs for a relay whose removal already confirmed"
+    );
+    assert_eq!(states(db.pool()).await, (0, 0));
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn held_post_removal_never_confirms_before_settlement() {
+    let db = fixture().await;
+    let relay = feed("removal-held-race");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let (mock, gate) = MockRest::start_gated(
+        vec![ScriptedResponse::json(200, json!({"id":"9001"}))],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+    let poll_pool = db.pool().clone();
+    let poll = tokio::spawn(async move {
+        let poller = FeedPoller::default();
+        let http = FixtureHttp::items(1);
+        poller.run_once(&poll_pool, &rest, GUILD, &http).await
+    });
+    gate.wait_for_request().await;
+    assert_eq!(
+        states(db.pool()).await,
+        (0, 1),
+        "the held POST holds exactly one pending claim"
+    );
+
+    // Race the removal from a separately constructed pool while the POST is
+    // still held at the mock. Either serialization is acceptable — refusal
+    // now, or wait for settlement — but confirmed removal before settlement
+    // is not: that is the window where the cascade deletes live evidence.
+    let remover = db.independent_pool().await.unwrap();
+    let race_id = relay.id.clone();
+    let race_pool = remover.clone();
+    let mut removal = tokio::spawn(async move {
+        attempt_remove(&race_pool, GUILD, &race_id).await;
+    });
+    let finished_early = tokio::time::timeout(Duration::from_millis(750), &mut removal).await;
+    assert_eq!(
+        relay_count(db.pool(), &relay.id).await,
+        1,
+        "relay survives while its POST is held (removal finished early: {})",
+        finished_early.is_ok()
+    );
+    assert_eq!(
+        states(db.pool()).await,
+        (0, 1),
+        "pending evidence survives while its POST is held"
+    );
+
+    gate.release();
+    poll.await.unwrap().unwrap();
+    removal.await.unwrap();
+    assert_eq!(post_count(&mock), 1, "exactly the one held POST was sent");
+    if relay_count(db.pool(), &relay.id).await == 1 {
+        assert_eq!(
+            states(db.pool()).await,
+            (1, 0),
+            "refused removal leaves the settled delivery on the retained relay"
+        );
+        run_once(db.pool(), &executor(&mock), GUILD, &FixtureHttp::items(1))
+            .await
+            .unwrap();
+        assert_eq!(post_count(&mock), 1, "no blind repost on a later pass");
+    } else {
+        assert_eq!(
+            states(db.pool()).await,
+            (0, 0),
+            "removal serialized after settlement may then cascade the settled ledger"
+        );
+    }
+    remover.close().await;
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn accepted_but_unrecorded_send_survives_removal_attempt_and_restart() {
+    let db = fixture().await;
+    let relay = feed("removal-unrecorded");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    sqlx::raw_sql("CREATE FUNCTION refuse_feed_completion_race() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.state = 'delivered' THEN RAISE EXCEPTION 'fixture completion failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_completion_race BEFORE UPDATE ON feed_deliveries FOR EACH ROW EXECUTE FUNCTION refuse_feed_completion_race();")
+        .execute(db.pool()).await.unwrap();
+    let post = plan_post(&relay, &item(0)).unwrap();
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"id":"9001"})),
+            me(),
+            history(&post),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+    assert_eq!(
+        run_once(db.pool(), &rest, GUILD, &FixtureHttp::items(1))
+            .await
+            .err(),
+        Some(ErrorClass::RecoveryRequired),
+        "accepted on the wire, unrecorded in the ledger"
+    );
+    assert_eq!(states(db.pool()).await, (0, 1));
+    let before = delivery_rows(db.pool(), &relay.id).await;
+
+    let remover = db.independent_pool().await.unwrap();
+    attempt_remove(&remover, GUILD, &relay.id).await;
+    assert_eq!(
+        relay_count(&remover, &relay.id).await,
+        1,
+        "removal must not cascade away an accepted-but-unrecorded send"
+    );
+    assert_eq!(delivery_rows(&remover, &relay.id).await, before);
+    remover.close().await;
+
+    sqlx::raw_sql(
+        "DROP TRIGGER fail_completion_race ON feed_deliveries; DROP FUNCTION refuse_feed_completion_race();",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    expire(db.pool()).await;
+    let reopened = db.independent_pool().await.unwrap();
+    run_once(&reopened, &rest, GUILD, &FixtureHttp::items(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        states(&reopened).await,
+        (1, 0),
+        "restart reconciles the retained evidence by nonce"
+    );
+    assert_eq!(post_count(&mock), 1, "reconciliation never reposts");
+
+    attempt_remove(&reopened, GUILD, &relay.id).await;
+    assert_eq!(
+        relay_count(&reopened, &relay.id).await,
+        0,
+        "once settled, the same removal is allowed again"
+    );
+    reopened.close().await;
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn unconfirmed_send_survives_removal_attempts_and_restart_without_repost() {
+    let db = fixture().await;
+    let relay = feed("removal-unconfirmed");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    // A 200 with no usable id is the timeout/ambiguous class: the send may
+    // have landed, so the claim stays pending for nonce reconciliation.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({})),
+            me(),
+            ScriptedResponse::json(200, json!([])),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let rest = executor(&mock);
+    assert_eq!(
+        run_once(db.pool(), &rest, GUILD, &FixtureHttp::items(1))
+            .await
+            .err(),
+        Some(ErrorClass::RecoveryRequired)
+    );
+    assert_eq!(states(db.pool()).await, (0, 1));
+    let before = delivery_rows(db.pool(), &relay.id).await;
+
+    let remover = db.independent_pool().await.unwrap();
+    attempt_remove(&remover, GUILD, &relay.id).await;
+    assert_eq!(relay_count(&remover, &relay.id).await, 1);
+    assert_eq!(delivery_rows(&remover, &relay.id).await, before);
+    remover.close().await;
+
+    expire(db.pool()).await;
+    let reopened = db.independent_pool().await.unwrap();
+    assert_eq!(
+        run_once(&reopened, &rest, GUILD, &FixtureHttp::items(0))
+            .await
+            .err(),
+        Some(ErrorClass::RecoveryRequired),
+        "a history miss after restart is still uncertainty, not absence"
+    );
+    assert_eq!(states(&reopened).await, (0, 1));
+    assert_eq!(post_count(&mock), 1, "no blind resend after restart");
+
+    attempt_remove(&reopened, GUILD, &relay.id).await;
+    assert_eq!(
+        relay_count(&reopened, &relay.id).await,
+        1,
+        "still-unresolved evidence still refuses removal after restart"
+    );
+    assert_eq!(delivery_rows(&reopened, &relay.id).await.len(), 1);
+    reopened.close().await;
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
