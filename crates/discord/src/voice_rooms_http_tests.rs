@@ -2,6 +2,8 @@
 
 #[path = "voice_creation_receipt_acceptance_tests.rs"]
 mod creation_receipt_acceptance;
+#[path = "voice_creation_receipt_edge_tests.rs"]
+mod creation_receipt_edges;
 
 use super::*;
 use axum::{
@@ -134,7 +136,7 @@ fn attributes() -> RoomChannelAttributes {
 }
 
 fn created_channel() -> Value {
-    json!({ "id": "600", "guild_id": "100", "type": 2, "name": "room" })
+    json!({ "id": "600", "guild_id": "100", "type": 2, "name": "room", "parent_id": "400" })
 }
 
 fn deferred_response() -> InteractionResponse {
