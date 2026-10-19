@@ -44,10 +44,13 @@ library code with no Discord dependency and can start immediately.
   the store and live category channels are protected too. Boot process inputs
   `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,
   `TWO_TEMP_VOICE_CATEGORY_ID` and comma-separated `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS`
-  supply additional protection; malformed IDs disable the voice runtime. Stored
-  settings remain unwired. `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600, read
-  at boot) sets the empty grace; unset keeps 60 seconds. `0` deletes a room on
-  the next tick after its last human leaves, matching the interim voice bot.
+  supply additional protection; malformed IDs disable the voice runtime. A stored
+  per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row (0 to 600 whole seconds)
+  overrides the boot value live without a restart; out-of-range rows fail closed
+  to the boot value with an `out_of_range` warning. `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS`
+  (0 to 600, read at boot) sets the empty grace; unset keeps 60 seconds. `0`
+  deletes a room on the next tick after its last human leaves, matching the
+  interim voice bot.
 - If the member can't be moved in (missing Move Members, or they left first), the
   bot deletes the room immediately.
 - Create admission (Auto-Voice parity): one room per member, 40 per guild, no
