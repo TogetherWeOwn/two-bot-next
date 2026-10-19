@@ -13130,15 +13130,23 @@ where
             }
             let interaction = created.0.clone();
             let vanity_code = vanity_code_from_cache(cache, &interaction);
-            let snapshot = (self.runtime.live_source)();
-            let invite_code = stored_invite_code_with(
-                &interaction
-                    .guild_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_default(),
-                vanity_code.as_deref(),
-                snapshot.as_ref(),
-            );
+            // The stored override resolves only for `/invite` (the sole
+            // renderer of `invite_code`): other interactions keep the plain
+            // vanity code, so an invalid row warns on invites, not on every
+            // voice interaction.
+            let invite_code = if matches!(command, Some(VoiceCommand::Invite)) {
+                let snapshot = (self.runtime.live_source)();
+                stored_invite_code_with(
+                    &interaction
+                        .guild_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    vanity_code.as_deref(),
+                    snapshot.as_ref(),
+                )
+            } else {
+                vanity_code
+            };
             let inventory = interaction_guild(&interaction)
                 .and_then(|guild_id| inventory_from_cache(cache, guild_id));
             let names = name_directory_from_cache(cache, &interaction);
