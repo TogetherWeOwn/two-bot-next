@@ -130,6 +130,26 @@ Scalar gateway series pair with the labels above:
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert) |
 | `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels |
 
+## Automod facts read warnings
+
+Source: `RestAutomodFacts::get` in `crates/discord/src/automod_activation.rs`.
+
+| Event | Level | Fields | Meaning |
+| --- | --- | --- | --- |
+| `automod_facts_read_failed` | WARN | `step`: `guild`, `bot_member`, `target_member` or `message`; `cause`: the fixed vocabulary from `DiscordError::cause()` in `crates/discord/src/executor.rs` | A strict Discord facts read failed; the caller still returns unavailable facts and preserves the existing fail-closed decision. Enrichment's author-member read uses `target_member`. |
+
+Only `Err` emits: successful reads and 404 (`Ok(None)`) stay silent and do not
+consume the warning window. The first failure emits immediately, then at most
+one warning per 60 seconds per facts resolver, shared across all steps and
+guilds. This constant-memory sampler also bounds each guild's warnings; a
+failure in one guild can suppress another guild's warning in the same window.
+Suppressed failures do not extend the window. The event carries no path,
+guild/member/message IDs, response body or formatted error. It adds no metric
+or retry and does not change `ActivationOutcome::Unavailable` or the eight
+terminal decision outcomes above. Missing or incomplete facts can still yield
+`Unavailable` without this warning; the warning is a sampled error signal,
+not a count of unavailable decisions.
+
 ## Voice stall gauge series
 
 Aggregated across all current guild actors. Before the aggregation change a
