@@ -2,8 +2,8 @@
 //! test is ignored and runs only on agent-testdb / the CI service container.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -359,6 +359,8 @@ fn posted_contents(mock: &MockRest) -> Vec<String> {
         .collect()
 }
 
+static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -366,11 +368,15 @@ struct TestSchema {
 
 impl TestSchema {
     async fn new() -> Self {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("tog10430_risk_{stamp}");
+        // PID + process-local counter: wall-clock nanos can repeat across
+        // parallel tests on a coarse clock (run 39175965289 attempt 1:
+        // duplicate schema `tog10430_risk_*` -> 23505), while a counter is
+        // unique per process and the PID separates test binaries.
+        let schema = format!(
+            "tog10430_risk_{}_{}",
+            std::process::id(),
+            NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
+        );
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");

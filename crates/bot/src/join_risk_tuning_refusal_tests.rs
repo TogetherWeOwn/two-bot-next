@@ -32,7 +32,7 @@
 //! at compile time (the fallible reader does not exist yet).
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
@@ -237,6 +237,8 @@ async fn discord() -> MockRest {
     .await
 }
 
+static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -244,11 +246,13 @@ struct TestSchema {
 
 impl TestSchema {
     async fn new() -> Self {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("joinrisk_refusal_{stamp}");
+        // Same PID + counter scheme as join_risk_runtime_tests: nanos can
+        // repeat across parallel tests sharing one test binary.
+        let schema = format!(
+            "joinrisk_refusal_{}_{}",
+            std::process::id(),
+            NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
+        );
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");
