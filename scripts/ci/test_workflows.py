@@ -2451,6 +2451,15 @@ class WorkflowTests(unittest.TestCase):
             step["run"],
         )
         self.assertIn("MEMBER_TESTDB=agent-testdb", step["run"])
+        # The member-moderation guard panics without MEMBER_TESTDB, so the
+        # export must precede the ignored sweep: otherwise the suite prints
+        # 32 FAILED lines in a tolerated sweep that the flake ledger
+        # misattributes as real flakes. The dedicated re-run below stays the
+        # fail-closed gate.
+        self.assertLess(
+            step["run"].index("export MEMBER_TESTDB=agent-testdb"),
+            step["run"].index("--no-report -- --ignored --test-threads=1"),
+        )
         for target in (
             "channel_moderation_runtime",
             "internal_channel_moderation",
