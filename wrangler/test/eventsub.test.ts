@@ -107,7 +107,8 @@ async function harness(t: TestContext, env: Record<string, unknown>, options: { 
   const seen: Seen[] = [];
   const values = new Map<string, unknown>([[OWNER_KEY, "owner" in options ? options.owner : OWNER]]);
   const listening = new Set<number>();
-  let receiver: (request: Seen) => Response | Promise<Response> = () => Response.json({ ok: true });
+  let receiver: (request: Seen) => Response | Promise<Response> = (request) =>
+    Response.json({ ok: true, request_id: request.headers["x-request-id"] });
   const runtime = {
     running: false,
     async destroy() { this.running = false; },
@@ -467,7 +468,10 @@ test("per-IP bucket returns 429 before the container; the in-flight cap bounds c
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const stalled = {
-    TWO_BOT: { getByName: () => ({ fetch: async () => { await gate; return Response.json({ ok: true }); } }) },
+    TWO_BOT: { getByName: () => ({ fetch: async (request: Request) => {
+      await gate;
+      return Response.json({ ok: true, request_id: request.headers.get("x-request-id") });
+    } }) },
   };
   const env = { ...ENABLED_ENV, ...stalled } as unknown as Env;
   const held = Array.from({ length: MAX_IN_FLIGHT }, () =>
@@ -535,12 +539,15 @@ test("a challenge answer relays as text/plain byte for byte; receiver 4xx verdic
   assert.equal(await challenge.text(), CHALLENGE);
   assert.equal(challenge.headers.get("cache-control"), "no-store");
 
-  // The receiver's own 4xx verdict (bad signature, stale timestamp, wrong
-  // subscription) relays with its status; the Worker adds nothing.
-  h.setReceiver(() => Response.json({ ok: false, error: { code: "bad_signature" } }, { status: 401 }));
+  // The receiver maps bad signatures and stale timestamps to the same
+  // unauthorized refusal; deterministic wrong-subscription deliveries ack.
+  h.setReceiver((request) => Response.json({
+    ok: false, request_id: request.headers["x-request-id"],
+    error: { code: "unauthorized", message: "request refused", retryable: false },
+  }, { status: 401 }));
   const refused = await h.call(post());
   assert.equal(refused.status, 401);
-  assert.deepEqual((await refused.json() as { error: { code: string } }).error.code, "bad_signature");
+  assert.deepEqual((await refused.json() as { error: { code: string } }).error.code, "unauthorized");
   // The drained happy paths settle the SDK proxy pipe.
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(h.bot["inflightRequests"], 0, "drained relays must release the proxy slot");
@@ -594,12 +601,16 @@ test("relay unit: oversize, wrong-media and bodyless answers never leave; envelo
   const bodyless = await relayEventsubResponse(new Response(null, { status: 204 }));
   assert.equal(bodyless.status, 503);
   await bodyless.arrayBuffer();
-  // JSON envelopes relay with status; only a numeric retry-after survives.
-  const denied = await relayEventsubResponse(Response.json({ ok: false, error: { code: "stale_timestamp" } }, { status: 403, headers: { "retry-after": "7" } }));
-  assert.equal(denied.status, 403);
+  // Complete receiver envelopes retain status; only numeric retry-after survives.
+  const sent = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const denied = await relayEventsubResponse(Response.json({
+    ok: false, request_id: sent,
+    error: { code: "unauthorized", message: "request refused", retryable: false },
+  }, { status: 401, headers: { "retry-after": "7" } }), sent);
+  assert.equal(denied.status, 401);
   assert.equal(denied.headers.get("retry-after"), "7");
-  assert.deepEqual((await denied.json() as { error: { code: string } }).error.code, "stale_timestamp");
-  const odd = await relayEventsubResponse(Response.json({ ok: true }, { status: 200, headers: { "retry-after": "7.5", "x-secret": "leak" } }));
+  assert.deepEqual((await denied.json() as { error: { code: string } }).error.code, "unauthorized");
+  const odd = await relayEventsubResponse(Response.json({ ok: true, request_id: sent }, { status: 200, headers: { "retry-after": "7.5", "x-secret": "leak" } }), sent);
   assert.equal(odd.status, 200);
   assert.equal(odd.headers.get("retry-after"), null);
   assert.equal(odd.headers.get("x-secret"), null);
@@ -701,7 +712,7 @@ test("abort/throw/relay refusals stamp the SHA (no unknown leak)", async (t) => 
 
   // 3. Relay with an already-aborted signal -> 503 unavailable.
   const relayed = await relayEventsubResponse(
-    Response.json({ ok: true }),
+    Response.json({ ok: true, request_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
     "01ARZ3NDEKTSV4RRFFQ69G5FAV",
     AbortSignal.abort(),
     sha,
