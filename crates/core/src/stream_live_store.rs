@@ -895,10 +895,15 @@ mod tests {
     /// key), so it is safe to alert on as-is.
     fn assert_unreleased_warn(capture: &WarnCapture) {
         let text = capture.text();
+        assert!(
+            text.lines()
+                .any(|line| line.contains("WARN") && line.contains("send_failed_unreleased")),
+            "expected an unreleased warn, got: {text}"
+        );
         let line = text
             .lines()
             .find(|line| line.contains("WARN") && line.contains("send_failed_unreleased"))
-            .unwrap_or_else(|| panic!("expected an unreleased warn, got: {text}"));
+            .expect("warn line present (asserted above)");
         for delivery_data in [
             "123456",
             "ourgamenight",
