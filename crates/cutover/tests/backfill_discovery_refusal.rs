@@ -247,16 +247,24 @@ fn text_channel(name: &str) -> Route {
 }
 
 fn run_cli(db: &TestDb, token: &str, bin: &str, base: &str) -> Output {
-    Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .env_clear()
         .env("TWO_DATABASE_URL", &db.url)
         .env("TWO_DATABASE_TLS", "local-only")
         .env("TWO_DB_POOL_MAX", "1")
         .env("DISCORD_TOKEN", token)
         .env("DISCORD_GUILD_ID", GUILD)
-        .args(["--dry-run", "--max-pages=1", "--discord-base", base])
-        .output()
-        .unwrap()
+        .args(["--dry-run", "--max-pages=1", "--discord-base", base]);
+    // Keep coverage instrumentation working across the subprocess boundary:
+    // `env_clear` would otherwise drop the profile path cargo-llvm-cov sets
+    // for this test process, and the instrumented CLI could not write its
+    // profile where the sweep collects it. Forward only that one variable;
+    // nothing else from the parent environment is inherited.
+    if let Some(profile_file) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile_file);
+    }
+    command.output().unwrap()
 }
 
 fn stdout_of(output: &Output) -> String {

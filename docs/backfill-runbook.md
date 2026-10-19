@@ -65,7 +65,7 @@ its flag names settle.
   a channel the token cannot see is skipped, and the scan report says so
   (see §4). Anything outside 2xx/403/404/429/5xx is a hard `Wire` error.
 - Every run prints its own Discord cost (`rest.requests()`,
-  `backfill.rs:470-473`, `backfill_messages.rs:319-323`): requests plus
+  `backfill.rs:472-475`, `backfill_messages.rs:326-330`): requests plus
   wall time. A successful re-run over already-populated history can scan
   pages without inserting rows. Read the scan-completion and
   `INCOMPLETE: unreadable` entries to distinguish a complete no-op from
@@ -180,8 +180,8 @@ in §1.
 
 | Binary | Dry-run form | Write form | Banner / gates |
 |---|---|---|---|
-| `backfill` (member joins/leaves/voice + invite baseline) | `backfill --dry-run` (usage `backfill.rs:26`; flag `63`) | bare `backfill` writes; invite baseline skipped while dry (`392-404`) | `DRY RUN - nothing will be written` (`101-106`); bot marks, event writes and activity touches all gated (`131`, `324`, `449`) |
-| `backfill-messages` (first/second/third message milestones) | `backfill-messages --dry-run` (flag `backfill_messages.rs:29`) | bare writes; milestones only ever move earlier, never later (module docs `1-8`) | banner (`76-80`); ladder writes and activity touches gated (`258-294`) |
+| `backfill` (member joins/leaves/voice + invite baseline) | `backfill --dry-run` (usage `backfill.rs:26`; flag `63`) | bare `backfill` writes; invite baseline skipped while dry (`392-404`) | `DRY RUN - nothing will be written` (`101-106`); bot marks, event writes and activity touches all gated (`131`, `326`, `451`) |
+| `backfill-messages` (first/second/third message milestones) | `backfill-messages --dry-run` (flag `backfill_messages.rs:29`) | bare writes; milestones only ever move earlier, never later (module docs `1-8`) | banner (`76-80`); ladder writes and activity touches gated (`265-301`) |
 | `capture` (join capture) | `capture --dry-run` (flag `capture.rs:26`) | bare writes | banner (`68-70`); writes gated (`145`, `167`) |
 | `dedupe-events` (clear double-logged joins/leaves) | default: counts without writing (`dedupe_events.rs:72`) | bare `--apply` deletes in 200-id chunks (`133-143`); prints `deleted {n}` | `DRY RUN - nothing will be deleted` (`78-82`); dry prints `would delete {found}` plus per-type rows/people/dupes and the remaining total (`124-129`, `159-166`) |
 | retention job (supervised bot job; `retention_jobs.rs`) | `TWO_RETENTION_MODE` unset (default) or `dry-run` reports per-class counts without deleting; runs every 15 minutes (`retention_jobs.rs:23,29,33-43`) | `TWO_RETENTION_MODE=execute` enables deletes; `off` parks the job. See [privacy retention settings](privacy.md#retention-and-explicit-exceptions) | per-class counts are `presence_raw_deleted`/`voice_raw_deleted`/`audit_cache_deleted`/`guild_rows_purged` (`retention.rs:82-90`); receipts, not row counts, for user deletions (`140-144`); `total_deleted` sums disjoint row classes (`146-151`). Stale game-activity aggregates log a `game_activity_aggregate_expiry` event in both modes (`stale_rows`, `horizon_days`, `mode`, `guilds_visited`, `guilds_deferred`): dry run counts the visited page's full stale rows without deleting (a same-predicate upper bound per pass), execute deletes at most the per-guild row batch per visited guild |
@@ -213,8 +213,8 @@ Safety rails, verified in code:
 - `--max-pages` bounds each channel walk (`backfill` default 25,
   `backfill.rs:64-67`; `backfill-messages` default 60,
   `backfill_messages.rs:30-33`). Hitting the cap prints `INCOMPLETE`
-  with a 4× re-run suggestion (`backfill.rs:462-468`,
-  `backfill_messages.rs:304-311`); a capped scan is a lower bound, not
+  with a 4× re-run suggestion (`backfill.rs:464-470`,
+  `backfill_messages.rs:311-318`); a capped scan is a lower bound, not
   a complete result.
 
 Staging-name-only recipe (no secrets, no live run performed for this
@@ -273,10 +273,10 @@ Burst triage:
 - `has_incomplete_history` is true unless every channel ended at
   `end-of-history` (`cli.rs:31-36`); the message-scan summary prints
   `lower bound - incomplete history` in that case
-  (`backfill_messages.rs:239-247`).
+  (`backfill_messages.rs:246-254`).
 - Probe misses are not failures: each candidate channel is probed for
   one page first, and channels under a 5% funnel-data hit rate are
-  skipped as mixed feeds (`backfill.rs:186-221`). Skipped channels are
+  skipped as mixed feeds (`backfill.rs:188-223`). Skipped channels are
   expected, not data loss.
 - Member-list traversal has hard ceilings: 500 pages / 500 000 members
   (`MAX_MEMBER_PAGES`, `MAX_MEMBERS`, `rest.rs:55-57`); a non-advancing
@@ -292,7 +292,7 @@ Burst triage:
   complete roster.
 - Archived-thread discovery has its own budget
   (`DEFAULT_ARCHIVED_THREAD_PAGES = 10`, `rest.rs:769`); early stops are
-  reported per forum (`backfill_messages.rs:312-318`), not silently
+  reported per forum (`backfill_messages.rs:319-325`), not silently
   complete.
 - Route-level anchors: progress-route 503 means the database is
   unreadable (do not read it as "not started"); uniform 401s (bare,
