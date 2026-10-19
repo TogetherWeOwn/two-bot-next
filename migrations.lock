@@ -430,11 +430,11 @@
       "justification": "Replace the broad event-time index with a per-event-class index so capped expiry scans avoid non-expiring event-store families."
     },
     "crates/store/migrations/0446_assistant_monthly_builds.sql": {
-      "sha256": "05180071e4fcec058578c93719193703eb02bea8275b64591e27902760857b52",
+      "sha256": "947269d9cce4a695fb62743588da4a604cae90d330a706c629935425d8da5056",
       "justification": "Per-guild template-assistant monthly-cap ledger (no member columns): one row per guild with month_key plus build_count and a nonnegativity check; store chain copy, IF NOT EXISTS. Renumbered 0444 to 0446 after main claimed 0444/0445 for event-store expiry indexes; never merged under 0444."
     },
     "crates/cutover/migrations/0447_assistant_monthly_builds.sql": {
-      "sha256": "898e68bd029395b268d947b8b98905b1e72d1ea44a5179d9bf14687dd613c724",
+      "sha256": "f5f5cdfc03f21d0a5329afc4924c92fc42a1aac97a25337dc48bf766542f4e39",
       "justification": "Per-guild template-assistant monthly-cap ledger (no member columns): one row per guild with month_key plus build_count and a nonnegativity check; cutover chain copy, IF NOT EXISTS. Numbered 0447 because the store chain owns 0446; global migration numbers remain unique across both chains."
     }
   }

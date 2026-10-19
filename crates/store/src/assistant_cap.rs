@@ -23,7 +23,7 @@
 
 use sqlx::{Pool, Postgres};
 use two_bot_core::{
-    voice_assistant_cap::{CapDecision, MonthKey, MONTHLY_BUILD_LIMIT},
+    voice_assistant_cap::{CapDecision, CapLedger, MonthKey, MONTHLY_BUILD_LIMIT},
     Snowflake,
 };
 
@@ -70,7 +70,6 @@ impl PgAssistantCapLedger {
         }
         let current = month_key(now_secs)?;
         let start = boundary(current.start_unix_secs(), "month start")?;
-        let resets_at = boundary(current.next_start_unix_secs(), "next month start")?;
         let guild = guild_id.to_string();
         let mut tx = self.pool.begin().await?;
         // Ensure a row exists so concurrent first-builds serialize on it: a
@@ -94,47 +93,18 @@ impl PgAssistantCapLedger {
         let (stored_key, stored_count) = row.ok_or_else(|| {
             sqlx::Error::InvalidArgument("cap row vanished after insert".to_owned())
         })?;
-        let stored = MonthKey::from_unix_secs(stored_key)
-            .map_err(|error| sqlx::Error::InvalidArgument(error.to_string()))?;
-        if stored > current {
-            tx.rollback().await?;
-            return Err(sqlx::Error::InvalidArgument(
-                "clock moved before the stored month start".to_owned(),
-            ));
-        }
-        let decision = if stored < current {
+        let decision = decide_build(guild_id, stored_key, stored_count, now_secs)?;
+        if let CapDecision::Allow { remaining } = decision {
             sqlx::query(
-                "UPDATE assistant_monthly_builds SET month_key = $2, build_count = 1, \
+                "UPDATE assistant_monthly_builds SET month_key = $2, build_count = $3, \
                  updated_at = clock_timestamp() WHERE guild_id = $1",
             )
             .bind(&guild)
             .bind(start)
+            .bind(i64::from(MONTHLY_BUILD_LIMIT - remaining))
             .execute(&mut *tx)
             .await?;
-            CapDecision::Allow {
-                remaining: MONTHLY_BUILD_LIMIT - 1,
-            }
-        } else if stored_count >= i64::from(MONTHLY_BUILD_LIMIT) {
-            CapDecision::Deny {
-                limit: MONTHLY_BUILD_LIMIT,
-                resets_at,
-            }
-        } else {
-            let used = u32::try_from(stored_count).map_err(|_| {
-                sqlx::Error::InvalidArgument("persisted build count out of range".to_owned())
-            })? + 1;
-            sqlx::query(
-                "UPDATE assistant_monthly_builds SET build_count = $2, \
-                 updated_at = clock_timestamp() WHERE guild_id = $1",
-            )
-            .bind(&guild)
-            .bind(i64::from(used))
-            .execute(&mut *tx)
-            .await?;
-            CapDecision::Allow {
-                remaining: MONTHLY_BUILD_LIMIT - used,
-            }
-        };
+        }
         tx.commit().await?;
         Ok(decision)
     }
@@ -185,6 +155,22 @@ impl PgAssistantCapLedger {
     }
 }
 
+fn decide_build(
+    guild_id: Snowflake,
+    stored_key: i64,
+    stored_count: i64,
+    now_secs: i64,
+) -> Result<CapDecision, sqlx::Error> {
+    // Counts at or above the cap are equivalent for the decision. Keep BIGINT
+    // over-cap rows denied without narrowing overflow or rewriting their count.
+    let used = u32::try_from(stored_count.min(i64::from(MONTHLY_BUILD_LIMIT))).map_err(|_| {
+        sqlx::Error::InvalidArgument("persisted build count out of range".to_owned())
+    })?;
+    CapLedger::new()
+        .record(guild_id, stored_key, used, now_secs)
+        .map_err(|error| sqlx::Error::InvalidArgument(error.to_string()))
+}
+
 /// The UTC year-month containing `now_secs`, as a [`MonthKey`].
 fn month_key(now_secs: i64) -> Result<MonthKey, sqlx::Error> {
     MonthKey::from_unix_secs(now_secs)
@@ -197,4 +183,46 @@ fn boundary(
     what: &str,
 ) -> Result<i64, sqlx::Error> {
     boundary.map_err(|error| sqlx::Error::InvalidArgument(format!("{what} out of range: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const JAN: i64 = 1_767_225_600;
+    const FEB: i64 = 1_769_904_000;
+
+    #[test]
+    fn malformed_month_start_and_clock_rollback_are_refused() {
+        for (stored_key, now, reason) in [
+            (JAN + 1, JAN + 60, "month start must be the 1st"),
+            (FEB, JAN, "clock moved before the stored month start"),
+        ] {
+            let error = decide_build(1, stored_key, 0, now).unwrap_err();
+            assert!(matches!(error, sqlx::Error::InvalidArgument(_)));
+            assert!(error.to_string().contains(reason));
+        }
+        assert!(decide_build(1, JAN, -1, JAN).is_err());
+    }
+
+    #[test]
+    fn core_decides_last_build_over_cap_and_rollover() {
+        assert_eq!(
+            decide_build(1, JAN, 199, JAN).unwrap(),
+            CapDecision::Allow { remaining: 0 }
+        );
+        for count in [200, i64::MAX] {
+            assert_eq!(
+                decide_build(1, JAN, count, JAN).unwrap(),
+                CapDecision::Deny {
+                    limit: MONTHLY_BUILD_LIMIT,
+                    resets_at: FEB,
+                }
+            );
+            assert_eq!(
+                decide_build(1, JAN, count, FEB).unwrap(),
+                CapDecision::Allow { remaining: 199 }
+            );
+        }
+    }
 }

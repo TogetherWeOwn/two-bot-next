@@ -11,7 +11,9 @@ gate in the existing pure assistant modules. A new table also needs its
 deployment classification in the same slice: a cutover-chain mirror
 migration (plus its checksum-lock entry) so deployed environments
 create the table, a backup dump classification and a rollback table
-spec so backup/rollback tooling never meets an unclassified table.
+spec so backup/rollback tooling never meets an unclassified table,
+plus the backup format-version bump and the matching rollback-probe
+version admission so pre-table archives stay readable.
 Those classification paths are admitted below as exact files (and the
 cutover migrations directory); every other cutover/backup path stays
 forbidden by omission. The slice must not introduce an endpoint call,
@@ -27,11 +29,16 @@ anywhere in its diff. This file pins that negatively:
   are violations even before content is considered.
 * Added lines in non-test source must not contain transport or
   credential tokens (HTTP clients, sockets, auth headers, provider
-  call paths, credential env names).
+  call paths, credential env names) or endpoint-call sites.
 
 The checker functions are unit-tested against synthetic diffs so the
 allowlist itself cannot silently rot. The repo-state tests fail until
-the build card lands the pinned migration, store type and gate.
+the build card lands the pinned migration, store type and gate. The
+live-diff assertion is one-shot: it judges only the diff that first
+lands this slice and retires once this checker already exists at the
+merge base, so later unrelated work is never judged against this
+slice's allowlist. The synthetic checker and repo-state tests stay
+evergreen.
 """
 
 import re
@@ -63,6 +70,11 @@ ALLOWED_FILES = frozenset(
         # added lines there still face the content scan below).
         "crates/core/src/backup/dump_file.rs",
         "crates/cutover/src/rollback_delta.rs",
+        # The backup format-version bump for the new table must also
+        # teach exactly this probe (and its test) the new version;
+        # added lines there still face the content scan below.
+        "scripts/rollback_readiness_probe.py",
+        "scripts/test_rollback_readiness_probe.py",
         "migrations.lock",
         ".github/workflows/check.yml",
     }
@@ -98,8 +110,15 @@ FORBIDDEN_FILES = frozenset(
 )
 
 # Test files may name the forbidden things in fixtures; production and
-# SQL/CI additions may not.
-_TEST_PATH = re.compile(r"(^|/)(tests?|test_[^/]*)$|(^|/)test_[^/]*\.py$|_test\.rs$|/tests/")
+# SQL/CI additions may not. Only real test locations are exempt: a
+# `tests` directory outside any production `src` tree, or an explicit
+# test script under scripts/. A path under a `src` directory is always
+# production — including files named test_*.rs / *_test.rs and anything
+# under a test-named directory nested inside src/ — because it is
+# wireable as a normal module.
+_TEST_SCRIPT = re.compile(r"scripts/(?:ci/)?test_[^/]+\.py")
+
+CHECKER_PATH = "scripts/ci/test_assistant_cap_diff_allowlist.py"
 
 FORBIDDEN_CONTENT = (
     re.compile(r"reqwest", re.IGNORECASE),
@@ -112,6 +131,20 @@ FORBIDDEN_CONTENT = (
     re.compile(r"chat/completions", re.IGNORECASE),
     re.compile(r"TWO_ASSISTANT_(API_KEY|TOKEN|SECRET|PASSWORD)", re.IGNORECASE),
     re.compile(r"ASSISTANT_(API_KEY|TOKEN|SECRET)\b", re.IGNORECASE),
+    # Endpoint-call sites that repeat no transport token on the added
+    # line (a client already in scope): an HTTP-method call addressed
+    # at an endpoint/url, a method call on a *client* value, or a
+    # no-argument `.send().await` request dispatch (channel sends take
+    # an argument, so they do not match).
+    re.compile(
+        r"\.\s*(?:get|post|put|patch|delete|head|request)\s*\(\s*[^)]*\b(?:endpoint|url|uri)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b\w*client\w*\s*\.\s*(?:get|post|put|patch|delete|head|request)\s*\(",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\.\s*send\s*\(\s*\)\s*\.\s*await\b"),
 )
 
 
@@ -125,7 +158,12 @@ def path_violation(path):
 
 
 def is_test_path(path):
-    return bool(_TEST_PATH.search(path)) or "/tests/" in path or path.startswith("scripts/ci/test_")
+    directories = path.split("/")[:-1]
+    if "src" in directories:
+        return False
+    if "tests" in directories:
+        return True
+    return bool(_TEST_SCRIPT.fullmatch(path))
 
 
 def content_violations(path, added_lines):
@@ -148,6 +186,18 @@ def diff_violations(changed_paths, added_lines_by_path):
             violations.append(f"{path}: {reason}")
         violations.extend(content_violations(path, added_lines_by_path.get(path, ())))
     return violations
+
+
+def live_diff_violations(changed_paths, added_lines_by_path, checker_at_base):
+    """One-shot live-diff gate for the diff that first lands this slice.
+
+    Once this checker already exists at the merge base the slice has
+    landed, and later diffs must not be judged against its allowlist.
+    Until then the live diff is checked in full.
+    """
+    if checker_at_base:
+        return []
+    return diff_violations(changed_paths, added_lines_by_path)
 
 
 BUILDER_SHAPED_PATHS = [
@@ -193,6 +243,21 @@ class AllowlistCheckerTest(unittest.TestCase):
             ],
         }
         self.assertEqual(diff_violations(list(added), added), [])
+
+    def test_rollback_probe_version_paths_pass_but_stay_scanned(self):
+        # The backup format-version bump that waives the new table for
+        # old archives must also teach the rollback readiness probe the
+        # new version; admit exactly the probe and its test.
+        added = {
+            "scripts/rollback_readiness_probe.py": ["DUMP_VERSIONS = (3, 4, 5, 6, 7, 8, 9)"],
+            "scripts/test_rollback_readiness_probe.py": ["    def test_dump_version_9_manifest_passes(self):"],
+        }
+        self.assertEqual(diff_violations(list(added), added), [])
+        transport = {"scripts/rollback_readiness_probe.py": ["import reqwest  # transport"]}
+        self.assertTrue(diff_violations(["scripts/rollback_readiness_probe.py"], transport))
+        for path in ("scripts/rollback_other.py", "scripts/check-migrations.py"):
+            with self.subTest(path=path):
+                self.assertTrue(diff_violations([path], {}))
 
     def test_other_cutover_and_backup_paths_fail_closed(self):
         for path in (
@@ -256,6 +321,70 @@ class AllowlistCheckerTest(unittest.TestCase):
         self.assertEqual(
             diff_violations(["crates/store/tests/assistant_cap_ledger_acceptance.rs"], added),
             [],
+        )
+
+    def test_production_src_paths_named_like_tests_are_scanned(self):
+        # A production file under src/ is wireable as a normal module
+        # whatever its name; test-shaped names must not skip the scan.
+        for path in (
+            "crates/store/src/test_proxy.rs",
+            "crates/store/src/transport_test.rs",
+            "crates/store/src/test_helpers/proxy.rs",
+            "crates/store/src/tests/proxy.rs",
+            "crates/store/src/test/proxy.rs",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(is_test_path(path))
+                added = {path: ["let client = reqwest::Client::new();"]}
+                self.assertTrue(diff_violations([path], added))
+
+    def test_real_test_locations_stay_exempt_from_content_scan(self):
+        for path in (
+            "crates/store/tests/test_proxy.rs",
+            "crates/store/tests/transport_test.rs",
+            "crates/core/tests/fixtures/test_proxy.rs",
+            "scripts/ci/test_assistant_cap_diff_allowlist.py",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(is_test_path(path))
+                added = {path: ["// fixture naming reqwest"]}
+                self.assertEqual(content_violations(path, added[path]), [])
+
+    def test_endpoint_call_without_transport_token_fails(self):
+        for line in (
+            "let resp = client.post(endpoint).send().await?;",
+            "let resp = http.post(url).send().await?;",
+            "let resp = builder.send().await?;",
+        ):
+            with self.subTest(line=line):
+                added = {"crates/store/src/assistant_cap.rs": [line]}
+                self.assertTrue(diff_violations(["crates/store/src/assistant_cap.rs"], added))
+
+    def test_live_diff_retires_once_checker_exists_at_merge_base(self):
+        # Simulated post-merge state, offline: the checker is already on
+        # the base, so an unrelated later diff is no longer judged
+        # against this one slice's allowlist.
+        changed = ["crates/bot/src/lib.rs"]
+        added = {"crates/bot/src/lib.rs": ["pub fn unrelated() {}"]}
+        self.assertEqual(live_diff_violations(changed, added, checker_at_base=True), [])
+        # The current slice remains checked while the checker is not at
+        # the base yet: a forbidden surface still fails, and a clean
+        # builder-shaped slice still passes.
+        self.assertTrue(live_diff_violations(changed, added, checker_at_base=False))
+        clean_added = {
+            "crates/store/src/assistant_cap.rs": [
+                "INSERT INTO assistant_monthly_builds (guild_id, month_key, build_count)"
+            ]
+        }
+        self.assertEqual(
+            live_diff_violations(BUILDER_SHAPED_PATHS, clean_added, checker_at_base=False),
+            [],
+        )
+        transport_added = {"crates/store/src/assistant_cap.rs": ["let c = reqwest::Client::new();"]}
+        self.assertTrue(
+            live_diff_violations(
+                ["crates/store/src/assistant_cap.rs"], transport_added, checker_at_base=False
+            )
         )
 
 
@@ -339,7 +468,12 @@ class RepoStateTest(unittest.TestCase):
 
 
 class LiveDiffTest(unittest.TestCase):
-    """The real diff against the base branch must stay inside the allowlist."""
+    """The real diff that first lands this slice stays inside the allowlist.
+
+    One-shot: once this checker exists at the merge base, the live
+    assertion retires (see live_diff_violations); the synthetic and
+    repo-state suites above remain evergreen.
+    """
 
     def test_current_diff_within_allowlist(self):
         try:
@@ -354,8 +488,19 @@ class LiveDiffTest(unittest.TestCase):
             self.skipTest("git merge-base unavailable")
         if base.returncode != 0 or not base.stdout.strip():
             self.skipTest("no origin/main merge base in this checkout")
+        base_sha = base.stdout.strip()
+        # Fail closed: only a confirmed presence at the base retires
+        # the gate; any probe failure keeps the slice checked.
+        at_base = subprocess.run(
+            ["git", "cat-file", "-e", f"{base_sha}:{CHECKER_PATH}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        checker_at_base = at_base.returncode == 0
         names = subprocess.run(
-            ["git", "diff", "--name-only", f"{base.stdout.strip()}...HEAD"],
+            ["git", "diff", "--name-only", f"{base_sha}...HEAD"],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -364,7 +509,7 @@ class LiveDiffTest(unittest.TestCase):
         self.assertEqual(names.returncode, 0, names.stderr)
         changed = [p for p in names.stdout.splitlines() if p.strip()]
         diff = subprocess.run(
-            ["git", "diff", "-U0", f"{base.stdout.strip()}...HEAD"],
+            ["git", "diff", "-U0", f"{base_sha}...HEAD"],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -379,7 +524,7 @@ class LiveDiffTest(unittest.TestCase):
                 added.setdefault(current, [])
             elif current is not None and line.startswith("+") and not line.startswith("+++"):
                 added[current].append(line[1:])
-        self.assertEqual(diff_violations(changed, added), [])
+        self.assertEqual(live_diff_violations(changed, added, checker_at_base), [])
 
 
 if __name__ == "__main__":

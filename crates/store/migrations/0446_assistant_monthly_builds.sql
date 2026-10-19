@@ -15,8 +15,9 @@
 -- `month_key` is the UTC month start (the 1st at 00:00:00) as Unix seconds,
 -- matching the core `MonthKey::start_unix_secs` the store writes and reads.
 -- Snowflakes persist as decimal TEXT, matching the funnel tables. The writer
--- upserts `(guild_id, month_key, build_count)` atomically under a row lock,
--- so a retried attempt after a drained connection writes exactly once.
+-- inserts a zero-count row if absent, then locks it to decide and update the
+-- count atomically. Each committed allowed call counts once; retrying after
+-- an unacknowledged commit counts again (there is no idempotency key).
 --
 -- Additive only: one new table, no changes to existing tables. `IF NOT
 -- EXISTS` throughout, matching the S6 convention, so cross-running the store
