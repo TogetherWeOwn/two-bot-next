@@ -34,8 +34,8 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import container_stdout_read as reader  # noqa: E402
-from test_container_stdout_read import (  # noqa: E402
+import container_stdout_read as reader
+from test_container_stdout_read import (
     ACCOUNT,
     END,
     RESPONSE,
