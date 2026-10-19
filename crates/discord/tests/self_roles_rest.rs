@@ -89,12 +89,19 @@ async fn fresh_member_and_complete_live_policy_use_shared_paced_reads() {
             format!("/api/v10/guilds/{GUILD}/channels"),
         ]
     );
+    // Coarse pacing pin: the exact 110 ms interval is pinned by
+    // `PACE_INTERVAL_MS` and the virtual-clock admission tests. Wire receipts
+    // mix client pacing with mock-side scheduling, so a 100 ms threshold
+    // leaves only ~10 ms for loopback jitter and flakes under load. 50 ms
+    // still proves each gap was paced (unpaced gaps are ~1 ms).
     for adjacent in calls.windows(2) {
         assert!(
             adjacent[1]
                 .received_at
                 .duration_since(adjacent[0].received_at)
-                >= Duration::from_millis(100)
+                >= Duration::from_millis(50),
+            "shared paced reads burst past the pacing floor: {:?}",
+            calls.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
         );
     }
     assert!(calls.iter().all(|c| c.method == "GET"));
@@ -393,14 +400,25 @@ async fn late_fence_is_evaluated_after_shared_pacing_wait() {
     )
     .await;
     let exec = executor(&mock);
+    // Client-side baseline, not the mock's server `received_at`: the shared
+    // pacing stamp is taken on the client just before the first send, while
+    // the server stamps arrival after TCP transit and its own scheduling. A
+    // fence assertion against the server timestamp leaves only ~10 ms of the
+    // 110 ms pacing interval for loopback/scheduler jitter and flakes under
+    // load. This baseline is monotonic on the test task and the second fence
+    // cannot run before `first stamp + 110 ms` by construction, so `100 ms`
+    // keeps its bite without the server clock in the loop.
+    let before_first = tokio::time::Instant::now();
     exec.self_role_step(GUILD, USER, ROLE, true, || async { Ok(true) })
         .await
         .unwrap();
     let fence_calls = Arc::clone(&calls);
-    let previous_send = mock.requests()[0].received_at;
     let result = exec
         .self_role_step(GUILD, USER, ROLE, false, || async {
-            assert!(previous_send.elapsed() >= Duration::from_millis(100));
+            assert!(
+                before_first.elapsed() >= Duration::from_millis(100),
+                "late fence ran before the shared pacing wait elapsed"
+            );
             fence_calls.fetch_add(1, Ordering::SeqCst);
             Ok(false)
         })

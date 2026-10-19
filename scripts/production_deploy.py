@@ -88,6 +88,13 @@ def render(args):
         container["image"] = str((source.parent / container["image"]).resolve())
         container["image_build_context"] = str(source.parent.parent)
     containers[0]["image_vars"] = {"BOT_BUILD_REVISION": args.sha, "BOT_BUILD_ID": f"{args.run_id}-{args.attempt}"}
+    # Worker-edge span lines log this SHA as `release` (same commit as the
+    # container image). Generated-only: a committed value would go stale, so
+    # the committed TOML must never carry it.
+    production_vars = config["env"]["production"].setdefault("vars", {})
+    if not isinstance(production_vars, dict):
+        sys.exit("render: production vars have the wrong shape")
+    production_vars["CONTAINER_RELEASE"] = args.sha
     Path(args.out).write_text(json.dumps(config, indent=2) + "\n")
     return 0
 

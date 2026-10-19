@@ -209,6 +209,18 @@ outcomes. See `docs/metrics.md` for the full label table.
 | --- | --- |
 | `two_bot_moderation_enforcements_total{verb,outcome}` | Terminal moderation enforcements by bounded verb and outcome |
 
+## Retention replay series
+
+Label-free counter emitted by the retention purge-skip path in
+`crates/bot/src/gateway.rs` (`retention_lifecycle`) and rendered by
+`crates/core/src/metrics.rs`. No guild id, SQLSTATE or error text ever
+becomes a label. Manual check, not an alert input: consumed by no alert
+rule. Full semantics live in `docs/metrics.md`.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_retention_replay_needed_total` | Skipped retention purges needing Operator replay: one per real guild removal whose purge-queue write hit the schema gap; successful queue writes and rejoin-cancel skips never increment it |
+
 ## Scheduled job labels
 
 Each label owns independent `two_bot_job_runs_total{job,outcome}`,

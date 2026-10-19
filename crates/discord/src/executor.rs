@@ -130,8 +130,8 @@ pub enum DiscordError {
     #[error("discord was unreachable: {0}")]
     Unavailable(String),
     /// Rate limited (legacy `rate_limited`): paced per §6. Discord did not
-    /// process the request ([`DiscordError::proves_no_effect`]), but the
-    /// member and website fences still classify it as uncertain.
+    /// process the request ([`DiscordError::proves_no_effect`]), so fences
+    /// release only the failed attempt; other failures stay uncertain.
     #[error("discord rate-limited this request")]
     RateLimited,
     /// Refused locally before any wire attempt; safe to release a claim.
