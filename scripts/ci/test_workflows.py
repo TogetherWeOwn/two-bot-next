@@ -2250,6 +2250,51 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
+    def test_runtime_container_pins_disposable_database_service_address(self):
+        # Same hardening as rust-tests and the stores lane: the runtime lane
+        # runs 26 sequential database suites, and a long run must not depend
+        # on service-alias DNS staying up (EAI_AGAIN on agent-testdb hit a
+        # stores run while Postgres PANIC-recovered on ENOSPC).
+        # The runtime WAL cap itself rides with the sibling WAL PR; this card
+        # carries only the hosts pin for the runtime lane.
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
+        prerequisites = next(
+            step for step in job["steps"]
+            if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
+        )
+        self.assertEqual(prerequisites.get("shell"), "bash")
+        run = prerequisites["run"]
+        self.assertIn("set -e", run)
+        hosts_tmp = run.index('hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"')
+        resolve = run.index("getent ahostsv4 agent-testdb")
+        remove_stale_pin = run.index("sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > \"$hosts_tmp\"")
+        self.assertNotIn("sed -i -E", run)
+        self.assertLess(hosts_tmp, remove_stale_pin)
+        copy_hosts = run.index('cat "$hosts_tmp" > /etc/hosts')
+        cleanup_hosts = run.index('rm -f "$hosts_tmp"')
+        self.assertLess(remove_stale_pin, copy_hosts)
+        self.assertLess(copy_hosts, cleanup_hosts)
+        pin = run.index("printf '%s agent-testdb\\n' \"$service_ip\" >> /etc/hosts")
+        verify_pin = run.index('getent ahostsv4 agent-testdb | awk \'NR == 1 { print $1; exit }\'')
+        forward = run.index("TCP:agent-testdb:5432")
+        ready = run.index("pg_isready -q -h 127.0.0.1")
+        self.assertIn("for attempt in $(seq 1 30)", run[:resolve])
+        self.assertLess(remove_stale_pin, resolve)
+        self.assertLess(resolve, pin)
+        self.assertLess(pin, verify_pin)
+        mismatch_check = run.index('if [ "$pinned_ip" != "$service_ip" ]; then')
+        mismatch_exit = run.index("exit 1", mismatch_check)
+        self.assertLess(verify_pin, mismatch_check)
+        self.assertLess(mismatch_exit, forward)
+        self.assertLess(verify_pin, forward)
+        self.assertLess(forward, ready)
+        self.assertIn("sleep 1", run)
+        fail_closed = run.index('if [ -z "$service_ip" ]; then')
+        self.assertLess(fail_closed, pin)
+        self.assertLess(run.index("exit 1", fail_closed), pin)
+        self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
+
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
         step = next(
@@ -4041,6 +4086,69 @@ class WorkflowTests(unittest.TestCase):
         job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
         # BaseLoader keeps scalars as strings; "45" is the 45-minute ceiling.
         self.assertEqual(job.get("timeout-minutes"), "45")
+
+    def test_nextest_container_pins_disposable_database_service_address(self):
+        # Same hardening as the check.yml lanes: the shared lane runs the
+        # workspace lib/bins against the same disposable service, so it pins
+        # the job-scoped address before the loopback forward instead of
+        # depending on service-alias DNS for the whole run.
+        job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        prerequisites = next(
+            step for step in job["steps"]
+            if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
+        )
+        self.assertEqual(prerequisites.get("shell"), "bash")
+        run = prerequisites["run"]
+        self.assertIn("set -e", run)
+        hosts_tmp = run.index('hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"')
+        resolve = run.index("getent ahostsv4 agent-testdb")
+        remove_stale_pin = run.index("sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > \"$hosts_tmp\"")
+        self.assertNotIn("sed -i -E", run)
+        self.assertLess(hosts_tmp, remove_stale_pin)
+        copy_hosts = run.index('cat "$hosts_tmp" > /etc/hosts')
+        cleanup_hosts = run.index('rm -f "$hosts_tmp"')
+        self.assertLess(remove_stale_pin, copy_hosts)
+        self.assertLess(copy_hosts, cleanup_hosts)
+        pin = run.index("printf '%s agent-testdb\\n' \"$service_ip\" >> /etc/hosts")
+        verify_pin = run.index('getent ahostsv4 agent-testdb | awk \'NR == 1 { print $1; exit }\'')
+        forward = run.index("TCP:agent-testdb:5432")
+        ready = run.index("pg_isready -q -h 127.0.0.1")
+        self.assertIn("for attempt in $(seq 1 30)", run[:resolve])
+        self.assertLess(remove_stale_pin, resolve)
+        self.assertLess(resolve, pin)
+        self.assertLess(pin, verify_pin)
+        mismatch_check = run.index('if [ "$pinned_ip" != "$service_ip" ]; then')
+        mismatch_exit = run.index("exit 1", mismatch_check)
+        self.assertLess(verify_pin, mismatch_check)
+        self.assertLess(mismatch_exit, forward)
+        self.assertLess(verify_pin, forward)
+        self.assertLess(forward, ready)
+        self.assertIn("sleep 1", run)
+        fail_closed = run.index('if [ -z "$service_ip" ]; then')
+        self.assertLess(fail_closed, pin)
+        self.assertLess(run.index("exit 1", fail_closed), pin)
+        self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
+
+    def test_nextest_postgres_wal_budget_is_bounded(self):
+        # Same budget as the check.yml lanes: the reusable lane shares the
+        # 1 GiB tmpfs service, so it caps WAL recycling in prepare and pins
+        # the cap in a verify step instead of running unbounded.
+        job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        prepare = next(
+            step for step in job["steps"]
+            if step.get("name") == "Prepare isolated test databases"
+        )
+        verify = next(
+            step for step in job["steps"]
+            if step.get("name") == "Verify disposable Postgres defaults"
+        )
+        self.assertEqual(verify.get("shell"), "bash")
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+        self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_required_nextest_quarantine_ejects_without_revert(self):
         # Red-group ejection path: the `quarantine` input must exist with an
