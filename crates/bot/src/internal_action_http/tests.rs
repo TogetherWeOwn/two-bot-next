@@ -359,6 +359,7 @@ impl ChannelModerationEffect for MockChannel {
             Ok(InternalChannelResult {
                 outcome,
                 affected,
+                stop_reason: None,
                 replayed: false,
             })
         })

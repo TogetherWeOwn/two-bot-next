@@ -308,7 +308,14 @@ mod tests {
 
     #[test]
     fn outcome_names_match_audit_mapping() {
-        assert_eq!(ChannelOutcome::Purged { affected: 5 }.name(), "purged");
+        assert_eq!(
+            ChannelOutcome::Purged {
+                affected: 5,
+                stop_reason: None
+            }
+            .name(),
+            "purged"
+        );
         assert_eq!(ChannelOutcome::SlowmodeUpdated.name(), "slowmode_updated");
         assert_eq!(ChannelOutcome::LockedDown.name(), "locked_down");
         assert_eq!(ChannelOutcome::Unlocked.name(), "unlocked");
@@ -602,7 +609,10 @@ mod tests {
     #[test]
     fn result_text_matches_legacy_format() {
         assert_eq!(
-            moderation_result_text(ChannelOutcome::Purged { affected: 5 }),
+            moderation_result_text(ChannelOutcome::Purged {
+                affected: 5,
+                stop_reason: None
+            }),
             "Moderation action completed: purged (5)."
         );
         assert_eq!(

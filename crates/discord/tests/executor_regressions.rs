@@ -11,7 +11,7 @@
 mod common;
 
 use common::{aged_message_id, fresh_message_id, MockRest, ScriptedResponse};
-use two_bot_core::{ActionOutcome, ModerationAction, ModerationExecution};
+use two_bot_core::{ActionOutcome, ModerationAction, ModerationExecution, PurgeStopReason};
 use two_bot_discord::{ActionExecutor, ChannelCall, DiscordError};
 
 const GUILD: &str = "2222";
@@ -632,10 +632,9 @@ async fn purge_accepts_a_valid_empty_history_without_deletion() {
         ScriptedResponse::status(500),
     )
     .await;
-    assert_eq!(
-        executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap(),
-        0
-    );
+    let report = executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap();
+    assert_eq!(report.affected, 0);
+    assert_eq!(report.stop_reason, None);
     assert_eq!(mock.requests().len(), 1);
     assert_eq!(mock.requests()[0].method, "GET");
     mock.shutdown().await;
@@ -678,8 +677,9 @@ async fn purge_deletes_messages_older_than_fourteen_days_singly() {
         ScriptedResponse::status(204),
     )
     .await;
-    let affected = executor_for(&mock).purge(CHANNEL, 4, REASON).await.unwrap();
-    assert_eq!(affected, 4);
+    let report = executor_for(&mock).purge(CHANNEL, 4, REASON).await.unwrap();
+    assert_eq!(report.affected, 4);
+    assert_eq!(report.stop_reason, None);
     let calls = wire_calls(&mock);
     assert_eq!(calls.len(), 4, "list, one bulk call, one delete per old id");
     assert_eq!(calls[0].0, "GET");
@@ -701,10 +701,9 @@ async fn purge_of_only_old_messages_never_sends_a_bulk_delete() {
         ScriptedResponse::status(204),
     )
     .await;
-    assert_eq!(
-        executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap(),
-        2
-    );
+    let report = executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap();
+    assert_eq!(report.affected, 2);
+    assert_eq!(report.stop_reason, None);
     let calls = wire_calls(&mock);
     assert_eq!(calls.len(), 3);
     assert!(calls[1..].iter().all(|(method, _)| method == "DELETE"));
@@ -719,10 +718,9 @@ async fn purge_deletes_a_lone_recent_message_next_to_old_ones_singly() {
         ScriptedResponse::status(204),
     )
     .await;
-    assert_eq!(
-        executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap(),
-        2
-    );
+    let report = executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap();
+    assert_eq!(report.affected, 2);
+    assert_eq!(report.stop_reason, None);
     let calls = wire_calls(&mock);
     assert_eq!(calls.len(), 3, "bulk delete needs at least two messages");
     assert!(calls[1..].iter().all(|(method, _)| method == "DELETE"));
@@ -749,8 +747,9 @@ async fn purge_skips_pinned_messages_and_the_bots_own_panels() {
         ScriptedResponse::status(204),
     )
     .await;
-    let affected = executor_for(&mock).purge(CHANNEL, 5, REASON).await.unwrap();
-    assert_eq!(affected, 3, "another bot's spam is still purged");
+    let report = executor_for(&mock).purge(CHANNEL, 5, REASON).await.unwrap();
+    assert_eq!(report.affected, 3, "another bot's spam is still purged");
+    assert_eq!(report.stop_reason, None);
     let calls = wire_calls(&mock);
     assert_eq!(calls.len(), 3, "list, bot identity, one bulk delete");
     assert!(calls[1].1.ends_with("/users/@me"));
@@ -771,10 +770,9 @@ async fn purge_reads_the_bot_identity_only_when_a_bot_authored_a_message() {
         ScriptedResponse::status(204),
     )
     .await;
-    assert_eq!(
-        executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap(),
-        2
-    );
+    let report = executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap();
+    assert_eq!(report.affected, 2);
+    assert_eq!(report.stop_reason, None);
     assert_eq!(mock.requests().len(), 2);
     mock.shutdown().await;
 }
@@ -788,10 +786,9 @@ async fn purge_of_only_protected_messages_deletes_nothing() {
         ScriptedResponse::status(500),
     )
     .await;
-    assert_eq!(
-        executor_for(&mock).purge(CHANNEL, 1, REASON).await.unwrap(),
-        0
-    );
+    let report = executor_for(&mock).purge(CHANNEL, 1, REASON).await.unwrap();
+    assert_eq!(report.affected, 0);
+    assert_eq!(report.stop_reason, None);
     assert_eq!(mock.requests().len(), 1, "only the read-only list was sent");
     mock.shutdown().await;
 }
@@ -826,10 +823,9 @@ async fn purge_skips_a_message_deleted_after_the_listing() {
         ScriptedResponse::status(500),
     )
     .await;
-    assert_eq!(
-        executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap(),
-        1
-    );
+    let report = executor_for(&mock).purge(CHANNEL, 2, REASON).await.unwrap();
+    assert_eq!(report.affected, 1);
+    assert_eq!(report.stop_reason, None);
     assert_eq!(mock.requests().len(), 3);
     mock.shutdown().await;
 }
@@ -837,9 +833,12 @@ async fn purge_skips_a_message_deleted_after_the_listing() {
 #[tokio::test]
 async fn purge_reports_the_deleted_count_when_a_later_delete_is_refused() {
     let ids = [aged_message_id(1), aged_message_id(2), aged_message_id(3)];
-    for refusal in [
-        ScriptedResponse::status(403),
-        ScriptedResponse::rate_limited(0.0, "0"),
+    for (refusal, expected_reason) in [
+        (ScriptedResponse::status(403), PurgeStopReason::Refused),
+        (
+            ScriptedResponse::rate_limited(0.0, "0"),
+            PurgeStopReason::RateLimited,
+        ),
     ] {
         let mock = MockRest::start(
             vec![
@@ -852,10 +851,9 @@ async fn purge_reports_the_deleted_count_when_a_later_delete_is_refused() {
         .await;
         // The refused delete proves only itself had no effect; message one is
         // gone, so the purge must not claim that nothing was mutated.
-        assert_eq!(
-            executor_for(&mock).purge(CHANNEL, 3, REASON).await.unwrap(),
-            1
-        );
+        let report = executor_for(&mock).purge(CHANNEL, 3, REASON).await.unwrap();
+        assert_eq!(report.affected, 1);
+        assert_eq!(report.stop_reason, Some(expected_reason));
         assert_eq!(mock.requests().len(), 3, "stops at the refusal");
         mock.shutdown().await;
     }
