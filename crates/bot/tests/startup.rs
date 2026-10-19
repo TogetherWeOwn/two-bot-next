@@ -294,7 +294,7 @@ fn assert_parked_gateway(vars: &[(&str, &str)]) {
     // nulled) so a genuine early exit still reports its cause.
     const ATTEMPTS: u8 = 3;
     let mut attempt = 0;
-    let (addr, listen_addr, health) = loop {
+    let (addr, listen_addr, health, _bot) = loop {
         attempt += 1;
         let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
         let addr = reserved.local_addr().unwrap();
@@ -337,7 +337,7 @@ fn assert_parked_gateway(vars: &[(&str, &str)]) {
             thread::sleep(Duration::from_millis(20));
         };
         if let Some(health) = health {
-            break (addr, listen_addr, health);
+            break (addr, listen_addr, health, bot);
         }
         // Early exit: the port was likely stolen under parallel load. The
         // dropped bot is killed here; the next attempt reserves a fresh port.
