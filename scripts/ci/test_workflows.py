@@ -2293,6 +2293,29 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        # The member_moderation_db suite only runs behind MEMBER_TESTDB; the
+        # ignored sweep must export it first, or the suite prints 32
+        # tolerated FAILED lines that trip failure triage. A whole-script
+        # substring check cannot pin this: the re-run export below would mask
+        # a deleted or moved sweep export. Pin both occurrences and order.
+        member_exports = [
+            index for index, line in enumerate(logical_lines)
+            if line == "export MEMBER_TESTDB=agent-testdb"
+        ]
+        self.assertEqual(len(member_exports), 2)
+        ignored_sweep_index = next(
+            index for index, line in enumerate(logical_lines)
+            if line.startswith("cov_run ")
+            and "--workspace --lib --bins --tests" in line
+            and "-- --ignored" in line
+        )
+        member_rerun_index = next(
+            index for index, line in enumerate(logical_lines)
+            if "--test member_moderation_db" in line
+        )
+        self.assertLess(member_exports[0], ignored_sweep_index)
+        self.assertLess(ignored_sweep_index, member_exports[1])
+        self.assertLess(member_exports[1], member_rerun_index)
         self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
         main_sweep = [run for run in sweeps if "-- --ignored" not in run][0]
         # Guarded suites panic under the bootstrap URL; they run only in
