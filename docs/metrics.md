@@ -86,6 +86,8 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_eventsub_reconcile_passes_total{outcome}` | EventSub reconcile passes by fixed `outcome`: `healthy` (every desired broadcaster holds a healthy subscription afterwards), `pending` (re-created but not all verified yet) or `failed` (an action failed or a healthy subscription is missing, including listing failures). Exactly one sample per pass that reaches Helix; parked or refused startup passes (flag dark, invalid config, empty allowlist) never reach Helix and record no sample — they are log-only. Alert when `failed` rises across scrapes (alert rules land separately) |
 | `two_bot_eventsub_reconcile_actions_total{action}` | Successful EventSub reconcile mutations by fixed `action`: `create` (2xx creates) or `delete` (2xx deletes, including already-gone deletes). 409 already-exists confirmations fold into the pass outcome, not into actions; per-subscription labels never reach exposition |
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | EventSub reconcile failure sites by the same fixed `error_class` strings as the `error_class` log field: `reconcile_action_failed` (once per failed plan action), `reconcile_prior_failed` (once per pass that found failed subscriptions), `reconcile_unhealthy` (once per non-converged pass) or `reconcile_failed` (listing or plan failures), plus `other` for unknown classes. No status code, body, broadcaster, subscription id or secret ever becomes a label |
+| `two_bot_feed_fetches_total{outcome}` | Feed fetch attempts by bounded outcome: `success` (2xx fetch), `invalid_source` (source refused before dialling), `refused_redirect` (redirect refused by policy) or `failure` (every other failure, including non-2xx HTTP). One sample per fetch; per-outcome, never per-feed, so no source URL, host or feed id reaches a label |
+| `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class: `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`. One sample per failed fetch alongside `two_bot_feed_fetches_total`; successes record nothing here. No URL, host, header or body bytes reach a label |
 
 ## REST admission guard
 
@@ -385,6 +387,19 @@ as dynamic labels.
   `crates/bot/src/gateway.rs` (`apply_dispatch`), in both warn-and-continue
   arms; the existing warn log lines are unchanged. No error text, SQL or
   identifier becomes a label.
+- `two_bot_feed_fetches_total{outcome}` — `outcome` is `success`,
+  `invalid_source`, `refused_redirect` or `failure`
+  (`crates/core/src/metrics.rs` `FEED_FETCH_OUTCOMES`). Recorded once per
+  fetch in `crates/bot/src/feed_jobs.rs` via
+  `crates/core/src/feeds_connector.rs` `record_feed_fetch`; per-outcome,
+  never per-feed, so no source URL, host or feed id becomes a label.
+- `two_bot_feed_fetch_errors_total{error_class}` — `error_class` is
+  `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`,
+  `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`,
+  `resolve`, `transport`, `deadline`, `http_error` or `other`
+  (`crates/core/src/metrics.rs` `FEED_FETCH_ERROR_CLASSES`). Recorded once
+  per failed fetch alongside the outcome above; successes record nothing
+  here. No URL, host, header or body bytes become labels.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,
