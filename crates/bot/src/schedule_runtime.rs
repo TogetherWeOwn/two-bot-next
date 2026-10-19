@@ -11,13 +11,16 @@
 //! Audit parity with legacy `AutomationService`: creates and replaces audit
 //! `scheduled.create` / `scheduled.update` (`ok`, `rejected` on validation
 //! failure), removes audit `scheduled.delete` (`ok` / `absent`), and
-//! successful lists write no row. Every store-failure refusal audits one row
-//! in the same refusal shape (`scheduled.create` / `scheduled.delete` /
-//! `scheduled.list`, outcome `rejected`, the invoking member as actor, the
-//! log line's fixed error-class token as reason, the attempted id or prefix
-//! as target, none for lists); a dead pool degrades to warn-plus-safe-reply
-//! because the audit write itself fails. The 15 s ticker is a sibling card's
-//! job — nothing here posts to channels.
+//! successful lists write no row. The five first-look store-failure refusals
+//! (create read and write, remove resolve and delete, list first read) each
+//! audit one row in the same refusal shape (`scheduled.create` /
+//! `scheduled.delete` / `scheduled.list`, outcome `rejected`, the invoking
+//! member as actor, the log line's fixed error-class token as reason, the
+//! attempted id or prefix as target, none for lists); a dead pool degrades
+//! to warn-plus-safe-reply because the audit write itself fails.
+//! Deep-pagination list failures (hidden-window and unknown-overflow reads)
+//! keep the warn-plus-safe-reply posture with no audit row. The 15 s ticker
+//! is a sibling card's job — nothing here posts to channels.
 
 use sqlx::{Pool, Postgres};
 use twilight_model::application::interaction::{
