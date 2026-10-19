@@ -782,5 +782,13 @@ class BodyCapRefusalTests(unittest.TestCase):
         self.assertEqual(seen, [probe.READYZ_BODY_CAP + 1])
 
 
+def load_tests(loader, tests, pattern):
+    # Keep protected acceptance coverage on the existing CI and direct-script routes.
+    import test_rollback_readiness_input_limits_acceptance as input_limits
+
+    tests.addTests(loader.loadTestsFromModule(input_limits))
+    return tests
+
+
 if __name__ == "__main__":
     unittest.main()
