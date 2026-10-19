@@ -7,11 +7,18 @@
 //! not hide gateway and job health, and no error text ever reaches the body
 //! (fixed `available: false`, never a message, class or row content).
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use axum::{extract::State, http::header, routing::get, Extension, Json, Router};
 use two_bot_discord::ratelimit_guard::RateLimitGuard;
 
+use crate::db_log::db_class;
 use crate::gateway::GatewayState;
 use crate::gateway_failure::GatewayFailure;
 use crate::jobs::{JobStatus, SharedStatus};
@@ -106,19 +113,93 @@ struct StoreSnapshot {
     tips: BTreeMap<String, i64>,
 }
 
-async fn store_snapshot(pool: Option<&sqlx::PgPool>) -> Option<StoreSnapshot> {
+async fn store_snapshot(pool: Option<&sqlx::PgPool>, failed: &AtomicBool) -> Option<StoreSnapshot> {
+    store_snapshot_with_budget(pool, failed, EVENT_STORE_TIMEOUT).await
+}
+
+/// [`store_snapshot`] with an injectable probe budget. Production passes
+/// [`EVENT_STORE_TIMEOUT`]; tests pass zero to force the timeout edge
+/// without waiting out the probe.
+async fn store_snapshot_with_budget(
+    pool: Option<&sqlx::PgPool>,
+    failed: &AtomicBool,
+    budget: std::time::Duration,
+) -> Option<StoreSnapshot> {
+    // No database is configured state (parked boot), not a failure: stay
+    // silent and leave the latch alone, like the backfill route's own
+    // no-database baseline.
     let pool = pool?;
-    let fetch = async {
-        let snapshot = two_bot_store::journal::snapshot(pool).await.ok()?;
-        Some(StoreSnapshot {
-            point: snapshot.point,
-            cursors: snapshot.cursors,
-            tips: snapshot.tips,
-        })
-    };
-    tokio::time::timeout(EVENT_STORE_TIMEOUT, fetch)
-        .await
-        .unwrap_or(None)
+    match tokio::time::timeout(budget, two_bot_store::journal::snapshot(pool)).await {
+        Ok(Ok(snapshot)) => {
+            note_snapshot_outcome(failed, SnapshotOutcome::Ok);
+            Some(StoreSnapshot {
+                point: snapshot.point,
+                cursors: snapshot.cursors,
+                tips: snapshot.tips,
+            })
+        }
+        Ok(Err(error)) => {
+            note_snapshot_outcome(
+                failed,
+                SnapshotOutcome::StoreFailed(snapshot_failure_class(&error)),
+            );
+            None
+        }
+        Err(_) => {
+            note_snapshot_outcome(failed, SnapshotOutcome::TimedOut);
+            None
+        }
+    }
+}
+
+/// One probe result for the transition log below: success resets the latch
+/// silently, either failure kind warns on the ok→failed edge only.
+#[derive(Clone, Copy)]
+enum SnapshotOutcome {
+    Ok,
+    StoreFailed(&'static str),
+    TimedOut,
+}
+
+/// Fixed token for a failed event-store snapshot read, never the error
+/// value: the `db_log` class for database errors, `invalid` for a journal
+/// entry that fails validation (unreachable from the store `snapshot()`
+/// read, which never validates — the arm keeps the match exhaustive
+/// without a panic path).
+fn snapshot_failure_class(error: &two_bot_store::journal::JournalError) -> &'static str {
+    match error {
+        two_bot_store::journal::JournalError::Db(inner) => db_class(inner),
+        two_bot_store::journal::JournalError::Invalid(_) => "invalid",
+    }
+}
+
+/// Record one probe result on the shared latch: the first failure after a
+/// success warns with its fixed token, steady-state failures stay silent,
+/// and recovery resets the latch silently so the next edge re-arms. The
+/// ordering is relaxed: the latch guards no other state, so a lost race at
+/// worst duplicates one line.
+fn note_snapshot_outcome(failed: &AtomicBool, outcome: SnapshotOutcome) {
+    match outcome {
+        SnapshotOutcome::Ok => failed.store(false, Ordering::Relaxed),
+        SnapshotOutcome::StoreFailed(class) => {
+            if !failed.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    msg = "ops_snapshot_failed",
+                    db_class = class,
+                    "event-store snapshot unreadable"
+                );
+            }
+        }
+        SnapshotOutcome::TimedOut => {
+            if !failed.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    msg = "ops_snapshot_failed",
+                    timed_out = true,
+                    "event-store snapshot unreadable"
+                );
+            }
+        }
+    }
 }
 
 fn backfill_tables(snapshot: &StoreSnapshot) -> Vec<TableCursor> {
@@ -186,7 +267,7 @@ async fn summary(
     let gateway_state = gateway_state_name(*state.gateway.read().await);
     let pool =
         crate::metrics_http::pool_sample().map(|(size, idle, max)| PoolGauges { size, idle, max });
-    let snapshot = store_snapshot(state.database.as_ref()).await;
+    let snapshot = store_snapshot(state.database.as_ref(), &state.ops_snapshot_failed).await;
     let tables = snapshot.as_ref().map(backfill_tables);
     let max_lag = tables
         .as_deref()
@@ -288,7 +369,7 @@ async fn backfill(
     Json<BackfillDetail>,
 ) {
     no_store_json(backfill_detail(
-        store_snapshot(state.database.as_ref()).await,
+        store_snapshot(state.database.as_ref(), &state.ops_snapshot_failed).await,
     ))
 }
 
@@ -331,6 +412,46 @@ mod tests {
             jobs,
             two_bot_discord::ratelimit_guard::process_guard(),
         )
+    }
+
+    /// Serializes the tests that assert exact `ops_snapshot_failed` counts
+    /// on the process-global capture, plus the tests that emit those lines:
+    /// without it a concurrent emitter lands inside another test's window
+    /// and its absolute count assertion fails. Hold for the whole test in
+    /// every test that reads or writes these diagnostics (same pattern as
+    /// the internal-action receiver's `TRACING_DIAGNOSTIC_LOCK`).
+    static OPS_SNAPSHOT_DIAGNOSTIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Process-wide log capture shared with every log-hygiene test in this
+    /// binary (see `tracing_capture::global`): one install per process, each
+    /// reader keeps only the text appended after its own start offset.
+    fn ops_snapshot_capture() -> &'static crate::tracing_capture::Capture {
+        crate::tracing_capture::global()
+    }
+
+    /// A pool whose every query fails at once with `PoolClosed`: the
+    /// deterministic store-failure probe (no network, no waits).
+    async fn closed_pool() -> sqlx::PgPool {
+        let pool = lazy_pool();
+        pool.close().await;
+        pool
+    }
+
+    async fn get_bytes(app: Router, uri: &str) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("test request"),
+            )
+            .await
+            .expect("oneshot");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("body bytes");
+        (status, bytes.to_vec())
     }
 
     #[test]
@@ -547,6 +668,9 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_database_degrades_to_unavailable_not_500() {
+        // Its failing probes emit `ops_snapshot_failed`: hold the
+        // diagnostic lock so the counting tests keep absolute windows.
+        let _diagnostics = OPS_SNAPSHOT_DIAGNOSTIC_LOCK.lock().await;
         // `connect_lazy` performs no I/O, so the queries fail and the
         // endpoints must report unavailable sections with 200, never 500.
         let pool = lazy_pool();
@@ -589,5 +713,175 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    }
+
+    #[test]
+    fn snapshot_failure_classes_are_fixed_tokens() {
+        assert_eq!(
+            snapshot_failure_class(&two_bot_store::journal::JournalError::Db(
+                sqlx::Error::PoolClosed
+            )),
+            "pool_closed"
+        );
+        assert_eq!(
+            snapshot_failure_class(&two_bot_store::journal::JournalError::Db(
+                sqlx::Error::RowNotFound
+            )),
+            "row_not_found"
+        );
+        // The store read never validates, so this arm is unreachable in
+        // practice; the token keeps the match exhaustive without a panic.
+        assert_eq!(
+            snapshot_failure_class(&two_bot_store::journal::JournalError::Invalid("test")),
+            "invalid"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_store_failure_warns_once_per_transition() {
+        let _diagnostics = OPS_SNAPSHOT_DIAGNOSTIC_LOCK.lock().await;
+        let failed = AtomicBool::new(false);
+        let pool = closed_pool().await;
+        let capture = ops_snapshot_capture();
+        let start = capture.text().len();
+        // Two failing probes: the transition logs, the steady state stays
+        // silent.
+        assert!(store_snapshot(Some(&pool), &failed).await.is_none());
+        assert!(store_snapshot(Some(&pool), &failed).await.is_none());
+        assert!(failed.load(Ordering::Relaxed));
+        let logs = capture.text().split_off(start);
+        assert_eq!(
+            logs.matches("ops_snapshot_failed").count(),
+            1,
+            "one warn per transition, got: {logs:?}"
+        );
+        assert!(
+            logs.contains("db_class=\"pool_closed\""),
+            "warn must carry the fixed class token, got: {logs:?}"
+        );
+        assert!(
+            logs.contains("WARN two_bot::ops_http"),
+            "snapshot failure must warn on this module, got: {logs:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_probe_timeout_warns_with_timed_out_once() {
+        let _diagnostics = OPS_SNAPSHOT_DIAGNOSTIC_LOCK.lock().await;
+        let failed = AtomicBool::new(false);
+        // Open but unconnected: every query pends on connect, so a zero
+        // budget always elapses instead of answering.
+        let pool = lazy_pool();
+        let capture = ops_snapshot_capture();
+        let start = capture.text().len();
+        assert!(
+            store_snapshot_with_budget(Some(&pool), &failed, std::time::Duration::ZERO)
+                .await
+                .is_none()
+        );
+        assert!(
+            store_snapshot_with_budget(Some(&pool), &failed, std::time::Duration::ZERO)
+                .await
+                .is_none()
+        );
+        pool.close().await;
+        let logs = capture.text().split_off(start);
+        assert_eq!(
+            logs.matches("ops_snapshot_failed").count(),
+            1,
+            "one warn per transition, got: {logs:?}"
+        );
+        assert!(
+            logs.contains("timed_out=true"),
+            "timeout warn must carry timed_out, got: {logs:?}"
+        );
+        assert!(
+            !logs.contains("db_class"),
+            "timeout warn must not carry a store class, got: {logs:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_recovery_is_silent_and_rearms() {
+        let _diagnostics = OPS_SNAPSHOT_DIAGNOSTIC_LOCK.lock().await;
+        let failed = AtomicBool::new(false);
+        let capture = ops_snapshot_capture();
+        let start = capture.text().len();
+        note_snapshot_outcome(&failed, SnapshotOutcome::StoreFailed("pool_closed"));
+        assert!(failed.load(Ordering::Relaxed));
+        // Steady-state failure: silent.
+        note_snapshot_outcome(&failed, SnapshotOutcome::StoreFailed("pool_closed"));
+        // Recovery: silent, and the latch drops.
+        note_snapshot_outcome(&failed, SnapshotOutcome::Ok);
+        assert!(!failed.load(Ordering::Relaxed));
+        // The next edge re-arms, whatever the failure kind.
+        note_snapshot_outcome(&failed, SnapshotOutcome::TimedOut);
+        note_snapshot_outcome(&failed, SnapshotOutcome::TimedOut);
+        let logs = capture.text().split_off(start);
+        assert_eq!(
+            logs.matches("ops_snapshot_failed").count(),
+            2,
+            "edges log, steady states and recovery stay silent, got: {logs:?}"
+        );
+        assert!(
+            logs.contains("db_class=\"pool_closed\""),
+            "store edge must carry its class, got: {logs:?}"
+        );
+        assert!(
+            logs.contains("timed_out=true"),
+            "timeout edge must carry timed_out, got: {logs:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ops_bodies_are_byte_identical_across_snapshot_transition() {
+        // Emits (the first failing probe trips the transition), so it holds
+        // the diagnostic lock even though it never reads the capture.
+        let _diagnostics = OPS_SNAPSHOT_DIAGNOSTIC_LOCK.lock().await;
+        let pool = closed_pool().await;
+        // One app per endpoint, so the first request trips the transition
+        // (and logs) while the second rides the steady state.
+        let backfill_app = app(
+            GatewayState::Connected,
+            Some(pool.clone()),
+            crate::jobs::statuses(&[], true),
+        );
+        let (first_status, first) = get_bytes(backfill_app.clone(), "/ops/backfill").await;
+        let (second_status, second) = get_bytes(backfill_app, "/ops/backfill").await;
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(second_status, StatusCode::OK);
+        assert_eq!(first, second, "log transition must not alter body bytes");
+        let backfill: serde_json::Value =
+            serde_json::from_slice(&first).expect("backfill JSON body");
+        assert_eq!(backfill["available"], false);
+        // `/ops/summary` also renders process-global gauges, so only the
+        // snapshot-derived sections compare; both must stay degraded.
+        let summary_app = app(
+            GatewayState::Connected,
+            Some(pool.clone()),
+            crate::jobs::statuses(&[], true),
+        );
+        let (_, summary_first) = get_bytes(summary_app.clone(), "/ops/summary").await;
+        let (_, summary_second) = get_bytes(summary_app, "/ops/summary").await;
+        let first_json: serde_json::Value =
+            serde_json::from_slice(&summary_first).expect("summary JSON body");
+        let second_json: serde_json::Value =
+            serde_json::from_slice(&summary_second).expect("summary JSON body");
+        assert_eq!(first_json["event_store"], second_json["event_store"]);
+        assert_eq!(first_json["backfill"], second_json["backfill"]);
+        assert_eq!(first_json["event_store"]["available"], false);
+        assert_eq!(first_json["backfill"]["available"], false);
+        // No log token may reach the wire on either endpoint.
+        for (name, bytes) in [("backfill", &first), ("summary", &summary_first)] {
+            let text = String::from_utf8_lossy(bytes);
+            for leaked in [
+                "ops_snapshot_failed",
+                "pool_closed",
+                "timed_out",
+                "db_class",
+            ] {
+                assert!(!text.contains(leaked), "{name} body leaked {leaked:?}");
+            }
+        }
     }
 }
