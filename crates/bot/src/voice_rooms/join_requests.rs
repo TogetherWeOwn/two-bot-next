@@ -710,13 +710,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.queue.mark_succeeded(&action);
             return;
         }
-        let existing = self
-            .live_overwrites(room)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|overwrite| {
-                overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == member
-            });
+        let Some(snapshot) = self.live.overwrite_snapshot(room) else {
+            // No authoritative ACL: neither write nor retire a durable witness.
+            self.queue.mark_succeeded(&action);
+            return;
+        };
+        let existing = snapshot.overwrites.iter().copied().find(|overwrite| {
+            overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == member
+        });
         let (allow, deny) = existing
             .map_or((Permissions::empty(), Permissions::empty()), |entry| {
                 (entry.allow, entry.deny)
@@ -750,16 +751,26 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             id: Id::new(member),
             kind: PermissionOverwriteType::Member,
         };
+        let next = private_runtime::with_overwrite(&snapshot.overwrites, &grant);
+        let guard =
+            self.live
+                .overwrite_guard(room, snapshot.generation, snapshot.overwrites.clone());
         let mut grant_landed = false;
-        let result = match self
-            .http
-            .put_overwrite(room, grant, self.live.room_guard(room))
-            .await
-        {
+        let result = match self.http.put_overwrite(room, grant, guard).await {
             Ok(()) => {
+                // Even if newer evidence prevents projection, the PUT landed:
+                // retain its durable witness, but do not move on stale evidence.
                 grant_landed = true;
-                self.note_overwrite(room, &grant);
-                self.move_in_from_join(room, member).await
+                if self.live.advance_overwrites(
+                    room,
+                    snapshot.generation,
+                    &snapshot.overwrites,
+                    &next,
+                ) {
+                    self.move_in_from_join(room, member).await
+                } else {
+                    Err(RoomHttpError::Cancelled)
+                }
             }
             Err(error) => Err(error),
         };
@@ -929,13 +940,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.queue.mark_succeeded(&action);
             return;
         }
-        let existing = self
-            .live_overwrites(room)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|overwrite| {
-                overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == member
-            });
+        let Some(snapshot) = self.live.overwrite_snapshot(room) else {
+            // No authoritative ACL: neither write nor retire a durable witness.
+            self.queue.mark_succeeded(&action);
+            return;
+        };
+        let existing = snapshot.overwrites.iter().copied().find(|overwrite| {
+            overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == member
+        });
         let Some(existing) = existing else {
             // Nothing to take back: Discord holds no overwrite, so the
             // witness can retire.
@@ -950,21 +962,37 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         };
         let remaining = existing.allow & !Permissions::CONNECT;
-        let result = if remaining.is_empty() && existing.deny.is_empty() {
-            self.http
-                .delete_overwrite(room, member, self.live.room_guard(room))
-                .await
-                .map(|()| self.forget_overwrite(room, member))
+        let guard =
+            self.live
+                .overwrite_guard(room, snapshot.generation, snapshot.overwrites.clone());
+        let (written, next) = if remaining.is_empty() && existing.deny.is_empty() {
+            let next = snapshot
+                .overwrites
+                .iter()
+                .copied()
+                .filter(|entry| {
+                    !(entry.kind == PermissionOverwriteType::Member && entry.id.get() == member)
+                })
+                .collect::<Vec<_>>();
+            (self.http.delete_overwrite(room, member, guard).await, next)
         } else {
             let kept = PermissionOverwrite {
                 allow: remaining,
                 ..existing
             };
-            self.http
-                .put_overwrite(room, kept, self.live.room_guard(room))
-                .await
-                .map(|()| self.note_overwrite(room, &kept))
+            let next = private_runtime::with_overwrite(&snapshot.overwrites, &kept);
+            (self.http.put_overwrite(room, kept, guard).await, next)
         };
+        let result = written.and_then(|()| {
+            if self
+                .live
+                .advance_overwrites(room, snapshot.generation, &snapshot.overwrites, &next)
+            {
+                Ok(())
+            } else {
+                Err(RoomHttpError::Cancelled)
+            }
+        });
         match result {
             Ok(()) => match self.retire_join_grant(room, member).await {
                 Ok(()) => {
@@ -990,19 +1018,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 );
             }
             Err(error) => self.complete_error(action, room, error),
-        }
-    }
-
-    /// Drop a deleted overwrite from the live snapshot, so the next decision
-    /// reads what Discord now holds without waiting for the gateway echo.
-    fn forget_overwrite(&self, room: Snowflake, member: Snowflake) {
-        let mut live = self.live.write_state();
-        if let Some(channel) = live.channels.get_mut(&room) {
-            if let Some(overwrites) = channel.permission_overwrites.as_mut() {
-                overwrites.retain(|entry| {
-                    !(entry.kind == PermissionOverwriteType::Member && entry.id.get() == member)
-                });
-            }
         }
     }
 
