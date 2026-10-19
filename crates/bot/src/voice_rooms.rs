@@ -4906,10 +4906,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             {
                 Ok(()) => return true,
                 Err(error) => {
+                    let guild = self.live.guild_id.to_string();
+                    let outcome = voice_outcome_from_http(&error);
                     warn!(
-                        guild = self.live.guild_id.to_string(),
+                        guild,
                         op = "send_notice",
-                        outcome = voice_outcome_from_http(&error),
+                        outcome,
                         "voice notice configured channel failed; trying fallback"
                     );
                 }
