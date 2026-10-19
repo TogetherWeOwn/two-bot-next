@@ -264,6 +264,13 @@ for (const path of ["/health", "/readyz"]) {
       assert.equal(response.status, 500);
       assert.equal(response.headers.get("x-two-worker-version"), metadata?.id ?? null);
       assert.deepEqual(await response.json(), { ready: false, error_class: "container_unavailable" });
+      assert.ok(h.logs.includes(JSON.stringify({
+        event: "container_probe_failed",
+        error_class: "container_unavailable",
+        release: "unknown",
+        worker_version: ID,
+        log_url: LOG_QUERY_URL,
+      })));
       assert.ok(h.logs.every((line) =>
         !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.DATABASE_URL)));
     });
@@ -460,6 +467,57 @@ test("cold keepalive passes env through the SDK's string-URL fetch path", async 
     worker_version: ID,
     log_url: LOG_QUERY_URL,
   })));
+});
+
+// Each probe-failure branch stamps the same attribution line: release stays
+// "unknown" (no probe body was parsed this tick) and worker_version names the
+// serving deployment, so Workers Logs can join the line to the deploy receipt.
+const PROBE_FAILED_LINE = JSON.stringify({
+  event: "container_keepalive_probe_failed",
+  release: "unknown",
+  worker_version: ID,
+  log_url: LOG_QUERY_URL,
+});
+
+test("keepalive probe failure (transport throws) stamps release and worker version", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => {
+    throw new Error("synthetic probe transport failure");
+  });
+  await tickKeepalive(h.bot);
+  assert.ok(h.logs.includes(PROBE_FAILED_LINE));
+});
+
+test("keepalive probe failure (oversized body) stamps release and worker version", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => new Response("x".repeat(70 * 1024), {
+    status: 200, headers: { "content-type": "application/json" },
+  }));
+  await tickKeepalive(h.bot);
+  assert.ok(h.logs.includes(PROBE_FAILED_LINE));
+});
+
+test("keepalive probe failure (completes past deadline) stamps release and worker version", async (t) => {
+  const h = await harness(t);
+  const ac = new AbortController();
+  const realTimeout = AbortSignal.timeout;
+  t.mock.method(AbortSignal, "timeout", (ms: number) => (ms === 6000 ? ac.signal : realTimeout(ms)));
+  let pulls = 0;
+  t.mock.method(h.bot, "containerFetch", async () => new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulls += 1;
+      if (pulls === 1) {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({ ready: true })));
+        return;
+      }
+      // Complete the body and trip the deadline in the same pull: the read
+      // finishes, but the probe signal is aborted before the tick trusts it.
+      controller.close();
+      ac.abort();
+    },
+  }, { highWaterMark: 0 }), { status: 200, headers: { "content-type": "application/json" } }));
+  await tickKeepalive(h.bot);
+  assert.ok(h.logs.includes(PROBE_FAILED_LINE));
 });
 
 // TOG-13044: the bot reports why its gateway task failed on /readyz; the
@@ -1439,6 +1497,38 @@ test("Worker gates the ops JSON roll-ups behind the scrape bearer, before the re
   assert.equal(upstream.mock.callCount(), before);
 });
 
+test("short scrape token stamps release and worker version on the misconfigured line", async (t) => {
+  // The misconfiguration line fires once per isolate; this is the only test
+  // in this file that trips it.
+  const logs: string[] = [];
+  t.mock.method(console, "error", (...args: unknown[]) => {
+    logs.push(args.map(String).join(" "));
+  });
+  const short = "short-token";
+  const env = {
+    REDIRECT_MAPPINGS_JSON: "[]",
+    REDIRECT_FALLBACK_CODE: "fallbackCode",
+    CF_VERSION_METADATA: { id: ID },
+    METRICS_SCRAPE_TOKEN: short,
+    TWO_BOT: { getByName: () => ({ fetch: async () => new Response("must not forward") }) },
+  } as unknown as Env;
+  const response = await worker.fetch(
+    new Request("https://worker.invalid/ops/metrics", { headers: { authorization: `Bearer ${short}` } }),
+    env, { waitUntil: () => {} } as ExecutionContext,
+  );
+  assert.equal(response.status, 404);
+  await response.text();
+  assert.ok(logs.includes(JSON.stringify({
+    event: "metrics_scrape_token_misconfigured",
+    reason: "token_below_minimum_length",
+    minimum_length: 32,
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })));
+  assert.ok(logs.every((line) => !line.includes(short)));
+});
+
 test("Worker forwards /ops/backfill/progress with x-two-* headers and no scrape bearer", async () => {
   // The signed progress read is container-authenticated (x-two-* HMAC), so
   // unlike the scrape-gated roll-ups it forwards with no bearer and no
@@ -2021,6 +2111,7 @@ for (const failure of [429, 500, "throw"] as const) {
     assert.equal(webhook.mock.callCount(), 1);
     assert.equal(h.events()[0].event, "container_unready_alert");
     assert.equal(h.events()[1].event, "container_unready_webhook_failed");
+    assert.equal(h.events()[1].worker_version, ID);
     h.setStatus(200);
     await h.tick();
     await h.tick();
@@ -2029,6 +2120,21 @@ for (const failure of [429, 500, "throw"] as const) {
     assert.ok(h.logs.every((line) => !line.includes(ALERT_ENV.OPS_ALERT_WEBHOOK_URL)));
   });
 }
+
+test("metrics webhook 500 stamps the serving worker version on the failure line", async (t) => {
+  const h = await senderHarness(t, "metrics", {
+    OPS_ALERT_FORWARDING: "on", OPS_ALERT_WEBHOOK_URL: ALERT_ENV.OPS_ALERT_WEBHOOK_URL,
+  });
+  const webhook = t.mock.method(globalThis, "fetch", async () =>
+    new Response("synthetic error", { status: 500 }));
+  await h.tick();
+  await h.tick();
+  assert.equal(webhook.mock.callCount(), 1);
+  assertAlertRecorded(h, "metrics");
+  assert.equal(h.events()[1].event, "metrics_alert_webhook_failed");
+  assert.equal(h.events()[1].status, 500);
+  assert.equal(h.events()[1].worker_version, ID);
+});
 
 const WEBHOOK_PATH = new URL(ALERT_ENV.OPS_ALERT_WEBHOOK_URL).pathname;
 const INVALID_WEBHOOKS = {
@@ -2069,6 +2175,7 @@ for (const sender of ["readiness", "metrics"] as const) {
       assert.equal(h.events()[1].event, sender === "readiness"
         ? "container_unready_webhook_failed" : "metrics_alert_webhook_failed");
       assert.equal(h.events()[1].status, null);
+      assert.equal(h.events()[1].worker_version, ID);
       assert.ok(h.logs.every((line) => !line.includes(binding)));
       assert.equal(h.schedules.mock.callCount(), 2);
     });
