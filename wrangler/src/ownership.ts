@@ -1,3 +1,5 @@
+import { withSecurityHeaders } from "./security-headers.ts";
+
 /** Persisted singleton ownership. Missing/corrupt/unreadable state never grants ownership. */
 export const OWNER_KEY = "two-bot:owner:v1";
 export const AUDIT_PREFIX = "two-bot:ownership-audit:v1:";
@@ -202,6 +204,6 @@ export function refused(error: unknown): Response {
   console.warn(`two-bot ownership refused: ${reason}`);
   return Response.json({ error: "ownership_fenced", reason }, {
     status: reason === "epoch_conflict" ? 409 : 503,
-    headers: { "cache-control": "no-store" },
+    headers: withSecurityHeaders({ "cache-control": "no-store" }),
   });
 }

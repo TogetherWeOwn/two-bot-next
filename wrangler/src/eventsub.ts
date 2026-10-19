@@ -32,6 +32,7 @@ import { TokenBuckets } from "./redirect.ts";
 import { LOG_QUERY_URL } from "./alert-rules.ts";
 import { UNKNOWN_RELEASE, normalizeRelease } from "./error-events.ts";
 import { REQUEST_ID_HEADER, ensureRequestId, newRequestId } from "./request-id.ts";
+import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
 
 export const EVENTSUB_PATH = "/hooks/twitch";
 /**
@@ -105,7 +106,7 @@ export function resetEventsubIngressLimits(): void {
 }
 
 export function notFound(): Response {
-  return new Response("not found", { status: 404 });
+  return new Response("not found", { status: 404, headers: withSecurityHeaders() });
 }
 
 /**
@@ -120,13 +121,15 @@ export function envelope(
   headers: Record<string, string> = {},
   requestId: string = newRequestId(),
 ): Response {
+  const hardened = new Headers({ "cache-control": "no-store", ...headers });
+  applySecurityHeaders(hardened);
   return Response.json(
     {
       ok: false,
       request_id: requestId,
       error: { code, message: "request refused", retryable },
     },
-    { status, headers: { "cache-control": "no-store", ...headers } },
+    { status, headers: hardened },
   );
 }
 
@@ -480,5 +483,6 @@ function relayHeaders(source: Headers, media: string): Headers {
   const retry = source.get("retry-after");
   if (retry !== null && /^\d{1,6}$/.test(retry)) headers.set("retry-after", retry);
   headers.set("cache-control", "no-store");
+  applySecurityHeaders(headers);
   return headers;
 }
