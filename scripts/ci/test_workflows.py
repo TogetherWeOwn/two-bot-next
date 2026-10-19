@@ -47,6 +47,8 @@ JOB_INVENTORY = {
     "staging-events-read.yml": {"read"},
     # Manual read-only authenticated MCP prove-out (TOG-23456); pinned shape below.
     "staging-mcp-proveout.yml": {"proveout"},
+    # Manual read-only staging ownership status read; pinned shape below.
+    "staging-ownership-status.yml": {"status"},
     # Manual gradual-promote proof caller (passive until the synthetic
     # fixture lands); pinned shape below.
     "gradual-promote-proof.yml": {"proof"},
@@ -1128,6 +1130,94 @@ def staging_mcp_proveout_errors(workflow):
     return errors
 
 
+OWNERSHIP_STATUS_ENV = {
+    "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+}
+
+
+def staging_ownership_status_errors(workflow):
+    """Manual staging-only read-only ownership status read.
+
+    Dispatch-only with no inputs. One job runs only from main through the
+    `staging` environment, on the routed runner for job `status`, with its
+    own non-cancelling concurrency group and a 10 minute timeout. Exactly
+    four unconditional steps: pinned checkout without persisted credentials,
+    pinned setup-node, the ownership-control preflight, and one Run step that
+    calls the reviewed status script with the existing staging pair via the
+    environment only and validates the allowlisted owner/timestamp output.
+    No deploy, drill, takeover, fence, production or Cloudflare route.
+    """
+    name = "staging-ownership-status.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent; secrets belong only on the Run steps")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    elif on.get("workflow_dispatch") not in (None, {}, ""):
+        errors.append(f"{name}: workflow_dispatch must take no inputs")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "staging-ownership-status", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own staging-ownership-status group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"status"}:
+        errors.append(f"{name}: jobs must be exactly status")
+        return errors
+    job = jobs["status"]
+    if job.get("name") != "staging ownership status (read-only)":
+        errors.append(f"{name}:status: job name must stay read-only")
+    if job.get("environment") != "staging":
+        errors.append(f"{name}:status: must read only the staging Environment binding")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:status: must run only from main")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:status: must keep contents:read only")
+    if job.get("timeout-minutes") != "10":
+        errors.append(f"{name}:status: timeout must stay 10 minutes")
+    if job.get("defaults") != {"run": {"working-directory": "wrangler"}}:
+        errors.append(f"{name}:status: must run steps from the wrangler directory")
+    if not runner_allowed("status", job.get("runs-on")):
+        errors.append(f"{name}:status: must use the routed runner expression for job 'status'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:status: must not set {key} (bindings stay on the Run steps)")
+    text = str(job).lower().replace(" ", "")
+    for marker in ("wrangler-action", "wranglerdeploy", "wranglerpublish", "production",
+                   "cloudflare_api_token", "cloudflare_account_id", "tojson(secrets", "secrets[",
+                   "set-x", "setx", "xtrace", "takeover", "fence", "transition", "inputs."):
+        if marker in text:
+            errors.append(f"{name}:status: must not contain {marker!r}")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"staging_ownership_control_token"}:
+        errors.append(f"{name}:status: must read exactly the staging ownership-control secret")
+    if "vars.staging_worker_url" not in text:
+        errors.append(f"{name}:status: must read the staging Worker URL variable")
+    steps = job.get("steps") or []
+    if len(steps) != 4 or any(key in step for step in steps for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:status: must run exactly checkout, setup-node, preflight and the read, unconditionally")
+        return errors
+    checkout, node, preflight, run = steps
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
+            or (checkout.get("with") or {}).get("fetch-depth") != "1":
+        errors.append(f"{name}:status: checkout must be pinned, shallow and must not persist credentials")
+    if not str(node.get("uses", "")).startswith("actions/setup-node@"):
+        errors.append(f"{name}:status: second step must be the pinned setup-node")
+    if preflight.get("env") != OWNERSHIP_STATUS_ENV \
+            or str(preflight.get("run", "")).strip() != "node scripts/ownership-control.mjs preflight":
+        errors.append(f"{name}:status: preflight must bind exactly the staging pair and run the preflight")
+    if run.get("env") != OWNERSHIP_STATUS_ENV or "uses" in run:
+        errors.append(f"{name}:status: read step must bind exactly the staging pair via the environment only")
+    command = str(run.get("run", ""))
+    if "node scripts/staging-ownership-status.mjs" not in command or "${{" in command:
+        errors.append(f"{name}:status: read step must call the reviewed status script without inline expressions")
+    if '{"owner_id","observed_at"}' not in command.replace(" ", ""):
+        errors.append(f"{name}:status: read step must validate the allowlisted owner/timestamp output")
+    return errors
+
+
 # Pinned central gradual-promote action (verified 2026-10-18; re-verify HEAD
 # before repinning). Every error-rate input stays explicit so a central
 # default change cannot silently widen the gate.
@@ -1965,6 +2055,12 @@ def workflow_policy_errors(workflows):
             # staging-deploy policy. The generic environment/marker scan
             # below would flag its production-migrate Environment binding.
             errors.extend(production_migrate_errors(workflow))
+            continue
+        if name == "staging-ownership-status.yml":
+            # Manual read-only ownership status read: pinned shape above;
+            # the generic environment scan below would flag its staging
+            # Environment binding.
+            errors.extend(staging_ownership_status_errors(workflow))
             continue
         for job_id, job in jobs.items():
             if name == "deploy-staging.yml" and job_id == "schema-gate":
@@ -3301,6 +3397,70 @@ class WorkflowTests(unittest.TestCase):
         # The inventory pin fails closed if the workflow disappears or gains a job.
         missing = deepcopy(workflows)
         del missing["staging-events-read.yml"]
+        self.assertTrue(workflow_policy_errors(missing))
+        self.assertEqual(workflow_policy_errors(workflows), [])
+
+    def test_staging_ownership_status_shape_is_pinned(self):
+        workflows = self.workflows
+        self.assertEqual(staging_ownership_status_errors(workflows["staging-ownership-status.yml"]), [])
+
+        def mutate(change):
+            copy = deepcopy(workflows["staging-ownership-status.yml"])
+            change(copy)
+            return staging_ownership_status_errors(copy)
+
+        def job(copy):
+            return copy["jobs"]["status"]
+
+        changes = {
+            "push trigger": lambda w: w["on"].update({"push": {"branches": ["main"]}}),
+            "schedule trigger": lambda w: w["on"].update({"schedule": [{"cron": "0 * * * *"}]}),
+            "with inputs": lambda w: w["on"].update({"workflow_dispatch": {"inputs": {"force": {"type": "boolean"}}}}),
+            "top-level permissions": lambda w: w.update({"permissions": {"contents": "read"}}),
+            "workflow-level secret": lambda w: w.update(
+                {"env": {"T": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}}),
+            "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
+            "wrong environment": lambda w: job(w).update({"environment": "staging-events-read"}),
+            "production environment": lambda w: job(w).update({"environment": "production"}),
+            "no environment": lambda w: job(w).pop("environment"),
+            "branch condition removed": lambda w: job(w).pop("if"),
+            "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
+            "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
+            "longer timeout": lambda w: job(w).update({"timeout-minutes": "30"}),
+            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
+            "other job's routing": lambda w: job(w).update(
+                {"runs-on": ROUTED_RUNNER.format(job="check")}),
+            "job-level secret": lambda w: job(w).update(
+                {"env": {"T": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}}),
+            "step condition": lambda w: job(w)["steps"][3].update({"if": "always()"}),
+            "continue on error": lambda w: job(w)["steps"][3].update({"continue-on-error": "true"}),
+            "extra step": lambda w: job(w)["steps"].append({"run": "echo done"}),
+            "persisted credentials": lambda w: job(w)["steps"][0]["with"].update(
+                {"persist-credentials": "true"}),
+            "extra secret": lambda w: job(w)["steps"][3]["env"].update(
+                {"X": "${{ secrets.CLOUDFLARE_API_TOKEN }}"}),
+            "dropped token": lambda w: job(w)["steps"][3]["env"].pop("OWNERSHIP_CONTROL_TOKEN"),
+            "dropped worker url": lambda w: job(w)["steps"][3]["env"].pop("STAGING_WORKER_URL"),
+            "blanket secrets": lambda w: job(w)["steps"][3]["env"].update({"ALL": "${{ toJSON(secrets) }}"}),
+            "inline expression": lambda w: job(w)["steps"][3].update(
+                {"run": 'node scripts/staging-ownership-status.mjs "${{ vars.STAGING_WORKER_URL }}"'}),
+            "shell trace": lambda w: job(w)["steps"][3].update(
+                {"run": "set -x\nnode scripts/staging-ownership-status.mjs"}),
+            "other script": lambda w: job(w)["steps"][3].update(
+                {"run": "node scripts/other.mjs"}),
+            "takeover step": lambda w: job(w)["steps"][3].update(
+                {"run": "node scripts/ownership-control.mjs deployment-takeover"}),
+            "wrangler action": lambda w: job(w)["steps"].insert(
+                2, {"uses": "cloudflare/wrangler-action@pinned"}),
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self.assertTrue(mutate(change))
+        # The inventory pin fails closed if the workflow disappears or gains a job.
+        missing = deepcopy(workflows)
+        del missing["staging-ownership-status.yml"]
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
