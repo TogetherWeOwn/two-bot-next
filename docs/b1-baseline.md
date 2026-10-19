@@ -172,7 +172,11 @@ the binary ceiling moves to 17 MiB; revisit if the binary approaches it. The
 
 On 2026-10-17, the landed slices since the 16 MiB bump consumed its headroom:
 main at `89c859b1` measured 16,777,376 bytes (16.00 MiB), 160 bytes over the
-ceiling, so the gate trips on main itself. The moderation-enforcement-outcomes
+ceiling, so the gate trips on main itself. The PR-1093 merge_group against
+the same base measured the identical 16,777,376 bytes in [its container smoke
+job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39061090833),
+confirming the trip is main-red, not PR-introduced. The
+moderation-enforcement-outcomes
 head measured 16,778,152 bytes (16.00 MiB), 936 bytes over, with no new
 dependencies and the same minimal release profile. The budget is therefore
 rebumped to 17 MiB, leaving about 1 MiB of headroom above the measured heads;

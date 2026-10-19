@@ -198,6 +198,14 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   INTERNAL_ACTIONS_INGRESS?: string;
   /** Staging-only var (wrangler.toml [env.staging.vars]); see eventsub.ts. */
   EVENTSUB_INGRESS?: string;
+  /**
+   * Deploy-stamped container Git SHA for Worker-edge span lines. Set only in
+   * the generated deploy configs (scripts/staging_rollout.py,
+   * scripts/production_deploy.py), never a committed var. Anything that is
+   * not a hex SHA logs as the visible `"unknown"` bucket. Never forwarded to
+   * the container or logged verbatim elsewhere.
+   */
+  CONTAINER_RELEASE?: string;
   /** Operator-set Worker secret enabling the EventSub forward. Never flag-forwarded. */
   TWO_EVENTSUB?: string;
   /** Operator-set Worker secret carrying the Twitch signing secret. Never flag-forwarded. */
@@ -1024,9 +1032,9 @@ export class TwoBotContainer extends Container<Env> {
     // it via the allowlisted headers, and these envelopes echo it so a 503
     // still joins the flow's Worker and container logs.
     const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
-    const checked = allowlistedHeaders(request.headers, requestId);
+    const checked = allowlistedHeaders(request.headers, requestId, this.lastRelease);
     if ("refusal" in checked) return checked.refusal;
-    const body = await readBody(request, requestId);
+    const body = await readBody(request, requestId, this.lastRelease);
     if ("refusal" in body) return body.refusal;
     const forward = forwardRequest(
       `http://c${ACTIONS_PATH}`,
@@ -1057,7 +1065,7 @@ export class TwoBotContainer extends Container<Env> {
         }
         let relayed: Response;
         try {
-          relayed = await relayReceiverResponse(upstream, requestId, signal);
+          relayed = await relayReceiverResponse(upstream, requestId, signal, this.lastRelease);
         } catch {
           return envelope(503, "unavailable", true, {}, requestId);
         }
@@ -1087,9 +1095,9 @@ export class TwoBotContainer extends Container<Env> {
     // Same join as the actions path above: the forward carries the stamped
     // id, and these envelopes echo it so a 503 still joins the flow's logs.
     const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
-    const checked = eventsubAllowlistedHeaders(request.headers, requestId);
+    const checked = eventsubAllowlistedHeaders(request.headers, requestId, this.lastRelease);
     if ("refusal" in checked) return checked.refusal;
-    const body = await readEventsubBody(request, requestId);
+    const body = await readEventsubBody(request, requestId, this.lastRelease);
     if ("refusal" in body) return body.refusal;
     const forward = forwardRequest(
       `http://c${EVENTSUB_PATH}`,
@@ -1118,7 +1126,7 @@ export class TwoBotContainer extends Container<Env> {
         }
         let relayed: Response;
         try {
-          relayed = await relayEventsubResponse(upstream, requestId, signal);
+          relayed = await relayEventsubResponse(upstream, requestId, signal, this.lastRelease);
         } catch {
           return envelope(503, "unavailable", true, {}, requestId);
         }
@@ -1702,6 +1710,7 @@ export default {
           sanitized.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
           return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         },
+        env.CONTAINER_RELEASE,
       );
     }
 
@@ -1717,6 +1726,7 @@ export default {
           sanitized.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
           return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         },
+        env.CONTAINER_RELEASE,
       );
     }
 
@@ -1724,7 +1734,9 @@ export default {
     // path only: only POST is served (browser probes get 405, never tool
     // execution). Unconfigured/short token → 404 (the route does not exist);
     // missing/wrong bearer → 401 with WWW-Authenticate, before the Container
-    // is touched. Every tool call below is bounded (6 s / 64 KiB) in mcp.ts.
+    // is touched. Authenticated request bodies are collected under their own
+    // inbound bound (64 KiB / 6 s, before parsing) in mcp.ts, and every tool
+    // call below keeps its separate outbound container bound (6 s / 64 KiB).
     if (url.pathname === "/mcp") {
       if (request.method !== "POST") {
         return new Response("method not allowed", {

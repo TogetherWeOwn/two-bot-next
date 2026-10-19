@@ -860,6 +860,46 @@ as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
 
+#### Alert: EventSub post failed share
+
+`two_bot_eventsub_posts_total{outcome}` failed share across keepalive
+samples: failed posts exceed 10% of attempted posts in the window, with at
+least 10 attempted posts. `eventsub_post_failed_share` is a **ticket, not a
+page**. The denominator is attempted posts, not succeeded plus failed: growth
+in `succeeded` from earlier attempts or in `other` never counts as delivery
+failure. Announcement traffic is low-volume, so windows below the floor hold
+the baseline and accumulate attempts across consecutive valid samples until the
+floor is met; only the judged window rebaselines. Low-volume windows (fewer
+than 10 attempted) stay quiet at any share, and a judged window at or below
+the 10% line stays quiet. The first valid sample
+is baseline only, even when every post so far failed. Missing or invalid samples
+preserve the active ticket and the baseline; a counter reset (any outcome
+moving backwards, including a process restart) rebaselines without firing. Each
+each judged window recomputes the share, so only a judged window at or below
+the line resolves the ticket. Flat or sub-floor windows hold an active ticket
+until that judged window clears it, so a sustained outage stays one ALERT
+instead of flapping. Recovery is a healthy judged window with the failed share
+back at or below the line; confirm live delivery separately before closing out.
+The resolve transition fires exactly once.
+
+First response: read-only diagnosis only. Read the attempted/failed counters
+through the existing authorized `/ops/metrics` path and correlate the window
+with `eventsub_receiver` log lines; do not re-post announcements, touch the
+durable ledger, retry sends, or reconcile subscriptions from this alert. No
+broadcaster, body, token or free-text label ever reaches the alert. For delivery
+shape and subscription health, follow the existing [stream funnel](stream-funnel.md#transport-webhook)
+transport/webhook section and the [EventSub operator runbook](eventsub-runbook.md)
+(refusal matrix, challenge verification, dark-unless-enabled behavior) through
+their authorized read paths. Record only fixed outcome names and sanitized
+counts, never broadcaster IDs, tokens, bodies or scrape secrets.
+
+Do not post announcements, write ledger rows, retry deliveries, or reconcile
+subscriptions to clear this ticket. This alert adds neither posting, ledger,
+retry, nor reconciliation behavior: it labels the existing transition delivery
+as `(ticket)` and supplies this runbook. Route a continuing delivery failure to
+the on-call engineer through the normal triage path. No new webhook, production
+activation or live load test is authorized.
+
 #### Alert: metrics scrape lost
 
 The Container DO failed the container-internal `/metrics` scrape on 3 consecutive scheduled keepalive ticks. This is a **ticket, not a page**: the observer itself is blind, so every metric-rule alert is missing evidence while this fires. One failed scrape stays quiet and three consecutive failures ticket exactly once; further failures do not re-ticket while the incident fires.

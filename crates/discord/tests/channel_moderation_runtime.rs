@@ -31,9 +31,18 @@ impl Database {
         let url = std::env::var("TWO_TEST_DATABASE_URL")
             .expect("explicit isolated test service required");
         let ci = std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true");
-        let host = if url == "postgres://agent_test@agent-testdb:5432/agent_test" {
+        // Also accept the workspace bootstrap URL used by the check.yml
+        // coverage sweep; the connection below still targets `agent_test`
+        // with an isolated schema, so data never lands in the bootstrap
+        // database.
+        let host = if url == "postgres://agent_test@agent-testdb:5432/agent_test"
+            || url == "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci"
+        {
             "agent-testdb"
-        } else if ci && url == "postgres://agent_test@127.0.0.1:5432/agent_test" {
+        } else if ci
+            && (url == "postgres://agent_test@127.0.0.1:5432/agent_test"
+                || url == "postgres://agent_test:@127.0.0.1:5432/two_bot_test_ci")
+        {
             "127.0.0.1"
         } else {
             panic!("non-test database refused")
