@@ -347,15 +347,19 @@ and `activity_detected`, so "no game was ever seen" is distinguishable
 from "the rename was refused"; the retry-only `channel_unseen` decision
 logs at debug, since the naming pass retries it on every pass.
 
-Adjacent actor message without a `voice_event` field:
-`voice actor load failed; actor respawns on the next guild snapshot`
+Adjacent actor messages without a `voice_event` field:
+`voice actor load failed; retrying with capped backoff` and
+`voice actor load failed; credential refused, not retrying`
 (`observe_voice_actor_load_failure` in `crates/bot/src/voice_rooms.rs`):
 the guild actor's store load failed. Every failure bumps
 `two_bot_db_errors_total{op="other"}`; the warn is throttled process-wide to
-one line per 5 minutes, so a burst across guilds names only the first. The
-actor respawns on the next guild snapshot (`publish_snapshot` on
-`GuildCreate`/resumed replay); voice, channel and role events for the guild
-are dropped until then.
+one line per 5 minutes, so a burst across guilds names only the first.
+Transient failures (including a load attempt abandoned at its 30 s
+deadline) retry inside the same actor task: 1 s doubling to a 60 s cap,
+until the load succeeds or the guild is removed. A credential refusal is
+never retried; that actor respawns only on the next guild snapshot
+(`publish_snapshot` on `GuildCreate`/resumed replay), and voice, channel
+and role events for the guild are dropped until then.
 
 `voice live view was not ready on a connected gateway; republished from cache`
 (warn; `heal_not_ready` in `crates/bot/src/voice_rooms.rs`, guild-only field,
