@@ -218,10 +218,10 @@ otherwise the loop is unchanged.
   outcome is `Bypassed` or `Retained(_)`, and otherwise copies the funnel. A
   `process` timeout keeps raw capture only for both (`crates/bot/src/automod_gateway.rs:294-303`). The worker
   hands the funnel disposition to
-  `handle_at_with_message_disposition` exactly once (`crates/bot/src/gateway.rs:699-710`) and fires the message hook
+  `handle_at_with_message_disposition` exactly once (`crates/bot/src/gateway.rs:744-755`) and fires the message hook
   only when `runs_text_automations` passes the trigger verdict — `None`
   (automod inactive) or `Accept` (`crates/bot/src/automod_gateway.rs:307-311`,
-  `crates/bot/src/gateway.rs:56-70`, `crates/bot/src/gateway.rs:721-729`). The hook carries
+  `crates/bot/src/gateway.rs:56-70`, `crates/bot/src/gateway.rs:766-774`). The hook carries
   the trigger verdict into the trigger handler, where a missing verdict fails
   closed (`crates/bot/src/command_runtime.rs:954-975`, `crates/bot/src/gateway_commands.rs:89-100`). Per outcome class
   (`ActivationOutcome` in `crates/discord/src/automod_activation.rs:74-86`):
