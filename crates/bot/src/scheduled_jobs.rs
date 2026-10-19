@@ -19,9 +19,9 @@ use std::{sync::Arc, time::Duration};
 use sqlx::PgPool;
 use two_bot_core::{
     activation::LiveCapability, audit_scheduled, claim_due, clamp_retry_delay_ms, complete_run,
-    format_iso_ms, lease_until_ms, post_failure_retryable, retry_scheduled, FeatureGates,
-    OccurrenceOutcome, ScheduledAuditInput, ScheduledMessageRow, ScheduledStoreError,
-    SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
+    format_iso_ms, lease_until_ms, neutralize_scheduled_body, post_failure_retryable,
+    retry_scheduled, FeatureGates, OccurrenceOutcome, ScheduledAuditInput, ScheduledMessageRow,
+    ScheduledStoreError, SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
 };
 use two_bot_discord::executor::{ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordError};
 
@@ -194,9 +194,18 @@ struct Occurrence<'a> {
 
 impl Occurrence<'_> {
     async fn run(&self, audit_failed: &mut bool) -> Result<Step, ErrorClass> {
+        // Defuse rows written before any validate-side screen on the way to
+        // the channel; benign bodies pass through byte-identical and the
+        // shared send path keeps the closed mention policy. The neutralized
+        // body is truncated to the message ceiling (surrogate-safe) so a
+        // legacy row at the old pre-neutralize limit still posts instead of
+        // failing permanent on the send-path length check.
         let call = ChannelCall::PostMessage {
             channel_id: self.row.channel_id.clone(),
-            content: self.row.body.clone(),
+            content: two_bot_core::message_safety::truncate(
+                &neutralize_scheduled_body(&self.row.body),
+                two_bot_core::message_safety::CONTENT_LIMIT,
+            ),
             nonce: self.row.occurrence_nonce.clone(),
         };
         let posted = match self.rest.execute_channel(&call).await {
