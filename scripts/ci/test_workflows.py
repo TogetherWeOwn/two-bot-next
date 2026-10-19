@@ -37,7 +37,8 @@ JOB_INVENTORY = {
                   "nextest"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "recheck",
                               "production", "release"},
-    "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "voice-synthetic"},
+    "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic",
+                           "pinned-history-guard"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"tag", "sbom-target", "release-sbom", "attach-sbom"},
@@ -215,7 +216,7 @@ def staging_push_filter_errors(name, push):
 
 
 def staging_dispatch_errors(workflow):
-    """The active staging workflow keeps exactly five fenced dispatch inputs.
+    """The active staging workflow keeps exactly six fenced dispatch inputs.
 
     `release_fence` exists on main (TOG-11143) so post-handoff release of an
     uninitialized/parked singleton is explicit and auditable; it defaults to
@@ -228,8 +229,11 @@ def staging_dispatch_errors(workflow):
     expression in staging_error_rate_gate_errors. `inject_voice_stall` and
     `inject_unpaired_disconnect` are the remediation-drill switches with the
     same shape, readable only through the pinned dispatch-only expressions
-    in staging_fault_injection_errors. Anything else in the
-    dispatch block (an arming switch, a deploy flag, a default of
+    in staging_fault_injection_errors. `sha` pins the deployed commit for
+    arm/disarm at one exact revision: an optional string, empty by default
+    (empty deploys the workflow head), readable only through the pinned
+    dispatch-or-head expression in staging_pinned_sha_errors. Anything else
+    in the dispatch block (an arming switch, a deploy flag, a default of
     true) is an unreviewed deploy route outside the pinned shape.
     """
     name = "deploy-staging.yml"
@@ -239,14 +243,21 @@ def staging_dispatch_errors(workflow):
         errors.append(f"{name}: triggers changed")
     errors.extend(staging_push_filter_errors(name, on.get("push")))
     dispatch = on.get("workflow_dispatch") or {}
-    expected = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike", "inject_voice_stall", "inject_unpaired_disconnect"}
+    expected_booleans = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike",
+                         "inject_voice_stall", "inject_unpaired_disconnect"}
+    expected = expected_booleans | {"sha"}
     if set(dispatch) != {"inputs"} or set(dispatch.get("inputs") or {}) != expected:
-        errors.append(f"{name}: workflow_dispatch must carry only the release_fence, inject_gateway_failure, inject_error_rate_spike, inject_voice_stall and inject_unpaired_disconnect inputs")
+        errors.append(f"{name}: workflow_dispatch must carry only the release_fence, drill and sha inputs")
     else:
-        for input_name in expected:
+        for input_name in expected_booleans:
             spec = dispatch["inputs"][input_name] or {}
             if spec.get("type") != "boolean" or spec.get("default") not in (False, "false"):
                 errors.append(f"{name}: {input_name} must be an opt-in boolean defaulting to false")
+        sha = dispatch["inputs"]["sha"] or {}
+        if (sha.get("type") != "string" or str(sha.get("required")).lower() != "false"
+                or sha.get("default") != ""):
+            errors.append(f"{name}: sha must be an optional string defaulting to empty "
+                          "(empty deploys the workflow head)")
     return errors
 
 
@@ -265,6 +276,14 @@ FAULT_MARKERS = (
     "inject_unpaired_disconnect", "INJECT_UNPAIRED_DISCONNECT",
     "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION", "--inject-unpaired-disconnect",
 )
+# Pinned-SHA arm/disarm: a dispatch names its exact commit, anything else
+# deploys the workflow head. Every checkout ref and every SHA-step env in
+# deploy-staging must use exactly this expression.
+DEPLOY_SHA_EXPRESSION = "${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}"
+# Soak-hold bindings: the Operator-owned repo variable holding the ISO-8601
+# UTC deadline, plus the event name that lets dispatches bypass the hold.
+SOAK_HOLD_ENV = {"HOLD_UNTIL": "${{ vars.STAGING_SOAK_HOLD_UNTIL }}",
+                 "EVENT": "${{ github.event_name }}"}
 
 
 def staging_gateway_injection_errors(workflows):
@@ -461,6 +480,265 @@ def staging_fault_injection_errors(workflows):
                    '[ "$INJECT_UNPAIRED_DISCONNECT" = "true" ]'):
         if run.count(needle) != 1:
             errors.append(f"deploy-staging.yml: fault step must contain exactly one {needle}")
+    return errors
+
+
+def staging_pinned_sha_errors(workflows):
+    """The pinned-SHA arm/disarm is dispatch-only, exact and ancestor-checked.
+
+    A dispatch may name its exact commit; a push (or an empty dispatch) always
+    deploys the workflow head. All three jobs check out the pinned
+    dispatch-or-head ref at full depth, and each carries one SHA step that
+    resolves the same expression through the environment, proves HEAD equals
+    it, enforces a full 40-hex shape and refuses anything that is not an
+    ancestor of origin/main. Each SHA step refuses exactly four ways (shape,
+    length, checkout equality, ancestry), pinned by exit count so no refusal
+    can go green. Exactly eight reads exist (three checkout refs, three
+    SHA-step envs, the schema gate's --source-sha env, the history guard's
+    comparison env): seven use the pinned expression and the eighth is the
+    guard's raw pin-vs-head comparison, so no other step can resolve or judge
+    a different commit. Build identity and provenance then follow the
+    validated SHA through the deploy job's DEPLOY_SHA export, pinned by
+    staging_deploy_identity_errors. Every other workflow must not mention the
+    switch at all, except deploy-production and release, which carry their
+    own reviewed sha inputs (the production guard's verified SHA, the
+    published release tag) pinned by their own checks.
+    """
+    errors = []
+    for name, workflow in workflows.items():
+        if name in ("deploy-staging.yml", "deploy-production.yml", "release.yml"):
+            continue
+        if "inputs.sha" in str(workflow):
+            errors.append(f"{name}: pinned-sha marker inputs.sha outside the deploy workflows")
+    staging = workflows.get("deploy-staging.yml") or {}
+    text = str(staging)
+    if text.count("inputs.sha") != 8:
+        errors.append("deploy-staging.yml: sha must be read exactly eight times "
+                      "(three checkouts, three SHA steps, the schema gate env, "
+                      "the history guard comparison)")
+    if text.count(DEPLOY_SHA_EXPRESSION) != 7:
+        errors.append("deploy-staging.yml: every sha read but the history guard comparison "
+                      "must use the pinned dispatch-or-head expression")
+    jobs = staging.get("jobs") or {}
+    for job_id in ("schema-gate", "roles-gate", "deploy"):
+        job = jobs.get(job_id) or {}
+        steps = job.get("steps") or []
+        checkouts = [step for step in steps
+                     if str(step.get("uses", "")).startswith("actions/checkout@")]
+        if len(checkouts) != 1:
+            errors.append(f"deploy-staging.yml:{job_id}: must check out exactly once")
+            continue
+        with_ = checkouts[0].get("with") or {}
+        if with_.get("ref") != DEPLOY_SHA_EXPRESSION:
+            errors.append(f"deploy-staging.yml:{job_id}: checkout must pin the dispatch-or-head ref")
+        if with_.get("fetch-depth") != "0":
+            errors.append(f"deploy-staging.yml:{job_id}: checkout must be full-depth for the ancestry check")
+        sha_steps = [step for step in steps
+                     if step.get("name") == "Deploy SHA must be exact and reachable from main"]
+        if len(sha_steps) != 1:
+            errors.append(f"deploy-staging.yml:{job_id}: must carry exactly one pinned-SHA check step")
+            continue
+        step = sha_steps[0]
+        if (step.get("env") or {}).get("SOURCE_SHA") != DEPLOY_SHA_EXPRESSION:
+            errors.append(f"deploy-staging.yml:{job_id}: SHA step must resolve the dispatch-or-head "
+                          "SHA through the environment")
+        run = str(step.get("run") or "")
+        for needle in ("git rev-parse HEAD", "git fetch origin main",
+                       'git merge-base --is-ancestor "$SOURCE_SHA" origin/main',
+                       "[!0-9a-f]", '"${#SOURCE_SHA}"', "-eq 40"):
+            if needle not in run:
+                errors.append(f"deploy-staging.yml:{job_id}: SHA step must contain {needle}")
+        # Four refusals, four exits: flipping any refusal green (in
+        # particular the ancestry rejection) trips this count.
+        if run.count("exit 1") != 4:
+            errors.append(f"deploy-staging.yml:{job_id}: SHA step must refuse exactly four ways "
+                          "(shape, length, checkout equality, ancestry)")
+        # The shape check runs before the checkout equality: HEAD is always a
+        # full SHA, so an equality-first order would refuse a short or branch
+        # pin with no message before the shape refusal could explain it.
+        if ("[!0-9a-f]" in run and "git rev-parse HEAD" in run
+                and run.index("[!0-9a-f]") > run.index("git rev-parse HEAD")):
+            errors.append(f"deploy-staging.yml:{job_id}: SHA step must check the 40-hex shape "
+                          "before the checkout equality")
+    gate_run = ((jobs.get("schema-gate") or {}).get("steps") or [])
+    gate_run = [step for step in gate_run if "staging_schema_gate.py" in str(step.get("run") or "")]
+    if len(gate_run) != 1 or (gate_run[0].get("env") or {}).get("SOURCE_SHA") != DEPLOY_SHA_EXPRESSION:
+        errors.append("deploy-staging.yml:schema-gate: gate step must check the dispatch-or-head source")
+    return errors
+
+
+def soak_hold_errors(workflow, name="deploy-staging.yml"):
+    """The soak hold defers push deploys loudly, never as a quiet green.
+
+    While the Operator holds staging armed for a remediation-drill soak,
+    push deploys must not redeploy it — and the run must fail fast here with
+    a deferral message instead of reporting success without deploying (the
+    production guard accepts a successful staging run as staging history, so
+    a quiet skip would void that leg). Dispatches (arm/disarm) always
+    proceed. One job runs first on every trigger (no `if:`, no `needs:`, no
+    environment, no checkout): a single step binds only the hold deadline var
+    and the event name, exits 0 for a dispatch, an empty var or an expired
+    deadline (fail open), and exits 1 for an unparsable or over-long value
+    (fail closed with a fix-it message) or an armed hold. Both the expiry and
+    the deferral leave a job-summary line. The gates wait on this job; the
+    deploy and the synthetic follow transitively, so a failed hold skips them
+    and fails the run red.
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    job = jobs.get("soak-hold") or {}
+    if job.get("name") != "soak hold (defer push deploys while armed)":
+        errors.append(f"{name}:soak-hold: consumer job identity changed")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:soak-hold: must keep contents:read only")
+    if not runner_allowed("soak-hold", job.get("runs-on")):
+        errors.append(f"{name}:soak-hold: must use the routed runner expression for job 'soak-hold'")
+    if job.get("timeout-minutes") != "5":
+        errors.append(f"{name}:soak-hold: timeout must stay 5 minutes")
+    for key in ("if", "needs", "uses", "environment", "services", "container",
+                "continue-on-error", "strategy", "env"):
+        if key in job:
+            errors.append(f"{name}:soak-hold: must not set {key} "
+                          "(it runs first, on every trigger, with no bindings)")
+    text = str(job)
+    if "secrets." in text or "inputs." in text:
+        errors.append(f"{name}:soak-hold: must read only the hold variable and the event name, "
+                      "never secrets or inputs")
+    steps = job.get("steps", [])
+    if len(steps) != 1 or any("if" in step or "continue-on-error" in step for step in steps):
+        errors.append(f"{name}:soak-hold: must run exactly one unconditional check step")
+        return errors
+    step = steps[0]
+    if step.get("env") != SOAK_HOLD_ENV:
+        errors.append(f"{name}:soak-hold: step must bind exactly the hold deadline and the event name "
+                      "via the environment")
+    run = str(step.get("run") or "")
+    for needle in ("set -euo pipefail", '[ "$EVENT" = "workflow_dispatch" ]', '[ -z "$HOLD_UNTIL" ]',
+                   'date -u -d "$HOLD_UNTIL" +%s', "14400", "GITHUB_STEP_SUMMARY", "::error::"):
+        if needle not in run:
+            errors.append(f"{name}:soak-hold: missing pin {needle}")
+    if run.count("exit 1") != 3 or run.count("exit 0") != 3:
+        errors.append(f"{name}:soak-hold: must exit 0 for dispatch/empty/expired and "
+                      "1 for unparsable/over-long/armed")
+    if "uses" in step or "${{" in run:
+        errors.append(f"{name}:soak-hold: step must use the environment only, never an inline expression")
+    return errors
+
+
+def pinned_history_guard_errors(workflow, name="deploy-staging.yml"):
+    """A pinned drill deploy stays red, so it never reads as staging history.
+
+    The production guard keys staging runs by head SHA: a dispatch that
+    deploys a pinned SHA below the workflow head would otherwise mint a
+    successful run for a commit that never served staging. One job runs after
+    the voice synthetic (a deploy-job step cannot judge: a failure there
+    would auto-roll back the drill build): a single step binds the raw pin
+    and the head, passes when the pin is empty or equal to the head (the
+    deploy served the head, so the run is honest history), and fails the run
+    red otherwise with the reason. The drill still deploys and the synthetic
+    still runs; only the run verdict is red, exactly like the rollback
+    drill's intentionally-red run.
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    job = jobs.get("pinned-history-guard") or {}
+    if job.get("name") != "pinned drill deploys stay red (not staging history)":
+        errors.append(f"{name}:pinned-history-guard: consumer job identity changed")
+    if job.get("needs") != "voice-synthetic":
+        errors.append(f"{name}:pinned-history-guard: must run after the voice synthetic "
+                      "(it judges a deployed drill)")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:pinned-history-guard: must keep contents:read only")
+    if not runner_allowed("pinned-history-guard", job.get("runs-on")):
+        errors.append(f"{name}:pinned-history-guard: must use the routed runner expression "
+                      "for job 'pinned-history-guard'")
+    if job.get("timeout-minutes") != "5":
+        errors.append(f"{name}:pinned-history-guard: timeout must stay 5 minutes")
+    for key in ("if", "uses", "environment", "services", "container",
+                "continue-on-error", "strategy", "env"):
+        if key in job:
+            errors.append(f"{name}:pinned-history-guard: must not set {key} "
+                          "(it judges after the synthetic, with no bindings)")
+    if "secrets." in str(job):
+        errors.append(f"{name}:pinned-history-guard: must never read a secret")
+    steps = job.get("steps", [])
+    if len(steps) != 1 or any("if" in step or "continue-on-error" in step for step in steps):
+        errors.append(f"{name}:pinned-history-guard: must run exactly one unconditional verdict step")
+        return errors
+    step = steps[0]
+    if step.get("env") != {"PINNED_SHA": "${{ inputs.sha }}", "HEAD_SHA": "${{ github.sha }}"}:
+        errors.append(f"{name}:pinned-history-guard: step must bind exactly the pin and the head "
+                      "via the environment")
+    run = str(step.get("run") or "")
+    for needle in ("set -euo pipefail", '[ -z "$PINNED_SHA" ]', '[ "$PINNED_SHA" = "$HEAD_SHA" ]',
+                   "not staging history", "::error::"):
+        if needle not in run:
+            errors.append(f"{name}:pinned-history-guard: missing pin {needle}")
+    if run.count("exit 1") != 1 or run.count("exit 0") != 1:
+        errors.append(f"{name}:pinned-history-guard: must exit 0 for head deploys and 1 for pins below the head")
+    if "uses" in step or "${{" in run:
+        errors.append(f"{name}:pinned-history-guard: step must use the environment only, "
+                      "never an inline expression")
+    return errors
+
+
+def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
+    """A pinned drill deploy stamps the pin, never the workflow head.
+
+    The checkout builds the pinned commit, so every build-identity and
+    provenance consumer in the deploy job must stamp the validated
+    dispatch-or-head SHA: the deploy SHA step exports it as DEPLOY_SHA, the
+    prepare step overrides GITHUB_SHA with it (staging_rollout.py prepare
+    reads GITHUB_SHA as the build revision for BOT_BUILD_REVISION,
+    CONTAINER_RELEASE and the baseline receipt the verify step judges
+    against), and the wrangler --message, the ownership and rollback actors
+    and the promotion-gate SHA resolve it. Stamping the head instead would
+    serve the pin labeled as the head, break the runbook's read-the-serving-
+    SHA-from-build_revision step and poison the next rollback snapshot's
+    serving_sha (recorded from the workers/message annotation). No other
+    github.sha may appear in the deploy job outside the two pinned
+    dispatch-or-head expressions (checkout ref, SHA-step env).
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    deploy = jobs.get("deploy") or {}
+    steps = deploy.get("steps") or []
+
+    def find(label, predicate):
+        found = [step for step in steps if predicate(step)]
+        if len(found) != 1:
+            errors.append(f"{name}:deploy: must carry exactly one {label}")
+            return None
+        return found[0]
+
+    sha_step = find("SHA check step",
+                    lambda step: step.get("name") == "Deploy SHA must be exact and reachable from main")
+    if sha_step is not None and 'echo "DEPLOY_SHA=$SOURCE_SHA" >> "$GITHUB_ENV"' not in str(sha_step.get("run") or ""):
+        errors.append(f"{name}:deploy: SHA step must export the validated dispatch-or-head SHA")
+    prepare = find("staging identity snapshot step",
+                   lambda step: step.get("name") == "Snapshot staging identity and generate per-deploy image provenance")
+    if prepare is not None and (prepare.get("env") or {}).get("GITHUB_SHA") != "${{ env.DEPLOY_SHA }}":
+        errors.append(f"{name}:deploy: prepare step must stamp the validated deploy SHA as GITHUB_SHA")
+    wrangler = find("wrangler deploy step", lambda step: step.get("id") == "deploy")
+    if wrangler is not None:
+        command = str((wrangler.get("with") or {}).get("command") or "")
+        if "--message ${{ env.DEPLOY_SHA }}" not in command or "github.sha" in command:
+            errors.append(f"{name}:deploy: wrangler deploy must message the validated deploy SHA")
+    takeover = find("ownership takeover step", lambda step: step.get("id") == "takeover")
+    if takeover is not None and (takeover.get("env") or {}).get("OWNERSHIP_ACTOR") != \
+            "github-actions:${{ github.run_id }}:${{ env.DEPLOY_SHA }}":
+        errors.append(f"{name}:deploy: ownership actor must name the validated deploy SHA")
+    gate = find("promotion error-rate gate step", lambda step: step.get("id") == "error_rate_gate")
+    if gate is not None and (gate.get("env") or {}).get("SHA") != "${{ env.DEPLOY_SHA }}":
+        errors.append(f"{name}:deploy: promotion gate must judge the validated deploy SHA")
+    rollback = find("auto-rollback step", lambda step: step.get("id") == "auto_rollback")
+    if rollback is not None and (rollback.get("env") or {}).get("ROLLBACK_ACTOR") != \
+            "github-actions:${{ github.run_id }}:${{ env.DEPLOY_SHA }}":
+        errors.append(f"{name}:deploy: rollback actor must name the validated deploy SHA")
+    text = str(deploy)
+    if text.count("github.sha") != text.count(DEPLOY_SHA_EXPRESSION) or text.count("github.sha") != 2:
+        errors.append(f"{name}:deploy: github.sha may only appear in the checkout ref and "
+                      "SHA-step dispatch-or-head expressions")
     return errors
 
 
@@ -1600,7 +1878,7 @@ SCHEMA_GATE_IMAGE = ("rust:1.98-trixie@sha256:"
 def schema_gate_errors(workflow, name="deploy-staging.yml"):
     """Pre-deploy schema-drift gate: read-only plan, fail closed, no new privilege.
 
-    One job runs on every deploy-staging run (no `if:`, no `needs:` of its own)
+    One job runs on every deploy-staging run (no `if:`, `needs: soak-hold` only)
     through the no-reviewer `staging-migrate-plan` environment, builds the
     reviewed `staging-migrate` binary and fails the run with a `schema drift`
     error when `pending_before` is non-empty. The deploy job must `needs` the
@@ -1616,8 +1894,8 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
         errors.append(f"{name}:schema-gate: must keep contents:read only")
     if "if" in gate:
         errors.append(f"{name}:schema-gate: a job condition would bypass the stage gate")
-    if "needs" in gate:
-        errors.append(f"{name}:schema-gate: must wait for nothing (it is the wait)")
+    if gate.get("needs") != "soak-hold":
+        errors.append(f"{name}:schema-gate: must wait only for the soak hold (it is the wait after the hold)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
         errors.append(f"{name}:schema-gate: must use the routed runner expression for job 'schema-gate'")
     if gate.get("timeout-minutes") != "30":
@@ -1638,17 +1916,18 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
             or (checkout.get("with") or {}).get("persist-credentials") != "false" \
             or (checkout.get("with") or {}).get("fetch-depth") != "0":
         errors.append(f"{name}:schema-gate: checkout must be pinned, credentialless and full-depth")
-    if ("${{ github.sha }}" not in str(sha_check.get("env", ""))
+    if ((sha_check.get("env") or {}).get("SOURCE_SHA") != DEPLOY_SHA_EXPRESSION
             or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
-        errors.append(f"{name}:schema-gate: SHA check must pin the step to the deploy SHA")
+        errors.append(f"{name}:schema-gate: SHA check must pin the step to the dispatch-or-head SHA")
     if "cargo build -p two-bot-cutover --bin staging-migrate --locked" not in str(build.get("run", "")):
         errors.append(f"{name}:schema-gate: build must compile the reviewed staging-migrate binary locked")
     if (run.get("shell") != "bash" or "set -o pipefail" not in str(run.get("run", ""))
             or "scripts/ci/staging_schema_gate.py" not in str(run.get("run", ""))
             or "--source-sha" not in str(run.get("run", ""))
-            or "TWO_BOT_STAGING_PLAN_DATABASE_URL" not in str(run.get("env", ""))):
+            or "TWO_BOT_STAGING_PLAN_DATABASE_URL" not in str(run.get("env", ""))
+            or (run.get("env") or {}).get("SOURCE_SHA") != DEPLOY_SHA_EXPRESSION):
         errors.append(f"{name}:schema-gate: gate step must run the reviewed script over pipefail "
-                      "with the plan binding and the deploy SHA")
+                      "with the plan binding and the dispatch-or-head SHA")
     # The expected staging identity is pinned independently of the secret
     # binding (vars, never derived from the URL): a wrong-target binding must
     # refuse instead of reading the wrong database.
@@ -1760,7 +2039,7 @@ ROLES_GATE_MARKERS = ("wrangler", "--apply", "rolesplan", "migrator_database_url
 def roles_gate_errors(workflow, name="deploy-staging.yml"):
     """Pre-deploy role-drift gate: read-only verify, fail closed, no new privilege.
 
-    One job runs on every deploy-staging run (no `if:`, no `needs:` of its own)
+    One job runs on every deploy-staging run (no `if:`, `needs: soak-hold` only)
     through the no-reviewer `staging-migrate-plan` environment, builds the
     reviewed `two-bot` binary and fails the run when `db roles verify` reports
     any finding. The deploy job must `needs` the gate, so drift can never
@@ -1776,8 +2055,8 @@ def roles_gate_errors(workflow, name="deploy-staging.yml"):
         errors.append(f"{name}:roles-gate: must keep contents:read only")
     if "if" in gate:
         errors.append(f"{name}:roles-gate: a job condition would let drift deploy silently")
-    if "needs" in gate:
-        errors.append(f"{name}:roles-gate: must wait for nothing (it is the wait)")
+    if gate.get("needs") != "soak-hold":
+        errors.append(f"{name}:roles-gate: must wait only for the soak hold (it is the wait after the hold)")
     if not runner_allowed("roles-gate", gate.get("runs-on")):
         errors.append(f"{name}:roles-gate: must use the routed runner expression for job 'roles-gate'")
     if gate.get("timeout-minutes") != "30":
@@ -1802,9 +2081,9 @@ def roles_gate_errors(workflow, name="deploy-staging.yml"):
             or (checkout.get("with") or {}).get("persist-credentials") != "false" \
             or (checkout.get("with") or {}).get("fetch-depth") != "0":
         errors.append(f"{name}:roles-gate: checkout must be pinned, credentialless and full-depth")
-    if ("${{ github.sha }}" not in str(sha_check.get("env", ""))
+    if ((sha_check.get("env") or {}).get("SOURCE_SHA") != DEPLOY_SHA_EXPRESSION
             or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
-        errors.append(f"{name}:roles-gate: SHA check must pin the step to the deploy SHA")
+        errors.append(f"{name}:roles-gate: SHA check must pin the step to the dispatch-or-head SHA")
     if "cargo build -p two-bot --bin two-bot --locked" not in str(build.get("run", "")):
         errors.append(f"{name}:roles-gate: build must compile the reviewed two-bot binary locked")
     expected_run = """set -o pipefail
@@ -2149,6 +2428,10 @@ def workflow_policy_errors(workflows):
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
             errors.extend(staging_active_errors(workflow))
+            errors.extend(staging_pinned_sha_errors(workflows))
+            errors.extend(staging_deploy_identity_errors(workflow))
+            errors.extend(soak_hold_errors(workflow))
+            errors.extend(pinned_history_guard_errors(workflow))
             errors.extend(schema_gate_errors(workflow))
             errors.extend(roles_gate_errors(workflow))
         if name == "voice-synthetic.yml":
@@ -2216,6 +2499,10 @@ def workflow_policy_errors(workflows):
                 # the generic environment scan below would flag its plan binding
             if name == "deploy-staging.yml" and job_id == "deploy":
                 continue  # the live deploy route: pinned by the staging checks above
+            if name == "deploy-staging.yml" and job_id == "soak-hold":
+                continue  # push-deferral gate: pinned by soak_hold_errors above
+            if name == "deploy-staging.yml" and job_id == "pinned-history-guard":
+                continue  # pinned-drill verdict: pinned by pinned_history_guard_errors above
             else:
                 # Retargeting a known CI job must not create an unapproved
                 # deploy/probe route outside the deploy workflows.
@@ -2617,6 +2904,72 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
+    def test_runtime_container_pins_disposable_database_service_address(self):
+        # Same hardening as rust-tests and the stores lane: the runtime lane
+        # runs 26 sequential database suites, and a long run must not depend
+        # on service-alias DNS staying up (EAI_AGAIN on agent-testdb hit a
+        # stores run while Postgres PANIC-recovered on ENOSPC).
+        # The runtime WAL cap lives in this lane too (see
+        # test_runtime_postgres_wal_budget_is_bounded below).
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
+        prerequisites = next(
+            step for step in job["steps"]
+            if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
+        )
+        self.assertEqual(prerequisites.get("shell"), "bash")
+        run = prerequisites["run"]
+        self.assertIn("set -e", run)
+        hosts_tmp = run.index('hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"')
+        resolve = run.index("getent ahostsv4 agent-testdb")
+        remove_stale_pin = run.index("sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > \"$hosts_tmp\"")
+        self.assertNotIn("sed -i -E", run)
+        self.assertLess(hosts_tmp, remove_stale_pin)
+        copy_hosts = run.index('cat "$hosts_tmp" > /etc/hosts')
+        cleanup_hosts = run.index('rm -f "$hosts_tmp"')
+        self.assertLess(remove_stale_pin, copy_hosts)
+        self.assertLess(copy_hosts, cleanup_hosts)
+        pin = run.index("printf '%s agent-testdb\\n' \"$service_ip\" >> /etc/hosts")
+        verify_pin = run.index('getent ahostsv4 agent-testdb | awk \'NR == 1 { print $1; exit }\'')
+        forward = run.index("TCP:agent-testdb:5432")
+        ready = run.index("pg_isready -q -h 127.0.0.1")
+        self.assertIn("for attempt in $(seq 1 30)", run[:resolve])
+        self.assertLess(remove_stale_pin, resolve)
+        self.assertLess(resolve, pin)
+        self.assertLess(pin, verify_pin)
+        mismatch_check = run.index('if [ "$pinned_ip" != "$service_ip" ]; then')
+        mismatch_exit = run.index("exit 1", mismatch_check)
+        self.assertLess(verify_pin, mismatch_check)
+        self.assertLess(mismatch_exit, forward)
+        self.assertLess(verify_pin, forward)
+        self.assertLess(forward, ready)
+        self.assertIn("sleep 1", run)
+        fail_closed = run.index('if [ -z "$service_ip" ]; then')
+        self.assertLess(fail_closed, pin)
+        self.assertLess(run.index("exit 1", fail_closed), pin)
+        self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        # A failed lookup must empty the result, not kill the step under pipefail.
+        self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
+        self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
+
+    def test_runtime_postgres_wal_budget_is_bounded(self):
+        # Same budget as rust-tests and the stores lane: the runtime lane runs
+        # 26 sequential database suites against the same 1 GiB tmpfs service,
+        # so WAL recycling stays bounded with headroom for relation files.
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
+        prepare = next(
+            step for step in job["steps"]
+            if step.get("name") == "Prepare isolated test databases"
+        )
+        verify = next(
+            step for step in job["steps"]
+            if step.get("name") == "Verify disposable Postgres defaults"
+        )
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+        self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assertIn("'min_wal_size': '64MB'", verify["run"])
+
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
         step = next(
@@ -2672,6 +3025,15 @@ class WorkflowTests(unittest.TestCase):
             step["run"],
         )
         self.assertIn("MEMBER_TESTDB=agent-testdb", step["run"])
+        # The member-moderation guard panics without MEMBER_TESTDB, so the
+        # export must precede the ignored sweep: otherwise the suite prints
+        # 32 FAILED lines in a tolerated sweep that the flake ledger
+        # misattributes as real flakes. The dedicated re-run below stays the
+        # fail-closed gate.
+        self.assertLess(
+            step["run"].index("export MEMBER_TESTDB=agent-testdb"),
+            step["run"].index("--no-report -- --ignored --test-threads=1"),
+        )
         for target in (
             "channel_moderation_runtime",
             "internal_channel_moderation",
@@ -2842,6 +3204,7 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["schema-gate"].__setitem__("environment", "staging-migrate-apply"),
             lambda w: w["jobs"]["schema-gate"].__setitem__("if", "github.ref == 'refs/heads/main'"),
             lambda w: w["jobs"]["schema-gate"].__setitem__("needs", "deploy"),
+            lambda w: w["jobs"]["schema-gate"].pop("needs"),
             lambda w: w["jobs"]["deploy"].pop("needs"),
             lambda w: w["jobs"]["schema-gate"]["steps"][3].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["schema-gate"]["steps"][3].get("env", {}).__setitem__(
@@ -2858,8 +3221,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("schema-gate", [deploy["needs"]] if isinstance(deploy["needs"], str) else deploy["needs"])
         self.assertEqual(gate.get("environment"), "staging-migrate-plan")
         self.assertNotIn("if", gate)
-        self.assertNotIn("needs", gate)
-        # The chain stays ordered: gate first, deploy second, synthetic last.
+        self.assertEqual(gate.get("needs"), "soak-hold")
+        # The chain stays ordered: hold first, gates second, deploy third, synthetic last.
         self.assertEqual(staging["jobs"]["voice-synthetic"].get("needs"), "deploy")
 
     def test_roles_gate_shape_is_pinned_and_mutations_fail(self):
@@ -2870,6 +3233,7 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["roles-gate"].__setitem__("environment", "staging-migrate-apply"),
             lambda w: w["jobs"]["roles-gate"].__setitem__("if", "github.ref == 'refs/heads/main'"),
             lambda w: w["jobs"]["roles-gate"].__setitem__("needs", "deploy"),
+            lambda w: w["jobs"]["roles-gate"].pop("needs"),
             lambda w: w["jobs"]["deploy"].pop("needs"),
             lambda w: w["jobs"]["roles-gate"]["steps"][3].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["roles-gate"]["steps"][3].get("env", {}).__setitem__(
@@ -2894,8 +3258,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("roles-gate", needs)
         self.assertEqual(gate.get("environment"), "staging-migrate-plan")
         self.assertNotIn("if", gate)
-        self.assertNotIn("needs", gate)
-        # The chain stays ordered: gates first, deploy second, synthetic last.
+        self.assertEqual(gate.get("needs"), "soak-hold")
+        # The chain stays ordered: hold first, gates second, deploy third, synthetic last.
         self.assertEqual(staging["jobs"]["voice-synthetic"].get("needs"), "deploy")
 
     def test_staging_takeover_fence_hint_is_scoped_to_the_fenced_refusal(self):
@@ -3178,6 +3542,399 @@ class WorkflowTests(unittest.TestCase):
                 job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_voice_stall }}"
                 self.assertTrue(staging_fault_injection_errors(changed))
                 self.assertTrue(workflow_policy_errors(changed))
+
+    def test_pinned_sha_is_dispatch_only_and_ancestor_checked(self):
+        workflows = self.workflows
+        staging = workflows["deploy-staging.yml"]
+        self.assertEqual(staging_pinned_sha_errors(workflows), [])
+        self.assertEqual(staging_dispatch_errors(staging), [])
+        for job_id in ("schema-gate", "roles-gate", "deploy"):
+            job = staging["jobs"][job_id]
+            checkout = next(step for step in job["steps"]
+                            if str(step.get("uses", "")).startswith("actions/checkout@"))
+            self.assertEqual(checkout["with"]["ref"], DEPLOY_SHA_EXPRESSION)
+            self.assertEqual(checkout["with"]["fetch-depth"], "0")
+            sha_step = next(step for step in job["steps"]
+                            if step.get("name") == "Deploy SHA must be exact and reachable from main")
+            self.assertEqual(sha_step["env"]["SOURCE_SHA"], DEPLOY_SHA_EXPRESSION)
+        gate_run = next(step for step in staging["jobs"]["schema-gate"]["steps"]
+                        if "staging_schema_gate.py" in str(step.get("run", "")))
+        self.assertEqual(gate_run["env"]["SOURCE_SHA"], DEPLOY_SHA_EXPRESSION)
+
+        def swap_shape_after_equality(workflow):
+            run = workflow["jobs"]["deploy"]["steps"][1]["run"]
+            lines = run.splitlines()
+            case_i = next(i for i, line in enumerate(lines) if line.strip().startswith("case "))
+            test_i = next(i for i, line in enumerate(lines) if "git rev-parse HEAD" in line)
+            lines[case_i], lines[test_i] = lines[test_i], lines[case_i]
+            workflow["jobs"]["deploy"]["steps"][1]["run"] = "\n".join(lines)
+
+        mutations = {
+            # A push (or an empty dispatch) must deploy the workflow head, never a constant.
+            "checkout ref constant": lambda w: w["jobs"]["deploy"]["steps"][0]["with"]
+                .__setitem__("ref", "main"),
+            "checkout ref without dispatch guard": lambda w: w["jobs"]["deploy"]["steps"][0]["with"]
+                .__setitem__("ref", "${{ inputs.sha }}"),
+            "checkout ref removed": lambda w: w["jobs"]["deploy"]["steps"][0]["with"].pop("ref"),
+            "deploy checkout shallow": lambda w: w["jobs"]["deploy"]["steps"][0]["with"]
+                .__setitem__("fetch-depth", "1"),
+            "SHA env constant": lambda w: w["jobs"]["deploy"]["steps"][1]["env"]
+                .__setitem__("SOURCE_SHA", "abc"),
+            "ancestry check dropped": lambda w: w["jobs"]["deploy"]["steps"][1]
+                .__setitem__("run", "\n".join(line for line in
+                                             w["jobs"]["deploy"]["steps"][1]["run"].splitlines()
+                                             if "merge-base" not in line)),
+            "ancestry rejection goes green": lambda w: w["jobs"]["deploy"]["steps"][1]
+                .__setitem__("run", w["jobs"]["deploy"]["steps"][1]["run"]
+                             .replace("exit 1", "exit 0")),
+            "ancestry-only rejection goes green": lambda w: [
+                job["steps"][1].__setitem__(
+                    "run", job["steps"][1]["run"].replace(
+                        'git merge-base --is-ancestor "$SOURCE_SHA" origin/main || '
+                        '{ echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 1; }',
+                        'git merge-base --is-ancestor "$SOURCE_SHA" origin/main || '
+                        '{ echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 0; }'))
+                for job in (w["jobs"]["schema-gate"], w["jobs"]["roles-gate"], w["jobs"]["deploy"])],
+            "hex enforcement dropped": lambda w: w["jobs"]["deploy"]["steps"][1]
+                .__setitem__("run", "\n".join(line for line in
+                                             w["jobs"]["deploy"]["steps"][1]["run"].splitlines()
+                                             if "${#SOURCE_SHA}" not in line)),
+            "shape check after equality": swap_shape_after_equality,
+            "second sha reader": lambda w: w["jobs"]["deploy"]["steps"][2]
+                .setdefault("env", {}).__setitem__("EXTRA_SHA", DEPLOY_SHA_EXPRESSION),
+            "sha input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("sha"),
+            "sha input boolean": lambda w: w["on"]["workflow_dispatch"]["inputs"]["sha"]
+                .__setitem__("type", "boolean"),
+            "sha default armed": lambda w: w["on"]["workflow_dispatch"]["inputs"]["sha"]
+                .__setitem__("default", "abc"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(
+                    staging_pinned_sha_errors(changed)
+                    or staging_dispatch_errors(changed["deploy-staging.yml"]),
+                    label,
+                )
+                self.assertTrue(workflow_policy_errors(changed), label)
+        # Any other workflow mentioning the switch is a forwarding route,
+        # except deploy-production and release, which carry their own
+        # reviewed sha inputs.
+        for name in ("check.yml", "staging-migrate.yml"):
+            with self.subTest(forwarded=name):
+                changed = deepcopy(workflows)
+                job = next(iter(changed[name]["jobs"].values()))
+                job.setdefault("env", {})["FORWARD"] = "${{ inputs.sha }}"
+                self.assertTrue(staging_pinned_sha_errors(changed))
+                self.assertTrue(workflow_policy_errors(changed))
+
+    def test_soak_hold_defers_push_and_never_skips_silently(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(soak_hold_errors(staging), [])
+        self.assertEqual(schema_gate_errors(staging), [])
+        self.assertEqual(roles_gate_errors(staging), [])
+        self.assertEqual(staging["jobs"]["schema-gate"].get("needs"), "soak-hold")
+        self.assertEqual(staging["jobs"]["roles-gate"].get("needs"), "soak-hold")
+        # A hold never becomes a quiet green: the gates and the deploy carry
+        # no `if`, so a failed hold skips them and fails the run red, which
+        # the production guard refuses as staging history.
+        for job_id in ("soak-hold", "schema-gate", "roles-gate", "deploy"):
+            self.assertNotIn("if", staging["jobs"][job_id])
+        mutations = {
+            "hold job removed": lambda w: w["jobs"].pop("soak-hold"),
+            "hold gains a condition": lambda w: w["jobs"]["soak-hold"].__setitem__("if", "true"),
+            "hold waits on a gate": lambda w: w["jobs"]["soak-hold"].__setitem__("needs", "deploy"),
+            "hold reads a secret": lambda w: w["jobs"]["soak-hold"]["steps"][0]["env"]
+                .__setitem__("TOKEN", "${{ secrets.X }}"),
+            "hold reads an input": lambda w: w["jobs"]["soak-hold"]["steps"][0]["env"]
+                .__setitem__("FLAG", "${{ inputs.sha }}"),
+            "deadline var renamed": lambda w: w["jobs"]["soak-hold"]["steps"][0]["env"]
+                .__setitem__("HOLD_UNTIL", "${{ vars.OTHER }}"),
+            "max window widened": lambda w: w["jobs"]["soak-hold"]["steps"][0]
+                .__setitem__("run", w["jobs"]["soak-hold"]["steps"][0]["run"].replace("14400", "99999")),
+            "summary dropped": lambda w: w["jobs"]["soak-hold"]["steps"][0]
+                .__setitem__("run", "\n".join(line for line in
+                                             w["jobs"]["soak-hold"]["steps"][0]["run"].splitlines()
+                                             if "GITHUB_STEP_SUMMARY" not in line)),
+            "deferral goes green": lambda w: w["jobs"]["soak-hold"]["steps"][0]
+                .__setitem__("run", w["jobs"]["soak-hold"]["steps"][0]["run"].replace("exit 1", "exit 0")),
+            "gate stops waiting": lambda w: w["jobs"]["schema-gate"].pop("needs"),
+            "gate waits on deploy": lambda w: w["jobs"]["schema-gate"].__setitem__("needs", "deploy"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(self.workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(
+                    soak_hold_errors(changed["deploy-staging.yml"])
+                    or schema_gate_errors(changed["deploy-staging.yml"])
+                    or roles_gate_errors(changed["deploy-staging.yml"]),
+                    label,
+                )
+                self.assertTrue(workflow_policy_errors(changed), label)
+
+    def test_soak_hold_shell_behaves(self):
+        # Execute the actual hold-check shell across its six cases: dispatch
+        # and empty bypass, expiry fails open, armed defers, unparsable and
+        # over-long fail closed. Deadlines sit minutes away from the real
+        # clock, far from any comparison boundary.
+        import datetime
+        import os
+        import subprocess
+        import tempfile
+        step = self.workflows["deploy-staging.yml"]["jobs"]["soak-hold"]["steps"][0]
+        shell = step["run"]
+        now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+        stamp = lambda moment: moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+        cases = (
+            ("dispatch bypasses the hold", "workflow_dispatch", stamp(now + datetime.timedelta(hours=1)), 0, ""),
+            ("empty var means no hold", "push", "", 0, ""),
+            ("expired hold fails open", "push", stamp(now - datetime.timedelta(minutes=1)), 0, "expired"),
+            ("armed hold defers", "push", stamp(now + datetime.timedelta(hours=1)), 1, "deferred"),
+            ("unparsable hold fails closed", "push", "not-a-timestamp", 1, ""),
+            ("over-long hold fails closed", "push", stamp(now + datetime.timedelta(hours=5)), 1, ""),
+        )
+        for label, event, hold_until, expected_code, summary_needle in cases:
+            with self.subTest(label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    summary = Path(temp_dir) / "summary.md"
+                    summary.write_text("", encoding="utf-8")
+                    env = dict(os.environ, EVENT=event, HOLD_UNTIL=hold_until,
+                               GITHUB_STEP_SUMMARY=str(summary))
+                    proc = subprocess.run(
+                        ["bash", "-c", shell], cwd=str(ROOT), env=env,
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    output = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, expected_code, output)
+                    body = summary.read_text(encoding="utf-8")
+                    if summary_needle:
+                        self.assertIn(summary_needle, body)
+                        self.assertIn(hold_until, body)
+                    else:
+                        self.assertEqual(body, "")
+                    if expected_code == 1:
+                        self.assertIn("::error::", output)
+
+    def test_pinned_drill_deploy_stays_red(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(pinned_history_guard_errors(staging), [])
+        self.assertEqual(staging["jobs"]["pinned-history-guard"].get("needs"), "voice-synthetic")
+        self.assertNotIn("if", staging["jobs"]["pinned-history-guard"])
+        # The guard judges after the synthetic ran: a pinned drill still
+        # deploys and still runs the synthetic; only the run verdict is red,
+        # so the pin never reads as staging history for the workflow head.
+        mutations = {
+            "guard job removed": lambda w: w["jobs"].pop("pinned-history-guard"),
+            "guard gains a condition": lambda w: w["jobs"]["pinned-history-guard"]
+                .__setitem__("if", "true"),
+            "guard stops waiting": lambda w: w["jobs"]["pinned-history-guard"].pop("needs"),
+            "guard waits on deploy": lambda w: w["jobs"]["pinned-history-guard"]
+                .__setitem__("needs", "deploy"),
+            "guard reads a secret": lambda w: w["jobs"]["pinned-history-guard"]["steps"][0]["env"]
+                .__setitem__("TOKEN", "${{ secrets.X }}"),
+            "guard compares against a constant": lambda w: w["jobs"]["pinned-history-guard"]["steps"][0]["env"]
+                .__setitem__("HEAD_SHA", "abc"),
+            "head comparison dropped": lambda w: w["jobs"]["pinned-history-guard"]["steps"][0]
+                .__setitem__("run", "\n".join(line for line in
+                                             w["jobs"]["pinned-history-guard"]["steps"][0]["run"].splitlines()
+                                             if '"$HEAD_SHA"' not in line)),
+            "verdict goes green": lambda w: w["jobs"]["pinned-history-guard"]["steps"][0]
+                .__setitem__("run", w["jobs"]["pinned-history-guard"]["steps"][0]["run"]
+                             .replace("exit 1", "exit 0")),
+            "raw second reader": lambda w: w["jobs"]["deploy"]["steps"][2]
+                .setdefault("env", {}).__setitem__("EXTRA", "${{ inputs.sha }}"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(self.workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(
+                    pinned_history_guard_errors(changed["deploy-staging.yml"])
+                    or staging_pinned_sha_errors(changed),
+                    label,
+                )
+                self.assertTrue(workflow_policy_errors(changed), label)
+
+    def test_pinned_history_guard_shell_behaves(self):
+        # Execute the actual guard shell: an empty pin and a pin equal to the
+        # head pass (the deploy served the head), a pin below the head fails
+        # with the reason naming both SHAs.
+        import os
+        import subprocess
+        import tempfile
+        step = self.workflows["deploy-staging.yml"]["jobs"]["pinned-history-guard"]["steps"][0]
+        shell = step["run"]
+        head, pin = "a" * 40, "b" * 40
+        cases = (
+            ("empty pin deploys the head", "", head, 0),
+            ("pin equal to the head deploys the head", head, head, 0),
+            ("pin below the head stays red", pin, head, 1),
+        )
+        for label, pinned, head_sha, expected_code in cases:
+            with self.subTest(label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    env = dict(os.environ, PINNED_SHA=pinned, HEAD_SHA=head_sha)
+                    proc = subprocess.run(
+                        ["bash", "-c", shell], cwd=str(ROOT), env=env,
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    output = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, expected_code, output)
+                    if expected_code == 1:
+                        self.assertIn("not staging history", output)
+                        self.assertIn(pinned, output)
+                        self.assertIn(head_sha, output)
+
+    def test_pinned_sha_shell_behaves(self):
+        # Execute the actual SHA-check shells in a scratch git repo: a valid
+        # ancestor passes and (in the deploy job) exports DEPLOY_SHA, while a
+        # short, uppercase, empty or branch pin, a non-ancestor and a
+        # HEAD-mismatch all refuse with their reason. The temp remote's
+        # origin/main is the ancestry root; each case checks out its commit
+        # first, exactly as the workflow checkout lands on the pin before the
+        # SHA step runs. The deploy shell runs from a subdirectory, mirroring
+        # the deploy job's wrangler working directory.
+        import os
+        import subprocess
+        import tempfile
+        shells = {}
+        for job_id in ("schema-gate", "roles-gate", "deploy"):
+            job = self.workflows["deploy-staging.yml"]["jobs"][job_id]
+            shells[job_id] = next(
+                step for step in job["steps"]
+                if step.get("name") == "Deploy SHA must be exact and reachable from main")["run"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            repo, origin = temp / "repo", temp / "origin.git"
+            # Hermetic git: caller identity overrides (even empty ones),
+            # ambient config paths and shell-startup injections (BASH_ENV,
+            # ENV) must not leak into the scratch repo or redirect git.
+            base_env = {key: value for key, value in os.environ.items()
+                        if not (key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"))}
+            for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                        "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+                        "GIT_CONFIG_COUNT", "BASH_ENV", "ENV"):
+                base_env.pop(key, None)
+            base_env.update(HOME=str(temp),
+                            GIT_CONFIG_GLOBAL=str(temp / "gitconfig"),
+                            GIT_CONFIG_SYSTEM=str(temp / "gitconfig-system"))
+            # The SHA shells start with `git config --global`, which a
+            # managed/shimmed git forbids; probe that capability and skip
+            # there (the static needle, exit-count and mutation pins above
+            # still run everywhere). Real runners execute the shells.
+            probe = subprocess.run(
+                ["git", "config", "--global", "--add", "paperclip.probe", "1"],
+                cwd=str(temp), env=base_env,
+                capture_output=True, text=True, timeout=30)
+            if probe.returncode != 0:
+                self.skipTest("git cannot write global config here; "
+                              "SHA shells execute on real runners only")
+
+            def git(*args, cwd):
+                return subprocess.run(
+                    ["git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                     "-c", "init.defaultBranch=main", *args],
+                    cwd=str(cwd), env=base_env,
+                    capture_output=True, text=True, timeout=30, check=True)
+
+            git("init", "--bare", origin.name, cwd=temp)
+            git("init", repo.name, cwd=temp)
+            (repo / "file.txt").write_text("ancestor\n", encoding="utf-8")
+            git("add", "file.txt", cwd=repo)
+            git("commit", "-m", "ancestor", cwd=repo)
+            ancestor = git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+            (repo / "file.txt").write_text("head\n", encoding="utf-8")
+            git("commit", "-am", "head", cwd=repo)
+            head = git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+            git("remote", "add", "origin", str(origin), cwd=repo)
+            git("push", "origin", "main", cwd=repo)
+            git("checkout", "-b", "feature", ancestor, cwd=repo)
+            (repo / "feature.txt").write_text("unmerged\n", encoding="utf-8")
+            git("add", "feature.txt", cwd=repo)
+            git("commit", "-m", "unmerged", cwd=repo)
+            unmerged = git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+            (repo / "wrangler").mkdir()
+            cases = (
+                ("valid ancestor passes", head, head, 0, ""),
+                ("short pin refuses", head, "abc123", 1, "full 40-hex"),
+                ("uppercase pin refuses", head, head.upper(), 1, "full 40-hex"),
+                ("empty pin refuses", head, "", 1, "full 40-hex"),
+                ("branch pin refuses", head, "main", 1, "full 40-hex"),
+                ("non-ancestor refuses", unmerged, unmerged, 1, "not an ancestor"),
+                ("head mismatch refuses", head, ancestor, 1, "did not land"),
+            )
+            for label, checkout_ref, source_sha, expected_code, needle in cases:
+                with self.subTest(label):
+                    git("checkout", checkout_ref, cwd=repo)
+                    for job_id, shell in shells.items():
+                        with self.subTest(job=job_id):
+                            exported = temp / f"github-env-{job_id}"
+                            exported.write_text("", encoding="utf-8")
+                            env = dict(base_env, GITHUB_WORKSPACE=str(repo),
+                                       SOURCE_SHA=source_sha, GITHUB_ENV=str(exported))
+                            workdir = repo / "wrangler" if job_id == "deploy" else repo
+                            proc = subprocess.run(
+                                ["bash", "-e", "-c", shell], cwd=str(workdir), env=env,
+                                capture_output=True, text=True, timeout=30,
+                            )
+                            output = proc.stdout + proc.stderr
+                            self.assertEqual(proc.returncode, expected_code, output)
+                            if expected_code == 1:
+                                self.assertIn("::error::", output)
+                                self.assertIn(needle, output)
+                                self.assertEqual(exported.read_text(encoding="utf-8"), "")
+                            elif job_id == "deploy":
+                                self.assertEqual(exported.read_text(encoding="utf-8"),
+                                                 f"DEPLOY_SHA={source_sha}\n")
+                            else:
+                                self.assertEqual(exported.read_text(encoding="utf-8"), "")
+
+    def test_deploy_identity_follows_the_pin(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(staging_deploy_identity_errors(staging), [])
+
+        def sha_step(w):
+            return next(step for step in w["jobs"]["deploy"]["steps"]
+                        if step.get("name") == "Deploy SHA must be exact and reachable from main")
+
+        def prepare_step(w):
+            return next(step for step in w["jobs"]["deploy"]["steps"]
+                        if step.get("name") == "Snapshot staging identity and generate per-deploy image provenance")
+
+        def step_by_id(w, step_id):
+            return next(step for step in w["jobs"]["deploy"]["steps"]
+                        if step.get("id") == step_id)
+
+        mutations = {
+            "identity export dropped": lambda w: sha_step(w)
+                .__setitem__("run", "\n".join(line for line in sha_step(w)["run"].splitlines()
+                                             if "DEPLOY_SHA" not in line)),
+            "prepare stamps the head": lambda w: prepare_step(w)["env"]
+                .__setitem__("GITHUB_SHA", "${{ github.sha }}"),
+            "deploy message stamps the head": lambda w: step_by_id(w, "deploy")["with"]
+                .__setitem__("command", step_by_id(w, "deploy")["with"]["command"]
+                             .replace("${{ env.DEPLOY_SHA }}", "${{ github.sha }}")),
+            "ownership actor stamps the head": lambda w: step_by_id(w, "takeover")["env"]
+                .__setitem__("OWNERSHIP_ACTOR", "github-actions:${{ github.run_id }}:${{ github.sha }}"),
+            "promotion gate stamps the head": lambda w: step_by_id(w, "error_rate_gate")["env"]
+                .__setitem__("SHA", "${{ github.sha }}"),
+            "rollback actor stamps the head": lambda w: step_by_id(w, "auto_rollback")["env"]
+                .__setitem__("ROLLBACK_ACTOR", "github-actions:${{ github.run_id }}:${{ github.sha }}"),
+            "second head reader": lambda w: prepare_step(w)["env"]
+                .__setitem__("EXTRA_SHA", "${{ github.sha }}"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(self.workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(
+                    staging_deploy_identity_errors(changed["deploy-staging.yml"])
+                    or staging_pinned_sha_errors(changed),
+                    label,
+                )
+                self.assertTrue(workflow_policy_errors(changed), label)
 
     def test_docs_only_push_skips_staging_but_runtime_paths_deploy(self):
         # A docs-only merge to main must start no run (the soak needs a stable
@@ -4485,6 +5242,71 @@ class WorkflowTests(unittest.TestCase):
         job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
         # BaseLoader keeps scalars as strings; "45" is the 45-minute ceiling.
         self.assertEqual(job.get("timeout-minutes"), "45")
+
+    def test_nextest_container_pins_disposable_database_service_address(self):
+        # Same hardening as the check.yml lanes: the shared lane runs the
+        # workspace lib/bins against the same disposable service, so it pins
+        # the job-scoped address before the loopback forward instead of
+        # depending on service-alias DNS for the whole run.
+        job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        prerequisites = next(
+            step for step in job["steps"]
+            if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
+        )
+        self.assertEqual(prerequisites.get("shell"), "bash")
+        run = prerequisites["run"]
+        self.assertIn("set -e", run)
+        hosts_tmp = run.index('hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"')
+        resolve = run.index("getent ahostsv4 agent-testdb")
+        remove_stale_pin = run.index("sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > \"$hosts_tmp\"")
+        self.assertNotIn("sed -i -E", run)
+        self.assertLess(hosts_tmp, remove_stale_pin)
+        copy_hosts = run.index('cat "$hosts_tmp" > /etc/hosts')
+        cleanup_hosts = run.index('rm -f "$hosts_tmp"')
+        self.assertLess(remove_stale_pin, copy_hosts)
+        self.assertLess(copy_hosts, cleanup_hosts)
+        pin = run.index("printf '%s agent-testdb\\n' \"$service_ip\" >> /etc/hosts")
+        verify_pin = run.index('getent ahostsv4 agent-testdb | awk \'NR == 1 { print $1; exit }\'')
+        forward = run.index("TCP:agent-testdb:5432")
+        ready = run.index("pg_isready -q -h 127.0.0.1")
+        self.assertIn("for attempt in $(seq 1 30)", run[:resolve])
+        self.assertLess(remove_stale_pin, resolve)
+        self.assertLess(resolve, pin)
+        self.assertLess(pin, verify_pin)
+        mismatch_check = run.index('if [ "$pinned_ip" != "$service_ip" ]; then')
+        mismatch_exit = run.index("exit 1", mismatch_check)
+        self.assertLess(verify_pin, mismatch_check)
+        self.assertLess(mismatch_exit, forward)
+        self.assertLess(verify_pin, forward)
+        self.assertLess(forward, ready)
+        self.assertIn("sleep 1", run)
+        fail_closed = run.index('if [ -z "$service_ip" ]; then')
+        self.assertLess(fail_closed, pin)
+        self.assertLess(run.index("exit 1", fail_closed), pin)
+        self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        # A failed lookup must empty the result, not kill the step under pipefail.
+        self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
+        self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
+
+    def test_nextest_postgres_wal_budget_is_bounded(self):
+        # Same budget as the check.yml lanes: the reusable lane shares the
+        # 1 GiB tmpfs service, so it caps WAL recycling in prepare and pins
+        # the cap in a verify step instead of running unbounded.
+        job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        prepare = next(
+            step for step in job["steps"]
+            if step.get("name") == "Prepare isolated test databases"
+        )
+        verify = next(
+            step for step in job["steps"]
+            if step.get("name") == "Verify disposable Postgres defaults"
+        )
+        self.assertEqual(verify.get("shell"), "bash")
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+        self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_required_nextest_quarantine_ejects_without_revert(self):
         # Red-group ejection path: the `quarantine` input must exist with an

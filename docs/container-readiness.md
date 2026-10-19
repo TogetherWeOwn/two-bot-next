@@ -82,8 +82,9 @@ replays. Delivery is **at most one attempt**, not guaranteed exactly-once:
 a failed/timed-out webhook is not retried because it may already have accepted
 the message. A crash between persistence and notification can lose that
 notification. The structured transition log is the primary operational signal
-when emitted; a webhook error emits `container_unready_webhook_failed` with only
-notification type and HTTP status (or null). Recovery is attempted once even if
+when emitted; a webhook error emits `container_unready_webhook_failed` with the
+notification type, HTTP status (or null), release, worker version and log URL —
+never the binding, error text or body. Recovery is attempted once even if
 the alert webhook failed. Both webhook and storage failures still re-arm the
 keepalive; storage failures propagate to the scheduler rather than falsely
 claiming an alert was recorded.
