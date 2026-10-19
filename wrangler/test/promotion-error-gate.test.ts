@@ -7,6 +7,7 @@ import {
   decideMode,
   isDirectInvocation,
   judgeFiring,
+  parseArgs,
   parseRehearsalFiring,
   runLiveGate,
 } from "../scripts/promotion-error-gate.mjs";
@@ -66,6 +67,16 @@ test("malformed rehearsal firing fails closed", () => {
   }
 });
 
+test("user agent defaults to the staging rollout name and accepts a production override", () => {
+  const base = ["--metrics-url", "https://example.test", "--evidence", "/tmp/evidence.json"];
+  assert.equal(parseArgs(base).userAgent, "two-bot-next-staging-rollout/1.0");
+  assert.equal(
+    parseArgs([...base, "--user-agent", "two-bot-next-production-rollout/1.0"]).userAgent,
+    "two-bot-next-production-rollout/1.0",
+  );
+  assert.throws(() => parseArgs([...base, "--user-agent", ""]), Error);
+});
+
 test("mode selection prefers rehearsal, then a full-length token", () => {
   assert.deepEqual(
     decideMode({ rehearsalFiring: '["rest_5xx_rate"]', token: "x".repeat(40) }),
@@ -75,6 +86,25 @@ test("mode selection prefers rehearsal, then a full-length token", () => {
   assert.deepEqual(decideMode({ rehearsalFiring: undefined, token: undefined }).mode, "skip");
   assert.deepEqual(decideMode({ rehearsalFiring: undefined, token: "short" }).mode, "skip");
   assert.deepEqual(decideMode({ rehearsalFiring: undefined, token: "x".repeat(31) }).mode, "skip");
+});
+
+test("live gate sends the configured user agent on scrapes", async () => {
+  const seen: string[] = [];
+  const fetchImpl = async (...args: any[]) => {
+    seen.push((args[1] as { headers: Record<string, string> }).headers["user-agent"]);
+    return { ok: true, status: 200, text: async () => restBody(100, 0) };
+  };
+  await runLiveGate({
+    metricsUrl: "https://example.test",
+    token: "x".repeat(40),
+    sampleIntervalSeconds: 75,
+    fetchImpl,
+    sleep: async () => {},
+    nowSeconds: () => 1_000_000,
+    userAgent: "two-bot-next-production-rollout/1.0",
+  });
+  assert.ok(seen.length > 0);
+  assert.ok(seen.every((userAgent) => userAgent === "two-bot-next-production-rollout/1.0"));
 });
 
 test("live gate fails the stage on a 5xx burst between scrapes", async () => {

@@ -27,6 +27,34 @@ pub enum FetchError {
     UnsupportedContentType,
 }
 
+impl FetchError {
+    /// Bounded `error_class` for `two_bot_feed_fetch_errors_total` (TOG-28423).
+    /// Every variant maps to a member of
+    /// [`crate::metrics::FEED_FETCH_ERROR_CLASSES`]; no URL, host or header
+    /// text ever becomes a label.
+    pub fn metrics_error_class(&self) -> &'static str {
+        match self {
+            Self::InvalidSource => "invalid_source",
+            Self::NonPublicAddress => "non_public_address",
+            Self::RedirectRefused => "redirect_refused",
+            Self::TooLarge => "too_large",
+            Self::InvalidEncoding => "invalid_encoding",
+            Self::UnsupportedContentType => "unsupported_content_type",
+        }
+    }
+
+    /// Bounded `outcome` for `two_bot_feed_fetches_total` (TOG-28423).
+    /// Sources refused before dialling stay distinct from refused redirects;
+    /// every other policy refusal is a generic failure.
+    pub fn metrics_outcome(&self) -> &'static str {
+        match self {
+            Self::InvalidSource | Self::NonPublicAddress => "invalid_source",
+            Self::RedirectRefused => "refused_redirect",
+            Self::TooLarge | Self::InvalidEncoding | Self::UnsupportedContentType => "failure",
+        }
+    }
+}
+
 pub fn validate_source(source: &str) -> Result<Url, FetchError> {
     if source.len() > MAX_FEED_SOURCE_BYTES {
         return Err(FetchError::InvalidSource);
