@@ -24,7 +24,7 @@
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -1213,6 +1213,11 @@ fn connection_warning_from_audit(audit: &Value) -> Option<String> {
     connection_warning(used, ceiling)
 }
 
+/// Shared prefix between the role-check producer (`connect`) and the
+/// `Protocol` matcher below: rewording one side rewords both, so the
+/// `role-verify` branch cannot silently stop matching.
+const ROLE_NOT_ACTIVE_PREFIX: &str = "expected role ";
+
 /// Bounded, non-secret cause class for a `connect` failure.
 ///
 /// `connect` refuses before any DDL with one fixed message; without the cause
@@ -1222,6 +1227,14 @@ fn connection_warning_from_audit(audit: &Value) -> Option<String> {
 /// vocabulary, e.g. `42501`): never the message, severity, statement, URL,
 /// host or login. Fail-closed is unchanged: the caller still refuses, only
 /// with a triageable `[cause=...]` suffix.
+///
+/// Reachability through the pool path: sqlx retries `after_connect` failures,
+/// refused ports and transient database errors until the acquire deadline,
+/// then returns only `PoolTimedOut` (sqlx-core 0.9.0 `pool/inner.rs`). `connect`
+/// therefore records the last `after_connect` cause (`set-role-denied`,
+/// `role-verify`) in a shared slot and prefers it over `pool-timeout`; a dead
+/// host or an exhausted server still refuses as `pool-timeout`, while startup
+/// auth (`28xxx`), TCP timeouts and other immediate errors classify directly.
 fn connect_cause(error: &sqlx::Error) -> String {
     match error {
         sqlx::Error::Database(db) => {
@@ -1264,7 +1277,7 @@ fn connect_cause(error: &sqlx::Error) -> String {
         sqlx::Error::Tls(_) => "tls".to_owned(),
         // Our own post-connect check (`current_user != role`): `SET ROLE`
         // succeeded syntactically but the role is not active. Real, fail-closed.
-        sqlx::Error::Protocol(message) if message.contains("expected role") => {
+        sqlx::Error::Protocol(message) if message.starts_with(ROLE_NOT_ACTIVE_PREFIX) => {
             "role-verify".to_owned()
         }
         _ => "connect-error".to_owned(),
@@ -1274,9 +1287,14 @@ fn connect_cause(error: &sqlx::Error) -> String {
 /// Fail-closed refusal for `connect`, with the triageable cause suffix.
 /// `role` is one of the two fixed group constants, never input.
 fn connect_refusal(role: &str, error: &sqlx::Error) -> RunError {
+    connect_refusal_with_cause(role, &connect_cause(error))
+}
+
+/// [`connect_refusal`] for a cause captured earlier (the `after_connect` slot):
+/// same fixed message, same fail-closed shape, no error text.
+fn connect_refusal_with_cause(role: &str, cause: &str) -> RunError {
     RunError::Refused(format!(
-        "could not connect and SET ROLE {role} (missing binding or membership) [cause={}]",
-        connect_cause(error)
+        "could not connect and SET ROLE {role} (missing binding or membership) [cause={cause}]"
     ))
 }
 
@@ -1285,34 +1303,61 @@ async fn connect(
     role: &'static str,
     verified: Arc<AtomicUsize>,
 ) -> Result<PgPool, RunError> {
+    // sqlx retries `after_connect` failures until the acquire deadline, then
+    // surfaces only `PoolTimedOut`: without this slot a real `SET ROLE`
+    // denial (42501) and a dead host refuse identically. The slot keeps the
+    // last `after_connect` cause so the refusal below reports what failed.
+    let after_connect_cause: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&after_connect_cause);
     PgPoolOptions::new()
         .max_connections(TARGET_POOL_MAX)
         // Bound pool checkout, not the duration of migration statements.
         .acquire_timeout(Duration::from_secs(TARGET_ACQUIRE_TIMEOUT_SECS))
         .after_connect(move |conn, _meta| {
             let verified = Arc::clone(&verified);
+            let slot = Arc::clone(&slot);
             Box::pin(async move {
-                // Per-connection: a separate psql SET ROLE cannot activate this.
-                // `role` is one of the two fixed group constants, never input.
-                sqlx::query(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
-                    .execute(&mut *conn)
-                    .await?;
-                conn.execute("SET search_path = public").await?;
-                let current: String = sqlx::query_scalar("SELECT current_user::text")
-                    .fetch_one(&mut *conn)
-                    .await?;
-                if current != role {
-                    return Err(sqlx::Error::Protocol(format!(
-                        "expected role {role} is not active"
-                    )));
+                let outcome: Result<(), sqlx::Error> = async {
+                    // Per-connection: a separate psql SET ROLE cannot activate this.
+                    // `role` is one of the two fixed group constants, never input.
+                    sqlx::query(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
+                        .execute(&mut *conn)
+                        .await?;
+                    conn.execute("SET search_path = public").await?;
+                    let current: String = sqlx::query_scalar("SELECT current_user::text")
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    if current != role {
+                        return Err(sqlx::Error::Protocol(format!(
+                            "{ROLE_NOT_ACTIVE_PREFIX}{role} is not active"
+                        )));
+                    }
+                    verified.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
                 }
-                verified.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                .await;
+                if let Err(error) = &outcome {
+                    if let Ok(mut guard) = slot.lock() {
+                        *guard = Some(connect_cause(error));
+                    }
+                }
+                outcome
             })
         })
         .connect_with(options)
         .await
-        .map_err(|error| connect_refusal(role, &error))
+        .map_err(|error| {
+            // Prefer the recorded `after_connect` cause: `PoolTimedOut` after
+            // a refused `SET ROLE` means membership loss, not a slow host.
+            if matches!(error, sqlx::Error::PoolTimedOut) {
+                if let Ok(guard) = after_connect_cause.lock() {
+                    if let Some(recorded) = guard.as_deref() {
+                        return connect_refusal_with_cause(role, recorded);
+                    }
+                }
+            }
+            connect_refusal(role, &error)
+        })
 }
 
 /// Run the plan (read-only, RO binding and role) or apply (migrator binding
@@ -3536,6 +3581,140 @@ mod tests {
             "connect-error"
         );
         assert_eq!(connect_cause(&sqlx::Error::WorkerCrashed), "connect-error");
+    }
+
+    /// `connect()` through a real pool against a closed loopback port refuses
+    /// with the documented pool-deadline cause: sqlx retries the refused port
+    /// until the acquire deadline, so the pool path can only report
+    /// `pool-timeout` here. Fails if the `connect_refusal` wiring is reverted
+    /// to the fixed string (no `[cause=...]` suffix). Costs one acquire
+    /// deadline (~10 s): the production timeout, not test overhead.
+    #[tokio::test]
+    async fn connect_refuses_closed_port_with_pool_timeout_cause() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("loopback bind")
+            .local_addr()
+            .expect("loopback addr")
+            .port();
+        // Listener dropped here: the port is closed when `connect` dials it.
+        let options = PgConnectOptions::new_without_pgpass()
+            .host("127.0.0.1")
+            .port(port)
+            .username("staging_migrate_cause_probe")
+            .database("staging_migrate_cause_probe")
+            .ssl_mode(sqlx::postgres::PgSslMode::Disable);
+        let verified = Arc::new(AtomicUsize::new(0));
+        let outcome = connect(options, READ_ONLY_ROLE, Arc::clone(&verified)).await;
+        let error = match outcome {
+            Ok(_) => panic!("closed port must refuse"),
+            Err(error) => error,
+        };
+        let RunError::Refused(message) = error else {
+            panic!("closed port must refuse fail-closed, got {error:?}");
+        };
+        assert!(
+            message.contains("[cause=pool-timeout]"),
+            "closed port must document the pool-deadline cause: {message}"
+        );
+        assert!(
+            message.contains("could not connect and SET ROLE"),
+            "refusal must keep the historic prefix: {message}"
+        );
+        assert_eq!(
+            verified.load(Ordering::SeqCst),
+            0,
+            "refused connections must not verify"
+        );
+    }
+
+    /// `connect()` as a login that is not a member of the role refuses with
+    /// `set-role-denied:42501`, not the pool-deadline cause: the
+    /// `after_connect` slot preserves the `SET ROLE` denial sqlx retries away.
+    /// Requires `TWO_TEST_DATABASE_URL` (agent-testdb or the CI service);
+    /// creates one login with a unique name and drops it before asserting, so
+    /// a red test does not leak the login. Costs one acquire deadline (~10 s):
+    /// the production retry budget a persistent denial always pays.
+    #[tokio::test]
+    async fn connect_records_set_role_denial_behind_pool_timeout() {
+        use sqlx::Connection as _;
+        let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => {
+                eprintln!("skipped: TWO_TEST_DATABASE_URL not set");
+                return;
+            }
+            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+        };
+        two_bot_testsupport::guard_database_url(&raw).expect("test database only");
+        let admin_options: PgConnectOptions = raw
+            .parse()
+            .expect("TWO_TEST_DATABASE_URL parses as Postgres options");
+        let admin_options = admin_options.ssl_mode(sqlx::postgres::PgSslMode::Disable);
+        let mut admin = PgConnection::connect_with(&admin_options)
+            .await
+            .expect("agent-testdb admin connect");
+        // The denial must be a real 42501, so the groups exist (idempotent,
+        // shared with other suites) while the probe login holds nothing.
+        for group in [MIGRATOR_ROLE, READ_ONLY_ROLE] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DO $$ BEGIN CREATE ROLE {group} NOLOGIN; \
+                 EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+            )))
+            .execute(&mut admin)
+            .await
+            .expect("shared test group exists");
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let login = format!("sm_cause_login_{}_{nonce}", std::process::id());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE ROLE {login} LOGIN")))
+            .execute(&mut admin)
+            .await
+            .expect("probe login created");
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&mut admin)
+            .await
+            .expect("current database");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "GRANT CONNECT ON DATABASE {database} TO {login}"
+        )))
+        .execute(&mut admin)
+        .await
+        .expect("probe login can connect");
+        let probe_options = admin_options.username(&login);
+        let verified = Arc::new(AtomicUsize::new(0));
+        let outcome = connect(probe_options, READ_ONLY_ROLE, Arc::clone(&verified)).await;
+        // Cleanup before asserting, so a red test does not leak the login.
+        // The CONNECT grant blocks DROP ROLE (2BP01) until revoked.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "REVOKE CONNECT ON DATABASE {database} FROM {login}"
+        )))
+        .execute(&mut admin)
+        .await
+        .expect("probe login connect revoked");
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {login}")))
+            .execute(&mut admin)
+            .await
+            .expect("probe login dropped");
+        admin.close().await.expect("admin close");
+        let error = match outcome {
+            Ok(_) => panic!("non-member SET ROLE must refuse"),
+            Err(error) => error,
+        };
+        let RunError::Refused(message) = error else {
+            panic!("non-member SET ROLE must refuse fail-closed, got {error:?}");
+        };
+        assert!(
+            message.contains("[cause=set-role-denied:42501]"),
+            "non-member SET ROLE must surface the denial cause: {message}"
+        );
+        assert_eq!(
+            verified.load(Ordering::SeqCst),
+            0,
+            "denied connections must not verify"
+        );
     }
 
     #[test]
