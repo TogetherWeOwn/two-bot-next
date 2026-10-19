@@ -165,8 +165,9 @@ the client's error text, and writes only an ordinal, `event_type` and
 ## Production route
 
 `deploy-production.yml` (main #243) is the one live deployment workflow. The
-regression pins it as `workflow_dispatch`-only. Its `production` job must need
-`guard`, run in GitHub environment `production` and carry no job condition. The
+regression pins it to `workflow_dispatch`, a completed `deploy-staging` run on
+`main`, and the daily schedule backstop — never push or PR. Its `production`
+job must need `guard`, run in GitHub environment `production` and carry no job condition. The
 `guard` job may not have an environment, call a reusable workflow, or contain
 deploy/probe steps. Its script must still require a deploy-staging run with
 `status="success"` on the SHA, plus required reviewers on the production
