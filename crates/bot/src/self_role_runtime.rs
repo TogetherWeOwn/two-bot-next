@@ -1679,3 +1679,7 @@ fn panel_roles(panel: &SelfRolePanel, roles: &HashSet<String>) -> Vec<String> {
 #[cfg(test)]
 #[path = "self_role_runtime_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "self_role_nonexclusive_acceptance_tests.rs"]
+mod nonexclusive_acceptance_tests;
