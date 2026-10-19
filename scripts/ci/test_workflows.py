@@ -2,8 +2,11 @@
 
 from copy import deepcopy
 import importlib.util
+import os
 from pathlib import Path
 import re
+import subprocess
+import tempfile
 import tomllib
 import unittest
 
@@ -2767,6 +2770,240 @@ class WorkflowTests(unittest.TestCase):
         self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
+
+    def test_tmpfs_postgres_wal_budget_is_bounded_in_every_lane(self):
+        # Run 39209332791: only rust-tests bounded WAL while the ignored lanes
+        # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
+        # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
+        # the bounded service must carry the budget and verify it.
+        for job_id in ("rust-tests", "ignored-db-stores", "ignored-db-runtime"):
+            with self.subTest(job=job_id):
+                job = self.workflows["check.yml"]["jobs"][job_id]
+                prepare = next(
+                    step for step in job["steps"]
+                    if step.get("name") == "Prepare isolated test databases"
+                )
+                verify = next(
+                    step for step in job["steps"]
+                    if step.get("name") == "Verify disposable Postgres defaults"
+                )
+                self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+                self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+                self.assertIn("pg_reload_conf()", prepare["run"])
+                # Reload-before-ALTER writes auto.conf but never applies it;
+                # the verify probe would then fail online, so pin the order.
+                run = prepare["run"]
+                self.assertLess(
+                    run.index("ALTER SYSTEM SET max_wal_size"),
+                    run.index("pg_reload_conf()"),
+                )
+                self.assertLess(
+                    run.index("ALTER SYSTEM SET min_wal_size"),
+                    run.index("pg_reload_conf()"),
+                )
+                self.assertIn("'max_wal_size': '512MB'", verify["run"])
+                self.assertIn("'min_wal_size': '64MB'", verify["run"])
+
+    def test_nextest_lane_bounds_tmpfs_wal_and_reports_headroom(self):
+        lane = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        steps = lane["steps"]
+        names = [step.get("name") for step in steps]
+        prepare = next(
+            step for step in steps
+            if step.get("name") == "Prepare isolated test databases"
+        )
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+        self.assertIn("pg_reload_conf()", prepare["run"])
+        run = prepare["run"]
+        self.assertLess(
+            run.index("ALTER SYSTEM SET max_wal_size"),
+            run.index("pg_reload_conf()"),
+        )
+        self.assertLess(
+            run.index("ALTER SYSTEM SET min_wal_size"),
+            run.index("pg_reload_conf()"),
+        )
+        # The nextest lane must verify the effective settings before tests run:
+        # pg_reload_conf() returning false still exits 0 under ON_ERROR_STOP,
+        # and the report only prints pg_settings. Without this probe the lane
+        # can run its whole suite on the PG18 default 1GB WAL budget.
+        self.assertIn("Verify disposable Postgres defaults", names)
+        self.assertEqual(
+            names.index("Verify disposable Postgres defaults"),
+            names.index("Prepare isolated test databases") + 1,
+        )
+        verify = next(
+            step for step in steps
+            if step.get("name") == "Verify disposable Postgres defaults"
+        )
+        self.assertEqual(verify.get("shell"), "bash")
+        for key, value in (
+            ("data_directory", "/var/lib/postgresql/18/docker"),
+            ("fsync", "on"),
+            ("full_page_writes", "on"),
+            ("synchronous_commit", "on"),
+            ("max_wal_size", "512MB"),
+            ("min_wal_size", "64MB"),
+        ):
+            self.assertIn(f"'{key}': '{value}'", verify["run"])
+        self.assertIn("current_setting(", verify["run"])
+        # Pin the rejection itself, not just the expected values: deleting the
+        # comparison makes the step print whatever it fetches and exit 0.
+        self.assertIn("if settings != expected:", verify["run"])
+        self.assertIn(
+            "raise SystemExit('disposable Postgres data path or durability defaults changed')",
+            verify["run"],
+        )
+        self.assertIn("Report Postgres storage headroom", names)
+        report = next(
+            step for step in steps
+            if step.get("name") == "Report Postgres storage headroom"
+        )
+        self.assertEqual(
+            names.index("Report Postgres storage headroom"),
+            names.index("Verify disposable Postgres defaults") + 1,
+        )
+        self.assertIn("ON_ERROR_STOP=1", report["run"])
+        self.assertIn("pg_database_size", report["run"])
+        self.assertIn("pg_ls_waldir()", report["run"])
+        # Post-suite bracket: max_wal_size is a soft target, so the pre-suite
+        # report cannot show peak WAL. The post-suite report always runs after
+        # the suite for the next ENOSPC triage.
+        self.assertIn("Report Postgres storage headroom (post-suite)", names)
+        post = next(
+            step for step in steps
+            if step.get("name") == "Report Postgres storage headroom (post-suite)"
+        )
+        self.assertEqual(post.get("if"), "always()")
+        self.assertGreater(
+            names.index("Report Postgres storage headroom (post-suite)"),
+            names.index("cargo nextest (unit and binary, retries=1, JUnit)"),
+        )
+        self.assertIn("ON_ERROR_STOP=1", post["run"])
+        self.assertIn("pg_database_size", post["run"])
+        self.assertIn("pg_ls_waldir()", post["run"])
+
+    def test_every_rust_lane_guards_runner_disk_headroom(self):
+        lanes = [
+            (workflow, job_id)
+            for workflow, job_id in (
+                ("check.yml", "check"),
+                ("check.yml", "rust-tests"),
+                ("check.yml", "ignored-db-stores"),
+                ("check.yml", "ignored-db-runtime"),
+                ("reusable-rust-nextest.yml", "nextest"),
+            )
+        ]
+        self.assertEqual(len(lanes), 5)
+        guards = []
+        for workflow, job_id in lanes:
+            with self.subTest(workflow=workflow, job=job_id):
+                steps = self.workflows[workflow]["jobs"][job_id]["steps"]
+                names = [step.get("name") for step in steps]
+                prereq = next(
+                    name for name in names
+                    if str(name).startswith("Job-container prerequisites")
+                )
+                self.assertIn("Guard runner disk headroom", names)
+                self.assertEqual(
+                    names.index("Guard runner disk headroom"),
+                    names.index(prereq) + 1,
+                )
+                guard = next(
+                    step for step in steps
+                    if step.get("name") == "Guard runner disk headroom"
+                )
+                self.assertEqual(guard.get("shell"), "bash")
+                run = guard["run"]
+                self.assertIn("floor=1073741824", run)
+                self.assertIn("::error::runner disk exhausted", run)
+                self.assertIn("Infra flake: rerun the job.", run)
+                # Pin the rejection path, not just the floor literal: a guard
+                # that keeps the floor and error text but stops comparing
+                # free_bytes must fail offline.
+                self.assertIn('for mount in / "$GITHUB_WORKSPACE"', run)
+                self.assertIn("df -B1 --output=avail", run)
+                self.assertIn('if [ "$free_bytes" -lt "$floor" ]', run)
+                self.assertIn("exit 1", run)
+                guards.append((workflow, job_id, run))
+        # All five copies stay byte-identical: a single-copy exit-1 removal or
+        # -lt/-gt inversion must fail offline instead of silently disabling
+        # the only fail-fast protection for that lane.
+        bodies = [run for _, _, run in guards]
+        self.assertEqual(len(set(bodies)), 1, "the lanes' disk guards drifted apart")
+        # Execute each guard with a stubbed df: fail when either mount is below
+        # the floor, pass when both are at or above it. Follows the stub
+        # pattern in scripts/test_ci_postgres_storage.py.
+        floor = 1073741824
+        scenarios = (
+            ("root low", floor - 1, floor, 1),
+            ("workspace low", floor, floor - 1, 1),
+            ("both low", floor - 1, floor - 1, 1),
+            ("both at floor", floor, floor, 0),
+            ("both above", floor + 1, floor + 1, 0),
+        )
+        stubs = (
+            'df() { if [ "$1" = "-h" ]; then return 0; fi; '
+            'last="${@: -1}"; '
+            'if [ "$last" = "/" ]; then printf \'Avail\\n%s\\n\' "$STUB_ROOT_AVAIL"; '
+            'else printf \'Avail\\n%s\\n\' "$STUB_WS_AVAIL"; fi; }; '
+            "du() { return 0; }; "
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = os.path.join(tmp, "ws")
+            runner_temp = os.path.join(tmp, "rt")
+            os.makedirs(workspace)
+            os.makedirs(runner_temp)
+            for workflow, job_id, run in guards:
+                for label, root_avail, ws_avail, expected in scenarios:
+                    with self.subTest(workflow=workflow, job=job_id, case=label):
+                        env = dict(
+                            os.environ,
+                            GITHUB_WORKSPACE=workspace,
+                            RUNNER_TEMP=runner_temp,
+                            STUB_ROOT_AVAIL=str(root_avail),
+                            STUB_WS_AVAIL=str(ws_avail),
+                        )
+                        result = subprocess.run(
+                            ["bash", "-c", stubs + run],
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        self.assertEqual(
+                            result.returncode, expected,
+                            f"{label}: root={root_avail} ws={ws_avail} "
+                            f"stdout={result.stdout!r} stderr={result.stderr!r}",
+                        )
+
+    def test_postgres_lanes_report_storage_headroom_post_suite(self):
+        # max_wal_size is a soft checkpoint target, not a hard ceiling: the
+        # pre-suite report cannot show peak WAL. Every Postgres lane brackets
+        # its run with an always-runs post-suite report for ENOSPC triage.
+        for job_id in ("rust-tests", "ignored-db-stores", "ignored-db-runtime"):
+            with self.subTest(job=job_id):
+                job = self.workflows["check.yml"]["jobs"][job_id]
+                steps = job["steps"]
+                names = [step.get("name") for step in steps]
+                self.assertIn("Report Postgres storage headroom (post-suite)", names)
+                post = next(
+                    step for step in steps
+                    if step.get("name") == "Report Postgres storage headroom (post-suite)"
+                )
+                self.assertEqual(post.get("if"), "always()")
+                test_steps = [
+                    index for index, candidate in enumerate(steps)
+                    if "cargo test" in str(candidate.get("run", ""))
+                ]
+                self.assertTrue(test_steps)
+                self.assertGreater(steps.index(post), max(test_steps))
+                self.assertIn("ON_ERROR_STOP=1", post["run"])
+                self.assertIn("pg_database_size", post["run"])
+                self.assertIn("pg_ls_waldir()", post["run"])
+                self.assertIn("max_wal_size", post["run"])
+                self.assertIn("min_wal_size", post["run"])
 
     def test_stores_container_pins_disposable_database_service_address(self):
         # Same hardening as rust-tests: the stores lane runs ~30 sequential
