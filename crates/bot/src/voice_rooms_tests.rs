@@ -4720,18 +4720,36 @@ fn setup_panel_lists_creators_failures_and_halt() {
 
 #[test]
 fn setup_panel_surfaces_store_errors() {
-    let panel = setup_panel(&SetupSummary {
-        guild_id: GUILD,
-        creators: vec![],
-        tracked_rooms: 0,
-        failures: vec![],
-        halted: false,
-        store_error: Some("Unavailable".to_owned()),
-    });
-    assert!(panel
-        .description
-        .contains("Could not load creator channels"));
-    assert!(!panel.description.contains("No creator channels yet"));
+    // The Setup arm stores `StoreError::to_string()`; pin each Display
+    // variant's exact line so a rewording fails here, not silently.
+    for (error, display) in [
+        (StoreError::Unavailable, "the store is unavailable"),
+        (
+            StoreError::CredentialRefused,
+            "the store refused the bot credential",
+        ),
+        (StoreError::Conflict, "the store reported a conflict"),
+    ] {
+        assert_eq!(error.to_string(), display);
+        let panel = setup_panel(&SetupSummary {
+            guild_id: GUILD,
+            creators: vec![],
+            tracked_rooms: 0,
+            failures: vec![],
+            halted: false,
+            store_error: Some(error.to_string()),
+        });
+        assert_eq!(
+            panel.description,
+            format!(
+                "Voice rooms are running.\n\
+                 Could not load creator channels ({display}); the worker state below is current.\n\
+                 Tracked rooms: 0.\n\
+                 No recent failures."
+            ),
+            "store-error line drifted for {display:?}"
+        );
+    }
 }
 
 #[test]
