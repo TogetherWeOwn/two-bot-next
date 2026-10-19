@@ -499,8 +499,11 @@ class MutantTests(unittest.TestCase):
         'raise ReadFailed("psql failed", done.stderr)',
         # A *splat smuggles the tuple through the same hole.
         "raise Refused(*error.args)",
-        # A **splat smuggles keywords through the same hole.
-        "raise Refused(**kwargs)",
+        # A **splat smuggles keywords through the same hole. Uppercase on
+        # purpose: a lowercase name still trips the broad lowercase-name
+        # pattern without the kw.arg branch, so only the uppercase form
+        # pins that half of the splat check.
+        "raise Refused(**KWARGS)",
     ]
     FIXED = [
         'raise Refused("refusing: the database login may not set that query parameter")',
