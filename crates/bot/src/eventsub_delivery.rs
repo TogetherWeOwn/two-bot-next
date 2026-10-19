@@ -278,7 +278,12 @@ mod tests {
             }),
             (true, true, false)
         );
-        for reason in ["send_failed", "ambiguous_send", "stamp_failed"] {
+        for reason in [
+            "send_failed",
+            "send_failed_unreleased",
+            "ambiguous_send",
+            "stamp_failed",
+        ] {
             assert_eq!(
                 post_metric_counts(&GoLiveOutcome::Failed { reason }),
                 (true, false, true),
