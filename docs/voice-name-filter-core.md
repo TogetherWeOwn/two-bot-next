@@ -86,9 +86,12 @@ cancellation. Move compensation, logging limits and write guards are unchanged.
 
 ## Residual parent work
 
-Room caps and claims, audit rows, V5 template expansion (member-requested
-renames are not filtered yet), and persistence stay on the voice parent. Unit
-and worker fixtures establish behaviour only, not staging readiness.
+Room caps and claims, audit rows, V5 template expansion, and persistence stay
+on the voice parent. Member-requested names are filtered by the panel's name
+decisions; queued renames and custom-name persistence also recheck the same
+policy at dispatch as defense in depth. A dispatch refusal records
+`name_blocked` and performs no Discord rename or custom-name store write.
+Unit and worker fixtures establish behaviour only, not staging readiness.
 
 ## Hermetic verification
 

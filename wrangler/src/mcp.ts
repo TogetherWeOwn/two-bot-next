@@ -7,8 +7,11 @@
  * The bearer gate lives in `index.ts` (before this handler runs), so every
  * call here is already authenticated with the `mcp:read` bearer.
  *
- * Phase 1 tools (all read-only, all bounded: 6 s timeout + 64 KiB body cap,
- * same as the metrics scrape in `index.ts`):
+ * Phase 1 tools (all read-only). Two separate budgets share the 6 s / 64 KiB
+ * shape but never each other: inbound intake collects at most 64 KiB under a
+ * six-second deadline before JSON parsing (measured on bytes read, never on
+ * Content-Length), while every outbound container read keeps its own 6 s
+ * timeout + 64 KiB cap (same as the metrics scrape in `index.ts`):
  * - `get_status` → `GET http://c/health` (single container read)
  * - `get_gateway` → `GET http://c/readyz`, gateway excerpt only
  * - `get_backfill_progress` → `GET http://c/readyz` jobs excerpt, with an
@@ -39,6 +42,11 @@ export const MCP_SERVER_VERSION = "0.1.0";
 /** Container-fetch bound for every MCP tool call (mirrors the scrape bound). */
 export const MCP_FETCH_TIMEOUT_MS = 6000;
 export const MCP_MAX_BODY_BYTES = 64 * 1024;
+/** Inbound intake bound for authenticated request bodies (a separate budget
+ * from the outbound container bound above): at most 64 KiB collected under a
+ * six-second deadline before JSON parsing. */
+export const MCP_INBOUND_MAX_BODY_BYTES = 64 * 1024;
+export const MCP_INBOUND_BODY_TIMEOUT_MS = 6000;
 
 const SINGLETON_NAME = "two-bot";
 
@@ -362,6 +370,100 @@ async function callTool(
 }
 
 /**
+ * Collect at most `limit` inbound bytes under `timeoutMs` before parsing.
+ * The count is measured on the bytes actually read, never on Content-Length.
+ * Oversize, deadline, client-abort and stream errors all resolve `ok: false`;
+ * the reader is cancelled and released so the tail is never drained.
+ * Decoding happens once, after a complete read, so a multi-byte character
+ * split across chunks still parses.
+ */
+async function readInboundText(
+  request: Request,
+  limit: number,
+  timeoutMs: number,
+): Promise<{ ok: true; text: string } | { ok: false }> {
+  const stream = request.body;
+  if (!stream) return { ok: true, text: "" };
+  const clientSignal = request.signal;
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  // The deadline and the client abort share one mechanism: cancelling the
+  // reader settles the pending read as done, and the flags below tell that
+  // apart from a genuine end of body. Cancelling directly (instead of racing
+  // the read against timer/abort promises) keeps each read to a single await
+  // hop, so an oversize stream is stopped before its tail is pulled.
+  let expired = false;
+  const expire = () => {
+    expired = true;
+    reader.cancel().catch(() => {});
+  };
+  const timer = setTimeout(expire, timeoutMs);
+  const onAbort = () => {
+    expired = true;
+    reader.cancel().catch(() => {});
+  };
+  clientSignal?.addEventListener("abort", onAbort, { once: true });
+  if (clientSignal?.aborted) {
+    clearTimeout(timer);
+    clientSignal.removeEventListener("abort", onAbort);
+    try {
+      await reader.cancel();
+    } catch {
+      // Reader already closed or errored; the refusal is the same.
+    }
+    reader.releaseLock();
+    return { ok: false };
+  }
+  try {
+    for (;;) {
+      let next: ReadableStreamReadResult<Uint8Array>;
+      try {
+        next = await reader.read();
+      } catch {
+        // Stream error mid-body: same fixed refusal, never an echo.
+        try {
+          await reader.cancel();
+        } catch {
+          // Reader already closed or errored; the refusal is the same.
+        }
+        return { ok: false };
+      }
+      if (expired || clientSignal?.aborted) {
+        try {
+          await reader.cancel();
+        } catch {
+          // Cancellation itself failing changes nothing about the refusal.
+        }
+        return { ok: false };
+      }
+      if (next.done) break;
+      size += next.value.byteLength;
+      if (size > limit) {
+        try {
+          await reader.cancel();
+        } catch {
+          // Cancellation itself failing changes nothing about the refusal.
+        }
+        return { ok: false };
+      }
+      chunks.push(next.value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { ok: true, text: new TextDecoder().decode(bytes) };
+  } finally {
+    clearTimeout(timer);
+    clientSignal?.removeEventListener("abort", onAbort);
+    reader.releaseLock();
+  }
+}
+
+/**
  * Stateless per-request JSON-RPC over POST. The caller is already
  * authenticated; this function never touches auth state.
  */
@@ -370,9 +472,17 @@ export async function handleMcp(
   env: McpEnv,
   fullEnv?: Record<string, string | undefined>,
 ): Promise<Response> {
+  const intake = await readInboundText(
+    request,
+    MCP_INBOUND_MAX_BODY_BYTES,
+    MCP_INBOUND_BODY_TIMEOUT_MS,
+  );
+  if (!intake.ok) {
+    return jsonError(null, -32700, "parse error");
+  }
   let body: unknown;
   try {
-    body = await request.json();
+    body = JSON.parse(intake.text) as unknown;
   } catch {
     return jsonError(null, -32700, "parse error");
   }
