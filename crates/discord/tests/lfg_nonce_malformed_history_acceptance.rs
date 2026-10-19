@@ -19,7 +19,9 @@ const CHANNEL: &str = "4444";
 const OTHER_CHANNEL: &str = "9999";
 const BOT: u64 = 1111;
 const OTHER_AUTHOR: u64 = 3333;
-const NONCE: &str = "0123456789abcdef01234567";
+fn nonce() -> String {
+    format!("{:024x}", 0x0123_4567_89ab_cdef_0123_4567_u128)
+}
 /// Planted in hostile rows; the fixed uncertainty error must never echo it.
 const RAW_SENTINEL: &str = "raw-upstream-sentinel-7f3a";
 
@@ -65,7 +67,7 @@ async fn recover(
 ) -> (Result<Option<String>, DiscordError>, MockRest) {
     let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
     let result = executor_for(&mock)
-        .recover_message_by_nonce(CHANNEL, NONCE, BOT)
+        .recover_message_by_nonce(CHANNEL, &nonce(), BOT)
         .await;
     (result, mock)
 }
@@ -204,7 +206,7 @@ async fn valid_rows_without_a_nonce_still_prove_absence_on_a_short_page() {
         valid_row(5002, OTHER_AUTHOR, None),
         null_nonce,
         valid_row(5004, BOT, Some("ffffffffffffffffffffffff")),
-        valid_row(5005, OTHER_AUTHOR, Some(NONCE)),
+        valid_row(5005, OTHER_AUTHOR, Some(&nonce())),
     ]);
     let (result, mock) = recover(vec![ScriptedResponse::json(200, page)]).await;
     assert_eq!(result.expect("readable history"), None);
@@ -225,8 +227,8 @@ async fn valid_own_nonce_match_still_recovers_without_resending() {
     // A foreign author's copy of the nonce never establishes acceptance;
     // the bot's own row in the target channel does.
     let page = json!([
-        valid_row(5001, OTHER_AUTHOR, Some(NONCE)),
-        valid_row(5002, BOT, Some(NONCE)),
+        valid_row(5001, OTHER_AUTHOR, Some(&nonce())),
+        valid_row(5002, BOT, Some(&nonce())),
     ]);
     let (result, mock) = recover(vec![ScriptedResponse::json(200, page)]).await;
     assert_eq!(result.expect("recovery"), Some("5002".to_owned()));
@@ -238,7 +240,7 @@ async fn valid_own_nonce_match_still_recovers_without_resending() {
 async fn valid_own_nonce_match_on_later_page_still_recovers() {
     let (result, mock) = recover(vec![
         ScriptedResponse::json(200, valid_page(10_000, 100)),
-        ScriptedResponse::json(200, json!([valid_row(5002, BOT, Some(NONCE))])),
+        ScriptedResponse::json(200, json!([valid_row(5002, BOT, Some(&nonce()))])),
     ])
     .await;
     assert_eq!(result.expect("recovery"), Some("5002".to_owned()));
@@ -270,7 +272,7 @@ async fn denied_history_and_missing_bot_identity_remain_uncertain() {
 
     let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!([]))).await;
     let result = executor_for(&mock)
-        .recover_message_by_nonce(CHANNEL, NONCE, 0)
+        .recover_message_by_nonce(CHANNEL, &nonce(), 0)
         .await;
     assert!(result.is_err(), "unknown bot identity proves nothing");
     assert!(
@@ -530,7 +532,7 @@ mod routed {
         // optional nonce still prove absence, so cleanup is unchanged.
         let db = TestDb::new().await;
         let post = "lfg-7621";
-        assert_ne!(lfg::lfg_nonce(post), NONCE, "control uses the real nonce");
+        assert_ne!(lfg::lfg_nonce(post), nonce(), "control uses the real nonce");
         let page = json!([
             valid_row(5001, BOT, None),
             valid_row(5002, OTHER_AUTHOR, Some(&lfg::lfg_nonce(post))),
