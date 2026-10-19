@@ -1463,3 +1463,35 @@ async fn relay_deadline_preserves_delivered_pending_and_fresh_items_across_resta
     mock.shutdown().await;
     db.close().await.unwrap();
 }
+
+/// Production-path metric assertion: the real fetch helper records exactly
+/// one outcome sample plus one error-class sample for a failed fetch. No
+/// network (the source is refused before dialling), no database, and a
+/// runtime-local registry, so removing the production `record_feed_fetch`
+/// call fails this test instead of going silent.
+#[tokio::test]
+async fn public_feed_fetch_records_failed_fetch_without_network() {
+    use two_bot_core::metrics::Metrics;
+
+    let metrics = Metrics::default();
+    let mut relay = feed("metric-path");
+    relay.source = "not a feed source".to_owned();
+    let result = fetch_public_feed(&metrics, &relay.source).await;
+    assert!(
+        matches!(result, Err(ErrorClass::Feed)),
+        "invalid source must surface as a feed error"
+    );
+    let text = metrics.render(None);
+    assert!(
+        text.contains("two_bot_feed_fetches_total{outcome=\"invalid_source\"} 1\n"),
+        "exactly one invalid_source outcome sample, got:\n{text}"
+    );
+    assert!(
+        text.contains("two_bot_feed_fetch_errors_total{error_class=\"invalid_source\"} 1\n"),
+        "exactly one invalid_source error-class sample, got:\n{text}"
+    );
+    assert!(
+        !text.contains("metric-path"),
+        "no feed id in any label, got:\n{text}"
+    );
+}
