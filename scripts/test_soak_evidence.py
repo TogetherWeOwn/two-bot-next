@@ -35,6 +35,29 @@ class SoakEvidenceTests(unittest.TestCase):
         self.assertEqual(len(actual["unknown_intervals"]), 2)
         self.assertEqual(actual["verdict"], "NEEDS WORK")
 
+    def test_invalid_sequence_does_not_advance_timestamp_state(self):
+        for event, seq in (("dispatch", True), ("resume", "bad")):
+            with self.subTest(event=event):
+                records = [
+                    {"ts": "2026-09-20T00:00:00Z", "event": "connect", "session": "a"},
+                    {"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 0},
+                    {"ts": "2026-09-20T00:00:02Z", "event": "disconnect"},
+                    {"ts": "2026-09-20T00:00:10Z", "event": event, "session": "a", "seq": seq},
+                    {"ts": "2026-09-20T00:00:04Z", "event": "resume", "session": "a"},
+                    {"ts": "2026-09-20T00:00:05Z", "event": "dispatch", "session": "a", "seq": 1},
+                ]
+                summary = run("".join(json.dumps(record) + "\n" for record in records))
+                self.assertEqual(summary["dispatches"], 2)
+                self.assertEqual(summary["resumes"], 1)
+                self.assertEqual(summary["redeploy_gaps_s"], [2.0])
+                self.assertEqual(summary["missed_events"], 0)
+                self.assertEqual(summary["window"], {
+                    "start": "2026-09-20T00:00:00+00:00",
+                    "end": "2026-09-20T00:00:05+00:00",
+                })
+                self.assertEqual(len(summary["unknown_intervals"]), 1)
+                self.assertEqual(summary["verdict"], "NEEDS WORK")
+
     def test_clean_week_passes(self):
         summary = run(
             '{"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": "a"}\n'

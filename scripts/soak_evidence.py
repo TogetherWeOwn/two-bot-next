@@ -35,6 +35,15 @@ counters, sequence state or reconnect gaps, and later valid records are
 still summarized. Disconnect and explicit unknown events keep their
 existing semantics.
 
+Dispatch ``seq`` and any supplied resume ``seq`` must be nonnegative integers;
+booleans, nulls, strings, floats, arrays and objects are invalid. Only an omitted
+resume ``seq`` is optional and leaves the sequence baseline unchanged. Invalid
+sequences become fixed UNKNOWN evidence before counters, sequence baselines,
+the accepted timestamp window or pending outages can change. UTC-normalization
+overflow in event timestamps or explicit UNKNOWN endpoints likewise becomes
+bounded malformed evidence, without echoing the rejected value or aborting the
+remaining input. None of these rules changes the live soak acceptance budget.
+
 Usage:
 
     python3 scripts/soak_evidence.py scripts/fixtures/soak_evidence_sample.jsonl
@@ -92,15 +101,23 @@ def _valid_session(value):
     return isinstance(value, str) and value != ""
 
 
+def _valid_sequence(value):
+    """True only for a nonnegative integer, never a boolean."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def parse_ts(value):
-    """Parse an ISO-8601 UTC timestamp; raise ValueError when absent/garbled."""
+    """Parse a timestamp representable in UTC; otherwise raise fixed ValueError."""
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"missing ts: {value!r}")
+        raise ValueError("invalid timestamp")
     text = value.strip().replace("Z", "+00:00")
-    moment = datetime.fromisoformat(text)
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc)
+    try:
+        moment = datetime.fromisoformat(text)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        raise ValueError("invalid timestamp") from None
 
 
 def summarize(lines):
@@ -160,9 +177,6 @@ def summarize(lines):
         if last_event_ts is not None and ts < last_event_ts:
             note_unknown(ts, ts, f"timestamp regression on line {lineno}")
             continue
-        last_event_ts = ts
-        first_ts = ts if first_ts is None else min(first_ts, ts)
-        last_ts = ts if last_ts is None else max(last_ts, ts)
         # No RecursionError guard here or around parse_ts above: the record
         # already passed the iterative _too_deeply_nested check, so this
         # block performs no recursive traversal and cannot raise it. The
@@ -174,6 +188,18 @@ def summarize(lines):
             if not _valid_session(session):
                 note_unknown(ts, ts, f"{event} with invalid session")
                 continue
+
+        seq = record.get("seq")
+        if event == "dispatch" and not _valid_sequence(seq):
+            note_unknown(ts, ts, "dispatch without integer seq (must be nonnegative)")
+            continue
+        if event == "resume" and "seq" in record and not _valid_sequence(seq):
+            note_unknown(ts, ts, "resume with invalid seq")
+            continue
+
+        last_event_ts = ts
+        first_ts = ts if first_ts is None else min(first_ts, ts)
+        last_ts = ts if last_ts is None else max(last_ts, ts)
 
         if event == "connect":
             connects += 1
@@ -190,15 +216,11 @@ def summarize(lines):
             if down_since is not None:
                 gaps.append((ts - down_since).total_seconds())
                 down_since = None
-            if isinstance(record.get("seq"), int):
+            if "seq" in record:
                 prev = last_seq.get(session)
-                if prev is None or record["seq"] > prev:
-                    last_seq[session] = record["seq"]
+                if prev is None or seq > prev:
+                    last_seq[session] = seq
         elif event == "dispatch":
-            seq = record.get("seq")
-            if not isinstance(seq, int):
-                note_unknown(ts, ts, "dispatch without integer seq")
-                continue
             dispatches += 1
             prev = last_seq.get(session)
             if prev is None:
