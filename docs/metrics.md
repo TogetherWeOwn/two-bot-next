@@ -79,13 +79,15 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert-threshold hook for M2.1: alert when the counter increases across consecutive scrapes; a single failed drain is not paging |
 | `two_bot_retention_replay_needed_total` | Skipped retention purges needing Operator replay: one per real guild removal whose purge-queue write hit the schema gap. Successful queue writes and rejoin-cancel skips never increment it. Label-free counter; resets on process restart, so pair it with the error log line. Manual check, not an alert input: no alert rule consumes this series. No guild id, SQLSTATE or error text ever becomes a label |
 | `two_bot_audit_delivery_halt` | Audit mirror delivery-halt state for staleness evaluation: `1` while the persistent kill switch is engaged, `0` once cleared. Label-free gauge set once per readable `audit_retry` sweep from the store's `delivery_halt` read; an unreadable halt keeps the last reported state, and a halted sweep still counts as a job `success` (the sweep ran; it claimed nothing by design). Manual check, not an alert input: no alert rule consumes this series and production alert forwarding stays off. No actor ID, timestamp, error text or row content ever reaches exposition |
-| `two_bot_event_store_consumer_lag_seconds` | Event-store consumer lag in seconds (`received_at` minus `event_time` for the newest observed capture row); `0` when unobserved. Label-free gauge; S1 exposes the series and its setter contract (last writer wins; non-finite or negative input clears to `0` so exposition stays a finite non-negative duration). The periodic store-read caller lands with the consumer slice, so until then the series reads `0` (unobserved), not "no lag". Manual check, not an alert input: no alert rule consumes this series. No message, channel, user, dedup-key, content or body label ever reaches exposition |
+| `two_bot_event_store_consumer_lag_seconds` | Event-store consumer lag in seconds (`received_at` minus `event_time` for the newest observed capture row); `0` when unobserved. Label-free gauge; S1 exposes the series and its setter contract (last writer wins; non-finite or negative input clears to `0` so exposition stays a finite non-negative duration). The periodic store-read caller lands with the consumer slice, so until then the series reads `0` (unobserved), not "no lag". Alert rule `event_store_consumer_lag` tickets on sustained lag above 60 s (see below). No message, channel, user, dedup-key, content or body label ever reaches exposition |
 | `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures. Requests rejected before body intake are not deliveries; label-free counter |
 | `two_bot_eventsub_classified_total{kind}` | EventSub deliveries classified by fixed `kind`: `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`. `ignored` covers known unrecognized or invalid outcomes, including deterministic 2xx acknowledgments, invalid challenges, and non-signature verification failures; `other` marks unknown/future classification errors, which return retryable 503. Only `BadSignature` is `tampered`. `eventsub_tampered` pages when the `tampered` series with exactly that label rises in 3 consecutive samples. No IDs, tokens, headers, body text or secrets become labels |
 | `two_bot_eventsub_posts_total{outcome}` | Go-live post outcomes: `attempted`, `succeeded`, `failed` or `other`. Counted by the receiver only for deliveries that reach the sender through the durable ledger flow; boot injects no delivery dependencies yet, so these remain zero until channel/invite provisioning lands; no IDs, content or errors become labels |
-| `two_bot_eventsub_reconcile_passes_total{outcome}` | EventSub reconcile passes by fixed `outcome`: `healthy` (every desired broadcaster holds a healthy subscription afterwards), `pending` (re-created but not all verified yet) or `failed` (an action failed or a healthy subscription is missing, including listing failures). Exactly one sample per pass that reaches Helix; parked or refused startup passes (flag dark, invalid config, empty allowlist) never reach Helix and record no sample — they are log-only. Alert when `failed` rises across scrapes (alert rules land separately) |
+| `two_bot_eventsub_reconcile_passes_total{outcome}` | EventSub reconcile passes by fixed `outcome`: `healthy` (every desired broadcaster holds a healthy subscription afterwards), `pending` (re-created but not all verified yet) or `failed` (an action failed or a healthy subscription is missing, including listing failures). Exactly one sample per pass that reaches Helix; parked or refused startup passes (flag dark, invalid config, empty allowlist) never reach Helix and record no sample — they are log-only. Alert `eventsub_reconcile_failed` tickets when `failed` rises between keepalive samples (first sample is baseline-only; see the alert table below) |
 | `two_bot_eventsub_reconcile_actions_total{action}` | Successful EventSub reconcile mutations by fixed `action`: `create` (2xx creates) or `delete` (2xx deletes, including already-gone deletes). 409 already-exists confirmations fold into the pass outcome, not into actions; per-subscription labels never reach exposition |
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | EventSub reconcile failure sites by the same fixed `error_class` strings as the `error_class` log field: `reconcile_action_failed` (once per failed plan action), `reconcile_prior_failed` (once per pass that found failed subscriptions), `reconcile_unhealthy` (once per non-converged pass) or `reconcile_failed` (listing or plan failures), plus `other` for unknown classes. No status code, body, broadcaster, subscription id or secret ever becomes a label |
+| `two_bot_feed_fetches_total{outcome}` | Feed fetch attempts by bounded outcome: `success` (2xx fetch), `invalid_source` (source refused before dialling), `refused_redirect` (redirect refused by policy) or `failure` (every other failure, including non-2xx HTTP). One sample per fetch; per-outcome, never per-feed, so no source URL, host or feed id reaches a label |
+| `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class: `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`. One sample per failed fetch alongside `two_bot_feed_fetches_total`; successes record nothing here. No URL, host, header or body bytes reach a label |
 
 ## REST admission guard
 
@@ -385,6 +387,19 @@ as dynamic labels.
   `crates/bot/src/gateway.rs` (`apply_dispatch`), in both warn-and-continue
   arms; the existing warn log lines are unchanged. No error text, SQL or
   identifier becomes a label.
+- `two_bot_feed_fetches_total{outcome}` — `outcome` is `success`,
+  `invalid_source`, `refused_redirect` or `failure`
+  (`crates/core/src/metrics.rs` `FEED_FETCH_OUTCOMES`). Recorded once per
+  fetch in `crates/bot/src/feed_jobs.rs` via
+  `crates/core/src/feeds_connector.rs` `record_feed_fetch`; per-outcome,
+  never per-feed, so no source URL, host or feed id becomes a label.
+- `two_bot_feed_fetch_errors_total{error_class}` — `error_class` is
+  `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`,
+  `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`,
+  `resolve`, `transport`, `deadline`, `http_error` or `other`
+  (`crates/core/src/metrics.rs` `FEED_FETCH_ERROR_CLASSES`). Recorded once
+  per failed fetch alongside the outcome above; successes record nothing
+  here. No URL, host, header or body bytes become labels.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,
@@ -578,8 +593,9 @@ only `two-bot metrics scrape failed`: no response body,
 exception detail, token or URL. Empty/non-exposition, malformed or interrupted
 bodies, timeouts, and missing/duplicate/invalid alert inputs keep the previous
 firing set, counter baselines and streaks, and emit no `RESOLVED` — except the
-dispatch-drop baselines and streaks, which reset without resolving active
-tickets (a failed scrape invalidates all dispatch baselines).
+dispatch-drop baselines and streaks and the event-store lag streak, which reset
+without resolving active tickets (a failed scrape invalidates all dispatch
+baselines and breaks the lag streak).
 The validator requires every always-emitted series consumed by the rules,
 including all current label combinations from `crates/core/src/metrics.rs`,
 with finite nonnegative integer inputs (pool-configured is 0 or 1). Additional
@@ -638,9 +654,11 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `voice_join_slow_burn` | **ticket**, not page: same budget burning faster than 6x in both the 6 h and 30 min windows, with the same per-window volume and bad-move floors (sustained grind the fast rule never catches) | [voice join slow burn](runbook.md#alert-voice-join-slow-burn) |
 | `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` > 600 (two missed 5 min refreshes) with `two_bot_voice_creator_map_generation` > 0; generation 0 (never merged) never fires, missing gauges on older containers hold the previous state | [voice creator-map stale](runbook.md#alert-voice-creator-map-stale) |
 | `eventsub_post_failed_share` | **ticket**, not page: failed `two_bot_eventsub_posts_total` > 10% of attempted posts, >= 10 attempted (sub-floor windows accumulate across consecutive valid samples until the floor is met; first sample is baseline, resets rebaseline, missing/invalid preserves, and flat/sub-floor windows hold an active ticket until a judged window clears it) | [EventSub post failed share](runbook.md#alert-eventsub-post-failed-share) |
+| `event_store_consumer_lag` | **ticket**, not page: `two_bot_event_store_consumer_lag_seconds` > 60 in 3 consecutive valid samples (fractional counts); a valid sample at or below 60 resolves and rebaselines, missing/invalid samples and failed scrapes break the streak but preserve a firing ticket | [event-store consumer lag](runbook.md#alert-event-store-consumer-lag) |
 | `error_budget_fast_burn` | REST error budget (99.9% success over 48 h) burning faster than 12x in both the 15 min and 2 min windows; each window needs at least 10 eligible requests and two budget errors (`5xx` plus `transport`); incomplete post-restart windows stay inactive and missing inputs hold the previous state | [error budget fast burn](runbook.md#alert-error-budget-fast-burn) |
 | `error_budget_slow_burn` | **ticket**, not page: same budget burning faster than 3x in both the 2 h and 15 min windows, with the same per-window volume and error floors; needs full 2 h history, holds on missing inputs, scrape gaps, or counter resets, and resolves on a covered quiet or below-threshold 15 min window | [error budget slow burn](runbook.md#alert-error-budget-slow-burn) |
 | `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` rises in 3 consecutive samples (first sample is baseline-only, flat resolves, resets rebaseline, missing/invalid preserves firing alerts) | [EventSub tampered](runbook.md#alert-eventsub-tampered) |
+| `eventsub_reconcile_failed` | **ticket**, not page: `two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rises between samples (one ticket per failed pass however many error sites moved; first sample is baseline-only, a restart sample re-baselines and fires when the new process already counted a failed pass (failed startup pass) else holds a firing ticket, a healthy-pass increase with no failed increase resolves, flat/pending-only growth and missing/invalid samples hold) | [eventsub reconcile failed](runbook.md#alert-eventsub-reconcile-failed) |
 
 `dispatch_drops` covers `messages`, `interactions`, `registry`, `privileged`,
 `busy` and `reactions` independently (the Worker allowlist is pinned to Rust).
@@ -717,7 +735,9 @@ DB-error coverage: `two_bot_db_errors_total` counts send-admission SQL
 failures (`op="admission"`) and voice actor load failures (`op="other"`);
 other stores adopt `Metrics::db_error` incrementally, so this is not a
 database-wide total. Correlate voice load failures with `voice actor load
-failed; actor respawns on the next guild snapshot` in container stdout.
+failed; retrying with capped backoff` in container stdout (transient
+failures retry inside the actor task; a credential refusal logs `voice
+actor load failed; credential refused, not retrying` instead).
 Every load failure increments the counter, but that warn is throttled
 process-wide to once per 300 s. A slow trickle below the burst threshold
 stays silent in `db_errors`; job-failure rules cover failed jobs, not every

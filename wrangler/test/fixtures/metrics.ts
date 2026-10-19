@@ -45,7 +45,9 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string>> = {
   two_bot_dispatch_drops_total: { lane: "DISPATCH_LANES" },
   two_bot_internal_actions_total: { family: "INTERNAL_ACTION_FAMILIES", outcome: "INTERNAL_ACTION_OUTCOMES" },
   two_bot_eventsub_posts_total: { outcome: "EVENTSUB_POST_OUTCOMES" },
+  two_bot_eventsub_reconcile_passes_total: { outcome: "EVENTSUB_RECONCILE_OUTCOMES" },
   two_bot_eventsub_classified_total: { kind: "EVENTSUB_DELIVERY_KINDS" },
+  two_bot_event_store_consumer_lag_seconds: {},
 };
 
 /** Complete consumed-input fixture generated from the Rust label contract, not the validator. */

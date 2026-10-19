@@ -250,19 +250,28 @@ pub(crate) enum Sweep {
     Drained(DrainReport),
 }
 
+/// Coherent destination state: the revision the destinations were resolved
+/// from, plus the destinations themselves. One mutex so competing refreshes
+/// compare and apply them as a single transition; revision equality alone
+/// never skips repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DestinationState {
+    revision: Option<i64>,
+    channels: AuditChannelIds,
+}
+
 pub(crate) struct AuditRuntime<M: AuditMirror> {
     /// Boot deployment values for the three destinations; the live snapshot
     /// layers over these on every refresh.
     deployment: HashMap<String, String>,
     guild: String,
     connect: Connect<M>,
-    /// Current destinations (boot, then live). Re-resolved whenever the
-    /// published snapshot moves; a malformed stored row keeps the last good
-    /// destinations rather than parking a running mirror.
-    channels: Mutex<AuditChannelIds>,
-    /// Published snapshot revision the destinations were last resolved from;
-    /// `None` before any live reader exists.
-    live_revision: Mutex<Option<i64>>,
+    /// Current destinations (boot, then live) plus the published revision they
+    /// were resolved from. Re-resolved whenever the published snapshot moves;
+    /// a malformed stored row keeps the last good destinations rather than
+    /// parking a running mirror, advancing the revision so the warn-once
+    /// transition is not repeated.
+    destinations: Mutex<DestinationState>,
     /// Connection parts (pool, mirror, bot id) built once on first success; a
     /// failed connect caches nothing. The service rebuilds only when the
     /// destinations move, so halt-transition memory survives idle sweeps.
@@ -302,46 +311,78 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
             deployment,
             guild,
             connect,
-            channels: Mutex::new(channels),
-            live_revision: Mutex::new(None),
+            destinations: Mutex::new(DestinationState {
+                revision: None,
+                channels,
+            }),
             wired: AsyncMutex::new(None),
             halted: Mutex::new(None),
             metrics,
         })
     }
 
-    /// Re-resolve destinations when the published snapshot moved. Pure apart
+    /// Re-resolve destinations from one coherent published snapshot. Pure apart
     /// from the process-wide live reader; production passes the poller's
     /// snapshot, tests pass an explicit pair.
+    ///
+    /// The revision and the destination values come from the same snapshot
+    /// read and are compared and applied as one transition under a single
+    /// lock, so competing refreshes never leave the cached revision describing
+    /// a different snapshot from the installed destinations, and a
+    /// current-publication call repairs destinations even when the revision
+    /// already matches. Restored snapshots apply in either numeric direction;
+    /// there is no monotonic-only policy.
     pub(crate) fn refresh_channels_with(&self, live: Option<&LiveSettings>) {
-        let revision = live.map(LiveSettings::revision);
-        if *self.live_revision.lock().unwrap_or_else(|e| e.into_inner()) == revision {
-            return;
-        }
-        *self.live_revision.lock().unwrap_or_else(|e| e.into_inner()) = revision;
-        let vars = layered_vars(&self.deployment, &self.guild, live);
+        let (revision, vars) = match live {
+            Some(live) => {
+                let snapshot = live.snapshot();
+                let revision = snapshot.revision();
+                let mut vars = self.deployment.clone();
+                vars.extend(
+                    snapshot
+                        .env_snapshot(Some(&self.guild))
+                        .into_iter()
+                        .filter(|(key, _)| CHANNEL_KEYS.contains(&key.as_str())),
+                );
+                (Some(revision), vars)
+            }
+            None => (None, self.deployment.clone()),
+        };
         match resolve_channels(&vars) {
             Ok(next) => {
-                let mut current = self.channels.lock().unwrap_or_else(|e| e.into_inner());
-                if *current != next {
-                    tracing::info!(job = JOB, "setting_changed: audit destinations");
-                    *current = next;
+                let mut state = self.destinations.lock().unwrap_or_else(|e| e.into_inner());
+                if state.revision == revision && state.channels == next {
+                    return;
                 }
+                if state.channels != next {
+                    tracing::info!(job = JOB, "setting_changed: audit destinations");
+                }
+                state.revision = revision;
+                state.channels = next;
             }
             Err("disabled") => {
                 let next = AuditChannelIds::default();
-                let mut current = self.channels.lock().unwrap_or_else(|e| e.into_inner());
-                if *current != next {
-                    tracing::info!(job = JOB, "audit destinations disabled live");
-                    *current = next;
+                let mut state = self.destinations.lock().unwrap_or_else(|e| e.into_inner());
+                if state.revision == revision && state.channels == next {
+                    return;
                 }
+                if state.channels != next {
+                    tracing::info!(job = JOB, "audit destinations disabled live");
+                }
+                state.revision = revision;
+                state.channels = next;
             }
             Err(reason) => {
+                let mut state = self.destinations.lock().unwrap_or_else(|e| e.into_inner());
+                if state.revision == revision {
+                    return;
+                }
                 tracing::warn!(
                     job = JOB,
                     reason,
                     "audit destinations unusable; keeping the last good"
                 );
+                state.revision = revision;
             }
         }
     }
@@ -349,7 +390,11 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
     /// Destinations for tests without a database or a poller.
     #[cfg(test)]
     pub(crate) fn channels_for_test(&self) -> AuditChannelIds {
-        self.channels.lock().unwrap().clone()
+        self.destinations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .channels
+            .clone()
     }
 
     /// Halt memory for tests: the state the previous sweep reported, `None`
@@ -394,9 +439,10 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
         // Refresh outside the slot lock so a concurrent channel change lands
         // on the next call instead of racing this one.
         let current = self
-            .channels
+            .destinations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .channels
             .clone();
         let mut slot = self.wired.lock().await;
         match slot.as_ref() {

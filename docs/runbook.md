@@ -151,8 +151,8 @@ Look for these literal messages:
   only a running-gateway failure lingers 75 s) and in Workers Logs as
   `container_gateway_failure` (see [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
-- Worker: `two-bot container started|stopped`, `two-bot /readyz unhealthy`,
-  `two-bot keepalive probe failed`, `two-bot container error`.
+- Worker: `two-bot container started|stopped`, `container_readyz_unhealthy`,
+  `container_keepalive_probe_failed`, `container_error`.
 
 The DO renews activity and probes `/readyz` every `KEEPALIVE_SECONDS` (default
 60); `sleepAfter` is 30 minutes. Outbound gateway traffic alone does not keep
@@ -359,10 +359,14 @@ First response: check the affected provider's status (PlanetScale for
 production, Neon for staging) before touching the bot; then correlate with
 the `op` label and recent deploys (a new query path or migration can explain
 a fresh error burst). For voice actor load failures, read `voice actor load
-failed; actor respawns on the next guild snapshot` in container stdout.
-Every failure increments the counter, but that warn is throttled
-process-wide to once per 300 s; its absence in a short window does not
-prove the actor loaded. Do not run SQL probes against staging or
+failed; retrying with capped backoff` in container stdout (or `voice actor
+load failed; credential refused, not retrying` when the store refused the
+bot credential). Transient failures retry inside the actor task (30 s
+per-attempt deadline, 1 s backoff doubling to a 60 s cap), so the guild
+recovers on its own once storage heals; a credential refusal never retries
+and needs the credential fixed first. Every failure increments the
+counter, but that warn is throttled process-wide to once per 300 s; its
+absence in a short window does not prove the actor loaded. Do not run SQL probes against staging or
 production, add grants, or restart the container to "clear" the errors;
 a replacement restarts the shard without fixing the failing storage path.
 
@@ -878,6 +882,36 @@ as `(ticket)` and supplies this runbook. Route a continuing delivery failure to
 the on-call engineer through the normal triage path. No new webhook, production
 activation or live load test is authorized.
 
+#### Alert: event-store consumer lag
+
+`two_bot_event_store_consumer_lag_seconds` stayed above 60 s (one keepalive
+window) in three consecutive valid keepalive samples. `event_store_consumer_lag`
+is a **ticket, not a page**: only lag above the 60 s threshold counts
+(fractional durations count), while samples at or below it — including `0`
+(unobserved) — never fire and a single transient spike stays quiet. Only a valid
+sample at or below 60 s resolves and rebaselines; missing or invalid samples
+(absent family, duplicate, labeled, non-finite, negative) and failed scrapes
+break the streak but preserve a firing ticket. A process restart reads `0`, so
+restarts rebaseline the same way.
+
+First response: triage within the watch shift through the existing read-only
+paths. Read `two_bot_event_store_consumer_lag_seconds` via the authorized
+`/ops/metrics` scrape and compare gateway readiness, missed-events and REST/DB
+alerts separately; a lag ticket with no gateway or store error is consumer
+pressure, not proof of capture loss. Diagnose the consumer with read-only
+checks only: recent deploy evidence, Worker `metrics_alert` log lines for the
+firing and recovery transitions, and the staging read-only verify query in the
+[event-store wiring note](event-store.md#staging-verify-steps-read-only).
+Record only the sanitized lag value and window, never message, channel, user,
+content or scrape tokens.
+
+Do not change the consumer, the store schema, retention or erasure, replay
+capture rows, or restart the bot to clear the gauge. This alert reuses the
+existing transition delivery as `(ticket)` and supplies this runbook. Persist
+sanitized incident evidence and route a continuing lag to the on-call engineer
+through the normal triage path. No new webhook, production activation or live
+load test is authorized.
+
 #### Alert: metrics scrape lost
 
 The Container DO failed the container-internal `/metrics` scrape on 3 consecutive scheduled keepalive ticks. This is a **ticket, not a page**: the observer itself is blind, so every metric-rule alert is missing evidence while this fires. One failed scrape stays quiet and three consecutive failures ticket exactly once; further failures do not re-ticket while the incident fires.
@@ -885,6 +919,51 @@ The Container DO failed the container-internal `/metrics` scrape on 3 consecutiv
 First response: read the scrape through the existing authorized `/ops/metrics` path, check container `/readyz` and Worker/container logs for `two-bot metrics scrape failed`. Timeouts (6 s deadline), non-OK status, oversized bodies (64 KiB cap) and invalid exposition all count as failure; the deadline and cap are unchanged by this alert. Notifications and logs carry only this runbook link and build context, never response bodies.
 
 A lost scrape never resolves any metric-rule incident: missing evidence is not recovery evidence, so previously firing alerts stay firing through the loss, and the existing dispatch-drop interruption still applies. The first complete valid scrape after the incident resolves only the scrape-loss ticket; metric rules re-evaluate on that same scrape and resolve only on their own evidence. A valid scrape before the third failure silently resets the streak with no resolve.
+
+#### Alert: eventsub reconcile failed
+
+`two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rose between two
+keepalive samples. The Rust process records exactly one outcome per completed
+reconcile pass that reaches Helix (`healthy`, `pending` or `failed`); parked or
+refused startup passes never reach Helix and record no sample. A failed pass
+means a reconcile action failed or a healthy subscription is still missing,
+including listing failures — the detailed per-site error counters
+(`two_bot_eventsub_reconcile_errors_total`) add detail only and never multiply
+this alert. This is a **ticket, not a page**.
+
+Trigger: the first valid sample only stores a baseline and never fires. A later
+positive failed-pass delta fires once, however many internal error counters
+moved in the same window; a failed delta beside a healthy delta still fires.
+Healthy-only or pending-only growth never fires. Recovery: a flat failed counter
+never recovers, and a verification-pending pass never recovers — only a later
+healthy-pass increase with no failed-pass increase resolves, once. A backwards
+counter in any of the three outcomes means the process restarted: that sample
+re-baselines, firing when the new process already counted a failed pass (the
+startup pass runs before the first scrape, so a failed boot pass is a
+post-restart failure, not a fabricated delta), and otherwise holding a firing
+ticket instead of fabricating a RESOLVED. Missing or invalid samples (absent family on older containers,
+malformed values, extra labels, duplicates) and failed scrapes hold the firing
+state and keep the previous baseline; the next valid failed delta still fires
+and the next valid healthy increase still recovers.
+
+First response: read-only diagnosis only — no Helix request and no
+reconciliation behavior change. Run the read-only reconcile queries in
+[eventsub-subscription-health-queries.md](eventsub-subscription-health-queries.md)
+(Q2 last reconcile outcome plus the dashboard fields it drops: `failed`,
+`missing`, `prior_failed`, `action`, `error`) via the authorized `/ops/metrics`
+scrape and Workers Observability, correlate the window with recent deploys (a
+fresh deploy restarts the process and resets the counters), and confirm the
+firing key is the fixed `eventsub_reconcile_failed` with no broadcaster,
+subscription id, body, token or free-text labels. Forwarding, persistence and
+log context are the existing metrics-alert path above (persist before notify,
+at most once per transition); turning forwarding off retains monitoring.
+
+Do not retry Helix calls, re-list subscriptions, delete/re-create subscriptions
+by hand, or restart the container to "clear" the counter; a replacement resets
+the baseline without healing the subscription. This alert adds neither automatic
+ticket-system integration nor paging escalation: it labels the existing
+transition delivery as `(ticket)` and supplies this runbook. No new webhook,
+production activation or live load test is authorized.
 
 #### Alert: EventSub tampered
 
@@ -1076,29 +1155,27 @@ provider HTTP success alone is not guard evidence.
 
 ### Event-store capture gaps and lag
 
-This is operator guidance, not a metrics alert: no rule in
-`wrangler/src/alert-rules.ts` watches this table, so nothing here fires or
-pages. The append-only capture table (`event_store`) only sees what the
-gateway received, so its gaps follow the gateway counters, not a separate
-store alert. A `two_bot_gateway_missed_events_total` increase between
-keepalive samples is a capture gap: those dispatches never arrived, RESUME
-does not replay them, and no backfill can reconstruct them. First response
-is the same as [gateway missed events](#alert-gateway-missed-events):
-scrape the authorized `/ops/metrics` path, compare the disconnect and
-recovery counters, correlate recent deploys, and do not restart the
-container to clear the counter.
+Capture gaps remain operator guidance, not a metrics alert: no rule watches
+for missing rows, so gaps never fire. The append-only capture table
+(`event_store`) only sees what the gateway received, so its gaps follow the
+gateway counters, not a separate store alert. A
+`two_bot_gateway_missed_events_total` increase between keepalive samples is a
+capture gap: those dispatches never arrived, RESUME does not replay them, and
+no backfill can reconstruct them. First response is the same as [gateway
+missed events](#alert-gateway-missed-events): scrape the authorized
+`/ops/metrics` path, compare the disconnect and recovery counters, correlate
+recent deploys, and do not restart the container to clear the counter.
 
-Capture lag is the spread between `received_at` and `event_time` per event
-family. No counter tracks it yet: lag is only detected by the read-only
-staging verify query ([event-store wiring
-note](event-store.md#staging-verify-steps-read-only)) until a slice ships a
-real counter and rule. A spread that stays above one keepalive window
-(about 60 s) across consecutive windows gets the same first response as a
-missed-events increase. Backfills and repairs against this table are
-insert-only with fresh dedup keys: never rewrite history with `UPDATE` or
-`DELETE`, and never replay an uncertain Discord effect from a capture row.
-Full wiring, fence and staging steps live in the [event-store wiring
-note](event-store.md).
+Capture lag has a ticket: [event-store consumer
+lag](#alert-event-store-consumer-lag) watches the label-free
+`two_bot_event_store_consumer_lag_seconds` gauge. Until the periodic
+store-read caller lands, the gauge reads `0` (unobserved); the staging
+read-only verify query ([event-store wiring
+note](event-store.md#staging-verify-steps-read-only)) remains the manual
+check. Backfills and repairs against this table are insert-only with fresh
+dedup keys: never rewrite history with `UPDATE` or `DELETE`, and never replay
+an uncertain Discord effect from a capture row. Full wiring, fence and staging
+steps live in the [event-store wiring note](event-store.md).
 
 ## Persisted ownership control
 
@@ -1870,8 +1947,8 @@ Gateway reconnect symptoms and REST send failures are different incidents:
 gateway-ready does not prove REST delivery, and HTTP liveness does not prove
 either. Use literal `gateway reconnect failed; Twilight will retry`,
 `durable gateway initialized; shard connecting` (`resume`) and
-`gateway ready; checkpoint committed` (`sequence`). Worker
-`two-bot /readyz unhealthy: <status>` is a readiness observation, not a Discord
+`gateway ready; checkpoint committed` (`sequence`). The Worker
+`container_readyz_unhealthy` line is a readiness observation, not a Discord
 cause. Do not infer a Discord outage from a Worker error or 403 alone.
 
 Existing **private** metrics are `two_bot_gateway_reconnects_total`,
