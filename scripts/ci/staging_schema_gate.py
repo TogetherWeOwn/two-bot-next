@@ -244,7 +244,10 @@ def run_gate(binary, source_sha, url, expected_host, expected_database, expected
     try:
         manifest = json.loads(proc.stdout.strip().splitlines()[-1],
                               object_pairs_hook=unique_object)
-    except (json.JSONDecodeError, IndexError, RecursionError):
+    except Refused:
+        raise
+    except (ValueError, IndexError, RecursionError):
+        # ValueError carries JSONDecodeError plus the int-digit cap; refuse all as non-JSON.
         raise Refused("plan manifest is not valid JSON")
     return manifest
 

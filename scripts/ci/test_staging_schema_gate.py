@@ -357,6 +357,12 @@ class DuplicateManifestRefusalTests(unittest.TestCase):
             self.run_with_stdout(stdout)
         self.assertEqual(str(caught.exception), "plan manifest is not valid JSON")
 
+    def test_overlong_integer_maps_digit_cap_to_invalid_json(self):
+        stdout = '{"pending_before": [%s], "pending_store_before": []}\n' % ("9" * 5000)
+        with self.assertRaises(Refused) as caught:
+            self.run_with_stdout(stdout)
+        self.assertEqual(str(caught.exception), "plan manifest is not valid JSON")
+
     def test_unique_nested_manifest_still_parses(self):
         stdout = (
             '{"pending_before": [], "pending_store_before": [], '
