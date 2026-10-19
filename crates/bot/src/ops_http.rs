@@ -129,7 +129,22 @@ async fn store_snapshot_with_budget(
     // silent and leave the latch alone, like the backfill route's own
     // no-database baseline.
     let pool = pool?;
-    match tokio::time::timeout(budget, two_bot_store::journal::snapshot(pool)).await {
+    snapshot_probe_result(
+        tokio::time::timeout(budget, two_bot_store::journal::snapshot(pool)).await,
+        failed,
+    )
+}
+
+/// Map the completed probe at one boundary so success, store failure and
+/// timeout all update the latch before returning the unchanged roll-up data.
+fn snapshot_probe_result(
+    result: Result<
+        Result<two_bot_store::journal::Snapshot, two_bot_store::journal::JournalError>,
+        tokio::time::error::Elapsed,
+    >,
+    failed: &AtomicBool,
+) -> Option<StoreSnapshot> {
+    match result {
         Ok(Ok(snapshot)) => {
             note_snapshot_outcome(failed, SnapshotOutcome::Ok);
             Some(StoreSnapshot {
@@ -562,6 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn summary_without_database_reports_readyz_and_unavailable_sections() {
+        let _diagnostics = OPS_SNAPSHOT_DIAGNOSTIC_LOCK.lock().await;
         let (status, json) = get(
             app(
                 GatewayState::Unconfigured,
@@ -652,6 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn backfill_without_database_is_unavailable() {
+        let _diagnostics = OPS_SNAPSHOT_DIAGNOSTIC_LOCK.lock().await;
         let (status, json) = get(
             app(
                 GatewayState::Connected,
@@ -830,6 +847,107 @@ mod tests {
         assert!(
             logs.contains("timed_out=true"),
             "timeout edge must carry timed_out, got: {logs:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_success_result_silently_rearms_store_failure() {
+        let _diagnostics = OPS_SNAPSHOT_DIAGNOSTIC_LOCK.lock().await;
+        let failed = AtomicBool::new(false);
+        let pool = closed_pool().await;
+        let capture = ops_snapshot_capture();
+        let start = capture.text().len();
+        assert!(store_snapshot(Some(&pool), &failed).await.is_none());
+        assert!(failed.load(Ordering::Relaxed));
+        let recovery_start = capture.text().len();
+
+        // Exercise the production probe-result mapping, not the latch helper:
+        // omitting the success arm's reset must leave the latch stuck true.
+        let recovered = snapshot_probe_result(
+            Ok(Ok(two_bot_store::journal::Snapshot {
+                point: 10,
+                cursors: BTreeMap::from([("events".to_owned(), 7)]),
+                tips: BTreeMap::from([("events".to_owned(), 10)]),
+            })),
+            &failed,
+        )
+        .expect("successful probe retains its snapshot");
+        assert_eq!(recovered.point, 10);
+        assert_eq!(
+            recovered.cursors,
+            BTreeMap::from([("events".to_owned(), 7)])
+        );
+        assert_eq!(recovered.tips, BTreeMap::from([("events".to_owned(), 10)]));
+        assert!(!failed.load(Ordering::Relaxed));
+        let recovery_logs = capture.text().split_off(recovery_start);
+        assert_eq!(
+            recovery_logs.matches("ops_snapshot_failed").count(),
+            0,
+            "recovery must be silent: {recovery_logs:?}"
+        );
+
+        assert!(store_snapshot(Some(&pool), &failed).await.is_none());
+        assert!(failed.load(Ordering::Relaxed));
+        let logs = capture.text().split_off(start);
+        assert_eq!(
+            logs.matches("ops_snapshot_failed").count(),
+            2,
+            "each outage must warn after a successful probe: {logs:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ops_handlers_share_snapshot_failure_latch() {
+        let _diagnostics = OPS_SNAPSHOT_DIAGNOSTIC_LOCK.lock().await;
+        let state = state_with(GatewayState::Connected, Some(closed_pool().await));
+        assert!(!state.ops_snapshot_failed.load(Ordering::Relaxed));
+        let app = crate::server::router_with_guard(
+            state.clone(),
+            crate::jobs::statuses(&[], true),
+            two_bot_discord::ratelimit_guard::process_guard(),
+        );
+        let capture = ops_snapshot_capture();
+        let start = capture.text().len();
+        for uri in [
+            "/ops/summary",
+            "/ops/backfill",
+            "/ops/summary",
+            "/ops/backfill",
+        ] {
+            let (status, json) = get(app.clone(), uri).await;
+            assert_eq!(status, StatusCode::OK);
+            let section = if uri == "/ops/summary" {
+                &json["event_store"]
+            } else {
+                &json
+            };
+            assert_eq!(section["available"], false);
+            assert!(state.ops_snapshot_failed.load(Ordering::Relaxed));
+            let logs = capture.text().split_off(start);
+            assert_eq!(
+                logs.matches("ops_snapshot_failed").count(),
+                1,
+                "both handlers must share one outage transition after {uri}: {logs:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_without_database_is_silent_and_preserves_latch() {
+        let _diagnostics = OPS_SNAPSHOT_DIAGNOSTIC_LOCK.lock().await;
+        let capture = ops_snapshot_capture();
+        let start = capture.text().len();
+        // Neither a spurious failure nor an implicit recovery is allowed.
+        for initial in [false, true] {
+            let failed = AtomicBool::new(initial);
+            assert!(store_snapshot(None, &failed).await.is_none());
+            assert_eq!(failed.load(Ordering::Relaxed), initial);
+        }
+        let logs = capture.text().split_off(start);
+        assert_eq!(
+            logs.matches("ops_snapshot_failed").count(),
+            0,
+            "an absent database must not warn: {logs:?}"
         );
     }
 
