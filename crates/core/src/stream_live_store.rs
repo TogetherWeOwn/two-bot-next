@@ -614,16 +614,31 @@ where
         Err(LiveSendError::ProvenNoSend) => {
             // The one releasable failure: Discord provably never got the
             // post, so freeing the started row lets the Twitch retry claim
-            // again. A failed release just leaves the row fenced (the
-            // retry then answers Duplicate) — safe either way, never a
-            // second send from here.
-            let _ = ledger.release_started(&claim.dedup_key, &token).await;
-            return settled(
-                GoLiveOutcome::Failed {
-                    reason: "send_failed",
-                },
-                Stage::SendFailed,
-            );
+            // again. If the release itself fails (error or noop) the row
+            // stays fenced, the retry answers Duplicate, and the
+            // announcement is lost without ever being posted: report that
+            // distinctly so it cannot be mistaken for a retryable
+            // `send_failed`. Either way nothing here sends twice — the
+            // release path never posts.
+            let released = ledger.release_started(&claim.dedup_key, &token).await;
+            let reason = match released {
+                Ok(true) => "send_failed",
+                Ok(false) | Err(_) => {
+                    // Fixed class, safe to alert on as-is: the message and
+                    // fields are literals, never delivery data (no
+                    // broadcaster, channel, invite, claim token or dedup
+                    // key) and never the database error text.
+                    tracing::warn!(
+                        target: "two_bot_core::stream_live",
+                        reason = "send_failed_unreleased",
+                        "send_failed_unreleased: started claim could not be released \
+                         after a provably-unsent send; the retry dedupes and the \
+                         announcement is lost"
+                    );
+                    "send_failed_unreleased"
+                }
+            };
+            return settled(GoLiveOutcome::Failed { reason }, Stage::SendFailed);
         }
         Err(LiveSendError::Ambiguous) => {
             // Same settle posture as a stamp failure: the post may have
