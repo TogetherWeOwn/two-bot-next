@@ -79,6 +79,7 @@ pub const ALERT_RULE_IDS: [&str; 22] = [
     "voice_join_slow_burn",
     "voice_creator_map_stale",
     "error_budget_fast_burn",
+    "error_budget_slow_burn",
     "eventsub_tampered",
     "event_store_consumer_lag",
 ];
@@ -972,6 +973,7 @@ mod tests {
                 "voice_join_slow_burn",
                 "voice_creator_map_stale",
                 "error_budget_fast_burn",
+                "error_budget_slow_burn",
                 "eventsub_tampered",
                 "event_store_consumer_lag",
             ]

@@ -923,6 +923,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "voice_join_slow_burn",
     "voice_creator_map_stale",
     "error_budget_fast_burn",
+    "error_budget_slow_burn",
     "eventsub_tampered",
     "event_store_consumer_lag",
   ]);
@@ -947,6 +948,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("voice_creator_map_stale", window), `evidence-voice_creator_map_stale-${window}.json`);
   assert.equal(packetFilename("event_store_consumer_lag", window), `evidence-event_store_consumer_lag-${window}.json`);
   assert.equal(packetFilename("error_budget_fast_burn", window), `evidence-error_budget_fast_burn-${window}.json`);
+  assert.equal(packetFilename("error_budget_slow_burn", window), `evidence-error_budget_slow_burn-${window}.json`);
   assert.equal(packetFilename("eventsub_tampered", window), `evidence-eventsub_tampered-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
@@ -1065,23 +1067,23 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   burn = evaluateMetrics(parseExposition(body(joinLines(1000, 10, 800))), burn.state, burnBase + 3600);
   firing.push(...burn.firing);
   // Forced REST error-budget burn: ~10k eligible events/hour with 2 budget
-  // errors/min over 16 min burns near 12x in both the 15 min and 2 min
-  // windows and pages exactly once (the per-sample 5xx share stays ~1%, so
-  // rest_5xx_rate stays silent).
+  // errors/min over 125 min burns near 12x in the 15 min / 2 min windows
+  // (fast page) and near 12x in the 2 h / 15 min windows (slow ticket); the
+  // per-sample 5xx share stays ~1%, so rest_5xx_rate stays silent.
   const restBudget = (total: number, errors5xx: number) => [
     `two_bot_rest_requests_total{route="other",result="2xx"} ${total - errors5xx}`,
     `two_bot_rest_requests_total{route="other",result="5xx"} ${errors5xx}`,
   ];
-  let budget = evaluateMetrics(parseExposition(body(restBudget(100_000, 1_000))), EMPTY_STATE, NOW - 1100);
+  let budget = evaluateMetrics(parseExposition(body(restBudget(100_000, 1_000))), EMPTY_STATE, NOW - 7600);
   let budgetTotal = 100_000;
   let budgetErrors = 1_000;
-  for (let minute = 1; minute <= 16; minute += 1) {
+  for (let minute = 1; minute <= 125; minute += 1) {
     budgetTotal += 167;
     budgetErrors += 2;
     budget = evaluateMetrics(
       parseExposition(body(restBudget(budgetTotal, budgetErrors))),
       budget.state,
-      NOW - 1100 + minute * 60,
+      NOW - 7600 + minute * 60,
     );
   }
   firing.push(...budget.firing);
@@ -1137,4 +1139,94 @@ test("/ops/metrics: 404 without a configured token, 401 without/with a wrong bea
   assert.equal(calls.length, 1);
   const post = await worker.fetch(new Request("https://w.invalid/ops/metrics", { method: "POST", headers: { authorization: `Bearer ${token}` } }), env(token), ctx);
   assert.equal(post.status, 404);
+});
+
+test("slow-burn ticket survives a counter reset instead of resolving", () => {
+  // Firing ~6x slow burn (167 eligible/min, 1 budget error/min), then a
+  // container restart sends the cumulative counters backwards while the
+  // leak continues: the ticket must hold, never post RESOLVED, and must
+  // not need a fresh 2 h ring to stay filed.
+  const restBudget = (total: number, errors5xx: number) => [
+    `two_bot_rest_requests_total{route="other",result="2xx"} ${total - errors5xx}`,
+    `two_bot_rest_requests_total{route="other",result="5xx"} ${errors5xx}`,
+  ];
+  const base = NOW - 200 * 60;
+  let state = evaluateMetrics(parseExposition(body(restBudget(100_000, 1_000))), EMPTY_STATE, base).state;
+  let total = 100_000;
+  let errors = 1_000;
+  for (let minute = 1; minute <= 125; minute += 1) {
+    total += 167;
+    errors += 1;
+    state = evaluateMetrics(parseExposition(body(restBudget(total, errors))), state, base + minute * 60).state;
+  }
+  const firingAt = base + 125 * 60;
+  assert.ok(
+    evaluateMetrics(parseExposition(body(restBudget(total, errors))), state, firingAt + 60).firing.includes(
+      "error_budget_slow_burn",
+    ),
+    "125 min of ~6x burn must ticket before the restart",
+  );
+  const reset = evaluateMetrics(parseExposition(body(restBudget(2_000, 20))), state, firingAt + 60);
+  assert.ok(
+    reset.firing.includes("error_budget_slow_burn"),
+    "counter reset must hold the firing slow ticket, not resolve it",
+  );
+  // The leak continues after the restart: the held ticket stays filed while
+  // the ring rebuilds, instead of re-ticketing as a new incident 2 h later.
+  let rebuilt = reset;
+  let rebuiltTotal = 2_000;
+  let rebuiltErrors = 20;
+  for (let minute = 1; minute <= 20; minute += 1) {
+    rebuiltTotal += 167;
+    rebuiltErrors += 1;
+    rebuilt = evaluateMetrics(
+      parseExposition(body(restBudget(rebuiltTotal, rebuiltErrors))),
+      rebuilt.state,
+      firingAt + 60 + minute * 60,
+    );
+    assert.ok(
+      rebuilt.firing.includes("error_budget_slow_burn"),
+      `ticket must stay filed while the ring rebuilds (minute ${minute} after restart)`,
+    );
+  }
+});
+
+test("slow-burn ticket resolves on a covered quiet short window while the long window is unknown", () => {
+  // Firing slow burn, then a ~2 h scrape stall with quiet counters ages the
+  // 2 h baseline out of tolerance while later quiet scrapes cover the
+  // 15 min window: the covered quiet short window must resolve the ticket
+  // instead of holding it on history alone.
+  const restBudget = (total: number, errors5xx: number) => [
+    `two_bot_rest_requests_total{route="other",result="2xx"} ${total - errors5xx}`,
+    `two_bot_rest_requests_total{route="other",result="5xx"} ${errors5xx}`,
+  ];
+  const base = NOW - 200 * 60;
+  let state = evaluateMetrics(parseExposition(body(restBudget(100_000, 1_000))), EMPTY_STATE, base).state;
+  let total = 100_000;
+  let errors = 1_000;
+  for (let minute = 1; minute <= 125; minute += 1) {
+    total += 167;
+    errors += 1;
+    state = evaluateMetrics(parseExposition(body(restBudget(total, errors))), state, base + minute * 60).state;
+  }
+  const firingAt = base + 125 * 60;
+  total += 100;
+  const stalledAt = firingAt + 7500;
+  let current = evaluateMetrics(parseExposition(body(restBudget(total, errors))), state, stalledAt);
+  assert.ok(
+    current.firing.includes("error_budget_slow_burn"),
+    "ticket must hold across the stall while the short window is uncovered",
+  );
+  for (let minute = 1; minute <= 16; minute += 1) {
+    total += 167;
+    current = evaluateMetrics(
+      parseExposition(body(restBudget(total, errors))),
+      current.state,
+      stalledAt + minute * 60,
+    );
+  }
+  assert.ok(
+    !current.firing.includes("error_budget_slow_burn"),
+    "covered quiet 15 min window must resolve the ticket even with the 2 h window unknown",
+  );
 });

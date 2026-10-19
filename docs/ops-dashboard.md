@@ -34,9 +34,19 @@ Connect form; the page sends the headers on its `GET /ops/summary` fetches.
 Install the pair as Worker secrets (never `wrangler.toml` vars):
 
 ```sh
-wrangler secret put --env staging OPS_DASHBOARD_CLIENT_ID
-wrangler secret put --env staging OPS_DASHBOARD_CLIENT_SECRET  # >= 32 chars
+wrangler versions secret put --env staging OPS_DASHBOARD_CLIENT_ID --message <sha>
+wrangler versions secret put --env staging OPS_DASHBOARD_CLIENT_SECRET --message <sha>  # >= 32 chars
+wrangler versions deploy --env staging
 ```
+
+Stamp with the live `/readyz` `build_revision` of that environment: a plain
+`wrangler secret put` publishes an unstamped version that can never form a rollback
+receipt (see `docs/production-deploy.md`). Precheck first: `versions secret put`
+builds on the newest-created version, not necessarily the serving one — confirm the
+last block of `wrangler versions list --env <name>` (the list prints oldest first,
+so the last block is the newest version) is the serving version (same id
+as `wrangler deployments status --env <name>`), and if they differ redeploy the intended
+SHA through the workflow first (full rule in `docs/production-deploy.md`).
 
 Same for `--env production`. Closing the summary requires removing both the
 dashboard pair and `METRICS_SCRAPE_TOKEN`: removing only the dashboard pair
@@ -74,11 +84,14 @@ reachable (it holds no data).
 
 ## Rollback
 
-1. Delete the Worker secrets (`wrangler secret delete --env <name>
-   OPS_DASHBOARD_CLIENT_ID OPS_DASHBOARD_CLIENT_SECRET` **and**
-   `METRICS_SCRAPE_TOKEN`) → the summary 404s (the static page stays
-   reachable). Deleting only the dashboard pair leaves scrape-bearer access
-   open.
+1. Delete the Worker secrets one key at a time, each stamped with the serving
+   SHA (same precheck and stamp as above):
+   `wrangler versions secret delete --env <name> OPS_DASHBOARD_CLIENT_ID --message <sha>`,
+   then `OPS_DASHBOARD_CLIENT_SECRET`, then `METRICS_SCRAPE_TOKEN`,
+   then `wrangler versions deploy --env <name>` → the summary 404s (the static
+   page stays reachable). A plain `wrangler secret delete` publishes an unstamped
+   version that can never form a rollback receipt. Deleting only the dashboard pair
+   leaves scrape-bearer access open.
 2. If the routes themselves must go, revert `wrangler/src/ops-dashboard.ts`
    and its wiring in `wrangler/src/index.ts`, then redeploy.
 3. `workers.dev` flips back by reverting the three `workers_dev` lines in

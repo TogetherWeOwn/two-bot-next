@@ -46,6 +46,15 @@ export function releaseTag(release: string | null): string {
   return release ?? UNKNOWN_RELEASE;
 }
 
+/**
+ * Render an edge-supplied release for a span log line. Only a hex SHA
+ * reaches the line; anything else (absent var, probe miss, hostile value)
+ * becomes the visible `"unknown"` bucket instead of echoed text.
+ */
+export function normalizeRelease(value: unknown): string {
+  return typeof value === "string" && RELEASE_TOKEN.test(value) ? value : UNKNOWN_RELEASE;
+}
+
 /** Render the platform Worker version for a log line; untrusted stays visible. */
 export function workerVersionTag(id: unknown): string {
   return typeof id === "string" && WORKER_VERSION_TOKEN.test(id) ? id : UNKNOWN_RELEASE;
