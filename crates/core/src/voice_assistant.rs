@@ -43,10 +43,23 @@ pub const MAX_ENDPOINT_CHARS: usize = 2048;
 
 /// Configured assistant endpoint and model. `None` (from [`AssistantConfig::from_map`]) means
 /// disabled: no command is published and no endpoint call may happen.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is redacted on purpose: the endpoint URL may carry userinfo
+/// credentials and the model string is a supplied value, so formatting must
+/// never render either (log/debug output is how configs get printed).
+#[derive(Clone, PartialEq, Eq)]
 pub struct AssistantConfig {
     endpoint: String,
     model: String,
+}
+
+impl std::fmt::Debug for AssistantConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssistantConfig")
+            .field("endpoint", &"[REDACTED]")
+            .field("model", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl AssistantConfig {

@@ -739,3 +739,45 @@ async fn short_messages_do_not_trigger_burst_halving(
     fixture.close().await.expect("drop test database");
     Ok(())
 }
+
+#[tokio::test]
+async fn short_attempt_completes_on_single_connection_pool(
+) -> Result<(), two_bot_core::LevelingStoreError> {
+    let fixture = database().await;
+    let pool = fixture.pool().clone();
+    let channel = "200000000000000099";
+    // Seed an existing member row so the short path runs with the advisory
+    // and row locks held in one open transaction.
+    let first =
+        store::award_message(&pool, GUILD, A, &at(0), Some(channel), Some(40), false).await?;
+    assert_eq!(first.awarded, 15);
+    // One connection proves no hold-and-wait: the old shape held `tx` open
+    // while `record_short_attempt` called `pool.begin()` for a second
+    // connection, so this short award could never complete here.
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect_with(fixture.pool().connect_options().as_ref().clone())
+        .await
+        .expect("single-connection fixture pool");
+    let short =
+        store::award_message(&single, GUILD, A, &at(61), Some(channel), Some(2), false).await?;
+    assert_eq!(short.awarded, 0, "short must earn zero");
+    assert_eq!(
+        store::profile(&single, GUILD, A).await?.message_xp,
+        15,
+        "short must grant no XP"
+    );
+    let decision: Option<String> = sqlx::query_scalar(
+        "SELECT decision FROM xp_awards
+          WHERE guild_id = $1 AND member_id = $2 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(GUILD)
+    .bind(A)
+    .fetch_one(&single)
+    .await?;
+    assert_eq!(decision.as_deref(), Some("short_message"));
+    single.close().await;
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}

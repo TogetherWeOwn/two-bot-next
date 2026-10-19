@@ -1,7 +1,6 @@
 //! The real binary, run with a cleared environment: help after an operator
 //! subcommand prints usage and touches nothing; stray arguments refuse.
 
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,11 +61,11 @@ impl Drop for Scratch {
 fn two_bot(dir: &Scratch, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_two-bot"));
     command.args(args).env_clear().current_dir(&dir.0);
-    // Under cargo-llvm-cov the child binary is coverage-instrumented. With a
-    // cleared env it loses LLVM_PROFILE_FILE and dumps `default.profraw`
-    // into the scratch cwd, tripping `is_empty`. Forward the parent's path
-    // (already uniquified with %p/%m) so child coverage merges into the
-    // report instead of polluting the assertion directory.
+    // Under cargo-llvm-cov the child is instrumented and writes its profile
+    // to LLVM_PROFILE_FILE. `env_clear` would drop that redirect, so the
+    // child drops `default.profraw` into the scratch dir and `is_empty`
+    // flakes. Forward the harness redirect (it carries `%p`/`%m`, so each
+    // child still gets its own profile); the cleared app env stays cleared.
     if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
         command.env("LLVM_PROFILE_FILE", profile);
     }
@@ -103,25 +102,28 @@ fn help_after_each_subcommand_prints_usage_and_exits_zero() {
 fn backup_help_never_reaches_a_configured_database() {
     // An operator shell with backup.env loaded: help must still decide
     // before env, so nothing connects and no backup directory appears.
+    // The URL names a port that can never accept a database (port 1 is
+    // privileged and never a test listener), so the proof is the child's
+    // deterministic output, not a timing-sensitive accept on a live
+    // listener: a future change that dials first fails here with exit 1
+    // and a redacted connection error on stderr instead of usage.
+    // Same closed-port probe as
+    // `crates/cutover/tests/admission_configuration.rs`.
     let dir = Scratch::new();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let port = listener.local_addr().unwrap().port();
     let args = ["backup", "--help"];
     let output = two_bot(&dir, &args)
         .env(
             "TWO_DATABASE_URL",
-            format!("postgres://fixture-user:fixture-password@127.0.0.1:{port}/db"),
+            "postgres://fixture-user:fixture-password@127.0.0.1:1/db",
         )
         .env("TWO_BACKUP_DIR", dir.0.join("backups"))
         .output()
         .unwrap();
     assert_usage(&output, &args);
     assert!(dir.is_empty(), "backup --help created a backup directory");
-    let accepted = listener.accept();
     assert!(
-        matches!(&accepted, Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
-        "backup --help opened a database connection"
+        !dir.0.join("backups").exists(),
+        "backup --help created its configured backup directory"
     );
 }
 

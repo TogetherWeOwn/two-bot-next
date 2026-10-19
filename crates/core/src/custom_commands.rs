@@ -30,6 +30,12 @@ pub const MAX_COMMAND_NAME_CHARS: usize = 32;
 /// Text-trigger bound, characters including the leading `!` (legacy
 /// `TRIGGER_PATTERN` `^![a-z0-9_-]{1,32}$`: one `!` plus a command name).
 pub const MAX_TEXT_TRIGGER_CHARS: usize = MAX_COMMAND_NAME_CHARS + 1;
+/// Placeholder-extraction bound: `placeholders_in` returns at most this many
+/// distinct keys in first-seen order, then stops scanning. Only four keys are
+/// ever known, so any five distinct keys already contain an unknown one —
+/// capping at 64 preserves `validate_template`'s unknown-placeholder refusal
+/// exactly while keeping hostile inputs total-bounded in time and memory.
+pub const MAX_PLACEHOLDERS: usize = 64;
 
 /// Said to anybody who reaches a custom command while automations are off
 /// (legacy `AUTOMATIONS_DISABLED_REPLY`; one constant shared with the router).
@@ -83,13 +89,17 @@ fn placeholder_end(bytes: &[u8], i: usize) -> Option<usize> {
 }
 
 /// Every placeholder the template references, deduplicated in first-seen
-/// order (legacy `placeholdersIn`).
+/// order (legacy `placeholdersIn`), capped at [`MAX_PLACEHOLDERS`] distinct
+/// keys so hostile inputs stay total-bounded.
 #[must_use]
 pub fn placeholders_in(template: &str) -> Vec<String> {
     let bytes = template.as_bytes();
     let mut found = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
+        if found.len() >= MAX_PLACEHOLDERS {
+            break;
+        }
         if bytes[i] == b'{' {
             if let Some(end) = placeholder_end(bytes, i) {
                 let key = template[i + 1..end - 1].to_owned();
@@ -125,22 +135,31 @@ pub fn validate_template(template: &str) -> Result<(), TemplateError> {
 /// Render a validated template against `ctx` (legacy `renderTemplate`).
 /// Unknown-but-pattern-matching keys render literally (unreachable after
 /// validation, kept so render never invents text); output past Discord's
-/// ceiling is refused.
+/// ceiling is refused. The render refuses once buffered bytes breach a byte
+/// tripwire (`3 *` the ceiling: byte length upper-bounds UTF-16 length, so
+/// past the tripwire the output is certainly over-ceiling), materialising at
+/// most one expansion past it. Outputs within the tripwire render exactly as
+/// before, keeping exact lengths; tripwire refusals report buffered bytes,
+/// always past the ceiling.
 pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, TemplateError> {
     let bytes = template.as_bytes();
-    let mut out = String::with_capacity(template.len());
+    let mut out = String::new();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
             if let Some(end) = placeholder_end(bytes, i) {
                 let key = &template[i + 1..end - 1];
-                match key {
-                    "user" => out.push_str(&ctx.user),
-                    "username" => out.push_str(&ctx.username),
-                    "server" => out.push_str(&ctx.server),
-                    "channel" => out.push_str(&ctx.channel),
-                    _ => out.push_str(&template[i..end]),
+                let text = match key {
+                    "user" => ctx.user.as_str(),
+                    "username" => ctx.username.as_str(),
+                    "server" => ctx.server.as_str(),
+                    "channel" => ctx.channel.as_str(),
+                    _ => &template[i..end],
+                };
+                if out.len() > MAX_RENDERED_CHARS * 3 {
+                    return Err(TemplateError::RenderTooLong(out.len()));
                 }
+                out.push_str(text);
                 i = end;
                 continue;
             }
@@ -684,6 +703,59 @@ mod tests {
         assert_eq!(
             placeholders_in("{user} and {user} and {server}"),
             ["user".to_owned(), "server".to_owned()]
+        );
+    }
+
+    #[test]
+    fn template_placeholders_in_is_total_bounded_on_hostile_input() {
+        // 200 distinct lowercase keys: unbounded extraction would return all
+        // 200; the hold caps distinct placeholders so fuzz-sized inputs stay
+        // bounded in time and memory.
+        fn alpha_key(mut n: usize) -> String {
+            let mut key = Vec::new();
+            loop {
+                key.push((b'a' + (n % 26) as u8) as char);
+                n /= 26;
+                if n == 0 {
+                    break;
+                }
+                n -= 1;
+            }
+            key.into_iter().rev().collect()
+        }
+        let hostile: String = (0..200).map(|i| format!("{{{}}}", alpha_key(i))).collect();
+        let found = placeholders_in(&hostile);
+        assert!(
+            found.len() <= 64,
+            "placeholders_in must stay total-bounded, got {}",
+            found.len()
+        );
+        // First-seen order preserved for the capped prefix.
+        assert_eq!(found[0], alpha_key(0));
+        assert_eq!(found[1], alpha_key(1));
+    }
+
+    #[test]
+    fn template_render_hostile_expansion_refused_without_panic() {
+        // Degenerate expansion: many placeholders over a large context must
+        // fail as a bounded RenderTooLong, never panic, hang, or blow up to
+        // the full expansion. The byte tripwire refuses once buffered bytes
+        // breach it (here the second push sees 10_000 buffered bytes),
+        // reporting bytes always past the ceiling.
+        let ctx = TemplateContext {
+            user: "y".repeat(10_000),
+            username: String::new(),
+            server: String::new(),
+            channel: String::new(),
+        };
+        let template = "{user}".repeat(500);
+        let result = render_template(&template, &ctx);
+        assert!(
+            matches!(
+                result,
+                Err(TemplateError::RenderTooLong(len)) if len > MAX_RENDERED_CHARS
+            ),
+            "expected bounded RenderTooLong, got {result:?}"
         );
     }
 

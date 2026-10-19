@@ -506,19 +506,24 @@ impl ModerationGates {
         if enabled && !is_snowflake(&owen_user_id) {
             return Err(ModerationGateError::InvalidOwenUserId);
         }
+        // Fail-closed list parsing: every comma-separated segment must be a
+        // snowflake verbatim. No trimming, no empty-segment filtering — an
+        // empty segment (`,,`, leading/trailing comma) or any whitespace
+        // padding is refused. A missing key (or an explicitly empty value)
+        // means no protected roles.
         let mut protected_role_ids = HashSet::new();
-        for role in vars
+        if let Some(raw) = vars
             .get("TWO_MODERATION_PROTECTED_ROLE_IDS")
             .map(String::as_str)
-            .unwrap_or("")
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
         {
-            if !is_snowflake(role) {
-                return Err(ModerationGateError::InvalidProtectedRoleId);
+            if !raw.is_empty() {
+                for role in raw.split(',') {
+                    if !is_snowflake(role) {
+                        return Err(ModerationGateError::InvalidProtectedRoleId);
+                    }
+                    protected_role_ids.insert(role.to_owned());
+                }
             }
-            protected_role_ids.insert(role.to_owned());
         }
         Ok(Self {
             enabled,
@@ -852,7 +857,7 @@ mod tests {
             ("TWO_OWEN_USER_ID", OWEN_ID),
             (
                 "TWO_MODERATION_PROTECTED_ROLE_IDS",
-                "444444444444444444, 555555555555555555",
+                "444444444444444444,555555555555555555",
             ),
         ]
         .iter()
