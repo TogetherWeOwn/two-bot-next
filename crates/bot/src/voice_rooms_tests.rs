@@ -29,6 +29,8 @@ mod name_rerender;
 mod private;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
+#[path = "voice_snapshot_fence_acceptance_tests.rs"]
+mod snapshot_fence_acceptance;
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
 
