@@ -128,6 +128,22 @@ fn backup_help_never_reaches_a_configured_database() {
 }
 
 #[test]
+fn scratch_is_empty_ignores_stray_profraw_profiles() {
+    let dir = Scratch::new();
+    assert!(dir.is_empty());
+    std::fs::write(dir.0.join("default.profraw"), b"profile").unwrap();
+    assert!(
+        dir.is_empty(),
+        "stray coverage profile should not count as product output"
+    );
+    std::fs::write(dir.0.join("output.txt"), b"product").unwrap();
+    assert!(
+        !dir.is_empty(),
+        "non-profile output should still count as touching the directory"
+    );
+}
+
+#[test]
 fn extra_argument_to_backup_or_snapshot_exits_two_with_usage() {
     for subcommand in ["backup", "guild-config-snapshot"] {
         let dir = Scratch::new();
