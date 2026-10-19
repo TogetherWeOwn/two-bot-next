@@ -922,6 +922,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "voice_join_fast_burn",
     "voice_join_slow_burn",
     "voice_creator_map_stale",
+    "eventsub_post_failed_share",
     "error_budget_fast_burn",
     "error_budget_slow_burn",
     "audit_delivery_halt",
@@ -946,6 +947,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("voice_join_fast_burn", window), `evidence-voice_join_fast_burn-${window}.json`);
   assert.equal(packetFilename("voice_join_slow_burn", window), `evidence-voice_join_slow_burn-${window}.json`);
   assert.equal(packetFilename("voice_creator_map_stale", window), `evidence-voice_creator_map_stale-${window}.json`);
+  assert.equal(packetFilename("eventsub_post_failed_share", window), `evidence-eventsub_post_failed_share-${window}.json`);
   assert.equal(packetFilename("error_budget_fast_burn", window), `evidence-error_budget_fast_burn-${window}.json`);
   assert.equal(packetFilename("error_budget_slow_burn", window), `evidence-error_budget_slow_burn-${window}.json`);
   assert.equal(packetFilename("audit_delivery_halt", window), `evidence-audit_delivery_halt-${window}.json`);
@@ -954,6 +956,35 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
   assert.equal(packetFilename("rest_429_rate", "2026-10-09T20:11:06Z"), "evidence-rest_429_rate-2026-10-09T20-11-06Z.json");
+});
+
+test("eventsub post failures accumulate across low-volume samples until the floor", () => {
+  const posts = (attempted: number, succeeded: number, failed: number, other: number) => [
+    `two_bot_eventsub_posts_total{outcome="attempted"} ${attempted}`,
+    `two_bot_eventsub_posts_total{outcome="succeeded"} ${succeeded}`,
+    `two_bot_eventsub_posts_total{outcome="failed"} ${failed}`,
+    `two_bot_eventsub_posts_total{outcome="other"} ${other}`,
+  ];
+  // One failed post per sample: every window is sub-floor, so nothing fires
+  // while attempts accumulate toward the 10-attempt floor.
+  let state = ev(posts(10, 9, 1, 0)).state;
+  for (let n = 11; n <= 18; n++) {
+    const next = ev(posts(n, 9, n - 9, 0), state);
+    assert.deepEqual(next.firing, [], `one failure per sample stays quiet with ${n - 10} accumulated`);
+    state = next.state;
+  }
+  // The tenth accumulated attempt reaches the floor at a 100% share: fires.
+  const fired = ev(posts(20, 9, 11, 0), state);
+  assert.deepEqual(fired.firing, ["eventsub_post_failed_share"]);
+  // The judged window rebaselines but the ticket holds: the next sub-floor
+  // window accumulates toward the next floor instead of resolving.
+  const held = ev(posts(21, 9, 12, 0), fired.state);
+  assert.deepEqual(held.firing, ["eventsub_post_failed_share"]);
+  assert.deepEqual(transitionMessages(fired.firing, held.firing), [], "holding is not a new ALERT");
+  // A healthy accumulation (floor met, share at the line) rebaselines quietly.
+  let healthy = ev(posts(0, 0, 0, 0)).state;
+  for (let n = 1; n <= 9; n++) healthy = ev(posts(n, n, 0, 0), healthy).state;
+  assert.deepEqual(ev(posts(10, 10, 0, 0), healthy).firing, []);
 });
 
 test("every rule links to an existing runbook heading", () => {
@@ -1091,6 +1122,22 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   let halted = EMPTY_STATE;
   for (let i = 0; i < 3; i++) halted = ev(["two_bot_audit_delivery_halt 1"], halted).state;
   firing.push(...halted.firing);
+  firing.push(
+    ...ev(
+      [
+        `two_bot_eventsub_posts_total{outcome="attempted"} 120`,
+        `two_bot_eventsub_posts_total{outcome="succeeded"} 90`,
+        `two_bot_eventsub_posts_total{outcome="failed"} 25`,
+        `two_bot_eventsub_posts_total{outcome="other"} 5`,
+      ],
+      ev([
+        `two_bot_eventsub_posts_total{outcome="attempted"} 100`,
+        `two_bot_eventsub_posts_total{outcome="succeeded"} 90`,
+        `two_bot_eventsub_posts_total{outcome="failed"} 5`,
+        `two_bot_eventsub_posts_total{outcome="other"} 5`,
+      ]).state,
+    ).firing,
+  );
   let tampered = ev([`two_bot_eventsub_classified_total{kind="tampered"} 0`]);
   for (const n of [1, 2, 3]) {
     tampered = ev([`two_bot_eventsub_classified_total{kind="tampered"} ${n}`], tampered.state);
