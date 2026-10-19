@@ -6615,11 +6615,13 @@ async fn schedule_list_store_failure_audits_one_rejected_row() {
 
 /// Fail exactly the `scheduled_messages` SELECTs whose text matches
 /// `pattern` (`%OFFSET%` selects only the hidden-window read, `%count(*)%`
-/// only the overflow count; the capped first read matches neither). An RLS
-/// policy whose `USING` raises on a `current_query()` match fails that one
-/// statement while the pool stays live, so an audit write can still land.
-/// `FORCE` is required because the test role owns the table. Install only
-/// after seeding: with RLS on and no INSERT policy, seeds would be denied.
+/// only the overflow count; the capped first read matches neither). The
+/// table is renamed under a same-named view whose `WHERE` raises on a
+/// `current_query()` match, failing that one statement while the pool
+/// stays live, so an audit write can still land. An RLS policy cannot do
+/// this here: the test role is the database superuser, and superusers
+/// bypass row security even under `FORCE`. Install only after seeding;
+/// nothing writes `scheduled_messages` in these tests afterwards.
 async fn fail_scheduled_selects_matching(db: &TestDb, pattern: &str) {
     sqlx::query(
         "CREATE OR REPLACE FUNCTION fail_query_matching(pat text) RETURNS boolean AS $$
@@ -6629,30 +6631,27 @@ async fn fail_scheduled_selects_matching(db: &TestDb, pattern: &str) {
            END IF;
            RETURN TRUE;
          END;
-         $$ LANGUAGE plpgsql",
+         $$ LANGUAGE plpgsql VOLATILE",
     )
     .execute(&db.pool)
     .await
     .expect("install select fault function");
-    sqlx::query("ALTER TABLE scheduled_messages ENABLE ROW LEVEL SECURITY")
-        .execute(&db.pool)
-        .await
-        .expect("enable scheduled_messages RLS");
-    sqlx::query("ALTER TABLE scheduled_messages FORCE ROW LEVEL SECURITY")
-        .execute(&db.pool)
-        .await
-        .expect("force scheduled_messages RLS");
     assert!(
         !pattern.contains('\''),
         "fault pattern is a test-owned literal"
     );
+    sqlx::query("ALTER TABLE scheduled_messages RENAME TO scheduled_messages_fault_base")
+        .execute(&db.pool)
+        .await
+        .expect("rename scheduled_messages under the fault view");
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE POLICY fail_scheduled_select ON scheduled_messages
-           FOR SELECT USING (fail_query_matching('{pattern}'))"
+        "CREATE VIEW scheduled_messages AS
+           SELECT * FROM scheduled_messages_fault_base
+            WHERE fail_query_matching('{pattern}')"
     )))
     .execute(&db.pool)
     .await
-    .expect("install select fault policy");
+    .expect("install select fault view");
 }
 
 /// The 27-row over-cap guild shared by the deep-pagination tests; direct
@@ -6754,10 +6753,10 @@ async fn schedule_list_unknown_overflow_store_failure_audits_one_rejected_row() 
     db.close().await;
 }
 
-/// Control: with the fault policy installed but matching no statement, the
+/// Control: with the fault view installed but matching no statement, the
 /// page-1 over-cap render and the successful deep page are byte-identical
 /// to the unfaulted listings and neither writes an audit row. This proves
-/// the RLS harness itself, not just the failures it induces, is inert.
+/// the fault harness itself, not just the failures it induces, is inert.
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn schedule_list_deep_pages_succeed_without_audit_when_no_query_fails() {
