@@ -74,8 +74,9 @@ only, never staging/production), and restart counts. See the query pack.
 - Rust stdout/stderr: the affected container's logs in the Cloudflare
   dashboard (`listening`, `gateway shard loop started`, `periodic job
   failed`, fatal `error_class` lines). For DB errors with `op="other"`,
-  correlate with `voice actor load failed; actor respawns on the next guild
-  snapshot`: the warn is throttled process-wide to once per 300 s, while
+  correlate with `voice actor load failed; retrying with capped backoff`
+  (or `voice actor load failed; credential refused, not retrying`): the
+  warn is throttled process-wide to once per 300 s, while
   every load failure increments `two_bot_db_errors_total`. Worker tail is
   not Rust stdout.
 - Watch checkpoints: +15 min, +1 h, +6 h, +24 h, +48 h from `T_0`,

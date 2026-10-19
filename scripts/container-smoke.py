@@ -48,6 +48,7 @@ IMAGE_MAX_BYTES = 112 * MIB
 # 117470241279 after ~450 lines of ledger/receiver code. The landed slices
 # since the 16 MiB bump consumed its headroom, so 17 MiB restores a working
 # tripwire with ~1 MiB of headroom; revisit if the binary approaches it.
+# The voice actor-init retry measured 16,782,904 bytes (+6,808, no new dependencies).
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.

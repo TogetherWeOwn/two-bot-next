@@ -717,7 +717,9 @@ DB-error coverage: `two_bot_db_errors_total` counts send-admission SQL
 failures (`op="admission"`) and voice actor load failures (`op="other"`);
 other stores adopt `Metrics::db_error` incrementally, so this is not a
 database-wide total. Correlate voice load failures with `voice actor load
-failed; actor respawns on the next guild snapshot` in container stdout.
+failed; retrying with capped backoff` in container stdout (transient
+failures retry inside the actor task; a credential refusal logs `voice
+actor load failed; credential refused, not retrying` instead).
 Every load failure increments the counter, but that warn is throttled
 process-wide to once per 300 s. A slow trickle below the burst threshold
 stays silent in `db_errors`; job-failure rules cover failed jobs, not every
