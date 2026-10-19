@@ -68,6 +68,14 @@ fn completion_warns_since(mark: usize) -> Vec<String> {
         .collect()
 }
 
+/// Serialise the log-capturing tests: they share one process-wide sink, so a
+/// success test asserting zero warns would otherwise race with the failing
+/// tests' warns for the same site.
+fn log_serial() -> &'static tokio::sync::Mutex<()> {
+    static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Admission double whose `complete` always fails with storage-unavailable,
 /// like a database fault under the receipt path. A failed completion holds
 /// the lane by design: `held` stays set.
@@ -127,17 +135,73 @@ impl SendAdmission for FailingLane {
     }
 }
 
+/// Admission double whose `complete` always succeeds, releasing the lane.
+/// Pins the success direction: a warn-on-success regression must fail.
+#[derive(Debug)]
+struct SucceedingRelease {
+    completes: Arc<AtomicU32>,
+    cooldowns: Arc<Mutex<Vec<Option<SendCooldown>>>>,
+    held: Arc<Mutex<bool>>,
+}
+
+impl SendCompletion for SucceedingRelease {
+    fn complete(
+        self: Box<Self>,
+        cooldown: Option<SendCooldown>,
+    ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+        self.completes.fetch_add(1, Ordering::SeqCst);
+        self.cooldowns.lock().unwrap().push(cooldown);
+        *self.held.lock().unwrap() = false;
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[derive(Debug)]
+struct SucceedingLane {
+    key: TokenKey,
+    held: Arc<Mutex<bool>>,
+    completes: Arc<AtomicU32>,
+    cooldowns: Arc<Mutex<Vec<Option<SendCooldown>>>>,
+}
+
+impl SucceedingLane {
+    fn new(token: &str) -> Self {
+        Self {
+            key: TokenKey::for_bot_token(token).unwrap(),
+            held: Arc::new(Mutex::new(false)),
+            completes: Arc::new(AtomicU32::new(0)),
+            cooldowns: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl SendAdmission for SucceedingLane {
+    fn token_key(&self) -> &TokenKey {
+        &self.key
+    }
+
+    fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        *self.held.lock().unwrap() = true;
+        let completes = Arc::clone(&self.completes);
+        let cooldowns = Arc::clone(&self.cooldowns);
+        let held = Arc::clone(&self.held);
+        Box::pin(async move {
+            Ok(AdmissionPermit::new(Box::new(SucceedingRelease {
+                completes,
+                cooldowns,
+                held,
+            })))
+        })
+    }
+}
+
 fn get_roles_request() -> Request {
     Request::from_route(&Route::GetGuildRoles { guild_id: 2222 })
 }
 
-fn governed_transport(origin: String, lane: Arc<FailingLane>) -> HyperTransport {
-    HyperTransport::with_admission(
-        "fixture-token".to_owned(),
-        Some(origin),
-        lane as Arc<dyn SendAdmission>,
-    )
-    .expect("governed transport builds against loopback")
+fn governed_transport(origin: String, lane: Arc<dyn SendAdmission>) -> HyperTransport {
+    HyperTransport::with_admission("fixture-token".to_owned(), Some(origin), lane)
+        .expect("governed transport builds against loopback")
 }
 
 /// A GET whose headers never arrive releases its permit in the header-timeout
@@ -145,6 +209,7 @@ fn governed_transport(origin: String, lane: Arc<FailingLane>) -> HyperTransport 
 /// the lane stays held and the caller still sees the header bound.
 #[tokio::test]
 async fn failed_header_timeout_release_warns_with_its_site() {
+    let _serial = log_serial().lock().await;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mark = log_mark();
     let mock = MockRest::start(
@@ -153,7 +218,7 @@ async fn failed_header_timeout_release_warns_with_its_site() {
     )
     .await;
     let lane = Arc::new(FailingLane::new("fixture-token"));
-    let transport = governed_transport(mock.origin(), Arc::clone(&lane));
+    let transport = governed_transport(mock.origin(), Arc::clone(&lane) as Arc<dyn SendAdmission>);
     let result = transport
         .send_request(
             &get_roles_request(),
@@ -192,6 +257,7 @@ async fn failed_header_timeout_release_warns_with_its_site() {
 /// site while the lane stays held and the caller still sees the body bound.
 #[tokio::test]
 async fn failed_body_timeout_release_warns_with_its_site() {
+    let _serial = log_serial().lock().await;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mark = log_mark();
     let mock = MockRest::start(
@@ -200,7 +266,7 @@ async fn failed_body_timeout_release_warns_with_its_site() {
     )
     .await;
     let lane = Arc::new(FailingLane::new("fixture-token"));
-    let transport = governed_transport(mock.origin(), Arc::clone(&lane));
+    let transport = governed_transport(mock.origin(), Arc::clone(&lane) as Arc<dyn SendAdmission>);
     let started = tokio::time::Instant::now();
     let result = transport
         .send_request(
@@ -242,6 +308,7 @@ async fn failed_body_timeout_release_warns_with_its_site() {
 /// errors instead of timing out.
 #[tokio::test]
 async fn failed_body_error_release_warns_with_its_site() {
+    let _serial = log_serial().lock().await;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mark = log_mark();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -271,7 +338,7 @@ async fn failed_body_error_release_warns_with_its_site() {
         // Drop the socket with a byte missing: the body read errors.
     });
     let lane = Arc::new(FailingLane::new("fixture-token"));
-    let transport = governed_transport(origin, Arc::clone(&lane));
+    let transport = governed_transport(origin, Arc::clone(&lane) as Arc<dyn SendAdmission>);
     let result = transport
         .send_request(
             &get_roles_request(),
@@ -303,4 +370,56 @@ async fn failed_body_error_release_warns_with_its_site() {
         "a failed body-error release must warn with its site; captured: {warns:?}"
     );
     handle.abort();
+}
+
+/// A GET whose headers never arrive but whose permit completes cleanly must
+/// stay silent: no completion warn may carry the `header_timeout` site. This
+/// pins the success direction against a warn-on-success regression.
+#[tokio::test]
+async fn successful_header_timeout_release_stays_silent() {
+    let _serial = log_serial().lock().await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mark = log_mark();
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!([])).delayed(Duration::from_secs(30)),
+    )
+    .await;
+    let lane = Arc::new(SucceedingLane::new("fixture-token"));
+    let transport = governed_transport(mock.origin(), Arc::clone(&lane) as Arc<dyn SendAdmission>);
+    let result = transport
+        .send_request(
+            &get_roles_request(),
+            Some(tokio::time::Instant::now() + Duration::from_millis(600)),
+        )
+        .await;
+    assert_eq!(
+        result.map(|_| ()),
+        Err("read headers timed out".to_owned()),
+        "headers stalled, so the stall must report the header bound"
+    );
+    assert_eq!(
+        lane.completes.load(Ordering::SeqCst),
+        1,
+        "the header-timed-out attempt releases its permit once"
+    );
+    assert_eq!(
+        lane.cooldowns.lock().unwrap().as_slice(),
+        [None],
+        "early releases carry no cooldown"
+    );
+    assert!(
+        !*lane.held.lock().unwrap(),
+        "a successful early completion must release the lane"
+    );
+    let warns = completion_warns_since(mark);
+    let site_warns: Vec<_> = warns
+        .iter()
+        .filter(|line| line.contains("header_timeout"))
+        .collect();
+    assert!(
+        site_warns.is_empty(),
+        "a successful header-timeout release must not warn; captured: {warns:?}"
+    );
+    mock.shutdown().await;
 }
