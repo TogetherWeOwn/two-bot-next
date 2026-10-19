@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Staging promotion error-rate gate. Invokes evaluatePromotionGate() from
+// Promotion error-rate gate (staging and production). Invokes evaluatePromotionGate() from
 // ../src/alert-rules.ts over a firing list and exits non-zero when the stage
 // must fail, so the workflow's existing per-stage auto-rollback restores the
 // recorded pre-promote snapshot. Secrets come from env only, never argv,
@@ -76,13 +76,13 @@ export function decideMode({ rehearsalFiring, token }) {
   return { mode: "skip", reason: "metrics scrape token absent: gate not yet enforcing (see docs/runbook-observability.md)" };
 }
 
-async function fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, retrySleepSeconds = SCRAPE_RETRY_SECONDS }) {
+async function fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, retrySleepSeconds = SCRAPE_RETRY_SECONDS, userAgent = USER_AGENT }) {
   const url = `${metricsUrl.replace(/\/$/, "")}/ops/metrics`;
   let lastError;
   for (let attempt = 1; attempt <= SCRAPE_ATTEMPTS; attempt += 1) {
     try {
       const response = await fetchImpl(url, {
-        headers: { authorization: `Bearer ${token}`, "user-agent": USER_AGENT },
+        headers: { authorization: `Bearer ${token}`, "user-agent": userAgent },
         signal: AbortSignal.timeout(timeoutSeconds * 1000),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -116,8 +116,9 @@ export async function runLiveGate({
   sleep = (s) => new Promise((resolve) => setTimeout(resolve, s * 1000)),
   nowSeconds = () => Date.now() / 1000,
   retrySleepSeconds = SCRAPE_RETRY_SECONDS,
+  userAgent = USER_AGENT,
 }) {
-  const scrape = () => fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, retrySleepSeconds });
+  const scrape = () => fetchExposition({ metricsUrl, token, timeoutSeconds, fetchImpl, retrySleepSeconds, userAgent });
   const first = await scrape();
   const baseline = evaluateMetrics(first.samples, EMPTY_STATE, nowSeconds());
   await sleep(sampleIntervalSeconds);
@@ -145,7 +146,7 @@ export function decideLiveVerdict({ firing, restDelta }) {
   return { fail: false, verdict: "pass", reasons: [] };
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const config = {
     metricsUrl: "",
     evidence: "",
@@ -153,6 +154,7 @@ function parseArgs(argv) {
     rehearsalFiring: undefined,
     sampleIntervalSeconds: DEFAULT_SAMPLE_INTERVAL_SECONDS,
     timeoutSeconds: DEFAULT_SCRAPE_TIMEOUT_SECONDS,
+    userAgent: USER_AGENT,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
@@ -164,6 +166,7 @@ function parseArgs(argv) {
     else if (flag === "--rehearsal-firing") config.rehearsalFiring = value;
     else if (flag === "--sample-interval-seconds") config.sampleIntervalSeconds = Number(value);
     else if (flag === "--scrape-timeout-seconds") config.timeoutSeconds = Number(value);
+    else if (flag === "--user-agent") config.userAgent = value;
     else throw new UsageError(`unknown flag ${flag}`);
     i += 1;
   }
@@ -171,6 +174,9 @@ function parseArgs(argv) {
   if (!config.evidence) throw new UsageError("--evidence is required");
   if (!Number.isFinite(config.sampleIntervalSeconds) || config.sampleIntervalSeconds <= 0) {
     throw new UsageError("--sample-interval-seconds must be a positive number");
+  }
+  if (!config.userAgent) {
+    throw new UsageError("--user-agent must not be empty");
   }
   return config;
 }
@@ -213,6 +219,7 @@ async function main(argv, env) {
     token: env.METRICS_SCRAPE_TOKEN,
     sampleIntervalSeconds: config.sampleIntervalSeconds,
     timeoutSeconds: config.timeoutSeconds,
+    userAgent: config.userAgent,
   });
   const { fail, verdict, reasons } = decideLiveVerdict({ firing: live.firing, restDelta: live.restDelta });
   const evidence = {
