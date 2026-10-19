@@ -327,6 +327,23 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_only_response_spellings_rejected() {
+        // Pins mee6.rs:145: a whitespace-only response is a half record,
+        // not an entry, for every response spelling. Without the trim
+        // check a blank template would import as a valid command.
+        for key in ["response", "message", "content"] {
+            let mut row = serde_json::Map::new();
+            row.insert("command".to_owned(), serde_json::json!("faq"));
+            row.insert(key.to_owned(), serde_json::json!(" \t\n"));
+            assert_eq!(
+                parse_mee6_entry(&serde_json::Value::Object(row)),
+                None,
+                "whitespace-only {key} must fail closed"
+            );
+        }
+    }
+
+    #[test]
     fn first_trigger_preserved_later_collisions_suffixed() {
         let long = "a".repeat(32);
         let out = translate_export(&[
