@@ -265,6 +265,14 @@ INSERT INTO game_activity_guild_aggregates
 VALUES ('100000000000000001', 'Apex', 1800000, 60000, 1, '2026-08-01T10:00:00.000Z'),
        ('100000000000000001', '', 60000, 0, 1, '2026-08-01T10:00:00.000Z'),
        ('100000000000000002', 'Apex', 5940000, 0, 9, '2026-08-01T11:00:00.000Z');
+-- Assistant monthly-cap ledger (0446/0447): one row per guild keyed by the
+-- UTC month start (`month_key` 1785542400 is 2026-08-01 00:00 UTC), one
+-- part-used and one near-cap. Guild keys only, so the roundtrip asserts
+-- archive coverage, not an empty seed.
+INSERT INTO assistant_monthly_builds
+    (guild_id, month_key, build_count, updated_at)
+VALUES ('100000000000000001', 1785542400, 17, '2026-08-01T10:00:00.000Z'),
+       ('100000000000000002', 1785542400, 199, '2026-08-01T11:00:00.000Z');
 
 INSERT INTO community_stream_heartbeats (guild_id, stream, covered_from, covered_through, updated_at)
 VALUES ('100000000000000001', 'event_attended', '2026-07-27T00:00:00.000Z',

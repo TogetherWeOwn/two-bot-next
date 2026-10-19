@@ -488,6 +488,28 @@ Same signals, same first response, same escalation, lower urgency. Do not
 close it as "fast burn resolved": the fast window can clear while the slow
 grind continues.
 
+The first firing also files one tracking issue by itself. Every five minutes
+the `slow-burn-tracker` workflow scrapes staging `/ops/metrics`, replays the
+checked-in slow-burn verdict over its cached ring and reconciles the
+`slow-burn` label: no open card means file one, an open card stays untouched
+(a refresh comment lands at most every six hours, so a refire never
+duplicates the card), and a cleared burn resolves and closes it. An unknown
+verdict — a failed scrape or evaluation, unusable join series, or slow
+windows without full history — never closes the card, and a lost ring
+rebuilds instead of firing. The five-minute cadence is load-bearing for
+the six-hour baseline: GitHub runs `*/5` best-effort, so when the newest
+ring entry is 600 s or older the run emits a `::warning::` instead of
+reading green-with-unknown. Entry age alone cannot prove coverage — sub-600 s
+spacings can also leave the baseline window empty — so the tracker records
+the most recent covered moment beside the ring, seeds the tracking start on
+the first live unknown run when it never covered, and warns once the slow
+windows go ~6.5 h uncovered: while coverage is gone genuine burns go unfiled
+and open cards stay unclosed. The tracker needs the `slow-burn-tracker` environment
+bearer for `/ops/metrics`; without it the run warns and stays green. Prove
+the path by dispatching the workflow with the fire and clear fixtures: they
+run the real verdict and the real issue calls under the `slow-burn-test`
+label without touching the live ring.
+
 #### Alert: voice creator-map stale
 
 The voice actor re-merges the creator map from the store every 5 minutes;
@@ -955,6 +977,57 @@ The Container DO failed the container-internal `/metrics` scrape on 3 consecutiv
 First response: read the scrape through the existing authorized `/ops/metrics` path, check container `/readyz` and Worker/container logs for `two-bot metrics scrape failed`. Timeouts (6 s deadline), non-OK status, oversized bodies (64 KiB cap) and invalid exposition all count as failure; the deadline and cap are unchanged by this alert. Notifications and logs carry only this runbook link and build context, never response bodies.
 
 A lost scrape never resolves any metric-rule incident: missing evidence is not recovery evidence, so previously firing alerts stay firing through the loss, and the existing dispatch-drop interruption still applies. The first complete valid scrape after the incident resolves only the scrape-loss ticket; metric rules re-evaluate on that same scrape and resolve only on their own evidence. A valid scrape before the third failure silently resets the streak with no resolve.
+
+#### Alert: audit delivery halt
+
+`audit_delivery_halt` is a **ticket, not a page**: the label-free
+`two_bot_audit_delivery_halt` gauge stayed `1` for three consecutive valid
+keepalive samples. At the default 60 s cadence the first-to-third span is
+about two minutes, so an intentional short hold cleared before that span stays
+quiet. This is a sample bound, not a maintenance-window authorization or a
+wall-clock guarantee at a different keepalive cadence. A deliberate longer
+hold still tickets once; acknowledge it through normal incident tracking.
+
+First response: establish whether the hold is intended before attempting to
+resume delivery. Correlate the ticket's build/log links with the authorized
+maintenance record and the fixed `audit_mirror_halt_engaged` /
+`audit_mirror_halt_disengaged` events. A halted sweep intentionally claims
+nothing but still records job success every 30 s. Fresh
+`audit_retry` success with gauge `1` means a persistent hold, not a wedged
+retry loop; do not restart it to clear the ticket. An undocumented hold or one
+past its intended end needs the authorized operator to diagnose it this watch
+shift. Check DB/pool errors and job failures separately.
+
+An `audit_retry_halt_unreadable` warning is **not a new halt reading**: the
+Rust process retains its previous gauge. Its supervisor reports a failed
+`audit_retry` attempt. While `two_bot_job_consecutive_failures{job="audit_retry"}`
+is nonzero (including other failed audit sweeps), this rule neither fires nor
+recovers. Missing, duplicate, labeled or non-boolean halt readings and failed
+scrapes also break the pending streak while retaining an active ticket. A valid
+`0` with a healthy audit sweep resolves once; a fresh `1` needs a new run of
+three samples after recovery. DO reconstruction preserves the streak and active
+state; older stored state starts with zero streak. A process restart is not
+proof that the persistent switch was cleared: the process's initial zero gauge
+cannot resolve a ticket until `audit_retry` has a nonzero last-success timestamp.
+Confirm a healthy readable sweep.
+
+Unhalt only through the existing durable store contract, after the authorized
+operator confirms the hold is no longer needed: `delivery_halt()` reads its
+presence and `disengage_halt()` clears it under the store's existing fence.
+See the [audit control boundary](#containment-kill-switches-and-feature-flags) and
+[audit store protocol](audit-store.md#crash-and-halt-protocol-for-the-service-slice).
+There is **no supported binary audit-halt/unhalt command or operator HTTP
+endpoint** here; do not invent one, issue ad hoc SQL, clear pending/quarantined
+rows, or reset accepted-send evidence. If that execution path is unavailable,
+route the exact request to the authorized operator rather than changing policy.
+Verify the next healthy sweep reports `0` and the normal drain resumes; clearing
+the alert alone is not delivery evidence.
+
+Only the fixed rule key, ticket classification and public runbook link enter
+transition messages. Keep audit content, actor IDs, halt reason text and
+free-text labels out of evidence. The existing persist-before-notify path and
+forwarding gate are reused; this adds no external ticket-system integration,
+new control, retention/delivery change or production activation.
 
 #### Alert: eventsub reconcile failed
 
