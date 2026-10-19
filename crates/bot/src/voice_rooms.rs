@@ -9288,9 +9288,6 @@ pub fn build_production_runtime(
             .as_deref(),
     )
     .map_err(|_| RoomHttpError::InvalidRequest)?;
-    // Unusable admission values fail closed per knob with an `invalid_value`
-    // warning; they never refuse the runtime.
-    let admission = configured_admission(|key| std::env::var(key).ok());
     let replies = RoomHttp::new(token.to_owned())?;
     let http = replies.clone();
     let store = PgRoomStore::new(pool);
@@ -9304,7 +9301,12 @@ pub fn build_production_runtime(
             .with_protected_channels(protected)
             .with_creator_channels(generator.into_iter().collect())
             .with_empty_grace(empty_grace)
-            .with_admission_config(admission)
+            // Resolve at the install site (not a `let` above): the
+            // acceptance wiring pin greps for this exact loader call, so
+            // extracting it would let a dropped temporary pass the pin.
+            // Unusable values fail closed per knob with an `invalid_value`
+            // warning; they never refuse the runtime.
+            .with_admission_config(configured_admission(|key| std::env::var(key).ok()))
             .with_synthetic_humans(synthetic_humans)
             .with_name_policy(name_policy)
             .with_live_source(live_source),
