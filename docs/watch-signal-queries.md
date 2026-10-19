@@ -322,8 +322,13 @@ error lines before acting. Those lines mean a best-effort unknown-state write, o
 (`persist_op=finish`), proven-not-sent (`persist_op=release`) or event-key (`persist_op=event_key`)
 write including the `Malformed` finishes in `execute_member`, failed after the
 claim was committed; the claim is never released or resent. Read the `persist_class` before
-acting: `storage_unavailable` leaves the claim `in_flight`, so repeats answer `in_progress`
-until it goes stale. `transition_refused` means the row had already moved on (for example to a
+acting. Proven-not-sent (`persist_op=release`) failures and the `execute_member` post-claim `Malformed` finishes
+never attempt the follow-up unknown-state mark, so `storage_unavailable` there leaves the claim
+`in_flight` with no paired line and repeats answer `in_progress` until it goes stale. On the other
+finish and event-key writes the mark is attempted: `storage_unavailable` leaves the claim `in_flight`
+only when that mark also fails (a paired `msg=internal_action_unknown_state_persist_failed` line);
+when the mark succeeds the claim is `unknown` and repeats answer `needs_reconciliation`.
+`transition_refused` means the row had already moved on (for example to a
 stored terminal response), so a repeat may replay that response instead. A counter that reset to
 zero between scrapes means the process restarted; it does not mean the
 window was quiet.
