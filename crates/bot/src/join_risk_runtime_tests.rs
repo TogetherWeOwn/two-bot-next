@@ -2,6 +2,7 @@
 //! test is ignored and runs only on agent-testdb / the CI service container.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -359,6 +360,8 @@ fn posted_contents(mock: &MockRest) -> Vec<String> {
         .collect()
 }
 
+static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -370,7 +373,11 @@ impl TestSchema {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let schema = format!("tog10430_risk_{stamp}");
+        // Parallel workers can share a clock tick, so a bare timestamp
+        // collides (`pg_namespace_nspname_index`). The pid + counter nonce
+        // keeps every schema in this process unique.
+        let nonce = NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed);
+        let schema = format!("tog10430_risk_{}_{}_{}", std::process::id(), stamp, nonce);
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");
