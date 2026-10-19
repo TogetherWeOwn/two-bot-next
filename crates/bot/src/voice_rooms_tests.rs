@@ -6479,8 +6479,14 @@ async fn access_command_refuses_bad_input_without_changing_anything() {
     }
 }
 
+// These tests share the process-global log capture. Serialize every admin
+// store-failure emitter, including the two reply-only tests, so each capture
+// window contains only its own operation's warning. Hold the guard across await.
+static ADMIN_STORE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn access_command_reports_store_failures_and_changes_nothing() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
     let shared = Arc::new(Mutex::new(AccessControls::default()));
     let runtime = shared_runtime(
         Trace::default(),
@@ -6515,6 +6521,7 @@ async fn access_command_reports_store_failures_and_changes_nothing() {
 
 #[tokio::test]
 async fn access_read_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
     let runtime = gated_runtime(
         Trace::default(),
         AccessControls::default(),
@@ -6532,10 +6539,12 @@ async fn access_read_store_failure_warns_and_keeps_reply() {
         "Could not read the voice-room settings. Nothing was changed; try again."
     );
     let log = global.text()[before..].to_owned();
-    let line = log
+    let lines: Vec<_> = log
         .lines()
-        .find(|line| line.contains("op=\"access_read\""))
-        .unwrap_or_else(|| panic!("missing access_read warn in:\n{log}"));
+        .filter(|line| line.contains("op=\"access_read\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one access_read warn in:\n{log}");
+    let line = lines[0];
     assert!(line.starts_with("WARN "), "{line}");
     assert!(line.contains("voice_admin_store"), "{line}");
     assert!(line.contains("reason=\"unavailable\""), "{line}");
@@ -6546,6 +6555,7 @@ async fn access_read_store_failure_warns_and_keeps_reply() {
 
 #[tokio::test]
 async fn access_save_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
     let shared = Arc::new(Mutex::new(AccessControls::default()));
     let runtime = shared_runtime(
         Trace::default(),
@@ -6571,10 +6581,12 @@ async fn access_save_store_failure_warns_and_keeps_reply() {
     );
     assert_eq!(*shared.lock().unwrap(), AccessControls::default());
     let log = global.text()[before..].to_owned();
-    let line = log
+    let lines: Vec<_> = log
         .lines()
-        .find(|line| line.contains("op=\"access_save\""))
-        .unwrap_or_else(|| panic!("missing access_save warn in:\n{log}"));
+        .filter(|line| line.contains("op=\"access_save\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one access_save warn in:\n{log}");
+    let line = lines[0];
     assert!(line.starts_with("WARN "), "{line}");
     assert!(line.contains("voice_admin_store"), "{line}");
     assert!(line.contains("reason=\"credential_refused\""), "{line}");
@@ -7014,6 +7026,7 @@ async fn logging_rejects_foreign_channel_and_disconnected_or_unidentified_actor(
 
 #[tokio::test]
 async fn logging_command_reports_store_failures_and_changes_nothing() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
     let level = || {
         logging_interaction(
             sub_option("level", vec![command_option("level", "off")]),
@@ -7036,6 +7049,7 @@ async fn logging_command_reports_store_failures_and_changes_nothing() {
 
 #[tokio::test]
 async fn logging_read_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
     let shared = Arc::new(Mutex::new(LoggingSettings::default()));
     let runtime = logging_runtime(shared.clone(), Some(StoreError::Conflict), None);
     assert!(runtime.publish_snapshot(GUILD, logging_snapshot()));
@@ -7052,10 +7066,12 @@ async fn logging_read_store_failure_warns_and_keeps_reply() {
     );
     assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
     let log = global.text()[before..].to_owned();
-    let line = log
+    let lines: Vec<_> = log
         .lines()
-        .find(|line| line.contains("op=\"logging_read\""))
-        .unwrap_or_else(|| panic!("missing logging_read warn in:\n{log}"));
+        .filter(|line| line.contains("op=\"logging_read\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one logging_read warn in:\n{log}");
+    let line = lines[0];
     assert!(line.starts_with("WARN "), "{line}");
     assert!(line.contains("voice_admin_store"), "{line}");
     assert!(line.contains("reason=\"conflict\""), "{line}");
@@ -7066,6 +7082,7 @@ async fn logging_read_store_failure_warns_and_keeps_reply() {
 
 #[tokio::test]
 async fn logging_save_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
     let shared = Arc::new(Mutex::new(LoggingSettings::default()));
     let runtime = logging_runtime(shared.clone(), None, Some(StoreError::Unavailable));
     assert!(runtime.publish_snapshot(GUILD, logging_snapshot()));
@@ -7082,10 +7099,12 @@ async fn logging_save_store_failure_warns_and_keeps_reply() {
     );
     assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
     let log = global.text()[before..].to_owned();
-    let line = log
+    let lines: Vec<_> = log
         .lines()
-        .find(|line| line.contains("op=\"logging_save\""))
-        .unwrap_or_else(|| panic!("missing logging_save warn in:\n{log}"));
+        .filter(|line| line.contains("op=\"logging_save\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one logging_save warn in:\n{log}");
+    let line = lines[0];
     assert!(line.starts_with("WARN "), "{line}");
     assert!(line.contains("voice_admin_store"), "{line}");
     assert!(line.contains("reason=\"unavailable\""), "{line}");
@@ -10367,6 +10386,7 @@ fn config_failure_runtime(trace: Trace, error: StoreError) -> VoiceRuntime<Store
 
 #[tokio::test]
 async fn export_read_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
     let trace = Trace::default();
     let runtime = config_failure_runtime(trace.clone(), StoreError::CredentialRefused);
     let interaction = with_user(
@@ -10384,10 +10404,12 @@ async fn export_read_store_failure_warns_and_keeps_reply() {
     );
     assert!(trace.lock().unwrap().is_empty());
     let log = global.text()[before..].to_owned();
-    let line = log
+    let lines: Vec<_> = log
         .lines()
-        .find(|line| line.contains("op=\"export_read\""))
-        .unwrap_or_else(|| panic!("missing export_read warn in:\n{log}"));
+        .filter(|line| line.contains("op=\"export_read\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one export_read warn in:\n{log}");
+    let line = lines[0];
     assert!(line.starts_with("WARN "), "{line}");
     assert!(line.contains("voice_admin_store"), "{line}");
     assert!(line.contains("reason=\"credential_refused\""), "{line}");
@@ -10398,6 +10420,7 @@ async fn export_read_store_failure_warns_and_keeps_reply() {
 
 #[tokio::test]
 async fn import_read_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
     let trace = Trace::default();
     let runtime = config_failure_runtime(trace.clone(), StoreError::Conflict);
     let interaction = import_interaction(10, manager(), UPLOADER);
@@ -10412,10 +10435,12 @@ async fn import_read_store_failure_warns_and_keeps_reply() {
     );
     assert!(trace.lock().unwrap().is_empty());
     let log = global.text()[before..].to_owned();
-    let line = log
+    let lines: Vec<_> = log
         .lines()
-        .find(|line| line.contains("op=\"import_read\""))
-        .unwrap_or_else(|| panic!("missing import_read warn in:\n{log}"));
+        .filter(|line| line.contains("op=\"import_read\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one import_read warn in:\n{log}");
+    let line = lines[0];
     assert!(line.starts_with("WARN "), "{line}");
     assert!(line.contains("voice_admin_store"), "{line}");
     assert!(line.contains("reason=\"conflict\""), "{line}");
