@@ -47,9 +47,37 @@ impl ChannelModerationVerb {
     }
 }
 
+/// A definitive refusal that ended a purge after at least one deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeStopReason {
+    Refused,
+    RateLimited,
+}
+
+impl PurgeStopReason {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::RateLimited => "rate_limited",
+        }
+    }
+}
+
+/// Confirmed deletions, with a reason only when a later delete was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PurgeReport {
+    pub affected: u64,
+    pub stop_reason: Option<PurgeStopReason>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelOutcome {
-    Purged { affected: u64 },
+    Purged {
+        affected: u64,
+        stop_reason: Option<PurgeStopReason>,
+    },
     SlowmodeUpdated,
     LockedDown,
     Unlocked,
@@ -264,9 +292,17 @@ pub fn plan_unlock(
 #[must_use]
 pub fn moderation_result_text(outcome: ChannelOutcome) -> String {
     match outcome {
-        ChannelOutcome::Purged { affected } => {
-            format!("Moderation action completed: purged ({affected}).")
-        }
+        ChannelOutcome::Purged {
+            affected,
+            stop_reason: Some(reason),
+        } => format!(
+            "Moderation action completed: purged ({affected}, stopped early: {}).",
+            reason.name()
+        ),
+        ChannelOutcome::Purged {
+            affected,
+            stop_reason: None,
+        } => format!("Moderation action completed: purged ({affected})."),
         other => format!("Moderation action completed: {}.", other.name()),
     }
 }
