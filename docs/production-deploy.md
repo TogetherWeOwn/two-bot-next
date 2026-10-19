@@ -4,7 +4,9 @@
 `production` Wrangler environment. It runs on manual dispatch, on a completed
 `deploy-staging` run on `main`, and on a daily schedule backstop — never on
 push or PR. A completed-but-unsuccessful staging run promotes nothing; a green
-one promotes its own SHA after a 30-minute soak past the staging-green time
+one promotes the commit of the latest successful staging deploy — never its
+own run SHA, so a re-run of an older staging run cannot downgrade production —
+after a 30-minute soak past the staging-green time
 (see [Automatic promotion](#automatic-promotion)). The B4 cutover executor
 (TOG-9699) dispatches it from `main`. Agents never do. The cutover gates in
 [cutover.md](cutover.md) still apply.
@@ -200,27 +202,40 @@ workflow starts on every completed `deploy-staging` run on `main` and once
 daily as a backstop (a missed trigger, an expired hold, an incident pause).
 An automatic run is exactly the empty-`sha` manual dispatch — the commit of
 the latest successful staging deploy — with takeover on, so the owned probes
-can certify it. Every guard still applies to it. Three skips keep it green
+can certify it. Every guard still applies to it. Four skips keep it green
 while deploying nothing:
 
 - the triggering staging run did not succeed (`staging-not-green`);
 - the hold variable is still in the future (see below);
-- the target is already live: production `/readyz` already reports the SHA.
+- the target is already live: production `/readyz` already reports the SHA;
+- the live build already contains the target (`older-than-live`): an older
+  build never replaces a newer one automatically, so a re-run of an older
+  staging run cannot downgrade production (intentional downgrades stay an
+  explicit operator rollback, which also serves the older container image).
 
-Otherwise the run soaks the remainder of 30 minutes past the staging-green
-time (the guard computes the remainder from the latest green staging run's
-finish; an unreadable timestamp soaks the full window), then deploys through
-the same schema gate, roles gate, readyz gate and error-rate gate as a manual
-dispatch. Automatic runs need either `PRODUCTION_AUTO_APPROVE=true` or
-Environment reviewers (which pause the run for approval); without either the
-guard refuses.
+Otherwise the `soak` job sleeps the remainder of 30 minutes past the
+staging-green time, recomputed there from the staging-green timestamp the
+guard reports (an unreadable timestamp soaks the full window). The soak runs
+outside the `deploy-production` lane — only the `production` and `release`
+jobs hold it — so a sleeping promotion never queues an operator rollback
+behind it, and a new arrival never displaces a pending recovery run. A
+`recheck` job then re-reads the hold and the live revision immediately before
+the deploy: a hold set, or a target gone live or stale, while the gates built
+or the soak slept skips green instead of deploying through the incident. The
+run then deploys through the same schema gate, roles gate, readyz gate and
+error-rate gate as a manual dispatch. Automatic runs need either
+`PRODUCTION_AUTO_APPROVE=true` or Environment reviewers (which pause the run
+for approval); without either the guard refuses.
 
 Hold: the repository variable `PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL` holds
 automatic promotion until an ISO-8601 UTC expiry (empty means no hold).
 Manual dispatches ignore it. An unparseable hold refuses the run instead of
 promoting through it. Setting or clearing the hold is an operator action;
 like `PRODUCTION_AUTO_APPROVE`, who set it and why needs a CEO and CISO
-decision first.
+decision first. After a manual rollback, set the hold until the incident is
+resolved: otherwise the next automatic run re-selects the staged build that
+was just rolled back and redeploys it (the live check only skips builds the
+live revision already contains, and a rolled-back target is newer than live).
 
 ## Production error-rate gate
 
@@ -234,6 +249,11 @@ secret (a `production` environment secret, 32+ chars); without it the step
 records a skip, never a pass. The dispatch-only `inject_error_rate_spike`
 input judges a rehearsal 5xx firing instead, proving the fail-to-rollback
 chain with no traffic — a push or an automatic trigger can never arm it.
+The drill needs `takeover: true` in deploy mode: without takeover a failed
+gate cannot roll back (so the drill would leave its build serving and prove
+nothing), and after a rollback restore there is nothing to roll back to (so
+the gate does not run in rollback mode at all). Any other combination
+refuses in the guard before anything deploys.
 
 ## Build identity and the `/readyz` gate
 

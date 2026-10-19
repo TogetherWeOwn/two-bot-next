@@ -32,7 +32,8 @@ JOB_INVENTORY = {
                   # Promoted nextest lane (shared reusable), gated by ci-ok
                   # like the Rust lanes.
                   "nextest"},
-    "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "production", "release"},
+    "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "recheck",
+                              "production", "release"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "voice-synthetic"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
@@ -338,6 +339,10 @@ def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
     step = armed[0]
     if step.get("id") != "error_rate_gate":
         errors.append(f"{name}: the error-rate drill switch must live on the error_rate_gate step")
+    # After a rollback restore there is no snapshot to roll back to: the
+    # gate must not fail the recovery run red with no action possible.
+    if step.get("if") != "env.MODE == 'deploy'":
+        errors.append(f"{name}: error_rate_gate must run in deploy mode only")
     env = step.get("env") or {}
     if env.get("INJECT_ERROR_RATE_SPIKE") != ERROR_RATE_EXPRESSION:
         errors.append(f"{name}: error-rate rehearsal must use the pinned dispatch-only expression")
@@ -1435,17 +1440,70 @@ def production_errors(workflow):
             errors.append(f"{name}: schedule must carry the daily backstop")
     jobs = workflow.get("jobs", {})
     production, guard = jobs.get("production", {}), jobs.get("guard", {})
+    soak, recheck = jobs.get("soak", {}), jobs.get("recheck", {})
     needs = production.get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
     expected_production_if = (
         "always() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
+        "(needs.recheck.result == 'skipped' || (needs.recheck.result == 'success' && "
+        "needs.recheck.outputs.skip == '')) && "
         "(needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || "
         "(needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))"
     )
-    if production.get("environment") != "production" or set(needs) != {"guard", "schema-gate", "roles-gate"}:
-        errors.append(f"{name}:production: must wait for the guard, the schema gate, the roles gate and the protected Environment")
+    if production.get("environment") != "production" \
+            or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate"}:
+        errors.append(f"{name}:production: must wait for the guard, the soak, the recheck, "
+                      "the schema gate, the roles gate and the protected Environment")
     if production.get("if") != expected_production_if:
-        errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates and no skip")
+        errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates, "
+                      "a fresh recheck and no skip")
+    # Only production and release hold the deploy-production lane: the
+    # guard, gates, soak and recheck run outside it, so a sleeping
+    # automatic promotion can never delay or displace an operator rollback.
+    if "concurrency" in workflow:
+        errors.append(f"{name}: must not hold the deploy lane at workflow level")
+    for job_id in ("production", "release"):
+        if jobs.get(job_id, {}).get("concurrency") != {"group": "deploy-production",
+                                                      "cancel-in-progress": "false"}:
+            errors.append(f"{name}:{job_id}: must hold the deploy-production lane without cancelling")
+    for job_id in ("guard", "schema-gate", "roles-gate", "soak", "recheck"):
+        if "concurrency" in jobs.get(job_id, {}):
+            errors.append(f"{name}:{job_id}: must not hold the deploy lane")
+    expected_soak_if = ("needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' "
+                        "&& needs.guard.outputs.allow_unstaged != 'true' "
+                        "&& needs.guard.outputs.soak_seconds != '0'")
+    if soak.get("needs") != "guard":
+        errors.append(f"{name}:soak: must wait for the guard (it sleeps the guarded SHA's remainder)")
+    if soak.get("if") != expected_soak_if:
+        errors.append(f"{name}:soak: must sleep only for ordinary non-skipped deploys with soak remaining")
+    soak_script = "\n".join(step.get("run", "") for step in soak.get("steps", []))
+    for required in ("SOAK_SECONDS - int(time.time() - green_at)", "time.sleep(remaining)"):
+        if required not in soak_script:
+            errors.append(f"{name}:soak: must recompute the remainder from the staging-green time")
+    soak_env = str((soak.get("steps") or [{}])[0].get("env", ""))
+    if "GREEN_AT" not in soak_env or "needs.guard.outputs.green_at" not in soak_env:
+        errors.append(f"{name}:soak: must read the staging-green timestamp from the guard")
+    expected_recheck_if = (
+        "always() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
+        "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.auto == 'true' && "
+        "(needs.soak.result == 'success' || needs.soak.result == 'skipped')"
+    )
+    if recheck.get("needs") != ["guard", "soak"]:
+        errors.append(f"{name}:recheck: must wait for the guard and the soak (it re-reads before the deploy)")
+    if recheck.get("if") != expected_recheck_if:
+        errors.append(f"{name}:recheck: must recheck only automatic deploys after the soak")
+    if (recheck.get("outputs") or {}).get("skip") != "${{ steps.recheck.outputs.skip }}":
+        errors.append(f"{name}:recheck: must publish the skip output for production")
+    recheck_text = str(recheck)
+    for required in ("vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL", "needs.guard.outputs.sha",
+                     'skip = "live"', 'skip = "older-than-live"',
+                     "compare/{target}...{live}"):
+        if required not in recheck_text:
+            errors.append(f"{name}:recheck: missing check {required}")
+    guard_outputs = guard.get("outputs") or {}
+    for output in ("auto", "green_at"):
+        if output not in guard_outputs:
+            errors.append(f"{name}:guard: must publish the {output} output for the soak and recheck jobs")
     expected_gate_if = ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
                         "&& needs.guard.outputs.skip == ''")
     for gate_name in ("schema-gate", "roles-gate"):
@@ -1479,6 +1537,17 @@ def production_errors(workflow):
                      'refuse("the production Environment has no required reviewers")'):
         if required not in script:
             errors.append(f"{name}:guard: missing check {required}")
+    # The rollback drill proves the fail-to-rollback chain, which exists
+    # only on a deploy-mode run with takeover: the guard receives the switch
+    # and refuses anything else, so the drill never leaves its build serving.
+    guard_env = (guard.get("steps") or [{}])[0].get("env", {})
+    if guard_env.get("INJECT_ERROR_RATE_SPIKE") != "${{ inputs.inject_error_rate_spike }}":
+        errors.append(f"{name}:guard: must receive the drill switch as an input env")
+    for required in ("inject_error_rate_spike needs deploy mode",
+                     "inject_error_rate_spike needs takeover true",
+                     "inject_error_rate_spike never applies to an automatic run"):
+        if required not in script:
+            errors.append(f"{name}:guard: missing drill refusal {required}")
     return errors
 
 
@@ -2733,6 +2802,8 @@ class WorkflowTests(unittest.TestCase):
                 .setdefault("env", {}).__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
             "switch off the gate step": lambda w: w["jobs"]["production"]["steps"][prod_index]
                 .__setitem__("id", "unrelated"),
+            "gate without the deploy-mode condition": lambda w: w["jobs"]["production"]["steps"][prod_index]
+                .pop("if"),
             "staging scrape token": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
                 .__setitem__("METRICS_SCRAPE_TOKEN", "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"),
             "tooling from the guarded SHA": lambda w: w["jobs"]["production"]["steps"][prod_index]
@@ -2900,6 +2971,22 @@ class WorkflowTests(unittest.TestCase):
                      {"run": 'curl "$PRODUCTION_WORKER_URL/readyz"'}):
             with self.subTest(guard_step=step):
                 self.assertTrue(mutated(lambda w, s=step: w["jobs"]["guard"]["steps"].append(s)))
+        for label, change in {
+            "workflow-level concurrency": lambda w: w.update(
+                {"concurrency": {"group": "deploy-production", "cancel-in-progress": False}}),
+            "production without the lane": lambda w: w["jobs"]["production"].pop("concurrency"),
+            "soak holding the lane": lambda w: w["jobs"]["soak"].update(
+                {"concurrency": {"group": "deploy-production", "cancel-in-progress": False}}),
+            "production skipping the recheck": lambda w: w["jobs"]["production"].__setitem__(
+                "needs", ["guard", "soak", "schema-gate", "roles-gate"]),
+            "recheck without the soak": lambda w: w["jobs"]["recheck"].__setitem__("needs", "guard"),
+            "soak without the guard": lambda w: w["jobs"]["soak"].__setitem__("needs", "recheck"),
+            "guard without the auto output": lambda w: w["jobs"]["guard"]["outputs"].pop("auto"),
+            "guard drill env removed": lambda w: w["jobs"]["guard"]["steps"][0]["env"].pop(
+                "INJECT_ERROR_RATE_SPIKE"),
+        }.items():
+            with self.subTest(lane=label):
+                self.assertTrue(mutated(change))
         with self.subTest(guard="environment"):
             self.assertTrue(mutated(lambda w: w["jobs"]["guard"].update({"environment": "production"})))
         for pin in ('status="success"', "deploy-staging.yml/runs", '"required_reviewers"',

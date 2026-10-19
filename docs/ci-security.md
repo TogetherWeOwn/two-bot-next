@@ -167,8 +167,13 @@ the client's error text, and writes only an ordinal, `event_type` and
 `deploy-production.yml` (main #243) is the one live deployment workflow. The
 regression pins it to `workflow_dispatch`, a completed `deploy-staging` run on
 `main`, and the daily schedule backstop — never push or PR. Its `production`
-job must need `guard`, run in GitHub environment `production` and carry no job condition. The
-`guard` job may not have an environment, call a reusable workflow, or contain
+job must need `guard`, `soak`, `recheck`, `schema-gate` and `roles-gate`, run in GitHub environment `production`
+and carry exactly the pinned condition (guard success, no skip, a fresh recheck pass or skip, and both gates green unless a
+rollback or live-SHA redeploy waives them); any other condition fails the regression. Only
+`production` and `release` hold the `deploy-production` lane (a job-level
+concurrency group, never workflow-level); the guard, gates, soak and recheck
+carry none, so a sleeping promotion can never delay or displace a rollback.
+The `guard` job may not have an environment, call a reusable workflow, or contain
 deploy/probe steps. Its script must still require a deploy-staging run with
 `status="success"` on the SHA, plus required reviewers on the production
 Environment. Negative fixtures cover extra triggers, removed `needs` or

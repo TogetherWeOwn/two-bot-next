@@ -7,9 +7,13 @@ name: deploy-production
 # an empty `sha` would: the commit of the latest successful deploy-staging
 # run on main (merges supersede pending staging deploys, so the newest main
 # SHA is rarely staged), after a 30-minute soak past the staging-green time.
-# Automatic runs skip green when the target is already live (production
-# /readyz reports the SHA), when the hold variable is still in the future,
-# or when the triggering staging run did not succeed. The guard job refuses
+# A green staging completion does NOT promote its own run SHA: a re-run of an
+# older staging run must never downgrade production, so the guard re-selects
+# the latest successful staging commit. Automatic runs skip green when the
+# target is already live (production /readyz reports the SHA), when the live
+# revision already contains the target (an older build must never replace a
+# newer one), when the hold variable is still in the future, or when the
+# triggering staging run did not succeed. The guard job refuses
 # a SHA that is not on main with a successful full `ci-ok` verdict and
 # `worker check` from the latest check.yml run/current attempt, plus a
 # successful deploy-staging run, except that a rollback (Worker version +
@@ -26,9 +30,13 @@ name: deploy-production
 # names a missing Environment makes GitHub create it with no reviewers, which
 # would remove the human gate. Automatic promotion additionally needs
 # `vars.PRODUCTION_AUTO_APPROVE` true (or Environment reviewers, which pause
-# the run for approval): without either, the guard refuses. A failed gate
-# after a takeover auto-rolls back to the pre-deploy snapshot (Worker
-# version AND container image) and still fails the run. Runbook:
+# the run for approval): without either, the guard refuses. The 30-minute
+# soak sleeps in its own `soak` job OUTSIDE the deploy-production lane, and a
+# `recheck` job re-reads the hold and the live revision immediately before
+# the deploy: a hold set, or a target gone stale, while the gates built or
+# the soak slept skips green instead of deploying through the incident. A
+# failed gate after a takeover auto-rolls back to the pre-deploy snapshot
+# (Worker version AND container image) and still fails the run. Runbook:
 # docs/production-deploy.md.
 on:
   workflow_run: # zizmor: ignore[dangerous-triggers] promotion notifier only: the guard re-resolves the SHA from the API and refuses unless it is on origin/main with green ci-ok, worker check and a successful deploy-staging run, in the protected production Environment
@@ -75,9 +83,11 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: deploy-production
-  cancel-in-progress: false
+# No workflow-level concurrency: only the `production` and `release` jobs
+# below hold the `deploy-production` lane. The guard, gates, soak and recheck
+# jobs run outside it, so a sleeping automatic promotion can never queue an
+# operator rollback behind it, and a new arrival can never displace a pending
+# recovery run.
 
 jobs:
   guard:
@@ -98,6 +108,8 @@ jobs:
       allow_unstaged: ${{ steps.guard.outputs.allow_unstaged }}
       skip: ${{ steps.guard.outputs.skip }}
       soak_seconds: ${{ steps.guard.outputs.soak_seconds }}
+      auto: ${{ steps.guard.outputs.auto }}
+      green_at: ${{ steps.guard.outputs.green_at }}
     steps:
       - name: Refuse unverified SHA or unprotected Environment
         id: guard
@@ -112,6 +124,10 @@ jobs:
           IMAGE: ${{ inputs.image }}
           ALLOW_UNSTAGED: ${{ inputs.allow_unstaged }}
           TAKEOVER: ${{ inputs.takeover }}
+          # Rollback-drill switch (dispatch-only boolean; empty on automatic
+          # triggers). The guard refuses drill combinations that cannot roll
+          # back, so the drill always exercises the fail-to-rollback chain.
+          INJECT_ERROR_RATE_SPIKE: ${{ inputs.inject_error_rate_spike }}
           EVENT_NAME: ${{ github.event_name }}
           WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
@@ -156,14 +172,19 @@ jobs:
                   sys.exit(1)
               takeover, allow_unstaged = "true", "false"
               if event == "workflow_run":
-                  sha = os.environ.get("WORKFLOW_RUN_SHA", "").strip().lower()
-                  if not re.fullmatch(r"[0-9a-f]{40}", sha):
+                  run_sha = os.environ.get("WORKFLOW_RUN_SHA", "").strip().lower()
+                  if not re.fullmatch(r"[0-9a-f]{40}", run_sha):
                       print("::error::Refusing production run: "
                             "the completed staging run carries no verifiable head SHA")
                       sys.exit(1)
                   staging_conclusion = os.environ.get("WORKFLOW_RUN_CONCLUSION", "")
                   if staging_conclusion != "success":
                       skip = "staging-not-green"
+                      sha = run_sha
+                  # A green completion promotes the LATEST successful staging
+                  # deploy (the empty-sha path below), never the triggering
+                  # run's SHA: a re-run of an older staging run must not
+                  # downgrade production over a newer live build.
           else:
               takeover = os.environ.get("TAKEOVER", "")
               allow_unstaged = os.environ.get("ALLOW_UNSTAGED", "")
@@ -256,6 +277,23 @@ jobs:
               refuse("takeover must be true or false")
           if allow_unstaged not in ("true", "false"):
               refuse("allow_unstaged must be true or false")
+          # The rollback drill proves the fail-to-rollback chain: it deploys,
+          # fails the error-rate gate on purpose, and auto-rolls back. That
+          # chain exists only on a deploy-mode run with takeover (the
+          # auto-rollback step requires both), so any other combination
+          # refuses here instead of leaving the drill build serving.
+          spike = os.environ.get("INJECT_ERROR_RATE_SPIKE", "")
+          if spike not in ("", "true", "false"):
+              refuse("inject_error_rate_spike must be true or false")
+          if spike == "true":
+              if auto:
+                  refuse("inject_error_rate_spike never applies to an automatic run")
+              if mode != "deploy":
+                  refuse("inject_error_rate_spike needs deploy mode: "
+                         "the drill proves the fail-to-rollback chain")
+              if takeover != "true":
+                  refuse("inject_error_rate_spike needs takeover true: "
+                         "without it a failed gate cannot roll back")
           # A rollback restores the Worker version AND the container image, so
           # it names both explicitly. The digest is a content hash, safe to
           # pass as an input. Deploy mode never takes an image.
@@ -295,7 +333,8 @@ jobs:
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
                   out.write(f"sha={sha}\nmode={mode}\nversion=\nrestore_image=\n"
                             f"takeover={takeover}\nallow_unstaged={allow_unstaged}\n"
-                            f"skip={skip}\nsoak_seconds=0\n")
+                            f"skip={skip}\nsoak_seconds=0\n"
+                            f"auto={'true' if auto else 'false'}\ngreen_at=\n")
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
                   summary.write(
                       "### Automatic production promotion skipped\n\n"
@@ -491,6 +530,26 @@ jobs:
               revision = live_report.get("build_revision")
               return revision if isinstance(revision, str) else None
 
+          def live_contains(target, live):
+              """True when the live revision already contains the target.
+
+              A non-refusing compare read: an unknown live revision (or an
+              API failure) returns False, so the existing gates still judge
+              the build instead of refusing a deployable one.
+              """
+              try:
+                  compared = json.loads(subprocess.check_output(
+                      ["gh", "api", "--method", "GET",
+                       f"repos/{repo}/compare/{target}...{live}",
+                       "-f", "per_page=1"],
+                      text=True,
+                  ))
+              except (subprocess.CalledProcessError, ValueError):
+                  return False
+              if not isinstance(compared, dict):
+                  return False
+              return compared.get("status") in ("ahead", "identical")
+
           def green_at_seconds():
               """When the latest successful staging deploy of the SHA finished.
 
@@ -512,24 +571,36 @@ jobs:
                   return None
               return moment.timestamp()
 
+          green_at_out = ""
           if auto and mode == "deploy" and not skip:
               held = hold_until(os.environ.get("HOLD_UNTIL", ""))
               now = time.time()
               if held is not None and now < held.timestamp():
                   skip = f"held until {held.isoformat()}"
-              elif live_revision() == sha:
-                  skip = "live"
-              elif allow_unstaged != "true":
-                  green_at = green_at_seconds()
-                  if green_at is None:
-                      soak_seconds = SOAK_SECONDS
-                  else:
-                      soak_seconds = max(0, SOAK_SECONDS - int(now - green_at))
+              else:
+                  live = live_revision()
+                  if live == sha:
+                      skip = "live"
+                  elif (live and re.fullmatch(r"[0-9a-f]{40}", live)
+                          and live_contains(sha, live)):
+                      # The live build already contains the target: deploying
+                      # it would downgrade production (and serve older code
+                      # under newer migrations). Intentional downgrades stay
+                      # an explicit operator rollback, never automatic.
+                      skip = "older-than-live"
+                  elif allow_unstaged != "true":
+                      green_at = green_at_seconds()
+                      if green_at is None:
+                          soak_seconds = SOAK_SECONDS
+                      else:
+                          green_at_out = str(int(green_at))
+                          soak_seconds = max(0, SOAK_SECONDS - int(now - green_at))
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"sha={sha}\nmode={mode}\nversion={version}\nrestore_image={image}\n"
                         f"takeover={takeover}\nallow_unstaged={allow_unstaged}\n"
-                        f"skip={skip}\nsoak_seconds={soak_seconds}\n")
+                        f"skip={skip}\nsoak_seconds={soak_seconds}\n"
+                        f"auto={'true' if auto else 'false'}\ngreen_at={green_at_out}\n")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(
                   f"### Production {mode} guard passed\n\n"
@@ -711,17 +782,208 @@ jobs:
             --expected-branch-id "$TWO_BOT_PRODUCTION_BRANCH_ID" \
             --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"
 
+  # Post-staging soak, OUTSIDE the deploy-production lane: sleeping here
+  # (instead of inside the production job) keeps an automatic run from
+  # holding the lane while it waits, so an operator rollback dispatch is
+  # never queued behind — or displaced by — a sleeping promotion. The
+  # remainder is recomputed here from the staging-green timestamp the guard
+  # reported, not carried from guard time, so the gate builds and any
+  # Environment approval wait do not extend the soak.
+  soak:
+    name: post-staging soak (automatic runs only)
+    needs: guard
+    if: needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && needs.guard.outputs.soak_seconds != '0'
+    permissions:
+      contents: read
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'soak') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 35
+    steps:
+      - name: Wait out the remainder of the 30-minute post-staging soak
+        env:
+          GREEN_AT: ${{ needs.guard.outputs.green_at }}
+        shell: python3 {0}
+        run: |
+          import os, time
+
+          SOAK_SECONDS = 1800
+          try:
+              green_at = float((os.environ.get("GREEN_AT") or "").strip())
+          except ValueError:
+              green_at = 0.0
+          # Recomputed here from the staging-green timestamp, not carried
+          # from guard time. An unreadable timestamp soaks the full window
+          # instead of skipping it.
+          if green_at <= 0:
+              remaining = SOAK_SECONDS
+          else:
+              remaining = max(0, SOAK_SECONDS - int(time.time() - green_at))
+          print(f"soaking {remaining}s of the 30 min post-staging window")
+          if remaining > 0:
+              time.sleep(remaining)
+
+  # Pre-deploy recheck for automatic runs: the guard's hold and live checks
+  # go stale while the gates build, the Environment approval waits and the
+  # soak sleeps. Immediately before the deploy, re-read the hold variable
+  # and the live revision: a hold set mid-run, an already-live target, or a
+  # target the live build already contains skips green instead of deploying
+  # through the incident. Manual dispatches skip this job (they ignore the
+  # hold, and a live-SHA redeploy is a legitimate manual cure).
+  recheck:
+    name: pre-deploy hold and live recheck (automatic runs only)
+    needs: [guard, soak]
+    if: always() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.auto == 'true' && (needs.soak.result == 'success' || needs.soak.result == 'skipped')
+    permissions:
+      contents: read # compare API: whether the live revision contains the target
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'recheck') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.recheck.outputs.skip }}
+    steps:
+      - name: Re-read the promotion hold and the live revision
+        id: recheck
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.guard.outputs.sha }}
+          # Promotion hold with expiry (repo/org variable, ISO-8601 UTC):
+          # skip green while now is before it. Empty means no hold.
+          HOLD_UNTIL: ${{ vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+        shell: python3 {0}
+        run: |
+          import datetime, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          sha = os.environ.get("SHA", "").strip().lower()
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              print(f"::error::Refusing pre-deploy recheck: unexpected guarded SHA {sha or 'empty'}")
+              sys.exit(1)
+          skip = ""
+
+          def refuse(reason):
+              print(f"::error::Refusing pre-deploy recheck: {reason}")
+              sys.exit(1)
+
+          def recheck_hold_until(raw):
+              """Parse the promotion-hold expiry, or refuse an unparseable one.
+
+              Same rule as the guard: ISO-8601 with an explicit zone (`Z` or a
+              numeric offset); a bare timestamp without a zone refuses instead
+              of assuming UTC.
+              """
+              text = (raw or "").strip()
+              if not text:
+                  return None
+              try:
+                  moment = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+              except ValueError:
+                  refuse("the promotion hold is not an ISO-8601 timestamp with a zone; "
+                         "clear it or set a valid expiry")
+              if moment.tzinfo is None:
+                  refuse("the promotion hold carries no time zone; set an explicit expiry")
+              return moment
+
+          def recheck_live_revision():
+              """The production build revision, or None when it cannot be read.
+
+              Never a refusal here: an unreadable revision falls through and
+              the deploy proceeds under the guard's gates.
+              """
+              worker_url = os.environ.get("PRODUCTION_WORKER_URL", "").strip().rstrip("/")
+              parsed_url = urllib.parse.urlsplit(worker_url)
+              if parsed_url.scheme != "https" or not parsed_url.netloc or parsed_url.username:
+                  return None
+              request = urllib.request.Request(
+                  worker_url + "/readyz",
+                  headers={"User-Agent": "two-bot-next-production-rollout/1.0"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=10) as response:
+                      status, body = response.status, response.read()
+              except urllib.error.HTTPError as error:
+                  if error.code != 503:
+                      return None
+                  status, body = error.code, error.read()
+              except (OSError, urllib.error.URLError):
+                  return None
+              if status not in (200, 503):
+                  return None
+              try:
+                  live_report = json.loads(body)
+              except ValueError:
+                  return None
+              if not isinstance(live_report, dict):
+                  return None
+              revision = live_report.get("build_revision")
+              return revision if isinstance(revision, str) else None
+
+          def recheck_live_contains(target, live):
+              """True when the live revision already contains the target.
+
+              A non-refusing compare read: an unknown live revision (or an
+              API failure) returns False, so the deploy proceeds under the
+              guard's gates instead of refusing a deployable build.
+              """
+              try:
+                  compared = json.loads(subprocess.check_output(
+                      ["gh", "api", "--method", "GET",
+                       f"repos/{repo}/compare/{target}...{live}",
+                       "-f", "per_page=1"],
+                      text=True,
+                  ))
+              except (subprocess.CalledProcessError, ValueError):
+                  return False
+              if not isinstance(compared, dict):
+                  return False
+              return compared.get("status") in ("ahead", "identical")
+
+          held = recheck_hold_until(os.environ.get("HOLD_UNTIL", ""))
+          now = time.time()
+          if held is not None and now < held.timestamp():
+              skip = f"held until {held.isoformat()}"
+          else:
+              live = recheck_live_revision()
+              if live == sha:
+                  skip = "live"
+              elif (live and re.fullmatch(r"[0-9a-f]{40}", live)
+                      and recheck_live_contains(sha, live)):
+                  skip = "older-than-live"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"skip={skip}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              if skip:
+                  summary.write(
+                      "### Automatic production promotion recheck skipped\n\n"
+                      f"- SHA: `{sha}`\n"
+                      f"- Reason: `{skip}` (the run stays green; nothing is deployed)\n"
+                  )
+              else:
+                  summary.write(
+                      "### Pre-deploy recheck passed\n\n"
+                      f"- SHA: `{sha}` (no hold set; target neither live nor older than live)\n"
+                  )
+          print(f"recheck: {'skipped: ' + skip if skip else 'passed'} {sha}")
+
   production:
     name: wrangler ${{ needs.guard.outputs.mode }} + readyz gate
-    needs: [guard, schema-gate, roles-gate]
-    if: always() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))
+    needs: [guard, soak, recheck, schema-gate, roles-gate]
+    if: always() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.recheck.result == 'skipped' || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))
+    # One of the two jobs holding the deploy-production lane (with `release`
+    # below): only a running or pending production job occupies it. The
+    # guard, gates, soak and recheck jobs carry no concurrency, so recovery
+    # dispatches are never queued behind a sleeping promotion.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'production') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
-    # Sized for the worst case: a 30 min post-staging soak, a ~442 s deploy,
-    # a failing readyz gate (~15 min of polls), the error-rate gate (~4 min
-    # of live scrapes) and the auto-rollback budget (600 s image + 900 s
-    # gate). A 60 min cap can cancel the run mid-rollback and leave
-    # production fenced.
+    # Sized for the worst case: a ~442 s deploy, a failing readyz gate
+    # (~15 min of polls), the error-rate gate (~4 min of live scrapes) and
+    # the auto-rollback budget (600 s image + 900 s gate). The 30 min soak
+    # sleeps in its own job, outside this cap. A 60 min cap can cancel the
+    # run mid-rollback and leave production fenced.
     timeout-minutes: 90
     # The human gate: this job waits for the Environment's required
     # reviewers. The guard job refused to get here without them, unless
@@ -761,22 +1023,6 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SHA"
           git merge-base --is-ancestor "$SHA" origin/main
-      # Automatic promotion only: wait out the remainder of the 30-minute
-      # soak past the staging-green time. The guard computed the remainder;
-      # manual dispatches and waived modes carry 0 and skip immediately. The
-      # schema/roles gates run concurrently in their own jobs, so the staged
-      # build bakes while they verify, and the deploy below starts only
-      # after this step.
-      - name: Soak past the staging-green time (automatic runs only)
-        env:
-          SOAK_SECONDS: ${{ needs.guard.outputs.soak_seconds }}
-        run: |
-          set -euo pipefail
-          case "${SOAK_SECONDS:-}" in
-            ""|0) echo "no soak remaining" ;;
-            *[!0-9]*) echo "::error::soak_seconds must be a non-negative integer"; exit 1 ;;
-            *) echo "soaking ${SOAK_SECONDS}s after staging went green"; sleep "$SOAK_SECONDS" ;;
-          esac
       - name: Require a production Worker URL distinct from staging
         env:
           PRODUCTION_URL: ${{ vars.PRODUCTION_WORKER_URL }}
@@ -1114,8 +1360,13 @@ jobs:
       # inject_error_rate_spike input judges a rehearsal 5xx firing instead,
       # proving the fail-to-rollback chain with no traffic. Reviewed tooling
       # runs from the workflow commit (../tooling), never the guarded SHA.
+      # Deploy mode only: after a rollback restore there is no snapshot to
+      # roll back to, so a firing verdict (or a stray drill input) would
+      # fail the recovery run red with no action possible. The guard already
+      # refuses the drill outside deploy mode with takeover.
       - name: Gate promotion on REST 5xx error rate
         id: error_rate_gate
+        if: env.MODE == 'deploy'
         env:
           PRODUCTION_URL: ${{ vars.PRODUCTION_WORKER_URL }}
           # Optional until the Operator provisions it: absent means the gate
@@ -1225,6 +1476,11 @@ jobs:
     # A rollback serves an older version, so it is never released.
     needs: [guard, production]
     if: needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.skip == ''
+    # The second job holding the deploy-production lane: the release dispatch
+    # for the just-deployed SHA serializes behind a running production job.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'release') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
