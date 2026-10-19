@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::PgPool;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
@@ -111,6 +112,47 @@ fn connect_options(raw: &str, statement_timeout: &str) -> Result<PgConnectOption
 static DATABASE_DDL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
 
+// A DNS blip on the disposable Postgres service fails every fixture created
+// while it lasts (each connect fails fast, so a whole suite goes red in
+// seconds). Retry the bootstrap connect on transport errors only, with
+// exponential backoff from this base; the sleeps below total ~7.5s.
+const ADMIN_CONNECT_ATTEMPTS: u32 = 5;
+const ADMIN_CONNECT_RETRY_BASE: Duration = Duration::from_millis(500);
+
+/// Only transport-level failures are retried: DNS blips and refused/reset
+/// connections. Auth, TLS, protocol and config errors fail immediately, so a
+/// misconfigured fixture never burns minutes retrying a certain failure.
+fn is_transient_connect_error(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Io(_))
+}
+
+async fn retry_on_transient<T, F, Fut>(
+    attempts: u32,
+    base_delay: Duration,
+    mut op: F,
+) -> Result<T, sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, sqlx::Error>>,
+{
+    let mut attempt = 0;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt + 1 < attempts && is_transient_connect_error(&error) => {
+                eprintln!(
+                    "test bootstrap connect failed (attempt {}/{}): {error}; retrying",
+                    attempt + 1,
+                    attempts
+                );
+                tokio::time::sleep(base_delay * 2u32.pow(attempt)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn database_name() -> String {
     let time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -177,12 +219,15 @@ pub struct TestDatabase {
 impl TestDatabase {
     pub async fn create(raw: &str, migrations: &Migrator) -> Result<Self> {
         let options = connect_options(raw, FIXTURE_STATEMENT_TIMEOUT)?;
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect_with(connect_options(raw, ADMIN_DDL_STATEMENT_TIMEOUT)?)
-            .await
-            .context("connect to test bootstrap database")?;
+        let admin_options = connect_options(raw, ADMIN_DDL_STATEMENT_TIMEOUT)?;
+        let admin = retry_on_transient(ADMIN_CONNECT_ATTEMPTS, ADMIN_CONNECT_RETRY_BASE, || {
+            PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(10))
+                .connect_with(admin_options.clone())
+        })
+        .await
+        .context("connect to test bootstrap database")?;
         let name = database_name();
         let created = {
             let _ddl = DATABASE_DDL.lock().await;
@@ -579,5 +624,55 @@ mod tests {
             guard_database_url(&format!("postgres://agent_test:@agent-testdb:5432/{name}"))
                 .unwrap();
         }
+    }
+
+    fn transient_io_error() -> sqlx::Error {
+        sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Temporary failure in name resolution",
+        ))
+    }
+
+    #[tokio::test]
+    async fn transient_connect_errors_are_retried_until_success() {
+        let mut calls = 0;
+        let result = retry_on_transient(5, Duration::ZERO, || {
+            calls += 1;
+            let attempt = calls;
+            async move {
+                if attempt < 3 {
+                    Err(transient_io_error())
+                } else {
+                    Ok("connected")
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), "connected");
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn persistent_transient_errors_give_up_after_max_attempts() {
+        let mut calls = 0;
+        let result: Result<(), sqlx::Error> = retry_on_transient(3, Duration::ZERO, || {
+            calls += 1;
+            async { Err(transient_io_error()) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn non_transient_errors_are_not_retried() {
+        let mut calls = 0;
+        let result: Result<(), sqlx::Error> = retry_on_transient(5, Duration::ZERO, || {
+            calls += 1;
+            async { Err(sqlx::Error::RowNotFound) }
+        })
+        .await;
+        assert!(matches!(result, Err(sqlx::Error::RowNotFound)));
+        assert_eq!(calls, 1);
     }
 }
