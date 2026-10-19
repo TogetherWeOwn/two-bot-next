@@ -1,4 +1,4 @@
-//! The v8 backup envelope (also reads v3/v4/v5/v6/v7): manifest / rows / end marker, gzipped NDJSON.
+//! The v9 backup envelope (also reads v3/v4/v5/v6/v7/v8): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -83,6 +83,11 @@ pub const DUMP_TABLES: &[&str] = &[
     // no member column, archived like the other aggregate tables. No foreign
     // keys, so order is free.
     "game_activity_guild_aggregates",
+    // Assistant monthly-cap ledger (0446/0447): one guild-keyed counter row
+    // per guild with no member column, archived so caps survive a restore
+    // fail-closed (an excluded ledger would grant a fresh quota after every
+    // restore). No foreign keys, so order is free.
+    "assistant_monthly_builds",
     "member_levels",
     // Seasonal XP projection (0100): append-only mirror of lifetime XP per
     // quarter, guild-keyed with no foreign keys, so order beside
@@ -222,6 +227,13 @@ pub const V7_ADDED_TABLES: &[&str] = &[
 /// absent from an older version.
 pub const V8_ADDED_TABLES: &[&str] = &["stream_live_claims"];
 
+/// Tables first covered by v9: guild game-activity aggregates (0441/0442) and
+/// the assistant monthly-cap ledger (0446/0447). Older archives may omit them;
+/// restore clears the destination rows, as for every versioned addition.
+/// New archives must contain both counters so their state survives recovery.
+pub const V9_ADDED_TABLES: &[&str] =
+    &["game_activity_guild_aggregates", "assistant_monthly_builds"];
+
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
 /// legacy subsystems. A table created by migrations must leave this list
@@ -297,8 +309,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v8 coverage; the reader also accepts frozen v3/v4/v5/v6/v7 coverage.
-pub const DUMP_VERSION: u32 = 8;
+/// Write complete v9 coverage; the reader also accepts frozen v3/v4/v5/v6/v7/v8 coverage.
+pub const DUMP_VERSION: u32 = 9;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -830,10 +842,11 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     && version != 5
                     && version != 6
                     && version != 7
+                    && version != 8
                     && version != u64::from(DUMP_VERSION)
                 {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4, 5, 6, 7 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -1091,15 +1104,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // Historical inventories are pinned by fixtures. New v8 archives must cover
-    // reservations, the retention queues (0438, v7), the seasonal XP
-    // projection (0100, v7), the event store (0427 voice plus 0428
-    // presence plus 0429 thread lifecycle plus 0430 message/reaction plus
-    // 0431 stage/interaction/audit capture plus 0432 member capture, v6)
-    // and the stream go-live ledger (0440/0443, v8) too; v7 recovery points remain
-    // readable without the ledger, v6 ones without the ledger and the v7
-    // seasonal projection and retention queues, v5 ones without those and the
-    // v6 event store, and v4 ones without any of the v5/v6/v7/v8 additions.
+    // Historical inventories are pinned by fixtures. Each old version waives
+    // only tables first covered by a later version. New v9 archives require
+    // the full inventory, including both guild counters (0441/0442/0446/0447).
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -1112,20 +1119,28 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V6_ADDED_TABLES.contains(name)
                     && !V7_ADDED_TABLES.contains(name)
                     && !V8_ADDED_TABLES.contains(name)
+                    && !V9_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(5) => {
                 !V6_ADDED_TABLES.contains(name)
                     && !V7_ADDED_TABLES.contains(name)
                     && !V8_ADDED_TABLES.contains(name)
+                    && !V9_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(6) => {
                 !V7_ADDED_TABLES.contains(name)
                     && !V8_ADDED_TABLES.contains(name)
+                    && !V9_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
-            Some(7) => !V8_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
+            Some(7) => {
+                !V8_ADDED_TABLES.contains(name)
+                    && !V9_ADDED_TABLES.contains(name)
+                    && !OPTIONAL_LEGACY_TABLES.contains(name)
+            }
+            Some(8) => !V9_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
@@ -1883,6 +1898,7 @@ mod tests {
                     && !V6_ADDED_TABLES.contains(name)
                     && !V7_ADDED_TABLES.contains(name)
                     && !V8_ADDED_TABLES.contains(name)
+                    && !V9_ADDED_TABLES.contains(name)
             })
             .collect();
         assert_eq!(names, expected);
@@ -1893,6 +1909,8 @@ mod tests {
                 "privacy_opt_outs",
                 "guild_analytics_settings",
                 "privacy_opt_out_audit",
+                "game_activity_guild_aggregates",
+                "assistant_monthly_builds",
                 "member_season_xp",
                 "stream_live_claims",
                 "voice_create_reservations",
@@ -1941,7 +1959,7 @@ mod tests {
         assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
         // The same inventory at the current version refuses: new archives must
         // cover the event store.
-        assert_eq!(DUMP_VERSION, 8);
+        assert_eq!(DUMP_VERSION, 9);
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
         assert!(validate_manifest(&current)
@@ -2027,7 +2045,7 @@ mod tests {
             .contains("event_store"));
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
-        assert_eq!(DUMP_VERSION, 8, "frozen v5 test pins the v8 bump");
+        assert_eq!(DUMP_VERSION, 9, "frozen v5 test pins the v9 bump");
         assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
@@ -2045,7 +2063,7 @@ mod tests {
         // A v6 recovery point written before the seasonal XP projection (0100)
         // declares every covered table except member_season_xp and stays
         // readable; promoting it to v7 without the table is refused. This is
-        // the frozen-manifest guard for the v7 bump (now pinned at v8):
+        // the frozen-manifest guard for the v7 bump (now pinned at v9):
         // building the old manifest from today's inventory (as the v5 tests
         // do) would silently include the new table and miss the refusal.
         let mut v6 = manifest(without(
@@ -2078,7 +2096,7 @@ mod tests {
             "member_season_xp",
         ));
         assert_eq!(v7_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 8, "frozen v6 test pins the v8 bump");
+        assert_eq!(DUMP_VERSION, 9, "frozen v6 test pins the v9 bump");
         assert!(validate_manifest(&v7_gap)
             .unwrap_err()
             .to_string()
@@ -2145,8 +2163,8 @@ mod tests {
         let mut v7_gap = v6.clone();
         v7_gap["version"] = serde_json::json!(DUMP_VERSION);
         assert_eq!(
-            DUMP_VERSION, 8,
-            "frozen pre-retention test pins the v8 bump"
+            DUMP_VERSION, 9,
+            "frozen pre-retention test pins the v9 bump"
         );
         let err = validate_manifest(&v7_gap).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
@@ -2198,11 +2216,68 @@ mod tests {
             "stream_live_claims",
         ));
         assert_eq!(v8_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 8, "frozen v7 test pins the v8 bump");
+        assert_eq!(DUMP_VERSION, 9, "frozen v7 test pins the v9 bump");
         assert!(validate_manifest(&v8_gap)
             .unwrap_err()
             .to_string()
             .contains("stream_live_claims"));
+    }
+
+    #[test]
+    fn v8_archives_read_without_guild_counters_but_v9_requires_them() {
+        // Literal names, not V9_ADDED_TABLES: this reproduces the pre-change
+        // inventory even if the version waiver is accidentally removed.
+        let tables = complete_tables(&BTreeMap::new())
+            .into_iter()
+            .filter(|table| {
+                table["name"] != "assistant_monthly_builds"
+                    && table["name"] != "game_activity_guild_aggregates"
+            })
+            .collect();
+        let mut old = manifest(tables);
+        for version in 4..=8 {
+            old["version"] = serde_json::json!(version);
+            let contents = inspect_bytes(&gzip_lines(&[
+                old.clone(),
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .expect("old archives without the v9 guild counters stay readable");
+            assert_eq!(contents.manifest.version, version);
+            assert_eq!(
+                contents.manifest.missing_tables(),
+                ["game_activity_guild_aggregates", "assistant_monthly_builds"]
+            );
+            let mut gap = old.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != "events");
+            assert!(validate_manifest(&gap)
+                .unwrap_err()
+                .to_string()
+                .contains("missing tables: events"));
+        }
+        assert_eq!(DUMP_VERSION, 9, "new dumps require both guild counters");
+        let current = manifest(complete_tables(&BTreeMap::new()));
+        inspect_bytes(&gzip_lines(&[
+            current.clone(),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("complete v9 archive inspects");
+        for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
+            let mut gap = current.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != name);
+            let error = inspect_bytes(&gzip_lines(&[
+                gap,
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(name), "{error}");
+        }
     }
 
     #[test]
@@ -2267,7 +2342,7 @@ mod tests {
         future[0]["version"] = serde_json::json!(DUMP_VERSION + 1);
         let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
         assert!(
-            message.contains(&format!("reads 3, 4, 5, 6, 7 and {DUMP_VERSION}")),
+            message.contains(&format!("reads 3, 4, 5, 6, 7, 8 and {DUMP_VERSION}")),
             "unknown versions are refused with the readable list: {message}"
         );
     }

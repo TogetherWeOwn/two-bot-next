@@ -34,16 +34,26 @@ Usage (the workflow supplies the environment):
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 UA = "two-bot-next-staging-rollout/1.0"
 DEFAULT_URL = "https://two-bot-next-staging.5150.workers.dev/mcp"
 TOKEN_ENV = "STAGING_MCP_TOKEN"
 URL_ENV = "STAGING_MCP_URL"
 MIN_TOKEN_LENGTH = 32
+STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
+# Response bound matching MCP_MAX_BODY_BYTES in wrangler/src/mcp.ts: every
+# response read takes at most MCP_MAX_BODY_BYTES+1 bytes so a hidden suffix
+# is detected. Any longer body is refused before decoding with the fixed
+# BODY_TOO_LARGE_TEXT; the oversize bytes never reach parsing, logs or the
+# artifact. Refusals never echo the body or the bearer.
+MCP_MAX_BODY_BYTES = 64 * 1024
+BODY_TOO_LARGE_TEXT = "MCP response answered over the body cap"
 REQUEST_TIMEOUT_SECONDS = 25
 SCHEMA_VERSION = 1
 
@@ -77,12 +87,37 @@ def fail_refusal(message):
     return 2
 
 
+def valid_staging_mcp_url(url):
+    """Only the exact staging https /mcp URL; refuse userinfo, port, query and fragment."""
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    return (parts.scheme == "https" and port is None
+            and parts.username is None and parts.password is None
+            and bool(STAGING_HOST.fullmatch(parts.hostname or ""))
+            and parts.path == "/mcp" and not parts.query and not parts.fragment)
+
+
 def redacted_request_line(rpc_method, rpc_id, extra=""):
     base = f'POST /mcp {{"jsonrpc":"2.0","id":{rpc_id},"method":"{rpc_method}"'
     if extra:
         base += f",{extra}"
     base += '} Authorization: Bearer ***'
     return base
+
+
+def _bounded_body_text(raw):
+    """Decode a capped read, or the fixed over-cap refusal text (never the body)."""
+    if len(raw) > MCP_MAX_BODY_BYTES:
+        return BODY_TOO_LARGE_TEXT
+    return raw.decode("utf-8", errors="replace")
 
 
 def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
@@ -92,6 +127,8 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
     The bearer is never included in any returned string. Redirects are
     refused (NoRedirect) so the bearer never leaves the target origin;
     a 3xx surfaces as its HTTP status and is recorded as a failure.
+    Every body read is capped at MCP_MAX_BODY_BYTES+1 bytes; an oversize
+    body is refused before decoding with BODY_TOO_LARGE_TEXT.
     """
     data = json.dumps(payload).encode("utf-8")
     headers = {
@@ -107,11 +144,11 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
         with opener.open(req, timeout=timeout) as resp:
             status = resp.status
             resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-            body = resp.read().decode("utf-8", errors="replace")
+            body = _bounded_body_text(resp.read(MCP_MAX_BODY_BYTES + 1))
             return status, resp_headers, body
     except urllib.error.HTTPError as e:
         try:
-            body = e.read().decode("utf-8", errors="replace")
+            body = _bounded_body_text(e.read(MCP_MAX_BODY_BYTES + 1))
         except Exception:
             body = ""
         resp_headers = {k.lower(): v for k, v in (e.headers.items() if e.headers else [])}
@@ -136,8 +173,10 @@ def main():
     if not token or len(token) < MIN_TOKEN_LENGTH:
         return fail_refusal(f"${TOKEN_ENV} missing or shorter than {MIN_TOKEN_LENGTH}; nothing sent")
     url = os.environ.get(URL_ENV, DEFAULT_URL).strip() or DEFAULT_URL
-    if not (url.startswith("https://") and "/mcp" in url):
-        return fail_refusal("staging MCP URL must be an https URL containing /mcp; nothing sent")
+    if not valid_staging_mcp_url(url):
+        return fail_refusal(
+            "staging MCP URL must be the exact staging https URL "
+            "two-bot-next-staging.<sub>.workers.dev/mcp; nothing sent")
 
     probes = []
     failures = []

@@ -6,7 +6,7 @@
 //! when every component reports ready, else 503 with the per-component
 //! breakdown — never a bare error string.
 
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 
 use axum::{http::StatusCode, routing::get, Json, Router};
 use tokio::{net::TcpListener, sync::RwLock};
@@ -61,6 +61,13 @@ pub struct SharedState {
     /// attaches the fenced env read. The gateway itself keeps running —
     /// only readiness reports it down, which is what the deploy gate reads.
     pub gateway_fail_injected: bool,
+    /// Transition latch for the `/ops` event-store snapshot probe: false
+    /// while the last probe succeeded, true while it fails. The `/ops`
+    /// handlers log `ops_snapshot_failed` on the ok→failed edge only, so a
+    /// steady outage emits one line; recovery resets it silently and re-arms
+    /// the next edge. Shared by `/ops/summary` and `/ops/backfill` through
+    /// the cloned state, so the two endpoints never double-log one outage.
+    pub ops_snapshot_failed: Arc<AtomicBool>,
 }
 
 impl SharedState {
@@ -71,6 +78,7 @@ impl SharedState {
             failure: FailureSlot::default(),
             backfill_ring: crate::ops_backfill::SharedRing::empty(),
             gateway_fail_injected: false,
+            ops_snapshot_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 

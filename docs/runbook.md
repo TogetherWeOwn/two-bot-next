@@ -319,6 +319,48 @@ Escalate when the 5xx share stays above threshold across several windows after
 containment, or when 5xx coincide with 429/transport failures suggesting a
 wider Discord or network incident.
 
+#### Alert: REST admission breaker open
+
+The invalid-request breaker stayed open (`two_bot_rest_guard_breaker_open` 1)
+for three consecutive valid keepalive samples. This is a **ticket**, not a page:
+the guard refuses non-essential REST sends locally. Essential interaction
+acknowledgements may bypass this breaker, but never a global pause or fatal
+token state. Local refusals happen before any REST wire attempt, so the
+request counter (`two_bot_rest_requests_total`) and its 429/5xx alerts cannot
+see this condition — a quiet 429/5xx board alongside this ticket is the
+expected shape of a local-refusal episode, not proof the REST path is healthy.
+Global pauses (`two_bot_rest_guard_global_paused`) report separate backpressure
+and are not this rule's input. However, every 429 response, including global
+429s, counts toward the same 600 s invalid-request window and can contribute
+to opening the breaker.
+
+First response: read the guard's `discord_breaker_open` log line for the
+invalid-request count and threshold, plus `two_bot_rest_guard_invalid_requests_in_window`
+and `two_bot_rest_guard_rejected_requests_total` from the authorized
+`/ops/metrics` scrape; confirm whether a deploy is in progress (a fresh
+deploy shipping a bad token or a hot invalid route fills the window fast).
+There is no manual breaker reset: the breaker closes on its own when the
+10-minute rolling invalid-request window clears below threshold, so do not
+restart the container to "clear" it — a restart only resets the counters and
+destroys the evidence. Missing, malformed or failed scrapes break the sampling
+streak but hold any firing ticket; only a valid closed sample resolves it.
+
+Check `two_bot_rest_guard_token_invalid` and the `/readyz` `token_invalid`
+component separately. That fatal latch refuses all new REST attempts, including
+essential acknowledgements. Once outstanding responses finish and the window
+drains, the breaker closes and this ticket resolves even while the token latch
+stays set and readiness stays **503**. **Ticket resolution is not REST recovery.**
+Follow the [fatal-token procedure](rest-guard.md#fatal-bot-token-and-readiness):
+the authorized credential operator verifies provisioning/token validity, then
+restarts with corrected configuration. Waiting for the window cannot clear
+the token latch; never automatically rotate a token or bypass the guard.
+
+Escalate when the breaker stays open across windows after the rolling window
+should have cleared, when invalid requests keep arriving with no suspect
+deploy (a caller may be minting bad requests in a loop), or when the ticket
+coincides with missed gateway events or 5xx alerts suggesting a wider Discord
+or network incident.
+
 #### Alert: DB pool
 
 The SQLx pool sat at its maximum with zero idle connections for three
@@ -487,6 +529,28 @@ refusals or p95 creep past 5 s — that never spikes hard enough to page.
 Same signals, same first response, same escalation, lower urgency. Do not
 close it as "fast burn resolved": the fast window can clear while the slow
 grind continues.
+
+The first firing also files one tracking issue by itself. Every five minutes
+the `slow-burn-tracker` workflow scrapes staging `/ops/metrics`, replays the
+checked-in slow-burn verdict over its cached ring and reconciles the
+`slow-burn` label: no open card means file one, an open card stays untouched
+(a refresh comment lands at most every six hours, so a refire never
+duplicates the card), and a cleared burn resolves and closes it. An unknown
+verdict — a failed scrape or evaluation, unusable join series, or slow
+windows without full history — never closes the card, and a lost ring
+rebuilds instead of firing. The five-minute cadence is load-bearing for
+the six-hour baseline: GitHub runs `*/5` best-effort, so when the newest
+ring entry is 600 s or older the run emits a `::warning::` instead of
+reading green-with-unknown. Entry age alone cannot prove coverage — sub-600 s
+spacings can also leave the baseline window empty — so the tracker records
+the most recent covered moment beside the ring, seeds the tracking start on
+the first live unknown run when it never covered, and warns once the slow
+windows go ~6.5 h uncovered: while coverage is gone genuine burns go unfiled
+and open cards stay unclosed. The tracker needs the `slow-burn-tracker` environment
+bearer for `/ops/metrics`; without it the run warns and stays green. Prove
+the path by dispatching the workflow with the fire and clear fixtures: they
+run the real verdict and the real issue calls under the `slow-burn-test`
+label without touching the live ring.
 
 #### Alert: voice creator-map stale
 
@@ -955,6 +1019,57 @@ The Container DO failed the container-internal `/metrics` scrape on 3 consecutiv
 First response: read the scrape through the existing authorized `/ops/metrics` path, check container `/readyz` and Worker/container logs for `two-bot metrics scrape failed`. Timeouts (6 s deadline), non-OK status, oversized bodies (64 KiB cap) and invalid exposition all count as failure; the deadline and cap are unchanged by this alert. Notifications and logs carry only this runbook link and build context, never response bodies.
 
 A lost scrape never resolves any metric-rule incident: missing evidence is not recovery evidence, so previously firing alerts stay firing through the loss, and the existing dispatch-drop interruption still applies. The first complete valid scrape after the incident resolves only the scrape-loss ticket; metric rules re-evaluate on that same scrape and resolve only on their own evidence. A valid scrape before the third failure silently resets the streak with no resolve.
+
+#### Alert: audit delivery halt
+
+`audit_delivery_halt` is a **ticket, not a page**: the label-free
+`two_bot_audit_delivery_halt` gauge stayed `1` for three consecutive valid
+keepalive samples. At the default 60 s cadence the first-to-third span is
+about two minutes, so an intentional short hold cleared before that span stays
+quiet. This is a sample bound, not a maintenance-window authorization or a
+wall-clock guarantee at a different keepalive cadence. A deliberate longer
+hold still tickets once; acknowledge it through normal incident tracking.
+
+First response: establish whether the hold is intended before attempting to
+resume delivery. Correlate the ticket's build/log links with the authorized
+maintenance record and the fixed `audit_mirror_halt_engaged` /
+`audit_mirror_halt_disengaged` events. A halted sweep intentionally claims
+nothing but still records job success every 30 s. Fresh
+`audit_retry` success with gauge `1` means a persistent hold, not a wedged
+retry loop; do not restart it to clear the ticket. An undocumented hold or one
+past its intended end needs the authorized operator to diagnose it this watch
+shift. Check DB/pool errors and job failures separately.
+
+An `audit_retry_halt_unreadable` warning is **not a new halt reading**: the
+Rust process retains its previous gauge. Its supervisor reports a failed
+`audit_retry` attempt. While `two_bot_job_consecutive_failures{job="audit_retry"}`
+is nonzero (including other failed audit sweeps), this rule neither fires nor
+recovers. Missing, duplicate, labeled or non-boolean halt readings and failed
+scrapes also break the pending streak while retaining an active ticket. A valid
+`0` with a healthy audit sweep resolves once; a fresh `1` needs a new run of
+three samples after recovery. DO reconstruction preserves the streak and active
+state; older stored state starts with zero streak. A process restart is not
+proof that the persistent switch was cleared: the process's initial zero gauge
+cannot resolve a ticket until `audit_retry` has a nonzero last-success timestamp.
+Confirm a healthy readable sweep.
+
+Unhalt only through the existing durable store contract, after the authorized
+operator confirms the hold is no longer needed: `delivery_halt()` reads its
+presence and `disengage_halt()` clears it under the store's existing fence.
+See the [audit control boundary](#containment-kill-switches-and-feature-flags) and
+[audit store protocol](audit-store.md#crash-and-halt-protocol-for-the-service-slice).
+There is **no supported binary audit-halt/unhalt command or operator HTTP
+endpoint** here; do not invent one, issue ad hoc SQL, clear pending/quarantined
+rows, or reset accepted-send evidence. If that execution path is unavailable,
+route the exact request to the authorized operator rather than changing policy.
+Verify the next healthy sweep reports `0` and the normal drain resumes; clearing
+the alert alone is not delivery evidence.
+
+Only the fixed rule key, ticket classification and public runbook link enter
+transition messages. Keep audit content, actor IDs, halt reason text and
+free-text labels out of evidence. The existing persist-before-notify path and
+forwarding gate are reused; this adds no external ticket-system integration,
+new control, retention/delivery change or production activation.
 
 #### Alert: eventsub reconcile failed
 
@@ -1819,7 +1934,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 
 | Control | Ported contract | Current operational boundary |
 |---|---|---|
-| Audit kill switch | Durable `audit_kill_switch`, singleton `id=1`; `engage_halt(actor_id)` / `disengage_halt()` library methods. Halt blocks queue discovery/claim/preparation, not fact recording or an already prepared/in-flight send. | Store exists, delivery service/operator endpoint not wired. No supported command in this binary. Durable DB errors propagate; legacy pure-model read-fail-open is **not** send authorization. See [audit store](audit-store.md). |
+| Audit kill switch | Durable `audit_kill_switch`, singleton `id=1`; `engage_halt(actor_id)` / `disengage_halt()` library methods. Halt blocks queue discovery/claim/preparation, not fact recording or an already prepared/in-flight send. | Store and delivery sweep exist (`crates/bot/src/website_jobs.rs:289` registers `audit_runtime`; `crates/bot/src/audit_runtime.rs:141-159` installs the `audit_retry` sweep). Operator endpoint not wired: no supported command in this binary. Durable DB errors propagate; legacy pure-model read-fail-open is **not** send authorization. See [audit store](audit-store.md). |
 | Automod | Exact `TWO_AUTOMOD=1` enables config. Dry-run by default; exact `TWO_AUTOMOD_ENFORCE=1` selects enforce. | Forwarded and composed into the gateway when activation/configuration permit. Requires valid Owen/protected-role configuration; enforcement can sanction. `TWO_AUTOMOD=1` requests MESSAGE_CONTENT intent. Flags alone do not override identity/permission gates or stop the bot. Filter/effect semantics, repeat expiry, corpus care and triage: [automod operator guide](automod-operator-guide.md). |
 | Moderation | Exact `TWO_MODERATION=1`; enabled config requires `TWO_OWEN_USER_ID`; protected-role policy applies. | Forwarded; channel handlers `/purge`, `/slowmode`, `/lockdown`, `/unlock` are registered and subject to activation and permission checks. Do not infer every member-moderation builtin executes. No config toggle demonstrated as an emergency stop. |
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Per-feature gates, not operational containment. Verify the affected deployed handler; registry publishing or a periodic job alone does not prove a specific action is active. |
@@ -2406,7 +2521,7 @@ into this Rust binary without an implemented dispatch path.
 | Redeploy/rollback/Coolify deployment | Replaced by explicit Wrangler environment/version/image procedure. Current production cutover remains separate; no Coolify action is prescribed here. |
 | Backup/restore, off-box storage, timers | Ported CLI/unit templates; [backup.md](backup.md). Only test-container rehearsals authorized here; no assertion timers are installed. |
 | Guild-config snapshot/restore/seal/drift | Ported staging-guarded CLI; not permission to run a real restore or use a live token. |
-| Operational audit kill switch/MAC reasons | Core/store port exists; delivery/operator control not wired. No fake SQL/CLI replacement. |
+| Operational audit kill switch/MAC reasons | Core/store port exists; delivery sweep wired (`crates/bot/src/website_jobs.rs:289`, `crates/bot/src/audit_runtime.rs:141-159`), operator control not wired. No fake SQL/CLI replacement. |
 | Automod, moderation, feature toggles | Forwarded gates, channel-command handlers and gateway automod are implemented and identity/permission gated. This is not blanket builtin coverage or cutover approval; use the current containment table and verify the deployed writer. |
 | Health/REST rate limits/429 breaker | Liveness/readiness, durable token admission, executor-local pacing and process-wide guard are implemented. They differ from the legacy control topology; no manual reset endpoint. The private announcement receiver has a separate governor; a legacy writer uses its own runbook. |
 | Attribution/scorecard/plan/onboarding/automation reports | Legacy read-only reporting CLIs intentionally dropped by parity decision; core calculations/store presence does not add operator commands. |
