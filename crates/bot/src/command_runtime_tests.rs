@@ -6956,7 +6956,8 @@ async fn worker_verdict_drives_prefix_trigger_from_call_site() {
     ]);
     runtime
         .initialize_custom_commands(
-            GatewayCommandConfig::from_map(GUILD, &vars).expect("dispatch command config"),
+            GatewayCommandConfig::from_map_for_activation(GUILD, &vars, true)
+                .expect("dispatch command config"),
         )
         .await
         .expect("custom-command bootstrap (loopback REST, isolated DB)");

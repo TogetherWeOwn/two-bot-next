@@ -198,6 +198,18 @@ outcomes. See `docs/metrics.md` for the full label table.
 | --- | --- |
 | `two_bot_moderation_enforcements_total{verb,outcome}` | Terminal moderation enforcements by bounded verb and outcome |
 
+## Retention replay series
+
+Label-free counter emitted by the retention purge-skip path in
+`crates/bot/src/gateway.rs` (`retention_lifecycle`) and rendered by
+`crates/core/src/metrics.rs`. No guild id, SQLSTATE or error text ever
+becomes a label. Manual check, not an alert input: consumed by no alert
+rule. Full semantics live in `docs/metrics.md`.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_retention_replay_needed_total` | Skipped retention purges needing Operator replay: one per real guild removal whose purge-queue write hit the schema gap; successful queue writes and rejoin-cancel skips never increment it |
+
 ## Scheduled job labels
 
 Each label owns independent `two_bot_job_runs_total{job,outcome}`,
@@ -232,6 +244,7 @@ is the single shared spelling also pinned in `evidence.rs`
 | `voice_join_slow_burn` | Same inputs as `voice_join_fast_burn` | Ticket, not page: same budget burning faster than 6x in both the 6 h and 30 min windows with the same per-window volume and bad-move floors; catches the sustained grind the fast rule never spikes on; do not close as "fast burn resolved" |
 | `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` with `two_bot_voice_creator_map_generation` | Pages when the age since the last successful creator-map merge passes 600 s (two missed 5 min refreshes) after at least one merge; generation 0 (never merged: boot or voice parked) never fires; the gauges are optional scrape inputs, so older containers hold the previous state |
 | `error_budget_fast_burn` | All `two_bot_rest_requests_total` samples (eligible requests) against `result="5xx"` plus `result="transport"` (budget spend) | Pages when the REST error budget (99.9% success over 48 h) burns faster than 12x in both the 15 min and 2 min windows; each window needs at least 10 eligible requests and two budget errors; incomplete post-restart windows stay inactive; missing or malformed inputs hold the previous state |
+| `error_budget_slow_burn` | Same inputs as `error_budget_fast_burn` | Ticket, not page: same budget burning faster than 3x in both the 2 h and 15 min windows with the same per-window volume and error floors; needs full 2 h history, holds on missing inputs, scrape gaps, or counter resets, and resolves on a covered quiet or below-threshold 15 min window |
 | `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` | Pages when the `tampered` counter (only `BadSignature`) rises in 3 consecutive samples; the first sample only baselines, a flat window resolves, a reset rebaselines, and missing/invalid scrapes hold firing |
 | `eventsub_reconcile_failed` | `two_bot_eventsub_reconcile_passes_total{outcome}` with the fixed `healthy`/`pending`/`failed` outcomes | Ticket, not page: fires when the failed-pass counter grows between valid samples, even beside healthy growth; the first valid sample only stores a baseline, healthy-only or pending-only growth never fires, and a flat failed counter never recovers (only healthy growth with no failed growth resolves, once); any backwards counter re-baselines: the reset sample fires when the new process already counted a failed pass (failed startup pass) and otherwise holds a firing ticket instead of fabricating a transition; missing or invalid samples hold the previous state; the family is an optional scrape input, so older containers hold the previous state |
 
@@ -359,6 +372,13 @@ worker halted on a Discord 401 (or the writer latched one); the probe stays
 out because only a token fix and a restart clear that halt.
 `voice halt re-probe: store still refusing` / `voice halt re-probe timed out`
 (debug): the latch stays set; the next probe runs after the re-probe interval.
+
+Empty-grace override warning (in `stored_empty_grace_with` in
+`crates/bot/src/voice_rooms.rs`, guild-only fields, no IDs):
+`stored empty-grace override out of range; using boot fallback` (warn): the
+stored per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row is malformed or
+outside 0 to 600 whole seconds, so the sweep keeps the boot fallback. The
+line carries the setting key and the `out_of_range` reason.
 
 Creator-view refresh actor messages (all in `GuildRoomWorker::revalidate_creator`
 / `reload_creators` in `crates/bot/src/voice_rooms.rs`, guild-only fields,
