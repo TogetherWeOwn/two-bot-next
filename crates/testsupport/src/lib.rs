@@ -199,6 +199,32 @@ fn is_transient_bootstrap_error(error: &anyhow::Error) -> bool {
     MARKERS.iter().any(|marker| text.contains(marker))
 }
 
+/// Run a bootstrap operation until it succeeds, retrying only transient
+/// hosted-runner infrastructure failures. The attempt budget is explicit so
+/// unit tests pin the loop: a transient-then-success operation is called
+/// until success, a deterministic error is called exactly once.
+async fn with_bootstrap_retries<T, F, Fut>(attempts: usize, mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let attempts = attempts.max(1);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < attempts && is_transient_bootstrap_error(&error) => {
+                eprintln!(
+                    "transient test-database bootstrap failure (attempt {attempt}/{attempts}): {error:#}; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(250u64 << (attempt - 1))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl TestDatabase {
     pub async fn create(raw: &str, migrations: &Migrator) -> Result<Self> {
         // Validate once and fail fast: guard/auth errors are deterministic and
@@ -210,20 +236,7 @@ impl TestDatabase {
         // host). Retry only transient bootstrap failures; anything else fails
         // fast with its original context.
         const ATTEMPTS: usize = 4;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match Self::create_once(raw, migrations).await {
-                Ok(fixture) => return Ok(fixture),
-                Err(error) if attempt < ATTEMPTS && is_transient_bootstrap_error(&error) => {
-                    eprintln!(
-                        "transient test-database bootstrap failure (attempt {attempt}/{ATTEMPTS}): {error:#}; retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(250u64 << (attempt - 1))).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        with_bootstrap_retries(ATTEMPTS, || Self::create_once(raw, migrations)).await
     }
 
     async fn create_once(raw: &str, migrations: &Migrator) -> Result<Self> {
@@ -471,6 +484,48 @@ mod tests {
                 "must fail fast: {deterministic}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_retry_retries_transient_until_success() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        let result = with_bootstrap_retries(3, || {
+            let calls = calls.clone();
+            async move {
+                let mut calls = calls.lock().unwrap();
+                *calls += 1;
+                let attempt = *calls;
+                drop(calls);
+                if attempt < 3 {
+                    Err::<u8, _>(anyhow::anyhow!("connection refused"))
+                } else {
+                    Ok(7u8)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 7);
+        assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_retry_fails_fast_on_deterministic_error() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        let result = with_bootstrap_retries(4, || {
+            let calls = calls.clone();
+            async move {
+                *calls.lock().unwrap() += 1;
+                Err::<u8, _>(anyhow::anyhow!(
+                    "test database must use agent-testdb on explicit port 5432"
+                ))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), 1);
     }
 
     const SAFE: &str = "postgres://agent_test:@agent-testdb:5432/two_bot_test_guard";

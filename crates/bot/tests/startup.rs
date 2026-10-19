@@ -285,6 +285,93 @@ fn non_unicode_gateway_override_exits_without_logging_its_value() {
     );
 }
 
+fn reserve_test_port() -> (SocketAddr, String) {
+    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+    let addr = reserved.local_addr().unwrap();
+    assert_ne!(addr.port(), 8080);
+    let listen_addr = format!("0.0.0.0:{}", addr.port());
+    drop(reserved);
+    (addr, listen_addr)
+}
+
+/// A parked child that cannot bind its listener exits 1 with this marker
+/// (crates/bot/src/main.rs `listener_bind_failed`). Only that case is
+/// retried: any other early exit is a genuine regression and panics at once.
+fn is_listener_bind_failure(logs: &str) -> bool {
+    logs.contains("listener_bind_failed")
+}
+
+fn should_retry_park_attempt(logs: &str, attempt: u8, attempts: u8) -> bool {
+    attempt < attempts && is_listener_bind_failure(logs)
+}
+
+/// Drain piped child logs until the forwarder threads end at pipe EOF.
+/// Both senders live in those threads, so disconnect means every line the
+/// child wrote has been collected; a `try_recv` drain can race the flush
+/// and report empty logs.
+fn drain_logs(rx: mpsc::Receiver<String>) -> String {
+    let mut logs = String::new();
+    for line in rx {
+        logs.push_str(&line);
+        logs.push('\n');
+    }
+    logs
+}
+
+/// One parked-gateway attempt: spawn on the given port and wait for health.
+/// Returns `None` when the child failed to bind (retryable); panics on any
+/// other early exit so genuine regressions never become a retried pass.
+fn park_once(
+    addr: SocketAddr,
+    listen_addr: &str,
+    vars: &[(&str, &str)],
+    attempt: u8,
+    attempts: u8,
+) -> Option<(String, Bot, mpsc::Receiver<String>)> {
+    let mut child = command(listen_addr)
+        .envs(vars.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start test bot");
+    let (lines_tx, lines_rx) = mpsc::channel();
+    forward_lines(child.stdout.take().unwrap(), lines_tx.clone());
+    forward_lines(child.stderr.take().unwrap(), lines_tx);
+    let mut bot = Bot(child);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = bot.0.try_wait().unwrap() {
+            let logs = drain_logs(lines_rx);
+            if should_retry_park_attempt(&logs, attempt, attempts) {
+                return None;
+            }
+            panic!(
+                "bot exited with {status} before serving the configured port; child logs: {logs}"
+            );
+        }
+        if let Ok(response) = get(addr, "/health") {
+            // The health response must come from the spawned child: a sibling
+            // parked bot on a stolen port serves identical /health and /readyz
+            // bodies, so an exited child here means the response is not ours.
+            if let Some(status) = bot.0.try_wait().unwrap() {
+                let logs = drain_logs(lines_rx);
+                if should_retry_park_attempt(&logs, attempt, attempts) {
+                    return None;
+                }
+                panic!(
+                    "bot exited with {status} around the health probe; response may be from another process; child logs: {logs}"
+                );
+            }
+            return Some((response, bot, lines_rx));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bot did not serve health on the configured non-default port"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn assert_parked_gateway(vars: &[(&str, &str)]) {
     // Reserve a non-default local port; no deployed service is contacted.
     // The reserve/drop/rebind handoff is racy at full parallelism: another
@@ -292,55 +379,28 @@ fn assert_parked_gateway(vars: &[(&str, &str)]) {
     // child then exits on listener bind failure. Retry with a fresh port so
     // a stolen port cannot flake the suite. Child output is piped (not
     // nulled) so a genuine early exit still reports its cause.
+    assert_parked_gateway_with_ports(vars, &mut reserve_test_port);
+}
+
+fn assert_parked_gateway_with_ports(
+    vars: &[(&str, &str)],
+    next_port: &mut dyn FnMut() -> (SocketAddr, String),
+) {
     const ATTEMPTS: u8 = 3;
     let mut attempt = 0;
-    let (addr, listen_addr, health, _bot) = loop {
+    let (addr, listen_addr, health, mut bot, _log_rx) = loop {
         attempt += 1;
-        let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
-        let addr = reserved.local_addr().unwrap();
-        assert_ne!(addr.port(), 8080);
-        let listen_addr = format!("0.0.0.0:{}", addr.port());
-        drop(reserved);
-
-        let mut child = command(&listen_addr)
-            .envs(vars.iter().copied())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start test bot");
-        let (lines_tx, lines_rx) = mpsc::channel();
-        forward_lines(child.stdout.take().unwrap(), lines_tx.clone());
-        forward_lines(child.stderr.take().unwrap(), lines_tx);
-        let mut bot = Bot(child);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let health = loop {
-            if let Some(status) = bot.0.try_wait().unwrap() {
-                let mut logs = String::new();
-                while let Ok(line) = lines_rx.try_recv() {
-                    logs.push_str(&line);
-                    logs.push('\n');
-                }
-                if attempt < ATTEMPTS {
-                    break None;
-                }
-                panic!(
-                    "bot exited with {status} before serving the configured port; child logs: {logs}"
-                );
-            }
-            if let Ok(response) = get(addr, "/health") {
-                break Some(response);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "bot did not serve health on the configured non-default port"
-            );
-            thread::sleep(Duration::from_millis(20));
-        };
-        if let Some(health) = health {
-            break (addr, listen_addr, health, bot);
+        let (addr, listen_addr) = next_port();
+        if let Some((health, bot, log_rx)) = park_once(addr, &listen_addr, vars, attempt, ATTEMPTS)
+        {
+            break (addr, listen_addr, health, bot, log_rx);
         }
-        // Early exit: the port was likely stolen under parallel load. The
-        // dropped bot is killed here; the next attempt reserves a fresh port.
+        assert!(
+            attempt < ATTEMPTS,
+            "park attempt failed to bind on its last allowed attempt"
+        );
+        // Bind failure: the port was stolen under parallel load. The exited
+        // child is reaped here; the next attempt reserves a fresh port.
     };
     assert!(health.starts_with("HTTP/1.0 200"));
 
@@ -385,6 +445,64 @@ fn assert_parked_gateway(vars: &[(&str, &str)]) {
         assert!(Instant::now() < deadline, "healthcheck did not exit");
         thread::sleep(Duration::from_millis(20));
     }
+
+    // The readyz and healthcheck assertions above must have run against the
+    // spawned child: a sibling on a stolen port serves identical bodies.
+    assert!(
+        bot.0.try_wait().unwrap().is_none(),
+        "parked child exited before the end of the assertions"
+    );
+}
+
+#[test]
+fn park_retry_gates_only_on_listener_bind_failure() {
+    assert!(is_listener_bind_failure(
+        "startup_phase=\"listener_bind\" error_class=\"listener_bind_failed\""
+    ));
+    assert!(!is_listener_bind_failure("database initialization failed"));
+    assert!(!is_listener_bind_failure(""));
+    assert!(should_retry_park_attempt(
+        "error_class=\"listener_bind_failed\"",
+        1,
+        3
+    ));
+    assert!(!should_retry_park_attempt(
+        "error_class=\"listener_bind_failed\"",
+        3,
+        3
+    ));
+    assert!(!should_retry_park_attempt(
+        "database initialization failed",
+        1,
+        3
+    ));
+}
+
+#[test]
+fn stolen_port_retries_with_fresh_port() {
+    // Deterministically steal the first attempt's port: with ATTEMPTS=1 this
+    // test fails (bind failure panics instead of retrying), pinning the loop.
+    let held = TcpListener::bind("127.0.0.1:0").expect("hold test port");
+    let held_addr = held.local_addr().unwrap();
+    let held_listen = format!("0.0.0.0:{}", held_addr.port());
+    let calls = std::cell::Cell::new(0u8);
+    let mut provider = || {
+        let n = calls.get() + 1;
+        calls.set(n);
+        if n == 1 {
+            (held_addr, held_listen.clone())
+        } else {
+            reserve_test_port()
+        }
+    };
+    assert_parked_gateway_with_ports(
+        &[("DISCORD_TOKEN", "INVALID"), ("GUILD_ID", "123")],
+        &mut provider,
+    );
+    assert!(
+        calls.get() >= 2,
+        "stolen-port test never took its second attempt"
+    );
 }
 
 fn signal_term(child: &Child) {
