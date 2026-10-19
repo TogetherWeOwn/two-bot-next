@@ -75,9 +75,10 @@ TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_te
 # Ephemeral CI only — on the persistent controller use the wrapper form above.
 TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_test \
   cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
-# Ephemeral CI only — on the persistent controller use the wrapper form below.
+# Persistent controller: bounded wrapper.
 TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
   python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --locked --test gateway_force_identify_cli
+# Ephemeral CI only — on the persistent controller use the wrapper form above.
 TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
   cargo test -p two-bot-cutover --locked --test gateway_force_identify_cli
 ```

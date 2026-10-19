@@ -279,9 +279,26 @@ Staging soak remains a separate gate; this change supplies no live approval.
   counted-claim reconciliation, preserved pre-count decision replay, five
   processed messages and a final violation count of five.
 
-Commands (existing Rust installation, target directory outside the synced tree):
+Commands below are verification recipes, not new execution evidence. On the
+persistent controller, use the
+[bounded build-cache wrapper](build-cache.md#local-builds) from the isolated
+worktree, with a 600000 ms Bash timeout or in the background. Refused or missing
+admission never permits direct compiling Cargo, an external target or another
+cache; follow the [Operator path](build-cache.md#operator-handoff-and-rollback-one-host-step).
+No current pool health is asserted. `cargo fmt` does not compile and may run directly.
 
 ```sh
+# Persistent controller only (fmt may run anywhere).
+python3 scripts/cargo_cache.py run -- test --offline --locked -p two-bot-core -p two-bot-discord --test automod_runtime --test automod_translation --test automod_activation
+python3 scripts/cargo_cache.py run -- test --offline --locked -p two-bot-core --features db --test automod_store --test automod_preserved_replay -- --ignored
+python3 scripts/cargo_cache.py run -- clippy --offline --locked -p two-bot-core -p two-bot-discord --features two-bot-core/db --lib --test automod_runtime --test automod_translation --test automod_activation --test automod_store --test automod_preserved_replay -- -D warnings
+cargo fmt --all -- --check
+```
+
+Ephemeral hosted CI retains its direct Cargo variants and the same filters:
+
+```sh
+# Ephemeral hosted CI only, not a controller fallback.
 cargo test --offline --locked -p two-bot-core -p two-bot-discord --test automod_runtime --test automod_translation --test automod_activation
 cargo test --offline --locked -p two-bot-core --features db --test automod_store --test automod_preserved_replay -- --ignored
 cargo clippy --offline --locked -p two-bot-core -p two-bot-discord --features two-bot-core/db --lib --test automod_runtime --test automod_translation --test automod_activation --test automod_store --test automod_preserved_replay -- -D warnings
