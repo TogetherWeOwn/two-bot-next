@@ -25,12 +25,21 @@ Two record-specific rules live here, not in the schema:
   rule (which suffixes are allowed); it only orders the instants it can
   parse as timezone-aware datetimes.
 * public-safety scan: no internal tracker IDs (`TOG-`, `PAP-`) and no
-  high-confidence secret markers in any string value. This repo is public.
-* input limits: a record or schema may nest at most `MAX_NESTING_DEPTH`
+  high-confidence secret markers in any string value or object key. Key
+  hits are reported at redacted paths, never echoing the key. This repo
+  is public.
+* input limits: a record or schema may hold at most `MAX_DOCUMENT_BYTES`
+  UTF-8 bytes; larger files are refused with a fixed message before any
+  decoding or parsing, so no read is unbounded. A record or schema may
+  nest at most `MAX_NESTING_DEPTH`
   container levels (the root container is level 1). Deeper input, and input
   the decoder refuses (recursion overflow or an oversized integer literal),
   is refused with a fixed message. Bytes that are not UTF-8 are refused with
   their byte offset. No diagnostic echoes raw bytes or values.
+* condition subset: `if` conditions support `properties` with `const`
+  only, the subset the checked-in schema uses. Any other `if` operator
+  is refused with a loud validation error instead of being silently
+  treated as satisfied.
 
 Timestamp policy for fields named `*_utc` (`window.start_utc`,
 `window.end_utc`, `commands[].started_utc`, `deployment.first_readyz_utc`):
@@ -111,6 +120,12 @@ MAX_NESTING_DEPTH = 32
 NESTING_MESSAGE = f"nesting depth exceeds the {MAX_NESTING_DEPTH}-level budget"
 DECODER_DIGITS_MESSAGE = "integer literal exceeds the decoder digit limit"
 
+# Bounds every document read before decoding: the loader issues one bounded
+# read of at most MAX_DOCUMENT_BYTES + 1 (the extra byte witnesses EOF) and
+# refuses larger input before UTF-8 decoding or JSON parsing.
+MAX_DOCUMENT_BYTES = 1024 * 1024
+BYTE_LIMIT_MESSAGE = "document exceeds byte limit"
+
 
 class DuplicateKeyError(ValueError):
     """A JSON object has repeated keys; diagnostics never include its values."""
@@ -122,6 +137,10 @@ class DecoderLimitError(ValueError):
 
 class InvalidUtf8Error(ValueError):
     """Input bytes are not UTF-8; reports the byte offset, never the bytes."""
+
+
+class DocumentTooLargeError(ValueError):
+    """Input exceeds the byte budget; fixed message, never echoes content."""
 
 
 class _ObjectPairs(list):
@@ -192,8 +211,15 @@ def load_json(text):
 
 
 def load_document(path):
+    # One bounded read: even a file that was small at stat time can grow,
+    # so a post-read length check is too late. The size refusal wins over
+    # decoding and parsing, and counts encoded bytes, not characters.
+    with Path(path).open("rb") as handle:
+        data = handle.read(MAX_DOCUMENT_BYTES + 1)
+    if len(data) > MAX_DOCUMENT_BYTES:
+        raise DocumentTooLargeError(BYTE_LIMIT_MESSAGE)
     try:
-        text = Path(path).read_text(encoding="utf-8")
+        text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise InvalidUtf8Error(f"invalid UTF-8 at byte offset {exc.start}") from None
     return load_json(text)
@@ -236,11 +262,45 @@ def check_utc_suffix(value, path, errors):
         )
 
 
-def condition_holds(instance, condition):
-    """Evaluate the small `if` subschemas this schema file uses."""
+def condition_holds(instance, condition, path, errors):
+    """Evaluate the small `if` subschemas this schema file uses.
+
+    Supports `properties` with `const` only. Any other `if` operator is
+    an unsupported condition: record a loud validation error naming the
+    operator (never its value) and treat the condition as not holding,
+    so `then` is skipped but validation still fails.
+    """
     if not isinstance(condition, dict):
         return False
+    supported = True
+    for key in condition:
+        if key != "properties":
+            errors.append(
+                f"{path}: unsupported condition {safe_key(key)!r} in if "
+                "(supported: properties)"
+            )
+            supported = False
     props = condition.get("properties", {})
+    if not isinstance(props, dict):
+        errors.append(
+            f"{path}: unsupported condition in if.properties "
+            "(supported: an object of const conditions)"
+        )
+        return False
+    for key, subschema in props.items():
+        if not isinstance(subschema, dict):
+            continue
+        unknown = [op for op in subschema if op != "const"]
+        for operator in unknown:
+            errors.append(
+                f"{path}: unsupported condition operator "
+                f"{safe_key(operator)!r} in "
+                f"if.properties.{safe_key(key)} (supported: const)"
+            )
+        if unknown:
+            supported = False
+    if not supported:
+        return False
     if not isinstance(instance, dict):
         return False
     for key, subschema in props.items():
@@ -314,7 +374,7 @@ def check_instance(instance, schema, path, errors):
         cond = subschema.get("if")
         then = subschema.get("then")
         if isinstance(cond, dict) and isinstance(then, dict):
-            if condition_holds(instance, cond):
+            if condition_holds(instance, cond, path, errors):
                 check_instance(instance, then, path, errors)
 
 
@@ -329,6 +389,14 @@ def scan_public_safety(value, path, errors):
                 break
     elif isinstance(value, dict):
         for key, item in value.items():
+            if isinstance(key, str):
+                for marker in SECRET_MARKERS:
+                    if marker.search(key):
+                        errors.append(
+                            f"{child_path(path, key)}: public-safety "
+                            f"scan hit {marker.pattern!r}"
+                        )
+                        break
             scan_public_safety(item, child_path(path, key), errors)
     elif isinstance(value, list):
         for index, item in enumerate(value):
@@ -503,6 +571,7 @@ LOAD_ERRORS = (
     json.JSONDecodeError,
     DuplicateKeyError,
     DecoderLimitError,
+    DocumentTooLargeError,
     InvalidUtf8Error,
 )
 
