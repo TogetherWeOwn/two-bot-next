@@ -190,7 +190,12 @@ claim them as shipped acceptance:
   records `insufficient_data` (exit 0 with a warning), which proves nothing
   and must never be read as a healthy pass. Traffic between container boot
   and the first scrape lands in the baseline and is not judged; only requests
-  between the two scrapes count. Production has no error-rate gate yet.
+  between the two scrapes count. Production runs the same gate at the end of
+  the `production` job against live production `/ops/metrics` (evidence
+  `production-error-rate-gate.json`), failing the stage into the same
+  auto-rollback; live enforcement needs the `PRODUCTION_METRICS_SCRAPE_TOKEN`
+  secret, else a recorded skip, and the `inject_error_rate_spike` dispatch
+  input proves the chain with a rehearsal firing.
 - The shared central gradual-promotion action promotes 5-50-100% with
   per-stage health gates and automatic rollback to the recorded pre-promote
   version. The caller contract is implemented (`bin/smoke.mjs`, contract-tested
