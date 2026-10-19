@@ -16,6 +16,14 @@
 //! disposable agent-testdb database the binary migrates itself.
 //! `TWO_TEST_DATABASE_URL` is the opt-in: without it the tests skip, with
 //! it (CI's `--test '*'` integration step) they run for real.
+//!
+//! Every case runs against its own disposable database with its own
+//! token. A deliberate transport drop can leave that token's
+//! send-admission lane held in that database until its lease expires, so
+//! reusing one database/token across cases would make the next CLI fail
+//! at admission before it reached the discovery step under test. Fresh
+//! per-case lanes keep each case observing only its own discovery
+//! outcome — no sleeps, no admission-row cleanup, no lease timing.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -29,7 +37,6 @@ use sqlx::PgPool;
 use two_bot_cutover::legacy_copy::options::guarded_target;
 
 const GUILD: &str = "1545644954272137297";
-const TOKEN: &str = "test-token-not-a-secret";
 /// Planted in mocked error/unreadable bodies: no diagnostic may echo it.
 const REMOTE_MARKER: &str = "REMOTE-BODY-MARKER-7f3d9a";
 const CHANNEL_ID: &str = "300000000000000001";
@@ -37,6 +44,17 @@ const CHANNEL_ID: &str = "300000000000000001";
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 static NEXT_DB: AtomicUsize = AtomicUsize::new(0);
+static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(0);
+
+/// A distinct fake token per case, so each CLI also gets its own
+/// send-admission lane key inside its fresh database.
+fn fresh_token() -> String {
+    format!(
+        "test-token-{}-{}",
+        std::process::id(),
+        NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 struct TestDb {
     admin: PgPool,
@@ -93,15 +111,17 @@ fn database_sql(operation: &str, name: &str) -> sqlx::AssertSqlSafe<String> {
     sqlx::AssertSqlSafe(format!("{operation} \"{name}\""))
 }
 
-/// Runs a scenario on a spawned task so a panicking assertion still reaches
-/// teardown, then reports the scenario failure ahead of any cleanup failure.
-async fn with_db<F, Fut>(prefix: &'static str, scenario: F) -> TestResult
+/// Runs one case on a spawned task against a fresh database and token, so
+/// a panicking assertion still reaches teardown and no earlier case's
+/// admission state can intercept this case; then reports the case failure
+/// ahead of any cleanup failure.
+async fn with_case<F, Fut>(prefix: &'static str, scenario: F) -> TestResult
 where
-    F: FnOnce(Arc<TestDb>) -> Fut,
+    F: FnOnce(Arc<TestDb>, String) -> Fut,
     Fut: std::future::Future<Output = TestResult> + Send + 'static,
 {
     let db = Arc::new(TestDb::new(prefix).await?);
-    let joined = tokio::spawn(scenario(db.clone())).await;
+    let joined = tokio::spawn(scenario(db.clone(), fresh_token())).await;
     let cleaned = db.cleanup().await;
     match joined {
         Ok(result) => result.and(cleaned),
@@ -226,13 +246,13 @@ fn text_channel(name: &str) -> Route {
     )
 }
 
-fn run_cli(db: &TestDb, bin: &str, base: &str) -> Output {
+fn run_cli(db: &TestDb, token: &str, bin: &str, base: &str) -> Output {
     Command::new(bin)
         .env_clear()
         .env("TWO_DATABASE_URL", &db.url)
         .env("TWO_DATABASE_TLS", "local-only")
         .env("TWO_DB_POOL_MAX", "1")
-        .env("DISCORD_TOKEN", TOKEN)
+        .env("DISCORD_TOKEN", token)
         .env("DISCORD_GUILD_ID", GUILD)
         .args(["--dry-run", "--max-pages=1", "--discord-base", base])
         .output()
@@ -260,7 +280,13 @@ fn assert_success(case: &str, output: &Output) {
 /// The failed-discovery contract: nonzero exit, no exact-completeness
 /// claim, and one bounded diagnostic that names the failed discovery step
 /// without echoing the remote body, the token, or the database URL.
-fn assert_discovery_refusal(case: &str, db: &TestDb, output: &Output, step_word: &str) {
+fn assert_discovery_refusal(
+    case: &str,
+    db: &TestDb,
+    token: &str,
+    output: &Output,
+    step_word: &str,
+) {
     let stdout = stdout_of(output);
     let stderr = stderr_of(output);
     assert!(
@@ -298,7 +324,7 @@ fn assert_discovery_refusal(case: &str, db: &TestDb, output: &Output, step_word:
         .any(|w| lower.contains(w)),
         "{case}: diagnostic does not say discovery failed:\n{stderr}"
     );
-    for forbidden in [REMOTE_MARKER, TOKEN, db.url.as_str()] {
+    for forbidden in [REMOTE_MARKER, token, db.url.as_str()] {
         assert!(
             !stdout.contains(forbidden) && !stderr.contains(forbidden),
             "{case}: output echoes forbidden detail {forbidden:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -306,124 +332,191 @@ fn assert_discovery_refusal(case: &str, db: &TestDb, output: &Output, step_word:
     }
 }
 
-async fn messages_scenario(db: Arc<TestDb>) -> TestResult {
+async fn messages_scenario() -> TestResult {
     let bin = env!("CARGO_BIN_EXE_backfill-messages");
 
     // Control: a successful empty discovery keeps its success semantics,
     // including the exact-completeness wording for a complete (empty) scan.
-    let (base, hits) = mock_discord(one_member(), empty_channels(), empty_threads());
-    let out = run_cli(&db, bin, &base);
-    assert_success("messages valid-empty control", &out);
-    assert!(
-        stdout_of(&out).contains("exactly"),
-        "messages valid-empty control lost its exact wording:\n{}",
-        stdout_of(&out)
-    );
-    assert_eq!(hits.channels.load(Ordering::SeqCst), 1, "channel discovery");
-    assert_eq!(
-        hits.threads_active.load(Ordering::SeqCst),
-        1,
-        "active-thread discovery"
-    );
+    with_case("two_bot_test_bfm_empty", move |db, token| async move {
+        let (base, hits) = mock_discord(one_member(), empty_channels(), empty_threads());
+        let out = run_cli(&db, &token, bin, &base);
+        assert_success("messages valid-empty control", &out);
+        assert!(
+            stdout_of(&out).contains("exactly"),
+            "messages valid-empty control lost its exact wording:\n{}",
+            stdout_of(&out)
+        );
+        assert_eq!(hits.channels.load(Ordering::SeqCst), 1, "channel discovery");
+        assert_eq!(
+            hits.threads_active.load(Ordering::SeqCst),
+            1,
+            "active-thread discovery"
+        );
+        Ok(())
+    })
+    .await?;
 
     // Control: one conversation channel with an empty history still scans
     // exactly one channel and completes exactly.
-    let (base, hits) = mock_discord(one_member(), text_channel("general"), empty_threads());
-    let out = run_cli(&db, bin, &base);
-    assert_success("messages one-channel control", &out);
-    let stdout = stdout_of(&out);
-    let scanned = stdout
-        .lines()
-        .find(|l| l.contains("channels scanned"))
-        .unwrap_or_default()
-        .to_owned();
-    assert!(
-        scanned.trim_end().ends_with('1'),
-        "messages one-channel control scanned line: {scanned:?}\nstdout:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("exactly"),
-        "messages one-channel control lost its exact wording:\n{stdout}"
-    );
-    assert!(hits.messages.load(Ordering::SeqCst) >= 1, "channel scanned");
+    with_case("two_bot_test_bfm_onech", move |db, token| async move {
+        let (base, hits) = mock_discord(one_member(), text_channel("general"), empty_threads());
+        let out = run_cli(&db, &token, bin, &base);
+        assert_success("messages one-channel control", &out);
+        let stdout = stdout_of(&out);
+        let scanned = stdout
+            .lines()
+            .find(|l| l.contains("channels scanned"))
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            scanned.trim_end().ends_with('1'),
+            "messages one-channel control scanned line: {scanned:?}\nstdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("exactly"),
+            "messages one-channel control lost its exact wording:\n{stdout}"
+        );
+        assert!(hits.messages.load(Ordering::SeqCst) >= 1, "channel scanned");
+        Ok(())
+    })
+    .await?;
 
     // Failed guild-channel discovery: refusal, unreadable body, transport.
-    for (case, channels) in [
-        ("messages channels refusal", refusal()),
-        ("messages channels unreadable", unreadable()),
-        ("messages channels transport", Route::Drop),
+    // Each case gets a fresh database/token, so the transport case cannot
+    // leave a held admission lane for the active-thread cases below.
+    for (prefix, case, channels) in [
+        (
+            "two_bot_test_bfm_chref",
+            "messages channels refusal",
+            refusal(),
+        ),
+        (
+            "two_bot_test_bfm_chunr",
+            "messages channels unreadable",
+            unreadable(),
+        ),
+        (
+            "two_bot_test_bfm_chtrn",
+            "messages channels transport",
+            Route::Drop,
+        ),
     ] {
-        let (base, hits) = mock_discord(one_member(), channels, empty_threads());
-        let out = run_cli(&db, bin, &base);
-        assert!(
-            hits.channels.load(Ordering::SeqCst) >= 1,
-            "{case}: channel discovery was never attempted"
-        );
-        assert_discovery_refusal(case, &db, &out, "channel");
+        with_case(prefix, move |db, token| async move {
+            let (base, hits) = mock_discord(one_member(), channels, empty_threads());
+            let out = run_cli(&db, &token, bin, &base);
+            assert!(
+                hits.channels.load(Ordering::SeqCst) >= 1,
+                "{case}: channel discovery was never attempted"
+            );
+            assert_discovery_refusal(case, &db, &token, &out, "channel");
+            Ok(())
+        })
+        .await?;
     }
 
     // Failed active-thread discovery with channel discovery healthy.
-    for (case, threads) in [
-        ("messages active-threads refusal", refusal()),
-        ("messages active-threads unreadable", unreadable()),
-        ("messages active-threads transport", Route::Drop),
+    for (prefix, case, threads) in [
+        (
+            "two_bot_test_bfm_thref",
+            "messages active-threads refusal",
+            refusal(),
+        ),
+        (
+            "two_bot_test_bfm_thunr",
+            "messages active-threads unreadable",
+            unreadable(),
+        ),
+        (
+            "two_bot_test_bfm_thtrn",
+            "messages active-threads transport",
+            Route::Drop,
+        ),
     ] {
-        let (base, hits) = mock_discord(one_member(), empty_channels(), threads);
-        let out = run_cli(&db, bin, &base);
-        assert!(
-            hits.threads_active.load(Ordering::SeqCst) >= 1,
-            "{case}: active-thread discovery was never attempted"
-        );
-        assert_discovery_refusal(case, &db, &out, "thread");
+        with_case(prefix, move |db, token| async move {
+            let (base, hits) = mock_discord(one_member(), empty_channels(), threads);
+            let out = run_cli(&db, &token, bin, &base);
+            assert!(
+                hits.threads_active.load(Ordering::SeqCst) >= 1,
+                "{case}: active-thread discovery was never attempted"
+            );
+            assert_discovery_refusal(case, &db, &token, &out, "thread");
+            Ok(())
+        })
+        .await?;
     }
     Ok(())
 }
 
-async fn backfill_scenario(db: Arc<TestDb>) -> TestResult {
+async fn backfill_scenario() -> TestResult {
     let bin = env!("CARGO_BIN_EXE_backfill");
 
     // Control: one listed member, a successful empty channel discovery,
     // and an empty invite list complete successfully.
-    let (base, hits) = mock_discord(one_member(), empty_channels(), empty_threads());
-    let out = run_cli(&db, bin, &base);
-    assert_success("backfill valid-empty control", &out);
-    assert!(
-        stdout_of(&out).contains("Discord requests"),
-        "backfill valid-empty control did not finish its report:\n{}",
-        stdout_of(&out)
-    );
-    assert!(hits.members.load(Ordering::SeqCst) >= 1, "members listed");
-    assert_eq!(hits.channels.load(Ordering::SeqCst), 1, "channel discovery");
+    with_case("two_bot_test_bf_empty", move |db, token| async move {
+        let (base, hits) = mock_discord(one_member(), empty_channels(), empty_threads());
+        let out = run_cli(&db, &token, bin, &base);
+        assert_success("backfill valid-empty control", &out);
+        assert!(
+            stdout_of(&out).contains("Discord requests"),
+            "backfill valid-empty control did not finish its report:\n{}",
+            stdout_of(&out)
+        );
+        assert!(hits.members.load(Ordering::SeqCst) >= 1, "members listed");
+        assert_eq!(hits.channels.load(Ordering::SeqCst), 1, "channel discovery");
+        Ok(())
+    })
+    .await?;
 
     // Control: one log channel with an empty history is probed and the run
     // still completes.
-    let (base, hits) = mock_discord(one_member(), text_channel("member-log"), empty_threads());
-    let out = run_cli(&db, bin, &base);
-    assert_success("backfill one-channel control", &out);
-    assert!(
-        stdout_of(&out).contains("Discord requests"),
-        "backfill one-channel control did not finish its report:\n{}",
-        stdout_of(&out)
-    );
-    assert!(
-        hits.messages.load(Ordering::SeqCst) >= 1,
-        "log channel probed"
-    );
+    with_case("two_bot_test_bf_onech", move |db, token| async move {
+        let (base, hits) = mock_discord(one_member(), text_channel("member-log"), empty_threads());
+        let out = run_cli(&db, &token, bin, &base);
+        assert_success("backfill one-channel control", &out);
+        assert!(
+            stdout_of(&out).contains("Discord requests"),
+            "backfill one-channel control did not finish its report:\n{}",
+            stdout_of(&out)
+        );
+        assert!(
+            hits.messages.load(Ordering::SeqCst) >= 1,
+            "log channel probed"
+        );
+        Ok(())
+    })
+    .await?;
 
     // Failed guild-channel discovery: refusal, unreadable body, transport.
     // The member list stays healthy so the run reaches channel discovery.
-    for (case, channels) in [
-        ("backfill channels refusal", refusal()),
-        ("backfill channels unreadable", unreadable()),
-        ("backfill channels transport", Route::Drop),
+    // Each case gets a fresh database/token for the same reason as above.
+    for (prefix, case, channels) in [
+        (
+            "two_bot_test_bf_chref",
+            "backfill channels refusal",
+            refusal(),
+        ),
+        (
+            "two_bot_test_bf_chunr",
+            "backfill channels unreadable",
+            unreadable(),
+        ),
+        (
+            "two_bot_test_bf_chtrn",
+            "backfill channels transport",
+            Route::Drop,
+        ),
     ] {
-        let (base, hits) = mock_discord(one_member(), channels, empty_threads());
-        let out = run_cli(&db, bin, &base);
-        assert!(
-            hits.channels.load(Ordering::SeqCst) >= 1,
-            "{case}: channel discovery was never attempted"
-        );
-        assert_discovery_refusal(case, &db, &out, "channel");
+        with_case(prefix, move |db, token| async move {
+            let (base, hits) = mock_discord(one_member(), channels, empty_threads());
+            let out = run_cli(&db, &token, bin, &base);
+            assert!(
+                hits.channels.load(Ordering::SeqCst) >= 1,
+                "{case}: channel discovery was never attempted"
+            );
+            assert_discovery_refusal(case, &db, &token, &out, "channel");
+            Ok(())
+        })
+        .await?;
     }
     Ok(())
 }
@@ -434,7 +527,7 @@ async fn backfill_messages_discovery_failures_refuse_and_empty_discovery_succeed
         eprintln!("skipped: TWO_TEST_DATABASE_URL opt-in required for agent-testdb");
         return Ok(());
     }
-    with_db("two_bot_test_bfmsg_disc", messages_scenario).await
+    messages_scenario().await
 }
 
 #[tokio::test]
@@ -443,5 +536,5 @@ async fn backfill_discovery_failures_refuse_and_empty_discovery_succeeds() -> Te
         eprintln!("skipped: TWO_TEST_DATABASE_URL opt-in required for agent-testdb");
         return Ok(());
     }
-    with_db("two_bot_test_bf_disc", backfill_scenario).await
+    backfill_scenario().await
 }
