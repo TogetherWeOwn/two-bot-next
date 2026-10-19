@@ -195,6 +195,13 @@ jobs:
       - name: Prepare isolated test databases
         shell: bash
         run: |
+          # The database service stores data and WAL on a 1 GiB tmpfs, and
+          # this lane runs the same DB-backed lib/bins scope the `rust-tests`
+          # lane already bounds. Bound WAL recycling identically so
+          # checkpoints recycle segments with headroom for relation files.
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
           createdb -h agent-testdb -U agent_test two_bot_test_ci
           createdb -h agent-testdb -U agent_test two_next_backup_ci
           createdb -h agent-testdb -U agent_test two_next_backup_publication_ci

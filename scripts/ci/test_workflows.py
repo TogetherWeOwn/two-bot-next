@@ -2173,37 +2173,50 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
-    def test_rust_test_postgres_wal_budget_is_bounded(self):
-        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+    def assert_postgres_wal_budget_is_bounded(self, workflow_name, job_id, *, expect_verify):
+        # Every 1 GiB tmpfs Postgres lane bounds WAL recycling before its
+        # bootstrap databases exist, and (where the lane carries a verify
+        # step) pins both settings so drift fails closed. The reload must
+        # precede the first createdb: ALTER SYSTEM without a reload leaves
+        # the running server on the 1 GB default, and the bootstrap
+        # databases are created later in this same step.
+        job = self.workflows[workflow_name]["jobs"][job_id]
         prepare = next(
             step for step in job["steps"]
             if step.get("name") == "Prepare isolated test databases"
         )
-        verify = next(
-            step for step in job["steps"]
-            if step.get("name") == "Verify disposable Postgres defaults"
+        run = prepare["run"]
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", run)
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", run)
+        self.assertIn("pg_reload_conf()", run)
+        self.assertLess(
+            run.index("pg_reload_conf()"),
+            run.index("createdb "),
+            "pg_reload_conf() must precede the first createdb",
         )
-        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
-        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
-        self.assertIn("pg_reload_conf()", prepare["run"])
-        self.assertIn("'max_wal_size': '512MB'", verify["run"])
-        self.assertIn("'min_wal_size': '64MB'", verify["run"])
+        if expect_verify:
+            verify = next(
+                step for step in job["steps"]
+                if step.get("name") == "Verify disposable Postgres defaults"
+            )
+            self.assertIn("'max_wal_size': '512MB'", verify["run"])
+            self.assertIn("'min_wal_size': '64MB'", verify["run"])
+
+    def test_rust_test_postgres_wal_budget_is_bounded(self):
+        self.assert_postgres_wal_budget_is_bounded("check.yml", "rust-tests", expect_verify=True)
 
     def test_stores_postgres_wal_budget_is_bounded(self):
-        job = self.workflows["check.yml"]["jobs"]["ignored-db-stores"]
-        prepare = next(
-            step for step in job["steps"]
-            if step.get("name") == "Prepare isolated test databases"
+        self.assert_postgres_wal_budget_is_bounded("check.yml", "ignored-db-stores", expect_verify=True)
+
+    def test_runtime_postgres_wal_budget_is_bounded(self):
+        self.assert_postgres_wal_budget_is_bounded("check.yml", "ignored-db-runtime", expect_verify=True)
+
+    def test_nextest_postgres_wal_budget_is_bounded(self):
+        # The reusable lane carries no verify step; the prepare assertions
+        # above are its pin.
+        self.assert_postgres_wal_budget_is_bounded(
+            "reusable-rust-nextest.yml", "nextest", expect_verify=False
         )
-        verify = next(
-            step for step in job["steps"]
-            if step.get("name") == "Verify disposable Postgres defaults"
-        )
-        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
-        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
-        self.assertIn("pg_reload_conf()", prepare["run"])
-        self.assertIn("'max_wal_size': '512MB'", verify["run"])
-        self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
