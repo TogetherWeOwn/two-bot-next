@@ -19,7 +19,7 @@ use std::{
 
 use sqlx::PgPool;
 use two_bot_core::game_activity_store;
-use two_bot_cutover::retention::{run_retention, RetentionMode};
+use two_bot_cutover::retention::{run_retention, RetentionMode, RETENTION_CADENCE_SECONDS};
 
 use crate::backfill_retention_chains::render_retention_failure;
 use crate::db_log::db_class;
@@ -34,7 +34,7 @@ pub const MODE_SETTING: &str = "TWO_RETENTION_MODE";
 pub const NAME: &str = "retention";
 
 /// Bounded cadence: fifteen minutes, inside the 60 s..=1 h contract.
-const CADENCE: Duration = Duration::from_secs(900);
+const CADENCE: Duration = Duration::from_secs(RETENTION_CADENCE_SECONDS);
 /// Per-attempt budget: two minutes, positive and no greater than cadence.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -169,8 +169,10 @@ pub(crate) fn pool_from_url(url: &str) -> Result<PgPool, ErrorClass> {
 /// is never silently reduced to scheduler success. Schema-coverage gaps
 /// defer as `Ok` (counted in `schema_gap_deferrals` for deletions and
 /// `guild_purges_failed` for queued guilds, with the gap list in the warn
-/// log) and retry after the plan is repaired; only SQL/connection failures
-/// return [`ErrorClass::Database`] to the supervisor and stay retryable.
+/// log) and retry after the plan is repaired. Core-lifecycle SQL/connection
+/// failures return [`ErrorClass::Database`] before raw expiry runs. A raw-expiry
+/// SQL failure is logged after core retention commits, returned as
+/// [`ErrorClass::Database`], and retried next cadence.
 #[must_use]
 pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
     let cadence = CADENCE;
