@@ -432,9 +432,9 @@ async fn global_headers_block_callers_before_delayed_body_finishes() {
         .unwrap();
         // Header-observation time: the guard anchors every pause at `observed_at`
         // plus `retry_after + 250ms`, so the settled deadline minus this instant
-        // must equal the body timing plus the pad — not the body-finish time
-        // plus the wait. Sampling here (1ms poll) keeps measurement error far
-        // below the 400-600ms restart signal.
+        // must stay near the body timing plus the pad — not shift by the
+        // body-finish delay. Sampling here (1ms poll) keeps measurement error
+        // far below the 400-600ms restart signal.
         let header_observed = Instant::now();
         let callers = tokio::spawn(async move { tokio::join!(ban(&second), ban(&second)) });
         tokio::time::sleep(body_delay - Duration::from_millis(100)).await;
@@ -449,17 +449,23 @@ async fn global_headers_block_callers_before_delayed_body_finishes() {
         // restart-at-body would add the full `body_delay` (400-600ms) to the
         // deadline, while post-deadline scheduling stalls (which flaked the old
         // `retry_after + 0.55` wire bound on loaded runners) leave the deadline
-        // itself untouched. Snapshot immediately while the pause is live.
+        // itself untouched.
+        //
+        // Only the upper bound is asserted: both sampling lag (the 1ms poll
+        // lands after the guard records the headers) and an expired pause
+        // (zero remaining) shrink `anchored`, so a lower deadline bound would
+        // reintroduce the flake class this removes. Short deadlines stay
+        // covered by the wire lower bound below, and the exact pad/anchor
+        // arithmetic by the paused-clock unit tests. A retained pre-body
+        // deadline cannot serve instead: the provisional pause legitimately
+        // differs from the settled one (60s fallback without header timing;
+        // body timing wins over header timing).
         let settled_at = Instant::now();
         let remaining = guard.snapshot().global_pause_remaining;
         let anchored = settled_at
             .checked_add(remaining)
             .unwrap_or(settled_at)
             .saturating_duration_since(header_observed);
-        assert!(
-            anchored >= Duration::from_secs_f64(retry_after + 0.15),
-            "deadline lost the header anchor: {anchored:?}"
-        );
         assert!(
             anchored < Duration::from_secs_f64(retry_after + 0.35),
             "cooldown restarted at body: {anchored:?}"
