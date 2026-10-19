@@ -152,6 +152,10 @@ export const VOICE_FAILURE_MIN_OPS = 10;
 export const VOICE_VOTE_KICK_FAILURE_OUTCOMES = ["discord_error", "gave_up", "permission_missing"] as const;
 /** Dispatch drops must grow in this many consecutive completed sample windows. */
 export const DISPATCH_DROP_SAMPLES = 3;
+/** Fixed reasons for the community-facts drain-failure counter (mirrors `COMMUNITY_FACTS_DRAIN_REASONS` in `crates/core/src/metrics.rs`). */
+export const COMMUNITY_FACTS_DRAIN_REASONS: readonly string[] = ["error", "timeout", "other"];
+/** Summed drain-failure growth must persist this many consecutive completed windows before ticketing. */
+export const COMMUNITY_FACTS_DRAIN_SAMPLES = 3;
 /** Sustained above-threshold event-store consumer lag samples before the ticket. */
 export const EVENT_STORE_LAG_SAMPLES = 3;
 /**
@@ -255,10 +259,12 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_join_fast_burn", summary: `creator-join error budget burning faster than ${JOIN_FAST_BURN}x over 1 h and 5 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-fast-burn" },
   { id: "voice_join_slow_burn", summary: `creator-join error budget burning faster than ${JOIN_SLOW_BURN}x over 6 h and 30 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-slow-burn", severity: "ticket" },
   { id: "voice_creator_map_stale", summary: `voice creator map has not merged for more than ${CREATOR_MAP_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-voice-creator-map-stale" },
+  { id: "community_facts_drain_failures", summary: `community-facts drain failures grew for ${COMMUNITY_FACTS_DRAIN_SAMPLES} consecutive sample windows (warn-and-continue drain loss; scorecard fails closed)`, runbook: "runbook.md#alert-community-facts-drain-failures", severity: "ticket" },
   { id: "eventsub_post_failed_share", summary: `EventSub announcement post failures exceed ${EVENTSUB_POST_FAILED_SHARE_RATIO * 100}% of attempted posts (min ${EVENTSUB_POST_FAILED_SHARE_MIN_ATTEMPTED} attempted)`, runbook: "runbook.md#alert-eventsub-post-failed-share", severity: "ticket" },
   { id: "error_budget_fast_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_FAST_BURN}x over ${ERROR_BUDGET_FAST_LONG_SECONDS / 60} min and ${ERROR_BUDGET_FAST_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-fast-burn" },
   { id: "error_budget_slow_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_SLOW_BURN}x over ${ERROR_BUDGET_SLOW_LONG_SECONDS / 3600} h and ${ERROR_BUDGET_SLOW_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-slow-burn", severity: "ticket" },
   { id: "eventsub_tampered", summary: `EventSub tampered-signature deliveries rose in ${EVENTSUB_TAMPERED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-eventsub-tampered" },
+  { id: "eventsub_reconcile_failed", summary: `EventSub reconcile failed passes increased between samples`, runbook: "runbook.md#alert-eventsub-reconcile-failed", severity: "ticket" },
   { id: "event_store_consumer_lag", summary: `event-store consumer lag above ${EVENT_STORE_LAG_THRESHOLD_SECONDS} s sustained for ${EVENT_STORE_LAG_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-event-store-consumer-lag", severity: "ticket" },
 ];
 
@@ -363,8 +369,20 @@ export interface MetricsAlertState {
   dispatchDrops?: Record<string, number>;
   /** Consecutive positive deltas, capped at DISPATCH_DROP_SAMPLES. */
   dispatchDropStreaks?: Record<string, number>;
+  /** Per-reason community-facts drain-failure baseline; absent after a missing/invalid sample or in legacy storage. */
+  communityFactsDrainFailures?: Record<string, number>;
+  /** Consecutive completed windows with positive summed drain-failure growth, capped at COMMUNITY_FACTS_DRAIN_SAMPLES. */
+  communityFactsDrainStreak?: number;
   /** Consecutive valid positive event-store lag samples; absent in legacy storage reads as 0. */
   eventStoreLagStreak?: number;
+  /** Healthy reconcile passes at the last valid baseline; absent in legacy storage. */
+  reconcileHealthy?: number;
+  /** Verification-pending reconcile passes at the last valid baseline; absent in legacy storage. */
+  reconcilePending?: number;
+  /** Failed reconcile passes at the last valid baseline; absent in legacy storage. */
+  reconcileFailed?: number;
+  /** False until a valid sample stores the reconcile baseline: the first sample never fires. */
+  reconcileSeen?: boolean;
   /**
    * Creator-join burn snapshots for the SLO windows, oldest first. Each entry
    * carries the scrape time plus cumulative counters (received joins,
@@ -564,11 +582,16 @@ function errorBudgetBurnEvaluation(
   };
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0 };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false };
 
 /** An unsuccessful scrape breaks the dispatch and lag streaks, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
   return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, eventStoreLagStreak: 0 };
+}
+
+/** A failed scrape breaks drain-growth evidence, never an active drain ticket. */
+export function interruptCommunityFactsDrain(state: MetricsAlertState): MetricsAlertState {
+  return { ...state, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0 };
 }
 
 export function parseExposition(text: string): Sample[] {
@@ -1297,6 +1320,65 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
+  // Sustained community-facts drain loss is a ticket. Only the fixed reasons
+  // count: unknown/hostile reason rows never become subjects or stored state.
+  // Growth is summed over every fixed reason, so a large single burst stays
+  // silent until three consecutive completed windows each add failures. A flat
+  // or reset window is the valid recovery; missing/invalid evidence breaks
+  // growth but preserves an active ticket.
+  const COMMUNITY_FACTS_DRAIN_KEY = "community_facts_drain_failures";
+  const drainSamples = gauge("two_bot_community_facts_drain_failures_total");
+  const drainCounts: Record<string, number> = {};
+  let drainValid = true;
+  for (const reason of COMMUNITY_FACTS_DRAIN_REASONS) {
+    const rows = drainSamples.filter((s) => s.labels["reason"] === reason);
+    const sample = rows[0];
+    if (rows.length !== 1 || !sample || Object.keys(sample.labels).length !== 1
+      || !Number.isSafeInteger(sample.value) || sample.value < 0) {
+      drainValid = false;
+      break;
+    }
+    drainCounts[reason] = sample.value;
+  }
+  const wasDrainFiring = prev.firing.includes(COMMUNITY_FACTS_DRAIN_KEY);
+  let communityFactsDrainFailures: Record<string, number> = {};
+  let communityFactsDrainStreak = 0;
+  if (!drainValid) {
+    // Missing/invalid evidence drops the baseline, never the active ticket.
+    if (wasDrainFiring) firing.push(COMMUNITY_FACTS_DRAIN_KEY);
+  } else {
+    const prevDrain = prev.communityFactsDrainFailures;
+    const hasBaseline = prevDrain !== undefined
+      && COMMUNITY_FACTS_DRAIN_REASONS.every((reason) => {
+        const count = prevDrain[reason];
+        return typeof count === "number" && Number.isSafeInteger(count) && count >= 0;
+      });
+    if (!hasBaseline) {
+      // The first valid sample (including after a gap or from legacy state)
+      // is only a baseline; it never resolves an active ticket on its own.
+      communityFactsDrainFailures = { ...drainCounts };
+      if (wasDrainFiring) firing.push(COMMUNITY_FACTS_DRAIN_KEY);
+    } else {
+      // Any backwards reason means the process restarted: re-baseline with a
+      // clear streak, even when another reason's new count overtook its old
+      // one. A reset window is valid recovery evidence, so it resolves.
+      const reset = COMMUNITY_FACTS_DRAIN_REASONS.some((reason) => drainCounts[reason]! < (prevDrain[reason] ?? 0));
+      communityFactsDrainFailures = { ...drainCounts };
+      if (reset) {
+        communityFactsDrainStreak = 0;
+      } else {
+        let delta = 0;
+        for (const reason of COMMUNITY_FACTS_DRAIN_REASONS) delta += drainCounts[reason]! - (prevDrain[reason] ?? 0);
+        if (delta <= 0) {
+          communityFactsDrainStreak = 0;
+        } else {
+          communityFactsDrainStreak = Math.min((prev.communityFactsDrainStreak ?? 0) + 1, COMMUNITY_FACTS_DRAIN_SAMPLES);
+          if (wasDrainFiring || communityFactsDrainStreak >= COMMUNITY_FACTS_DRAIN_SAMPLES) firing.push(COMMUNITY_FACTS_DRAIN_KEY);
+        }
+      }
+    }
+  }
+
   // Event-store consumer lag is a ticket, not a page. The label-free duration
   // gauge reads 0 when unobserved; only sustained samples above
   // EVENT_STORE_LAG_THRESHOLD_SECONDS (fractional counts) across
@@ -1328,7 +1410,64 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (wasLagFiring || eventStoreLagStreak >= EVENT_STORE_LAG_SAMPLES) firing.push(EVENT_STORE_LAG_RULE);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, eventStoreLagStreak, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak } };
+  // Failed EventSub reconciliation passes (one ticket per failed pass). The
+  // Rust process records exactly one outcome per completed pass that reaches
+  // Helix (`two_bot_eventsub_reconcile_passes_total{outcome}` with the fixed
+  // `healthy`/`pending`/`failed` outcomes); parked or refused startup passes
+  // never reach Helix and record no sample. Only the pass outcome is an alert
+  // input: the detailed per-site error counters stay exposition-only so one
+  // failed pass raises one ticket however many error sites moved. The first
+  // valid sample only stores a baseline. A later positive failed-pass delta
+  // fires (even beside a healthy delta); healthy-only or pending-only growth
+  // never fires. A flat failed counter never recovers: only a healthy-pass
+  // increase with no failed-pass increase resolves, once. Any backwards
+  // counter means the process restarted: that sample re-baselines, firing
+  // when the new process has already counted a failed pass (the startup pass
+  // runs before the first scrape, so a reset sample with failed > 0 is a
+  // post-restart failure, not a fabricated delta) and otherwise holding a
+  // firing ticket instead of fabricating a RESOLVED. Missing or
+  // invalid samples (absent family on older containers, malformed values,
+  // extra labels, duplicates) hold the firing state and keep the previous
+  // baseline; `??` covers DO storage written before this rule existed.
+  const RECONCILE_FAILED_RULE = "eventsub_reconcile_failed";
+  const wasReconcileFiring = prev.firing.includes(RECONCILE_FAILED_RULE);
+  const passSamples = gauge("two_bot_eventsub_reconcile_passes_total");
+  const reconcileHealthyNow = exactSeries(passSamples, { outcome: "healthy" });
+  const reconcilePendingNow = exactSeries(passSamples, { outcome: "pending" });
+  const reconcileFailedNow = exactSeries(passSamples, { outcome: "failed" });
+  let reconcileHealthy = prev.reconcileHealthy ?? 0;
+  let reconcilePending = prev.reconcilePending ?? 0;
+  let reconcileFailed = prev.reconcileFailed ?? 0;
+  let reconcileSeen = prev.reconcileSeen ?? false;
+  if (reconcileHealthyNow === undefined || reconcilePendingNow === undefined || reconcileFailedNow === undefined) {
+    if (wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
+  } else if (!reconcileSeen) {
+    reconcileHealthy = reconcileHealthyNow;
+    reconcilePending = reconcilePendingNow;
+    reconcileFailed = reconcileFailedNow;
+    reconcileSeen = true;
+  } else if (
+    reconcileHealthyNow < reconcileHealthy
+    || reconcilePendingNow < reconcilePending
+    || reconcileFailedNow < reconcileFailed
+  ) {
+    reconcileHealthy = reconcileHealthyNow;
+    reconcilePending = reconcilePendingNow;
+    reconcileFailed = reconcileFailedNow;
+    reconcileSeen = true;
+    if (reconcileFailedNow > 0 || wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
+  } else {
+    const failedGrew = reconcileFailedNow > reconcileFailed;
+    const healthyGrew = reconcileHealthyNow > reconcileHealthy;
+    reconcileHealthy = reconcileHealthyNow;
+    reconcilePending = reconcilePendingNow;
+    reconcileFailed = reconcileFailedNow;
+    reconcileSeen = true;
+    if (failedGrew) firing.push(RECONCILE_FAILED_RULE);
+    else if (!healthyGrew && wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
+  }
+
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

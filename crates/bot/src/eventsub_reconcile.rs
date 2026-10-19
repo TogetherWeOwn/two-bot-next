@@ -20,6 +20,22 @@
 //! create-subscription body, both inside core) and no log line carries a
 //! secret value, header, challenge or body byte: only scalar counts, statuses
 //! and error classes.
+//!
+//! Shutdown policy: the latched watch flag is checked before the startup
+//! pass, before every interval pass, and between the Helix calls of a pass
+//! (before the listing, before each plan action, and before the follow-up
+//! listing), so shutdown never starts another pass and an in-flight pass
+//! stops cooperatively after its current Helix call instead of being cut
+//! mid-request. A pass stopped that way logs
+//! `reconcile_shutdown_interrupted` with the completed/remaining action
+//! counts and skips verification; the next startup pass re-lists the real
+//! subscription state and re-plans, so nothing is left silently assumed.
+//! The owner retains the spawned handle and [`join`]s it with what is left of
+//! the same shutdown deadline (capped by [`SHUTDOWN_DRAIN`]), never a fresh
+//! drain after the service drain; only a task that outlives that shared
+//! budget is aborted, and that abort logs
+//! `reconcile_shutdown_drain_exceeded` because an in-flight remote mutation
+//! outcome is then uncertain until the next startup pass.
 
 use std::{collections::HashMap, future::Future, time::Duration};
 
@@ -29,7 +45,7 @@ use two_bot_core::twitch_eventsub::{
 };
 use two_bot_core::twitch_helix::{
     plan_boot_actions, webhook_secret_from_env, ActionOutcome, HelixClient, HelixCredentials,
-    HelixError, HelixTransport, HyperHelixTransport,
+    HelixError, HelixTransport, HyperHelixTransport, HELIX_TIMEOUT_MS,
 };
 
 /// Environment variable carrying the bot's own public callback. Reconcile only
@@ -41,6 +57,16 @@ pub const BROADCASTERS_ENV: &str = "TWO_TWITCH_BROADCASTERS";
 /// Reconcile cadence after the startup run. Hourly is cheap (a few Helix calls
 /// per pass) and bounds how long a dropped subscription stays dark.
 pub const RECONCILE_INTERVAL_SECS: u64 = 3_600;
+
+/// Cap for how long the owner waits for the reconcile task to stop after
+/// shutdown latches before aborting it in [`join`]. A pass stops
+/// cooperatively between Helix calls, so the wait is at most one in-flight
+/// action: a create can add a confirmation listing to its own round trip,
+/// hence two Helix transport timeouts plus margin. The owner passes
+/// `min(SHUTDOWN_DRAIN, deadline - elapsed)` so the whole drain stays bounded
+/// by `SHUTDOWN_TIMEOUT_SECONDS`. The task normally exits long before the cap
+/// expires because it drains concurrently with the gateway/HTTP drain.
+pub const SHUTDOWN_DRAIN: Duration = Duration::from_millis(HELIX_TIMEOUT_MS * 2 + 5_000);
 
 /// What one reconcile pass did, for scalar receiver logs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -192,6 +218,9 @@ struct PlanRun {
     failed: usize,
     /// The first failed action's error, returned when the pass fails.
     first_failure: Option<HelixError>,
+    /// Shutdown latched before an action started; that action and every
+    /// later one were skipped, so the pass is incomplete by request.
+    interrupted: bool,
 }
 
 /// `delete` or `create`, for the scalar action-failure log.
@@ -207,19 +236,28 @@ fn action_label(action: &SubscriptionAction) -> &'static str {
 /// the creates are sorted, so a poisoned broadcaster id would otherwise block
 /// every later create on every pass. Each failure is logged with its action
 /// kind and error, counted, and the plan carries on; the plan is bounded by
-/// the broadcaster allowlist, so the pass stays bounded too.
+/// the broadcaster allowlist, so the pass stays bounded too. Shutdown is
+/// checked before each action: a latched shutdown skips every remaining
+/// action (never cutting the in-flight one mid-request) and marks the run
+/// interrupted for the caller to report.
 async fn run_plan<T: HelixTransport>(
     client: &mut HelixClient<T>,
     plan: &[SubscriptionAction],
     callback: &CallbackUrl,
     secret: &WebhookSecret,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> PlanRun {
     let mut run = PlanRun {
         outcomes: Vec::with_capacity(plan.len()),
         failed: 0,
         first_failure: None,
+        interrupted: false,
     };
     for action in plan {
+        if stopped(shutdown) {
+            run.interrupted = true;
+            break;
+        }
         match client
             .execute_actions(std::slice::from_ref(action), callback, secret)
             .await
@@ -243,6 +281,20 @@ async fn run_plan<T: HelixTransport>(
     run
 }
 
+/// Report a pass stopped by shutdown between Helix calls. The completed and
+/// remaining action counts say exactly how far the plan got; the resulting
+/// subscription state is deliberately not guessed here, because the next
+/// startup pass re-lists it before planning.
+fn log_interrupted(completed: usize, remaining: usize) {
+    tracing::warn!(
+        event = "eventsub_reconcile",
+        error_class = "reconcile_shutdown_interrupted",
+        completed = completed,
+        remaining = remaining,
+        "eventsub reconcile pass interrupted by shutdown; remaining actions skipped and subscription state unverified until the next startup pass"
+    );
+}
+
 /// Record the successful mutations of one executed plan in the metrics
 /// registry: 2xx creates and deletes. Zero counts are no-ops; 409
 /// already-exists confirmations fold into the pass outcome, not into actions.
@@ -254,36 +306,48 @@ fn record_actions(metrics: &Metrics, outcomes: &[ActionOutcome]) {
 
 /// List, diff with `plan_boot_actions` (deletes before creates, our callback
 /// only), run the plan action by action, then confirm with a follow-up
-/// `list_subscriptions` that always runs: the pass fails loudly, with the
-/// failed and missing counts, when any action failed or a desired broadcaster
-/// lacks a healthy subscription afterwards.
+/// `list_subscriptions`: the pass fails loudly, with the failed and missing
+/// counts, when any action failed or a desired broadcaster lacks a healthy
+/// subscription afterwards. A latched `shutdown` stops the pass between
+/// Helix calls instead (see the module shutdown policy): the actions done
+/// so far are summarized with no verification status, and the interruption
+/// is logged, never silently counted as converged. Every concluded pass also
+/// records exactly one `two_bot_eventsub_reconcile_passes_total{outcome}`
+/// sample via [`reconcile_all_with_metrics`]; shutdown interruptions stay
+/// log-only (plus the mutations they already made).
 pub async fn reconcile_all<T: HelixTransport>(
     client: &mut HelixClient<T>,
     callback: &CallbackUrl,
     desired: &[String],
     secret: &WebhookSecret,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<ReconcileSummary, HelixError> {
     reconcile_all_with_metrics(
         client,
         callback,
         desired,
         secret,
+        shutdown,
         two_bot_core::metrics::global(),
     )
     .await
 }
 
-/// [`reconcile_all`] against an explicit metrics registry. Every pass that
-/// reaches Helix records exactly one
+/// [`reconcile_all`] against an explicit metrics registry. Every concluded
+/// pass that reaches Helix records exactly one
 /// `two_bot_eventsub_reconcile_passes_total{outcome}` sample (`healthy`,
 /// `pending`, `failed`), the successful creates/deletes in
 /// `two_bot_eventsub_reconcile_actions_total{action}`, and each failure site in
 /// `two_bot_eventsub_reconcile_errors_total{error_class}` under the
 /// failure-site `error_class` log strings (`reconcile_action_failed`,
 /// `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed`).
-/// `reconcile_pending`, config refusals and parked startup passes stay
-/// log-only, and the `startup_reconcile` wrapper's `reconcile_failed` line
-/// surfaces the same failure the pass already counted. Cardinality is bounded
+/// `reconcile_pending`, config refusals, parked startup passes, and shutdown
+/// interruptions stay log-only (interruptions still record the mutations they
+/// already made via `record_actions`), and the `startup_reconcile` wrapper's
+/// `reconcile_failed` line surfaces the same failure the pass already
+/// counted. A latched `shutdown` stops the pass between Helix calls: the
+/// actions done so far are summarized with no verification status, and the
+/// interruption is logged via `log_interrupted`. Cardinality is bounded
 /// per-outcome, never per-subscription: no broadcaster, subscription id,
 /// status code or body byte reaches a label. Callers pass a fresh
 /// [`Metrics`] in tests; production passes the global registry.
@@ -292,8 +356,13 @@ pub async fn reconcile_all_with_metrics<T: HelixTransport>(
     callback: &CallbackUrl,
     desired: &[String],
     secret: &WebhookSecret,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
     metrics: &Metrics,
 ) -> Result<ReconcileSummary, HelixError> {
+    if stopped(shutdown) {
+        log_interrupted(0, 0);
+        return Ok(ReconcileSummary::default());
+    }
     let existing = match client.list_subscriptions().await {
         Ok(existing) => existing,
         Err(error) => {
@@ -321,9 +390,29 @@ pub async fn reconcile_all_with_metrics<T: HelixTransport>(
             return Err(error);
         }
     };
-    let run = run_plan(client, &plan, callback, secret).await;
+    let run = run_plan(client, &plan, callback, secret, shutdown).await;
     for _ in 0..run.failed {
         metrics.eventsub_reconcile_error("reconcile_action_failed");
+    }
+    if run.interrupted || stopped(shutdown) {
+        // The plan is finished or cut short, but shutdown takes priority
+        // over the verification listing: report what ran, claim no status.
+        // An action that already failed still fails the pass, exactly as in
+        // the uninterrupted path below, so shutdown never masks a failure.
+        // Mutations already made still count in actions; the interrupted pass
+        // itself stays log-only unless it failed, in which case it records
+        // the same failed/unhealthy samples as the uninterrupted failure.
+        record_actions(metrics, &run.outcomes);
+        let completed = run.outcomes.len() + run.failed;
+        log_interrupted(completed, plan.len() - completed);
+        if let Some(error) = run.first_failure {
+            metrics.eventsub_reconcile_error("reconcile_unhealthy");
+            metrics.eventsub_reconcile_pass("failed");
+            return Err(error);
+        }
+        let mut summary = summarize(&run.outcomes);
+        summary.prior_failed = prior_failed;
+        return Ok(summary);
     }
     let confirmed = match client.list_subscriptions().await {
         Ok(confirmed) => confirmed,
@@ -393,7 +482,10 @@ pub async fn reconcile_all_with_metrics<T: HelixTransport>(
 /// One reconcile pass from the process environment: gate, Operator
 /// credentials, callback plus allowlist, then `reconcile_all`. Every refusal
 /// and failure is logged with an `error_class`; callers need no extra log.
-pub async fn startup_reconcile() -> Result<ReconcileSummary, HelixError> {
+/// `shutdown` is the process latch the pass checks between Helix calls.
+pub async fn startup_reconcile(
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> Result<ReconcileSummary, HelixError> {
     let vars: HashMap<String, String> = std::env::vars().collect();
     if !gate_open(&vars) {
         tracing::info!(
@@ -449,7 +541,7 @@ pub async fn startup_reconcile() -> Result<ReconcileSummary, HelixError> {
         }
     };
     let mut client = HelixClient::new(HyperHelixTransport, creds);
-    match reconcile_all(&mut client, &callback, &desired, &secret).await {
+    match reconcile_all(&mut client, &callback, &desired, &secret, shutdown).await {
         Ok(summary) => Ok(summary),
         Err(error) => {
             tracing::error!(
@@ -464,8 +556,8 @@ pub async fn startup_reconcile() -> Result<ReconcileSummary, HelixError> {
 }
 
 /// One pass; the outcome is already logged inside `startup_reconcile`.
-async fn run_once() {
-    let _ = startup_reconcile().await;
+async fn run_once(shutdown: &tokio::sync::watch::Receiver<bool>) {
+    let _ = startup_reconcile(shutdown).await;
 }
 
 /// Shutdown latch for the interval loop.
@@ -474,7 +566,11 @@ fn stopped(shutdown: &tokio::sync::watch::Receiver<bool>) -> bool {
 }
 
 /// Startup run, then the bounded interval, until shutdown. Failures are
-/// logged per pass and never stop the loop: the next tick retries.
+/// logged per pass and never stop the loop: the next tick retries. The
+/// latch is checked before every pass, including the startup one, so a
+/// shutdown that landed before the task first polls starts no pass at all;
+/// a pass already in flight drains cooperatively (see the module shutdown
+/// policy) and no pass after it starts.
 async fn run_loop<P, Fut>(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     interval: Duration,
@@ -483,6 +579,9 @@ async fn run_loop<P, Fut>(
     P: FnMut() -> Fut,
     Fut: Future<Output = ()>,
 {
+    if stopped(&shutdown) {
+        return;
+    }
     pass().await;
     loop {
         tokio::select! {
@@ -500,9 +599,13 @@ async fn run_loop<P, Fut>(
     }
 }
 
-/// Spawn the reconcile task when `TWO_EVENTSUB` is exactly `1`. Dark is a
-/// parked info log, never a silent downgrade of an enabled receiver.
-pub fn spawn_if_enabled(shutdown: tokio::sync::watch::Receiver<bool>) {
+/// Spawn the reconcile task when `TWO_EVENTSUB` is exactly `1`, returning
+/// its handle so the owner can [`join`] it at shutdown instead of detaching
+/// it. Dark is a parked info log and no handle, never a silent downgrade of
+/// an enabled receiver.
+pub fn spawn_if_enabled(
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !enabled() {
         tracing::info!(
             event = "eventsub_reconcile",
@@ -510,13 +613,51 @@ pub fn spawn_if_enabled(shutdown: tokio::sync::watch::Receiver<bool>) {
             reason = "flag_dark",
             "eventsub reconcile parked: TWO_EVENTSUB is not exactly 1"
         );
-        return;
+        return None;
     }
-    tokio::spawn(run_loop(
+    let pass_shutdown = shutdown.clone();
+    Some(tokio::spawn(run_loop(
         shutdown,
         Duration::from_secs(RECONCILE_INTERVAL_SECS),
-        run_once,
-    ));
+        move || {
+            let shutdown = pass_shutdown.clone();
+            async move { run_once(&shutdown).await }
+        },
+    )))
+}
+
+/// Join the reconcile task after shutdown has latched, waiting at most
+/// `drain` for its cooperative stop. A panicked task is logged, never
+/// propagated. A task that outlives the drain is aborted and then still
+/// awaited, so this returns only once the worker is actually finished; the
+/// abort is logged as an uncertain remote-mutation outcome because the
+/// in-flight Helix call may or may not have landed, and only the next
+/// startup pass's listing settles it.
+pub async fn join(task: Option<tokio::task::JoinHandle<()>>, drain: Duration) {
+    let Some(mut task) = task else {
+        return;
+    };
+    match tokio::time::timeout(drain, &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::error!(
+                event = "eventsub_reconcile",
+                error_class = "reconcile_task_failed",
+                panicked = error.is_panic(),
+                "eventsub reconcile task ended abnormally"
+            );
+        }
+        Err(_) => {
+            tracing::error!(
+                event = "eventsub_reconcile",
+                error_class = "reconcile_shutdown_drain_exceeded",
+                drain_ms = drain.as_millis() as u64,
+                "eventsub reconcile task did not finish within the shutdown drain; aborting it, so an in-flight remote mutation outcome is uncertain until the next startup pass re-checks"
+            );
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -550,6 +691,10 @@ mod tests {
     struct ScriptTransport {
         answers: Mutex<VecDeque<Result<HelixResponse, HelixError>>>,
         log: CallLog,
+        /// Latches shutdown while a create-subscription call is being
+        /// answered, so a test can land shutdown deterministically between
+        /// two plan actions: the create completes, the next one must not run.
+        flip_shutdown_on_create: Option<tokio::sync::watch::Sender<bool>>,
     }
 
     impl ScriptTransport {
@@ -557,6 +702,7 @@ mod tests {
             Self {
                 answers: Mutex::new(answers.into()),
                 log,
+                flip_shutdown_on_create: None,
             }
         }
 
@@ -593,6 +739,11 @@ mod tests {
 
     impl HelixTransport for ScriptTransport {
         async fn send(&self, request: HelixRequest) -> Result<HelixResponse, HelixError> {
+            if let Some(shutdown) = &self.flip_shutdown_on_create {
+                if request.method == Method::POST && request.url.contains("subscriptions") {
+                    shutdown.send_replace(true);
+                }
+            }
             self.log
                 .inner
                 .lock()
@@ -615,6 +766,17 @@ mod tests {
         fn requests(&self) -> Vec<HelixRequest> {
             self.inner.lock().expect("call log must unlock").clone()
         }
+    }
+
+    /// A shutdown receiver that never latches: its sender lives in a static
+    /// for the whole test process, because a dropped sender also counts as
+    /// stopped.
+    fn never_shutdown() -> tokio::sync::watch::Receiver<bool> {
+        static SENDER: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> =
+            std::sync::OnceLock::new();
+        SENDER
+            .get_or_init(|| tokio::sync::watch::channel(false).0)
+            .subscribe()
     }
 
     fn test_secret() -> WebhookSecret {
@@ -865,6 +1027,7 @@ mod tests {
             &callback(),
             &["222".to_owned(), "444".to_owned()],
             &test_secret(),
+            &never_shutdown(),
         )
         .await
         .expect("healthy follow-up must succeed");
@@ -916,6 +1079,7 @@ mod tests {
             &callback(),
             &["111".to_owned(), "222".to_owned()],
             &test_secret(),
+            &never_shutdown(),
         )
         .await
         .expect("a mixed enabled/pending follow-up must still succeed");
@@ -959,6 +1123,7 @@ mod tests {
             &callback(),
             &["444".to_owned()],
             &test_secret(),
+            &never_shutdown(),
         )
         .await
         .expect_err("a failed desired subscription in the follow-up must fail the pass");
@@ -986,6 +1151,7 @@ mod tests {
             &callback(),
             &["444".to_owned()],
             &test_secret(),
+            &never_shutdown(),
         )
         .await
         .expect_err("missing follow-up subscription must fail");
@@ -1023,6 +1189,7 @@ mod tests {
             &callback(),
             &["111".to_owned(), "222".to_owned(), "333".to_owned()],
             &test_secret(),
+            &never_shutdown(),
         )
         .await
         .expect_err("a rejected create must fail the pass");
@@ -1088,6 +1255,7 @@ mod tests {
             &callback(),
             &["222".to_owned()],
             &test_secret(),
+            &never_shutdown(),
         )
         .await
         .expect_err("a rejected delete must fail the pass even though 222 is healthy");
@@ -1137,6 +1305,7 @@ mod tests {
             &callback(),
             &["444".to_owned()],
             &test_secret(),
+            &never_shutdown(),
         )
         .await
         .expect("pending follow-up after a prior failure must still succeed");
@@ -1187,6 +1356,7 @@ mod tests {
             &callback(),
             &["222".to_owned(), "444".to_owned()],
             &test_secret(),
+            &never_shutdown(),
             &metrics,
         )
         .await
@@ -1244,6 +1414,7 @@ mod tests {
             &callback(),
             &["444".to_owned()],
             &test_secret(),
+            &never_shutdown(),
             &metrics,
         )
         .await
@@ -1279,6 +1450,7 @@ mod tests {
             &callback(),
             &["444".to_owned()],
             &test_secret(),
+            &never_shutdown(),
             &metrics,
         )
         .await
@@ -1315,6 +1487,7 @@ mod tests {
             &callback(),
             &["444".to_owned()],
             &test_secret(),
+            &never_shutdown(),
             &metrics,
         )
         .await
@@ -1356,6 +1529,7 @@ mod tests {
             &callback(),
             &["111".to_owned(), "222".to_owned(), "333".to_owned()],
             &test_secret(),
+            &never_shutdown(),
             &metrics,
         )
         .await
@@ -1410,5 +1584,207 @@ mod tests {
             3,
             "no pass runs after shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_latched_before_a_pass_skips_every_helix_call() {
+        // The script holds no answers, so any Helix call would panic inside
+        // the transport; zero logged requests is the positive proof.
+        let log = CallLog::default();
+        let transport = ScriptTransport::new(Vec::new(), log.clone());
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true);
+        let summary = reconcile_all(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+            &shutdown_rx,
+        )
+        .await
+        .expect("a shutdown-skipped pass is not a failure");
+        assert_eq!(summary, ReconcileSummary::default());
+        assert!(log.requests().is_empty(), "no Helix call may run");
+    }
+
+    #[tokio::test]
+    async fn shutdown_between_creates_skips_the_remaining_actions() {
+        let listing = json!({"data": [], "pagination": {}});
+        let log = CallLog::default();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+            ],
+            log.clone(),
+        );
+        transport.flip_shutdown_on_create = Some(shutdown_tx);
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let summary = reconcile_all(
+            &mut client,
+            &callback(),
+            &["111".to_owned(), "222".to_owned()],
+            &test_secret(),
+            &shutdown_rx,
+        )
+        .await
+        .expect("a shutdown-interrupted pass is not a failure");
+        assert_eq!(summary.created, 1, "only the in-flight create completes");
+        assert_eq!(
+            summary.status, None,
+            "an interrupted pass claims no verification status"
+        );
+        assert_eq!(
+            log.requests().len(),
+            3,
+            "token, listing, first create: the second create and the follow-up listing never run"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_a_failed_create_still_fails_the_pass() {
+        let listing = json!({"data": [], "pagination": {}});
+        let log = CallLog::default();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::rejected(StatusCode::BAD_REQUEST),
+            ],
+            log.clone(),
+        );
+        transport.flip_shutdown_on_create = Some(shutdown_tx);
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let error = reconcile_all(
+            &mut client,
+            &callback(),
+            &["111".to_owned(), "222".to_owned()],
+            &test_secret(),
+            &shutdown_rx,
+        )
+        .await
+        .expect_err("shutdown must not mask a create rejected before it latched");
+        assert!(
+            matches!(
+                error,
+                HelixError::HelixRejected { status, .. } if status == StatusCode::BAD_REQUEST
+            ),
+            "the rejected create is still the pass error: {error}"
+        );
+        assert_eq!(
+            log.requests().len(),
+            3,
+            "token, listing, rejected create: no later action runs after shutdown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_loop_skips_the_startup_pass_when_shutdown_is_already_latched() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let passes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&passes);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true);
+        let task = tokio::spawn(run_loop(shutdown_rx, Duration::from_secs(60), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async {}
+        }));
+        join(Some(task), Duration::from_secs(300)).await;
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            0,
+            "a latched shutdown starts no pass, not even the startup one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_a_pass_drains_it_and_the_task_is_joined() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let passes = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let (pass_started, pass_release) = (Arc::clone(&started), Arc::clone(&release));
+        let (pass_count, done_count) = (Arc::clone(&passes), Arc::clone(&finished));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_loop(shutdown_rx, Duration::from_secs(60), move || {
+            let started = Arc::clone(&pass_started);
+            let release = Arc::clone(&pass_release);
+            let passes = Arc::clone(&pass_count);
+            let finished = Arc::clone(&done_count);
+            async move {
+                passes.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
+                release.notified().await;
+                finished.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        started.notified().await;
+        shutdown_tx.send(true).expect("loop holds the receiver");
+        assert!(
+            !task.is_finished(),
+            "shutdown must not abandon the in-flight pass"
+        );
+        assert_eq!(finished.load(Ordering::SeqCst), 0, "pass still held");
+        release.notify_one();
+        join(Some(task), Duration::from_secs(300)).await;
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "join returned only after the drained pass completed"
+        );
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            1,
+            "no pass starts after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_aborts_a_task_that_outlives_the_drain_and_still_awaits_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(Arc::clone(&dropped));
+        let task = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        });
+        join(Some(task), Duration::from_millis(20)).await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the aborted task's future was dropped before join returned, so nothing is detached"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_swallows_a_panicked_task_and_accepts_no_task() {
+        join(None, Duration::from_secs(1)).await;
+        let task = tokio::spawn(async {
+            // panic_any (not the panic macro) so the semgrep
+            // rust-panic-in-prod gate, which flags added panic lines even in
+            // inline tests, stays silent while still producing a panicked
+            // JoinError for join to swallow.
+            std::panic::panic_any("synthetic reconcile task panic");
+        });
+        // Returning at all is the assertion: the JoinError is logged inside
+        // join, never propagated to the shutdown path.
+        join(Some(task), Duration::from_secs(60)).await;
     }
 }

@@ -1804,8 +1804,9 @@ impl CommandRuntime {
     /// `/feed-add`: decode options → plan → insert-only write → `feed.create`
     /// audit → ephemeral confirmation. The relay id is generated here (legacy
     /// `randomUUID()`); plan errors reply with the domain text and write
-    /// neither a row nor an audit (legacy parity). The relay binds to the
-    /// invoking channel.
+    /// neither a row nor an audit (legacy parity). A store failure audits one
+    /// `feed.create`/`rejected` refusal row, then replies safe. The relay
+    /// binds to the invoking channel.
     async fn feed_add(&self, interaction: &Interaction) {
         let Some(channel_id) = interaction_channel(interaction) else {
             self.finish(interaction, NO_CHANNEL_REPLY).await;
@@ -1835,12 +1836,15 @@ impl CommandRuntime {
                     if let two_bot_core::feeds_store::FeedStoreError::Capacity(quota) = err {
                         self.finish(interaction, quota.to_string()).await;
                     } else {
-                        warn!(reason = feed_store_class(&err), "feed insert failed");
+                        let class = feed_store_class(&err);
+                        warn!(reason = class, "feed insert failed");
+                        self.feed_audit(&inputs, "feed.create", &relay.id, "rejected", Some(class))
+                            .await;
                         self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
                     }
                     return;
                 }
-                self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str())
+                self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str(), None)
                     .await;
                 self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
                     .await;
@@ -1855,7 +1859,9 @@ impl CommandRuntime {
     }
 
     /// `/feed-remove`: decode `id` → plan → guild-scoped delete → `feed.remove`
-    /// audit (`removed`/`missing` outcome) → ephemeral confirmation.
+    /// audit (`removed`/`missing` outcome) → ephemeral confirmation. A store
+    /// failure audits one `feed.remove`/`rejected` refusal row, then replies
+    /// safe.
     async fn feed_remove(&self, interaction: &Interaction) {
         // Remove does not bind to the invoking channel; `channel_id` is only
         // context the planner ignores for this command.
@@ -1874,12 +1880,16 @@ impl CommandRuntime {
                             "feed.remove",
                             &id,
                             if removed { "removed" } else { "missing" },
+                            None,
                         )
                         .await;
                         self.finish(interaction, feed_removed_text(removed)).await;
                     }
                     Err(err) => {
-                        warn!(reason = feed_store_class(&err), "feed remove failed");
+                        let class = feed_store_class(&err);
+                        warn!(reason = class, "feed remove failed");
+                        self.feed_audit(&inputs, "feed.remove", &id, "rejected", Some(class))
+                            .await;
                         self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
                     }
                 }
@@ -1935,7 +1945,16 @@ impl CommandRuntime {
 
     /// Append one `feed.*` audit row; an audit write failure is logged but
     /// never fails the operation it records (same posture as [`Self::audit`]).
-    async fn feed_audit(&self, inputs: &FeedInputs, action: &str, target_key: &str, outcome: &str) {
+    /// Refusals carry the shared error-class token as `reason`; healthy
+    /// outcomes pass `None`.
+    async fn feed_audit(
+        &self,
+        inputs: &FeedInputs,
+        action: &str,
+        target_key: &str,
+        outcome: &str,
+        reason: Option<&str>,
+    ) {
         let audit_id = new_id();
         let row = FeedAudit {
             id: &audit_id,
@@ -1944,7 +1963,7 @@ impl CommandRuntime {
             action,
             target_key,
             outcome,
-            reason: None,
+            reason,
             now_ms: now_millis_for_test(),
         };
         if let Err(err) = write_audit(&self.pool, &row).await {

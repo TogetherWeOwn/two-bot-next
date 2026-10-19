@@ -721,7 +721,7 @@ fn eventsub_revocation_ack_carries_a_bounded_reason() {
 /// vocabulary. The file is permanent, so it is read at compile time; the
 /// message set, the bounded `event` field, the `error_class` tokens and the
 /// `status` tokens each fail closed when renamed or added without a catalog row.
-const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 11] = [
+const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 14] = [
     "eventsub reconcile parked: TWO_EVENTSUB is not exactly 1",
     "eventsub reconcile refused: callback configuration is invalid",
     "eventsub reconcile parked: broadcaster allowlist is empty, no subscriptions mutated",
@@ -733,8 +733,11 @@ const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 11] = [
     "eventsub subscriptions re-created but not all verified yet",
     "eventsub subscriptions reconciled",
     "eventsub reconcile failed",
+    "eventsub reconcile pass interrupted by shutdown; remaining actions skipped and subscription state unverified until the next startup pass",
+    "eventsub reconcile task ended abnormally",
+    "eventsub reconcile task did not finish within the shutdown drain; aborting it, so an in-flight remote mutation outcome is uncertain until the next startup pass re-checks",
 ];
-const EVENTSUB_RECONCILE_ERROR_CLASSES: [&str; 7] = [
+const EVENTSUB_RECONCILE_ERROR_CLASSES: [&str; 10] = [
     "reconcile_prior_failed",
     "reconcile_action_failed",
     "reconcile_unhealthy",
@@ -742,6 +745,9 @@ const EVENTSUB_RECONCILE_ERROR_CLASSES: [&str; 7] = [
     "reconcile_config_invalid",
     "reconcile_no_broadcasters",
     "reconcile_failed",
+    "reconcile_shutdown_interrupted",
+    "reconcile_task_failed",
+    "reconcile_shutdown_drain_exceeded",
 ];
 const EVENTSUB_RECONCILE_STATUSES: [&str; 3] = ["parked", "healthy", "pending"];
 const EVENTSUB_RECONCILE_EVENT_FIELD: &str = "eventsub_reconcile";

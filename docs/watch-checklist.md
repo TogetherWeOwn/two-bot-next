@@ -25,7 +25,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `container_unready_alert` | keepalive `/readyz` probes fail 2 consecutive samples (≈2 min at default 60 s cadence) | Worker logs (structured JSON event) | [container-readiness.md](container-readiness.md#responding-to-an-alert) |
 | `container_unready_recovery` | first ready sample after an alert | Worker logs | same as above |
 | `container_keepalive_arm_failed` | keepalive schedule lookup/insert fails (monitoring outage, not a readiness sample) | Worker logs | [container-readiness.md](container-readiness.md) |
-| `container_unready_webhook_failed` | alert/recovery webhook POST failed or timed out (type + HTTP status only) | Worker logs | [container-readiness.md](container-readiness.md) |
+| `container_unready_webhook_failed` | alert/recovery webhook POST failed or timed out (type, HTTP status, release, log URL; never the binding or body) | Worker logs | [container-readiness.md](container-readiness.md) |
 | `job_stale:<job>` | job's last success older than 2 x its cadence (never-succeeded is ignored) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-stale) |
 | `job_consecutive_failures:<job>` | 3 failed completions in a row; page includes the latest fixed error class when available | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s above 10% of REST requests between samples (min 10 requests; restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-429) |
@@ -45,9 +45,11 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `voice_join_fast_burn` | **page**: genuine creator joins burn the 99.5% move-within-5s budget faster than 14.4x in both the 1 h and 5 min windows (each needs at least 10 joins and two bad moves; incomplete startup/restart windows stay inactive) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-join-fast-burn) |
 | `voice_join_slow_burn` | **ticket**: genuine creator joins burn the 99.5% move-within-5s budget faster than 6x in both the 6 h and 30 min windows (each uses the same volume and bad-move floors) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-join-slow-burn) |
 | `voice_creator_map_stale` | creator-map age past 600 s (two missed 5 min refreshes) after at least one merge; generation 0 never fires, older containers without the gauges hold state | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-creator-map-stale) |
+| `community_facts_drain_failures` | **ticket**: summed community-facts drain failures grow in 3 consecutive windows after a baseline; single bursts stay silent, flat/reset resolves | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-community-facts-drain-failures) |
 | `event_store_consumer_lag` | **ticket**: consumer lag above 60 s in 3 consecutive valid samples (fractional counts); a valid sample at or below 60 s resolves, missing/invalid samples and failed scrapes preserve a firing ticket | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-event-store-consumer-lag) |
 | `error_budget_fast_burn` | **page**: REST error budget burns faster than 12x in both the 15 min and 2 min windows (each needs at least 10 requests and two budget errors; incomplete startup/restart windows stay inactive) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-error-budget-fast-burn) |
 | `error_budget_slow_burn` | **ticket**: same budget burns faster than 3x in both the 2 h and 15 min windows (same floors; needs full 2 h history, holds on gaps, covered quiet 15 min resolves) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-error-budget-slow-burn) |
+| `eventsub_reconcile_failed` | **ticket**: failed EventSub reconcile passes rise between samples (first sample is baseline-only; a restart sample fires when the new process already counted a failed pass, else holds) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-eventsub-reconcile-failed) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via

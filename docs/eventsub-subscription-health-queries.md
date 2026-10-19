@@ -222,6 +222,9 @@ dashboard for them.
 | `eventsub reconcile action failed; continuing with the rest of the plan`, `error_class="reconcile_action_failed"` | a delete or create failed; `action` and `error` identify which one and why in the dashboard; later actions and follow-up listing still run |
 | `eventsub reconcile found failed subscriptions on our callback; deleting and re-creating`, `error_class="reconcile_prior_failed"` | pre-pass failed entries were found and scheduled for replacement; `prior_failed` count is available in the dashboard |
 | `eventsub reconcile failed`, `error_class="reconcile_failed"` | the pass itself errored (list, plan or execute) |
+| `eventsub reconcile pass interrupted by shutdown; remaining actions skipped and subscription state unverified until the next startup pass`, `error_class="reconcile_shutdown_interrupted"` (warn) | shutdown landed mid-pass; `completed`/`remaining` dashboard counts say how far the plan got and the result was not verified — expected during deploys, the next startup pass re-checks |
+| `eventsub reconcile task did not finish within the shutdown drain; …`, `error_class="reconcile_shutdown_drain_exceeded"` | the worker outlived its bounded shutdown drain and was aborted, so one in-flight mutation outcome is uncertain until the next startup pass re-checks — investigate if it repeats outside deploys |
+| `eventsub reconcile task ended abnormally`, `error_class="reconcile_task_failed"` | the reconcile worker panicked or was cancelled (`panicked` dashboard field says which) — investigate |
 | `eventsub reconcile parked: broadcaster allowlist is empty, no subscriptions mutated`, `error_class="reconcile_no_broadcasters"` (warn) | allowlist empty, nothing mutated |
 | `eventsub reconcile parked: TWO_EVENTSUB is not exactly 1`, `reason="flag_dark"` (`status="parked"` in the dashboard) | feature gate is off; reconcile is not running |
 | `eventsub reconcile refused …`, `error_class="reconcile_config_invalid"` (error) | callback, credentials or secret invalid; needs the Operator |
@@ -233,8 +236,10 @@ then the outer `reconcile_failed` wrapper; that pair is one failed pass, not two
 `prior_failed` and `action_failed` lines add detail, not separate pass outcomes.
 The terminal result is `healthy` (reconciled), `pending` (verification
 incomplete), `reconcile_no_broadcasters` (parked), `reconcile_config_invalid`
-(refused), or `reconcile_failed` (errored, sometimes preceded by
-`reconcile_unhealthy`). A `flag_dark` parked line means no pass ran. The
+(refused), `reconcile_failed` (errored, sometimes preceded by
+`reconcile_unhealthy`), or `reconcile_shutdown_interrupted` (stopped by
+shutdown before verification; the next startup pass is the verdict). A
+`flag_dark` parked line means no pass ran. The
 dashboard exposes fields this script drops.
 The broad filter catches diagnostic, error, refused, and parked messages whose
 text contains `eventsub reconcile`; it does not match the healthy or pending
