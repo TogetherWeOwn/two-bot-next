@@ -546,7 +546,10 @@ async fn router_cleans_failed_posts_but_preserves_unreadable_acceptance() {
         );
         if retained {
             assert!(stored.unwrap().message_id.is_none());
-            assert!(last_reply(&mock).contains("acceptance is uncertain"));
+            assert_eq!(
+                last_reply(&mock),
+                "LFG post acceptance is uncertain; saved state retained for nonce recovery."
+            );
         } else {
             assert!(last_reply(&mock).contains("operation failed"));
             let audit: (String,) =

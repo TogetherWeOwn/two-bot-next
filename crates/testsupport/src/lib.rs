@@ -110,10 +110,9 @@ fn connect_options(raw: &str, statement_timeout: &str) -> Result<PgConnectOption
 // retry (run 39197217315 attempt 1: 7x bootstrap-connect "Temporary failure in
 // name resolution", 1x teardown EOF). Connect-level retry lives in
 // `retry_on_transient`/`with_bootstrap_retries`; the statement layer below
-// absorbs a blip that kills a CREATE/migrate/DROP connection instead of
+// absorbs a blip that kills a CREATE/migrate connection instead of
 // failing the suite on the first lost packet.
 const SETUP_DDL_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
-const TEARDOWN_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
 
 /// Run `op` until it succeeds or `delays` run out, sleeping one delay between
 /// attempts. Returns the last error when every attempt fails. Each retry is
@@ -141,16 +140,6 @@ where
             },
         }
     }
-}
-
-/// A teardown DROP whose connection died after the server committed leaves no
-/// database behind: the retry then reports undefined_catalog (3D000), which
-/// proves the teardown goal instead of failing it.
-fn is_missing_database(error: &sqlx::Error) -> bool {
-    error
-        .as_database_error()
-        .and_then(|error| error.code())
-        .is_some_and(|code| code == "3D000")
 }
 
 /// A setup CREATE whose connection died after the server committed leaves the
@@ -269,37 +258,110 @@ async fn prepare_cleanup_connection(conn: &mut sqlx::PgConnection) -> Result<()>
     Ok(())
 }
 
+/// Substrings marking a teardown failure as transient hosted-runner
+/// infrastructure (DNS, dropped connection) rather than a deterministic
+/// teardown bug (unknown database, permission). Anything outside this list
+/// fails fast and is never retried.
+fn is_transient_teardown_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_lowercase();
+    const MARKERS: &[&str] = &[
+        "temporary failure in name resolution",
+        "failed to lookup address information",
+        "name or service not known",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "unexpected eof",
+        "got 0 bytes",
+        "expected to read",
+        "could not connect",
+        "server closed the connection",
+        "connection timed out",
+        "timed out",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
+
+/// A retry that finds the database already gone means an earlier attempt
+/// committed its DROP server-side before the client saw EOF. Fixture names
+/// are unique per process/time/sequence and only this Cleanup drops them,
+/// so "does not exist" on attempt 2+ is success, never a bug.
+fn is_teardown_already_dropped(error: &anyhow::Error) -> bool {
+    format!("{error:#}")
+        .to_lowercase()
+        .contains("does not exist")
+}
+
+/// Run a teardown operation until it succeeds, retrying only transient
+/// hosted-runner infrastructure failures. The attempt budget is explicit so
+/// unit tests pin the loop: a transient-then-success operation is called
+/// until success, a deterministic error is called exactly once. A
+/// "does not exist" error after the first attempt means an earlier DROP
+/// already committed, so it returns success; the first attempt stays strict
+/// so wrong-name teardown bugs still fail fast.
+async fn with_teardown_retries<F, Fut>(attempts: usize, mut operation: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let attempts = attempts.max(1);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match operation().await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt > 1 && is_teardown_already_dropped(&error) => {
+                eprintln!(
+                    "test-database teardown already dropped on attempt {attempt}/{attempts}; treating as success"
+                );
+                return Ok(());
+            }
+            Err(error) if attempt < attempts && is_transient_teardown_error(&error) => {
+                eprintln!(
+                    "transient test-database teardown failure (attempt {attempt}/{attempts}): {error:#}; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(250u64 << (attempt - 1))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl Cleanup {
-    async fn close(self) -> Result<()> {
-        self.close_with_delays(&TEARDOWN_RETRY_DELAYS).await
+    async fn drop_once(admin: &PgPool, name: &str) -> Result<()> {
+        let _ddl = DATABASE_DDL.lock().await;
+        let mut conn = admin.acquire().await?;
+        prepare_cleanup_connection(&mut conn).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE \"{}\" WITH (FORCE)",
+            name
+        )))
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
     }
 
-    async fn close_with_delays(self, delays: &[Duration]) -> Result<()> {
-        for pool in self.independent_pools.into_inner().unwrap() {
+    async fn close(self) -> Result<()> {
+        let Self {
+            admin,
+            pool,
+            independent_pools,
+            name,
+        } = self;
+        for pool in independent_pools.into_inner().unwrap() {
             pool.close().await;
         }
-        self.pool.close().await;
-        // The name is generated internally, not supplied by a caller. Each
-        // attempt takes the DDL gate; the backoff sleep never holds it.
-        let result: Result<()> =
-            retry_with_backoff("drop disposable test database", delays, || async {
-                let _ddl = DATABASE_DDL.lock().await;
-                let mut conn = self.admin.acquire().await?;
-                prepare_cleanup_connection(&mut conn).await?;
-                match sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "DROP DATABASE \"{}\" WITH (FORCE)",
-                    self.name
-                )))
-                .execute(&mut *conn)
-                .await
-                {
-                    Ok(_) => Ok(()),
-                    Err(error) if is_missing_database(&error) => Ok(()),
-                    Err(error) => Err(anyhow::Error::from(error)),
-                }
-            })
-            .await;
-        self.admin.close().await;
+        pool.close().await;
+        // The name is generated internally, not supplied by a caller.
+        // Hosted runners occasionally lose the service hostname for seconds;
+        // the same blip that fails bootstrap connects can also kill an
+        // in-flight DROP with EOF. Retry only transient teardown failures;
+        // anything else fails fast with its original context. The DDL guard
+        // is per attempt inside drop_once, never held across backoff sleep.
+        const ATTEMPTS: usize = 4;
+        let result = with_teardown_retries(ATTEMPTS, || Self::drop_once(&admin, &name)).await;
+        admin.close().await;
         result.context("drop disposable test database")?;
         Ok(())
     }
@@ -942,6 +1004,135 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
+    #[test]
+    fn teardown_retry_covers_transient_infra_but_not_teardown_bugs() {
+        for transient in [
+            "drop disposable test database: error communicating with database: \
+             expected to read 5 bytes, got 0 bytes at EOF",
+            "server closed the connection unexpectedly",
+            "connection reset by peer",
+            "pool timed out while waiting for an open connection",
+        ] {
+            assert!(
+                is_transient_teardown_error(&anyhow::anyhow!("{transient}")),
+                "should retry: {transient}"
+            );
+        }
+        for deterministic in [
+            "database \"two_bot_test_deadbeef\" does not exist",
+            "permission denied to drop database",
+            "cannot drop the currently open database",
+            "set disposable database teardown timeout: statement timeout",
+        ] {
+            assert!(
+                !is_transient_teardown_error(&anyhow::anyhow!("{deterministic}")),
+                "must fail fast: {deterministic}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_retry_retries_transient_until_success() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        with_teardown_retries(4, || {
+            let calls = calls.clone();
+            async move {
+                let mut calls = calls.lock().unwrap();
+                *calls += 1;
+                let attempt = *calls;
+                drop(calls);
+                if attempt < 3 {
+                    Err(anyhow::anyhow!("connection reset by peer"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn teardown_retry_fails_fast_on_deterministic_error() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        let result = with_teardown_retries(4, || {
+            let calls = calls.clone();
+            async move {
+                *calls.lock().unwrap() += 1;
+                Err(anyhow::anyhow!("permission denied to drop database"))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn teardown_retry_exhausts_attempts_on_persistent_transient() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        let result = with_teardown_retries(4, || {
+            let calls = calls.clone();
+            async move {
+                *calls.lock().unwrap() += 1;
+                Err(anyhow::anyhow!(
+                    "expected to read 5 bytes, got 0 bytes at EOF"
+                ))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn teardown_retry_treats_already_dropped_as_success_after_transient() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        with_teardown_retries(4, || {
+            let calls = calls.clone();
+            async move {
+                let mut calls = calls.lock().unwrap();
+                *calls += 1;
+                let attempt = *calls;
+                drop(calls);
+                if attempt == 1 {
+                    Err(anyhow::anyhow!(
+                        "expected to read 5 bytes, got 0 bytes at EOF"
+                    ))
+                } else {
+                    Err(anyhow::anyhow!(
+                        "database \"two_bot_test_deadbeef\" does not exist"
+                    ))
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn teardown_retry_fails_fast_when_first_attempt_finds_nothing() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(0usize));
+        let result = with_teardown_retries(4, || {
+            let calls = calls.clone();
+            async move {
+                *calls.lock().unwrap() += 1;
+                Err(anyhow::anyhow!(
+                    "database \"two_bot_test_deadbeef\" does not exist"
+                ))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
     fn transient_io_error() -> sqlx::Error {
         sqlx::Error::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
@@ -1011,8 +1202,8 @@ mod tests {
     }
 
     /// Stand-in database error carrying a message and an optional SQLSTATE
-    /// code: proves the teardown classifier recognizes a lost-then-dropped
-    /// database and the connect classifier fails fast on auth errors.
+    /// code: proves CREATE recognizes a lost-then-created database and the
+    /// connect classifier fails fast on auth errors.
     #[derive(Debug)]
     struct FakeDbError {
         message: &'static str,
@@ -1054,25 +1245,6 @@ mod tests {
     }
 
     #[test]
-    fn teardown_treats_a_missing_database_as_dropped() {
-        let missing = sqlx::Error::Database(Box::new(FakeDbError {
-            message: "database does not exist",
-            code: Some("3D000"),
-        }));
-        assert!(is_missing_database(&missing));
-        let deadlock = sqlx::Error::Database(Box::new(FakeDbError {
-            message: "deadlock detected",
-            code: Some("40P01"),
-        }));
-        assert!(!is_missing_database(&deadlock));
-        let eof = sqlx::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "expected to read 5 bytes, got 0 bytes at EOF",
-        ));
-        assert!(!is_missing_database(&eof));
-    }
-
-    #[test]
     fn create_treats_a_duplicate_database_as_created() {
         let duplicate = sqlx::Error::Database(Box::new(FakeDbError {
             message: "database already exists",
@@ -1095,10 +1267,6 @@ mod tests {
     fn retry_budgets_are_bounded_and_enabled() {
         assert_eq!(
             SETUP_DDL_RETRY_DELAYS,
-            [Duration::from_secs(1), Duration::from_secs(2)]
-        );
-        assert_eq!(
-            TEARDOWN_RETRY_DELAYS,
             [Duration::from_secs(1), Duration::from_secs(2)]
         );
     }
@@ -1172,70 +1340,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn teardown_succeeds_when_the_database_is_already_gone() {
-        let raw = match std::env::var_os("TWO_TEST_DATABASE_URL") {
-            Some(os) => os
-                .into_string()
-                .expect("invalid test bootstrap configuration"),
-            None => return,
-        };
-        let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
-            .await
-            .unwrap();
-        let name = fixture.name().to_owned();
-        let admin = fixture.cleanup.as_ref().unwrap().admin.clone();
-        {
-            let _ddl = DATABASE_DDL.lock().await;
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DROP DATABASE \"{name}\" WITH (FORCE)"
-            )))
-            .execute(&admin)
-            .await
-            .unwrap();
-        }
-        fixture
-            .close()
-            .await
-            .expect("teardown must treat an already-dropped database as dropped");
-    }
-
-    #[tokio::test]
-    async fn teardown_retries_a_dead_admin_before_failing() {
-        let Some(missing) = missing_bootstrap_url() else {
-            return;
-        };
-        let admin_options =
-            connect_options(&missing, ADMIN_DDL_STATEMENT_TIMEOUT).expect("probe options parse");
-        let fixture_options =
-            connect_options(&missing, FIXTURE_STATEMENT_TIMEOUT).expect("probe options parse");
-        let cleanup = Cleanup {
-            admin: PgPoolOptions::new()
-                .max_connections(1)
-                .connect_lazy_with(admin_options),
-            pool: PgPoolOptions::new()
-                .max_connections(1)
-                .connect_lazy_with(fixture_options),
-            independent_pools: std::sync::Mutex::new(Vec::new()),
-            name: "two_bot_test_missing_cleanup_probe".to_string(),
-        };
-        let start = Instant::now();
-        let error = cleanup
-            .close_with_delays(&WIRING_DELAYS)
-            .await
-            .expect_err("teardown against a dead admin must fail");
-        assert!(
-            start.elapsed() >= Duration::from_millis(100),
-            "teardown returned in {:?} without running the 200ms retry backoff",
-            start.elapsed()
-        );
-        let chain = format!("{error:?}");
-        assert!(
-            chain.contains("drop disposable test database"),
-            "lost the teardown error context: {chain}"
-        );
-    }
-
-    #[tokio::test]
     async fn public_create_still_retries_migrations_past_the_first_production_delay() {
         let raw = match std::env::var_os("TWO_TEST_DATABASE_URL") {
             Some(os) => os
@@ -1259,36 +1363,6 @@ mod tests {
         assert!(
             probe.is_err(),
             "public TestDatabase::create returned before the 1s production migration delay elapsed"
-        );
-    }
-
-    #[tokio::test]
-    async fn public_close_still_retries_past_the_first_production_delay() {
-        let Some(missing) = missing_bootstrap_url() else {
-            return;
-        };
-        let admin_options =
-            connect_options(&missing, ADMIN_DDL_STATEMENT_TIMEOUT).expect("probe options parse");
-        let fixture_options =
-            connect_options(&missing, FIXTURE_STATEMENT_TIMEOUT).expect("probe options parse");
-        let cleanup = Cleanup {
-            admin: PgPoolOptions::new()
-                .max_connections(1)
-                .connect_lazy_with(admin_options),
-            pool: PgPoolOptions::new()
-                .max_connections(1)
-                .connect_lazy_with(fixture_options),
-            independent_pools: std::sync::Mutex::new(Vec::new()),
-            name: "two_bot_test_missing_cleanup_probe".to_string(),
-        };
-        // Pins the public Cleanup::close delegate to the 1s/2s production
-        // teardown backoff: at 1.5s the first delay is consumed and the
-        // second attempt is in flight, so the timeout must elapse. Emptying
-        // the delegate delays fails fast and the timeout returns the error.
-        let probe = tokio::time::timeout(Duration::from_millis(1500), cleanup.close()).await;
-        assert!(
-            probe.is_err(),
-            "public Cleanup::close returned before the 1s production delay elapsed"
         );
     }
 

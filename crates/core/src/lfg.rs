@@ -865,14 +865,14 @@ mod tests {
 
     #[test]
     fn role_spec_rejects_input_over_the_published_utf16_bound() {
-        assert_eq!(
-            parse_role_spec(&"x".repeat(MAX_ROLE_SPEC_CHARS + 1)),
-            Err(RoleSpecError::TooLong)
-        );
-        assert_eq!(
-            parse_role_spec(&"😀".repeat(MAX_ROLE_SPEC_CHARS / 2 + 1)),
-            Err(RoleSpecError::TooLong)
-        );
+        for oversized in [
+            "x".repeat(MAX_ROLE_SPEC_CHARS + 1),
+            "😀".repeat(MAX_ROLE_SPEC_CHARS / 2 + 1),
+        ] {
+            let error = parse_role_spec(&oversized).unwrap_err();
+            assert_eq!(error, RoleSpecError::TooLong);
+            assert_eq!(error.to_string(), "LFG role specification is too long.");
+        }
     }
 
     #[test]
@@ -965,6 +965,10 @@ mod tests {
         assert_eq!(
             RoleSpecError::BadKey("Tank!".to_owned()).to_string(),
             "Invalid LFG role key \"Tank!\"."
+        );
+        assert_eq!(
+            RoleSpecError::TooLong.to_string(),
+            "LFG role specification is too long."
         );
         assert_eq!(
             RoleSpecError::BadLabel.to_string(),
