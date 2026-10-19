@@ -1750,6 +1750,8 @@ async fn held_post_removal_never_confirms_before_settlement() {
     // await when the timeout elapsed. Both serializations stay acceptable.
     if finished_early.is_err() {
         removal.await.unwrap();
+    } else {
+        finished_early.unwrap().unwrap();
     }
     assert_eq!(post_count(&mock), 1, "exactly the one held POST was sent");
     if relay_count(db.pool(), &relay.id).await == 1 {
