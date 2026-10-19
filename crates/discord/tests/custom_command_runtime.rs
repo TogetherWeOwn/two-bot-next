@@ -1143,6 +1143,37 @@ async fn manage_registry_publish_failure_suffix_is_pinned() {
     pool.close().await;
 }
 
+// ---- display pins ----
+
+#[test]
+fn custom_command_error_display_strings_are_pinned() {
+    use two_bot_discord::custom_commands::CustomCommandError;
+    assert_eq!(
+        CustomCommandError::Storage.to_string(),
+        "Custom-command storage failed."
+    );
+    assert_eq!(
+        CustomCommandError::Delivery.to_string(),
+        "Custom-command Discord delivery failed."
+    );
+    assert_eq!(
+        CustomCommandError::DeliveryUnknown.to_string(),
+        "Custom-command Discord delivery outcome is unknown."
+    );
+    assert_eq!(
+        CustomCommandError::Publication.to_string(),
+        "Custom-command registry publication failed; the saved definition is unchanged."
+    );
+    assert_eq!(
+        CustomCommandError::Context.to_string(),
+        "Custom-command context is unavailable."
+    );
+    assert_eq!(
+        CustomCommandError::Render.to_string(),
+        "Custom-command template could not be rendered."
+    );
+}
+
 // Acceptance: a refused slash defer leaves a failed `command.run` row.
 //
 // `docs/custom-commands.md` handoff item 5 requires rendering inside the

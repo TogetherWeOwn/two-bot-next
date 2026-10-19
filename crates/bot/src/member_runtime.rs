@@ -585,6 +585,10 @@ async fn tick(member: &MemberRuntime, rest: &ActionExecutor) -> Result<(), Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use two_bot_core::{
+        member_moderation::StoreError,
+        moderation::{PolicyError, ReasonError},
+    };
 
     #[test]
     fn unknown_bot_role_or_everyone_position_refuses() {
@@ -630,9 +634,98 @@ mod tests {
             error_text(MemberError::Discord(MemberDiscordError::RateLimited)),
             "Discord rate-limited the request; nothing was applied. Try again shortly."
         );
+        // Literal copy, not `UNCERTAIN_REPLY`: a changed constant must fail.
         assert_eq!(
             error_text(MemberError::Discord(MemberDiscordError::Timeout)),
-            UNCERTAIN_REPLY
+            "Discord did not confirm the action. It may still land; ask an operator to reconcile before retrying."
+        );
+        // `Unavailable` carries a detail but renders the same fenced copy: the
+        // detail must never leak into the ephemeral reply.
+        assert_eq!(
+            error_text(MemberError::Discord(MemberDiscordError::Unavailable(
+                "503 service unavailable".to_owned()
+            ))),
+            "Discord did not confirm the action. It may still land; ask an operator to reconcile before retrying."
+        );
+    }
+
+    #[test]
+    fn policy_error_display_passthrough_is_pinned() {
+        // `error_text` renders policy refusals verbatim: pin the copy and the
+        // passthrough shape so either change fails loudly.
+        assert_eq!(
+            error_text(MemberError::Policy(PolicyError::ActorHierarchy)),
+            "The target is equal to or above your highest role"
+        );
+        assert_eq!(
+            error_text(MemberError::Policy(PolicyError::ActorHierarchy)),
+            PolicyError::ActorHierarchy.to_string()
+        );
+    }
+
+    #[test]
+    fn reason_error_display_passthrough_is_pinned() {
+        // Same verbatim rendering for reason refusals.
+        assert_eq!(
+            error_text(MemberError::Reason(ReasonError::Empty)),
+            "\"reason\" must be a non-empty string"
+        );
+        assert_eq!(
+            error_text(MemberError::Reason(ReasonError::Empty)),
+            ReasonError::Empty.to_string()
+        );
+    }
+
+    #[test]
+    fn malformed_error_text_is_pinned() {
+        assert_eq!(
+            error_text(MemberError::Malformed {
+                field: "duration_seconds",
+                message: "\"duration_seconds\" must be an integer between 60 and 31536000"
+                    .to_owned(),
+            }),
+            "malformed duration_seconds: \"duration_seconds\" must be an integer between 60 and 31536000"
+        );
+    }
+
+    #[test]
+    fn inflight_error_text_is_pinned() {
+        assert_eq!(
+            error_text(MemberError::InFlight),
+            "A moderation action for this member is already in progress."
+        );
+    }
+
+    #[test]
+    fn key_mismatch_error_text_is_pinned() {
+        assert_eq!(
+            error_text(MemberError::KeyMismatch),
+            "This moderation request was already submitted with different details."
+        );
+    }
+
+    #[test]
+    fn rejected_detail_passthrough_is_pinned() {
+        // Representative fixed detail: a Discord 4xx refusal names its cause.
+        assert_eq!(
+            error_text(MemberError::Discord(MemberDiscordError::Rejected(
+                "missing permissions".to_owned()
+            ))),
+            "Discord refused the request: missing permissions"
+        );
+    }
+
+    #[test]
+    fn store_and_bot_identity_unknown_copy_is_pinned() {
+        // Both arms render the opaque failure reply: the store message never
+        // leaks into the ephemeral copy.
+        assert_eq!(
+            error_text(MemberError::Store(StoreError::new("db down"))),
+            "Moderation command failed; try again."
+        );
+        assert_eq!(
+            error_text(MemberError::BotIdentityUnknown),
+            "Moderation command failed; try again."
         );
     }
 

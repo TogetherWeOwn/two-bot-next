@@ -77,6 +77,10 @@ fn unknown_only_submission_answers_with_an_ephemeral_retry_explanation() {
     )
     .expect("legacy serves the picker");
     assert!(out.ephemeral, "only the clicker sees the stale-menu answer");
+    assert_eq!(
+        out.reply,
+        "That menu looks stale - I did not recognize those choices.\nNothing was changed. Open the picker again and choose afresh."
+    );
     assert_ne!(
         out.reply, PICKER_CLEARED_REPLY,
         "unknown-only input must never claim the roles were cleared"
