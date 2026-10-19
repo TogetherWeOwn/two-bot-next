@@ -225,6 +225,7 @@ pub const PREFIX_TRIGGER_REFUSED_REASONS: &[&str] = &["verdict", "other"];
 /// (`proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`);
 /// and each queued rename at dispatch (`rename_sent`, or why it was dropped
 /// or held, including `rename_duplicate` for a flush-time folded duplicate).
+/// `name_blocked` records a dispatch-time rename or custom-override refusal.
 /// Unknown outcomes collapse to `other`.
 pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "created_with_template",
@@ -241,6 +242,7 @@ pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "rename_no_access",
     "rename_held",
     "rename_duplicate",
+    "name_blocked",
     "other",
 ];
 /// Creator-join accept refusals for `two_bot_voice_join_refused_total{reason}`:
