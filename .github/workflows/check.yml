@@ -2329,6 +2329,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
         run: node --test scripts/test-ownership-control.mjs
+      - name: Verify ownership control response validation (offline fixtures)
+        run: node --test scripts/test-ownership-control-response-validation.mjs
       - name: Verify staging ownership status read (offline fixtures)
         run: node --test scripts/test-staging-ownership-status.mjs
       - name: Verify staging ownership status workflow (offline fixtures)
