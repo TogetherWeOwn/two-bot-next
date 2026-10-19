@@ -1034,10 +1034,39 @@ armed tick, the unpaired alert needs one baseline tick plus three
 outstanding ticks (about 4 min). Observe one full 30-minute cooldown window
 for R1-to-R2 escalation (`creator-map-reload`, no host action, then one
 Operator card for `same-sha-takeover` at the same SHA); a further window
-proves the two-failure CEO page and silence. Re-dispatching without the
-flags (or any plain push deploy) disarms the drill: the triggers resolve on
-their own rules and the guards reset. Rollback is disarm-by-redeploy; the
-Worker recommends only, so nothing executes from this path.
+proves the two-failure CEO page and silence. Disarming re-dispatches the
+same SHA without the flags: the triggers resolve on their own rules and the
+guards reset. Rollback is disarm-by-redeploy; the Worker recommends only, so
+nothing executes from this path.
+
+Drill procedure (Operator). The soak needs the armed build undisturbed for
+at least 90 minutes (R1, R2 30+ minutes later, STOP 30+ minutes after R2,
+disarm, then a 30-minute clear) while merges keep landing. Arm the hold
+first so no push redeploys staging mid-soak: without it, the next push
+disarms the drill by redeploy.
+
+1. Pick the drill SHA: the full 40-hex main commit staging currently serves
+   (the `build_revision` on staging `/readyz`, not a guess). The pin must be
+   an ancestor of `origin/main`.
+2. Arm the hold: `gh variable set STAGING_SOAK_HOLD_UNTIL --body
+   "2026-10-19T20:00:00Z"` with an ISO-8601 UTC deadline at most 4h out
+   (past the planned disarm plus the 30-minute clear).
+3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
+   --ref main -f sha=<40hex> -f inject_voice_stall=true` (add
+   `-f inject_unpaired_disconnect=true` for the crash-loop scope).
+   Dispatches bypass the hold, so arm and disarm work while it is armed.
+   The arm run stays red by design: the history guard fails it after a green
+   deploy and synthetic so the pin never reads as staging history for the
+   head. Read the deploy and synthetic steps, not the run color.
+4. Run the R1/R2/STOP observation above. Pushes during the window fail fast
+   with the deferral message (red, by design: a quiet green would read as
+   staging history to the production guard); merges stay unblocked.
+5. Disarm at the SAME SHA with no flags: `gh workflow run
+   deploy-staging.yml --ref main -f sha=<same-40hex>`. The disarm run stays
+   red for the same reason while the pin sits below the head.
+6. Watch the 30-minute clear (triggers resolve, guards reset), then release
+   the hold: `gh variable delete STAGING_SOAK_HOLD_UNTIL`. Letting it expire
+   works too: expiry fails open and the next push deploys normally.
 
 #### Staging guard receipts (persisted remediation evidence)
 
