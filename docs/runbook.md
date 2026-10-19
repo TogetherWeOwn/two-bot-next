@@ -582,6 +582,33 @@ at full fast burn), when half the 48h budget is spent, or when the spike
 matches a deploy — the fix belongs to the on-call engineer, not another
 redeploy.
 
+#### Alert: error budget slow burn
+
+The same REST error budget is burning faster than 3x in both the last 2 hours
+and the last 15 minutes. This is the ticket-severity companion to the
+fast-burn page above: a moderate but sustained degradation — a slow leak of
+`5xx` or `transport` errors — that never spikes hard enough to page. Each
+window needs at least 10 eligible requests and two budget errors; quiet
+traffic and one bad event stay silent. After startup the ticket waits for a
+full 2 h of history; a counter reset (process restart) rebuilds the ring
+instead of firing and holds a firing ticket instead of resolving it, so a
+deploy never posts a spurious RESOLVED. A scrape gap or missing series
+holds a firing ticket, and a covered quiet or below-threshold 15 min window
+resolves it even while the 2 h window is still unknown. Window edges land
+on whole
+keepalive scrapes, so the comparison carries the same ~1% allowance as the
+fast rule.
+
+First response: same signals as the fast burn — compare `5xx` against
+`transport` growth by `route` via the authorized `/ops/metrics` scrape, then
+read the container logs for the failing route. Triage within the watch
+shift; do not close it as "fast burn resolved": the fast window can clear
+while the slow grind continues.
+
+Escalate to a page when half the 48h budget is spent, when the slow burn
+persists across two consecutive 2 h windows, or when the leak matches a
+deploy — the fix belongs to the on-call engineer, not another redeploy.
+
 #### Alert: gateway missed events
 
 `two_bot_gateway_missed_events_total` increased between two keepalive
