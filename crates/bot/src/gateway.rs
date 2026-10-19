@@ -659,6 +659,7 @@ async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Opti
                         error_code = code,
                         "retention purge skipped; schema gap, operator replay required"
                     );
+                    two_bot_core::metrics::global().retention_replay_needed();
                 } else {
                     tracing::warn!(
                         guild = event_guild_id(event),
