@@ -867,6 +867,53 @@ mod tests {
     }
 
     #[test]
+    fn validation_refusal_displays_are_pinned() {
+        // Every ScheduleError variant, reached through the real validate path,
+        // with its member-visible Display text byte-pinned.
+        let err = validate_schedule(&input("", Some(1), None)).expect_err("empty body");
+        assert_eq!(err, ScheduleError::BodyEmpty);
+        assert_eq!(
+            err.to_string(),
+            "Message body must be between 1 and 2000 characters."
+        );
+
+        let err =
+            validate_schedule(&input(&"x".repeat(2001), Some(1), None)).expect_err("long body");
+        assert_eq!(err, ScheduleError::BodyTooLong);
+        assert_eq!(
+            err.to_string(),
+            "Message body must be between 1 and 2000 characters."
+        );
+
+        let err = validate_schedule(&input("x", None, None)).expect_err("missing timing");
+        assert_eq!(err, ScheduleError::MissingTiming);
+        assert_eq!(
+            err.to_string(),
+            "Give either in-minutes (one-shot) or every-minutes (recurring)."
+        );
+
+        for value in [0, 525_601] {
+            let err =
+                validate_schedule(&input("x", Some(value), None)).expect_err("in-minutes range");
+            assert_eq!(err, ScheduleError::InMinutesOutOfRange(value));
+            assert_eq!(
+                err.to_string(),
+                format!("in-minutes must be between 1 and 525600, got {value}.")
+            );
+        }
+
+        for value in [59, 525_601] {
+            let err =
+                validate_schedule(&input("x", None, Some(value))).expect_err("every-minutes range");
+            assert_eq!(err, ScheduleError::EveryMinutesOutOfRange(value));
+            assert_eq!(
+                err.to_string(),
+                format!("every-minutes must be between 60 and 525600, got {value}.")
+            );
+        }
+    }
+
+    #[test]
     fn body_bounds_count_utf16_units_without_truncating_stored_text() {
         for body in [
             "é".repeat(2000),
