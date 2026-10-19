@@ -1051,6 +1051,13 @@ pub enum PersistOutcome {
 /// additive and drained buffers never flush twice, so a tick persists each
 /// interval at most once.
 ///
+/// The gate reads and the upsert share one serializing transaction: it holds
+/// `ROW EXCLUSIVE` on the suppression table from before the first gate read
+/// until the upsert commits, so a suppression installed mid-flush either
+/// lands before the gate (filtered out of this flush) or waits for the
+/// commit (filtered out of the next). Either linearization stores zero for
+/// the newly-suppressed member from the opting flush on.
+///
 /// Telemetry is label-free: counts only, no game or member labels.
 pub async fn persist_guild(
     pool: &sqlx::PgPool,
@@ -1060,7 +1067,21 @@ pub async fn persist_guild(
     now_ms: i64,
 ) -> Result<PersistOutcome, GameActivityStoreError> {
     let guild_text = guild.to_string();
-    if game_activity_store::game_analytics_disabled(pool, &guild_text).await? {
+    // Serialize the gate reads with the upsert below (`record_event`
+    // precedent): the transaction holds ROW EXCLUSIVE on the suppression
+    // table from before the first gate read until the upsert commits, so an
+    // opt-out's SHARE ROW EXCLUSIVE either lands fully before the gate read
+    // or waits for the commit. ROW EXCLUSIVE never blocks other writers, and
+    // suppression is the only table this flush shares with the opt-out lock
+    // set, so there is no lock-ordering hazard. Gate failures still fail
+    // closed (rollback, buffers untouched); an upsert failure rolls back and
+    // requeues as before.
+    let mut tx = pool.begin().await?;
+    sqlx::query("LOCK TABLE privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    if game_activity_store::game_analytics_disabled_in(&mut tx, &guild_text).await? {
+        tx.rollback().await?;
         let (deltas, spans) = collector.drain_guild_at(guild, now_ms);
         collector.clear_guild_carry(guild);
         tracing::info!(
@@ -1070,8 +1091,8 @@ pub async fn persist_guild(
         );
         return Ok(PersistOutcome::SkippedDisabled);
     }
-    let opted_out = game_activity_store::opted_out_user_keys(pool, &guild_text).await?;
-    let voice_off = game_activity_store::voice_analytics_disabled(pool, &guild_text).await?;
+    let opted_out = game_activity_store::opted_out_user_keys_in(&mut tx, &guild_text).await?;
+    let voice_off = game_activity_store::voice_analytics_disabled_in(&mut tx, &guild_text).await?;
     let (deltas, spans) = collector.drain_guild_at(guild, now_ms);
     if !opted_out.is_empty() {
         collector.drop_carry_users(guild, &opted_out);
@@ -1102,6 +1123,7 @@ pub async fn persist_guild(
             spans = spans.len(),
             "game_activity_flush_empty"
         );
+        tx.rollback().await?;
         // Same span retention as [`GameActivityCollector::flush`]: with play
         // still carried, drained spans wait for the bridged session instead
         // of dropping covered voice time. Voice-off drops them above.
@@ -1111,8 +1133,9 @@ pub async fn persist_guild(
         return Ok(PersistOutcome::Empty);
     }
     let session_total: u64 = rows.iter().map(|row| row.session_count).sum();
-    match game_activity_store::upsert_guild_aggregates(pool, &rows).await {
+    match game_activity_store::upsert_guild_aggregates_in(&mut tx, &rows).await {
         Ok(written) => {
+            tx.commit().await?;
             // Busy-guild case (see `flush`): retain silent carried members'
             // spans even though other members persisted rows. Retention runs
             // only on success so a failed upsert requeues the full drained
