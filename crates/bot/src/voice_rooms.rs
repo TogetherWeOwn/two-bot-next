@@ -68,7 +68,10 @@ use two_bot_core::{
         diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
         DIFF_HASH_CHARS,
     },
-    voice_create_admission::{CreateAdmissionConfig, RefusalReason},
+    voice_create_admission::{
+        CreateAdmissionConfig, RefusalReason, MAX_CREATE_COOLDOWN_SECS, MAX_ROOMS_PER_GUILD,
+        MAX_ROOMS_PER_USER, MIN_CREATE_COOLDOWN_SECS, MIN_ROOMS_PER_GUILD, MIN_ROOMS_PER_USER,
+    },
     voice_custom_id::{
         import_cancel_custom_id, import_confirm_custom_id, parse_voice_custom_id, VoiceAction,
         IMPORT_HASH_CHARS,
@@ -624,6 +627,65 @@ impl RoomPersistence for PgRoomStore {
 /// the lobby.
 fn temp_voice_admission() -> CreateAdmissionConfig {
     CreateAdmissionConfig::new(1, 40, 0).expect("temp-voice admission limits are in range")
+}
+
+/// Boot-time temp-voice create-admission keys: cold-class settings resolved
+/// once at boot into every guild worker's durable create admission.
+const ADMISSION_MAX_PER_USER_KEY: &str = "TWO_TEMP_VOICE_MAX_PER_USER";
+const ADMISSION_MAX_PER_GUILD_KEY: &str = "TWO_TEMP_VOICE_MAX_PER_GUILD";
+const ADMISSION_COOLDOWN_KEY: &str = "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS";
+
+/// Resolve the boot temp-voice create admission from the process environment
+/// (shaped like `configured_protected_channels`). Each knob validates
+/// independently against the [`CreateAdmissionConfig`] ranges: a
+/// missing/blank value keeps today's effective default, while a
+/// present-but-unparsable or out-of-range value warns once with the setting
+/// key and reason `invalid_value` and fails closed to that knob's default
+/// only. Unset keeps today's (1, 40, 0) — deliberately not the legacy core
+/// default's 30 s cooldown, which silently kept members who rejoined the
+/// creator in the lobby.
+pub fn configured_admission(env: impl Fn(&str) -> Option<String>) -> CreateAdmissionConfig {
+    let user = admission_knob(
+        env(ADMISSION_MAX_PER_USER_KEY).as_deref(),
+        ADMISSION_MAX_PER_USER_KEY,
+        1,
+        MIN_ROOMS_PER_USER,
+        MAX_ROOMS_PER_USER,
+    );
+    let guild = admission_knob(
+        env(ADMISSION_MAX_PER_GUILD_KEY).as_deref(),
+        ADMISSION_MAX_PER_GUILD_KEY,
+        40,
+        MIN_ROOMS_PER_GUILD,
+        MAX_ROOMS_PER_GUILD,
+    );
+    let cooldown = admission_knob(
+        env(ADMISSION_COOLDOWN_KEY).as_deref(),
+        ADMISSION_COOLDOWN_KEY,
+        0,
+        MIN_CREATE_COOLDOWN_SECS,
+        MAX_CREATE_COOLDOWN_SECS,
+    );
+    CreateAdmissionConfig::new(user, guild, cooldown).expect("admission knobs validated per knob")
+}
+
+/// One admission knob: blank counts as unset (silent), anything else must
+/// parse as a whole number inside `min..=max` or it warns and fails closed.
+fn admission_knob(raw: Option<&str>, key: &str, default: u32, min: u32, max: u32) -> u32 {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return default;
+    };
+    match raw.parse::<u32>() {
+        Ok(value) if (min..=max).contains(&value) => value,
+        _ => {
+            warn!(
+                key = key,
+                reason = "invalid_value",
+                "temp-voice admission setting invalid; using default"
+            );
+            default
+        }
+    }
 }
 
 /// Wall clock in Unix seconds for the durable create admission; a clock
@@ -7374,6 +7436,9 @@ pub struct VoiceRuntime<S, H> {
     /// `creator_channels` alongside the store creators loaded later.
     creator_channels: HashSet<Snowflake>,
     empty_grace: Option<Duration>,
+    /// Boot create-admission config (the three cold-class admission keys in
+    /// production): copied into each new actor's worker at spawn.
+    admission_config: Option<CreateAdmissionConfig>,
     synthetic_humans: HashSet<Snowflake>,
     seeds: AtomicU64,
     actors: Mutex<HashMap<Snowflake, GuildActor>>,
@@ -7420,6 +7485,7 @@ where
             protected_channels: HashSet::new(),
             creator_channels: HashSet::new(),
             empty_grace: None,
+            admission_config: None,
             synthetic_humans: HashSet::new(),
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
@@ -7456,6 +7522,15 @@ where
     /// production; fixtures shorten it for unrelated lifecycle races).
     pub fn with_empty_grace(mut self, grace: Duration) -> Self {
         self.empty_grace = Some(grace);
+        self
+    }
+
+    /// Set the boot create-admission config (the three cold-class admission
+    /// keys resolved through [`configured_admission`] in production). Actor
+    /// spawn applies it via [`GuildRoomWorker::set_admission_config`];
+    /// without this, workers keep the `temp_voice_admission` default.
+    pub fn with_admission_config(mut self, config: CreateAdmissionConfig) -> Self {
+        self.admission_config = Some(config);
         self
     }
 
@@ -7628,6 +7703,7 @@ where
         let tick = self.tick;
         let name_policy = Arc::clone(&self.name_policy);
         let live_source = Arc::clone(&self.live_source);
+        let admission_config = self.admission_config;
         tokio::spawn(async move {
             let mut rx = rx;
             let Some((worker, buffered)) = load_actor_worker(make.as_ref(), live, &mut rx).await
@@ -7644,6 +7720,11 @@ where
             // Apply the stored override at spawn; later stored changes arrive
             // through the maintenance refresh without a restart.
             worker.refresh_empty_grace();
+            // Apply the boot admission config at spawn; without one the
+            // worker keeps its `temp_voice_admission` default untouched.
+            if let Some(config) = admission_config {
+                worker.set_admission_config(config);
+            }
             run_actor_with_initial(&mut worker, rx, tick, buffered).await;
         });
         actors.insert(guild, actor.clone());
@@ -9220,6 +9301,12 @@ pub fn build_production_runtime(
             .with_protected_channels(protected)
             .with_creator_channels(generator.into_iter().collect())
             .with_empty_grace(empty_grace)
+            // Resolve at the install site (not a `let` above): the
+            // acceptance wiring pin greps for this exact loader call, so
+            // extracting it would let a dropped temporary pass the pin.
+            // Unusable values fail closed per knob with an `invalid_value`
+            // warning; they never refuse the runtime.
+            .with_admission_config(configured_admission(|key| std::env::var(key).ok()))
             .with_synthetic_humans(synthetic_humans)
             .with_name_policy(name_policy)
             .with_live_source(live_source),

@@ -1156,8 +1156,9 @@ jobs:
           # is 1GB) filled it: run 39209332791 died in the ignored-db-stores
           # lane with `PANIC: could not write to file "pg_wal/xlogtemp.*": No
           # space left on device`, and two earlier main runs PANIC'd the same
-          # way mid-suite. max_wal_size is a soft checkpoint target, not a
-          # hard ceiling: heavy WAL can exceed it, so keep recycling bounded
+          # way mid-suite; run 39197217315 tore the service down and failed the
+          # whole binary on DNS. max_wal_size is a soft checkpoint target, not
+          # a hard ceiling: heavy WAL can exceed it, so keep recycling bounded
           # with headroom for relation files and segment creation, mirroring
           # the rust-tests lane. The pre/post suite reports bracket the run
           # for future budget tuning.

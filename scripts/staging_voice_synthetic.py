@@ -63,6 +63,7 @@ Usage:
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import socket
@@ -103,6 +104,28 @@ RENAME_MARKER = " (synthetic)"
 # exceptions.
 MAX_BODY_BYTES = 64 * 1024
 BODY_CAP = MAX_BODY_BYTES
+
+# Timing-input bound (seconds). Every synthetic deadline is a live gateway
+# wait, and the workflow budget is one run: voice-synthetic.yml runs this
+# script with timeout-minutes: 10, so 600 s is the largest meaningful value.
+# A larger deadline only probes a run the workflow would kill first, and a
+# non-finite one (NaN/inf) would hang or skip the wait silently. All four
+# timing inputs (flag and env-var sourced) go through timing_seconds, which
+# refuses anything outside (0, TIMING_CAP_SECONDS] before any live call.
+TIMING_CAP_SECONDS = 600.0
+TIMING_REFUSAL = ("timing input must be a finite number of seconds above 0 "
+                  f"and at most {TIMING_CAP_SECONDS:g}")
+
+
+def timing_seconds(raw):
+    """One finite, positive, bounded argparse type for the timing inputs."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(TIMING_REFUSAL) from None
+    if not math.isfinite(value) or not 0 < value <= TIMING_CAP_SECONDS:
+        raise argparse.ArgumentTypeError(TIMING_REFUSAL)
+    return value
 
 
 class Refusal(Exception):
@@ -898,17 +921,29 @@ def run_live(args, token):
     return obs
 
 
-def main(argv=None):
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--guild", default=os.environ.get("DISCORD_STAGING_GUILD_ID", STAGING_GUILD_ID))
     p.add_argument("--creator", default=STAGING_CREATOR_ID)
     p.add_argument("--staging-url", default=os.environ.get("STAGING_WORKER_URL"))
-    p.add_argument("--create-within", type=float, default=20.0)
-    p.add_argument("--settle", type=float, default=8.0)
-    p.add_argument("--grace", type=float, default=float(os.environ.get("TWO_STAGING_EMPTY_GRACE_SECONDS", "60")))
-    p.add_argument("--delete-slack", type=float, default=20.0)
+    p.add_argument("--create-within", type=timing_seconds, default=20.0,
+                   metavar="SECONDS")
+    p.add_argument("--settle", type=timing_seconds, default=8.0,
+                   metavar="SECONDS")
+    # The env default stays a string so argparse validates it through the
+    # same type: a bare float() here would crash with a traceback instead of
+    # the fixed refusal (and accept NaN/inf).
+    p.add_argument("--grace", type=timing_seconds,
+                   default=os.environ.get("TWO_STAGING_EMPTY_GRACE_SECONDS", "60"),
+                   metavar="SECONDS")
+    p.add_argument("--delete-slack", type=timing_seconds, default=20.0,
+                   metavar="SECONDS")
     p.add_argument("--evidence", default=None)
-    args = p.parse_args(argv)
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
     token = os.environ.get("TWO_VOICE_SYNTHETIC_BOT_TOKEN", "").strip()
     try:
         fence(args.guild, args.creator, args.staging_url)
