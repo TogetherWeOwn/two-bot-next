@@ -7,7 +7,9 @@ response body read is capped at MCP_MAX_BODY_BYTES.
 """
 
 import io
+import os
 import sys
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -111,6 +113,8 @@ class UrlFenceTests(unittest.TestCase):
             f"{base}.evil.example/mcp",
             "https://two-bot-next-staging@evil.example/mcp",
             "https://user@two-bot-next-staging.5150.workers.dev/mcp",
+            "https://@two-bot-next-staging.5150.workers.dev/mcp",
+            "https://:@two-bot-next-staging.5150.workers.dev/mcp",
             f"{base}:8443/mcp",
             base + "/mcp/extra",
             base + "/ops/mcp",
@@ -127,6 +131,26 @@ class UrlFenceTests(unittest.TestCase):
         for url in evil:
             with self.subTest(url=url):
                 self.assertFalse(proveout.valid_staging_mcp_url(url))
+
+
+class MainFenceTests(unittest.TestCase):
+    def test_refused_url_exits_2_without_probes_or_artifact(self):
+        token = "test-bearer-000000000000000000000000"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "proveout.json")
+            argv = ["staging_mcp_proveout.py", "--output", out]
+            env = {
+                proveout.TOKEN_ENV: token,
+                proveout.URL_ENV: "https://two-bot-next-staging.evil.example/mcp",
+            }
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.dict(os.environ, env), \
+                    mock.patch("urllib.request.build_opener") as build_opener, \
+                    mock.patch.object(proveout, "do_post") as do_post:
+                self.assertEqual(proveout.main(), 2)
+            build_opener.assert_not_called()
+            do_post.assert_not_called()
+            self.assertFalse(Path(out).exists())
 
 
 class BodyCapTests(unittest.TestCase):

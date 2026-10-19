@@ -523,6 +523,8 @@ class FenceTest(unittest.TestCase):
             "https://two-bot-next-staging.example.workers.dev.evil.example",
             "https://two-bot-next-staging@evil.example",
             "https://user@two-bot-next-staging.example.workers.dev",
+            "https://@two-bot-next-staging.example.workers.dev",
+            "https://:@two-bot-next-staging.example.workers.dev",
             "https://two-bot-next-staging.example.workers.dev:8443",
             "https://two-bot-next-staging.example.workers.dev/ops/metrics",
             "https://two-bot-next-staging.example.workers.dev?x=1",

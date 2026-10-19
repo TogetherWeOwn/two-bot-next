@@ -100,7 +100,7 @@ def valid_staging_mcp_url(url):
     except ValueError:
         return False
     return (parts.scheme == "https" and port is None
-            and not parts.username and not parts.password
+            and parts.username is None and parts.password is None
             and bool(STAGING_HOST.fullmatch(parts.hostname or ""))
             and parts.path == "/mcp" and not parts.query and not parts.fragment)
 

@@ -426,7 +426,8 @@ def fence(guild_id, creator_id, staging_url):
             port = parts.port
         except ValueError:
             raise Refusal("staging URL must be the two-bot-next-staging workers.dev origin")
-        if (parts.scheme != "https" or port is not None or parts.username or parts.password
+        if (parts.scheme != "https" or port is not None
+                or parts.username is not None or parts.password is not None
                 or not STAGING_HOST.fullmatch(parts.hostname or "")
                 or parts.path not in ("", "/") or parts.query or parts.fragment):
             raise Refusal("staging URL must be the two-bot-next-staging workers.dev origin")
