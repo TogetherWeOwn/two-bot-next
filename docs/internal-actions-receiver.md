@@ -234,7 +234,8 @@ until its claim goes stale, then `needs_reconciliation`; a live owner can still
 finish after that. A panic after a claim answers `needs_reconciliation`. A 504 on a
 mutation is an unknown outcome that may still complete: retry the same key only.
 Shutdown latches drain mode at the request, stops new mutation effects after the
-claim (replay, in-flight and reconciliation answers keep working), then joins
+claim (replay, in-flight and reconciliation answers keep working) and releases
+the fresh provably-never-sent claim so the same key may retry, then joins
 tracked children within the shared 5-second HTTP drain budget: clean completion
 is reported only after every child is reaped, and work still in flight at the
 deadline is aborted and reported as a drain timeout, never waited on past the

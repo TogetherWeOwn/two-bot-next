@@ -2449,12 +2449,19 @@ async fn mutate_event(
         Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
-    // Shutdown stops new mutation effects here, after the claim: the fence
-    // above stays occupied, so a retry sees in-flight/reconciliation and never
-    // a second effect, while replay and pending-claim answers keep working
-    // through drain. The claim is deliberately not released: drain is a
-    // cancellation, and cancellation never releases mutation rights.
+    // Shutdown stops new mutation effects here, after the claim: replay,
+    // in-flight and reconciliation answers above keep working through drain.
+    // No effect has run at this point, and none can be running (only the
+    // freshly claimed owner ever proceeds), so the claim is released exactly
+    // like a pre-effect admission refusal and the same key may retry after
+    // restart. A failed release keeps the fence occupied instead. Only this
+    // provably-never-sent refusal releases; cancelling work already underway
+    // never does.
     if state.draining.load(Ordering::SeqCst) {
+        if let Err(release_error) = state.store.release_proven_not_sent(claim).await {
+            log_terminal_persist_failed(action, "release", release_error);
+            return reject(Failure::code(ErrorCode::Internal));
+        }
         return reject(Failure::http(
             StatusCode::SERVICE_UNAVAILABLE,
             "busy",
