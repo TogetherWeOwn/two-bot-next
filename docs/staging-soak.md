@@ -75,11 +75,14 @@ environment. Names only — values never go in cards, logs, or PRs:
 
 - `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` — GitHub Actions secrets,
   used by `deploy-staging.yml`.
-- `DISCORD_TOKEN` — Worker secret (`wrangler secret put --env staging`),
+- `DISCORD_TOKEN` — Worker secret (staged with `wrangler versions secret put
+  --env staging DISCORD_TOKEN --message <sha>`, then `wrangler versions deploy --env staging`),
   the staging bot token.
-- `GUILD_ID` — Worker secret (`wrangler secret put --env staging`),
+- `GUILD_ID` — Worker secret (staged with `wrangler versions secret put
+  --env staging GUILD_ID --message <sha>`, then `wrangler versions deploy --env staging`),
   the TWO Staging guild (`1545644954272137297`).
-- `DATABASE_URL` — Worker secret (`wrangler secret put --env staging`),
+- `DATABASE_URL` — Worker secret (staged with `wrangler versions secret put
+  --env staging DATABASE_URL --message <sha>`, then `wrangler versions deploy --env staging`),
   the direct, unpooled URL for the bot's dedicated `two_bot` database and role
   on the Neon **staging** branch (`br-summer-sunset`, project
   `rough-dream-43123587`), separate from the web's `two` / `two_app`.
@@ -87,6 +90,16 @@ environment. Names only — values never go in cards, logs, or PRs:
 - `STAGING_WORKER_URL` — GitHub Actions **variable** (not a secret), the
   staging Worker URL, used by the `/readyz` gate. If it is missing the gate
   fails closed with instructions instead of deploying blind.
+
+`<sha>` above is the live `/readyz` `build_revision` of staging: a plain
+`wrangler secret put` publishes an unstamped version that can never form a
+rollback receipt (see `docs/production-deploy.md`). Precheck first:
+`versions secret put` builds on the newest-created version, not necessarily the
+serving one — confirm the last block of `wrangler versions list --env staging`
+(the list prints oldest first, so the last block is the newest version)
+is the serving version (same id as `wrangler deployments status --env staging`),
+and if they differ redeploy the intended SHA through the workflow first (full rule
+in `docs/production-deploy.md`).
 
 ## Starting the soak
 

@@ -149,10 +149,13 @@ claim them as shipped acceptance:
 - Worker/DO alert log lines and Discord messages do not yet consistently carry
   the Container Git SHA and a direct log-query URL. Use the build/deploy
   correlation procedure above.
-- Worker/DO request-span and dispatch lines do not carry the container
-  `build_sha`/`release`: the Worker version ID is distinct from the Git SHA.
-  The release-tagged error events above are the exception. Correlate other
-  Worker/DO activity via the procedure above.
+- Worker/DO request-span and dispatch lines (`internal_actions_ingress`,
+  `eventsub_ingress`) carry `release` (the container Git SHA, deploy-stamped
+  on the Worker edge and probe-read on the DO relay, `"unknown"` when neither
+  has a SHA yet) and the stable `log_url` above; the Worker version ID is
+  still distinct from the Git SHA and is never used as one. Join an edge
+  refusal to the container's `build_sha`/`release` lines via `request_id`.
+  Correlate other Worker/DO activity via the procedure above.
 - Release-tagged error grouping is provided by Workers Logs, not an external
   error-tracking service. Every `container_gateway_failure` and `metrics_alert`
   line carries `release` (the container git SHA) and `worker_version` plus the
