@@ -1,5 +1,6 @@
 """Offline cutover freeze-drill harness checks; stdlib only, no network access."""
 
+import copy
 import http.server
 import io
 import json
@@ -219,6 +220,8 @@ def discord_routes(overrides):
         ("PUT", OVERWRITE_PATH): (204, {}, b""),
         ("DELETE", OVERWRITE_PATH): (204, {}, b""),
         ("DELETE", NOTICE_PATH): (204, {}, b""),
+        ("GET", NOTICE_PATH): (404, {}, json.dumps(
+            {"code": 10008, "message": "Unknown Message"}).encode()),
         ("GET", COMMANDS_PATH): (200, {}, json.dumps([{"id": "1", "name": "ping"}]).encode()),
     }
     routes.update(overrides)
@@ -226,21 +229,37 @@ def discord_routes(overrides):
 
 
 class LoopbackDiscord:
-    """127.0.0.1 stand-in for Discord: canned replies per (method, path), every hit recorded."""
+    """127.0.0.1 stand-in for Discord: stateful channel/notice, canned commands.
+
+    Acknowledged channel and notice writes apply to `channel`/`notices` so the
+    harness's independent GET readbacks observe them; an explicit override in
+    `routes` still wins so malformed-reply cases keep their canned bodies.
+    Every hit is recorded with its Authorization header.
+    """
 
     def __init__(self):
         self.routes = {}
         self.hits = []
+        self.channel = copy.deepcopy(CHANNEL_JSON)
+        self.notices = {}
+        self._defaults = discord_routes({})
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
             def serve(self):
                 length = int(self.headers.get("Content-Length") or 0)
-                if length:
-                    self.rfile.read(length)
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    payload = json.loads(raw) if raw else None
+                except (ValueError, RecursionError):
+                    payload = None
                 fixture.hits.append((self.command, self.path, self.headers.get("Authorization")))
-                status, headers, body = fixture.routes.get(
-                    (self.command, self.path), (404, {}, b""))
+                key = (self.command, self.path)
+                override = fixture.routes.get(key)
+                if override is not None and override != fixture._defaults.get(key):
+                    status, headers, body = override
+                else:
+                    status, headers, body = fixture.stateful(key, payload)
                 self.send_response(status)
                 for name, value in headers.items():
                     self.send_header(name, value)
@@ -256,6 +275,43 @@ class LoopbackDiscord:
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stateful(self, key, payload):
+        """Apply acknowledged writes; GETs observe the current fixture state."""
+        method, path = key
+        if key == ("GET", CHANNEL_PATH):
+            return 200, {}, json.dumps(self.channel).encode()
+        if key == ("PATCH", CHANNEL_PATH):
+            seconds = (payload or {}).get("rate_limit_per_user")
+            if isinstance(seconds, int):
+                self.channel["rate_limit_per_user"] = seconds
+            return 200, {}, json.dumps(self.channel).encode()
+        if key == ("PUT", OVERWRITE_PATH):
+            rows = [r for r in self.channel["permission_overwrites"]
+                    if r.get("id") != STAGING_GUILD]
+            rows.append({"id": STAGING_GUILD, "type": 0,
+                         "allow": (payload or {}).get("allow", "0"),
+                         "deny": (payload or {}).get("deny", "0")})
+            self.channel["permission_overwrites"] = rows
+            return 204, {}, b""
+        if key == ("DELETE", OVERWRITE_PATH):
+            self.channel["permission_overwrites"] = [
+                r for r in self.channel["permission_overwrites"]
+                if r.get("id") != STAGING_GUILD]
+            return 204, {}, b""
+        if key == ("POST", MESSAGES_PATH):
+            self.notices[NOTICE_ID] = {"id": NOTICE_ID, "channel_id": CHANNEL}
+            return 200, {}, json.dumps({"id": NOTICE_ID}).encode()
+        if key == ("DELETE", NOTICE_PATH):
+            self.notices.pop(NOTICE_ID, None)
+            return 204, {}, b""
+        if key == ("GET", NOTICE_PATH):
+            if NOTICE_ID in self.notices:
+                return 200, {}, json.dumps(self.notices[NOTICE_ID]).encode()
+            return self._defaults[("GET", NOTICE_PATH)]
+        if key in self.routes:
+            return self.routes[key]
+        return 404, {}, b""
 
     def close(self):
         self.server.shutdown()

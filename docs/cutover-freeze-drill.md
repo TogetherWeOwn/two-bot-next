@@ -10,7 +10,8 @@ Source of behavior: `crates/core/src/channel_moderation.rs`
 (`plan_lockdown` moves only the send, thread and reaction lockdown bits,
 `plan_unlock` restores the recorded seed verbatim) and `docs/cutover-sequence.md` §1 (freeze and
 drain). The harness is `scripts/cutover_freeze_drill.py`; its offline
-checks are `scripts/test_cutover_freeze_drill.py`.
+checks are `scripts/test_cutover_freeze_drill.py` and
+`scripts/test_cutover_freeze_drill_observation_acceptance.py`.
 
 ## Scope and guards
 
@@ -23,6 +24,13 @@ checks are `scripts/test_cutover_freeze_drill.py`.
 - Authenticated Discord reads and writes refuse every redirect before a
   follow-up request, even to the same origin. The fixed failure message and
   receipt omit the bot token, redirect Location, headers and response body.
+- Acknowledged writes are not observations: slowmode and lockdown steps
+  read the channel back and match the intended value and masks before they
+  pass, and the notice identity is kept until an independent exact-message
+  GET proves absence. Only Discord's Unknown Message (`10008`) proves the
+  notice is gone; a DELETE reply, a generic 404, or a local flag never does.
+- An already-locked baseline refuses before any mutation, and every
+  readback re-checks the staging guild and drill channel identity.
 - On any step failure the harness best-effort restores slowmode, the
   overwrite seed and the notice, then reports the failing step. A restore
   mismatch is `NEEDS WORK`, never a silent waiver.
