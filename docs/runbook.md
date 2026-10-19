@@ -151,8 +151,8 @@ Look for these literal messages:
   only a running-gateway failure lingers 75 s) and in Workers Logs as
   `container_gateway_failure` (see [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
-- Worker: `two-bot container started|stopped`, `two-bot /readyz unhealthy`,
-  `two-bot keepalive probe failed`, `two-bot container error`.
+- Worker: `two-bot container started|stopped`, `container_readyz_unhealthy`,
+  `container_keepalive_probe_failed`, `container_error`.
 
 The DO renews activity and probes `/readyz` every `KEEPALIVE_SECONDS` (default
 60); `sleepAfter` is 30 minutes. Outbound gateway traffic alone does not keep
@@ -842,6 +842,42 @@ as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
 
+#### Alert: community facts drain failures
+
+`two_bot_community_facts_drain_failures_total{reason}` grew in three consecutive
+completed keepalive sample windows after a baseline. `community_facts_drain_failures`
+is a **ticket, not a page**: gateway dispatch deliberately warns and continues
+when the community-facts writer errors or misses its deadline, so scorecard data
+loss can otherwise remain log-only while checkpoints look healthy. Growth is
+summed over the fixed `error`, `timeout` and `other` reasons. A large single
+burst stays silent.
+
+First response: triage within the watch shift. Read the per-reason counter
+through the existing authorized `/ops/metrics` path, correlate the window with
+`gateway community facts dispatch failed` / `gateway community facts dispatch
+timed out` warn logs, and check scorecard coverage separately: the scorecard
+fails closed on missing coverage, so a drain-loss window means the scorecard
+undercounts rather than overcounts. Record only fixed reason names and
+sanitized counts, never member/channel IDs, payloads or scrape tokens.
+
+Flat samples clear the streak and resolve the ticket. A backwards counter in any
+fixed reason signals a process reset: all reasons re-baseline with a zero streak
+and resolve, even if another reason's new count overtook its old value.
+Missing/invalid series or a failed scrape break the streak and discard the
+baseline, **not** the active ticket; the first valid sample after a gap is only
+a baseline, ongoing growth retains the ticket, and a subsequent valid flat/reset
+window proves recovery. A new DO field or legacy state starts unbaselined.
+Counter-only monitoring cannot detect a restart whose replacement counter
+already exceeds the old value; correlate deployment evidence rather than
+claiming that case is proven quiet.
+
+Do not change facts capture, gateway commit semantics, privacy/retention or
+scorecard calculations to clear this alert, and do not restart the bot to clear
+a counter. This alert adds neither automatic ticket-system integration nor paging
+escalation: it labels the existing transition delivery as `(ticket)` and supplies
+this runbook. Persist sanitized incident evidence and route a continuing drain
+problem to the on-call engineer through the normal triage path. No new webhook,
+production activation or live load test is authorized.
 #### Alert: EventSub post failed share
 
 `two_bot_eventsub_posts_total{outcome}` failed share across keepalive
@@ -919,6 +955,51 @@ The Container DO failed the container-internal `/metrics` scrape on 3 consecutiv
 First response: read the scrape through the existing authorized `/ops/metrics` path, check container `/readyz` and Worker/container logs for `two-bot metrics scrape failed`. Timeouts (6 s deadline), non-OK status, oversized bodies (64 KiB cap) and invalid exposition all count as failure; the deadline and cap are unchanged by this alert. Notifications and logs carry only this runbook link and build context, never response bodies.
 
 A lost scrape never resolves any metric-rule incident: missing evidence is not recovery evidence, so previously firing alerts stay firing through the loss, and the existing dispatch-drop interruption still applies. The first complete valid scrape after the incident resolves only the scrape-loss ticket; metric rules re-evaluate on that same scrape and resolve only on their own evidence. A valid scrape before the third failure silently resets the streak with no resolve.
+
+#### Alert: eventsub reconcile failed
+
+`two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rose between two
+keepalive samples. The Rust process records exactly one outcome per completed
+reconcile pass that reaches Helix (`healthy`, `pending` or `failed`); parked or
+refused startup passes never reach Helix and record no sample. A failed pass
+means a reconcile action failed or a healthy subscription is still missing,
+including listing failures — the detailed per-site error counters
+(`two_bot_eventsub_reconcile_errors_total`) add detail only and never multiply
+this alert. This is a **ticket, not a page**.
+
+Trigger: the first valid sample only stores a baseline and never fires. A later
+positive failed-pass delta fires once, however many internal error counters
+moved in the same window; a failed delta beside a healthy delta still fires.
+Healthy-only or pending-only growth never fires. Recovery: a flat failed counter
+never recovers, and a verification-pending pass never recovers — only a later
+healthy-pass increase with no failed-pass increase resolves, once. A backwards
+counter in any of the three outcomes means the process restarted: that sample
+re-baselines, firing when the new process already counted a failed pass (the
+startup pass runs before the first scrape, so a failed boot pass is a
+post-restart failure, not a fabricated delta), and otherwise holding a firing
+ticket instead of fabricating a RESOLVED. Missing or invalid samples (absent family on older containers,
+malformed values, extra labels, duplicates) and failed scrapes hold the firing
+state and keep the previous baseline; the next valid failed delta still fires
+and the next valid healthy increase still recovers.
+
+First response: read-only diagnosis only — no Helix request and no
+reconciliation behavior change. Run the read-only reconcile queries in
+[eventsub-subscription-health-queries.md](eventsub-subscription-health-queries.md)
+(Q2 last reconcile outcome plus the dashboard fields it drops: `failed`,
+`missing`, `prior_failed`, `action`, `error`) via the authorized `/ops/metrics`
+scrape and Workers Observability, correlate the window with recent deploys (a
+fresh deploy restarts the process and resets the counters), and confirm the
+firing key is the fixed `eventsub_reconcile_failed` with no broadcaster,
+subscription id, body, token or free-text labels. Forwarding, persistence and
+log context are the existing metrics-alert path above (persist before notify,
+at most once per transition); turning forwarding off retains monitoring.
+
+Do not retry Helix calls, re-list subscriptions, delete/re-create subscriptions
+by hand, or restart the container to "clear" the counter; a replacement resets
+the baseline without healing the subscription. This alert adds neither automatic
+ticket-system integration nor paging escalation: it labels the existing
+transition delivery as `(ticket)` and supplies this runbook. No new webhook,
+production activation or live load test is authorized.
 
 #### Alert: EventSub tampered
 
@@ -1034,10 +1115,41 @@ armed tick, the unpaired alert needs one baseline tick plus three
 outstanding ticks (about 4 min). Observe one full 30-minute cooldown window
 for R1-to-R2 escalation (`creator-map-reload`, no host action, then one
 Operator card for `same-sha-takeover` at the same SHA); a further window
-proves the two-failure CEO page and silence. Re-dispatching without the
-flags (or any plain push deploy) disarms the drill: the triggers resolve on
-their own rules and the guards reset. Rollback is disarm-by-redeploy; the
-Worker recommends only, so nothing executes from this path.
+proves the two-failure CEO page and silence. Disarming re-dispatches the
+same SHA without the flags: the triggers resolve on their own rules and the
+guards reset. Rollback is disarm-by-redeploy; the Worker recommends only, so
+nothing executes from this path.
+
+Drill procedure (Operator). The soak needs the armed build undisturbed for
+at least 90 minutes (R1, R2 30+ minutes later, STOP 30+ minutes after R2,
+disarm, then a 30-minute clear) while merges keep landing. Arm the hold
+first so no push redeploys staging mid-soak: without it, the next push
+disarms the drill by redeploy.
+
+1. Pick the drill SHA: the full 40-hex main commit staging currently serves
+   (the `build_revision` on staging `/readyz`, not a guess). The pin must be
+   an ancestor of `origin/main`. Save it once: `DRILL_SHA=<paste the 40-hex
+   SHA>` (replace the placeholder before running; the shell would read the
+   angle brackets as a redirection).
+2. Arm the hold: `gh variable set STAGING_SOAK_HOLD_UNTIL --body
+   "2026-10-19T20:00:00Z"` with an ISO-8601 UTC deadline at most 4h out
+   (past the planned disarm plus the 30-minute clear).
+3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
+   --ref main -f "sha=$DRILL_SHA" -f inject_voice_stall=true` (add
+   `-f inject_unpaired_disconnect=true` for the crash-loop scope).
+   Dispatches bypass the hold, so arm and disarm work while it is armed.
+   The arm run stays red by design: the history guard fails it after a green
+   deploy and synthetic so the pin never reads as staging history for the
+   head. Read the deploy and synthetic steps, not the run color.
+4. Run the R1/R2/STOP observation above. Pushes during the window fail fast
+   with the deferral message (red, by design: a quiet green would read as
+   staging history to the production guard); merges stay unblocked.
+5. Disarm at the SAME SHA with no flags: `gh workflow run
+   deploy-staging.yml --ref main -f "sha=$DRILL_SHA"`. The disarm run stays
+   red for the same reason while the pin sits below the head.
+6. Watch the 30-minute clear (triggers resolve, guards reset), then release
+   the hold: `gh variable delete STAGING_SOAK_HOLD_UNTIL`. Letting it expire
+   works too: expiry fails open and the next push deploys normally.
 
 #### Staging guard receipts (persisted remediation evidence)
 
@@ -1902,8 +2014,8 @@ Gateway reconnect symptoms and REST send failures are different incidents:
 gateway-ready does not prove REST delivery, and HTTP liveness does not prove
 either. Use literal `gateway reconnect failed; Twilight will retry`,
 `durable gateway initialized; shard connecting` (`resume`) and
-`gateway ready; checkpoint committed` (`sequence`). Worker
-`two-bot /readyz unhealthy: <status>` is a readiness observation, not a Discord
+`gateway ready; checkpoint committed` (`sequence`). The Worker
+`container_readyz_unhealthy` line is a readiness observation, not a Discord
 cause. Do not infer a Discord outage from a Worker error or 403 alone.
 
 Existing **private** metrics are `two_bot_gateway_reconnects_total`,

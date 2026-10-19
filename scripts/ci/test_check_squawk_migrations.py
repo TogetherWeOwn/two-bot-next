@@ -61,6 +61,33 @@ class RuleTests(unittest.TestCase):
             ["creating-index"],
         )
 
+    def test_transactional_event_store_index_waiver_is_exact(self):
+        path = "crates/cutover/migrations/0444_event_store_expiry_index.sql"
+        statement = (
+            "CREATE INDEX IF NOT EXISTS idx_event_store_expiry_event_time_id "
+            "ON event_store (event_time, id)"
+        )
+        self.assertTrue(
+            squawk.is_waived_finding(path, "creating-index", statement)
+        )
+        self.assertFalse(
+            squawk.is_waived_finding(
+                path,
+                "creating-index",
+                "CREATE INDEX unrelated_idx ON event_store (event_time)",
+            )
+        )
+        self.assertFalse(
+            squawk.is_waived_finding(
+                "crates/cutover/migrations/0445_other.sql",
+                "creating-index",
+                statement,
+            )
+        )
+        self.assertFalse(
+            squawk.is_waived_finding(path, "dropping-object", statement)
+        )
+
     def test_concurrent_index_is_clean(self):
         self.assertEqual(
             self.rules(
@@ -696,6 +723,33 @@ class ExitCodeTests(unittest.TestCase):
             code, out = self.run_checker(*args)
             self.assertEqual(code, 0)
             self.assertIn("no risky migration statements", out)
+
+    def test_exact_transactional_index_waivers_stay_strict_for_other_indexes(self):
+        approved = {
+            "crates/cutover/migrations/0444_event_store_expiry_index.sql": (
+                "CREATE INDEX IF NOT EXISTS idx_event_store_expiry_event_time_id "
+                "ON event_store (event_time, id);\n"
+            ),
+            "crates/cutover/migrations/0445_event_store_expiry_class_index.sql": (
+                "CREATE INDEX IF NOT EXISTS idx_event_store_expiry_class_time_id "
+                "ON event_store (event_type, event_time, id);\n"
+            ),
+        }
+        for relative, sql in approved.items():
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(sql)
+
+        code, out = self.run_checker("--strict")
+        self.assertEqual(code, 0)
+        self.assertIn("no risky migration statements", out)
+
+        with (self.root / next(iter(approved))).open("a") as migration:
+            migration.write("CREATE INDEX unreviewed_idx ON event_store (id);\n")
+        code, out = self.run_checker("--strict")
+        self.assertEqual(code, 1)
+        self.assertIn("[squawk:creating-index]", out)
+        self.assertIn("1 finding(s) in 1 file(s)", out)
 
     def test_broken_tooling_fails_even_when_advisory(self):
         code, _ = self.run_checker("--base-ref", "no-such-ref")
