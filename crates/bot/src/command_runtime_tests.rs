@@ -6602,6 +6602,239 @@ async fn schedule_list_store_failure_audits_one_rejected_row() {
     db.close().await;
 }
 
+// --- acceptance: deep-pagination list failures audit like other refusals --
+//
+// Locked contract: the two deep-pagination `/schedule-list` failure paths —
+// a failed hidden-window read on a page past the first window's packed
+// pages, and an unknown-overflow deep page whose count read failed — each
+// write exactly one `automation_audit_log` row in the refusal shape above
+// (`scheduled.list` / `rejected`, the invoking member as actor, no target,
+// the failing read's bounded error-class token as reason), keeping the
+// existing fixed store-failure reply. A successful deep page still writes
+// no audit row and the page-1 over-cap render does not change.
+
+/// Fail exactly the `scheduled_messages` SELECTs whose text matches
+/// `pattern` (`%OFFSET%` selects only the hidden-window read, `%count(*)%`
+/// only the overflow count; the capped first read matches neither). An RLS
+/// policy whose `USING` raises on a `current_query()` match fails that one
+/// statement while the pool stays live, so an audit write can still land.
+/// `FORCE` is required because the test role owns the table. Install only
+/// after seeding: with RLS on and no INSERT policy, seeds would be denied.
+async fn fail_scheduled_selects_matching(db: &TestDb, pattern: &str) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_query_matching(pat text) RETURNS boolean AS $$
+         BEGIN
+           IF current_query() LIKE pat THEN
+             RAISE EXCEPTION 'induced scheduled select failure';
+           END IF;
+           RETURN TRUE;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install select fault function");
+    sqlx::query("ALTER TABLE scheduled_messages ENABLE ROW LEVEL SECURITY")
+        .execute(&db.pool)
+        .await
+        .expect("enable scheduled_messages RLS");
+    sqlx::query("ALTER TABLE scheduled_messages FORCE ROW LEVEL SECURITY")
+        .execute(&db.pool)
+        .await
+        .expect("force scheduled_messages RLS");
+    assert!(
+        !pattern.contains('\''),
+        "fault pattern is a test-owned literal"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE POLICY fail_scheduled_select ON scheduled_messages
+           FOR SELECT USING (fail_query_matching('{pattern}'))"
+    )))
+    .execute(&db.pool)
+    .await
+    .expect("install select fault policy");
+}
+
+/// The 27-row over-cap guild shared by the deep-pagination tests; direct
+/// seeds bypass quota admission, and page 2 is the first deep page.
+async fn seed_over_cap_schedule_rows(db: &TestDb) {
+    for n in (0..27u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("cap-{n:02}"),
+            &format!("2030-01-{:02}T00:00:00.000Z", n + 1),
+            None,
+            true,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_hidden_window_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    seed_over_cap_schedule_rows(&db).await;
+    fail_scheduled_selects_matching(&db, "%OFFSET%").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(2)).await;
+
+    assert_eq!(
+        schedule_list_reply_contents(&mock, 1),
+        vec![SCHEDULE_STORE_FAILURE_REPLY.to_owned()],
+        "a failed hidden-window read keeps the existing safe reply text"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len(),
+        27,
+        "a failed deep page writes no schedule rows"
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one hidden-window failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_schedule_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "scheduled.list",
+    );
+    assert!(
+        target_key.as_deref().is_none_or(str::is_empty),
+        "a failed list names no schedule id: {target_key:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_unknown_overflow_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    seed_over_cap_schedule_rows(&db).await;
+    fail_scheduled_selects_matching(&db, "%count(*)%").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(2)).await;
+
+    assert_eq!(
+        schedule_list_reply_contents(&mock, 1),
+        vec![SCHEDULE_STORE_FAILURE_REPLY.to_owned()],
+        "an unknown-overflow deep page keeps the existing safe reply text"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len(),
+        27,
+        "a failed deep page writes no schedule rows"
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one unknown-overflow refusal writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_schedule_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "scheduled.list",
+    );
+    assert!(
+        target_key.as_deref().is_none_or(str::is_empty),
+        "a failed list names no schedule id: {target_key:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Control: with the fault policy installed but matching no statement, the
+/// page-1 over-cap render and the successful deep page are byte-identical
+/// to the unfaulted listings and neither writes an audit row. This proves
+/// the RLS harness itself, not just the failures it induces, is inert.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_deep_pages_succeed_without_audit_when_no_query_fails() {
+    let db = TestDb::new().await;
+    seed_over_cap_schedule_rows(&db).await;
+    fail_scheduled_selects_matching(&db, "%ZZZ_NO_SUCH_FRAGMENT%").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(1)).await;
+    invoke_schedule_list(&runtime, Some(2)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 2);
+    let mut expected_lines: Vec<String> = (0..25u32)
+        .map(|n| format!("`cap-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
+        .collect();
+    expected_lines.push("(truncated, 2 more)".to_owned());
+    assert_eq!(
+        contents[0],
+        expected_lines.join("\n"),
+        "page-1 over-cap render is unchanged"
+    );
+    assert_eq!(
+        contents[1],
+        "`cap-25` `<#3333>` 2030-01-26T00:00:00.000Z\n\
+         `cap-26` `<#3333>` 2030-01-27T00:00:00.000Z",
+        "a successful deep page still lists the hidden rows"
+    );
+    assert!(
+        schedule_audit_rows(&db).await.is_empty(),
+        "successful lists write no audit row on any page"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Dead-pool control for a deep page: a closed pool fails the first read,
+/// so no audit write is possible either; asking for page 2 must still
+/// finish with the fixed safe reply — no panic, no leaked internals.
+#[tokio::test]
+async fn schedule_list_deep_page_on_dead_pool_replies_safely() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let runtime = CommandRuntime::new(
+        pool,
+        executor_at(origin),
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+
+    runtime
+        .on_interaction(&slash(
+            "schedule-list",
+            Some(CHANNEL),
+            vec![option("page", CommandOptionValue::Integer(2))],
+        ))
+        .await;
+
+    let replies = schedule_store_failure_replies(&mock, 1);
+    assert_eq!(
+        replies,
+        vec![SCHEDULE_STORE_FAILURE_REPLY.to_owned()],
+        "a deep page on a dead pool degrades to the safe reply"
+    );
+    for leaked in ["sqlx", "postgres", "127.0.0.1", "agent_test", "Pool"] {
+        assert!(
+            !replies[0].contains(leaked),
+            "dead-pool reply must not leak {leaked}: {}",
+            replies[0]
+        );
+    }
+    mock.shutdown().await;
+}
+
 /// Dead-pool control: with a closed pool, the audit write is impossible by
 /// construction, so every schedule command must still finish with the
 /// fixed safe reply — no panic, no hang, no sqlx internals, pool address
