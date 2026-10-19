@@ -402,6 +402,31 @@ stored per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row is malformed or
 outside 0 to 600 whole seconds, so the sweep keeps the boot fallback. The
 line carries the setting key and the `out_of_range` reason.
 
+Fatal boot-setting warning (in `invalid_boot_setting`, called by
+`build_production_runtime` in `crates/bot/src/voice_rooms.rs`):
+`temp-voice boot setting invalid; refusing voice runtime` (warn). Fields:
+`key`: `&'static str` (one fixed key below); `reason`: `&'static str`
+(always `invalid_value`). No configured values, parser errors, tokens,
+channel/member lists or synthetic identity input are logged. This precedes
+the unchanged `RoomHttpError::InvalidRequest` setup failure and the gateway's
+`voice HTTP setup failed` line. It refuses the voice runtime, not necessarily
+the process. Exactly one warning names the first invalid setting in existing
+validation order:
+
+1. Protected infrastructure channels: `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`,
+   `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`, `TWO_TEMP_VOICE_CATEGORY_ID`, then
+   `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS`. The exact refused sub-key is named.
+2. Generator channel: `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID` (also checked by
+   protection above, so malformed input normally refuses there first).
+3. Empty-room grace: `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (whole seconds,
+   0 to 600).
+4. Synthetic humans: `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` (up to four distinct
+   nonzero IDs).
+
+Absent, blank and valid settings remain silent. Nonfatal admission knobs
+retain their separate default-fallback warning below. For safe triage, see
+[voice boot-setting refusal](runbook-observability.md#voice-boot-setting-refusal).
+
 Boot admission warning (in `configured_admission` in
 `crates/bot/src/voice_rooms.rs`, key-only fields, no IDs):
 `temp-voice admission setting invalid; using default` (warn): one of the
