@@ -1819,6 +1819,77 @@ for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) 
   });
 }
 
+for (const forwarding of ["on", "off"] as const) {
+  for (const gap of ["http", "fetch", "body", "missing", "invalid", "unreadable"] as const) {
+    test(`DO audit halt (${forwarding} forwarding) holds across ${gap} and reconstructs without duplicate tickets`, async (t) => {
+      const env = { ...ALERT_ENV, OPS_ALERT_FORWARDING: forwarding };
+      const first = await alertHarness(t, env);
+      let value = 1;
+      let failed = false;
+      const mockMetrics = (h: typeof first) => t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+        const path = new URL(typeof input === "string" ? input : input.url).pathname;
+        if (path !== "/metrics") return new Response(null, { status: 200 });
+        if (failed && gap === "fetch") throw new Error("synthetic scrape failure");
+        if (failed && gap === "http") return new Response(null, { status: 503 });
+        if (failed && gap === "body") return new Response(new ReadableStream({ start(controller) {
+          controller.error(new Error("synthetic body failure"));
+        } }));
+        let body = metricsBody().replace("two_bot_audit_delivery_halt 0", `two_bot_audit_delivery_halt ${value}`).replace(
+          'two_bot_job_last_success_timestamp_seconds{job="audit_retry"} 0',
+          `two_bot_job_last_success_timestamp_seconds{job="audit_retry"} ${Math.floor(Date.now() / 1000)}`,
+        );
+        if (failed && gap === "missing") body = body.split("\n").filter((line) => !line.startsWith("two_bot_audit_delivery_halt")).join("\n");
+        if (failed && gap === "invalid") body = body.replace(`two_bot_audit_delivery_halt ${value}`, "two_bot_audit_delivery_halt 2");
+        if (failed && gap === "unreadable") body = body.replace(
+          'two_bot_job_consecutive_failures{job="audit_retry"} 0',
+          'two_bot_job_consecutive_failures{job="audit_retry"} 1',
+        );
+        return new Response(body);
+      });
+      const stored = (h: typeof first) => h.values.get("two-bot:metrics-alerts");
+      const messages = (h: typeof first) => h.events().filter((e) => e.event === "metrics_alert").map((e) => e.content);
+      mockMetrics(first);
+      await first.tick();
+      await first.tick();
+      failed = true;
+      await first.tick();
+      assert.deepEqual(stored(first)?.firing, []);
+      assert.equal(stored(first)?.auditHaltStreak, 0, "gap interrupts pending engagement");
+      failed = false;
+      await first.tick();
+      await first.tick();
+      assert.deepEqual(messages(first), []);
+      // Simulated eviction: the third valid sample continues only persisted state.
+      const rebuilt = await alertHarness(t, env, first.values);
+      mockMetrics(rebuilt);
+      await rebuilt.tick();
+      assert.deepEqual(stored(rebuilt)?.firing, ["audit_delivery_halt"]);
+      assert.equal(messages(rebuilt).length, 1);
+      assert.match(messages(rebuilt)[0], /ALERT audit_delivery_halt \(ticket\):/);
+      assert.equal(rebuilt.posts.length, forwarding === "on" ? 1 : 0);
+      failed = true;
+      value = 0;
+      await rebuilt.tick();
+      assert.deepEqual(stored(rebuilt)?.firing, ["audit_delivery_halt"], "failure is not a recovery");
+      assert.equal(messages(rebuilt).length, 1);
+      // Reconstruct an active ticket too: steady engagement must not notify again.
+      const active = await alertHarness(t, env, rebuilt.values);
+      mockMetrics(active);
+      failed = false;
+      value = 1;
+      await active.tick();
+      assert.deepEqual(messages(active), []);
+      value = 0;
+      await active.tick();
+      await active.tick();
+      assert.deepEqual(stored(active)?.firing, []);
+      assert.equal(messages(active).length, 1);
+      assert.match(messages(active)[0], /RESOLVED audit_delivery_halt\./);
+      assert.equal(active.posts.length, forwarding === "on" ? 1 : 0);
+    });
+  }
+}
+
 test("DO failed EventSub reconcile passes ticket once, survive a failed scrape, and recover on a healthy pass", async (t) => {
   const h = await alertHarness(t, ALERT_ENV);
   let healthy = 10;
@@ -2414,6 +2485,7 @@ const PRIOR_METRICS: MetricsAlertState = {
   receiverRefusals: { membership: 8 }, receiverRefusalsSeen: true,
   receiverRefusalStreaks: { membership: 2 },
   dispatchDrops: { reactions: 5 }, dispatchDropStreaks: { reactions: 2 },
+  auditHaltStreak: 2,
 };
 
 async function backgroundMetricsHarness(t: TestContext) {
@@ -2430,13 +2502,13 @@ async function backgroundMetricsHarness(t: TestContext) {
     ...h, previous, puts,
     setMetricsResponse: (next: typeof response) => { response = next; },
     assertInterrupted: () => {
-      // A failed scrape preserves firing keys and every baseline/streak except
-      // the dispatch-drop window, which resets without resolving anything.
+      // A failed scrape preserves firing keys and other rules' baselines;
+      // dispatch growth and the engaged-halt run restart without resolving.
       const writes = puts.mock.calls.filter((call) => call.arguments[0] === METRICS_KEY);
-      assert.equal(writes.length, 1, "one dispatch-interrupt write");
-      assert.deepEqual(writes[0]!.arguments[1], { ...previous, dispatchDrops: {}, dispatchDropStreaks: {} });
+      assert.equal(writes.length, 1, "one streak-interrupt write");
+      assert.deepEqual(writes[0]!.arguments[1], { ...previous, dispatchDrops: {}, dispatchDropStreaks: {}, auditHaltStreak: 0 });
       assert.deepEqual(previous, PRIOR_METRICS, "no in-place baseline/streak/firing mutation");
-      assert.deepEqual(h.values.get(METRICS_KEY), { ...PRIOR_METRICS, dispatchDrops: {}, dispatchDropStreaks: {} });
+      assert.deepEqual(h.values.get(METRICS_KEY), { ...PRIOR_METRICS, dispatchDrops: {}, dispatchDropStreaks: {}, auditHaltStreak: 0 });
       assert.equal(h.posts.length, 0, "no false RESOLVED notification");
       assert.equal(h.events().length, 0, "no false transition logs");
       assert.deepEqual(h.logs.filter((line) => line !== "two-bot container started"), [SCRAPE_FAILURE]);

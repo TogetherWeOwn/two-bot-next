@@ -926,6 +926,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "eventsub_post_failed_share",
     "error_budget_fast_burn",
     "error_budget_slow_burn",
+    "audit_delivery_halt",
     "eventsub_tampered",
     "eventsub_reconcile_failed",
     "event_store_consumer_lag",
@@ -954,6 +955,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("event_store_consumer_lag", window), `evidence-event_store_consumer_lag-${window}.json`);
   assert.equal(packetFilename("error_budget_fast_burn", window), `evidence-error_budget_fast_burn-${window}.json`);
   assert.equal(packetFilename("error_budget_slow_burn", window), `evidence-error_budget_slow_burn-${window}.json`);
+  assert.equal(packetFilename("audit_delivery_halt", window), `evidence-audit_delivery_halt-${window}.json`);
   assert.equal(packetFilename("eventsub_tampered", window), `evidence-eventsub_tampered-${window}.json`);
   assert.equal(packetFilename("eventsub_reconcile_failed", window), `evidence-eventsub_reconcile_failed-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
@@ -1123,6 +1125,9 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   }
   firing.push(...budget.firing);
   firing.push(...ev(["two_bot_voice_creator_map_generation 3", "two_bot_voice_creator_map_age_seconds 601"]).firing);
+  let halted = EMPTY_STATE;
+  for (let i = 0; i < 3; i++) halted = ev(["two_bot_audit_delivery_halt 1"], halted).state;
+  firing.push(...halted.firing);
   const drainFamily = (error: number) => [
     `two_bot_community_facts_drain_failures_total{reason="error"} ${error}`,
     `two_bot_community_facts_drain_failures_total{reason="timeout"} 0`,

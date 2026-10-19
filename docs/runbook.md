@@ -956,6 +956,57 @@ First response: read the scrape through the existing authorized `/ops/metrics` p
 
 A lost scrape never resolves any metric-rule incident: missing evidence is not recovery evidence, so previously firing alerts stay firing through the loss, and the existing dispatch-drop interruption still applies. The first complete valid scrape after the incident resolves only the scrape-loss ticket; metric rules re-evaluate on that same scrape and resolve only on their own evidence. A valid scrape before the third failure silently resets the streak with no resolve.
 
+#### Alert: audit delivery halt
+
+`audit_delivery_halt` is a **ticket, not a page**: the label-free
+`two_bot_audit_delivery_halt` gauge stayed `1` for three consecutive valid
+keepalive samples. At the default 60 s cadence the first-to-third span is
+about two minutes, so an intentional short hold cleared before that span stays
+quiet. This is a sample bound, not a maintenance-window authorization or a
+wall-clock guarantee at a different keepalive cadence. A deliberate longer
+hold still tickets once; acknowledge it through normal incident tracking.
+
+First response: establish whether the hold is intended before attempting to
+resume delivery. Correlate the ticket's build/log links with the authorized
+maintenance record and the fixed `audit_mirror_halt_engaged` /
+`audit_mirror_halt_disengaged` events. A halted sweep intentionally claims
+nothing but still records job success every 30 s. Fresh
+`audit_retry` success with gauge `1` means a persistent hold, not a wedged
+retry loop; do not restart it to clear the ticket. An undocumented hold or one
+past its intended end needs the authorized operator to diagnose it this watch
+shift. Check DB/pool errors and job failures separately.
+
+An `audit_retry_halt_unreadable` warning is **not a new halt reading**: the
+Rust process retains its previous gauge. Its supervisor reports a failed
+`audit_retry` attempt. While `two_bot_job_consecutive_failures{job="audit_retry"}`
+is nonzero (including other failed audit sweeps), this rule neither fires nor
+recovers. Missing, duplicate, labeled or non-boolean halt readings and failed
+scrapes also break the pending streak while retaining an active ticket. A valid
+`0` with a healthy audit sweep resolves once; a fresh `1` needs a new run of
+three samples after recovery. DO reconstruction preserves the streak and active
+state; older stored state starts with zero streak. A process restart is not
+proof that the persistent switch was cleared: the process's initial zero gauge
+cannot resolve a ticket until `audit_retry` has a nonzero last-success timestamp.
+Confirm a healthy readable sweep.
+
+Unhalt only through the existing durable store contract, after the authorized
+operator confirms the hold is no longer needed: `delivery_halt()` reads its
+presence and `disengage_halt()` clears it under the store's existing fence.
+See the [audit control boundary](#containment-kill-switches-and-feature-flags) and
+[audit store protocol](audit-store.md#crash-and-halt-protocol-for-the-service-slice).
+There is **no supported binary audit-halt/unhalt command or operator HTTP
+endpoint** here; do not invent one, issue ad hoc SQL, clear pending/quarantined
+rows, or reset accepted-send evidence. If that execution path is unavailable,
+route the exact request to the authorized operator rather than changing policy.
+Verify the next healthy sweep reports `0` and the normal drain resumes; clearing
+the alert alone is not delivery evidence.
+
+Only the fixed rule key, ticket classification and public runbook link enter
+transition messages. Keep audit content, actor IDs, halt reason text and
+free-text labels out of evidence. The existing persist-before-notify path and
+forwarding gate are reused; this adds no external ticket-system integration,
+new control, retention/delivery change or production activation.
+
 #### Alert: eventsub reconcile failed
 
 `two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rose between two
