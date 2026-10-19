@@ -255,6 +255,15 @@ no write grant. Transitive dependencies remain unlocked. A future fixture
 lockfile can remove this exception; it is not an exception for deployment
 package installation.
 
+`deploy-production.yml` carries two inline suppressions for its automatic
+promotion trigger. `dangerous-triggers` on the `workflow_run` notifier: the
+trigger only wakes the run, and the guard re-resolves the SHA from the API
+and refuses unless it is on `origin/main` with green `ci-ok`, `worker
+check` and a successful `deploy-staging` run, inside the protected
+`production` Environment. `github-env` on the deploy-config render step:
+the only value written is a fixed `$RUNNER_TEMP` path, with no trigger,
+input or API data reaching `GITHUB_ENV`.
+
 The former `if: ${{ false }}` staging suspension (and its narrow
 `obfuscation` suppression) is removed by this re-activation; the workflow
 carries no such suppression. The offline regression now requires the deploy

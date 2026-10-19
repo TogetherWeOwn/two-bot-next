@@ -31,7 +31,7 @@ name: deploy-production
 # version AND container image) and still fails the run. Runbook:
 # docs/production-deploy.md.
 on:
-  workflow_run:
+  workflow_run: # zizmor: ignore[dangerous-triggers] promotion notifier only: the guard re-resolves the SHA from the API and refuses unless it is on origin/main with green ci-ok, worker check and a successful deploy-staging run, in the protected production Environment
     workflows: [deploy-staging]
     types: [completed]
     branches: [main]
@@ -854,7 +854,7 @@ jobs:
       # be newer than the commit being deployed.
       - name: Render the production deploy config with build identity
         if: env.MODE == 'deploy'
-        run: |
+        run: | # zizmor: ignore[github-env] fixed RUNNER_TEMP path only; no trigger, input or API data reaches GITHUB_ENV here
           set -euo pipefail
           config="$RUNNER_TEMP/production-deploy.json"
           python3 ../tooling/scripts/production_deploy.py render \
