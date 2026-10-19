@@ -359,10 +359,14 @@ First response: check the affected provider's status (PlanetScale for
 production, Neon for staging) before touching the bot; then correlate with
 the `op` label and recent deploys (a new query path or migration can explain
 a fresh error burst). For voice actor load failures, read `voice actor load
-failed; actor respawns on the next guild snapshot` in container stdout.
-Every failure increments the counter, but that warn is throttled
-process-wide to once per 300 s; its absence in a short window does not
-prove the actor loaded. Do not run SQL probes against staging or
+failed; retrying with capped backoff` in container stdout (or `voice actor
+load failed; credential refused, not retrying` when the store refused the
+bot credential). Transient failures retry inside the actor task (30 s
+per-attempt deadline, 1 s backoff doubling to a 60 s cap), so the guild
+recovers on its own once storage heals; a credential refusal never retries
+and needs the credential fixed first. Every failure increments the
+counter, but that warn is throttled process-wide to once per 300 s; its
+absence in a short window does not prove the actor loaded. Do not run SQL probes against staging or
 production, add grants, or restart the container to "clear" the errors;
 a replacement restarts the shard without fixing the failing storage path.
 
@@ -878,6 +882,36 @@ as `(ticket)` and supplies this runbook. Route a continuing delivery failure to
 the on-call engineer through the normal triage path. No new webhook, production
 activation or live load test is authorized.
 
+#### Alert: event-store consumer lag
+
+`two_bot_event_store_consumer_lag_seconds` stayed above 60 s (one keepalive
+window) in three consecutive valid keepalive samples. `event_store_consumer_lag`
+is a **ticket, not a page**: only lag above the 60 s threshold counts
+(fractional durations count), while samples at or below it — including `0`
+(unobserved) — never fire and a single transient spike stays quiet. Only a valid
+sample at or below 60 s resolves and rebaselines; missing or invalid samples
+(absent family, duplicate, labeled, non-finite, negative) and failed scrapes
+break the streak but preserve a firing ticket. A process restart reads `0`, so
+restarts rebaseline the same way.
+
+First response: triage within the watch shift through the existing read-only
+paths. Read `two_bot_event_store_consumer_lag_seconds` via the authorized
+`/ops/metrics` scrape and compare gateway readiness, missed-events and REST/DB
+alerts separately; a lag ticket with no gateway or store error is consumer
+pressure, not proof of capture loss. Diagnose the consumer with read-only
+checks only: recent deploy evidence, Worker `metrics_alert` log lines for the
+firing and recovery transitions, and the staging read-only verify query in the
+[event-store wiring note](event-store.md#staging-verify-steps-read-only).
+Record only the sanitized lag value and window, never message, channel, user,
+content or scrape tokens.
+
+Do not change the consumer, the store schema, retention or erasure, replay
+capture rows, or restart the bot to clear the gauge. This alert reuses the
+existing transition delivery as `(ticket)` and supplies this runbook. Persist
+sanitized incident evidence and route a continuing lag to the on-call engineer
+through the normal triage path. No new webhook, production activation or live
+load test is authorized.
+
 #### Alert: metrics scrape lost
 
 The Container DO failed the container-internal `/metrics` scrape on 3 consecutive scheduled keepalive ticks. This is a **ticket, not a page**: the observer itself is blind, so every metric-rule alert is missing evidence while this fires. One failed scrape stays quiet and three consecutive failures ticket exactly once; further failures do not re-ticket while the incident fires.
@@ -1005,31 +1039,98 @@ flags (or any plain push deploy) disarms the drill: the triggers resolve on
 their own rules and the guards reset. Rollback is disarm-by-redeploy; the
 Worker recommends only, so nothing executes from this path.
 
+#### Staging guard receipts (persisted remediation evidence)
+
+Each keepalive tick writes the evaluator guard to DO storage at
+`two-bot:remediation`, flushes it with `storage.sync()`, reads it back, and —
+in staging only (`TWO_DEPLOY_ENV` exactly `"staging"`) — logs one structured
+receipt proving what was persisted. The flush matters: without it the
+read-back is served from the DO in-memory cache/write buffer and always
+repeats the just-written value. Production emits none. No endpoint,
+permission, dump, or storage mutation beyond the existing evaluator write;
+thresholds and the state machine are untouched.
+
+Log query (staging Worker logs): filter for the receipt event, then narrow by
+decision or firing key. In Cloudflare dashboard open Workers & Pages →
+`two-bot-next-staging` → Observability → Logs and query
+`event = "remediation_guard_receipt"` (JSON: `{"event":"remediation_guard_receipt"}`).
+Narrow with `decision = "recommend"` (R1/R2), `decision = "ceo-page"`
+(STOP), `decision = "suppressed-quiet"` (quiet after two failures),
+`decision = "held-cooldown"` (inside the 1800 s window),
+`decision = "clear-hold"` (sustained-clear hold-down), or `decision = "idle"`
+(pre-drill baseline / reset). Correlate a tick with its alert by matching
+`firing` to the same tick's `metrics_alert` line and `build_revision` /
+`release` / `worker_version` to the keepalive probe.
+
+Capture schema (allowlist only; no tokens, webhooks, or arbitrary storage):
+
+```json
+{
+  "event": "remediation_guard_receipt",
+  "service": "two-bot-next",
+  "ok": true,
+  "deploy_env": "staging",
+  "evaluated_at_seconds": 1760001860,
+  "firing": ["voice_creator_map_stale"],
+  "decision": "recommend",
+  "action": "creator-map-reload",
+  "guard": {
+    "lastRecommendedAtSeconds": 1760001860,
+    "scopes": {
+      "voice-stall": { "phase": "reload-recommended", "consecutiveFailures": 0, "suppressed": false, "clearSinceSeconds": 0 },
+      "crash-loop": { "phase": "idle", "consecutiveFailures": 0, "suppressed": false, "clearSinceSeconds": 0 }
+    }
+  },
+  "build_revision": "abc1234",
+  "release": "abc1234",
+  "worker_version": "deployment-A",
+  "log_url": "https://developers.cloudflare.com/workers/observability/logs/workers-logs/"
+}
+```
+
+A storage failure never yields `ok: true`: a failed write keeps the existing
+`two-bot remediation guard failed` line with no success receipt, and a failed
+flush (`storage.sync()`), failed read-back, or mismatched read-back yields
+`ok: false` with `reason` of `readback_failed`, `mismatch`, or
+`invalid_persisted` (same correlation fields, no guard). At most one receipt
+per 60 s keepalive tick.
+
+Truthful limits: staging runs with `OPS_ALERT_FORWARDING=off`, so the STOP
+(`ceo-page`) decision is log-only — there is no external CEO-page delivery to
+capture. The full clean-start R1/R2/STOP/clear sequence takes more than 30
+minutes (R1 at first firing, R2 one 1800 s window later, STOP another window
+later, then a full 1800 s quiet window to reset; typically about 90 minutes),
+so a short soak can only prove the prefix it covers. The receipt proves the
+guard persisted, not that any remediation executed — the Worker recommends
+only. This receipt is application-level evidence through the Worker's own
+authorized guard-storage path: a provider storage query can return transport
+HTTP 200 / `success=true` while its nested result is still a denial (for
+example `access to _cf_KV.key is prohibited: SQLITE_AUTH` with no rows), so
+provider HTTP success alone is not guard evidence.
+
 ### Event-store capture gaps and lag
 
-This is operator guidance, not a metrics alert: no rule in
-`wrangler/src/alert-rules.ts` watches this table, so nothing here fires or
-pages. The append-only capture table (`event_store`) only sees what the
-gateway received, so its gaps follow the gateway counters, not a separate
-store alert. A `two_bot_gateway_missed_events_total` increase between
-keepalive samples is a capture gap: those dispatches never arrived, RESUME
-does not replay them, and no backfill can reconstruct them. First response
-is the same as [gateway missed events](#alert-gateway-missed-events):
-scrape the authorized `/ops/metrics` path, compare the disconnect and
-recovery counters, correlate recent deploys, and do not restart the
-container to clear the counter.
+Capture gaps remain operator guidance, not a metrics alert: no rule watches
+for missing rows, so gaps never fire. The append-only capture table
+(`event_store`) only sees what the gateway received, so its gaps follow the
+gateway counters, not a separate store alert. A
+`two_bot_gateway_missed_events_total` increase between keepalive samples is a
+capture gap: those dispatches never arrived, RESUME does not replay them, and
+no backfill can reconstruct them. First response is the same as [gateway
+missed events](#alert-gateway-missed-events): scrape the authorized
+`/ops/metrics` path, compare the disconnect and recovery counters, correlate
+recent deploys, and do not restart the container to clear the counter.
 
-Capture lag is the spread between `received_at` and `event_time` per event
-family. No counter tracks it yet: lag is only detected by the read-only
-staging verify query ([event-store wiring
-note](event-store.md#staging-verify-steps-read-only)) until a slice ships a
-real counter and rule. A spread that stays above one keepalive window
-(about 60 s) across consecutive windows gets the same first response as a
-missed-events increase. Backfills and repairs against this table are
-insert-only with fresh dedup keys: never rewrite history with `UPDATE` or
-`DELETE`, and never replay an uncertain Discord effect from a capture row.
-Full wiring, fence and staging steps live in the [event-store wiring
-note](event-store.md).
+Capture lag has a ticket: [event-store consumer
+lag](#alert-event-store-consumer-lag) watches the label-free
+`two_bot_event_store_consumer_lag_seconds` gauge. Until the periodic
+store-read caller lands, the gauge reads `0` (unobserved); the staging
+read-only verify query ([event-store wiring
+note](event-store.md#staging-verify-steps-read-only)) remains the manual
+check. Backfills and repairs against this table are insert-only with fresh
+dedup keys: never rewrite history with `UPDATE` or `DELETE`, and never replay
+an uncertain Discord effect from a capture row. Full wiring, fence and staging
+steps live in the [event-store wiring note](event-store.md).
 
 ## Persisted ownership control
 
