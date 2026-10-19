@@ -287,30 +287,60 @@ fn non_unicode_gateway_override_exits_without_logging_its_value() {
 
 fn assert_parked_gateway(vars: &[(&str, &str)]) {
     // Reserve a non-default local port; no deployed service is contacted.
-    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
-    let addr = reserved.local_addr().unwrap();
-    assert_ne!(addr.port(), 8080);
-    let listen_addr = format!("0.0.0.0:{}", addr.port());
-    drop(reserved);
+    // The reserve/drop/rebind handoff is racy at full parallelism: another
+    // test process can claim the port before the child binds it, and the
+    // child then exits on listener bind failure. Retry with a fresh port so
+    // a stolen port cannot flake the suite. Child output is piped (not
+    // nulled) so a genuine early exit still reports its cause.
+    const ATTEMPTS: u8 = 3;
+    let mut attempt = 0;
+    let (addr, listen_addr, health) = loop {
+        attempt += 1;
+        let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+        let addr = reserved.local_addr().unwrap();
+        assert_ne!(addr.port(), 8080);
+        let listen_addr = format!("0.0.0.0:{}", addr.port());
+        drop(reserved);
 
-    let mut bot = Bot(command(&listen_addr)
-        .envs(vars.iter().copied())
-        .spawn()
-        .expect("start test bot"));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let health = loop {
-        assert!(
-            bot.0.try_wait().unwrap().is_none(),
-            "bot exited before serving the configured port"
-        );
-        if let Ok(response) = get(addr, "/health") {
-            break response;
+        let mut child = command(&listen_addr)
+            .envs(vars.iter().copied())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start test bot");
+        let (lines_tx, lines_rx) = mpsc::channel();
+        forward_lines(child.stdout.take().unwrap(), lines_tx.clone());
+        forward_lines(child.stderr.take().unwrap(), lines_tx);
+        let mut bot = Bot(child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let health = loop {
+            if let Some(status) = bot.0.try_wait().unwrap() {
+                let mut logs = String::new();
+                while let Ok(line) = lines_rx.try_recv() {
+                    logs.push_str(&line);
+                    logs.push('\n');
+                }
+                if attempt < ATTEMPTS {
+                    break None;
+                }
+                panic!(
+                    "bot exited with {status} before serving the configured port; child logs: {logs}"
+                );
+            }
+            if let Ok(response) = get(addr, "/health") {
+                break Some(response);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bot did not serve health on the configured non-default port"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        if let Some(health) = health {
+            break (addr, listen_addr, health);
         }
-        assert!(
-            Instant::now() < deadline,
-            "bot did not serve health on the configured non-default port"
-        );
-        thread::sleep(Duration::from_millis(20));
+        // Early exit: the port was likely stolen under parallel load. The
+        // dropped bot is killed here; the next attempt reserves a fresh port.
     };
     assert!(health.starts_with("HTTP/1.0 200"));
 
