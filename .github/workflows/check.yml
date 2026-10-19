@@ -760,6 +760,11 @@ jobs:
               exit 1
             fi
           }
+          # The member-moderation suite guards on MEMBER_TESTDB, not a URL, so
+          # export it before the sweep: otherwise every member test prints a
+          # FAILED guard line here and only passes in the re-run below, which
+          # looks like a regression (and like a flake to the ledger).
+          export MEMBER_TESTDB=agent-testdb
           # Main sweep under the bootstrap URL: non-ignored tests first at
           # full parallelism, then ignored tests serially. The ignored stores
           # share tables and locks, so parallel runs race and
@@ -769,11 +774,6 @@ jobs:
           # their own guarded DBs (dedicated step below / agent_test re-run);
           # never feed them the round-trip/bootstrap URL here, mirroring the
           # integration step's skips so their guards don't fail the sweep.
-          # channel_moderation_store is skipped in the ignored sweep below:
-          # its exact-URL guard rejects the bootstrap URL by design, so
-          # running it there only prints FAILED lines that look like
-          # regressions. It is re-run below with its accepted URL, which
-          # also collects its coverage.
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail --no-report -- \
             --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump \
@@ -795,9 +795,9 @@ jobs:
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test legacy_tls_fence --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test staging_migrate_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           # Suites pinned to the agent_test database under the empty-password
-          # URL form, plus the member-moderation suite behind MEMBER_TESTDB.
+          # URL form (MEMBER_TESTDB was exported before the sweep above, and
+          # the member-moderation re-run below only merges its profiles).
           export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test
-          export MEMBER_TESTDB=agent-testdb
           cov_run "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test internal_events -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test raid_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test reengagement_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs

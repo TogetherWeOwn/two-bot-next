@@ -4383,13 +4383,18 @@ mod tests {
             self.0.lock().expect("capture lock").len()
         }
 
-        /// Lines logged since `mark` that carry `event` for `action`; other
-        /// tests' lines are ignored so concurrent tests cannot interfere.
-        fn lines(&self, mark: usize, event: &str, action: &str) -> Vec<String> {
+        /// Lines logged since `mark` that carry `event` for `action` with
+        /// `cause`; other tests' lines are ignored so concurrent tests cannot
+        /// interfere. The cause pin matters: sibling tests share one global
+        /// capture, and two release-failure tests emit the same event for the
+        /// same action with different causes.
+        fn lines(&self, mark: usize, event: &str, action: &str, cause: &str) -> Vec<String> {
             let bytes = self.0.lock().expect("capture lock");
             String::from_utf8_lossy(&bytes[mark..])
                 .lines()
-                .filter(|line| line.contains(event) && line.contains(action))
+                .filter(|line| {
+                    line.contains(event) && line.contains(action) && line.contains(cause)
+                })
                 .map(str::to_owned)
                 .collect()
         }
@@ -4410,6 +4415,44 @@ mod tests {
     }
 
     const RELEASE_FAILED: &str = "moderation_idempotency_release_failed";
+
+    // A sibling test's line for the same event and action but a different
+    // cause must not leak into this test's window: the kick release tests
+    // run concurrently on one global capture, and without the cause pin each
+    // window intermittently held both lines (`left: 2, right: 1`).
+    #[tokio::test]
+    async fn release_capture_ignores_a_sibling_cause_for_the_same_action() {
+        let capture = LogCapture::global();
+        let mark = capture.mark();
+        tracing::error!(
+            action = "moderation.kick",
+            cause = "sibling_cause",
+            "{RELEASE_FAILED}"
+        );
+        assert!(
+            capture
+                .lines(
+                    mark,
+                    RELEASE_FAILED,
+                    "moderation.kick",
+                    "cause=\"own_cause\""
+                )
+                .is_empty(),
+            "a sibling cause must not match this test's window"
+        );
+        assert_eq!(
+            capture
+                .lines(
+                    mark,
+                    RELEASE_FAILED,
+                    "moderation.kick",
+                    "cause=\"sibling_cause\""
+                )
+                .len(),
+            1,
+            "the cause pin still matches its own lines"
+        );
+    }
 
     // A provably mutation-free refusal gives the key back. When that release
     // itself fails the row stays `in_flight` (a retry answers `InFlight`), and
@@ -4435,7 +4478,12 @@ mod tests {
         assert_eq!(err, MemberError::Discord(refusal.clone()));
         assert!(
             capture
-                .lines(mark, RELEASE_FAILED, "moderation.kick")
+                .lines(
+                    mark,
+                    RELEASE_FAILED,
+                    "moderation.kick",
+                    "cause=\"discord_rejected\""
+                )
                 .is_empty(),
             "a released key is not a failure"
         );
@@ -4447,13 +4495,13 @@ mod tests {
         let mark = capture.mark();
         let err = svc.execute(&request).await.expect_err("refused");
         assert_eq!(err, MemberError::Discord(refusal));
-        let lines = capture.lines(mark, RELEASE_FAILED, "moderation.kick");
-        assert_eq!(lines.len(), 1, "one diagnostic per failed release");
-        assert!(
-            lines[0].contains("cause=\"discord_rejected\""),
-            "{}",
-            lines[0]
+        let lines = capture.lines(
+            mark,
+            RELEASE_FAILED,
+            "moderation.kick",
+            "cause=\"discord_rejected\"",
         );
+        assert_eq!(lines.len(), 1, "one diagnostic per failed release");
         for private in [
             "req-release-fault",
             GUILD,
@@ -4491,13 +4539,13 @@ mod tests {
         let mark = capture.mark();
         let err = svc.execute(&request).await.expect_err("rate limited");
         assert_eq!(err, MemberError::Discord(DiscordError::RateLimited));
-        let lines = capture.lines(mark, RELEASE_FAILED, "moderation.kick");
-        assert_eq!(lines.len(), 1, "one diagnostic per failed release");
-        assert!(
-            lines[0].contains("cause=\"discord_rate_limited\""),
-            "{}",
-            lines[0]
+        let lines = capture.lines(
+            mark,
+            RELEASE_FAILED,
+            "moderation.kick",
+            "cause=\"discord_rate_limited\"",
         );
+        assert_eq!(lines.len(), 1, "one diagnostic per failed release");
         assert!(!lines[0].contains("req-rate-limit-release-fault"));
         assert_eq!(svc.execute(&request).await, Err(MemberError::InFlight));
         assert_eq!(discord.call_count("kick"), 1);
@@ -4520,13 +4568,13 @@ mod tests {
         let mark = capture.mark();
         let err = svc.execute(&request).await.expect_err("stage fails");
         assert!(matches!(err, MemberError::Store(ref e) if e.is_safe_pre_mutation()));
-        let lines = capture.lines(mark, RELEASE_FAILED, "moderation.ban");
-        assert_eq!(lines.len(), 1, "one diagnostic per failed release");
-        assert!(
-            lines[0].contains("cause=\"store_rolled_back\""),
-            "{}",
-            lines[0]
+        let lines = capture.lines(
+            mark,
+            RELEASE_FAILED,
+            "moderation.ban",
+            "cause=\"store_rolled_back\"",
         );
+        assert_eq!(lines.len(), 1, "one diagnostic per failed release");
         assert!(
             !lines[0].contains("req-stage-release-fault"),
             "{}",
