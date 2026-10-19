@@ -233,14 +233,18 @@ hand first. An in-flight intent whose owner has stopped answers `in_progress` to
 until its claim goes stale, then `needs_reconciliation`; a live owner can still
 finish after that. A panic after a claim answers `needs_reconciliation`. A 504 on a
 mutation is an unknown outcome that may still complete: retry the same key only.
-Shutdown latches drain mode at the request, stops new mutation effects after the
-claim (replay, in-flight and reconciliation answers keep working) and releases
-the fresh provably-never-sent claim so the same key may retry, then joins
-tracked children within the shared 5-second HTTP drain budget: clean completion
-is reported only after every child is reaped, and work still in flight at the
-deadline is aborted and reported as a drain timeout, never waited on past the
-budget. Aborted or failed children keep their claim fence occupied, so a retry
-sees `in_progress`/`needs_reconciliation` and never a second effect.
+Shutdown latches drain mode — and a single shutdown deadline inside the shared
+5-second HTTP drain budget — at the request: the Axum drain and the child join
+share that deadline's remaining time, so an admitted handler holding a
+connection cannot starve the child drain past the supervisor's backstop.
+Shutdown stops new mutation effects after the claim (replay, in-flight and
+reconciliation answers keep working) and releases the fresh provably-never-sent
+claim so the same key may retry, then joins tracked children within the
+deadline's remainder: clean completion is reported only after every child is
+reaped, and work still in flight at the deadline is aborted and reported as a
+drain timeout, never waited on past the budget. Aborted or failed children keep
+their claim fence occupied, so a retry sees `in_progress`/`needs_reconciliation`
+and never a second effect.
 A claimed mutation holds the gate until it finishes, so a slow database can keep
 queued requests waiting for their 8 seconds. The events poller writes the mirror
 outside the gate, but both writers stamp `updated_at` with the same UTC-millis

@@ -96,6 +96,11 @@ const MAX_HEADERS: usize = 64;
 const MAX_REQUESTS: usize = 32;
 const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Headroom inside the supervisor's HTTP drain budget: the receiver's shared
+/// shutdown deadline sits this far inside it, so the receiver always runs its
+/// child-abort path and reports before the supervisor backstop — armed on the
+/// same latch — can drop it mid-drain.
+const SUPERVISOR_HEADROOM: Duration = Duration::from_millis(500);
 /// Queued event work waits at most this long, then is refused `in_progress`
 /// before any claim.
 const EVENT_GATE_WAIT: Duration = Duration::from_secs(8);
@@ -1224,6 +1229,14 @@ pub async fn bind(
 }
 
 impl BoundReceiver {
+    /// Shutdown budget shared by the Axum drain and the child drain, armed
+    /// when shutdown latches. It sits inside the supervisor's HTTP drain
+    /// budget by [`SUPERVISOR_HEADROOM`], so the receiver reports (and runs
+    /// its child-abort path) before the supervisor backstop fires.
+    fn shutdown_budget() -> Duration {
+        crate::website_jobs::HTTP_DRAIN_TIMEOUT.saturating_sub(SUPERVISOR_HEADROOM)
+    }
+
     /// Supervised by website_jobs along with the other runtime services.
     pub async fn serve(self, shutdown: tokio::sync::watch::Receiver<bool>) -> std::io::Result<()> {
         let Self { listener, state } = self;
@@ -1234,7 +1247,22 @@ impl BoundReceiver {
         tokio::pin!(server);
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         let mut draining = false;
+        // One shutdown deadline shared by the Axum drain and the child drain,
+        // armed when shutdown latches: an admitted handler holding a
+        // connection must not starve the child drain past the supervisor's
+        // backstop.
+        let mut deadline: Option<tokio::time::Instant> = None;
         let result = loop {
+            // Copied per iteration so the latch arm can re-arm the deadline
+            // while the nap below is pinned.
+            let latched_at = deadline;
+            let nap = async move {
+                match latched_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(nap);
             tokio::select! {
                 result = &mut server => break result,
                 _ = tick.tick() => state.flush(false),
@@ -1244,12 +1272,24 @@ impl BoundReceiver {
                 _ = latch.wait_for(|latched| *latched), if !draining => {
                     draining = true;
                     state.draining.store(true, Ordering::SeqCst);
+                    deadline = Some(tokio::time::Instant::now() + Self::shutdown_budget());
+                }
+                // The Axum drain shares the shutdown deadline: the child-abort
+                // path below still runs on the deadline's remainder.
+                _ = &mut nap, if draining => {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "internal-action receiver drain timed out",
+                    ));
                 }
             }
         };
         // A listener that stopped on its own drains the same way.
         state.draining.store(true, Ordering::SeqCst);
-        let drained = Self::drain_children(&state).await;
+        let budget = deadline
+            .map(|at| at.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or_else(Self::shutdown_budget);
+        let drained = Self::drain_children(&state, budget).await;
         state.flush(true);
         match (result, drained) {
             (Ok(()), true) => Ok(()),
@@ -1261,14 +1301,15 @@ impl BoundReceiver {
         }
     }
 
-    /// Join tracked receipt-finishing children within the shared HTTP drain
-    /// budget. Clean completion needs every child reaped; a reaped failure is
-    /// terminal work (its claim fence keeps durable uncertainty), but work
-    /// still in flight at the deadline is aborted and reported unclean, never
-    /// waited on past the budget.
-    async fn drain_children(state: &ReceiverState) -> bool {
+    /// Join tracked receipt-finishing children within `budget`, the remaining
+    /// share of the shutdown deadline the Axum drain did not consume. Clean
+    /// completion needs every child reaped; a reaped failure is terminal work
+    /// (its claim fence keeps durable uncertainty), but work still in flight
+    /// at the deadline is aborted and reported unclean, never waited on past
+    /// the budget.
+    async fn drain_children(state: &ReceiverState, budget: Duration) -> bool {
         let mut children = state.children.lock().await;
-        let outcome = tokio::time::timeout(crate::website_jobs::HTTP_DRAIN_TIMEOUT, async {
+        let outcome = tokio::time::timeout(budget, async {
             while let Some(finished) = children.join_next().await {
                 if let Err(join_error) = finished {
                     tracing::warn!(
