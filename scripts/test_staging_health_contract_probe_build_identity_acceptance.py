@@ -36,15 +36,13 @@ including the unverified-root-cause evidence) must not change.
 import io
 import json
 import os
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import staging_health_contract_probe as probe  # noqa: E402
+import staging_health_contract_probe as probe
 
 STAGING = "https://two-bot-next-staging.example-sub.workers.dev"
 SHA = "0123456789abcdef0123456789abcdef01234567"
