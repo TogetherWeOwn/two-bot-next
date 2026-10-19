@@ -690,6 +690,11 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test --workspace --lib --bins --features two-bot-core/db --locked
 
+      # Global metric deltas must not be satisfied by a sibling hostile-name test.
+      # Reuse the compiled feature graph, in a fresh process with serial tests.
+      - name: cargo test (isolated voice-name filter acceptance)
+        run: cargo test -p two-bot --lib --features two-bot-core/db --locked voice_rooms::tests::name_filter_acceptance -- --test-threads=1
+
       # The standalone backup fixture has its own scratch-only URL guard.
       # Supplying it here executes the round trip rather than its local skip.
       - name: cargo test (integration, including website acceptance and backup round trip)
