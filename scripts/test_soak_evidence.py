@@ -58,6 +58,31 @@ class SoakEvidenceTests(unittest.TestCase):
                 self.assertEqual(len(summary["unknown_intervals"]), 1)
                 self.assertEqual(summary["verdict"], "NEEDS WORK")
 
+    def test_invalid_unknown_endpoint_does_not_advance_timestamp_state(self):
+        for field in ("start", "end"):
+            for value in ("bad", "0001-01-01T00:00:00+01:00",
+                          "9999-12-31T23:59:59-01:00"):
+                with self.subTest(field=field, value=value):
+                    records = [
+                        {"ts": "2026-09-20T00:00:00Z", "event": "connect", "session": "a"},
+                        {"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 0},
+                        {"ts": "2026-09-20T00:00:02Z", "event": "disconnect"},
+                        {"ts": "2026-09-20T00:00:20Z", "event": "unknown", field: value},
+                        {"ts": "2026-09-20T00:00:14Z", "event": "resume", "session": "a"},
+                        {"ts": "2026-09-20T00:00:15Z", "event": "dispatch", "session": "a", "seq": 1},
+                    ]
+                    summary = run("".join(json.dumps(record) + "\n" for record in records))
+                    self.assertEqual(summary["resumes"], 1)
+                    self.assertEqual(summary["dispatches"], 2)
+                    self.assertEqual(summary["redeploy_gaps_s"], [12.0])
+                    self.assertEqual(summary["window"]["end"], "2026-09-20T00:00:15+00:00")
+                    self.assertEqual(summary["unknown_intervals"], [{
+                        "start": "2026-09-20T00:00:20+00:00",
+                        "end": "2026-09-20T00:00:20+00:00",
+                        "reason": "unknown interval with bad start/end",
+                    }])
+                    self.assertEqual(summary["verdict"], "NEEDS WORK")
+
     def test_clean_week_passes(self):
         summary = run(
             '{"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": "a"}\n'

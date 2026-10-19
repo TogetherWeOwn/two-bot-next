@@ -197,6 +197,17 @@ def summarize(lines):
             note_unknown(ts, ts, "resume with invalid seq")
             continue
 
+        if event == "unknown":
+            start = end = None
+            try:
+                if record.get("start"):
+                    start = parse_ts(record["start"])
+                if record.get("end"):
+                    end = parse_ts(record["end"])
+            except ValueError:
+                note_unknown(ts, ts, "unknown interval with bad start/end")
+                continue
+
         last_event_ts = ts
         first_ts = ts if first_ts is None else min(first_ts, ts)
         last_ts = ts if last_ts is None else max(last_ts, ts)
@@ -238,15 +249,6 @@ def summarize(lines):
                     })
                 last_seq[session] = seq
         elif event == "unknown":
-            start = end = None
-            try:
-                if record.get("start"):
-                    start = parse_ts(record["start"])
-                if record.get("end"):
-                    end = parse_ts(record["end"])
-            except ValueError:
-                note_unknown(ts, ts, "unknown interval with bad start/end")
-                continue
             note_unknown(start or ts, end,
                          str(record.get("reason", "unspecified")))
         else:
