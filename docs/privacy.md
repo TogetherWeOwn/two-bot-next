@@ -201,7 +201,24 @@ aggregates (`game_activity_guild_aggregates`) expire by `updated_at` age on
 the retention cadence (default 90 days, `TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`
 accepts 1..=36,500 days and any missing, malformed, or out-of-range value
 falls back to 90 days, only when `TWO_RETENTION_MODE` is exactly
-`execute`; dry runs count and log the same rows without deleting). After
+`execute`; dry runs count the visited page's full stale rows without deleting).
+Each production pass visits at most 32 candidate guilds and deletes at most
+500 rows per visited guild (test builds page at 4 x 10 to keep fixtures
+meaningful): tens of single-statement deletes per tick, far inside the
+120-second attempt budget, for at most ~16k rows per 15-minute tick
+(~1.5M/day). Each per-guild delete runs with `lock_timeout = '5s'` / `statement_timeout = '15s'`
+(plus a 15 s pool statement timeout), so a lock held by a stuck session fails
+that guild fast as an isolated retryable error instead of blocking the pass
+until the supervisor cancels it and pins its pooled connection. The cursor is
+written per guild immediately before that guild's delete, so a failed or
+cancelled pass still advances past the last attempted guild and the next pass
+reaches the later guilds on the same page, even when the whole fleet fits on
+one page; `guilds_deferred` counts
+eligible guilds after the visited page (zero only at the end of the eligible
+list), so backlog lag is observable via `guilds_deferred`/`stale_rows` with no
+per-guild labels. Dry-run totals are a same-predicate upper bound per pass
+(execute deletes at most the per-guild batch), not an exact future-delete
+promise under concurrent writes. After
 expiry a returning game's totals restart from zero with no marker. Apart
 from that window, a departed guild's rows go only through
 the guild-purge queue keyed on a true guild removal (a rejoin cancels the

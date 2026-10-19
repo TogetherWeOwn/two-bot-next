@@ -126,12 +126,21 @@ async fn schedules_count_disabled_rows_allow_replacement_and_preserve_guild_fenc
         scheduled_store::put_scheduled(db.pool(), &schedule(GUILD, "still-overflow", true)).await,
         Err(QuotaWriteError::Capacity(AutomationQuota::Schedules))
     ));
+    // The listing read stays capped at the per-guild quota even though the
+    // store still holds the grandfathered row: the restore above is not
+    // pruned, it is counted, not listed.
+    assert_eq!(
+        scheduled_store::count_scheduled(db.pool(), GUILD)
+            .await
+            .unwrap(),
+        26
+    );
     assert_eq!(
         scheduled_store::list_scheduled(db.pool(), GUILD)
             .await
             .unwrap()
             .len(),
-        26
+        25
     );
     db.close().await.unwrap();
 }
