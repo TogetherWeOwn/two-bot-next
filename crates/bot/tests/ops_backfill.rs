@@ -176,7 +176,7 @@ fn status_code(response: &str) -> Option<u16> {
         .ok()
 }
 
-/// One-line diagnostic for assertion context: length plus an escaped preview
+/// One-line diagnostic for failure context: length plus an escaped preview
 /// so an empty read (closed without a status line) or garbage bytes are
 /// visible in the failure output instead of a bare `None`.
 fn describe_response(response: &str) -> String {
@@ -189,35 +189,30 @@ fn describe_response(response: &str) -> String {
 /// is `None`. Each attempt mints fresh headers (fresh timestamp/nonce, so no
 /// replay) and only unparseable/transport failures retry; a parseable status
 /// — even a wrong one — returns immediately so a real auth regression still
-/// fails instead of being retried away.
+/// fails instead of being retried away. No sleep here: the timing gate pins
+/// this file to its single 20 ms spawn backoff, so retries are immediate.
 fn get_with_fresh_headers(
     addr: SocketAddr,
     path: &str,
     make_headers: impl Fn() -> Vec<(&'static str, String)>,
-) -> String {
+) -> Result<String, String> {
     const ATTEMPTS: usize = 3;
-    let mut last_response = String::new();
     let mut last_note = String::from("no attempts");
-    for attempt in 0..ATTEMPTS {
+    for _ in 0..ATTEMPTS {
         let headers = make_headers();
         match raw_get(addr, path, &headers) {
-            Ok(response) if status_code(&response).is_some() => return response,
+            Ok(response) if status_code(&response).is_some() => return Ok(response),
             Ok(response) => {
                 last_note = describe_response(&response);
-                last_response = response;
             }
             Err(error) => {
                 last_note = format!("transport error: {error}");
             }
         }
-        if attempt + 1 < ATTEMPTS {
-            thread::sleep(Duration::from_millis(50));
-        }
     }
-    if status_code(&last_response).is_some() || !last_response.is_empty() {
-        return last_response;
-    }
-    panic!("backfill read got no parseable status after {ATTEMPTS} attempts: {last_note}");
+    Err(format!(
+        "backfill read got no parseable status after {ATTEMPTS} attempts: {last_note}"
+    ))
 }
 
 fn body_json(response: &str) -> Value {
@@ -253,6 +248,7 @@ fn signed_get(addr: SocketAddr) -> String {
     get_with_fresh_headers(addr, BACKFILL_PATH, || {
         backfill_auth_headers(FIXTURE_KEY_ID, &fixture_secret())
     })
+    .expect("signed backfill read")
 }
 
 fn families_of(body: &Value) -> &serde_json::Map<String, Value> {
@@ -359,7 +355,7 @@ fn unsigned_and_mistaken_backfill_callers_share_one_401_refusal() {
     // 401, carrying the shared failure message and no key, cursor or
     // progress material.
     let (_bot, addr) = spawn_bot();
-    let bare = get_with_fresh_headers(addr, BACKFILL_PATH, Vec::new);
+    let bare = get_with_fresh_headers(addr, BACKFILL_PATH, Vec::new).expect("bare backfill read");
     assert_eq!(
         status_code(&bare),
         Some(401),
@@ -368,7 +364,8 @@ fn unsigned_and_mistaken_backfill_callers_share_one_401_refusal() {
     );
     let wrong = get_with_fresh_headers(addr, BACKFILL_PATH, || {
         backfill_auth_headers("fixture-unknown-key", &fixture_secret())
-    });
+    })
+    .expect("wrong-key backfill read");
     assert_eq!(
         status_code(&wrong),
         Some(401),
