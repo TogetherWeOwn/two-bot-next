@@ -362,6 +362,23 @@ fn posted_contents(mock: &MockRest) -> Vec<String> {
 
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 
+fn schema_name_at(stamp: u128) -> String {
+    // Parallel workers can share a clock tick, so a bare timestamp
+    // collides (`pg_namespace_nspname_index`). The pid + counter nonce
+    // keeps every schema in this process unique.
+    format!(
+        "tog10430_risk_{}_{}_{}",
+        std::process::id(),
+        stamp,
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -373,11 +390,7 @@ impl TestSchema {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        // Parallel workers can share a clock tick, so a bare timestamp
-        // collides (`pg_namespace_nspname_index`). The pid + counter nonce
-        // keeps every schema in this process unique.
-        let nonce = NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed);
-        let schema = format!("tog10430_risk_{}_{}_{}", std::process::id(), stamp, nonce);
+        let schema = schema_name_at(stamp);
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");

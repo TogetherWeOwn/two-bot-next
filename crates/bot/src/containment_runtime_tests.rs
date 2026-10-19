@@ -2,6 +2,7 @@
 //! tests are ignored and run only on agent-testdb / the CI service container.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -313,6 +314,25 @@ fn posted_contents(mock: &MockRest) -> Vec<String> {
         .collect()
 }
 
+static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
+fn schema_name_at(stamp: u128) -> String {
+    // Parallel workers can share a clock tick, so a bare timestamp
+    // collides (`pg_namespace_nspname_index`). The pid + counter nonce
+    // keeps every schema in this process unique.
+    format!(
+        "tog10430_contain_{}_{}_{}",
+        std::process::id(),
+        stamp,
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -324,7 +344,7 @@ impl TestSchema {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let schema = format!("tog10430_contain_{stamp}");
+        let schema = schema_name_at(stamp);
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");

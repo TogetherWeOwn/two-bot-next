@@ -4,6 +4,7 @@
 #[path = "onboarding_connect_acceptance_tests.rs"]
 mod connect_acceptance;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +26,25 @@ use crate::onboarding::{OnboardingJob, OnboardingRuntime};
 const TEST_DATABASE: &str = "postgres://agent_test@agent-testdb:5432/postgres";
 const NOW: i64 = 1_790_780_400_000;
 
+static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
+
+fn schema_name_at(stamp: u128) -> String {
+    // Parallel workers can share a clock tick, so a bare timestamp
+    // collides (`pg_namespace_nspname_index`). The pid + counter nonce
+    // keeps every schema in this process unique.
+    format!(
+        "tog10278_onboarding_{}_{}_{}",
+        std::process::id(),
+        stamp,
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -36,7 +56,7 @@ impl TestSchema {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let schema = format!("tog10278_onboarding_{stamp}");
+        let schema = schema_name_at(stamp);
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");
