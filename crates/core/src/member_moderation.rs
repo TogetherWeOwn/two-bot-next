@@ -4383,8 +4383,10 @@ mod tests {
             self.0.lock().expect("capture lock").len()
         }
 
-        /// Lines logged since `mark` that carry `event` for `action`; other
-        /// tests' lines are ignored so concurrent tests cannot interfere.
+        /// Lines logged since `mark` that carry `event` for `action`. Lines
+        /// with a different pair are ignored, but a parallel sibling
+        /// emitting the same pair still lands in this window, so tests
+        /// sharing a pair must serialise on `RELEASE_LOG_SERIAL`.
         fn lines(&self, mark: usize, event: &str, action: &str) -> Vec<String> {
             let bytes = self.0.lock().expect("capture lock");
             String::from_utf8_lossy(&bytes[mark..])
