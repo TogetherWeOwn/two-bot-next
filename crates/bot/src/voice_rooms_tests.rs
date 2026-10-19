@@ -10901,6 +10901,54 @@ async fn notices_fall_back_from_system_channel_to_owner_dm_to_creator_chat() {
 }
 
 #[tokio::test]
+async fn configured_channel_failure_warns_then_falls_back() {
+    let settings = LoggingSettings {
+        channel_id: Some(650),
+        mention_role_id: Some(NOTICE_ROLE),
+        ..LoggingSettings::default()
+    };
+    let mut worker = failed_worker(settings, Some(SYSTEM_CHANNEL)).await;
+
+    // A working configured channel stays silent: no fallback warn.
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    assert!(worker.send_notices(0).await);
+    assert_eq!(sent(&worker)[0].0, NoticeTarget::Channel(650));
+    let quiet = global.text()[before..].to_owned();
+    assert!(
+        !quiet.contains("voice notice configured channel failed; trying fallback"),
+        "success stays silent: {quiet}"
+    );
+
+    // A failing configured channel warns once, then the fallback delivers
+    // with the mention intact.
+    worker
+        .http
+        .refused_notices
+        .lock()
+        .unwrap()
+        .push(NoticeTarget::Channel(650));
+    let before = global.text().len();
+    assert!(worker.send_notices(NOTICE_REPEAT_INTERVAL_MS).await);
+    let notices = sent(&worker);
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices[1].0, NoticeTarget::Channel(SYSTEM_CHANNEL));
+    assert_eq!(notices[1].2, Some(NOTICE_ROLE));
+    let logged = global.text()[before..].to_owned();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("voice notice configured channel failed; trying fallback"))
+        .expect("a configured-channel failure warns before falling back");
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("op=\"send_notice\""), "{line}");
+    assert!(line.contains("outcome=\"discord\""), "{line}");
+    assert!(
+        !line.contains("/setup"),
+        "the warn carries no notice text: {line}"
+    );
+}
+
+#[tokio::test]
 async fn no_system_channel_goes_straight_to_the_owner_dm() {
     let mut worker = failed_worker(LoggingSettings::default(), None).await;
     assert!(worker.send_notices(0).await);

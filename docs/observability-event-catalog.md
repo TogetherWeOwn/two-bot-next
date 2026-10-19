@@ -398,6 +398,14 @@ stored per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row is malformed or
 outside 0 to 600 whole seconds, so the sweep keeps the boot fallback. The
 line carries the setting key and the `out_of_range` reason.
 
+Configured-channel notice fallback warning (in
+`GuildRoomWorker::deliver_notice` in `crates/bot/src/voice_rooms.rs`, guild
+field plus bounded `op` and `outcome`, no notice text or mention payload):
+`voice notice configured channel failed; trying fallback` (warn): the
+configured `/logging` channel refused the notice send, so delivery falls
+through to the system channel, owner DM and creator chat in order. One line
+per failed configured-channel attempt; a working channel logs nothing.
+
 Creator-view refresh actor messages (all in `GuildRoomWorker::revalidate_creator`
 / `reload_creators` in `crates/bot/src/voice_rooms.rs`, guild-only fields,
 no IDs):
