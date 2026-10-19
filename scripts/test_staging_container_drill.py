@@ -830,11 +830,57 @@ class LagToleranceTests(unittest.TestCase):
             ("x", lambda p: 0, "y"),
             now=lambda: world.t, sleep=sleep_with_lag, log=logs.append)
         instance.evidence["rollout_ids_before"] = []
-        moment, counts, timeline = instance.wait_ready(
+        _moment, counts, timeline = instance.wait_ready(
             BACKOUT_WORKER, BACKOUT_SHA, BACKOUT_BUILD, BACKOUT_IMAGE,
             world.t)
         self.assertGreaterEqual(counts["probes"], 1)
         self.assertTrue(any(entry[2] and entry[3] for entry in timeline))
+
+    def test_drill_leg_refuses_drifted_live_listing(self):
+        world = World()
+        old = rollout_row(world, "r-old", PRE_IMAGE)
+        world.tick(10)
+        new = rollout_row(world, "r-new", BACKOUT_IMAGE)
+        world.rollouts = [old, new]
+        world.serving_image = PRE_IMAGE
+        instance = container_drill.Drill(
+            FakeClient(world), make_control(world), URL, "1",
+            ("unused", lambda p: 0, "unused"),
+            now=lambda: world.t, sleep=world.tick, log=lambda message: None)
+        with patch.object(instance, "deploy_image",
+                          side_effect=AssertionError("unexpected deploy")) as deploy:
+            with self.assertRaises(GateError) as caught:
+                instance.leg("drill", pin(), container_drill.validate_attestation(
+                    COVERING_ATTESTATION))
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        deploy.assert_not_called()
+        self.assertEqual(world.deploys, [])
+        self.assertEqual([call[0] for call in world.calls], ["status", "fence"])
+
+    def test_restore_refuses_unproven_serving_image(self):
+        for scenario in ("no_completed_rollouts", "malformed_listing"):
+            with self.subTest(scenario=scenario):
+                world = World()
+                if scenario == "no_completed_rollouts":
+                    world.rollouts = []
+                else:
+                    world.serving_image = "not-an-image-digest"
+                instance = container_drill.Drill(
+                    FakeClient(world), make_control(world), URL, "1",
+                    ("unused", lambda p: 0, "unused"),
+                    now=lambda: world.t, sleep=world.tick, log=lambda message: None)
+                restore_pin = pin(source_sha=PRE_SHA, build_id=PRE_BUILD,
+                                  image=PRE_IMAGE, worker_version=PRE)
+                with patch.object(instance, "deploy_image",
+                                  side_effect=AssertionError("unexpected deploy")) as deploy:
+                    with self.assertRaises(GateError) as caught:
+                        instance.leg("restore", restore_pin,
+                                     container_drill.validate_attestation(
+                                         COVERING_ATTESTATION))
+                self.assertEqual(str(caught.exception), "serving_image_unproven")
+                deploy.assert_not_called()
+                self.assertEqual(world.deploys, [])
+                self.assertEqual([call[0] for call in world.calls], ["status", "fence"])
 
     def test_restore_deploys_when_live_listing_drifted(self):
         # Run-8: backout left listing drifted (newest rollout BACKOUT, listing
