@@ -173,6 +173,7 @@ async function poll() {
     if (obsolete()) return;
     lastAppliedSeq = seq;
     status.textContent = "fetch failed";
+    el.innerHTML = '<p class="bad">summary unavailable: fetch failed</p>';
     return;
   }
   const contentType = res.headers.get("content-type") || "";
