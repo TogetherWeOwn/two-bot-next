@@ -37,6 +37,7 @@
 //! step and no `nightly.yml` `--skip` line is required for this target.
 
 use std::{
+    cell::Cell,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     process::{Child, Command, Stdio},
@@ -167,13 +168,21 @@ fn raw_get(addr: SocketAddr, path: &str, headers: &[(&str, String)]) -> std::io:
 }
 
 fn status_code(response: &str) -> Option<u16> {
-    response
-        .lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
+    // Strict: only a complete `HTTP/<version> <code>` status line counts, so
+    // a truncated write (e.g. `HTTP/1.1 2`) or a non-HTTP first line falls
+    // through to the retry like the empty read does instead of returning a
+    // bogus code.
+    let line = response.lines().next()?;
+    let mut parts = line.split_whitespace();
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    let code: u16 = parts.next()?.parse().ok()?;
+    if !(100..=599).contains(&code) {
+        return None;
+    }
+    Some(code)
 }
 
 /// One-line diagnostic for failure context: length plus an escaped preview
@@ -477,4 +486,79 @@ fn backfill_body_carries_ids_and_counts_only() {
             "free-text content {text:?} must never be exposed"
         );
     }
+}
+
+/// Serve one scripted payload per accepted connection: drain the request so
+/// the client write succeeds, then write the bytes (possibly empty) and close
+/// by drop. An empty payload reproduces the transient empty read (accept then
+/// close without a status line). Blocking accepts only; no backoff here.
+fn serve_scripted(listener: TcpListener, scripts: Vec<Vec<u8>>) {
+    for script in scripts {
+        let (mut conn, _) = listener.accept().expect("fake listener accept");
+        let mut drain = [0u8; 4096];
+        let _ = conn.read(&mut drain);
+        if !script.is_empty() {
+            conn.write_all(&script).expect("fake listener write");
+        }
+    }
+}
+
+#[test]
+fn retry_recovers_from_empty_and_truncated_reads() {
+    // Pins the flake fix: a dropped connection and a truncated status line
+    // must both retry with fresh headers and return the next good response.
+    // With `ATTEMPTS` reverted to 1 this goes red (the retry never runs).
+    let good = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_vec();
+    for first in [Vec::new(), b"HTTP/1.1 2".to_vec()] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake listener");
+        let addr = listener.local_addr().expect("fake listener addr");
+        let good_next = good.clone();
+        let handle = thread::spawn(move || serve_scripted(listener, vec![first, good_next]));
+        let attempts = Cell::new(0u32);
+        let response = get_with_fresh_headers(addr, BACKFILL_PATH, || {
+            attempts.set(attempts.get() + 1);
+            Vec::new()
+        })
+        .expect("retry must recover from an unparseable read");
+        assert_eq!(
+            status_code(&response),
+            Some(200),
+            "retry must return the good response: {}",
+            describe_response(&response)
+        );
+        assert_eq!(
+            attempts.get(),
+            2,
+            "empty/truncated read must cost exactly one retry"
+        );
+        handle.join().expect("fake server thread");
+    }
+}
+
+#[test]
+fn retry_returns_parseable_status_without_extra_attempt() {
+    // Pins the no-retry guard: a parseable denial must return immediately so
+    // a real auth regression fails instead of being retried away.
+    let denied = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_vec();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake listener");
+    let addr = listener.local_addr().expect("fake listener addr");
+    // Serve exactly one response, then close: a parseable status must return
+    // after one attempt, so the server thread must exit without a second
+    // accept (serving more would hang `join`). If the client ever retried, the
+    // refused connection would surface as a transport error and fail the test.
+    let handle = thread::spawn(move || serve_scripted(listener, vec![denied]));
+    let attempts = Cell::new(0u32);
+    let response = get_with_fresh_headers(addr, BACKFILL_PATH, || {
+        attempts.set(attempts.get() + 1);
+        Vec::new()
+    })
+    .expect("parseable denial must return");
+    assert_eq!(
+        status_code(&response),
+        Some(401),
+        "parseable denial must pass through: {}",
+        describe_response(&response)
+    );
+    assert_eq!(attempts.get(), 1, "parseable status must not retry");
+    handle.join().expect("fake server thread");
 }
