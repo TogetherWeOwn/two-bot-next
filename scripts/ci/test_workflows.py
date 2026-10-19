@@ -2193,10 +2193,37 @@ class WorkflowTests(unittest.TestCase):
         # Every 1 GiB tmpfs lane needs the rust-tests WAL bound: unbounded WAL
         # plus disposable-database data peaks exhaust the service disk late in
         # the ignored-db-stores job (main runs 39149193652 and 39197217315 both
-        # PANIC'd with No space left on device in internal_member_store).
-        for lane in ("rust-tests", "ignored-db-stores", "ignored-db-runtime"):
-            with self.subTest(lane=lane):
-                job = self.workflows["check.yml"]["jobs"][lane]
+        # PANIC'd with No space left on device in internal_member_store). The
+        # required nextest lane runs the same DB-backed suites on the same 1
+        # GiB tmpfs service via the reusable workflow, so it is the same
+        # defect, not a separate one. Lanes are derived from the tmpfs
+        # services rather than enumerated, so a new 1 GiB lane fails closed
+        # until its bound is pinned here.
+        lanes = []
+        for workflow_name, workflow in self.workflows.items():
+            for job_id, job in workflow.get("jobs", {}).items():
+                services = job.get("services") or {}
+                options = " ".join(
+                    str(service.get("options", ""))
+                    for service in services.values()
+                    if isinstance(service, dict)
+                )
+                if "size=1073741824" in options:
+                    lanes.append((workflow_name, job_id))
+        # Sentinel: an enumeration that silently found nothing would pass
+        # every subtest vacuously.
+        self.assertEqual(
+            sorted(lanes),
+            sorted([
+                ("check.yml", "rust-tests"),
+                ("check.yml", "ignored-db-stores"),
+                ("check.yml", "ignored-db-runtime"),
+                ("reusable-rust-nextest.yml", "nextest"),
+            ]),
+        )
+        for workflow_name, lane in lanes:
+            with self.subTest(lane=f"{workflow_name}:{lane}"):
+                job = self.workflows[workflow_name]["jobs"][lane]
                 prepare = next(
                     step for step in job["steps"]
                     if step.get("name") == "Prepare isolated test databases"
