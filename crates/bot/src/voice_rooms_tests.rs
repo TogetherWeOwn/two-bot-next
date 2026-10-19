@@ -6513,6 +6513,76 @@ async fn access_command_reports_store_failures_and_changes_nothing() {
     assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
 }
 
+#[tokio::test]
+async fn access_read_store_failure_warns_and_keeps_reply() {
+    let runtime = gated_runtime(
+        Trace::default(),
+        AccessControls::default(),
+        Some(StoreError::Unavailable),
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (_, response) = handle_capture(
+        &runtime,
+        &access_interaction(sub_option("show", vec![]), true),
+    )
+    .await;
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not read the voice-room settings. Nothing was changed; try again."
+    );
+    let log = global.text()[before..].to_owned();
+    let line = log
+        .lines()
+        .find(|line| line.contains("op=\"access_read\""))
+        .unwrap_or_else(|| panic!("missing access_read warn in:\n{log}"));
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"unavailable\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
+#[tokio::test]
+async fn access_save_store_failure_warns_and_keeps_reply() {
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(
+        Trace::default(),
+        shared.clone(),
+        Some(StoreError::CredentialRefused),
+    );
+    let disable = access_interaction(
+        sub_option(
+            "creation",
+            vec![CommandDataOption {
+                name: "enabled".to_owned(),
+                value: CommandOptionValue::Boolean(false),
+            }],
+        ),
+        true,
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (_, response) = handle_capture(&runtime, &disable).await;
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not save the voice-room settings. Nothing was changed; try again."
+    );
+    assert_eq!(*shared.lock().unwrap(), AccessControls::default());
+    let log = global.text()[before..].to_owned();
+    let line = log
+        .lines()
+        .find(|line| line.contains("op=\"access_save\""))
+        .unwrap_or_else(|| panic!("missing access_save warn in:\n{log}"));
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"credential_refused\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
 fn channel_option(name: &str, id: u64) -> CommandDataOption {
     CommandDataOption {
         name: name.to_owned(),
@@ -6962,6 +7032,99 @@ async fn logging_command_reports_store_failures_and_changes_nothing() {
     let (_, response) = handle_capture(&unreadable, &level()).await;
     assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
     assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+}
+
+#[tokio::test]
+async fn logging_read_store_failure_warns_and_keeps_reply() {
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let runtime = logging_runtime(shared.clone(), Some(StoreError::Conflict), None);
+    assert!(runtime.publish_snapshot(GUILD, logging_snapshot()));
+    let level = logging_interaction(
+        sub_option("level", vec![command_option("level", "off")]),
+        true,
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (_, response) = handle_capture(&runtime, &level).await;
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not read the logging settings. Nothing was changed; try again."
+    );
+    assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+    let log = global.text()[before..].to_owned();
+    let line = log
+        .lines()
+        .find(|line| line.contains("op=\"logging_read\""))
+        .unwrap_or_else(|| panic!("missing logging_read warn in:\n{log}"));
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"conflict\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
+#[tokio::test]
+async fn logging_save_store_failure_warns_and_keeps_reply() {
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let runtime = logging_runtime(shared.clone(), None, Some(StoreError::Unavailable));
+    assert!(runtime.publish_snapshot(GUILD, logging_snapshot()));
+    let level = logging_interaction(
+        sub_option("level", vec![command_option("level", "off")]),
+        true,
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (_, response) = handle_capture(&runtime, &level).await;
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not save the logging settings. Nothing was changed; try again."
+    );
+    assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+    let log = global.text()[before..].to_owned();
+    let line = log
+        .lines()
+        .find(|line| line.contains("op=\"logging_save\""))
+        .unwrap_or_else(|| panic!("missing logging_save warn in:\n{log}"));
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"unavailable\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
+#[test]
+fn admin_store_error_tokens_cover_all_variants() {
+    assert_eq!(
+        admin_store_error_token(StoreError::Unavailable),
+        "unavailable"
+    );
+    assert_eq!(
+        admin_store_error_token(StoreError::CredentialRefused),
+        "credential_refused"
+    );
+    assert_eq!(admin_store_error_token(StoreError::Conflict), "conflict");
+}
+
+#[test]
+fn admin_store_failure_logs_one_warn_with_op_and_reason() {
+    tracing_capture::global();
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        log_admin_store_failure("access_read", GUILD, StoreError::Unavailable);
+    });
+    let log = capture.text();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_event=\"voice_admin_store\""), "{line}");
+    assert!(line.contains("op=\"access_read\""), "{line}");
+    assert!(line.contains("reason=\"unavailable\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
 }
 
 #[tokio::test]
@@ -10188,6 +10351,77 @@ async fn export_and_import_refuse_without_guild_inventory() {
     let (owned, response) = handle_import_capture(&runtime, &import, None).await;
     assert!(owned);
     assert!(response_text(&response.expect("refusal")).contains("unavailable"));
+}
+
+fn config_failure_runtime(trace: Trace, error: StoreError) -> VoiceRuntime<Store, Http> {
+    VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            store.config_error = Some(error);
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+#[tokio::test]
+async fn export_read_store_failure_warns_and_keeps_reply() {
+    let trace = Trace::default();
+    let runtime = config_failure_runtime(trace.clone(), StoreError::CredentialRefused);
+    let interaction = with_user(
+        voice_interaction(Some(command_data("export", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let inventory = config_inventory();
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not read the voice configuration. Nothing was sent; try again."
+    );
+    assert!(trace.lock().unwrap().is_empty());
+    let log = global.text()[before..].to_owned();
+    let line = log
+        .lines()
+        .find(|line| line.contains("op=\"export_read\""))
+        .unwrap_or_else(|| panic!("missing export_read warn in:\n{log}"));
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"credential_refused\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
+#[tokio::test]
+async fn import_read_store_failure_warns_and_keeps_reply() {
+    let trace = Trace::default();
+    let runtime = config_failure_runtime(trace.clone(), StoreError::Conflict);
+    let interaction = import_interaction(10, manager(), UPLOADER);
+    let inventory = config_inventory();
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not read the current voice configuration. Nothing was changed; try again."
+    );
+    assert!(trace.lock().unwrap().is_empty());
+    let log = global.text()[before..].to_owned();
+    let line = log
+        .lines()
+        .find(|line| line.contains("op=\"import_read\""))
+        .unwrap_or_else(|| panic!("missing import_read warn in:\n{log}"));
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"conflict\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
 }
 
 #[tokio::test]
