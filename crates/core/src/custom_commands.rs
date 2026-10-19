@@ -136,7 +136,7 @@ pub fn validate_template(template: &str) -> Result<(), TemplateError> {
 /// Unknown-but-pattern-matching keys render literally (unreachable after
 /// validation, kept so render never invents text); output past Discord's
 /// ceiling is refused. The render refuses once buffered bytes breach a byte
-/// tripwire (`3 *` the ceiling: byte length upper-bounds UTF-16 length, so
+/// tripwire (`3 *` the ceiling: triple the UTF-16 length upper-bounds byte length, so
 /// past the tripwire the output is certainly over-ceiling), materialising at
 /// most one expansion past it. Outputs within the tripwire render exactly as
 /// before, keeping exact lengths; tripwire refusals report buffered bytes,
