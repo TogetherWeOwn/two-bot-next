@@ -769,6 +769,11 @@ jobs:
           # their own guarded DBs (dedicated step below / agent_test re-run);
           # never feed them the round-trip/bootstrap URL here, mirroring the
           # integration step's skips so their guards don't fail the sweep.
+          # channel_moderation_store is skipped in the ignored sweep below:
+          # its exact-URL guard rejects the bootstrap URL by design, so
+          # running it there only prints FAILED lines that look like
+          # regressions. It is re-run below with its accepted URL, which
+          # also collects its coverage.
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail --no-report -- \
             --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump \
@@ -2212,10 +2217,10 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Builds all twenty-three libFuzzer targets. No campaign or generated corpus
-      # output; the existing weekly run replays the bounded eventsub_delivery
-      # and helix_token seeds below. Bounded vote_kick and helix_token smokes
-      # are manual (README).
+      # Builds all twenty-five libFuzzer targets. No campaign or generated corpus
+      # output; the existing weekly run replays the bounded eventsub_delivery,
+      # helix_token, and custom_command_template seeds below. Bounded vote_kick
+      # and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -2223,19 +2228,25 @@ jobs:
       - name: Compile-only fuzz build (no execution)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz build
-      # Bounded seed replay, eventsub_delivery and helix_token: `-runs=0`
+      # Bounded seed replay, eventsub_delivery, helix_token and
+      # custom_command_template: `-runs=0`
       # executes each committed corpus seed exactly once (plus the target's
       # fixed matrix) and exits without fuzzing. A signing-key drift between
       # the harness and production, a token-contract drift between the
-      # helix_token oracle and the parser, or seed misrouting panics an
-      # assertion here instead of passing a compile-only gate. Compile stays
-      # the only gate for the other twenty-one targets.
+      # helix_token oracle and the parser, a template-contract drift between
+      # the custom_command_template oracle and the renderer, or seed
+      # misrouting panics an assertion here instead of passing a
+      # compile-only gate. Compile stays the only gate for the other
+      # twenty-two targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
       - name: Seed replay for helix_token (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run helix_token -- -runs=0 -timeout=10 -rss_limit_mb=2048
+      - name: Seed replay for custom_command_template (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run custom_command_template -- -runs=0 -timeout=10 -rss_limit_mb=2048
 
   worker:
     name: worker check
