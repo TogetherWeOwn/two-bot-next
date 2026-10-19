@@ -15,10 +15,10 @@ use two_bot_core::{
         delivery_action, parse_xml_feed_report, poll_candidates, DeliveryAction, DeliveryClaim,
         FeedItem, FeedPollSchedule, FeedPost, FeedRelay, MAX_FEED_POSTS_PER_POLL,
     },
-    feeds_connector::fetch_feed,
+    feeds_connector::{fetch_feed, record_feed_fetch},
     feeds_store::{self as store, FeedAudit},
     funnel::now_millis_for_test,
-    FeatureGates,
+    metrics, FeatureGates,
 };
 use two_bot_discord::{ActionExecutor, DiscordError};
 
@@ -127,12 +127,23 @@ struct PublicFeedFetch;
 impl FeedFetch for PublicFeedFetch {
     fn fetch(&self, feed: FeedRelay) -> FetchFuture {
         Box::pin(async move {
-            let fetched = fetch_feed(&feed.source)
-                .await
-                .map_err(|_| ErrorClass::Feed)?;
+            let fetched = fetch_public_feed(metrics::global(), &feed.source).await?;
             parse_fetched(fetched, &feed)
         })
     }
+}
+
+/// Production fetch with metric recording, split from [`PublicFeedFetch`] so
+/// hermetic tests can pass a runtime-local registry: exactly one outcome
+/// sample plus (on failure) one error-class sample per call, never per-feed,
+/// so no source URL reaches a label.
+async fn fetch_public_feed(
+    metrics: &metrics::Metrics,
+    source: &str,
+) -> Result<two_bot_core::feeds_connector::FetchedFeed, ErrorClass> {
+    let result = fetch_feed(source).await;
+    record_feed_fetch(metrics, &result);
+    result.map_err(|_| ErrorClass::Feed)
 }
 
 fn parse_fetched(

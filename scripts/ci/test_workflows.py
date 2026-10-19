@@ -32,7 +32,8 @@ JOB_INVENTORY = {
                   # Promoted nextest lane (shared reusable), gated by ci-ok
                   # like the Rust lanes.
                   "nextest"},
-    "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "production", "release"},
+    "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "recheck",
+                              "production", "release"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "voice-synthetic"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
@@ -310,6 +311,60 @@ ERROR_RATE_MARKERS = (
 )
 
 
+def production_error_rate_gate_errors(workflow, name="deploy-production.yml"):
+    """The production error-rate gate mirrors staging against production.
+
+    Exactly one expression in exactly one production step may read the
+    rehearsal input, it must use the pinned dispatch-only expression (an
+    automatic trigger never carries inputs), and that step must be the
+    error-rate gate step: it judges the rehearsal firing when armed and
+    scrapes live production /ops/metrics otherwise, failing the stage so
+    auto-rollback runs. The scrape token is the production binding only;
+    the staging token must never appear. Reviewed tooling runs from the
+    workflow commit (../tooling), never the guarded SHA.
+    """
+    errors = []
+    inputs = (((workflow.get("on") or {}).get("workflow_dispatch") or {}).get("inputs") or {})
+    drill = inputs.get("inject_error_rate_spike") or {}
+    if drill.get("type") != "boolean" or drill.get("default") not in (False, "false") \
+            or str(drill.get("required")).lower() != "false":
+        errors.append(f"{name}: inject_error_rate_spike must stay an opt-in boolean defaulting to false")
+    jobs = workflow.get("jobs", {}) or {}
+    steps = ((jobs.get("production") or {}).get("steps") or [])
+    armed = [step for step in steps
+             if isinstance(step, dict) and "INJECT_ERROR_RATE_SPIKE" in str(step)]
+    if len(armed) != 1:
+        errors.append(f"{name}: exactly one production step may carry the error-rate drill switch")
+        return errors
+    step = armed[0]
+    if step.get("id") != "error_rate_gate":
+        errors.append(f"{name}: the error-rate drill switch must live on the error_rate_gate step")
+    # After a rollback restore there is no snapshot to roll back to: the
+    # gate must not fail the recovery run red with no action possible.
+    if step.get("if") != "env.MODE == 'deploy'":
+        errors.append(f"{name}: error_rate_gate must run in deploy mode only")
+    env = step.get("env") or {}
+    if env.get("INJECT_ERROR_RATE_SPIKE") != ERROR_RATE_EXPRESSION:
+        errors.append(f"{name}: error-rate rehearsal must use the pinned dispatch-only expression")
+    if env.get("METRICS_SCRAPE_TOKEN") != "${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}":
+        errors.append(f"{name}: error_rate_gate must bind the production scrape token by name")
+    if env.get("PRODUCTION_URL") != "${{ vars.PRODUCTION_WORKER_URL }}":
+        errors.append(f"{name}: error_rate_gate must read the production Worker URL from vars")
+    run = str(step.get("run") or "")
+    for needle in ("../tooling/wrangler/scripts/promotion-error-gate.mjs", "--metrics-url", "--evidence",
+                   "--sha", "--user-agent", "--rehearsal-firing",
+                   '[ "$INJECT_ERROR_RATE_SPIKE" = "true" ]'):
+        if run.count(needle) != 1:
+            errors.append(f"{name}: error_rate_gate step must contain exactly one {needle}")
+    # The evidence filename appears exactly twice: the --evidence write path
+    # and the read-back print, which must name the same file.
+    if run.count("production-error-rate-gate.json") != 2:
+        errors.append(f"{name}: error_rate_gate must write and read back the same production-error-rate-gate.json")
+    if "STAGING_METRICS_SCRAPE_TOKEN" in str(step):
+        errors.append(f"{name}: error_rate_gate must never read the staging scrape token")
+    return errors
+
+
 def staging_error_rate_gate_errors(workflows):
     """The error-rate promotion gate is dispatch-gated rehearsal plus live plumbing.
 
@@ -319,18 +374,18 @@ def staging_error_rate_gate_errors(workflows):
     rehearsal firing when armed and scrapes live staging /ops/metrics
     otherwise, failing the stage so auto-rollback runs. The scrape token is
     optional (absent means a recorded skip, pinned in the gate script's
-    tests); the rehearsal path needs no secret. Every other workflow —
-    deploy-production above all — must not mention the switch at all, so no
-    route can forward it to production.
+    tests); the rehearsal path needs no secret. Every other workflow except
+    the pinned production mirror must not mention the switch at all, so no
+    unreviewed route can forward a drill anywhere else.
     """
     errors = []
     for name, workflow in workflows.items():
-        if name == "deploy-staging.yml":
+        if name in ("deploy-staging.yml", "deploy-production.yml"):
             continue
         text = str(workflow)
         for marker in ERROR_RATE_MARKERS:
             if marker in text:
-                errors.append(f"{name}: error-rate gate marker {marker} outside deploy-staging")
+                errors.append(f"{name}: error-rate gate marker {marker} outside deploy-staging/deploy-production")
     staging = workflows.get("deploy-staging.yml") or {}
     text = str(staging)
     if text.count("inputs.inject_error_rate_spike") != 1:
@@ -1369,28 +1424,101 @@ def gradual_promote_proof_errors(workflow):
 
 
 def production_errors(workflow):
-    """deploy-production is the one live route: dispatch-only, human-gated, chained to staging."""
+    """deploy-production is the one live route: dispatch, green-staging completion or schedule, chained to staging."""
     name = "deploy-production.yml"
     errors = []
-    if set(workflow.get("on") or {}) != {"workflow_dispatch"}:
-        errors.append(f"{name}: production must be dispatch-only")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch", "workflow_run", "schedule"}:
+        errors.append(f"{name}: production must run on dispatch, staging completion or schedule only")
+    else:
+        run_trigger = (on.get("workflow_run") or {})
+        if (run_trigger.get("workflows") != ["deploy-staging"]
+                or run_trigger.get("types") != ["completed"]
+                or run_trigger.get("branches") != ["main"]):
+            errors.append(f"{name}: workflow_run must be a completed deploy-staging run on main only")
+        if not isinstance(on.get("schedule"), list) or not on.get("schedule"):
+            errors.append(f"{name}: schedule must carry the daily backstop")
     jobs = workflow.get("jobs", {})
     production, guard = jobs.get("production", {}), jobs.get("guard", {})
+    soak, recheck = jobs.get("soak", {}), jobs.get("recheck", {})
     needs = production.get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
     expected_production_if = (
-        "always() && needs.guard.result == 'success' && "
+        "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
+        "(needs.soak.result == 'success' || needs.soak.result == 'skipped') && "
+        "((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || "
+        "(needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && "
         "(needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || "
         "(needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))"
     )
-    if production.get("environment") != "production" or set(needs) != {"guard", "schema-gate", "roles-gate"}:
-        errors.append(f"{name}:production: must wait for the guard, the schema gate, the roles gate and the protected Environment")
+    if production.get("environment") != "production" \
+            or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate"}:
+        errors.append(f"{name}:production: must wait for the guard, the soak, the recheck, "
+                      "the schema gate, the roles gate and the protected Environment")
     if production.get("if") != expected_production_if:
-        errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates")
-    expected_gate_if = "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
+        errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates, "
+                      "a completed soak, a fresh recheck and no skip; cancelled runs never deploy")
+    # Only production and release hold the deploy-production lane: the guard,
+    # gates, soak and recheck run outside it, so a sleeping automatic promotion
+    # can never delay an operator rollback. The lane keeps the default single
+    # pending slot, so the recheck must skip an automatic run while an operator
+    # dispatch is active instead of entering the lane behind it.
+    if "concurrency" in workflow:
+        errors.append(f"{name}: must not hold the deploy lane at workflow level")
+    for job_id in ("production", "release"):
+        if jobs.get(job_id, {}).get("concurrency") != {"group": "deploy-production",
+                                                      "cancel-in-progress": "false"}:
+            errors.append(f"{name}:{job_id}: must hold the deploy-production lane without cancelling")
+    for job_id in ("guard", "schema-gate", "roles-gate", "soak", "recheck"):
+        if "concurrency" in jobs.get(job_id, {}):
+            errors.append(f"{name}:{job_id}: must not hold the deploy lane")
+    expected_soak_if = ("needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' "
+                        "&& needs.guard.outputs.allow_unstaged != 'true' "
+                        "&& needs.guard.outputs.soak_seconds != '0'")
+    if soak.get("needs") != "guard":
+        errors.append(f"{name}:soak: must wait for the guard (it sleeps the guarded SHA's remainder)")
+    if soak.get("if") != expected_soak_if:
+        errors.append(f"{name}:soak: must sleep only for ordinary non-skipped deploys with soak remaining")
+    soak_script = "\n".join(step.get("run", "") for step in soak.get("steps", []))
+    for required in ("SOAK_SECONDS - int(time.time() - green_at)", "time.sleep(remaining)"):
+        if required not in soak_script:
+            errors.append(f"{name}:soak: must recompute the remainder from the staging-green time")
+    soak_env = str((soak.get("steps") or [{}])[0].get("env", ""))
+    if "GREEN_AT" not in soak_env or "needs.guard.outputs.green_at" not in soak_env:
+        errors.append(f"{name}:soak: must read the staging-green timestamp from the guard")
+    expected_recheck_if = (
+        "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
+        "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.auto == 'true' && "
+        "(needs.soak.result == 'success' || needs.soak.result == 'skipped') && "
+        "needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'"
+    )
+    if recheck.get("needs") != ["guard", "soak", "schema-gate", "roles-gate"]:
+        errors.append(f"{name}:recheck: must wait for the guard, the soak and both gates "
+                      "(the fresh read happens after the last long build)")
+    if recheck.get("if") != expected_recheck_if:
+        errors.append(f"{name}:recheck: must recheck only automatic deploys after the soak and both gates")
+    if (recheck.get("outputs") or {}).get("skip") != "${{ steps.recheck.outputs.skip }}":
+        errors.append(f"{name}:recheck: must publish the skip output for production")
+    recheck_text = str(recheck)
+    for required in ("vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL", "needs.guard.outputs.sha",
+                     'skip = "live"', 'skip = "older-than-live"',
+                     'skip = "operator-dispatch-active"',
+                     'skip = "dispatch-check-unreadable"',
+                     "compare/{target}...{live}",
+                     "actions/workflows/deploy-production.yml/runs"):
+        if required not in recheck_text:
+            errors.append(f"{name}:recheck: missing check {required}")
+    if (recheck.get("permissions") or {}).get("actions") != "read":
+        errors.append(f"{name}:recheck: must read workflow runs to see an active operator dispatch")
+    guard_outputs = guard.get("outputs") or {}
+    for output in ("auto", "green_at"):
+        if output not in guard_outputs:
+            errors.append(f"{name}:guard: must publish the {output} output for the soak and recheck jobs")
+    expected_gate_if = ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
+                        "&& needs.guard.outputs.skip == ''")
     for gate_name in ("schema-gate", "roles-gate"):
         if jobs.get(gate_name, {}).get("if") != expected_gate_if:
-            errors.append(f"{name}:{gate_name}: must run only for ordinary deploys")
+            errors.append(f"{name}:{gate_name}: must run only for ordinary non-skipped deploys")
     guard_text = str(guard).lower()
     guard_markers = tuple(marker for marker in DEPLOY_MARKERS if marker not in ("production_worker_url", "/readyz"))
     if ("environment" in guard or "uses" in guard or "curl " in guard_text
@@ -1419,6 +1547,17 @@ def production_errors(workflow):
                      'refuse("the production Environment has no required reviewers")'):
         if required not in script:
             errors.append(f"{name}:guard: missing check {required}")
+    # The rollback drill proves the fail-to-rollback chain, which exists
+    # only on a deploy-mode run with takeover: the guard receives the switch
+    # and refuses anything else, so the drill never leaves its build serving.
+    guard_env = (guard.get("steps") or [{}])[0].get("env", {})
+    if guard_env.get("INJECT_ERROR_RATE_SPIKE") != "${{ inputs.inject_error_rate_spike }}":
+        errors.append(f"{name}:guard: must receive the drill switch as an input env")
+    for required in ("inject_error_rate_spike needs deploy mode",
+                     "inject_error_rate_spike needs takeover true",
+                     "inject_error_rate_spike never applies to an automatic run"):
+        if required not in script:
+            errors.append(f"{name}:guard: missing drill refusal {required}")
     return errors
 
 
@@ -1543,8 +1682,9 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:schema-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:schema-gate: must keep contents:read only")
-    if gate.get("if") != "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'":
-        errors.append(f"{name}:gate: must run only for ordinary deploys")
+    if gate.get("if") != ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
+                          "&& needs.guard.outputs.skip == ''"):
+        errors.append(f"{name}:gate: must run only for ordinary non-skipped deploys")
     if gate.get("needs") != "guard":
         errors.append(f"{name}:schema-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
@@ -1709,8 +1849,9 @@ def production_roles_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:roles-gate: must read only the production-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:roles-gate: must keep contents:read only")
-    if gate.get("if") != "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'":
-        errors.append(f"{name}:roles-gate: must run only for ordinary deploys")
+    if gate.get("if") != ("needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
+                          "&& needs.guard.outputs.skip == ''"):
+        errors.append(f"{name}:roles-gate: must run only for ordinary non-skipped deploys")
     if gate.get("needs") != "guard":
         errors.append(f"{name}:roles-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("roles-gate", gate.get("runs-on")):
@@ -2000,6 +2141,7 @@ def workflow_policy_errors(workflows):
             errors.extend(production_errors(workflow))
             errors.extend(production_schema_gate_errors(workflow))
             errors.extend(production_roles_gate_errors(workflow))
+            errors.extend(production_error_rate_gate_errors(workflow))
             continue
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
@@ -2171,10 +2313,75 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(fail_closed, pin)
         self.assertLess(run.index("exit 1", fail_closed), pin)
         self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        # A failed lookup must empty the result, not kill the step under pipefail.
+        self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
     def test_rust_test_postgres_wal_budget_is_bounded(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        prepare = next(
+            step for step in job["steps"]
+            if step.get("name") == "Prepare isolated test databases"
+        )
+        verify = next(
+            step for step in job["steps"]
+            if step.get("name") == "Verify disposable Postgres defaults"
+        )
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+        self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assertIn("'min_wal_size': '64MB'", verify["run"])
+
+    def test_stores_container_pins_disposable_database_service_address(self):
+        # Same hardening as rust-tests: the stores lane runs ~30 sequential
+        # database suites, and a main run lost service-alias DNS mid-suite
+        # (EAI_AGAIN on agent-testdb while Postgres PANIC-recovered on ENOSPC).
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-stores"]
+        prerequisites = next(
+            step for step in job["steps"]
+            if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
+        )
+        self.assertEqual(prerequisites.get("shell"), "bash")
+        run = prerequisites["run"]
+        self.assertIn("set -e", run)
+        hosts_tmp = run.index('hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"')
+        resolve = run.index("getent ahostsv4 agent-testdb")
+        remove_stale_pin = run.index("sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > \"$hosts_tmp\"")
+        self.assertNotIn("sed -i -E", run)
+        self.assertLess(hosts_tmp, remove_stale_pin)
+        copy_hosts = run.index('cat "$hosts_tmp" > /etc/hosts')
+        cleanup_hosts = run.index('rm -f "$hosts_tmp"')
+        self.assertLess(remove_stale_pin, copy_hosts)
+        self.assertLess(copy_hosts, cleanup_hosts)
+        pin = run.index("printf '%s agent-testdb\\n' \"$service_ip\" >> /etc/hosts")
+        verify_pin = run.index('getent ahostsv4 agent-testdb | awk \'NR == 1 { print $1; exit }\'')
+        forward = run.index("TCP:agent-testdb:5432")
+        ready = run.index("pg_isready -q -h 127.0.0.1")
+        self.assertIn("for attempt in $(seq 1 30)", run[:resolve])
+        self.assertLess(remove_stale_pin, resolve)
+        self.assertLess(resolve, pin)
+        self.assertLess(pin, verify_pin)
+        mismatch_check = run.index('if [ "$pinned_ip" != "$service_ip" ]; then')
+        mismatch_exit = run.index("exit 1", mismatch_check)
+        self.assertLess(verify_pin, mismatch_check)
+        self.assertLess(mismatch_exit, forward)
+        self.assertLess(verify_pin, forward)
+        self.assertLess(forward, ready)
+        self.assertIn("sleep 1", run)
+        fail_closed = run.index('if [ -z "$service_ip" ]; then')
+        self.assertLess(fail_closed, pin)
+        self.assertLess(run.index("exit 1", fail_closed), pin)
+        self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        # A failed lookup must empty the result, not kill the step under pipefail.
+        self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
+        self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
+
+    def test_stores_postgres_wal_budget_is_bounded(self):
+        # Same budget as rust-tests: two main runs PANIC'd the 1 GiB tmpfs
+        # service with No space left on device mid-suite (runs 39149193652,
+        # 39197217315 attempt 1), failing every test in internal_member_store.
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-stores"]
         prepare = next(
             step for step in job["steps"]
             if step.get("name") == "Prepare isolated test databases"
@@ -2679,9 +2886,52 @@ class WorkflowTests(unittest.TestCase):
                     label,
                 )
                 self.assertTrue(workflow_policy_errors(changed), label)
-        # Production (or any other workflow) mentioning the gate at all
-        # is a forwarding route, whatever the surrounding shape.
-        for name in ("deploy-production.yml", "check.yml"):
+        # Production holds the pinned mirror, not a forwarding route: an
+        # extra reader, an armed default, a staging token or unpinned
+        # tooling there fails the policy.
+        self.assertEqual(production_error_rate_gate_errors(workflows["deploy-production.yml"]), [])
+        prod_steps = workflows["deploy-production.yml"]["jobs"]["production"]["steps"]
+        prod_armed = [s for s in prod_steps if "INJECT_ERROR_RATE_SPIKE" in str(s)]
+        self.assertEqual(len(prod_armed), 1)
+        self.assertEqual(prod_armed[0].get("id"), "error_rate_gate")
+        prod_index = prod_steps.index(prod_armed[0])
+        prod_mutations = {
+            # An automatic trigger could read it / default armed.
+            "expression without dispatch guard": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
+                .__setitem__("INJECT_ERROR_RATE_SPIKE", "${{ inputs.inject_error_rate_spike }}"),
+            "expression constant true": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
+                .__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
+            "rehearsal flag unconditional": lambda w: w["jobs"]["production"]["steps"][prod_index]
+                .__setitem__("run", "node ../tooling/wrangler/scripts/promotion-error-gate.mjs "
+                             "--rehearsal-firing '[\"rest_5xx_rate\"]'"),
+            "input defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["inject_error_rate_spike"]
+                .__setitem__("default", True),
+            "input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("inject_error_rate_spike"),
+            "second reader step": lambda w: w["jobs"]["production"]["steps"][0]
+                .setdefault("env", {}).__setitem__("INJECT_ERROR_RATE_SPIKE", "true"),
+            "switch off the gate step": lambda w: w["jobs"]["production"]["steps"][prod_index]
+                .__setitem__("id", "unrelated"),
+            "gate without the deploy-mode condition": lambda w: w["jobs"]["production"]["steps"][prod_index]
+                .pop("if"),
+            "staging scrape token": lambda w: w["jobs"]["production"]["steps"][prod_index]["env"]
+                .__setitem__("METRICS_SCRAPE_TOKEN", "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"),
+            "tooling from the guarded SHA": lambda w: w["jobs"]["production"]["steps"][prod_index]
+                .__setitem__("run", str(w["jobs"]["production"]["steps"][prod_index]["run"])
+                             .replace("../tooling/wrangler/scripts/promotion-error-gate.mjs",
+                                      "wrangler/scripts/promotion-error-gate.mjs")),
+        }
+        for label, mutate in prod_mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(workflows)
+                mutate(changed["deploy-production.yml"])
+                self.assertTrue(
+                    production_error_rate_gate_errors(changed["deploy-production.yml"]),
+                    label,
+                )
+                self.assertTrue(workflow_policy_errors(changed), label)
+        # Any other workflow mentioning the gate at all is a forwarding
+        # route, whatever the surrounding shape.
+        for name in ("check.yml",):
             with self.subTest(forwarded=name):
                 changed = deepcopy(workflows)
                 job = next(iter(changed[name]["jobs"].values()))
@@ -2803,7 +3053,7 @@ class WorkflowTests(unittest.TestCase):
                 workflows["nightly.yml"]["jobs"]["pipeline-benchmark"]["uses"] = target
                 self.assertTrue(workflow_policy_errors(workflows))
 
-    def test_production_route_is_dispatch_only_and_gated(self):
+    def test_production_route_is_automatic_or_dispatch_and_gated(self):
         production = self.workflows["deploy-production.yml"]
         self.assertEqual(production_errors(production), [])
         self.assertEqual(production["jobs"]["production"]["environment"], "production")
@@ -2830,6 +3080,38 @@ class WorkflowTests(unittest.TestCase):
                      {"run": 'curl "$PRODUCTION_WORKER_URL/readyz"'}):
             with self.subTest(guard_step=step):
                 self.assertTrue(mutated(lambda w, s=step: w["jobs"]["guard"]["steps"].append(s)))
+        for label, change in {
+            "workflow-level concurrency": lambda w: w.update(
+                {"concurrency": {"group": "deploy-production", "cancel-in-progress": False}}),
+            "production without the lane": lambda w: w["jobs"]["production"].pop("concurrency"),
+            "soak holding the lane": lambda w: w["jobs"]["soak"].update(
+                {"concurrency": {"group": "deploy-production", "cancel-in-progress": False}}),
+            "production skipping the recheck": lambda w: w["jobs"]["production"].__setitem__(
+                "needs", ["guard", "soak", "schema-gate", "roles-gate"]),
+            "recheck without the soak": lambda w: w["jobs"]["recheck"].__setitem__("needs", "guard"),
+            "recheck before the gates": lambda w: w["jobs"]["recheck"].__setitem__(
+                "needs", ["guard", "soak"]),
+            "production deploying past a failed soak": lambda w: w["jobs"]["production"].__setitem__(
+                "if", w["jobs"]["production"]["if"].replace(
+                    " && (needs.soak.result == 'success' || needs.soak.result == 'skipped')", "")),
+            "automatic run without a fresh recheck": lambda w: w["jobs"]["production"].__setitem__(
+                "if", w["jobs"]["production"]["if"].replace(
+                    "(needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped')",
+                    "needs.recheck.result == 'skipped'")),
+            "production deploying after cancel": lambda w: w["jobs"]["production"].__setitem__(
+                "if", w["jobs"]["production"]["if"].replace("!cancelled()", "always()")),
+            "recheck ignoring operator dispatches": lambda w: w["jobs"]["recheck"]["steps"][0].__setitem__(
+                "run", w["jobs"]["recheck"]["steps"][0]["run"].replace(
+                    "actions/workflows/deploy-production.yml/runs", "")),
+            "recheck without the runs permission": lambda w: w["jobs"]["recheck"]["permissions"].pop(
+                "actions"),
+            "soak without the guard": lambda w: w["jobs"]["soak"].__setitem__("needs", "recheck"),
+            "guard without the auto output": lambda w: w["jobs"]["guard"]["outputs"].pop("auto"),
+            "guard drill env removed": lambda w: w["jobs"]["guard"]["steps"][0]["env"].pop(
+                "INJECT_ERROR_RATE_SPIKE"),
+        }.items():
+            with self.subTest(lane=label):
+                self.assertTrue(mutated(change))
         with self.subTest(guard="environment"):
             self.assertTrue(mutated(lambda w: w["jobs"]["guard"].update({"environment": "production"})))
         for pin in ('status="success"', "deploy-staging.yml/runs", '"required_reviewers"',
@@ -2874,7 +3156,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(production["jobs"]["schema-gate"].get("environment"),
                          "production-migrate-plan")
         self.assertEqual(production["jobs"]["schema-gate"].get("if"),
-                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'")
+                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
+                         " && needs.guard.outputs.skip == ''")
 
     def test_production_roles_gate_shape_is_pinned_and_mutations_fail(self):
         import copy
@@ -2918,7 +3201,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(production["jobs"]["roles-gate"].get("environment"),
                          "production-migrate-plan")
         self.assertEqual(production["jobs"]["roles-gate"].get("if"),
-                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'")
+                         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
+                         " && needs.guard.outputs.skip == ''")
 
     def test_staging_migrate_runner_shape_is_pinned(self):
         # TOG-11572: the slice's own workflow must satisfy its carve-out, and
@@ -4122,6 +4406,10 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
+                    elif (name, job_id) == ("deploy-production.yml", "recheck"):
+                        # Reads workflow runs to skip while an operator
+                        # dispatch is active; the compare read needs contents.
+                        expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("release.yml", "tag"):
                         # Tags the promoted commit and publishes its release.
                         expected = {"contents": "write"}
