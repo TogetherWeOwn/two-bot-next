@@ -25,7 +25,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `container_unready_alert` | keepalive `/readyz` probes fail 2 consecutive samples (≈2 min at default 60 s cadence) | Worker logs (structured JSON event) | [container-readiness.md](container-readiness.md#responding-to-an-alert) |
 | `container_unready_recovery` | first ready sample after an alert | Worker logs | same as above |
 | `container_keepalive_arm_failed` | keepalive schedule lookup/insert fails (monitoring outage, not a readiness sample) | Worker logs | [container-readiness.md](container-readiness.md) |
-| `container_unready_webhook_failed` | alert/recovery webhook POST failed or timed out (type + HTTP status only) | Worker logs | [container-readiness.md](container-readiness.md) |
+| `container_unready_webhook_failed` | alert/recovery webhook POST failed or timed out (type, HTTP status, release, log URL; never the binding or body) | Worker logs | [container-readiness.md](container-readiness.md) |
 | `job_stale:<job>` | job's last success older than 2 x its cadence (never-succeeded is ignored) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-stale) |
 | `job_consecutive_failures:<job>` | 3 failed completions in a row; page includes the latest fixed error class when available | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s above 10% of REST requests between samples (min 10 requests; restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-429) |
@@ -48,6 +48,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `event_store_consumer_lag` | **ticket**: consumer lag above 60 s in 3 consecutive valid samples (fractional counts); a valid sample at or below 60 s resolves, missing/invalid samples and failed scrapes preserve a firing ticket | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-event-store-consumer-lag) |
 | `error_budget_fast_burn` | **page**: REST error budget burns faster than 12x in both the 15 min and 2 min windows (each needs at least 10 requests and two budget errors; incomplete startup/restart windows stay inactive) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-error-budget-fast-burn) |
 | `error_budget_slow_burn` | **ticket**: same budget burns faster than 3x in both the 2 h and 15 min windows (same floors; needs full 2 h history, holds on gaps, covered quiet 15 min resolves) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-error-budget-slow-burn) |
+| `eventsub_reconcile_failed` | **ticket**: failed EventSub reconcile passes rise between samples (first sample is baseline-only; a restart sample fires when the new process already counted a failed pass, else holds) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-eventsub-reconcile-failed) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via
