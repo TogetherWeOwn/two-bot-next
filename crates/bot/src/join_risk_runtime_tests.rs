@@ -508,6 +508,20 @@ async fn join_risk_runtime_fixture_retries_collisions_and_cleans_only_owned_sche
 
 #[tokio::test]
 #[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+#[should_panic(expected = "create isolated join-risk schema")]
+async fn join_risk_runtime_fixture_refuses_non_collision_errors_without_retry() {
+    // The invalid name raises 42601, not a namespace collision. Allocation
+    // must surface that error immediately instead of trying the next
+    // (valid) candidate and reporting success or an exhausted budget.
+    let _ = TestSchema::with_candidates([
+        "join risk invalid".to_owned(),
+        format!("join_risk_test_{:032x}", rand::random::<u128>()),
+    ])
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
 async fn join_risk_worker_posts_persisted_flags_once_and_ignores_the_rest() {
     let db = TestSchema::new().await;
     let store = JoinRiskStore::from_pool(db.pool.clone());
