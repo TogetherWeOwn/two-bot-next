@@ -129,7 +129,27 @@ jobs:
               sha = staged[0]["head_sha"].strip().lower()
               print(f"Promoting the latest successful staging deploy: {sha}")
           if not re.fullmatch(r"[0-9a-f]{40}", sha):
-              refuse("sha must be a full 40-character hex commit SHA")
+              # Accept an unambiguous 7-39 character hex prefix: resolve it to
+              # the full commit via the commits API, then run every downstream
+              # gate on that full SHA. An ambiguous/unknown prefix refuses with
+              # the exact accepted format (10-15 incident: short SHAs refused).
+              accepted = ("sha must be a full 40-character hex commit SHA "
+                          "or an unambiguous 7-40 character hex prefix")
+              if not re.fullmatch(r"[0-9a-f]{7,39}", sha):
+                  refuse(accepted)
+              short = sha
+              try:
+                  commit = json.loads(subprocess.check_output(
+                      ["gh", "api", "--method", "GET", f"repos/{repo}/commits/{short}"],
+                      text=True,
+                  ))
+              except (subprocess.CalledProcessError, ValueError):
+                  refuse(accepted)
+              raw = commit.get("sha", "") if isinstance(commit, dict) else ""
+              full = raw.strip().lower() if isinstance(raw, str) else ""
+              if not re.fullmatch(r"[0-9a-f]{40}", full) or not full.startswith(short):
+                  refuse(accepted)
+              sha = full
           if version and not re.fullmatch(
               r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", version
           ):
@@ -598,9 +618,11 @@ jobs:
           environment: production
           quiet: true
           command: deployments status --json
-      # Snapshot the serving Worker version and container image BEFORE
-      # replacing anything: a failed gate below auto-rolls back to exactly
-      # this state. Allowlisted IDs only, safe to keep as a run artifact.
+      # Snapshot the serving Worker version, its stamped Git SHA and the
+      # container image BEFORE replacing anything: a failed gate below
+      # auto-rolls back to exactly this provenance receipt, and a later
+      # manual rollback derives its sha/version/image inputs from it.
+      # Allowlisted IDs only, safe to keep as a run artifact.
       - name: Snapshot the pre-deploy rollback state
         id: snapshot
         if: env.MODE == 'deploy'
@@ -652,8 +674,13 @@ jobs:
       # A Worker-version rollback alone leaves the new container image
       # serving, so a rollback restores BOTH the named Worker version and
       # the named container image, with takeover and the stable gate, in one
-      # reviewed step. The guard proved both inputs; the digest is a content
-      # hash, safe in the log.
+      # reviewed step. The guard proved the input shapes; the script then
+      # validates (version, sha, image) as one provenance receipt against
+      # live Cloudflare state (the version's stamped deploy SHA, its
+      # serving history, the completed rollouts) before any restore POST,
+      # so a CI-green SHA that this version was not built from refuses
+      # here instead of after traffic moves. The digest is a content hash,
+      # safe in the log.
       - name: Roll back production Worker version and container image
         id: rollback
         if: env.MODE == 'rollback'
@@ -713,16 +740,19 @@ jobs:
           takeover = os.environ.get("TAKEOVER", "false") == "true"
           before = versions(os.environ.get("BEFORE", ""))
           after = versions(os.environ.get("AFTER", ""))
-          # The pre-deploy snapshot names the container image a manual
-          # rollback must restore alongside the Worker version. The digest
-          # is a content hash, safe in the summary.
+          # The pre-deploy snapshot is the provenance receipt a manual
+          # rollback derives its inputs from: the previous version's
+          # container image and the Git SHA that version was deployed
+          # from. Both are content hashes, safe in the summary.
           try:
               with open((os.environ.get("RUNNER_TEMP") or "") + "/production-rollback-snapshot.json",
                         encoding="utf-8") as handle:
                   snapshot = json.load(handle)
               prev_image = snapshot.get("serving_image") if snapshot.get("has_previous") else None
+              prev_sha = snapshot.get("serving_sha") if snapshot.get("has_previous") else None
           except (OSError, ValueError, AttributeError):
               prev_image = None
+              prev_sha = None
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(
                   f"\n### Production {mode}\n\n"
@@ -733,7 +763,9 @@ jobs:
               if len(before) == 1:
                   summary.write(f"- Roll back by dispatching with `rollback={before[0][0]}`")
                   if prev_image:
-                      summary.write(f" and `image={prev_image}`")
+                      summary.write(f", `image={prev_image}`")
+                  if prev_sha:
+                      summary.write(f" and `sha={prev_sha}`")
                   summary.write("\n")
           if not after:
               print("::error::could not read the active production version after the change")
@@ -886,9 +918,11 @@ jobs:
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
         run: |
           set -euo pipefail
-          # No pinned-revision flag here: the snapshot restores the previous
-          # serving build, whose /readyz reports the previous revision, not
-          # the failed SHA. Identity rests on the restored Worker version header.
+          # No pinned-revision flag here: the snapshot's recorded serving
+          # SHA is the receipt member the stable gate pins (the restored
+          # build reports the previous revision, not the failed SHA). A
+          # pre-stamp snapshot carries none; identity then rests on the
+          # restored Worker version header.
           python3 ../tooling/scripts/worker_container_rollback.py rollback \
             --variant production \
             --worker-url "$PRODUCTION_WORKER_URL" \

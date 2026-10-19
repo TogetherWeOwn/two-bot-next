@@ -149,10 +149,13 @@ claim them as shipped acceptance:
 - Worker/DO alert log lines and Discord messages do not yet consistently carry
   the Container Git SHA and a direct log-query URL. Use the build/deploy
   correlation procedure above.
-- Worker/DO request-span and dispatch lines do not carry the container
-  `build_sha`/`release`: the Worker version ID is distinct from the Git SHA.
-  The release-tagged error events above are the exception. Correlate other
-  Worker/DO activity via the procedure above.
+- Worker/DO request-span and dispatch lines (`internal_actions_ingress`,
+  `eventsub_ingress`) carry `release` (the container Git SHA, deploy-stamped
+  on the Worker edge and probe-read on the DO relay, `"unknown"` when neither
+  has a SHA yet) and the stable `log_url` above; the Worker version ID is
+  still distinct from the Git SHA and is never used as one. Join an edge
+  refusal to the container's `build_sha`/`release` lines via `request_id`.
+  Correlate other Worker/DO activity via the procedure above.
 - Release-tagged error grouping is provided by Workers Logs, not an external
   error-tracking service. Every `container_gateway_failure` and `metrics_alert`
   line carries `release` (the container git SHA) and `worker_version` plus the
@@ -190,9 +193,16 @@ claim them as shipped acceptance:
   between the two scrapes count. Production has no error-rate gate yet.
 - The shared central gradual-promotion action promotes 5-50-100% with
   per-stage health gates and automatic rollback to the recorded pre-promote
-  version. This repository has no caller wiring to it yet, so do not treat
-  the existing gated readiness check plus manual rollback as proof of a
-  gradual traffic rollout here.
+  version. The caller contract is implemented (`bin/smoke.mjs`, contract-tested
+  against a loopback stub with live staging probes without an override only;
+  override probes of a non-owner version return 503 `ownership_fenced` on this
+  singleton Worker and cannot pass as a canary; passive proof caller in
+  `.github/workflows/gradual-promote-proof.yml`
+  with every error-rate input explicit — see `docs/gradual-promote-caller.md`),
+  but no gradual traffic rollout has run here yet: the proof workflow refuses
+  before any Cloudflare call until its isolated synthetic fixture lands, and
+  production has no gradual caller. Do not treat the existing gated readiness
+  check plus manual rollback as proof of a gradual traffic rollout here.
 
 For the full health, metrics, and rollback procedures, see the
 [operations runbook](runbook.md), [metrics reference](metrics.md), and

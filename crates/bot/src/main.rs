@@ -15,6 +15,8 @@ mod automod_gateway;
 mod backfill_error_chain_acceptance_tests;
 mod backfill_retention_chains;
 mod backup_cli;
+#[cfg(test)]
+mod backup_cli_pool_open_tests;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.
 #[allow(dead_code)]
 mod burn_rate;
@@ -25,6 +27,7 @@ mod command_runtime;
 mod command_runtime_tests;
 mod commands_cli;
 mod community_jobs;
+mod containment_runtime;
 #[cfg(test)]
 mod containment_runtime_tests;
 mod database_roles_cli;
@@ -39,8 +42,12 @@ mod event_cli;
 mod eventsub_delivery;
 mod eventsub_http;
 mod eventsub_reconcile;
+#[cfg(test)]
+mod fast_burn_page_tests;
 mod feed_jobs;
 mod gateway;
+#[cfg(test)]
+mod slow_burn_ticket_tests;
 // Bounded reconnect schedule and runner: no runtime caller yet. Test-only
 // until the gateway loop adopts it, so it lives in test builds instead of
 // shipping dead code to the container.
@@ -58,8 +65,11 @@ mod internal_action_http;
 #[cfg(test)]
 mod job_emission_conformance_tests;
 mod jobs;
+mod join_risk_runtime;
 #[cfg(test)]
 mod join_risk_runtime_tests;
+#[cfg(test)]
+mod join_risk_tuning_refusal_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
@@ -75,9 +85,13 @@ mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
+#[cfg(test)]
+mod onboarding_unknown_only_acceptance_tests;
 mod ops_backfill;
 mod ops_http;
 mod preflight;
+mod privacy_command;
+mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
 mod restore_drill;
@@ -118,7 +132,6 @@ use gateway::{
 };
 use gateway_failure::{step_failure, FailureClass, FailureSlot, GatewayFailure};
 use server::SharedState;
-use two_bot::{containment_runtime, join_risk_runtime, raid_runtime};
 use website_jobs::serve;
 
 #[tokio::main]
@@ -487,17 +500,23 @@ async fn run(cli_args: &[String]) {
                         )
                     });
                     if let Some(runtime) = &runtime {
-                        let config = gateway_commands::GatewayCommandConfig::from_map(
-                            guild_id,
-                            &std::env::vars().collect(),
-                        )
-                        .map_err(|error| {
-                            step_failure(
-                                FailureClass::CustomCommandsInitFailed,
-                                "custom_commands_config",
-                                error,
+                        let vars: std::collections::HashMap<String, String> =
+                            std::env::vars().collect();
+                        let config =
+                            gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                                guild_id,
+                                &vars,
+                                activation.permitted(
+                                    two_bot_core::activation::LiveCapability::Moderation,
+                                ),
                             )
-                        })?;
+                            .map_err(|error| {
+                                step_failure(
+                                    FailureClass::CustomCommandsInitFailed,
+                                    "custom_commands_config",
+                                    error,
+                                )
+                            })?;
                         runtime
                             .initialize_custom_commands(config)
                             .await

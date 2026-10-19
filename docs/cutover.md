@@ -167,8 +167,8 @@ before invoking tools. `two-bot` with no subcommand starts the server;
 `two-bot guild-config-snapshot --help`, and `--help` after any subcommand print
 usage and exit 0 before any env, DB or network read, so `--help` never dumps,
 prunes or uploads
-([help routing](../crates/bot/src/backup_cli.rs#L216), [dispatch](../crates/bot/src/backup_cli.rs#L242)).
-A trailing argument that is not `--help` is refused with exit 2 (`:231-236`).
+([help routing](../crates/bot/src/backup_cli.rs#L228), [dispatch](../crates/bot/src/backup_cli.rs#L254)).
+A trailing argument that is not `--help` is refused with exit 2 (`:243-248`).
 Other binaries or future subcommand help paths still require source/fixture
 verification before approval; a `--help` suffix is not a universal read-only
 safety boundary.
@@ -182,8 +182,8 @@ safety boundary.
 | `two-bot backup-upload <dump.ndjson.gz>` | Uploads one dump using approved S3 bindings; an upload is not proof of completeness or restore compatibility |
 | `two-bot guild-config-snapshot` / `two-bot guild-config-restore --snapshot FILE` | Pinned **staging-only** guild structure recovery. Does **not** snapshot application commands; never use as production registry rollback |
 
-Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L136),
-[restore implementation](../crates/bot/src/backup_cli.rs#L482) and
+Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L148),
+[restore implementation](../crates/bot/src/backup_cli.rs#L501) and
 [backup runbook](backup.md). `restore --dry-run` optionally reads a target when
 `TWO_RESTORE_URL` is set; do not mistake it for automatically offline operation.
 For local fixture/artifact inspection **without any DB connection**:
@@ -227,9 +227,10 @@ paste them into a production shell without the cutover executor's approval:
 | `two-bot commands publish --apply` | Same source: explicit overwrite; default dry-run and `--allow-live-guild` opt-in required. Global snapshot/restore is not implied by a guild tool |
 | `two-bot preflight --json` | `crates/bot/src/preflight.rs:31-40`: read-only REST identity/intents/role/channel checks, FAIL vs WARN |
 | `gateway-force-identify` (separate cutover binary), default dry-run; `--apply --reason`, `--allow-live-guild` | `crates/cutover/src/bin/gateway_force_identify.rs:1-14`: prints guild, shard, checkpoint age and directive, writes nothing; `--apply` arms a one-shot force-fresh IDENTIFY consumed by the next boot. Required for the first production boot ([gateway recovery](gateway-recovery.md#force-fresh-identify-first-production-boot)) |
-| `rollback-delta --since <RFC3339> [--export <path>]` (separate cutover binary) | `crates/cutover/src/bin/rollback_delta.rs:14-52`: read-only delta report; `--export` writes the report to a file. Reverse import is still missing |
+| `rollback-delta --since <RFC3339> [--export <path>]` (separate cutover binary) | `crates/cutover/src/bin/rollback_delta.rs`: read-only delta report on stdout; `--export` writes the measured post-`T_f` rows as NDJSON (`{"table","row"}` per line) |
+| `rollback-delta import --file <export.ndjson> [--apply] [--allow-live-target] [--acknowledge-divergent]` (same binary) | `crates/cutover/src/rollback_import.rs`: replays an `--export` file into `TWO_DATABASE_URL`. Default dry-run prints a row-count plan without opening a database; `--apply` plus the live-target opt-in applies it in one idempotent transaction, parent-first. `--export` parent-joins `lfg_roles` to every exported `lfg_posts` row so a post-freeze post imports with its roles and signups; a failed insert names its table and constraint for integrity violations, while other server errors stay redacted database errors. The apply reports inserted vs already-present rows per table and advances owned sequences past the imported maxima. Skipped rows with no identical match are divergent (target values kept): the comparison is primary-keyed inside a UTC-pinned transaction with destination-owned columns (e.g. `guild_settings.cas_version`) excluded, the keyless `member_erasure_audit` inserts only when no identical row exists so its re-run never duplicates, the run lists their `table:key` entries and exits 3 unless `--acknowledge-divergent` is passed after manual reconciliation. Malformed lines, unknown tables and row-cap overruns refuse before any write |
 
-No `commands restore` (registry), database delta reverse-import, or
+No `commands restore` (registry) or
 `--disable-resume` command is established by this baseline (re-checked at
 `bce86a791`: `commands_cli.rs` offers only `diff`/`publish`, no `restore`;
 no `disable-resume`/`RESUME=0` in `crates/bot/src`). Gateway RESUME is
@@ -355,7 +356,7 @@ alongside an unconfirmed Next gateway.
   `FORWARDED_DISCORD_IDS`:
   [configuration](../crates/core/src/config.rs#L24),
   [tool connection](../crates/cutover/src/cli.rs#L180),
-  [Worker environment](../wrangler/src/index.ts#L550).
+  [Worker environment](../wrangler/src/index.ts) (`containerEnvVars`).
 - Configured server startup runs embedded migrations; it is not a read-only
   preflight. Gateway boot wires the funnel pipeline, not the full feature/job
   stack. Domain/store libraries and command definitions are not activated

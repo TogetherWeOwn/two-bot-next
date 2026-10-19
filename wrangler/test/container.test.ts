@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { setImmediate } from "node:timers/promises";
-import worker, { TwoBotContainer, type Env } from "../src/index.ts";
+import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
 import { EMPTY_STATE, type MetricsAlertState } from "../src/alert-rules.ts";
 import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
@@ -61,7 +61,7 @@ const PUBLICATION_ENV = {
   TWO_FEED_POLL_SECONDS: "300",
   TWO_MODERATION: "1",
   TWO_OWEN_USER_ID: "333444555666777888",
-  TWO_MODERATION_PROTECTED_ROLE_IDS: "444555666777888999, 555666777888999000",
+  TWO_MODERATION_PROTECTED_ROLE_IDS: "444555666777888999,555666777888999000",
   TWO_COMMUNITY_SCORECARD: "1",
 };
 const PUBLICATION_WORKER_ENV = {
@@ -621,6 +621,46 @@ test("metrics alert lines carry the keepalive release and worker version", async
     assert.equal(alert.worker_version, ID);
   }
   assert.match(alerts[0].content, /last error class: database/);
+});
+
+test("gateway component parsing reads only the ready/starting/down vocabulary", () => {
+  assert.equal(gatewayComponentReady([["process", "ready"], ["gateway", "ready"]]), true);
+  assert.equal(gatewayComponentReady([["process", "ready"], ["gateway", "starting"]]), false);
+  assert.equal(gatewayComponentReady([["process", "ready"], ["gateway", "down"]]), false);
+  assert.equal(gatewayComponentReady([["process", "ready"], ["gateway", "down"], ["token_invalid", "down"]]), false);
+  // Anything else holds the stuck-gateway rule instead of guessing.
+  assert.equal(gatewayComponentReady([["process", "ready"]]), undefined);
+  assert.equal(gatewayComponentReady([["process", "ready"], ["gateway", "restarting"]]), undefined);
+  assert.equal(gatewayComponentReady([["process", "ready"], ["gateway", 7]]), undefined);
+  assert.equal(gatewayComponentReady([["process", "ready"], "gateway"]), undefined);
+  assert.equal(gatewayComponentReady({ gateway: "down" }), undefined);
+  assert.equal(gatewayComponentReady(undefined), undefined);
+});
+
+test("keepalive pages gateway_not_ready on the third tick with the gateway component down", async (t) => {
+  const h = await harness(t);
+  let gatewayStatus = "down";
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") return new Response(metricsBody(0));
+    return new Response(JSON.stringify({
+      components: [["process", "ready"], ["gateway", gatewayStatus]],
+      build_revision: RELEASE_SHA, build_id: "123-1",
+    }), { status: gatewayStatus === "ready" ? 200 : 503, headers: { "content-type": "application/json" } });
+  });
+  const metricsAlerts = () => h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line))
+    .filter((event) => event.event === "metrics_alert").map((event) => event.content as string);
+  await tickKeepalive(h.bot);
+  await tickKeepalive(h.bot);
+  assert.ok(metricsAlerts().every((content) => !content.includes("gateway_not_ready")), "no page before the third sample");
+  await tickKeepalive(h.bot);
+  assert.ok(metricsAlerts().some((content) => content.includes("two-bot-next ALERT gateway_not_ready")),
+    `expected a gateway_not_ready page, got: ${JSON.stringify(metricsAlerts())}`);
+  // Recovery clears on the first ready sample.
+  gatewayStatus = "ready";
+  await tickKeepalive(h.bot);
+  assert.ok(metricsAlerts().some((content) => content.includes("two-bot-next RESOLVED gateway_not_ready")),
+    `expected a gateway_not_ready resolution, got: ${JSON.stringify(metricsAlerts())}`);
 });
 
 test("keepalive ignores a gateway failure in a non-bot (text) probe answer", async (t) => {
@@ -1509,8 +1549,13 @@ test("Worker /ops/backfill/progress: over-budget caller is 429 without reaching 
 async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map<string, unknown>) {
   const h = await harness(t, { KEEPALIVE_SECONDS: "60", ...env }, values);
   let status: number | Error = 503;
-  t.mock.method(h.bot, "containerFetch", async () => {
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     if (status instanceof Error) throw status;
+    // Readiness is the subject here: keep the metrics scrape healthy and
+    // quiet so sustained scrape-loss tickets never ride along. Tests that
+    // exercise scrape failure override this mock with their own /metrics.
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") return new Response(metricsBody());
     return new Response(null, { status });
   });
   await h.bot.onStart();
@@ -1601,7 +1646,10 @@ async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<E
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
     if (path === "/metrics") {
-      if (sender !== "metrics") return new Response("");
+      // The readiness sender keeps a healthy quiet scrape: its subject is
+      // readiness forwarding, and a permanently failed scrape would now
+      // (by design) ticket its own sustained-loss incident mid-test.
+      if (sender !== "metrics") return new Response(metricsBody());
       const rankClass = `two_bot_job_last_error_class{job="rank",class="database"} ${failing ? 1 : 0}`;
       return new Response(metricsBody(failing ? 3 : 0).replace('two_bot_job_last_error_class{job="rank",class="database"} 0', rankClass));
     }
@@ -1646,6 +1694,16 @@ test("real SDK keeps one persistent chain across concurrent health traffic, rest
   assert.deepEqual(first.pending(), [initialTask], "restart must not postpone the pending tick");
 
   const h = await harness(t, env, first.values, first.database);
+  // Chain continuity is the subject here: serve a healthy quiet scrape so the
+  // ticks under test never trip the sustained scrape-loss ticket, while
+  // readiness probes still travel the recorded TCP path below.
+  const containerFetch = h.bot.containerFetch.bind(h.bot);
+  t.mock.method(h.bot, "containerFetch", (...args: Parameters<typeof containerFetch>) => {
+    const input = args[0];
+    const url = typeof input === "string" ? input : input.url;
+    if (new URL(url).pathname === "/metrics") return Promise.resolve(new Response(metricsBody()));
+    return containerFetch(...args);
+  });
   await h.bot.onStart();
   assert.deepEqual(h.pending(), [initialTask], "eviction must reuse the persisted task");
   t.mock.timers.tick(60_000);

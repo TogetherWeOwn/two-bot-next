@@ -254,7 +254,8 @@ pub const PERM_MANAGE_EVENTS: u64 = 8589934592;
 
 /// Always-published core commands (two-bot `CORE_COMMAND_DATA` = leveling,
 /// plus the Next-only `/help` discovery surface — legacy has no help command,
-/// see the `help` row in the registry golden exceptions).
+/// see the `help` row in the registry golden exceptions — plus the Next-only
+/// `/privacy` member self-serve for per-guild analytics opt-out).
 #[must_use]
 pub fn core_commands() -> Vec<CommandDefinition> {
     vec![
@@ -263,11 +264,31 @@ pub fn core_commands() -> Vec<CommandDefinition> {
         ]),
         CommandDefinition::new("leaderboard", "Show the server XP leaderboard."),
         CommandDefinition::new("help", HELP_DESCRIPTION),
+        CommandDefinition::new("privacy", PRIVACY_DESCRIPTION).options(vec![
+            CommandOption::new(
+                "opt-out",
+                "Delete your stored activity for this server and stop future analytics persistence.",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "opt-in",
+                "Resume analytics persistence for this server (already-deleted rows are not restored).",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "status",
+                "Show whether you are opted out and this server's analytics switches.",
+                CommandOptionType::SubCommand,
+            ),
+        ]),
     ]
 }
 
 /// Discovery reply entry point, shared by the registry golden fixture.
 pub const HELP_DESCRIPTION: &str = "Show this server's live commands, grouped by who can use them.";
+
+/// Member self-serve privacy description, shared by the registry fixtures.
+pub const PRIVACY_DESCRIPTION: &str = "Manage your analytics privacy for this server.";
 
 /// Merge the authoritative guild command set.
 ///
@@ -455,10 +476,10 @@ mod tests {
                 }
             }
             let actual = merge_commands(&[builtins, duplicates], &custom);
-            // 3 core (rank, leaderboard, help) plus the generated builtins;
-            // the duplicated slice adds no new names.
-            if builtin_count + 3 > 100 {
-                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 3)));
+            // 4 core (rank, leaderboard, help, privacy) plus the generated
+            // builtins; the duplicated slice adds no new names.
+            if builtin_count + 4 > 100 {
+                prop_assert_eq!(actual, Err(RegistryError::BuiltinLimit(builtin_count + 4)));
             } else if expected.len() > 100 {
                 prop_assert_eq!(actual, Err(RegistryError::TotalLimit(expected.len())));
             } else {
@@ -476,10 +497,11 @@ mod tests {
     #[test]
     fn core_commands_match_legacy_names() {
         let core = core_commands();
-        assert_eq!(core.len(), 3);
+        assert_eq!(core.len(), 4);
         assert_eq!(core[0].name, "rank");
         assert_eq!(core[1].name, "leaderboard");
         assert_eq!(core[2].name, "help");
+        assert_eq!(core[3].name, "privacy");
         // Guild-only, DM off (legacy `setDMPermission(false)`).
         assert!(core.iter().all(|c| !c.dm_permission));
         // `rank` has one optional `member` user option; `leaderboard` and the
@@ -491,6 +513,19 @@ mod tests {
         assert!(core[2].options.is_empty());
         assert_eq!(core[2].description, HELP_DESCRIPTION);
         assert!(core[2].default_member_permissions.is_none());
+        // The Next-only `privacy` self-serve carries the three subcommands,
+        // is open to everyone, and takes no other option.
+        assert_eq!(core[3].description, PRIVACY_DESCRIPTION);
+        assert!(core[3].default_member_permissions.is_none());
+        assert_eq!(core[3].options.len(), 3);
+        let mut subcommands: Vec<&str> = core[3].options.iter().map(|o| o.name.as_str()).collect();
+        subcommands.sort_unstable();
+        assert_eq!(subcommands, ["opt-in", "opt-out", "status"]);
+        for option in &core[3].options {
+            assert_eq!(option.kind, CommandOptionType::SubCommand.as_u8());
+            assert!(option.required.is_none());
+            assert!(option.options.is_empty());
+        }
     }
 
     #[test]
@@ -506,7 +541,10 @@ mod tests {
         }];
         let merged = merge_commands(&[extra], &custom).expect("merges");
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "help", "rsvp", "faq"]);
+        assert_eq!(
+            names,
+            ["rank", "leaderboard", "help", "privacy", "rsvp", "faq"]
+        );
     }
 
     #[test]
@@ -519,8 +557,8 @@ mod tests {
         )];
         let rsvp_totals = vec![CommandDefinition::new("attendance", "Show RSVP totals")];
         let merged = merge_commands(&[scorecard, rsvp_totals], &[]).expect("merges");
-        assert_eq!(merged.len(), 4); // rank, leaderboard, help, attendance×1
-        assert_eq!(merged[3].description, "Record a verified attendee");
+        assert_eq!(merged.len(), 5); // rank, leaderboard, help, privacy, attendance×1
+        assert_eq!(merged[4].description, "Record a verified attendee");
     }
 
     #[test]
@@ -549,13 +587,13 @@ mod tests {
         ];
         let merged = merge_commands(&[], &custom).expect("merges");
         let names: Vec<_> = merged.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["rank", "leaderboard", "help", "faq"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "privacy", "faq"]);
     }
 
     #[test]
     fn builtin_limit_enforced() {
-        // 3 core + 98 fillers = 101: one past the ceiling.
-        let extra: Vec<CommandDefinition> = (0..98)
+        // 4 core + 97 fillers = 101: one past the ceiling.
+        let extra: Vec<CommandDefinition> = (0..97)
             .map(|i| CommandDefinition::new(&format!("cmd-{i}"), "filler"))
             .collect();
         let err = merge_commands(&[extra], &[]).expect_err("must exceed 100");

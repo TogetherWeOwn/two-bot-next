@@ -152,7 +152,7 @@ When your opt-out runs, the bot:
    invite keeps the joiner's row but with your inviter field blanked.
    Anonymous aggregate counters keep counting throughout.
 3. Writes exactly one audit receipt: the guild/member scope plus the
-   operator actor label and the database timestamp.
+   actor label and the database timestamp.
 
 Moderation, audit, XP/level, ticket, voice-room and settings rows are not
 part of an opt-out: they serve safety, delivery and accountability, not
@@ -164,11 +164,20 @@ already-purged rows. Afterwards the pair persists exactly as before, and
 the re-enable itself writes no purge receipt (the receipt table records
 purges, one row per purge).
 
-Until the member self-serve slash command lands, an opt-out is executed by
-a server operator through the reviewed `opt_out_member` service with an
-explicit operator actor label, against a disposable/staging binding first
-per the rollout gates. The actor label carries operator attribution only:
-never put a member ID, content, count or secret in it.
+Members run this themselves with `/privacy opt-out` (`opt-in` to resume,
+`status` to check). The command acts only on the invoker in the invoking
+guild and writes the receipt with the fixed `member:self-serve` actor label.
+A server operator can still execute an assisted opt-out through the reviewed
+`opt_out_member` service with an explicit operator actor label, against a
+disposable/staging binding first per the rollout gates. Either actor label
+carries attribution only: never put a member ID, content, count or secret
+in it.
+
+Repeat `/privacy opt-out` taps take no purge lock: an already-suppressed
+pair gets the already-opted-out reply, and a pair with a purge receipt
+younger than 10 minutes gets a cooldown reply. Either early return writes
+no new receipt; only a fresh purge locks, deletes and receipts. Assisted
+operator calls go through the service directly and are unaffected.
 
 **Policy note (verified 2026-10-12):** the live Discord Developer Policy
 now lives on Discord's developer support help center (the old
@@ -204,7 +213,16 @@ job runs on a bounded schedule: a dry run that deletes nothing unless
 purger is installed: do not claim a live 30/90-day TTL beyond the windows
 this job enforces. Every run reports per-class metrics, with partial runs
 (deferred/overdue deletions, failed guild purges) surfaced as warnings that
-stay retryable. When the database is behind the binary (an unapplied
+stay retryable. An authenticated erasure intake
+(`two-bot-cutover::deletion_intake`) exists for the published `/privacy`
+surface but is not yet invoked on live interactions, so members cannot yet
+submit requests through it. When wired, the request binds to the invoker's
+guild/member pair, acknowledges pending only, and persists to the same
+deletion-request ledger the scheduler drains — never the narrower opt-out
+purge. Status and completion receipts are readable by the requester without
+the interaction token; receipts name the guild/member footprint and the
+retained limits, never global erasure. Live-dispatch call sites that invoke
+the intake on real interactions are follow-up work. When the database is behind the binary (an unapplied
 migration or grant), the gateway acks dispatches whose queue write hits the
 schema gap instead of crash-looping, with one exception: a missing grant
 (`42501`) on an available rejoin holds the cursor (the gateway fails the
@@ -212,9 +230,16 @@ dispatch and replays it) until the ACL plan is applied, because the queue
 may hold a pending purge for that guild. A missing queue table (`42P01`) on
 a rejoin is still skipped — an absent table holds nothing to cancel — and
 a skipped true guild removal is logged at error level with the guild id
-(`retention purge skipped; schema gap, operator replay required`) and must be
-replayed by the Operator once the migration lands, running the same insert
-the live path runs: `INSERT INTO retention_guild_purge_queue (guild_id)
+(`retention purge skipped; schema gap, operator replay required`), increments
+the pollable `retention_replay_needed` counter on `/metrics`
+(`two_bot_retention_replay_needed_total`), and must be replayed by the
+Operator once the migration lands — a nonzero counter means at least one
+skip since the last restart and is only an early hint: the counter resets
+on process restart and carries no guild id, so the error log line
+(`operator replay required`) stays the source of truth for which guilds to
+replay. Always search that line over the whole schema-gap window, then run
+the same insert the live path runs:
+`INSERT INTO retention_guild_purge_queue (guild_id)
 VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;`
 Conditional: replay only if no `GUILD_CREATE` for that guild was acked after
 the `operator replay required` line — a later `retention lifecycle skipped;
