@@ -15,6 +15,8 @@ mod delete_guards;
 mod empty_grace_override;
 #[path = "voice_invite_override_tests.rs"]
 mod invite_override;
+#[path = "voice_invite_responder_wiring_tests.rs"]
+mod invite_responder_wiring;
 #[path = "voice_join_requests_tests.rs"]
 mod join;
 #[path = "voice_kick_tests.rs"]
