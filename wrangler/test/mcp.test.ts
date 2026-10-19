@@ -719,6 +719,38 @@ test("a multi-byte character split across chunks inside the cap still parses and
   );
 });
 
+test("a multi-byte character split across chunks inside the string id echoes exactly", async () => {
+  const marker = "synthetic-intake-split-id-ok";
+  const h = harness(() => Response.json({ status: "ok", marker }));
+  const splitId = "café-€";
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: splitId,
+    method: "tools/call",
+    params: { name: "get_status", arguments: {} },
+  });
+  const bytes = encoder.encode(body);
+  assert.ok(bytes.byteLength < INBOUND_CAP_BYTES, "fixture must be inside the cap");
+  assert.ok(body.includes(splitId), "fixture must carry the split id");
+  // Split between the two UTF-8 bytes of "é" in the id (0xC3 0xA9). The
+  // fixture carries no other non-ASCII bytes, so this split is inside the id.
+  const at = bytes.indexOf(0xc3);
+  assert.ok(at > 0 && bytes[at + 1] === 0xa9, "fixture must locate the id split point");
+  const { stream, state } = trackedChunks([bytes.subarray(0, at + 1), bytes.subarray(at + 1)]);
+  const res = await worker.fetch(rawMcp(stream), h.env, h.ctx);
+  assert.equal(res.status, 200);
+  const parsed = await rpcBody(res);
+  assert.equal(parsed.id, splitId, "split string id must decode exactly, preserving JSON-RPC correlation");
+  assert.ok(JSON.stringify(parsed).includes(marker), "split-id call must return the container JSON");
+  assert.equal(state.cancelled, false, "an in-bounds body is read to the end, not cancelled");
+  assert.equal(h.forwarded.length, 1, "one tool call proxies exactly one container fetch");
+  assert.equal(
+    h.forwarded[0]!.headers["authorization"],
+    undefined,
+    "caller bearer must not be forwarded",
+  );
+});
+
 test("a stalled inbound body is refused at the six-second deadline and cancelled", async () => {
   const h = harness(() => Response.json({ synthetic: true }));
   const { stream, state } = stalledBody('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"pad":"');
@@ -756,6 +788,57 @@ test("a client abort mid-body settles as the fixed refusal well before the deadl
   assert.equal(state.cancelled, true, "abort refusal must release/cancel the reader");
   assert.deepEqual(h.names, [], "aborted intake must not resolve the DO");
   assert.deepEqual(h.forwarded, [], "aborted intake must never reach the container");
+});
+
+test("a complete body that then stalls is still refused at the deadline with no forward", async () => {
+  const h = harness(() => Response.json({ status: "ok", marker: "synthetic-intake-complete-stall" }));
+  // Complete valid tools/call body: without the deadline/abort discriminator
+  // a cancelled read resolving done:true would look like EOF, parse, and
+  // forward. The intake must refuse instead.
+  const complete = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "get_status", arguments: {} },
+  });
+  const { stream, state } = stalledBody(complete);
+  const start = Date.now();
+  const res = await settleWithin(
+    worker.fetch(rawMcp(stream), h.env, h.ctx),
+    "complete-then-stalled inbound body",
+    15_000,
+  );
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed >= 4_000, `complete-then-stalled body must be held to the deadline, refused after ${elapsed}ms`);
+  assert.ok(elapsed < 12_000, `complete-then-stalled body must be refused near 6s, took ${elapsed}ms`);
+  await assertIntakeRefusal(res);
+  assert.equal(state.cancelled, true, "deadline refusal must cancel the reader");
+  assert.deepEqual(h.names, [], "complete-then-stalled intake must not resolve the DO");
+  assert.deepEqual(h.forwarded, [], "complete-then-stalled intake must never reach the container");
+});
+
+test("a complete body that then aborts settles as the fixed refusal with no forward", async () => {
+  const h = harness(() => Response.json({ synthetic: true }));
+  const complete = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "get_status", arguments: {} },
+  });
+  const { stream, state } = stalledBody(complete);
+  const ac = new AbortController();
+  const pending = settleWithin(
+    worker.fetch(rawMcp(stream, { signal: ac.signal }), h.env, h.ctx),
+    "complete-then-aborted inbound body",
+    4_500,
+  );
+  setTimeout(() => ac.abort(), 100);
+  const res = await pending;
+  await assertIntakeRefusal(res);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(state.cancelled, true, "abort refusal must release/cancel the reader");
+  assert.deepEqual(h.names, [], "complete-then-aborted intake must not resolve the DO");
+  assert.deepEqual(h.forwarded, [], "complete-then-aborted intake must never reach the container");
 });
 
 test("a body stream that errors mid-body gets the fixed refusal with no echo", async () => {
