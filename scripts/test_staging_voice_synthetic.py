@@ -506,6 +506,8 @@ class FenceTest(unittest.TestCase):
         synth.fence(synth.STAGING_GUILD_ID, synth.STAGING_CREATOR_ID, None)
         synth.fence(synth.STAGING_GUILD_ID, synth.STAGING_CREATOR_ID,
                     "https://two-bot-next-staging.example.workers.dev")
+        synth.fence(synth.STAGING_GUILD_ID, synth.STAGING_CREATOR_ID,
+                    "https://two-bot-next-staging.example.workers.dev/")
         for guild in (synth.LIVE_GUILD_ID, "1", ""):
             with self.assertRaises(synth.Refusal):
                 synth.fence(guild, synth.STAGING_CREATOR_ID, None)
@@ -514,6 +516,24 @@ class FenceTest(unittest.TestCase):
         for url in ("http://two-bot-next-staging.x.workers.dev", "https://two-bot-next-production.x.workers.dev"):
             with self.assertRaises(synth.Refusal):
                 synth.fence(synth.STAGING_GUILD_ID, synth.STAGING_CREATOR_ID, url)
+
+    def test_suffix_userinfo_port_and_path_urls_refuse(self):
+        evil = (
+            "https://two-bot-next-staging.evil.example",
+            "https://two-bot-next-staging.example.workers.dev.evil.example",
+            "https://two-bot-next-staging@evil.example",
+            "https://user@two-bot-next-staging.example.workers.dev",
+            "https://two-bot-next-staging.example.workers.dev:8443",
+            "https://two-bot-next-staging.example.workers.dev/ops/metrics",
+            "https://two-bot-next-staging.example.workers.dev?x=1",
+            "https://two-bot-next-staging.example.workers.dev#x",
+        )
+        for url in evil:
+            with self.subTest(url=url):
+                with self.assertRaises(synth.Refusal) as caught:
+                    synth.fence(synth.STAGING_GUILD_ID, synth.STAGING_CREATOR_ID, url)
+                self.assertEqual(str(caught.exception),
+                                 "staging URL must be the two-bot-next-staging workers.dev origin")
 
     def test_live_guild_refuses_before_any_request(self):
         with mock.patch.object(synth, "Session") as session, mock.patch.object(synth, "rest") as rest, \
