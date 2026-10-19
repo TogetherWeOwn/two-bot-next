@@ -2320,10 +2320,11 @@ class WorkflowTests(unittest.TestCase):
     def assert_postgres_wal_budget_is_bounded(self, workflow_name, job_id, *, expect_verify):
         # Every 1 GiB tmpfs Postgres lane bounds WAL recycling before its
         # bootstrap databases exist, and (where the lane carries a verify
-        # step) pins both settings so drift fails closed. The reload must
-        # precede the first createdb: ALTER SYSTEM without a reload leaves
-        # the running server on the 1 GB default, and the bootstrap
-        # databases are created later in this same step.
+        # step) pins both settings so drift fails closed. Order is
+        # load-bearing both ways: the ALTERs must precede the reload (ALTER
+        # SYSTEM only writes postgresql.auto.conf, which the reload reads),
+        # and the reload must precede the first createdb, since the
+        # bootstrap databases are created later in this same step.
         job = self.workflows[workflow_name]["jobs"][job_id]
         prepare = next(
             step for step in job["steps"]
@@ -2333,8 +2334,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", run)
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", run)
         self.assertIn("pg_reload_conf()", run)
+        reload = run.index("pg_reload_conf()")
         self.assertLess(
-            run.index("pg_reload_conf()"),
+            run.index("ALTER SYSTEM SET max_wal_size = '512MB'"),
+            reload,
+            "max_wal_size ALTER must precede pg_reload_conf()",
+        )
+        self.assertLess(
+            run.index("ALTER SYSTEM SET min_wal_size = '64MB'"),
+            reload,
+            "min_wal_size ALTER must precede pg_reload_conf()",
+        )
+        self.assertLess(
+            reload,
             run.index("createdb "),
             "pg_reload_conf() must precede the first createdb",
         )
