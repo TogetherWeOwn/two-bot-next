@@ -611,6 +611,23 @@ class TrackerUnitTests(unittest.TestCase):
 
 @unittest.skipUnless(NODE and DRIVER.exists(), "node driver integration needs node")
 class TrackerDriverTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Hand-built cadence fixtures need every companion series a Worker
+        # scrape requires; keep fixture_inputs itself under test unchanged.
+        fixture = (DRIVER.parent.parent / "test" / "fixtures" / "metrics.ts").as_uri()
+        import subprocess
+        completed = subprocess.run(
+            [NODE, "--input-type=module", "-e",
+             f"import {{ metricsLines }} from {json.dumps(fixture)};"
+             'process.stdout.write(metricsLines().filter(line => '
+             '!line.startsWith(\'two_bot_voice_joins_received_total \') && '
+             '!line.startsWith(\'two_bot_voice_join_refused_total{reason="duplicate"} \') && '
+             '!line.startsWith(\'two_bot_voice_join_to_move_seconds_bucket{le="5"} \')'
+             ').join("\\n") + "\\n");'],
+            capture_output=True, text=True, timeout=10, check=True)
+        cls.companion_exposition = completed.stdout
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -670,7 +687,7 @@ class TrackerDriverTests(unittest.TestCase):
                          "fastMoves": fast})
         received += 25
         fast += 24
-        exposition = (
+        exposition = self.companion_exposition + (
             f"two_bot_voice_joins_received_total {received}\n"
             f'two_bot_voice_join_refused_total{{reason="duplicate"}} 0\n'
             f'two_bot_voice_join_to_move_seconds_bucket{{le="5"}} {fast}\n'
@@ -702,7 +719,7 @@ class TrackerDriverTests(unittest.TestCase):
                          "fastMoves": fast})
         received += 25
         fast += 24
-        exposition = (
+        exposition = self.companion_exposition + (
             f"two_bot_voice_joins_received_total {received}\n"
             f'two_bot_voice_join_refused_total{{reason="duplicate"}} 0\n'
             f'two_bot_voice_join_to_move_seconds_bucket{{le="5"}} {fast}\n'
@@ -748,6 +765,10 @@ class TrackerDriverTests(unittest.TestCase):
         verdict = tracker.run_driver(NODE, str(DRIVER), expo, ring_path, now)
         self.assertFalse(verdict["slow"])
         self.assertFalse(verdict.get("slowCovered", True))
+
+
+# Keep protected intake acceptance tests in the existing CI entrypoint.
+from test_slow_burn_tracker_intake_acceptance import TrackerIntakeAcceptanceTests
 
 
 if __name__ == "__main__":
