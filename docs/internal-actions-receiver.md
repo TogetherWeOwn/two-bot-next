@@ -220,7 +220,10 @@ refused as a version conflict and needs a new key. Event reads and mutations sha
 one process-wide gate, so a mutation that has registered its key is visible to the
 next read or mutation for that key. A request that cannot enter the gate within 8
 seconds is refused `in_progress` before any claim. A claimed mutation runs to its
-receipt in its own task, even if the client has timed out. A create whose Discord
+receipt in its own receiver-tracked task, even if the client has timed out, and
+carries its admission permit with it: capacity stays held through receipt
+persistence, so repeated timed-out clients cannot admit more than the 32-slot
+work limit. A create whose Discord
 call times out, gets a 5xx or an unreadable reply, or whose key mapping or mirror
 write fails, can leave a Discord event with no key mapping; a create under a new
 Idempotency-Key for that key would then make a second event. The same can happen
@@ -230,6 +233,13 @@ hand first. An in-flight intent whose owner has stopped answers `in_progress` to
 until its claim goes stale, then `needs_reconciliation`; a live owner can still
 finish after that. A panic after a claim answers `needs_reconciliation`. A 504 on a
 mutation is an unknown outcome that may still complete: retry the same key only.
+Shutdown latches drain mode at the request, stops new mutation effects after the
+claim (replay, in-flight and reconciliation answers keep working), then joins
+tracked children within the shared 5-second HTTP drain budget: clean completion
+is reported only after every child is reaped, and work still in flight at the
+deadline is aborted and reported as a drain timeout, never waited on past the
+budget. Aborted or failed children keep their claim fence occupied, so a retry
+sees `in_progress`/`needs_reconciliation` and never a second effect.
 A claimed mutation holds the gate until it finishes, so a slow database can keep
 queued requests waiting for their 8 seconds. The events poller writes the mirror
 outside the gate, but both writers stamp `updated_at` with the same UTC-millis
