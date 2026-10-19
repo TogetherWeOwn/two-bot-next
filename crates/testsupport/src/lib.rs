@@ -105,6 +105,56 @@ fn connect_options(raw: &str, statement_timeout: &str) -> Result<PgConnectOption
         .options([("statement_timeout", statement_timeout)]))
 }
 
+// A seconds-long agent-testdb DNS blip failed every test in one binary with no
+// retry (run 39197217315 attempt 1: 7x bootstrap-connect "Temporary failure in
+// name resolution", 1x teardown EOF). Fixture setup and teardown absorb the
+// blip with backoff instead of failing the suite on the first lost packet.
+const BOOTSTRAP_CONNECT_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
+const TEARDOWN_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
+
+/// Run `op` until it succeeds or `delays` run out, sleeping one delay between
+/// attempts. Returns the last error when every attempt fails. Each retry is
+/// one stderr line, so a passing suite still shows the blip it absorbed.
+async fn retry_with_backoff<T, E, F, Fut>(
+    what: &str,
+    delays: &[Duration],
+    mut op: F,
+) -> std::result::Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let mut delays = delays.iter();
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(error) => match delays.next() {
+                Some(delay) => {
+                    eprintln!("{what} failed, retrying in {delay:?}: {error}");
+                    tokio::time::sleep(*delay).await;
+                }
+                None => return Err(error),
+            },
+        }
+    }
+}
+
+/// A teardown DROP whose connection died after the server committed leaves no
+/// database behind: the retry then reports undefined_catalog (3D000), which
+/// proves the teardown goal instead of failing it.
+fn is_missing_database(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .is_some_and(|code| code == "3D000")
+}
+
 // CREATE/DROP DATABASE can wait for checkpoints. Queue fixture lifecycle DDL
 // outside the unchanged SQL deadline instead of making concurrent drops race it.
 // Cargo runs test binaries sequentially; tests inside each binary share this gate.
@@ -145,19 +195,28 @@ impl Cleanup {
             pool.close().await;
         }
         self.pool.close().await;
-        // The name is generated internally, not supplied by a caller.
-        let result: Result<()> = async {
-            let _ddl = DATABASE_DDL.lock().await;
-            let mut conn = self.admin.acquire().await?;
-            prepare_cleanup_connection(&mut conn).await?;
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DROP DATABASE \"{}\" WITH (FORCE)",
-                self.name
-            )))
-            .execute(&mut *conn)
-            .await?;
-            Ok(())
-        }
+        // The name is generated internally, not supplied by a caller. Each
+        // attempt takes the DDL gate; the backoff sleep never holds it.
+        let result: Result<()> = retry_with_backoff(
+            "drop disposable test database",
+            &TEARDOWN_RETRY_DELAYS,
+            || async {
+                let _ddl = DATABASE_DDL.lock().await;
+                let mut conn = self.admin.acquire().await?;
+                prepare_cleanup_connection(&mut conn).await?;
+                match sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DROP DATABASE \"{}\" WITH (FORCE)",
+                    self.name
+                )))
+                .execute(&mut *conn)
+                .await
+                {
+                    Ok(_) => Ok(()),
+                    Err(error) if is_missing_database(&error) => Ok(()),
+                    Err(error) => Err(anyhow::Error::from(error)),
+                }
+            },
+        )
         .await;
         self.admin.close().await;
         result.context("drop disposable test database")?;
@@ -177,12 +236,23 @@ pub struct TestDatabase {
 impl TestDatabase {
     pub async fn create(raw: &str, migrations: &Migrator) -> Result<Self> {
         let options = connect_options(raw, FIXTURE_STATEMENT_TIMEOUT)?;
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect_with(connect_options(raw, ADMIN_DDL_STATEMENT_TIMEOUT)?)
-            .await
-            .context("connect to test bootstrap database")?;
+        let admin_options = connect_options(raw, ADMIN_DDL_STATEMENT_TIMEOUT)?;
+        let admin = retry_with_backoff(
+            "connect to test bootstrap database",
+            &BOOTSTRAP_CONNECT_RETRY_DELAYS,
+            || {
+                let admin_options = admin_options.clone();
+                async move {
+                    PgPoolOptions::new()
+                        .max_connections(1)
+                        .acquire_timeout(Duration::from_secs(10))
+                        .connect_with(admin_options)
+                        .await
+                }
+            },
+        )
+        .await
+        .context("connect to test bootstrap database")?;
         let name = database_name();
         let created = {
             let _ddl = DATABASE_DDL.lock().await;
@@ -579,5 +649,91 @@ mod tests {
             guard_database_url(&format!("postgres://agent_test:@agent-testdb:5432/{name}"))
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn backoff_retry_returns_the_first_success() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let attempts = AtomicU64::new(0);
+        let result = retry_with_backoff("test op", &[Duration::ZERO, Duration::ZERO], || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if attempt < 3 {
+                    Err::<&str, &str>("boom")
+                } else {
+                    Ok("done")
+                }
+            }
+        })
+        .await;
+        assert_eq!(result, Ok("done"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn backoff_retry_gives_up_after_the_last_delay() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let attempts = AtomicU64::new(0);
+        let result = retry_with_backoff("test op", &[Duration::ZERO, Duration::ZERO], || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err::<(), &str>("boom") }
+        })
+        .await;
+        assert_eq!(result, Err("boom"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    /// Stand-in database error carrying only a SQLSTATE code: proves the
+    /// teardown classifier recognizes a lost-then-dropped database.
+    #[derive(Debug)]
+    struct FakeDbError {
+        code: &'static str,
+    }
+
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fake database error")
+        }
+    }
+
+    impl std::error::Error for FakeDbError {}
+
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            "fake"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.code))
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    #[test]
+    fn teardown_treats_a_missing_database_as_dropped() {
+        let missing = sqlx::Error::Database(Box::new(FakeDbError { code: "3D000" }));
+        assert!(is_missing_database(&missing));
+        let deadlock = sqlx::Error::Database(Box::new(FakeDbError { code: "40P01" }));
+        assert!(!is_missing_database(&deadlock));
+        let eof = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "expected to read 5 bytes, got 0 bytes at EOF",
+        ));
+        assert!(!is_missing_database(&eof));
     }
 }
