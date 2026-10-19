@@ -32,6 +32,10 @@ fn executor(mock: &MockRest, guard: &Arc<RateLimitGuard>) -> ActionExecutor {
     .unwrap()
 }
 
+async fn ban(exec: &ActionExecutor) -> Result<(), DiscordError> {
+    exec.ban("2222", "3333", "bare 429 test").await
+}
+
 fn guard() -> Arc<RateLimitGuard> {
     Arc::new(RateLimitGuard::new(Default::default()).unwrap())
 }
@@ -177,7 +181,6 @@ async fn concurrent_workers_wait_out_the_shared_bare_deadline_once() {
     let guard = guard();
     let first = executor(&mock, &guard);
     let second = executor(&mock, &guard);
-    let ban = |exec: &ActionExecutor| exec.ban("2222", "3333", "bare 429 test");
 
     assert_eq!(ban(&first).await, Err(DiscordError::RateLimited));
     let started = Instant::now();
