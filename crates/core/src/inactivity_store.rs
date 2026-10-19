@@ -72,9 +72,13 @@ pub async fn run_sweep(
     fn epoch_millis(dt: &sqlx::types::time::OffsetDateTime) -> i64 {
         dt.unix_timestamp() * 1000 + i64::from(dt.millisecond())
     }
-    // `seen` is the paging progress guard: members the sweep selects but can
-    // never write (stale revalidation, opt-out suppression) stay eligible, so
-    // a page with nothing new ends the sweep instead of looping on them.
+    // `seen` is the paging progress guard, and it terminates correctly only
+    // because every unwritten row leaves the select window on reselect:
+    // suppressed members are excluded from the select below (they would
+    // otherwise pin the LIMIT window forever and starve the writable tail),
+    // while stale, left, bot, concurrently-flagged, and deleted rows all stop
+    // matching the eligibility predicate once observed. A page with nothing
+    // new therefore means exhaustion, not a crowded window.
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut written: Vec<(String, String)> = Vec::with_capacity(SWEEP_PAGE_ROWS);
     let mut outcome = InactivityOutcome { flagged: vec![] };
@@ -83,6 +87,12 @@ pub async fn run_sweep(
         // The eligible set shrinks as the sweep flags it, so paging re-runs
         // the same bounded select until it comes back empty instead of using
         // OFFSET (an offset would skip members the earlier pages just flagged).
+        // Suppressed members are excluded here, not only at the per-write
+        // gate: they never leave the eligible set, so a suppressed prefix of
+        // SWEEP_PAGE_ROWS or more would otherwise pin this window and the
+        // sweep would end without ever visiting the writable tail. The
+        // per-write suppression check stays as the TOCTOU gate for opt-outs
+        // that land between this select and the write.
         let rows: Vec<SweepRow> = sqlx::query_as(
             "SELECT guild_id, member_id, COALESCE(last_active_at, joined_at),
                     inactive_flagged_at, is_bot
@@ -91,6 +101,11 @@ pub async fn run_sweep(
                 AND NOT is_bot
                 AND COALESCE(last_active_at, joined_at) < $1::timestamptz
                 AND (inactive_flagged_at IS NULL OR inactive_flagged_at < $1::timestamptz)
+                AND NOT EXISTS (
+                    SELECT 1 FROM privacy_opt_outs AS opt
+                    WHERE opt.guild_id = members.guild_id
+                      AND opt.member_id = members.member_id
+                )
               LIMIT $2",
         )
         .bind(&cutoff)
@@ -133,8 +148,10 @@ pub async fn run_sweep(
             // Serialize with concurrent opt-outs so a sweep that selected the
             // member before the opt-out cannot write after the purge. Lock order
             // matches `opt_out_member`'s sorted order; ROW EXCLUSIVE never blocks
-            // other writers. A suppressed pair is skipped: the flag event would
-            // otherwise recreate per-user data the purge just removed.
+            // other writers. The select already excludes suppressed members;
+            // this is the TOCTOU gate for opt-outs landing between the select
+            // and the write: a suppressed pair is skipped, since the flag event
+            // would otherwise recreate per-user data the purge just removed.
             sqlx::query("LOCK TABLE events, members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
                 .execute(&mut *tx)
                 .await?;
@@ -471,6 +488,47 @@ mod tests {
             .await
             .expect("event count");
         assert_eq!(count.0, 0);
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_pages_past_a_suppressed_prefix_without_dropping_the_tail() {
+        let Some((pool, schema)) = test_pool("inactivity_suppressed_prefix")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping inactivity_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // A full page of suppressed-and-quiet members ahead of a writable tail.
+        // Suppressed rows never leave the eligible set, so without the
+        // select-time exclusion they would pin the LIMIT window and the sweep
+        // would end without ever visiting the tail. `generate_series` keeps
+        // the seed to two statements.
+        sqlx::query(
+            "INSERT INTO members (guild_id, member_id, joined_at)
+             SELECT 'guild-a', 'member-' || g, '2026-07-01T00:00:00.000Z'::timestamptz
+             FROM generate_series(1, 4196) g",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed members");
+        sqlx::query(
+            "INSERT INTO privacy_opt_outs (guild_id, member_id)
+             SELECT 'guild-a', 'member-' || g FROM generate_series(1, 4096) g",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed opt-outs");
+        let outcome = run_sweep(&pool, "2026-09-07T00:00:00.000Z", 14)
+            .await
+            .expect("sweep past suppressed prefix");
+        assert_eq!(outcome.flagged.len(), 100);
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .expect("event count");
+        assert_eq!(count.0, 100);
         drop_schema(&pool, &schema).await;
     }
 }
