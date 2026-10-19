@@ -649,6 +649,35 @@ mod tests {
             .join("\n")
         );
 
+        // Same-tick burst, zero-second span: still "within a second".
+        let instant = RaidAlert {
+            guild_id: "g".into(),
+            count: 2,
+            window_seconds: 60.0,
+            first_join_at: "1970-01-01T00:00:00.000Z".into(),
+            last_join_at: "1970-01-01T00:00:00.000Z".into(),
+            span_seconds: 0,
+            member_ids: vec!["a".into(), "b".into()],
+            truncated: false,
+            repeat: false,
+        };
+        let message = instant.staff_message();
+        assert_eq!(message.mentions, MentionPolicy::None);
+        assert_eq!(
+            message.content,
+            [
+                "**Join burst** - 2 accounts joined within a second (threshold: 5 in 60s).",
+                "First 1970-01-01T00:00:00.000Z, last 1970-01-01T00:00:00.000Z.",
+                "",
+                "IDs: `a` `b`",
+                "",
+                "This is an alert only - the bot has kicked, banned and messaged nobody.",
+                "Next: 1. Review join-attribution evidence to see which invite sent them.",
+                "2. If it is a raid, Server Settings -> Safety Setup -> pause invites.",
+            ]
+            .join("\n")
+        );
+
         // First alert, multi-second span: "in Ns".
         let slow = RaidAlert {
             guild_id: "g".into(),
