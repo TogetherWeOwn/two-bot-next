@@ -106,6 +106,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'backfill_history_messages', 'table'),
     ('public', 'backfill_history_counts', 'table'),
     ('public', 'game_activity_guild_aggregates', 'table'),
+    ('public', 'assistant_monthly_builds', 'table'),
     ('public', '_sqlx_migrations', 'ledger'),
     ('public', '_two_bot_migrations', 'ledger'),
     ('public', 'events_id_seq', 'sequence'),

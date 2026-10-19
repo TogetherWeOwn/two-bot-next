@@ -23,16 +23,20 @@
 //!    itself is admin-gated (Manage Guild) with one required `request`
 //!    option bounded by the V12b [`crate::voice_assistant_request`] limit.
 //!
-//! Residual parent work (later slices): the per-guild monthly-cap DB column
-//! (the V12a [`crate::voice_assistant_cap`] ledger consumes the persisted
-//! row), the endpoint call with the validated V12b payload, the six-scenario
-//! V12c validation before the admin sees output, the Apply/Refine/Cancel
-//! flow and the credential binding for the endpoint. Publication already runs
-//! through `InteractionRouter::publish_set` while both gates are on.
+//! Residual parent work (later slices): the endpoint call with the validated
+//! V12b payload, the six-scenario V12c validation before the admin sees
+//! output, the Apply/Refine/Cancel flow and the credential binding for the
+//! endpoint. The per-guild monthly-cap row lives in `two-bot-store`
+//! (`assistant_monthly_builds`, decided through the V12a
+//! [`crate::voice_assistant_cap`] ledger) and the before-send gate below
+//! refuses unconfigured assistants and capped guilds before any send.
+//! Publication already runs through `InteractionRouter::publish_set` while
+//! both gates are on.
 
 use std::collections::HashMap;
 
 use super::commands::{CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_GUILD};
+use super::voice_assistant_cap::CapDecision;
 use super::voice_assistant_request::MAX_REQUEST_CHARS;
 use crate::voice_rooms::VoiceGates;
 
@@ -125,6 +129,50 @@ fn valid_endpoint(endpoint: &str) -> bool {
         return false;
     };
     !rest.trim().is_empty()
+}
+
+/// Why a build never reached the endpoint: the single before-send verdict.
+/// The names are stable machine-readable text surfaced before any send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AssistantGateRefusal {
+    /// No OpenAI-compatible endpoint is configured: the assistant stays
+    /// fully disabled on every path.
+    #[error("assistant_not_configured")]
+    NotConfigured,
+    /// The assistant is configured but the guild already used `limit`
+    /// builds this month; the next attempt is allowed again at `resets_at`
+    /// (the next 1st 00:00 UTC, as Unix seconds).
+    #[error("monthly_cap_reached (limit {limit}, resets_at {resets_at})")]
+    MonthlyCapReached { limit: u32, resets_at: i64 },
+}
+
+impl AssistantGateRefusal {
+    /// The stable machine-readable refusal name.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::NotConfigured => "assistant_not_configured",
+            Self::MonthlyCapReached { .. } => "monthly_cap_reached",
+        }
+    }
+}
+
+/// The single before-send gate: decide, never send. An unconfigured
+/// assistant is refused first, on every path, whatever the cap says; a
+/// configured assistant at the monthly cap is refused with the cap's limit
+/// and reset instant; only a configured assistant under the cap passes,
+/// returning the config for the caller to send with.
+pub fn require_send_allowed(
+    config: Option<&AssistantConfig>,
+    cap: CapDecision,
+) -> Result<&AssistantConfig, AssistantGateRefusal> {
+    let config = config.ok_or(AssistantGateRefusal::NotConfigured)?;
+    match cap {
+        CapDecision::Allow { .. } => Ok(config),
+        CapDecision::Deny { limit, resets_at } => {
+            Err(AssistantGateRefusal::MonthlyCapReached { limit, resets_at })
+        }
+    }
 }
 
 /// V12 `/templateassistant` definition: admin-only (Manage Guild), one
