@@ -1236,6 +1236,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_create_still_retries_migrations_past_the_first_production_delay() {
+        let raw = match std::env::var_os("TWO_TEST_DATABASE_URL") {
+            Some(os) => os
+                .into_string()
+                .expect("invalid test bootstrap configuration"),
+            None => return,
+        };
+        // Pins the public TestDatabase::create delegate to the 1s/2s
+        // production migration backoff: a broken migration keeps failing, so
+        // at 1.5s the first delay is consumed and a later attempt is in
+        // flight, and the timeout must elapse. Emptying the delegate delays
+        // returns the error in milliseconds and the timeout observes it. The
+        // cancelled create drops its fixture, whose Drop schedules
+        // best-effort teardown of the created database.
+        let broken = sqlx::migrate!("./tests/broken_migrations");
+        let probe = tokio::time::timeout(
+            Duration::from_millis(1500),
+            TestDatabase::create(&raw, &broken),
+        )
+        .await;
+        assert!(
+            probe.is_err(),
+            "public TestDatabase::create returned before the 1s production migration delay elapsed"
+        );
+    }
+
+    #[tokio::test]
     async fn public_close_still_retries_past_the_first_production_delay() {
         let Some(missing) = missing_bootstrap_url() else {
             return;
