@@ -502,8 +502,9 @@ cache is rewritten. A lost, malformed or over-1 MiB ring rebuilds instead of
 firing; an over-cap coverage sidecar discards old stamps and seeds fresh
 tracking. Cache reads are byte-bounded before buffering. Driver and issue-list
 JSON answers are limited to 1 MiB of UTF-8 before JSON decoding; malformed,
-excessively nested or over-cap answers fail with a fixed-vocabulary error and
-an evidence receipt, never a raw parser traceback. Issue rows require positive
+undecodable, excessively nested or over-cap answers fail with a
+fixed-vocabulary error and an evidence receipt, never a raw parser traceback.
+Issue rows require positive
 integer numbers (not booleans) before choosing the oldest open issue. The five-minute cadence is load-bearing for
 the six-hour baseline: GitHub runs `*/5` best-effort, so when the newest
 ring entry is 600 s or older the run emits a `::warning::` instead of

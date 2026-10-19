@@ -230,7 +230,7 @@ def run_driver(node, driver, exposition_path, ring_path, now):
         completed = subprocess.run(
             [node, str(driver), "--exposition", str(exposition_path),
              "--ring", str(ring_path), "--now", str(now)],
-            capture_output=True, text=True, timeout=120, check=False,
+            capture_output=True, timeout=120, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         raise TrackError("burn evaluation failed: driver did not run")
@@ -296,6 +296,8 @@ def gh(args, repo, token_env):
             capture_output=True, text=True, timeout=60, check=False,
             env={"GH_TOKEN": token_env, "PATH": "/usr/bin:/bin:/usr/local/bin"},
         )
+    except UnicodeDecodeError:
+        raise TrackError("issue reconcile failed: gh answer is not text")
     except (OSError, subprocess.SubprocessError):
         raise TrackError("issue reconcile failed: gh did not run")
     if completed.returncode != 0:
