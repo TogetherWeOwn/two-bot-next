@@ -79,10 +79,11 @@ test("scrape gap during a firing burn holds the page without flapping", () => {
     t += 60;
   }
 
-  // Minimal history: the ring keeps about one long window of 60 s scrapes
-  // plus its anchor, never an unbounded log.
+  // Bounded history: the shared ring now retains about 2 h of 60 s scrapes
+  // for the slow-burn ticket plus its anchor, never an unbounded log. This
+  // 37 min feed keeps every snapshot.
   const ring = state.errorBudgetBurn ?? [];
-  assert.ok(ring.length <= 22, `ring must stay minimal, got ${ring.length} snapshots`);
+  assert.ok(ring.length >= 30 && ring.length <= 50, `ring must stay bounded near the feed length, got ${ring.length} snapshots`);
 });
 
 test("uncovered short window after a gap never opens a new page", () => {

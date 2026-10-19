@@ -201,7 +201,24 @@ aggregates (`game_activity_guild_aggregates`) expire by `updated_at` age on
 the retention cadence (default 90 days, `TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`
 accepts 1..=36,500 days and any missing, malformed, or out-of-range value
 falls back to 90 days, only when `TWO_RETENTION_MODE` is exactly
-`execute`; dry runs count and log the same rows without deleting). After
+`execute`; dry runs count the visited page's full stale rows without deleting).
+Each production pass visits at most 32 candidate guilds and deletes at most
+500 rows per visited guild (test builds page at 4 x 10 to keep fixtures
+meaningful): tens of single-statement deletes per tick, far inside the
+120-second attempt budget, for at most ~16k rows per 15-minute tick
+(~1.5M/day). Each per-guild delete runs with `lock_timeout = '5s'` / `statement_timeout = '15s'`
+(plus a 15 s pool statement timeout), so a lock held by a stuck session fails
+that guild fast as an isolated retryable error instead of blocking the pass
+until the supervisor cancels it and pins its pooled connection. The cursor is
+written per guild immediately before that guild's delete, so a failed or
+cancelled pass still advances past the last attempted guild and the next pass
+reaches the later guilds on the same page, even when the whole fleet fits on
+one page; `guilds_deferred` counts
+eligible guilds after the visited page (zero only at the end of the eligible
+list), so backlog lag is observable via `guilds_deferred`/`stale_rows` with no
+per-guild labels. Dry-run totals are a same-predicate upper bound per pass
+(execute deletes at most the per-guild batch), not an exact future-delete
+promise under concurrent writes. After
 expiry a returning game's totals restart from zero with no marker. Apart
 from that window, a departed guild's rows go only through
 the guild-purge queue keyed on a true guild removal (a rejoin cancels the
@@ -227,25 +244,25 @@ deletion-request ledger the scheduler drains — never the narrower opt-out
 purge. Status and completion receipts are readable by the requester without
 the interaction token; receipts name the guild/member footprint and the
 retained limits, never global erasure. Live-dispatch call sites that invoke
-the intake on real interactions are follow-up work.
-
-When the database is behind the binary (an unapplied migration or grant), the
-gateway acks dispatches whose queue write hits the schema gap instead of
-crash-looping, with one exception: a missing grant (`42501`) on an available
-rejoin holds the cursor (the gateway fails the dispatch and replays it) until
-the ACL plan is applied, because the queue may hold a pending purge for that
-guild. A missing queue table (`42P01`) on a rejoin is still skipped — an
-absent table holds nothing to cancel — and a skipped true guild removal is
-logged at error level with the guild id
-(`retention purge skipped; schema gap, operator replay required`) and must be
-replayed by the Operator once the migration lands, running the same insert the
-live path runs:
-
-```sql
-INSERT INTO retention_guild_purge_queue (guild_id)
-VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;
-```
-
+the intake on real interactions are follow-up work. When the database is behind the binary (an unapplied
+migration or grant), the gateway acks dispatches whose queue write hits the
+schema gap instead of crash-looping, with one exception: a missing grant
+(`42501`) on an available rejoin holds the cursor (the gateway fails the
+dispatch and replays it) until the ACL plan is applied, because the queue
+may hold a pending purge for that guild. A missing queue table (`42P01`) on
+a rejoin is still skipped — an absent table holds nothing to cancel — and
+a skipped true guild removal is logged at error level with the guild id
+(`retention purge skipped; schema gap, operator replay required`), increments
+the pollable `retention_replay_needed` counter on `/metrics`
+(`two_bot_retention_replay_needed_total`), and must be replayed by the
+Operator once the migration lands — a nonzero counter means at least one
+skip since the last restart and is only an early hint: the counter resets
+on process restart and carries no guild id, so the error log line
+(`operator replay required`) stays the source of truth for which guilds to
+replay. Always search that line over the whole schema-gap window, then run
+the same insert the live path runs:
+`INSERT INTO retention_guild_purge_queue (guild_id)
+VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;`
 Conditional: replay only if no `GUILD_CREATE` for that guild was acked after
 the `operator replay required` line — a later `retention lifecycle skipped;
 schema gap, nothing to cancel` warn for the same guild means it rejoined, so

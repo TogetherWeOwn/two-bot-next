@@ -72,13 +72,15 @@ them. Handle it exactly like the existing missed-events alert in the
 [runbook](runbook.md#alert-gateway-missed-events).
 
 Capture lag is the spread between `received_at` and `event_time` per
-`event_type` over a window. No counter tracks it yet: until a slice ships a
-real counter and rule, the staging verify query below is the only detector.
-Treat a spread that stays above one keepalive window (about 60 s) across
-consecutive windows as a missed-events-equivalent: scrape the authorized
-`/ops/metrics` path, correlate disconnects and recent deploys, and do not
-restart the container to clear the counter. A replacement resets baselines
-without recovering the gap.
+`event_type` over a window. The `two_bot_event_store_consumer_lag_seconds`
+gauge exposes the newest observed spread (`0` when unobserved), and the
+`event_store_consumer_lag` Worker rule tickets when it stays above one
+keepalive window (about 60 s) across three consecutive valid samples; the
+staging verify query below remains the manual check. Treat such a spread as a
+missed-events-equivalent: scrape the authorized `/ops/metrics` path,
+correlate disconnects and recent deploys, and do not restart the container
+to clear the counter. A replacement resets baselines without recovering
+the gap.
 
 ### Backfill-no-replay rule
 

@@ -115,7 +115,9 @@ import {
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
 import {
+  buildRemediationGuardReceipt,
   evaluateRemediation,
+  remediationTriggerFiring,
   sanitizeRemediationState,
   type RemediationState,
 } from "./remediation.ts";
@@ -198,6 +200,14 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   INTERNAL_ACTIONS_INGRESS?: string;
   /** Staging-only var (wrangler.toml [env.staging.vars]); see eventsub.ts. */
   EVENTSUB_INGRESS?: string;
+  /**
+   * Deploy-stamped container Git SHA for Worker-edge span lines. Set only in
+   * the generated deploy configs (scripts/staging_rollout.py,
+   * scripts/production_deploy.py), never a committed var. Anything that is
+   * not a hex SHA logs as the visible `"unknown"` bucket. Never forwarded to
+   * the container or logged verbatim elsewhere.
+   */
+  CONTAINER_RELEASE?: string;
   /** Operator-set Worker secret enabling the EventSub forward. Never flag-forwarded. */
   TWO_EVENTSUB?: string;
   /** Operator-set Worker secret carrying the Twitch signing secret. Never flag-forwarded. */
@@ -210,6 +220,12 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_TWITCH_CLIENT_ID?: string;
   /** Operator-set Helix client secret. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
   TWO_TWITCH_CLIENT_SECRET?: string;
+  /** Operator-set go-live delivery gate. Forwarded as exactly "1" on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
+  TWO_EVENTSUB_DELIVERY?: string;
+  /** Operator-set announcements channel for go-live posts. Forwarded on its own explicit containerEnvVars line while the delivery gate travels, never flag-forwarded. */
+  TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID?: string;
+  /** Operator-set Discord invite URL for go-live posts. Forwarded on its own explicit containerEnvVars line while the delivery gate travels, never flag-forwarded. */
+  TWO_EVENTSUB_INVITE_URL?: string;
   /** Staging rollback-drill switch (docs/staging-rollout-gate.md). Set only
    * in the generated staging deploy config by a manual deploy-staging
    * dispatch, never a committed var (check-env-bindings.py). Reaches the
@@ -733,6 +749,15 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     if (env.TWO_TWITCH_BROADCASTERS) vars["TWO_TWITCH_BROADCASTERS"] = env.TWO_TWITCH_BROADCASTERS;
     if (env.TWO_TWITCH_CLIENT_ID) vars["TWO_TWITCH_CLIENT_ID"] = env.TWO_TWITCH_CLIENT_ID;
     if (env.TWO_TWITCH_CLIENT_SECRET) vars["TWO_TWITCH_CLIENT_SECRET"] = env.TWO_TWITCH_CLIENT_SECRET;
+    // Go-live delivery is a second gate inside the receiver forward: only
+    // exactly "1" travels, with its channel and invite inputs on their own
+    // lines. Absent stays absent so a half-provisioned delivery enable
+    // fails loudly in the Container instead of silently staying ack-only.
+    if (env.TWO_EVENTSUB_DELIVERY === "1") {
+      vars["TWO_EVENTSUB_DELIVERY"] = "1";
+      if (env.TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID) vars["TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID"] = env.TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID;
+      if (env.TWO_EVENTSUB_INVITE_URL) vars["TWO_EVENTSUB_INVITE_URL"] = env.TWO_EVENTSUB_INVITE_URL;
+    }
   }
   return vars;
 }
@@ -1024,9 +1049,9 @@ export class TwoBotContainer extends Container<Env> {
     // it via the allowlisted headers, and these envelopes echo it so a 503
     // still joins the flow's Worker and container logs.
     const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
-    const checked = allowlistedHeaders(request.headers, requestId);
+    const checked = allowlistedHeaders(request.headers, requestId, this.lastRelease);
     if ("refusal" in checked) return checked.refusal;
-    const body = await readBody(request, requestId);
+    const body = await readBody(request, requestId, this.lastRelease);
     if ("refusal" in body) return body.refusal;
     const forward = forwardRequest(
       `http://c${ACTIONS_PATH}`,
@@ -1057,7 +1082,7 @@ export class TwoBotContainer extends Container<Env> {
         }
         let relayed: Response;
         try {
-          relayed = await relayReceiverResponse(upstream, requestId, signal);
+          relayed = await relayReceiverResponse(upstream, requestId, signal, this.lastRelease);
         } catch {
           return envelope(503, "unavailable", true, {}, requestId);
         }
@@ -1087,9 +1112,9 @@ export class TwoBotContainer extends Container<Env> {
     // Same join as the actions path above: the forward carries the stamped
     // id, and these envelopes echo it so a 503 still joins the flow's logs.
     const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
-    const checked = eventsubAllowlistedHeaders(request.headers, requestId);
+    const checked = eventsubAllowlistedHeaders(request.headers, requestId, this.lastRelease);
     if ("refusal" in checked) return checked.refusal;
-    const body = await readEventsubBody(request, requestId);
+    const body = await readEventsubBody(request, requestId, this.lastRelease);
     if ("refusal" in body) return body.refusal;
     const forward = forwardRequest(
       `http://c${EVENTSUB_PATH}`,
@@ -1118,7 +1143,7 @@ export class TwoBotContainer extends Container<Env> {
         }
         let relayed: Response;
         try {
-          relayed = await relayEventsubResponse(upstream, requestId, signal);
+          relayed = await relayEventsubResponse(upstream, requestId, signal, this.lastRelease);
         } catch {
           return envelope(503, "unavailable", true, {}, requestId);
         }
@@ -1584,6 +1609,55 @@ export class TwoBotContainer extends Container<Env> {
           }));
           await this.postWebhookText(content);
         }
+        // Staging-only persisted guard receipt: read back the guard just
+        // written and log the allowlisted counters/timestamps/phases with
+        // evaluation time, firing trigger keys, decision and build correlation.
+        // Exactly one receipt per keepalive tick in staging, none in production.
+        // No endpoint, permission, dump, or storage mutation beyond the
+        // evaluator persistence above; thresholds and state-machine semantics
+        // are untouched.
+        if (this.env.TWO_DEPLOY_ENV === "staging") {
+          try {
+            // Flush the just-written guard before the read-back: DO storage
+            // serves recent writes from its in-memory cache/write buffer and
+            // put() resolves before the flush, so without sync() the get()
+            // below always repeats the in-memory value and can never prove
+            // durability. A failed flush throws here and lands in the
+            // readback_failed branch below.
+            await this.ctx.storage.sync();
+            const persisted = await this.ctx.storage.get<RemediationState>(REMEDIATION_KEY);
+            const receipt = buildRemediationGuardReceipt({
+              persisted,
+              expected: remediation.state,
+              firing,
+              messages: remediation.messages,
+              nowSeconds,
+              buildRevision: context?.buildRevision ?? "unknown",
+              release: releaseTag(this.lastRelease),
+              workerVersion: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+            });
+            console.warn(JSON.stringify({
+              event: "remediation_guard_receipt",
+              service: "two-bot-next",
+              ...receipt,
+              log_url: LOG_QUERY_URL,
+            }));
+          } catch {
+            console.warn(JSON.stringify({
+              event: "remediation_guard_receipt",
+              service: "two-bot-next",
+              ok: false,
+              deploy_env: "staging",
+              evaluated_at_seconds: nowSeconds,
+              firing: remediationTriggerFiring(firing),
+              reason: "readback_failed",
+              build_revision: context?.buildRevision ?? "unknown",
+              release: releaseTag(this.lastRelease),
+              worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+              log_url: LOG_QUERY_URL,
+            }));
+          }
+        }
       } catch {
         console.warn("two-bot remediation guard failed; alerts already delivered");
       }
@@ -1702,6 +1776,7 @@ export default {
           sanitized.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
           return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         },
+        env.CONTAINER_RELEASE,
       );
     }
 
@@ -1717,6 +1792,7 @@ export default {
           sanitized.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
           return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         },
+        env.CONTAINER_RELEASE,
       );
     }
 
@@ -1724,7 +1800,9 @@ export default {
     // path only: only POST is served (browser probes get 405, never tool
     // execution). Unconfigured/short token → 404 (the route does not exist);
     // missing/wrong bearer → 401 with WWW-Authenticate, before the Container
-    // is touched. Every tool call below is bounded (6 s / 64 KiB) in mcp.ts.
+    // is touched. Authenticated request bodies are collected under their own
+    // inbound bound (64 KiB / 6 s, before parsing) in mcp.ts, and every tool
+    // call below keeps its separate outbound container bound (6 s / 64 KiB).
     if (url.pathname === "/mcp") {
       if (request.method !== "POST") {
         return new Response("method not allowed", {

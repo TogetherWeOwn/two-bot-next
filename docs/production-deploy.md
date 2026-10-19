@@ -116,9 +116,47 @@ from the failed run's summary, `image` set to the previous container image
 digest from the same summary's rollback-snapshot line, and `takeover: true`.
 Set `sha` to the commit that version was built
 from (full SHA or an unambiguous 7-40 character hex prefix; the guard resolves
-a prefix and records the full SHA). It is recorded as the rollback message, and the `/readyz` gate after the
+a prefix and records the full SHA): take all three from that summary line, which the pre-deploy snapshot
+(the provenance receipt) fills in. Use that line only when it names all
+three (`rollback`, `image` and `sha`): a line without `sha` is not a
+complete receipt, and a manual rollback must not be dispatched from it.
+The three inputs are validated as one
+receipt before anything is restored: the rollback script refuses unless the
+Worker version's stamped deploy message (`wrangler deploy --message <sha>`)
+equals `sha` (the resolved full SHA), the version appears in the 100%-serving deployment history,
+and the image comes from a completed rollout. A merely CI-green SHA paired
+with the wrong version therefore refuses before traffic moves instead of
+failing the gate after the restore; do not widen the guard to admit one.
+The `/readyz` gate after the
 rollback must report that revision, or a pre-stamp version on 200 with
-gateway ready (see below). The
+gateway ready (see below). A version with no stamped SHA — deployed before
+SHA stamping began, or created by a secret change without `--message` —
+cannot form a receipt and a manual rollback to it refuses; the
+in-run auto-rollback to such a snapshot keeps its legacy version-header
+identity and records `provenance: legacy-no-sha` in its evidence. Keep
+every serving version stamped: a secret change publishes a new Worker
+version too, so stage secrets with `wrangler versions secret put --env <env> <KEY>
+--message <sha>` — where `<sha>` is the SHA of the last successful deploy
+(the run summary's `SHA:` line, or the live `/readyz` `build_revision`),
+not the pre-deploy snapshot's `serving_sha` (that snapshot describes the
+version being replaced, so stamping with it would label the new version with
+the previous build's SHA and trip the post-restore gate) — then deploy that
+staged version with `wrangler versions deploy --env <env>`, on staging
+and production alike. Precheck first: `versions secret put` builds on the
+newest-created version (`PATCH .../versions/latest`), not necessarily the
+serving one. Confirm the last block of `wrangler versions list --env <env>`
+(the list prints oldest first, so the last block is the newest version)
+is the serving version (same id as `wrangler deployments status --env <env>`);
+the stamp is the SHA that serving version was built from (its
+`workers/message`, or the live `/readyz` `build_revision`). If they differ
+(after an auto-rollback, a manual rollback, or a `versions upload`), do not
+stage secrets — redeploy the intended SHA through the workflow first, then
+stage. A secret-change version created by `wrangler secret
+put` or by a `versions secret put` without `--message` carries no stamped
+SHA and can never form a receipt. If the pre-deploy snapshot records
+`serving_sha: None`, the serving version is unstamped: stamp it (secret
+change with `--message` as above) before the deploy the snapshot precedes,
+or the next manual rollback to it will refuse. The
 rollback passes the same guard and the same Environment approval, except the
 guard never needs deploy-staging history for a rollback: aged-out staging
 runs must not block recovery. It still needs a human Environment reviewer:

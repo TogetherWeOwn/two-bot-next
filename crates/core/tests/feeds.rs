@@ -1285,3 +1285,91 @@ fn feed_add_rejects_long_sources_and_nonstandard_ports() {
         );
     }
 }
+
+#[test]
+fn feed_list_at_capacity_keeps_same_host_sources_distinguishable() {
+    // Paperclip Review 4/5 on #1167: at the 25-relay cap the uniform ~11-unit
+    // budget collapsed every same-kind row to an identical prefix
+    // (`https://w…`), so all ids were visible but unmappable to a source.
+    // The capacity path now middle-elides the scheme-stripped source, keeping
+    // the distinguishing tail (`channel_id=UC…` / path).
+    let feeds: Vec<FeedRelay> = (1..=25)
+        .map(|index| FeedRelay {
+            id: format!("{index:032x}"),
+            guild_id: "guild-1".into(),
+            channel_id: "1234567890123456789".into(),
+            kind: FeedKind::Youtube,
+            source: format!("https://www.youtube.com/feeds/videos.xml?channel_id=UC{index:022}"),
+            enabled: true,
+            last_checked_at: None,
+            created_by: "actor".into(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .collect();
+    let text = feed_list_text(&feeds);
+
+    assert!(
+        text.encode_utf16().count() <= 2000,
+        "response exceeds the 2,000 UTF-16 unit limit: {text}"
+    );
+    for feed in &feeds {
+        assert!(
+            text.contains(&format!("`{}`", feed.id)),
+            "relay {} discoverable at capacity: {text}",
+            feed.id
+        );
+    }
+    // Every row's displayed source snippet must differ: same channel for all
+    // relays forces the source text to be the distinguisher.
+    let snippets: Vec<&str> = text
+        .lines()
+        .map(|line| line.rsplit(' ').next().expect("row has a source"))
+        .collect();
+    assert_eq!(snippets.len(), 25, "all rows listed: {text}");
+    let distinct: std::collections::HashSet<&&str> = snippets.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        25,
+        "same-host sources stay pairwise distinct at capacity: {text}"
+    );
+}
+
+#[test]
+fn feed_list_id_only_fallback_stays_bounded() {
+    // Defensive path: legacy-restored rows beyond the 25-relay cap (or
+    // pathological max-length ids) cannot fit even as id-only rows. The
+    // fallback emits the fitting exact-id prefix, bounded to 2,000 units.
+    let feeds: Vec<FeedRelay> = (1..=60)
+        .map(|index| FeedRelay {
+            id: format!("{index:032x}"),
+            guild_id: "guild-1".into(),
+            channel_id: "1234567890123456789".into(),
+            kind: FeedKind::Rss,
+            source: format!("https://example.org/{}/feed-{index}", "a".repeat(300)),
+            enabled: true,
+            last_checked_at: None,
+            created_by: "actor".into(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .collect();
+    let text = feed_list_text(&feeds);
+
+    assert!(
+        text.encode_utf16().count() <= 2000,
+        "fallback exceeds the 2,000 UTF-16 unit limit: {text}"
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines.len() < feeds.len(),
+        "over-capacity fallback bounds rows: {text}"
+    );
+    assert!(!lines.is_empty(), "fallback keeps at least one id: {text}");
+    for line in &lines {
+        assert!(
+            line.starts_with('`') && line.ends_with('`') && !line.contains(' '),
+            "fallback rows are exact ids, never partial: {line}"
+        );
+    }
+}

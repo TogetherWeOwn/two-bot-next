@@ -21,6 +21,18 @@ Two modes share one code path:
   digest-only, so no history scan can link an image back to its Worker
   version. The digest is a content hash, safe to pass as a dispatch input.
 
+Rollback inputs travel as one provenance receipt (Worker version, Git SHA,
+container image), never as independently believable values. A production
+deploy stamps its guarded SHA as the Worker version's `workers/message`
+annotation (`wrangler deploy --message <sha>`), so the version detail binds
+version to SHA; the snapshot records that SHA beside the serving version
+and image. Before any restore POST, the receipt is validated against live
+Cloudflare state: the version's annotated SHA must equal the receipt SHA,
+the version must appear in the 100%-serving deployment history, and the
+image must appear in a completed rollout for the application. A missing or
+mismatched member refuses the rollback: a merely CI-green SHA paired with
+some other version is never admitted.
+
 Fail-closed rules, each pinned by scripts/test_worker_container_rollback.py:
 - Only allowlisted IDs, integers, statuses and fixed-vocabulary tokens reach
   the log or the evidence file. API, ownership and probe bodies are never
@@ -31,9 +43,15 @@ Fail-closed rules, each pinned by scripts/test_worker_container_rollback.py:
   `immediate`: the restored code must serve now, not after a deferred window.
 - The stable gate needs STABLE_PASSES consecutive fully-passing polls; any
   non-passing poll resets the streak, and the deadline fails the run.
+- The provenance receipt is immutable once built and is fully validated
+  before the fence: no restore POST happens on an incomplete or mismatched
+  (version, SHA, image) tuple. Snapshot rollbacks of builds deployed
+  before SHA stamping keep the legacy version-header identity and say so
+  in the evidence; manual rollbacks have no legacy path.
 """
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -215,6 +233,11 @@ def snapshot_state(client, worker, application):
         return {"has_previous": False, "worker": worker, "application": application}
     rows = app_rollouts(client, app["id"])
     prev = newest_completed_rollout(rows)
+    # The provenance receipt's SHA member: the serving version's stamped
+    # deploy message. An unstamped version (pre-stamp, or a secret change
+    # without --message) records None (the receipt is incomplete) instead
+    # of blocking the deploy this snapshot precedes.
+    serving_sha = version_sha(client, worker, history[0])
     return {
         "has_previous": True,
         "worker": worker,
@@ -222,6 +245,8 @@ def snapshot_state(client, worker, application):
         "application_id": app["id"],
         "namespace_id": namespace,
         "serving_version": history[0],
+        "serving_sha": serving_sha,
+        "provenance_complete": serving_sha is not None,
         "serving_rollout_id": prev["id"],
         "serving_image": rollout_image(prev, application),
         "recorded_at": time.time(),
@@ -234,6 +259,80 @@ def restore_image_shape(image, application):
     require(isinstance(image, str) and re.fullmatch(image_pattern(application), image),
             "invalid_target_image")
     return image
+
+
+@dataclass(frozen=True)
+class ProvenanceReceipt:
+    """The known-good (Worker version, Git SHA, container image) tuple a
+    rollback restores. Built once, immutable, and shape-validated here;
+    `validate_receipt_against_live` binds it to Cloudflare state before
+    any restore POST. All three members are content identifiers (a UUID,
+    a commit SHA, an image digest), safe in logs and workflow artifacts."""
+
+    worker: str
+    application: str
+    version: str
+    sha: str
+    image: str
+
+    def __post_init__(self):
+        require(isinstance(self.worker, str) and bool(self.worker),
+                "provenance_worker_invalid")
+        require(isinstance(self.application, str) and bool(self.application),
+                "provenance_application_invalid")
+        require(isinstance(self.version, str) and VERSION_ID.fullmatch(self.version),
+                "provenance_version_invalid")
+        require(isinstance(self.sha, str) and SHA.fullmatch(self.sha),
+                "provenance_sha_invalid")
+        require(isinstance(self.image, str)
+                and re.fullmatch(image_pattern(self.application), self.image),
+                "provenance_image_invalid")
+
+    def validate(self, *, version, sha, image):
+        """Refuse unless the named inputs are exactly this receipt's tuple.
+        The detail names the mismatched member in fixed vocabulary only."""
+        for member, expected, actual in (
+                ("version", self.version, version),
+                ("sha", self.sha, sha),
+                ("image", self.image, image)):
+            require(actual == expected, "provenance_mismatch", f"member={member}")
+
+
+def version_sha(client, worker, version):
+    """The Git SHA a Worker version was deployed from: its immutable
+    `workers/message` annotation (`wrangler deploy --message <sha>`, or
+    `wrangler versions secret put --message <sha>` for a secret change).
+    Returns None for an unstamped version — deployed before SHA stamping,
+    or a secret change without --message — whose annotation is absent or
+    not a commit SHA."""
+    data = base.mapping(client.api(
+        f"/workers/scripts/{base.identifier(worker)}/versions/{base.identifier(version)}"))
+    require(data.get("id") == version, "version_identity_drift")
+    annotations = data.get("annotations")
+    message = annotations.get("workers/message") if isinstance(annotations, dict) else None
+    return message if isinstance(message, str) and SHA.fullmatch(message) else None
+
+
+def validate_receipt_against_live(client, receipt):
+    """Bind a receipt to live Cloudflare state with reads only, before any
+    restore POST: the version must have been deployed from the receipt
+    SHA and must have served 100% before, and the image must come from a
+    completed rollout of this application. Rollout images carry no
+    version link, so served-before membership is the strongest image
+    binding the API offers; version and SHA bind exactly."""
+    require(version_sha(client, receipt.worker, receipt.version) == receipt.sha,
+            "provenance_mismatch", "member=sha")
+    require(receipt.version in deployments(client, receipt.worker),
+            "provenance_version_never_served")
+    app = application_by_name(client, receipt.application)
+    served = set()
+    for row in app_rollouts(client, app["id"]):
+        row = base.mapping(row)
+        image = base.mapping(row.get("target_configuration")).get("image")
+        if (row.get("status") == "completed" and isinstance(image, str)
+                and re.fullmatch(image_pattern(receipt.application), image)):
+            served.add(image)
+    require(receipt.image in served, "provenance_image_never_served")
 
 
 def gateway_state(report):
@@ -349,26 +448,44 @@ class Rollback:
             row = base.mapping(self.client.api(
                 f"/containers/applications/{base.identifier(self.app_id)}/rollouts/{rollout_id}"))
             require(row.get("id") == rollout_id, "rollout_identity_drift")
-            self.log(f"image rollout {row.get('status')}")
+            status = row.get("status")
+            require(status not in ("replaced", "reverted"), "rollout_replaced_or_reverted")
+            require(status in ("pending", "progressing", "completed"), "unknown_rollout_status")
+            require(base.mapping(row.get("target_configuration")).get("image") == image,
+                    "rollout_identity_drift")
             if target_version is None:
                 try:
                     target_version = base.number(row.get("target_version"))
                 except GateError:
                     target_version = None
-            # The lag shape is the same steady state staging verify accepts
-            # (a completed rollout whose counters read active:1/healthy:0
-            # under durable_object scheduling); the stable gate after takeover
-            # still proves the exact version serves.
-            if (target_version is not None
-                    and (base.converged(row, image, target_version)
-                         or base.active_lag(row, image, target_version))
-                    and base.mapping(application_by_name(
-                        self.client, self.application).get("configuration")).get("image")
-                    == image):
+            # The pinned rollout proves the image leg, including the same
+            # completed counter-lag shapes accepted by staging verify. Staging's
+            # application listing can lag that record indefinitely; takeover
+            # and the unchanged stable runtime gate still have to pass next.
+            # Production retains its separate application-listing requirement.
+            ready = (target_version is not None
+                     and (base.converged(row, image, target_version)
+                          or base.active_lag(row, image, target_version)))
+            if target_version is None:
+                waiting_for = "target_version"
+            elif status != "completed":
+                waiting_for = "rollout_completion"
+            else:
+                waiting_for = "counters_or_progress"
+            if ready and self.variant != "staging":
+                ready = base.mapping(application_by_name(
+                    self.client, self.application).get("configuration")).get("image") == image
+                waiting_for = "application_image"
+            if ready:
+                self.log(f"image rollout {status}")
+                self.evidence.pop("image_restore_wait", None)
                 self.evidence["restored_rollout_id"] = rollout_id
                 self.stamp("image restored")
                 return
-            require(self.now() < deadline, "image_rollout_timeout")
+            self.evidence["image_restore_wait"] = waiting_for
+            self.log(f"image rollout {status} waiting_for={waiting_for}")
+            require(self.now() < deadline, "image_rollout_timeout",
+                    f"waiting_for={waiting_for} rollout={status}")
             self.sleep(POLL_SECONDS)
 
     def take_over(self, version):
@@ -409,9 +526,10 @@ class Rollback:
             # Recorded as a pass like the release gate, never a failure.
             self.evidence["pre_stamp_recorded"] = True
         elif self.expected_sha is not None and revision != self.expected_sha:
-            # Snapshot rollbacks (auto-rollback) carry no --expected-sha: the
-            # restored build reports the previous revision, so identity rests
-            # on the x-two-worker-version header checked above.
+            # The expected SHA is the receipt's: the dispatch's --expected-sha
+            # for a manual rollback, or the snapshot's recorded serving SHA
+            # for an auto-rollback. Only a pre-stamp snapshot carries none;
+            # identity then rests on the x-two-worker-version header above.
             return False, f"readyz={status} identity=mismatch"
         if gateway_state(report) != "ready":
             return False, f"readyz={status} gateway=not-ready"
@@ -496,6 +614,7 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
     roll.add_argument("--evidence", required=True)
     args = parser.parse_args(argv)
     env = os.environ if environ is None else environ
+    rollback = None
     try:
         worker = args.worker or WORKERS[args.variant]
         application = args.application or APPLICATIONS[args.variant]
@@ -515,6 +634,7 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
         expected_sha = args.expected_sha
         if expected_sha is not None:
             require(SHA.fullmatch(expected_sha), "invalid_expected_sha")
+        receipt = None
         if args.snapshot:
             try:
                 snap_state = base.mapping(base.decode(Path(args.snapshot).read_bytes()))
@@ -532,12 +652,44 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
                 f"/rollouts/{prev_rollout}"))
             require(row.get("id") == prev_rollout, "rollout_identity_drift")
             restore_image = rollout_image(row, application)
+            # The snapshot recorded the image it snapshotted; the live
+            # re-read of that same rollout must still name it.
+            recorded_image = snap_state.get("serving_image")
+            if recorded_image is not None:
+                require(recorded_image == restore_image,
+                        "provenance_mismatch", "member=image")
+            # A complete snapshot carries the serving build's SHA: it
+            # becomes the stable gate's expected revision, and an explicit
+            # --expected-sha must agree with it. The receipt is then bound
+            # to live Cloudflare state exactly like a manual rollback's, so
+            # a stale or hand-edited snapshot refuses before any POST
+            # instead of at the stable gate after traffic moved. A
+            # pre-stamp snapshot has no SHA member and keeps the legacy
+            # header-only identity.
+            recorded_sha = snap_state.get("serving_sha")
+            if recorded_sha is not None:
+                require(isinstance(recorded_sha, str) and SHA.fullmatch(recorded_sha),
+                        "invalid_snapshot_sha")
+                receipt = ProvenanceReceipt(worker, application, restore_version,
+                                            recorded_sha, restore_image)
+                if expected_sha is not None:
+                    receipt.validate(version=restore_version, sha=expected_sha,
+                                     image=restore_image)
+                validate_receipt_against_live(client, receipt)
+                expected_sha = receipt.sha
         else:
+            # A manual rollback is admitted only as a complete receipt:
+            # version, image and the SHA that version was deployed from,
+            # validated against live Cloudflare state below. No member is
+            # optional, so no arbitrary CI-green SHA can ride along.
+            require(expected_sha is not None, "manual_rollback_needs_expected_sha")
             restore_version = args.target_version
             require(isinstance(restore_version, str) and VERSION_ID.fullmatch(restore_version),
                     "invalid_target_version")
             restore_image = restore_image_shape(args.target_image, application)
-            app = application_by_name(client, application)
+            receipt = ProvenanceReceipt(worker, application, restore_version,
+                                        expected_sha, restore_image)
+            validate_receipt_against_live(client, receipt)
         token = env.get("OWNERSHIP_CONTROL_TOKEN", "")
         require(len(token) >= 32, "missing_ownership_token")
         require(ACTOR.fullmatch(args.actor), "invalid_actor")
@@ -547,10 +699,17 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
                             expected_sha, env.get("GITHUB_RUN_ID", ""),
                             log=print)
         evidence = rollback.run(restore_version, restore_image)
+        if receipt is not None:
+            evidence.update({"provenance": "validated", "provenance_sha": receipt.sha})
+        else:
+            evidence["provenance"] = "legacy-no-sha"
     except GateError as error:
         print(f"worker-container rollback failed: {error}")
         if error.detail:
             print(f"worker-container rollback diagnostic: {error.detail}")
+        if rollback is not None and str(error) == "image_rollout_timeout":
+            evidence = dict(rollback.evidence, failure="image_rollout_timeout")
+            Path(args.evidence).write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
         return 1
     Path(args.evidence).write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
     print("worker-container rollback evidence: " + json.dumps(evidence, sort_keys=True))

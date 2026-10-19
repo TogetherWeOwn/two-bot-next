@@ -128,7 +128,13 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     // --- signing secret. Env-only like the internal-actions receiver above:
     // --- a web form must never enable the ingress or see the secret. ---
     ("TWO_EVENTSUB", SettingClass::EnvOnly),
+    (
+        "TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID",
+        SettingClass::EnvOnly,
+    ),
     ("TWO_EVENTSUB_BIND", SettingClass::EnvOnly),
+    ("TWO_EVENTSUB_DELIVERY", SettingClass::EnvOnly),
+    ("TWO_EVENTSUB_INVITE_URL", SettingClass::EnvOnly),
     ("TWO_TWITCH_BROADCASTERS", SettingClass::EnvOnly),
     ("TWO_TWITCH_CALLBACK_URL", SettingClass::EnvOnly),
     ("TWO_TWITCH_CLIENT_ID", SettingClass::EnvOnly),
@@ -168,7 +174,6 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID", SettingClass::Cold),
     ("TWO_TEMP_VOICE_CATEGORY_ID", SettingClass::Cold),
     ("TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS", SettingClass::Cold),
-    ("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS", SettingClass::Cold),
     ("TWO_TEMP_VOICE_SWEEP_SECONDS", SettingClass::Cold),
     ("TWO_TEMP_VOICE_MAX_PER_USER", SettingClass::Cold),
     ("TWO_TEMP_VOICE_MAX_PER_GUILD", SettingClass::Cold),
@@ -235,6 +240,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_SELF_ROLE_DRY_RUN", SettingClass::Hot),
     ("TWO_REDIRECT_FALLBACK_CODE", SettingClass::Hot),
     ("TWO_FEED_POLL_SECONDS", SettingClass::Hot),
+    ("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS", SettingClass::Hot),
 ];
 
 /// The hot keys whose consumers read through the live config (legacy
@@ -267,6 +273,7 @@ pub const HOT_WIRED: &[&str] = &[
     "TWO_FEED_POLL_SECONDS",
     "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
     "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
+    "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
 ];
 
 /// The catalogue class for `key`, or `None` for a name this file has never
@@ -889,6 +896,7 @@ mod tests {
         "TWO_REDIRECT_FALLBACK_CODE",
         "TWO_SELF_ROLE_DRY_RUN",
         "TWO_FEED_POLL_SECONDS",
+        "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
     ];
 
     const EXPECTED_COLD: &[&str] = &[
@@ -909,7 +917,6 @@ mod tests {
         "TWO_TEMP_VOICE_CATEGORY_ID",
         "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS",
         "TWO_TEMP_VOICE_DISABLED_CONTROLS",
-        "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
         "TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID",
         "TWO_TEMP_VOICE_MAX_PER_GUILD",
         "TWO_TEMP_VOICE_MAX_PER_USER",
@@ -943,7 +950,10 @@ mod tests {
         "TWO_DATABASE_URL",
         "TWO_DB_POOL_MAX",
         "TWO_EVENTSUB",
+        "TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID",
         "TWO_EVENTSUB_BIND",
+        "TWO_EVENTSUB_DELIVERY",
+        "TWO_EVENTSUB_INVITE_URL",
         "TWO_HEALTH_BIND_HOST",
         "TWO_HEALTH_PORT",
         "TWO_INTERNAL_ACTIONS",
@@ -997,7 +1007,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 130, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 133, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,
@@ -1039,7 +1049,7 @@ mod tests {
 
     #[test]
     fn hot_wired_is_a_hot_subset() {
-        assert_eq!(HOT_WIRED.len(), 24);
+        assert_eq!(HOT_WIRED.len(), 25);
         for key in HOT_WIRED {
             assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
         }

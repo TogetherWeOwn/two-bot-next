@@ -55,6 +55,7 @@ pub mod disable_preflight;
 pub mod e2e_matrix;
 pub mod error_chain;
 pub mod events;
+pub mod eventsub_delivery_config;
 pub mod eventsub_receiver_config;
 pub mod evidence;
 pub mod expected_joins;
@@ -393,13 +394,13 @@ pub use rsvp_conversion::{
 #[cfg(feature = "db")]
 pub use rsvp_store::{
     compensate_checkin_write, compensate_rsvp_write, list_rsvps, prune_rsvp_history, put_rsvp,
-    record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+    put_rsvp_with_audit, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
 };
 pub use scheduled::{
     advance_next_run_iso, advance_next_run_ms, clamp_retry_delay_ms, format_iso_ms, lease_until_ms,
-    next_run_at_ms, no_such_schedule_text, no_unique_match_text, parse_iso_ms,
-    post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text, schedule_confirm_text,
-    schedule_list_line, schedule_list_page, schedule_list_page_indicator,
+    neutralize_scheduled_body, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
+    parse_iso_ms, post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text,
+    schedule_confirm_text, schedule_list_line, schedule_list_page, schedule_list_page_indicator,
     schedule_list_page_out_of_range_text, schedule_list_page_underflow_text, schedule_list_pages,
     schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome, ScheduleError,
     ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX, EVERY_MINUTES_MIN,
