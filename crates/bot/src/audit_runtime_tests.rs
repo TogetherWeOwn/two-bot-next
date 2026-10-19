@@ -834,3 +834,240 @@ async fn sweep_logs_carry_ids_and_counts_only() {
     }
     db.close().await.unwrap();
 }
+
+// ------------------------------------------- refresh coherence acceptance --
+// Protected acceptance suite: destination channels and the settings revision
+// must stay coherent under refresh. Written against the existing test surface
+// only (`refresh_channels_with`, `channels_for_test`, the live settings
+// channel); the implementation handoff must make these pass without editing
+// this section. No database, poller or Discord is involved.
+
+fn acceptance_row(key: &str, value: &str) -> SettingRow {
+    SettingRow {
+        guild_id: GUILD.to_owned(),
+        key: key.to_owned(),
+        value: json!(value),
+        version: 1,
+    }
+}
+
+/// Deterministic RED on the baseline: the settings writer republishes to live
+/// readers when the row set changes even at an unchanged revision
+/// (`changed` covers row count), so a refresh that skips solely because the
+/// revision matches its cache strands the previous destinations under the
+/// current revision, and every later current-publication call also skips.
+/// The outcome contract requires that call to repair the destinations to the
+/// currently published snapshot.
+#[test]
+fn acceptance_current_publication_refresh_repairs_destinations_at_reused_revision() {
+    let (mut writer, live) = live_channel();
+    let runtime = unconnected_runtime(all_vars());
+
+    writer.publish(&SettingsSnapshot {
+        revision: 7,
+        rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", "4444")],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test().audit.as_deref(), Some("4444"));
+
+    // Same revision, different published row set: this reaches live readers.
+    writer.publish(&SettingsSnapshot {
+        revision: 7,
+        rows: vec![
+            acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", "5555"),
+            acceptance_row("DISCORD_VOICE_LOG_CHANNEL_ID", "6666"),
+        ],
+    });
+    assert_eq!(live.revision(), 7);
+    runtime.refresh_channels_with(Some(&live));
+    let repaired = runtime.channels_for_test();
+    assert_eq!(
+        repaired.audit.as_deref(),
+        Some("5555"),
+        "a current-publication refresh must not skip needed repair when the \
+         cached revision already matches"
+    );
+    assert_eq!(repaired.voice.as_deref(), Some("6666"));
+    assert_eq!(repaired.moderation.as_deref(), Some(MOD_CH));
+
+    // Rows deleted again at the same revision: destinations fall back to the
+    // boot deployment values instead of stranding the last stored ones.
+    writer.publish(&SettingsSnapshot {
+        revision: 7,
+        rows: vec![],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(
+        runtime.channels_for_test(),
+        channels(),
+        "deleting every stored row hands destinations back to deployment"
+    );
+}
+
+/// Competing refreshes (record and sweep both reach refresh through the wired
+/// path) must converge: after they quiesce, one more refresh against the
+/// current publication leaves exactly that publication's destinations
+/// installed. A late completion of an older snapshot's refresh must never
+/// strand stale destinations that later calls then refuse to repair.
+#[test]
+fn acceptance_competing_refreshes_converge_to_current_publication() {
+    use std::sync::Barrier;
+
+    let (mut writer, live) = live_channel();
+    let runtime = Arc::new(unconnected_runtime(all_vars()));
+
+    for round in 0..600_u64 {
+        let old_audit = format!("{}", 100_000 + round * 2);
+        let new_audit = format!("{}", 100_001 + round * 2);
+        writer.publish(&SettingsSnapshot {
+            revision: (round * 2 + 1) as i64,
+            rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", &old_audit)],
+        });
+
+        // Three competitors refresh the older publication from a barrier
+        // release while this thread publishes and applies the newer one.
+        let barrier = Arc::new(Barrier::new(4));
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let (runtime, live, barrier) = (&runtime, &live, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    runtime.refresh_channels_with(Some(live));
+                });
+            }
+            barrier.wait();
+            writer.publish(&SettingsSnapshot {
+                revision: (round * 2 + 2) as i64,
+                rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", &new_audit)],
+            });
+            runtime.refresh_channels_with(Some(&live));
+        });
+
+        runtime.refresh_channels_with(Some(&live));
+        assert_eq!(
+            runtime.channels_for_test().audit.as_deref(),
+            Some(new_audit.as_str()),
+            "round {round}: destinations must converge to the current \
+             publication, never strand the older snapshot's channels"
+        );
+    }
+}
+
+/// Control: many concurrent refreshes of one unchanged publication are
+/// idempotent and keep the installed destinations exact.
+#[test]
+fn acceptance_concurrent_refresh_of_one_publication_is_idempotent() {
+    let (mut writer, live) = live_channel();
+    let runtime = Arc::new(unconnected_runtime(all_vars()));
+    writer.publish(&SettingsSnapshot {
+        revision: 3,
+        rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", "4444")],
+    });
+
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let (runtime, live) = (&runtime, &live);
+            scope.spawn(move || {
+                for _ in 0..50 {
+                    runtime.refresh_channels_with(Some(live));
+                }
+            });
+        }
+    });
+
+    let settled = runtime.channels_for_test();
+    assert_eq!(settled.audit.as_deref(), Some("4444"));
+    assert_eq!(settled.voice.as_deref(), Some(VOICE_CH));
+    assert_eq!(settled.moderation.as_deref(), Some(MOD_CH));
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test(), settled);
+}
+
+/// Control: a restored snapshot whose revision is numerically lower than the
+/// applied one is legitimate and must be applied — refresh must not grow a
+/// monotonic-only revision policy.
+#[test]
+fn acceptance_restored_lower_revision_snapshot_is_applied() {
+    let (mut writer, live) = live_channel();
+    let runtime = unconnected_runtime(all_vars());
+
+    writer.publish(&SettingsSnapshot {
+        revision: 9,
+        rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", "4444")],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test().audit.as_deref(), Some("4444"));
+
+    writer.publish(&SettingsSnapshot {
+        revision: 4,
+        rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", "5555")],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(
+        runtime.channels_for_test().audit.as_deref(),
+        Some("5555"),
+        "a restored lower-revision snapshot must reload, not be rejected"
+    );
+
+    // And forward again, so neither direction is treated as one-way.
+    writer.publish(&SettingsSnapshot {
+        revision: 9,
+        rows: vec![acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", "4444")],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test().audit.as_deref(), Some("4444"));
+}
+
+/// Controls: malformed last-good, blank-disable and deployment fallback keep
+/// their documented behavior under repeated current-publication refreshes,
+/// and each state can still be left by a later coherent publication.
+#[test]
+fn acceptance_malformed_blank_and_fallback_controls_hold() {
+    let (mut writer, live) = live_channel();
+    let runtime = unconnected_runtime(all_vars());
+
+    // No live reader at all: boot deployment destinations stand.
+    runtime.refresh_channels_with(None);
+    assert_eq!(runtime.channels_for_test(), channels());
+
+    // Malformed stored row: last good destinations stand, repeatedly.
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![acceptance_row(
+            "DISCORD_VOICE_LOG_CHANNEL_ID",
+            "not-a-snowflake",
+        )],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test(), channels());
+
+    // A later valid publication recovers from the malformed one.
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![acceptance_row("DISCORD_VOICE_LOG_CHANNEL_ID", "6666")],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test().voice.as_deref(), Some("6666"));
+
+    // Blanking every destination parks the mirror, repeatedly.
+    writer.publish(&SettingsSnapshot {
+        revision: 3,
+        rows: vec![
+            acceptance_row("DISCORD_AUDIT_LOG_CHANNEL_ID", ""),
+            acceptance_row("DISCORD_VOICE_LOG_CHANNEL_ID", ""),
+            acceptance_row("DISCORD_MODERATION_LOG_CHANNEL_ID", ""),
+        ],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test(), AuditChannelIds::default());
+
+    // Deleting the blanking rows restores the deployment fallback.
+    writer.publish(&SettingsSnapshot {
+        revision: 4,
+        rows: vec![],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test(), channels());
+}

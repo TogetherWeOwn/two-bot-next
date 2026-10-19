@@ -6,6 +6,7 @@ scripts each answer. Nothing here dispatches the workflow.
 """
 
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -113,6 +114,8 @@ def run_blocks():
 TOP = children(LINES, 0)
 JOBS = children(TOP["jobs"][1:], 2)
 GUARD = inline_script(GUARD_STEP)
+RECHECK_STEP = "Re-read the promotion hold and the live revision"
+RECHECK = inline_script(RECHECK_STEP)
 RECORD = inline_script("Record the Worker version and SHA")
 CONFIRM = inline_script("Confirm the taken-over version still serves")
 URL_CHECK = inline_script("Require a production Worker URL distinct from staging")
@@ -183,10 +186,43 @@ def failed_call():
     return subprocess.CalledProcessError(1, ["gh", "api"], "gh: Not Found (HTTP 404)")
 
 
+def fake_readyz_opener(testcase, api, calls):
+    """A loopback /readyz opener shared by the guard and recheck harnesses."""
+    def fake_urlopen(request, timeout):
+        testcase.assertIsInstance(request, urllib.request.Request)
+        testcase.assertEqual(request.get_header("User-agent"), AGENT)
+        calls.append(("production-readyz", {"url": request.full_url, "timeout": timeout}))
+        response = api["production-readyz"]
+
+        class ReadyResponse:
+            status = response.get("status", 200)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return json.dumps(response).encode()
+
+        return ReadyResponse()
+    return fake_urlopen
+
+
 class StaticGuardTests(unittest.TestCase):
-    def test_dispatch_is_the_only_trigger_and_sha_defaults_to_last_staged(self):
+    def test_automatic_triggers_promote_green_staging_and_sha_defaults_to_last_staged(self):
         triggers = children(TOP["on"][1:], 2)
-        self.assertEqual(list(triggers), ["workflow_dispatch"])
+        self.assertEqual(list(triggers), ["workflow_run", "schedule", "workflow_dispatch"])
+        # workflow_run: a completed deploy-staging run on main only. Anything
+        # else (another workflow, another branch, queued/cancelled) never
+        # reaches the guard.
+        run_trigger = "\n".join(triggers["workflow_run"])
+        self.assertIn("workflows: [deploy-staging]", run_trigger)
+        self.assertIn("types: [completed]", run_trigger)
+        self.assertIn("branches: [main]", run_trigger)
+        # schedule: the daily backstop for a soaked commit the event missed.
+        self.assertRegex("\n".join(triggers["schedule"]), r"(?m)^\s*-\s*cron:\s*\"\S+ \S+ \* \* \*\"")
         inputs = children(children(triggers["workflow_dispatch"][1:], 4)["inputs"][1:], 6)
         sha_input = children(inputs["sha"][1:], 8)
         self.assertEqual(value(sha_input["required"]), "false")
@@ -204,8 +240,14 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(value(unstaged["required"]), "false")
         self.assertEqual(value(unstaged["type"]), "boolean")
         self.assertEqual(value(unstaged["default"]), "false")
+        # The error-rate drill switch is dispatch-only rehearsal input, the
+        # same shape as staging: a push can never arm it.
+        drill = children(inputs["inject_error_rate_spike"][1:], 8)
+        self.assertEqual(value(drill["required"]), "false")
+        self.assertEqual(value(drill["type"]), "boolean")
+        self.assertEqual(value(drill["default"]), "false")
         text = "\n".join(TOP["on"])
-        for trigger in ("push", "pull_request", "pull_request_target", "schedule", "workflow_run", "workflow_call"):
+        for trigger in ("push", "pull_request", "pull_request_target", "workflow_call"):
             self.assertNotRegex(text, rf"(?m)^\s*{trigger}:", trigger)
 
     def test_wrangler_and_secrets_only_run_in_the_production_environment(self):
@@ -215,10 +257,11 @@ class StaticGuardTests(unittest.TestCase):
         # the prod schema gate and the prod roles gate. A rollback serves no
         # new schema and waives the ledger check inside the reviewed gate
         # script, never here.
-        self.assertEqual(value(production["needs"]), "[guard, schema-gate, roles-gate]")
+        self.assertEqual(value(production["needs"]), "[guard, soak, recheck, schema-gate, roles-gate]")
         for gate in ("schema-gate", "roles-gate"):
             condition = value(children(JOBS[gate][1:], 4)["if"])
-            self.assertEqual(condition, "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'")
+            self.assertEqual(condition, "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'"
+                                        " && needs.guard.outputs.skip == ''")
         production_if = value(children(JOBS["production"][1:], 4)["if"])
         self.assertIn("needs.guard.outputs.mode == 'rollback'", production_if)
         self.assertIn("needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'", production_if)
@@ -234,13 +277,25 @@ class StaticGuardTests(unittest.TestCase):
             self.assertIn("          environment: production", step)
 
     def test_concurrency_queues_instead_of_cancelling(self):
-        concurrency = children(TOP["concurrency"][1:], 2)
-        self.assertEqual(value(concurrency["group"]), "deploy-production")
-        self.assertEqual(value(concurrency["cancel-in-progress"]), "false")
+        # Job-level concurrency on production and release only: the guard,
+        # gates, soak and recheck run outside the lane, so an automatic run
+        # can never delay an operator rollback behind a sleeping promotion.
+        # The lane keeps the default single pending slot (a third arrival
+        # cancels the queued run), so the recheck skips an automatic run while
+        # an operator dispatch is active instead of entering the lane behind
+        # it. Running jobs are never cancelled (cancel-in-progress is false).
+        self.assertNotIn("concurrency", TOP)
+        for job in ("production", "release"):
+            conc = children(JOBS[job][1:], 4).get("concurrency", [])
+            self.assertIn("group: deploy-production", "\n".join(conc))
+            self.assertIn("cancel-in-progress: false", "\n".join(conc))
+        for job in ("guard", "schema-gate", "roles-gate", "soak", "recheck"):
+            self.assertNotIn("concurrency", children(JOBS[job][1:], 4))
 
     def test_every_job_uses_the_shared_runner_routing(self):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
-        self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "production", "release"])
+        self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak", "recheck",
+                                      "production", "release"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
@@ -301,9 +356,17 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(input_lines, ["SHA: ${{ inputs.sha }}", "ROLLBACK: ${{ inputs.rollback }}",
                                        "IMAGE: ${{ inputs.image }}",
                                        "ALLOW_UNSTAGED: ${{ inputs.allow_unstaged }}",
-                                       "TAKEOVER: ${{ inputs.takeover }}"])
+                                       "TAKEOVER: ${{ inputs.takeover }}",
+                                       "INJECT_ERROR_RATE_SPIKE: ${{ inputs.inject_error_rate_spike }}",
+                                       "INJECT_ERROR_RATE_SPIKE: ${{ github.event_name == 'workflow_dispatch' "
+                                       "&& inputs.inject_error_rate_spike && 'true' || 'false' }}"])
         production = "\n".join(JOBS["production"])
-        self.assertNotIn("inputs.", production)
+        # The error-rate drill switch is the one exception: a pinned
+        # dispatch-only expression (a push or automatic trigger can never
+        # arm it), read by exactly one step.
+        drill_reads = [line for line in production.splitlines() if "inputs." in line]
+        self.assertEqual(len(drill_reads), 1)
+        self.assertIn("github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike", drill_reads[0])
         self.assertIn("ref: ${{ needs.guard.outputs.sha }}", production)
         self.assertIn("persist-credentials: false", production)
         self.assertIn('git merge-base --is-ancestor "$SHA" origin/main', production)
@@ -435,14 +498,137 @@ class StaticGuardTests(unittest.TestCase):
         self.assertNotIn("inputs.takeover", production)
         self.assertIn("TAKEOVER: ${{ needs.guard.outputs.takeover }}", production)
 
+    def test_skipped_runs_deploy_nothing(self):
+        # held, already-live and non-green automatic runs stay green while
+        # deploying nothing: every downstream job requires skip == ''.
+        for gate in ("schema-gate", "roles-gate"):
+            condition = value(children(JOBS[gate][1:], 4)["if"])
+            self.assertIn("needs.guard.outputs.skip == ''", condition)
+        production_if = value(children(JOBS["production"][1:], 4)["if"])
+        self.assertIn("needs.guard.outputs.skip == ''", production_if)
+        release_if = value(children(JOBS["release"][1:], 4)["if"])
+        self.assertEqual(release_if, "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.skip == ''")
+
+    def test_soak_runs_outside_the_production_lane_and_recomputes_the_remainder(self):
+        # The soak sleeps in its own job with no concurrency group, so a
+        # sleeping promotion never holds the deploy-production lane behind
+        # which a rollback would queue. The remainder is recomputed here
+        # from the staging-green timestamp, not carried from guard time.
+        soak_job = "\n".join(JOBS["soak"])
+        self.assertIn("needs: guard", soak_job)
+        condition = value(children(JOBS["soak"][1:], 4)["if"])
+        for needle in ("needs.guard.outputs.skip == ''",
+                       "needs.guard.outputs.mode == 'deploy'",
+                       "needs.guard.outputs.allow_unstaged != 'true'",
+                       "needs.guard.outputs.soak_seconds != '0'"):
+            self.assertIn(needle, condition)
+        self.assertNotIn("concurrency", children(JOBS["soak"][1:], 4))
+        self.assertIn("GREEN_AT: ${{ needs.guard.outputs.green_at }}", soak_job)
+        soak = inline_script("Wait out the remainder of the 30-minute post-staging soak")
+        self.assertIn("SOAK_SECONDS - int(time.time() - green_at)", soak)
+        self.assertIn("time.sleep(remaining)", soak)
+        # An unreadable timestamp soaks the full window, never zero.
+        self.assertIn("remaining = SOAK_SECONDS", soak)
+        # Never interpolate the expression into the script text.
+        self.assertNotIn("${{", soak)
+        production = "\n".join(JOBS["production"])
+        self.assertNotIn("Soak past the staging-green time", production)
+        self.assertNotIn("needs.guard.outputs.soak_seconds", production)
+
+    def test_recheck_rereads_hold_and_live_before_the_deploy(self):
+        # The guard's hold/live verdict goes stale while gates build and the
+        # soak sleeps: the recheck job gates production on a fresh read. It
+        # waits for the soak AND both gates, so the read happens after the
+        # last long build; a hold flipped during the gate builds still skips.
+        recheck_job = "\n".join(JOBS["recheck"])
+        self.assertIn("needs: [guard, soak, schema-gate, roles-gate]", recheck_job)
+        condition = value(children(JOBS["recheck"][1:], 4)["if"])
+        for needle in ("!cancelled()",
+                       "needs.guard.result == 'success'",
+                       "needs.guard.outputs.skip == ''",
+                       "needs.guard.outputs.mode == 'deploy'",
+                       "needs.guard.outputs.auto == 'true'",
+                       "(needs.soak.result == 'success' || needs.soak.result == 'skipped')",
+                       "needs.schema-gate.result == 'success'",
+                       "needs.roles-gate.result == 'success'"):
+            self.assertIn(needle, condition)
+        self.assertIn("HOLD_UNTIL: ${{ vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL }}", recheck_job)
+        self.assertIn("SHA: ${{ needs.guard.outputs.sha }}", recheck_job)
+        # Entering the single-pending lane behind a recovery dispatch would
+        # cancel the queued run, so the recheck skips while a dispatch is
+        # active — and when the runs cannot be listed, so a blind run never
+        # risks the lane.
+        granted = set(children(children(JOBS["recheck"][1:], 4)["permissions"][1:], 6))
+        self.assertEqual(granted, {"contents", "actions"})
+        recheck = inline_script("Re-read the promotion hold and the live revision")
+        for needle in ('f"held until {held.isoformat()}"', 'skip = "live"',
+                       'skip = "older-than-live"',
+                       'skip = "operator-dispatch-active"',
+                       'skip = "dispatch-check-unreadable"',
+                       "actions/workflows/deploy-production.yml/runs",
+                       '"event=workflow_dispatch"',
+                       '("queued", "waiting", "in_progress"'):
+            self.assertIn(needle, recheck)
+        self.assertNotIn("${{", recheck)
+        production_if = value(children(JOBS["production"][1:], 4)["if"])
+        # A failed soak fails closed into no deploy, a cancelled run never
+        # deploys, and a skipped recheck counts only for manual runs: an
+        # automatic run always needs a fresh recheck pass with no skip.
+        self.assertIn("!cancelled()", production_if)
+        self.assertIn("(needs.soak.result == 'success' || needs.soak.result == 'skipped')",
+                      production_if)
+        self.assertIn("needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped'",
+                      production_if)
+        self.assertIn("needs.recheck.result == 'success' && needs.recheck.outputs.skip == ''",
+                      production_if)
+
+    def test_production_error_rate_gate_uses_reviewed_tooling_and_production_bindings(self):
+        production = "\n".join(JOBS["production"])
+        # Reviewed tooling from the workflow commit, never the guarded SHA.
+        self.assertIn("node ../tooling/wrangler/scripts/promotion-error-gate.mjs", production)
+        self.assertIn("METRICS_SCRAPE_TOKEN: ${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}", production)
+        self.assertIn("PRODUCTION_URL: ${{ vars.PRODUCTION_WORKER_URL }}", production)
+        self.assertNotIn("STAGING_METRICS_SCRAPE_TOKEN", production)
+        by_name = {step[0].strip(): step for step in steps(JOBS["production"])}
+        gate = by_name["- name: Gate promotion on REST 5xx error rate"]
+        self.assertIn("id: error_rate_gate", "\n".join(gate))
+        # After a rollback restore there is nothing to roll back to: the
+        # gate must not fail the recovery run red.
+        conditions = [line.strip() for line in gate if line.strip().startswith("if:")]
+        self.assertEqual(conditions, ["if: env.MODE == 'deploy'"], gate)
+
+    def test_drill_switch_reaches_the_guard_and_refuses_unrollbackable_runs(self):
+        # The drill proves the fail-to-rollback chain, which exists only on
+        # a deploy-mode run with takeover: anything else refuses in the
+        # guard instead of leaving the drill build serving.
+        guard_job = "\n".join(JOBS["guard"])
+        self.assertIn("INJECT_ERROR_RATE_SPIKE: ${{ inputs.inject_error_rate_spike }}", guard_job)
+        for needle in ("inject_error_rate_spike needs deploy mode",
+                       "inject_error_rate_spike needs takeover true",
+                       "inject_error_rate_spike never applies to an automatic run"):
+            self.assertIn(needle, GUARD)
+        run = inline_script("Gate promotion on REST 5xx error rate")
+        for needle in ('--metrics-url "$PRODUCTION_URL"', "--evidence",
+                       '--sha "$SHA"', '--user-agent "two-bot-next-production-rollout/1.0"',
+                       "--rehearsal-firing", '[ "$INJECT_ERROR_RATE_SPIKE" = "true" ]'):
+            self.assertIn(needle, run)
+        # The evidence filename appears exactly twice: the --evidence write
+        # path and the read-back print, which must name the same file.
+        self.assertEqual(run.count("production-error-rate-gate.json"), 2)
+        self.assertNotIn("${{", run)
+
 
 class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
-              ref="refs/heads/main", auto="", resolved_sha=None, **responses):
+              ref="refs/heads/main", auto="", resolved_sha=None, event="workflow_dispatch",
+              run_sha="", run_conclusion="", run_updated="", hold="", spike="", **responses):
         if image is None:
             image = IMAGE if rollback else ""
         api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
-               "production-readyz": {"status": 200, "build_revision": SHA}, **responses}
+               "production-readyz": {"status": 200, "build_revision": SHA},
+               # Older-than-live compare (compare/{sha}...{live}): the default
+               # live build is behind the target, so automatic runs proceed.
+               "compare-live": {"status": "behind"}, **responses}
         calls = []
         resolved = sha.strip().lower() or (SHA if not rollback else "")
         # R1 short-SHA fixture routing: a 7-39 hex prefix of SHA (other than the
@@ -470,6 +656,11 @@ class GuardBehaviourTests(unittest.TestCase):
                 raise failed_call()
             if path == f"repos/{REPO}/compare/{downstream}...main":
                 key = "compare"
+            elif (path.startswith(f"repos/{REPO}/compare/{downstream}...")
+                    and re.fullmatch(r"[0-9a-f]{40}", path.split("...")[-1])):
+                # Older-than-live check: whether the live revision already
+                # contains the guarded SHA.
+                key = "compare-live"
             elif path == f"repos/{REPO}/commits/{downstream}/check-runs":
                 self.assertEqual(query["app_id"], "15368")
                 self.assertEqual(query["filter"], "latest")
@@ -524,31 +715,17 @@ class GuardBehaviourTests(unittest.TestCase):
                 ]}
             return result if isinstance(result, str) else json.dumps(result)
 
-        def fake_urlopen(request, timeout):
-            self.assertIsInstance(request, urllib.request.Request)
-            self.assertEqual(request.get_header("User-agent"), AGENT)
-            calls.append(("production-readyz", {"url": request.full_url, "timeout": timeout}))
-            response = api["production-readyz"]
-
-            class ReadyResponse:
-                status = response.get("status", 200)
-
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *_):
-                    return False
-
-                def read(self):
-                    return json.dumps(response).encode()
-
-            return ReadyResponse()
+        fake_urlopen = fake_readyz_opener(self, api, calls)
 
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             output, summary = Path(tmp) / "output", Path(tmp) / "summary"
             env = {
                 "GITHUB_REPOSITORY": REPO, "GITHUB_REF": ref, "SHA": sha, "ROLLBACK": rollback,
                 "IMAGE": image, "TAKEOVER": takeover, "ALLOW_UNSTAGED": allow_unstaged,
+                "EVENT_NAME": event,
+                "WORKFLOW_RUN_SHA": run_sha, "WORKFLOW_RUN_CONCLUSION": run_conclusion,
+                "WORKFLOW_RUN_UPDATED_AT": run_updated, "HOLD_UNTIL": hold,
+                "INJECT_ERROR_RATE_SPIKE": spike,
                 "PRODUCTION_WORKER_URL": "https://production.example.test",
                 "AUTO_APPROVE": auto,
                 "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
@@ -574,11 +751,57 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("::error::Refusing production", stdout)
         self.assertIn(reason, stdout)
 
+    def recheck(self, sha=SHA, hold="", **responses):
+        api = {"production-readyz": {"status": 200, "build_revision": "f" * 40},
+               "compare-live": {"status": "behind"},
+               "dispatch-runs": {"workflow_runs": []}, **responses}
+        calls = []
+
+        def fake_check_output(args, **kwargs):
+            self.assertEqual(args[:4], ["gh", "api", "--method", "GET"])
+            path, query = args[4], dict(arg.split("=", 1) for arg in args[6::2])
+            calls.append((path, query))
+            if (path.startswith(f"repos/{REPO}/compare/{sha.lower()}...")
+                    and re.fullmatch(r"[0-9a-f]{40}", path.split("...")[-1])):
+                result = api["compare-live"]
+            elif path == f"repos/{REPO}/actions/workflows/deploy-production.yml/runs":
+                self.assertEqual(query.get("event"), "workflow_dispatch")
+                result = api["dispatch-runs"]
+            else:
+                self.fail(f"unexpected API call {path}")
+            if isinstance(result, Exception):
+                raise result
+            return result if isinstance(result, str) else json.dumps(result)
+
+        fake_urlopen = fake_readyz_opener(self, api, calls)
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            output, summary = Path(tmp) / "output", Path(tmp) / "summary"
+            env = {
+                "GITHUB_REPOSITORY": REPO, "SHA": sha, "HOLD_UNTIL": hold,
+                "PRODUCTION_WORKER_URL": "https://production.example.test",
+                "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
+            }
+            stdout, code = io.StringIO(), 0
+            with patch.dict(os.environ, env, clear=True), \
+                    patch("subprocess.check_output", side_effect=fake_check_output), \
+                    patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                    contextlib.redirect_stdout(stdout):
+                try:
+                    exec(RECHECK, {})
+                except SystemExit as exit_:
+                    code = exit_.code
+            outputs = dict(
+                line.split("=", 1) for line in (output.read_text().splitlines() if output.exists() else [])
+            )
+            return code, outputs, summary.read_text() if summary.exists() else "", calls, stdout.getvalue()
+
     def test_green_main_sha_passes_and_reports(self):
         code, outputs, summary, calls, _ = self.guard()
         self.assertEqual(code, 0)
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
-                                   "takeover": "false", "allow_unstaged": "false"})
+                                   "takeover": "false", "allow_unstaged": "false",
+                                   "skip": "", "soak_seconds": "0",
+                                   "auto": "false", "green_at": ""})
         self.assertIn("Takeover: not requested", summary)
         self.assertIn(SHA, summary)
         self.assertIn("full `ci-ok` verdict", summary)
@@ -707,7 +930,8 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(outputs, {"sha": SHA, "mode": "rollback", "version": VERSION,
                                    "restore_image": IMAGE, "takeover": "false",
-                                   "allow_unstaged": "false"})
+                                   "allow_unstaged": "false", "skip": "", "soak_seconds": "0",
+                                   "auto": "false", "green_at": ""})
         self.assertIn(VERSION, summary)
 
     def test_rollback_needs_the_previous_container_image(self):
@@ -748,7 +972,9 @@ class GuardBehaviourTests(unittest.TestCase):
             staging={"total_count": 0, "workflow_runs": []})
         self.assertEqual(code, 0)
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
-                                   "takeover": "true", "allow_unstaged": "true"})
+                                   "takeover": "true", "allow_unstaged": "true",
+                                   "skip": "", "soak_seconds": "0",
+                                   "auto": "false", "green_at": ""})
         self.assertIn("operator confirms the SHA is live", summary)
         self.assertIn(("production-readyz", {"url": "https://production.example.test/readyz", "timeout": 10}), calls)
         self.assertFalse(any("deploy-staging" in path for path, _ in calls))
@@ -1017,7 +1243,9 @@ class GuardBehaviourTests(unittest.TestCase):
         code, outputs, summary, calls, _ = self.guard(auto="true", environment=environment)
         self.assertEqual(code, 0)
         self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
-                                   "takeover": "false", "allow_unstaged": "false"})
+                                   "takeover": "false", "allow_unstaged": "false",
+                                   "skip": "", "soak_seconds": "0",
+                                   "auto": "false", "green_at": ""})
         self.assertIn("Approval: automated", summary)
         self.assertIn("deploy-staging run `501`", summary)
         self.assertTrue(any(path.endswith("deploy-staging.yml/runs") and "status" not in q for path, q in calls))
@@ -1066,6 +1294,256 @@ class GuardBehaviourTests(unittest.TestCase):
         result = self.guard(auto="true", environment=environment, takeover="true", allow_unstaged="true")
         self.assertRefused(result, "no required reviewers")
 
+    def test_unexpected_trigger_is_refused(self):
+        result = self.guard(event="push")
+        self.assertRefused(result, "unexpected trigger")
+        self.assertEqual(result[3], [])
+
+    def test_automatic_run_refuses_rollback_inputs(self):
+        # Recovery is always an explicit operator dispatch, never automatic.
+        result = self.guard(event="schedule", rollback=VERSION, image=IMAGE)
+        self.assertRefused(result, "rollback inputs never apply to an automatic run")
+        self.assertEqual(result[3], [])
+
+    def test_workflow_run_without_success_skips_green(self):
+        # A red staging completion promotes nothing: green, no API storm.
+        for conclusion in ("failure", "cancelled", ""):
+            with self.subTest(conclusion=conclusion):
+                code, outputs, summary, calls, _ = self.guard(
+                    event="workflow_run", sha="", run_sha=SHA, run_conclusion=conclusion)
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs["skip"], "staging-not-green")
+                self.assertEqual(outputs["sha"], SHA)
+                self.assertEqual(calls, [])
+                self.assertIn("nothing to promote", summary)
+
+    def test_workflow_run_green_promotes_latest_not_its_sha_with_takeover_and_soak(self):
+        # Automatic promotion is the empty-sha dispatch with takeover, plus
+        # the remaining soak past the staging-green time. A green completion
+        # promotes the LATEST successful staging deploy, never the triggering
+        # run's SHA: the trigger here names an older run, which must not
+        # downgrade production.
+        old_run_sha = "e" * 40
+        now = datetime.datetime.now(datetime.timezone.utc)
+        green_at = (now - datetime.timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        code, outputs, summary, calls, _ = self.guard(
+            event="workflow_run", sha="", run_sha=old_run_sha, run_conclusion="success",
+            **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
+               "staging": {"total_count": 1, "workflow_runs": [
+                   {"conclusion": "success", "updated_at": green_at}]}})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["sha"], SHA)
+        self.assertNotEqual(outputs["sha"], old_run_sha)
+        self.assertEqual(outputs["takeover"], "true")
+        self.assertEqual(outputs["allow_unstaged"], "false")
+        self.assertEqual(outputs["skip"], "")
+        self.assertEqual(outputs["auto"], "true")
+        self.assertTrue(outputs["green_at"], outputs)
+        self.assertTrue(1700 <= int(outputs["soak_seconds"]) <= 1800, outputs)
+        self.assertIn("automatic", summary)
+        self.assertIn("Soak:", summary)
+        # The target came from the latest-successful selection, not the trigger.
+        self.assertEqual(calls[0][0], f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs")
+
+    def test_target_older_than_live_skips_green(self):
+        # The live build already contains the target: deploying it would be
+        # an unrequested downgrade with newer migrations under older code.
+        # Intentional downgrades stay an explicit operator rollback.
+        live = "b" * 40
+        code, outputs, summary, _, _ = self.guard(
+            event="schedule", sha="",
+            **{"production-readyz": {"status": 200, "build_revision": live},
+               "compare-live": {"status": "ahead"}})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["skip"], "older-than-live")
+        self.assertIn("nothing is deployed", summary)
+
+    def test_unknown_live_revision_falls_through_to_gates(self):
+        # The older-than-live check is non-refusing: an unreadable live
+        # revision, or a failed compare read, still deploys under the guard's
+        # gates instead of refusing a deployable build.
+        code, outputs, _, _, _ = self.guard(
+            event="schedule", sha="",
+            **{"production-readyz": {"status": 500, "build_revision": SHA},
+               "compare-live": failed_call(),
+               "staging": {"total_count": 1, "workflow_runs": [{"conclusion": "success"}]}})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["skip"], "")
+        code, outputs, _, calls, _ = self.guard(
+            event="schedule", sha="",
+            **{"production-readyz": {"status": 200, "build_revision": "c" * 40},
+               "compare-live": failed_call(),
+               "staging": {"total_count": 1, "workflow_runs": [{"conclusion": "success"}]}})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["skip"], "")
+        self.assertTrue(any(path.startswith(f"repos/{REPO}/compare/") for path, _ in calls))
+
+    def test_schedule_after_rollback_stays_held_when_hold_set(self):
+        # After a manual rollback the next automatic run re-selects the
+        # staged build it just rolled back: the operator holds promotion
+        # until the incident is resolved, or the backstop redeploys it.
+        code, outputs, _, _, _ = self.guard(
+            event="schedule", sha="", hold="2999-01-01T00:00:00Z",
+            **{"production-readyz": {"status": 200, "build_revision": "a" * 40},
+               "compare-live": {"status": "behind"}})
+        self.assertEqual(code, 0)
+        self.assertTrue(outputs["skip"].startswith("held until"), outputs)
+
+    def test_drill_spike_without_takeover_is_refused(self):
+        # Without takeover a failed gate cannot roll back: the drill would
+        # leave its build serving and prove nothing.
+        result = self.guard(spike="true", takeover="false")
+        self.assertRefused(result, "inject_error_rate_spike needs takeover true")
+
+    def test_drill_spike_in_rollback_mode_is_refused(self):
+        # After a restore there is nothing to roll back to: the drill would
+        # fail the recovery run red with no action possible.
+        result = self.guard(spike="true", takeover="true", rollback=VERSION)
+        self.assertRefused(result, "inject_error_rate_spike needs deploy mode")
+
+    def test_drill_spike_on_an_automatic_run_is_refused(self):
+        result = self.guard(event="schedule", sha="", spike="true",
+                            **{"production-readyz": {"status": 200, "build_revision": "f" * 40}})
+        self.assertRefused(result, "inject_error_rate_spike never applies to an automatic run")
+
+    def test_drill_spike_with_takeover_in_deploy_mode_passes(self):
+        code, outputs, _, _, _ = self.guard(spike="true", takeover="true")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["skip"], "")
+
+    def test_schedule_promotes_the_latest_staged_commit(self):
+        code, outputs, _, calls, stdout = self.guard(event="schedule", sha="")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["sha"], SHA)
+        self.assertEqual(outputs["takeover"], "true")
+        self.assertIn("Promoting the latest successful staging deploy", stdout)
+        self.assertEqual(calls[0][0], f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs")
+
+    def test_stale_staging_needs_no_soak(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        green_at = (now - datetime.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _, outputs, _, _, _ = self.guard(
+            event="schedule", sha="",
+            **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
+               "staging": {"total_count": 1, "workflow_runs": [
+                   {"conclusion": "success", "updated_at": green_at}]}})
+        self.assertEqual(outputs["skip"], "")
+        self.assertEqual(outputs["soak_seconds"], "0")
+
+    def test_unreadable_staging_time_soaks_the_full_window(self):
+        # A missing timestamp must not skip the soak: fail closed.
+        _, outputs, _, _, _ = self.guard(
+            event="schedule", sha="",
+            **{"production-readyz": {"status": 200, "build_revision": "f" * 40}})
+        self.assertEqual(outputs["skip"], "")
+        self.assertEqual(outputs["soak_seconds"], "1800")
+
+    def test_live_target_skips_green(self):
+        # The default readyz fixture already serves the SHA: an automatic
+        # run then deploys nothing.
+        code, outputs, summary, _, _ = self.guard(event="schedule", sha="")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["skip"], "live")
+        self.assertIn("nothing is deployed", summary)
+
+    def test_hold_skips_until_expiry_then_proceeds(self):
+        code, outputs, summary, _, _ = self.guard(event="schedule", sha="", hold="2999-01-01T00:00:00Z")
+        self.assertEqual(code, 0)
+        self.assertTrue(outputs["skip"].startswith("held until"), outputs)
+        self.assertIn("nothing is deployed", summary)
+        code, outputs, _, _, _ = self.guard(
+            event="schedule", sha="", hold="2020-01-01T00:00:00Z",
+            **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
+               "staging": {"total_count": 1, "workflow_runs": [{"conclusion": "success"}]}})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["skip"], "")
+
+    def test_hold_without_a_zone_or_shape_is_refused(self):
+        for hold in ("tomorrow", "2026-10-20T07:42:00", "2026-13-01T00:00:00Z"):
+            with self.subTest(hold=hold):
+                self.assertRefused(self.guard(event="schedule", sha="", hold=hold), "promotion hold")
+
+    def test_manual_dispatch_ignores_the_hold_and_never_soaks(self):
+        # An explicit operator dispatch is intent: hold and soak do not gate it.
+        code, outputs, _, _, _ = self.guard(hold="2999-01-01T00:00:00Z")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["skip"], "")
+        self.assertEqual(outputs["soak_seconds"], "0")
+        self.assertEqual(outputs["takeover"], "false")
+
+    def test_recheck_passes_without_hold_and_fresh_live(self):
+        code, outputs, summary, _, _ = self.recheck()
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, {"skip": ""})
+        self.assertIn("Pre-deploy recheck passed", summary)
+
+    def test_recheck_skips_when_the_hold_flips_after_the_guard(self):
+        # The incident starts while the gates build or the soak sleeps: the
+        # operator sets the hold, and the recheck stops the promotion green
+        # instead of deploying through it.
+        code, outputs, summary, _, _ = self.recheck(hold="2999-01-01T00:00:00Z")
+        self.assertEqual(code, 0)
+        self.assertTrue(outputs["skip"].startswith("held until"), outputs)
+        self.assertIn("nothing is deployed", summary)
+        code, outputs, _, _, _ = self.recheck(hold="2020-01-01T00:00:00Z")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, {"skip": ""})
+
+    def test_recheck_skips_live_and_older_than_live(self):
+        code, outputs, _, _, _ = self.recheck(
+            **{"production-readyz": {"status": 200, "build_revision": SHA}})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, {"skip": "live"})
+        code, outputs, _, _, _ = self.recheck(
+            **{"production-readyz": {"status": 200, "build_revision": "b" * 40},
+               "compare-live": {"status": "identical"}})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, {"skip": "older-than-live"})
+
+    def test_recheck_falls_through_on_unreadable_live(self):
+        code, outputs, _, _, _ = self.recheck(
+            **{"production-readyz": {"status": 500, "build_revision": SHA},
+               "compare-live": failed_call()})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, {"skip": ""})
+
+    def test_recheck_skips_while_an_operator_dispatch_is_active(self):
+        # Entering the single-pending lane behind a recovery dispatch would
+        # cancel the queued run: an active dispatch stops the promotion green.
+        # Completed dispatch history does not block it.
+        for status in ("queued", "waiting", "in_progress"):
+            with self.subTest(status=status):
+                code, outputs, _, _, _ = self.recheck(
+                    **{"dispatch-runs": {"workflow_runs": [
+                        {"status": "completed", "conclusion": "success"},
+                        {"status": status, "conclusion": None}]}})
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs, {"skip": "operator-dispatch-active"})
+        code, outputs, _, _, _ = self.recheck(
+            **{"dispatch-runs": {"workflow_runs": [
+                {"status": "completed", "conclusion": "success"}]}})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, {"skip": ""})
+
+    def test_recheck_skips_when_dispatch_runs_are_unreadable(self):
+        # A blind run never risks the lane: when the dispatch list cannot be
+        # read, the promotion skips green and the backstop retries it.
+        for unreadable in (failed_call(), {"workflow_runs": [7]},
+                           {"workflow_runs": None}, {"total_count": 0}):
+            with self.subTest(unreadable=unreadable):
+                code, outputs, _, _, _ = self.recheck(
+                    **{"dispatch-runs": unreadable})
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs, {"skip": "dispatch-check-unreadable"})
+
+    def test_recheck_refuses_an_unparseable_hold(self):
+        for hold in ("tomorrow", "2026-10-20T07:42:00"):
+            with self.subTest(hold=hold):
+                code, outputs, _, _, stdout = self.recheck(hold=hold)
+                self.assertEqual(code, 1)
+                self.assertEqual(outputs, {})
+                self.assertIn("promotion hold", stdout)
+
     def test_reviewed_tooling_runs_from_the_workflow_commit(self):
         # A rollback targets an older SHA that predates these scripts, so
         # the guarded checkout may not contain them; reviewed tooling runs
@@ -1076,6 +1554,7 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("../tooling/scripts/worker_container_rollback.py", production)
         self.assertIn("../tooling/scripts/production_deploy.py", production)
         self.assertIn("../tooling/wrangler/scripts/production-ownership-control.mjs", production)
+        self.assertIn("../tooling/wrangler/scripts/promotion-error-gate.mjs", production)
         self.assertIn("tooling/scripts/ci/production_schema_gate.py",
                       "\n".join(JOBS["schema-gate"]))
         roles_gate = "\n".join(JOBS["roles-gate"])
