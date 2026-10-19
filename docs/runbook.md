@@ -494,9 +494,17 @@ checked-in slow-burn verdict over its cached ring and reconciles the
 `slow-burn` label: no open card means file one, an open card stays untouched
 (a refresh comment lands at most every six hours, so a refire never
 duplicates the card), and a cleared burn resolves and closes it. An unknown
-verdict — a failed scrape or evaluation, unusable join series, or slow
-windows without full history — never closes the card, and a lost ring
-rebuilds instead of firing. The five-minute cadence is load-bearing for
+verdict — a failed scrape or evaluation, any scrape refused by the Worker's
+strict `parseAlertScrape` validator (including corrupt non-join series), or
+slow windows without full history — never closes the card. A refused scrape
+is held: no issue is filed, refreshed or closed, and neither ring nor coverage
+cache is rewritten. A lost, malformed or over-1 MiB ring rebuilds instead of
+firing; an over-cap coverage sidecar discards old stamps and seeds fresh
+tracking. Cache reads are byte-bounded before buffering. Driver and issue-list
+JSON answers are limited to 1 MiB of UTF-8 before JSON decoding; malformed,
+excessively nested or over-cap answers fail with a fixed-vocabulary error and
+an evidence receipt, never a raw parser traceback. Issue rows require positive
+integer numbers (not booleans) before choosing the oldest open issue. The five-minute cadence is load-bearing for
 the six-hour baseline: GitHub runs `*/5` best-effort, so when the newest
 ring entry is 600 s or older the run emits a `::warning::` instead of
 reading green-with-unknown. Entry age alone cannot prove coverage — sub-600 s
