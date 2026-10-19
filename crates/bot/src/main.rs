@@ -69,6 +69,8 @@ mod join_risk_runtime;
 #[cfg(test)]
 mod join_risk_runtime_tests;
 #[cfg(test)]
+mod join_risk_tuning_refusal_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod log_volume_guard_tests;
