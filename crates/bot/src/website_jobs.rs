@@ -45,6 +45,10 @@ mod tests;
 #[path = "website_snapshot_tests.rs"]
 mod snapshot_tests;
 
+#[cfg(test)]
+#[path = "website_rank_repair_acceptance_tests.rs"]
+mod rank_repair_acceptance_tests;
+
 #[derive(Clone, Copy)]
 pub enum Kind {
     Counter,
