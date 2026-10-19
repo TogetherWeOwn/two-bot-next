@@ -1362,6 +1362,11 @@ export class TwoBotContainer extends Container<Env> {
           let status: number | null = null;
           let probe: ProbeDetail = { failure: null };
           try {
+            // Refresh the release tag before any error event below: a failed
+            // probe must not reuse a previous image's SHA. containerFetch can
+            // trigger startup and port checks, and the SDK awaits onError from
+            // those paths, so the clear must precede the fetch.
+            this.lastRelease = null;
             const probeSignal = AbortSignal.timeout(6000);
             const res = await deadlineFetch(
               this.containerFetch("http://c/readyz", { signal: probeSignal }), probeSignal);
@@ -1372,9 +1377,6 @@ export class TwoBotContainer extends Container<Env> {
             // is a failed probe, never a buffered parse. Small bodies still
             // drain fully, so the SDK 0.3.7 proxy pipe settles cleanly.
             const body = await readBoundedText(res, MAX_PROBE_BODY_BYTES, probeSignal);
-            // Refresh the release tag before any error event below: a failed
-            // probe must not reuse a previous image's SHA.
-            this.lastRelease = null;
             if (probeSignal.aborted) {
               // A probe that only completed past its deadline is no evidence
               // of readiness: record it as failed, never as recovery.
@@ -1732,6 +1734,9 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   override onStop(): void {
+    // A stop invalidates the parsed release: the replacement image is
+    // unprobed, so its startup failure must stamp "unknown", not the old SHA.
+    this.lastRelease = null;
     console.log("two-bot container stopped");
   }
 
