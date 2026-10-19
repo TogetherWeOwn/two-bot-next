@@ -145,7 +145,18 @@ pub async fn resolve_scheduled_id(
     }
 }
 
-/// One guild's definitions in ticker order (legacy `listScheduled`).
+/// Guild-listing read cap: a long-lived guild can hold more rows than the
+/// quota-admission write path allows (legacy rows, direct repairs), so the
+/// list read stays bounded at exactly the per-guild schedule quota. Every
+/// guild whose rows came through [`put_scheduled`] lists in full; callers
+/// render `(truncated, N more)` (see [`crate::scheduled`]) when the guild
+/// holds more. Pinned by acceptance: raising this breaks the cap tests.
+pub const SCHEDULE_LIST_CAP: i64 = AutomationQuota::Schedules.limit();
+
+/// One guild's definitions in list order: ascending (`next_run_at`, `id`),
+/// so tied run times keep a deterministic id order for paged discovery.
+/// Capped at [`SCHEDULE_LIST_CAP`] earliest rows — pair with
+/// [`count_scheduled`] to size the overflow line.
 pub async fn list_scheduled(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -154,9 +165,45 @@ pub async fn list_scheduled(
         "SELECT id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
                 last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
                 claim_token, claimed_at, occurrence_nonce
-           FROM scheduled_messages WHERE guild_id = $1 ORDER BY next_run_at",
+           FROM scheduled_messages WHERE guild_id = $1 ORDER BY next_run_at, id LIMIT $2",
     )
     .bind(guild_id)
+    .bind(SCHEDULE_LIST_CAP)
+    .fetch_all(pool)
+    .await
+}
+
+/// Count one guild's definitions: the overflow-line denominator for a
+/// [`SCHEDULE_LIST_CAP`]-capped [`list_scheduled`] read. Only call it when
+/// the capped read came back full — under-cap guilds need no second query.
+pub async fn count_scheduled(pool: &Pool<Postgres>, guild_id: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT count(*) FROM scheduled_messages WHERE guild_id = $1")
+        .bind(guild_id)
+        .fetch_one(pool)
+        .await
+}
+
+/// One hidden window past the capped read, in the same list order:
+/// ascending (`next_run_at`, `id`). The `/schedule-list` pager calls this
+/// only when the capped read came back full and the count proves more rows
+/// exist, and only for `page` past the first window's packed pages — page 1
+/// never pays for it. `limit` stays bounded (callers pass
+/// [`SCHEDULE_LIST_CAP`]); `offset` is the capped prefix to skip.
+pub async fn list_scheduled_window(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ScheduledMessageRow>, sqlx::Error> {
+    sqlx::query_as::<_, ScheduledMessageRow>(
+        "SELECT id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
+                claim_token, claimed_at, occurrence_nonce
+           FROM scheduled_messages WHERE guild_id = $1 ORDER BY next_run_at, id LIMIT $2 OFFSET $3",
+    )
+    .bind(guild_id)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
 }

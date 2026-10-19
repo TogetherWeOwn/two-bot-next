@@ -79,13 +79,17 @@ with shared admission:
 - Paced lane 110 ms, kick lane 350 ms (`PACE_INTERVAL_MS` at
   `executor.rs:66`, `KICK_INTERVAL_MS` at `executor.rs:69`, wired at
   `executor.rs:971-972`).
-- Paced GETs retry 429 with `retry_after_wait_ms()` and spend one of the
-  same 5 tries per 429/5xx/transport failure; a steady 429 stream exhausts
-  the budget instead of parking forever (`get_json_observed` at
-  `executor.rs:1753`, 429 arm at `executor.rs:1791-1805`). In the kick
-  path, a global 429 uses the header-anchored shared deadline at the next
-  admission, while route-local 429s sleep locally
-  (`executor.rs:1686-1691`).
+- The backfill evidence reads (`get_json_observed`, `get_json_checked`)
+  retry a per-route 429 by waiting out the header unclamped — one sleep per
+  429 — bounded by a 5 min ceiling per wait
+  (`MAX_BACKFILL_RETRY_AFTER_MS` in `crates/core/src/action_outcomes.rs`),
+  and spend one of the same 5 tries per 429/5xx/transport failure; a steady
+  429 stream exhausts the budget instead of parking forever. The general
+  `get_json` read (containment snapshot, website jobs, onboarding probe)
+  keeps the 60 s `retry_after_wait_ms()` clamp, as do the kick, publish
+  and registry lanes. In the kick path, a global 429 uses the
+  header-anchored shared deadline at the next admission, while route-local
+  429s sleep locally.
 - The process-wide guard (`crates/discord/src/ratelimit_guard.rs`) counts
   401/403/429 toward the invalid-request budget — 10-minute rolling window
   (`INVALID_REQUEST_WINDOW:15`), default threshold 5 000 (production
@@ -180,7 +184,7 @@ in §1.
 | `backfill-messages` (first/second/third message milestones) | `backfill-messages --dry-run` (flag `backfill_messages.rs:29`) | bare writes; milestones only ever move earlier, never later (module docs `1-8`) | banner (`76-80`); ladder writes and activity touches gated (`258-294`) |
 | `capture` (join capture) | `capture --dry-run` (flag `capture.rs:26`) | bare writes | banner (`68-70`); writes gated (`145`, `167`) |
 | `dedupe-events` (clear double-logged joins/leaves) | default: counts without writing (`dedupe_events.rs:72`) | bare `--apply` deletes in 200-id chunks (`133-143`); prints `deleted {n}` | `DRY RUN - nothing will be deleted` (`78-82`); dry prints `would delete {found}` plus per-type rows/people/dupes and the remaining total (`124-129`, `159-166`) |
-| retention job (supervised bot job; `retention_jobs.rs`) | `TWO_RETENTION_MODE` unset (default) or `dry-run` reports per-class counts without deleting; runs every 15 minutes (`retention_jobs.rs:23,29,33-43`) | `TWO_RETENTION_MODE=execute` enables deletes; `off` parks the job. See [privacy retention settings](privacy.md#retention-and-explicit-exceptions) | per-class counts are `presence_raw_deleted`/`voice_raw_deleted`/`audit_cache_deleted`/`guild_rows_purged` (`retention.rs:82-90`); receipts, not row counts, for user deletions (`140-144`); `total_deleted` sums disjoint row classes (`146-151`) |
+| retention job (supervised bot job; `retention_jobs.rs`) | `TWO_RETENTION_MODE` unset (default) or `dry-run` reports per-class counts without deleting; runs every 15 minutes (`retention_jobs.rs:23,29,33-43`) | `TWO_RETENTION_MODE=execute` enables deletes; `off` parks the job. See [privacy retention settings](privacy.md#retention-and-explicit-exceptions) | per-class counts are `presence_raw_deleted`/`voice_raw_deleted`/`audit_cache_deleted`/`guild_rows_purged` (`retention.rs:82-90`); receipts, not row counts, for user deletions (`140-144`); `total_deleted` sums disjoint row classes (`146-151`). Stale game-activity aggregates log a `game_activity_aggregate_expiry` event in both modes (`stale_rows`, `horizon_days`, `mode`, `guilds_visited`, `guilds_deferred`): dry run counts the visited page's full stale rows without deleting (a same-predicate upper bound per pass), execute deletes at most the per-guild row batch per visited guild |
 
 Safety rails, verified in code:
 

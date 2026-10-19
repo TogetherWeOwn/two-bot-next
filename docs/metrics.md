@@ -24,6 +24,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_missed_events_total` | Dispatches Discord assigned but this process never received (sequence gaps inside one session). Any nonzero increase over the watch window fails the zero-missed-events acceptance |
 | `two_bot_gateway_events_total{event}` | Received dispatches, including replays/duplicates, plus heartbeat ACKs and closes; fixed type allowlist, remainder `other` |
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert). Fixed three series from process start; no user, activity, application or free-text labels |
+| `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels |
 | `two_bot_handler_duration_seconds` | Cumulative histogram over nonduplicate dispatch parse/pipeline/durable commit, including failures; seconds |
 | `two_bot_rest_requests_total{route,result}` | Executor HTTP sends, including retries; result `2xx`, `3xx`, `4xx`, `429`, `5xx` at response headers or `transport` (failure/cancellation/timeout before headers); later body failures do not hide 429/5xx |
 | `two_bot_rest_guard_invalid_requests_total` | Shared guard observations of 401, 403 or 429 response headers, across guarded REST callers |
@@ -59,6 +60,8 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_worker_halted` | Guild-actor halt latch: 1 while any guild actor is halted by a store CredentialRefused or Discord 401 (only store halts auto-recover; 401s need a token fix + restart); aggregated over all current guild actors, so a healthy guild cannot hide another guild's halt |
 | `two_bot_voice_queue_pending{lane}` | Queued (not in-flight) voice actions, summed across all current guild actors per lane; `lane` is `urgent` or `deferred` |
 | `two_bot_voice_queue_oldest_age_seconds` | Age of the oldest queued voice action in seconds, the maximum across all current guild actors; 0 when every queue is empty |
+| `two_bot_voice_live_not_ready_seconds` | Seconds a guild's live voice view has been not ready while the gateway is connected (READY or RESUMED handled), the maximum across all current guild actors, republished every actor tick; 0 when every view is ready or the gateway is down. While above 0 creator joins in that guild are dropped without an accept or refusal line and `two_bot_voice_joins_received_total` stays flat; every dispatch retries the cached snapshot, so a value that keeps climbing past 120 s needs a restart and a bug report |
+| `two_bot_voice_live_self_heal_total` | Live voice views republished from the gateway cache because they were not ready on a connected gateway; any increase is a fault the self-heal covered, worth a look in the container logs (`voice live view was not ready on a connected gateway`) |
 | `two_bot_voice_rest_in_flight_age_seconds` | Age of the oldest in-flight voice REST attempt in seconds; 0 when idle |
 | `two_bot_voice_creator_map_generation` | Last merged creator-map generation; 0 before the first merge — a flat line across reconnects means the map stopped converging |
 | `two_bot_voice_creator_map_age_seconds` | Seconds since the last successful creator-map merge, republished every actor tick; 0 when never merged — climbing past the 5 min refresh interval means merges stopped landing; the `voice_creator_map_stale` rule pages past 600 s once a merge has landed |
@@ -66,21 +69,25 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_dispatch_timeouts_total` | Actor dispatch turns that ran past the observe bound (run to completion; counted after the fact); the queue keeps its retries |
 | `two_bot_voice_watchdog_stucks_total` | Watchdog firings: queued work with no dispatch progress inside the window |
 | `two_bot_voice_halt_recoveries_total` | Halt-latch recoveries via store-credential re-probe (Discord-401 halts never auto-recover) |
-| `two_bot_voice_names_total{outcome}` | Automatic room-name decisions: a room created with its template name, each template render, and each queued rename sent or dropped at dispatch; `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_room_gone`, `rename_superseded`, `rename_already_applied`, `rename_unseen`, `rename_no_access`, `rename_held`, `rename_duplicate` or `other` |
+| `two_bot_voice_names_total{outcome}` | Automatic room-name decisions: a room created with its template name, each template render, and each queued rename sent or dropped at dispatch; `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_room_gone`, `rename_superseded`, `rename_already_applied`, `rename_unseen`, `rename_no_access`, `rename_held`, `rename_duplicate`, `name_blocked` or `other` |
 | `two_bot_voice_join_occupancy_total{occupancy}` | Organic VOICE_STATE_UPDATE joins by humans already present in the target channel when the join arrived, excluding the joiner; `occupancy` is `0`, `1`, `2`, `3`, `4`, `5`, `6` or `7+` (`7+` caps the tail). Leaves, same-channel updates, pre-READY frames and mechanical transitions (creator/generator target or previous channel: creator join, generator join, bot move echo) are not samples; joins into the session lobby or permanent protected channels still sample; no member, channel or time labels, so hourly curves use `increase(...[1h])` and there is no per-event log line |
 | `two_bot_voice_vote_kick_total{outcome}` | Vote-kick starts, refusals and terminal enforcements; `outcome` is `started`, a refusal code (`evidence_unavailable`, `not_a_room`, `initiator_not_occupant`, `target_not_occupant`, `self_target`, `protected_target`, `privileged_target`, `authority_unavailable`, `active_vote_exists`, `cooldown`, `initiator_limited`, `reused_vote_id`, `unknown_vote`, `wrong_vote_boundary`, `ineligible_voter`, `repeated_vote`, `invalid_time`), an enforcement code (`connect_denied_and_disconnected`, `connect_denied_target_absent`, `skipped_room_gone`, `skipped_target_protected`, `permission_missing`, `discord_error`, `gave_up`) or `other`; vote results (`passed`/`expired`/`cancelled`) are audit-only and never counted |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. `dispatch_drops:<lane>` raises a ticket after growth in 3 consecutive completed keepalive sample windows; the first valid sample only establishes a baseline. A flat sample or counter reset clears the streak; missing/invalid samples break growth but never falsely resolve an active ticket. A single burst never pages. `reactions`-lane growth can reflect per-member fairness rather than an undersized lane. Dispatch refusals are not proof of gateway packet loss |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert rule `gateway_checkpoint_failures` fires on any increase summed over every `stage` between consecutive keepalive samples (the first sample is baseline-only; the failing process lingers 75 s so a scrape lands before the restart resets the counter); unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
 | `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
+| `two_bot_moderation_enforcements_total{verb,outcome}` | Moderation enforcement terminal outcomes. `verb` is one of `ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`, `slowmode`, `lockdown` or `unlock` (see label allowlists below). `outcome` is `success`, `refused`, `discord_error`, `storage_error` or `other`. Each terminal member/channel enforcement counts once; retries and rate-limit backoffs are not outcomes |
 | `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert-threshold hook for M2.1: alert when the counter increases across consecutive scrapes; a single failed drain is not paging |
+| `two_bot_retention_replay_needed_total` | Skipped retention purges needing Operator replay: one per real guild removal whose purge-queue write hit the schema gap. Successful queue writes and rejoin-cancel skips never increment it. Label-free counter; resets on process restart, so pair it with the error log line. Manual check, not an alert input: no alert rule consumes this series. No guild id, SQLSTATE or error text ever becomes a label |
 | `two_bot_audit_delivery_halt` | Audit mirror delivery-halt state for staleness evaluation: `1` while the persistent kill switch is engaged, `0` once cleared. Label-free gauge set once per readable `audit_retry` sweep from the store's `delivery_halt` read; an unreadable halt keeps the last reported state, and a halted sweep still counts as a job `success` (the sweep ran; it claimed nothing by design). Manual check, not an alert input: no alert rule consumes this series and production alert forwarding stays off. No actor ID, timestamp, error text or row content ever reaches exposition |
-| `two_bot_event_store_consumer_lag_seconds` | Event-store consumer lag in seconds (`received_at` minus `event_time` for the newest observed capture row); `0` when unobserved. Label-free gauge; S1 exposes the series and its setter contract (last writer wins; non-finite or negative input clears to `0` so exposition stays a finite non-negative duration). The periodic store-read caller lands with the consumer slice, so until then the series reads `0` (unobserved), not "no lag". Manual check, not an alert input: no alert rule consumes this series. No message, channel, user, dedup-key, content or body label ever reaches exposition |
+| `two_bot_event_store_consumer_lag_seconds` | Event-store consumer lag in seconds (`received_at` minus `event_time` for the newest observed capture row); `0` when unobserved. Label-free gauge; S1 exposes the series and its setter contract (last writer wins; non-finite or negative input clears to `0` so exposition stays a finite non-negative duration). The periodic store-read caller lands with the consumer slice, so until then the series reads `0` (unobserved), not "no lag". Alert rule `event_store_consumer_lag` tickets on sustained lag above 60 s (see below). No message, channel, user, dedup-key, content or body label ever reaches exposition |
 | `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures. Requests rejected before body intake are not deliveries; label-free counter |
-| `two_bot_eventsub_classified_total{kind}` | EventSub deliveries classified by fixed `kind`: `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`. `ignored` covers known unrecognized or invalid outcomes, including deterministic 2xx acknowledgments, invalid challenges, and non-signature verification failures; `other` marks unknown/future classification errors, which return retryable 503. Only `BadSignature` is `tampered`. No IDs, tokens, headers, body text or secrets become labels |
+| `two_bot_eventsub_classified_total{kind}` | EventSub deliveries classified by fixed `kind`: `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`. `ignored` covers known unrecognized or invalid outcomes, including deterministic 2xx acknowledgments, invalid challenges, and non-signature verification failures; `other` marks unknown/future classification errors, which return retryable 503. Only `BadSignature` is `tampered`. `eventsub_tampered` pages when the `tampered` series with exactly that label rises in 3 consecutive samples. No IDs, tokens, headers, body text or secrets become labels |
 | `two_bot_eventsub_posts_total{outcome}` | Go-live post outcomes: `attempted`, `succeeded`, `failed` or `other`. Counted by the receiver only for deliveries that reach the sender through the durable ledger flow; boot injects no delivery dependencies yet, so these remain zero until channel/invite provisioning lands; no IDs, content or errors become labels |
-| `two_bot_eventsub_reconcile_passes_total{outcome}` | EventSub reconcile passes by fixed `outcome`: `healthy` (every desired broadcaster holds a healthy subscription afterwards), `pending` (re-created but not all verified yet) or `failed` (an action failed or a healthy subscription is missing, including listing failures). Exactly one sample per concluded pass that reaches Helix; parked or refused startup passes (flag dark, invalid config, empty allowlist) never reach Helix and record no sample — they are log-only, as are passes interrupted by shutdown (which still record the mutations they already made in actions). Alert when `failed` rises across scrapes (alert rules land separately) |
+| `two_bot_eventsub_reconcile_passes_total{outcome}` | EventSub reconcile passes by fixed `outcome`: `healthy` (every desired broadcaster holds a healthy subscription afterwards), `pending` (re-created but not all verified yet) or `failed` (an action failed or a healthy subscription is missing, including listing failures). Exactly one sample per concluded pass that reaches Helix; parked or refused startup passes (flag dark, invalid config, empty allowlist) never reach Helix and record no sample — they are log-only, as are passes interrupted by shutdown (which still record the mutations they already made in actions). Alert `eventsub_reconcile_failed` tickets when `failed` rises between keepalive samples (first sample is baseline-only; see the alert table below) |
 | `two_bot_eventsub_reconcile_actions_total{action}` | Successful EventSub reconcile mutations by fixed `action`: `create` (2xx creates) or `delete` (2xx deletes, including already-gone deletes). 409 already-exists confirmations fold into the pass outcome, not into actions; per-subscription labels never reach exposition |
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | EventSub reconcile failure sites by the same fixed `error_class` strings as the `error_class` log field: `reconcile_action_failed` (once per failed plan action), `reconcile_prior_failed` (once per pass that found failed subscriptions), `reconcile_unhealthy` (once per non-converged pass) or `reconcile_failed` (listing or plan failures), plus `other` for unknown classes. No status code, body, broadcaster, subscription id or secret ever becomes a label |
+| `two_bot_feed_fetches_total{outcome}` | Feed fetch attempts by bounded outcome: `success` (2xx fetch), `invalid_source` (source refused before dialling), `refused_redirect` (redirect refused by policy) or `failure` (every other failure, including non-2xx HTTP). One sample per fetch; per-outcome, never per-feed, so no source URL, host or feed id reaches a label |
+| `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class: `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`. One sample per failed fetch alongside `two_bot_feed_fetches_total`; successes record nothing here. No URL, host, header or body bytes reach a label |
 
 ## REST admission guard
 
@@ -205,6 +212,15 @@ as dynamic labels.
 - `two_bot_presence_capture_total{outcome}` — `outcome` is one of `inserted`,
   `duplicate`, `rejected`. Exactly three series; unrecognised outcomes collapse
   to `rejected`, never to a new series.
+- `two_bot_automod_decisions_total{outcome}` — `outcome` is one of
+  `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`,
+  `warned`, `timed_out` or `sanction_refused`
+  (`crates/core/src/metrics.rs` `AUTOMOD_DECISION_OUTCOMES`, mirroring
+  `automod_runtime::CompletionKind::as_str`). Recorded once per committed
+  `StoredOutcome` in `crates/discord/src/automod_activation.rs` (`settle`);
+  replays, retained claims, bypassed and unavailable inspections never count.
+  No message text, excerpts or user IDs become labels; unrecognised outcomes
+  collapse to `sanction_refused`, never to a new series.
 - `two_bot_rest_requests_total{route,result}` — `result` is one of `2xx`,
   `3xx`, `4xx`, `429`, `5xx`, `transport`. `route` is one of the fixed
   executor route templates (`GET /channels/:channel`,
@@ -263,9 +279,10 @@ as dynamic labels.
   contributes zero; `voice_reconcile` stays quiet when all four counts are zero.
 - `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
   `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other`.
-- `two_bot_voice_names_total{outcome}` — `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_room_gone`, `rename_superseded`, `rename_already_applied`, `rename_unseen`, `rename_no_access`, `rename_held`, `rename_duplicate` or `other`
-  (`crates/core/src/metrics.rs` `VOICE_NAME_OUTCOMES`). The former
-  `rename_stale` outcome is split into `rename_room_gone` (no tracked room),
+- `two_bot_voice_names_total{outcome}` — `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_room_gone`, `rename_superseded`, `rename_already_applied`, `rename_unseen`, `rename_no_access`, `rename_held`, `rename_duplicate`, `name_blocked` or `other`
+  (`crates/core/src/metrics.rs` `VOICE_NAME_OUTCOMES`). `name_blocked` counts
+  dispatch-time rename or custom-override filter refusals; `blocked` remains
+  the template-render filter outcome. The former `rename_stale` outcome is split into `rename_room_gone` (no tracked room),
   `rename_superseded` (the queued name is no longer desired), and
   `rename_already_applied` (the live channel already has that name). These
   skips send no HTTP request; dashboards using the old label should sum the
@@ -341,11 +358,48 @@ as dynamic labels.
   `ReceiverState::terminal` plus the keyless-read and settings/moderation
   success envelopes for executions); no key id, token, body or request bytes
   ever become labels.
+- `two_bot_moderation_enforcements_total{verb,outcome}` — `verb` is one of
+  `ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`, `slowmode`,
+  `lockdown` or `unlock` (exactly `ModerationAction::command_name`, in legacy
+  publish order; `crates/core/src/metrics.rs` `MODERATION_VERBS`); `outcome`
+  is `success` (completed enforcement, including idempotent replays served
+  without a second effect), `refused` (policy/validation/definitive
+  rejections that prove no mutation happened), `discord_error` (uncertain
+  Discord failures: timeout, unreachable, rate-limited), `storage_error`
+  (persistence failures) or `other`. Recorded once per terminal member
+  enforcement (slash `MemberRuntime`, website `ModerationExecutor` plus
+  `InternalMemberExecutor`), including definitive preflight refusals (slash:
+  unknown roles and non-member target; website: resolver `ActionNotAllowed`
+  such as non-member target, actor not member, or actor forbidden, recorded
+  by the website effect before the executor runs); actor cooldowns, Discord
+  snapshot failures and other indeterminate reads are not outcomes.
+  Recorded once per terminal channel enforcement (slash
+  `ChannelModerationRuntime`, website `ChannelModerationExecutor` plus
+  `InternalChannelExecutor`), with the same boundary: website resolver
+  `ActionNotAllowed` records `refused` at the effect, snapshot failures stay
+  unsampled. Retries and rate-limit backoffs are not outcomes. Channel
+  slash enforcement records uncertain outcomes as `other`; website enforcement
+  records uncertain Discord failures as `discord_error`. A purge timeout that
+  proves no deletion was sent is recorded as `refused`. No user id, reason
+  text or free-form detail ever becomes a label.
 - `two_bot_community_facts_drain_failures_total{reason}` — `reason` is `error`,
   `timeout` or `other`. Recorded once per failed community-facts drain in
   `crates/bot/src/gateway.rs` (`apply_dispatch`), in both warn-and-continue
   arms; the existing warn log lines are unchanged. No error text, SQL or
   identifier becomes a label.
+- `two_bot_feed_fetches_total{outcome}` — `outcome` is `success`,
+  `invalid_source`, `refused_redirect` or `failure`
+  (`crates/core/src/metrics.rs` `FEED_FETCH_OUTCOMES`). Recorded once per
+  fetch in `crates/bot/src/feed_jobs.rs` via
+  `crates/core/src/feeds_connector.rs` `record_feed_fetch`; per-outcome,
+  never per-feed, so no source URL, host or feed id becomes a label.
+- `two_bot_feed_fetch_errors_total{error_class}` — `error_class` is
+  `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`,
+  `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`,
+  `resolve`, `transport`, `deadline`, `http_error` or `other`
+  (`crates/core/src/metrics.rs` `FEED_FETCH_ERROR_CLASSES`). Recorded once
+  per failed fetch alongside the outcome above; successes record nothing
+  here. No URL, host, header or body bytes become labels.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,
@@ -539,8 +593,9 @@ only `two-bot metrics scrape failed`: no response body,
 exception detail, token or URL. Empty/non-exposition, malformed or interrupted
 bodies, timeouts, and missing/duplicate/invalid alert inputs keep the previous
 firing set, counter baselines and streaks, and emit no `RESOLVED` — except the
-dispatch-drop baselines and streaks, which reset without resolving active
-tickets (a failed scrape invalidates all dispatch baselines).
+dispatch-drop baselines and streaks and the event-store lag streak, which reset
+without resolving active tickets (a failed scrape invalidates all dispatch
+baselines and breaks the lag streak).
 The validator requires every always-emitted series consumed by the rules,
 including all current label combinations from `crates/core/src/metrics.rs`,
 with finite nonnegative integer inputs (pool-configured is 0 or 1). Additional
@@ -586,9 +641,10 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
 | `db_errors` | 3+ storage failures between samples (restarts skip the window) | [DB errors](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
-| `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan (restarts skip the window) | [voice failures](runbook.md#alert-voice-failures) |
+| `voice_failures` | room-op failures > 5% of >= 10 ops between samples, any new dead-letter/orphan, or any new vote-kick enforcement failure (`discord_error`/`gave_up`/`permission_missing`; benign refusals and terminal skips never fire; missing/invalid samples hold, restarts skip the window) | [voice failures](runbook.md#alert-voice-failures) |
 | `gateway_missed_events` | any increase of `two_bot_gateway_missed_events_total` between samples (first sample and restarts skip the window) | [gateway missed events](runbook.md#alert-gateway-missed-events) |
 | `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` grew and RESUMED plus fresh READY (`two_bot_gateway_events_total{event="READY"}`) have not grown for 3 consecutive samples; any RESUMED or fresh READY growth clears at once (first sample sets the baseline, restarts re-baseline and hold a firing alert, invalid samples change nothing) | [gateway unpaired disconnect](runbook.md#alert-gateway-unpaired-disconnect) |
+| `gateway_not_ready` | `/readyz` gateway component non-ready (`starting`/`down`) for 3 consecutive valid samples with no disconnect edge required; any ready sample clears at once (first valid sample sets the baseline, restarts re-baseline and hold a firing alert, invalid probes/scrapes change nothing) | [gateway not ready](runbook.md#alert-gateway-not-ready) |
 | `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | [ticker stale](runbook.md#alert-ticker-stale) |
 | `receiver_refusals:<family>` | refused `two_bot_internal_actions_total` outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak) | [receiver refusals](runbook.md#alert-receiver-refusals) |
 | `dispatch_drops:<lane>` | **ticket**, not page: `two_bot_dispatch_drops_total{lane}` grows in 3 consecutive completed sample windows per bounded lane; first sample is baseline, flat/reset clears, missing/invalid retains active alerts | [dispatch drops](runbook.md#alert-dispatch-drops) |
@@ -597,6 +653,12 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `voice_join_fast_burn` | creator-join budget (99.5% moved within 5 s) burning faster than 14.4x in both the 1 h and 5 min windows; each window requires at least 10 genuine joins and two bad moves; receive counts lag one scrape and incomplete post-restart windows stay inactive | [voice join fast burn](runbook.md#alert-voice-join-fast-burn) |
 | `voice_join_slow_burn` | **ticket**, not page: same budget burning faster than 6x in both the 6 h and 30 min windows, with the same per-window volume and bad-move floors (sustained grind the fast rule never catches) | [voice join slow burn](runbook.md#alert-voice-join-slow-burn) |
 | `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` > 600 (two missed 5 min refreshes) with `two_bot_voice_creator_map_generation` > 0; generation 0 (never merged) never fires, missing gauges on older containers hold the previous state | [voice creator-map stale](runbook.md#alert-voice-creator-map-stale) |
+| `eventsub_post_failed_share` | **ticket**, not page: failed `two_bot_eventsub_posts_total` > 10% of attempted posts, >= 10 attempted (sub-floor windows accumulate across consecutive valid samples until the floor is met; first sample is baseline, resets rebaseline, missing/invalid preserves, and flat/sub-floor windows hold an active ticket until a judged window clears it) | [EventSub post failed share](runbook.md#alert-eventsub-post-failed-share) |
+| `event_store_consumer_lag` | **ticket**, not page: `two_bot_event_store_consumer_lag_seconds` > 60 in 3 consecutive valid samples (fractional counts); a valid sample at or below 60 resolves and rebaselines, missing/invalid samples and failed scrapes break the streak but preserve a firing ticket | [event-store consumer lag](runbook.md#alert-event-store-consumer-lag) |
+| `error_budget_fast_burn` | REST error budget (99.9% success over 48 h) burning faster than 12x in both the 15 min and 2 min windows; each window needs at least 10 eligible requests and two budget errors (`5xx` plus `transport`); incomplete post-restart windows stay inactive and missing inputs hold the previous state | [error budget fast burn](runbook.md#alert-error-budget-fast-burn) |
+| `error_budget_slow_burn` | **ticket**, not page: same budget burning faster than 3x in both the 2 h and 15 min windows, with the same per-window volume and error floors; needs full 2 h history, holds on missing inputs, scrape gaps, or counter resets, and resolves on a covered quiet or below-threshold 15 min window | [error budget slow burn](runbook.md#alert-error-budget-slow-burn) |
+| `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` rises in 3 consecutive samples (first sample is baseline-only, flat resolves, resets rebaseline, missing/invalid preserves firing alerts) | [EventSub tampered](runbook.md#alert-eventsub-tampered) |
+| `eventsub_reconcile_failed` | **ticket**, not page: `two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rises between samples (one ticket per failed pass however many error sites moved; first sample is baseline-only, a restart sample re-baselines and fires when the new process already counted a failed pass (failed startup pass) else holds a firing ticket, a healthy-pass increase with no failed increase resolves, flat/pending-only growth and missing/invalid samples hold) | [eventsub reconcile failed](runbook.md#alert-eventsub-reconcile-failed) |
 
 `dispatch_drops` covers `messages`, `interactions`, `registry`, `privileged`,
 `busy` and `reactions` independently (the Worker allowlist is pinned to Rust).
@@ -673,7 +735,9 @@ DB-error coverage: `two_bot_db_errors_total` counts send-admission SQL
 failures (`op="admission"`) and voice actor load failures (`op="other"`);
 other stores adopt `Metrics::db_error` incrementally, so this is not a
 database-wide total. Correlate voice load failures with `voice actor load
-failed; actor respawns on the next guild snapshot` in container stdout.
+failed; retrying with capped backoff` in container stdout (transient
+failures retry inside the actor task; a credential refusal logs `voice
+actor load failed; credential refused, not retrying` instead).
 Every load failure increments the counter, but that warn is throttled
 process-wide to once per 300 s. A slow trickle below the burst threshold
 stays silent in `db_errors`; job-failure rules cover failed jobs, not every

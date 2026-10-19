@@ -86,7 +86,7 @@ def date(offset=0):
 def receipts():
     return [
         {
-            "type": "wrangler-session", "version": 1, "wrangler_version": "4.149.0",
+            "type": "wrangler-session", "version": 1, "wrangler_version": "4.151.0",
             "command_line_args": ["deploy", "--config", "staging-deploy.json", "--env", "staging"],
         },
         {
@@ -99,7 +99,7 @@ def receipts():
 
 
 def real_shape_receipts():
-    """Record shapes written by Wrangler 4.149.0 when `wrangler-action` drives a deploy.
+    """Record shapes written by Wrangler 4.151.0 when `wrangler-action` drives a deploy.
 
     Field names follow workers-sdk `packages/wrangler/src/index.ts` (the `wrangler-session`
     entry, written for EVERY invocation) and its deploy output entry; values are
@@ -107,9 +107,9 @@ def real_shape_receipts():
     """
     log = "/home/runner/.config/.wrangler/logs/wrangler-2026-10-03_01-22-59_123.log"
     return [
-        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.149.0",
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.151.0",
          "command_line_args": ["--version"], "log_file_path": log, "timestamp": date()},
-        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.149.0",
+        {"version": 1, "type": "wrangler-session", "wrangler_version": "4.151.0",
          "command_line_args": ["deploy", "--config", "/tmp/staging-deploy.json", "--env", "staging"],
          "log_file_path": log, "timestamp": date()},
         {"version": 1, "type": "deploy", "worker_name": "two-bot-next-staging",
@@ -291,7 +291,7 @@ class DeployReceiptTests(OfflineTestCase):
         for flag in ("--version", "-v"):
             with self.subTest(flag=flag):
                 probe = {"type": "wrangler-session", "version": 1,
-                         "wrangler_version": "4.149.0", "command_line_args": [flag]}
+                         "wrangler_version": "4.151.0", "command_line_args": [flag]}
                 self.assertEqual(rollout.deploy_version([probe] + receipts(), STARTED), VERSION)
                 self.assertEqual(rollout.deploy_version(receipts() + [probe], STARTED), VERSION)
 
@@ -305,7 +305,7 @@ class DeployReceiptTests(OfflineTestCase):
         bad_args = receipts()
         bad_args[0]["command_line_args"] = ["deploy", 1]
         probe = {"type": "wrangler-session", "version": 1,
-                 "wrangler_version": "4.149.0", "command_line_args": ["--version"]}
+                 "wrangler_version": "4.151.0", "command_line_args": ["--version"]}
         wrong_probe = dict(probe, wrangler_version="4.142.0")
         schema_probe = dict(probe, version=2)
         other_command = dict(probe, command_line_args=["secret", "put", "X"])
@@ -1095,9 +1095,16 @@ class OrchestrationTests(OfflineTestCase):
         self.config.write_text(CONFIG + '[env.staging.vars]\nTWO_DEPLOY_ENV = "staging"\n')
         self.prepare_baseline()
         generated = json.loads(Path(self.args.deploy_config).read_text())
-        self.assertEqual(generated["env"]["staging"]["vars"], {"TWO_DEPLOY_ENV": "staging"})
+        self.assertEqual(generated["env"]["staging"]["vars"], {"TWO_DEPLOY_ENV": "staging", rollout.CONTAINER_RELEASE_VAR: REVISION})
         self.assertNotIn(rollout.GATEWAY_FAIL_INJECTION_VAR, json.dumps(generated))
         self.assertEqual(json.loads(Path(self.args.receipt).read_text()), baseline())
+
+    def test_prepare_stamps_container_release_for_worker_edge_span_lines(self):
+        self.prepare_baseline()
+        generated = json.loads(Path(self.args.deploy_config).read_text())
+        self.assertEqual(generated["env"]["staging"]["vars"], {rollout.CONTAINER_RELEASE_VAR: REVISION})
+        self.assertEqual(generated["env"]["production"]["vars"], {"PRESERVED": "production-fixture"})
+        self.assertEqual(self.config.read_text(), CONFIG)
 
     def test_prepare_with_drill_flag_injects_only_generated_staging_vars(self):
         config = CONFIG + '[env.staging.vars]\nTWO_DEPLOY_ENV = "staging"\n'
@@ -1107,7 +1114,7 @@ class OrchestrationTests(OfflineTestCase):
         generated = json.loads(Path(self.args.deploy_config).read_text())
         self.assertEqual(
             generated["env"]["staging"]["vars"],
-            {"TWO_DEPLOY_ENV": "staging", rollout.GATEWAY_FAIL_INJECTION_VAR: "1"},
+            {"TWO_DEPLOY_ENV": "staging", rollout.GATEWAY_FAIL_INJECTION_VAR: "1", rollout.CONTAINER_RELEASE_VAR: REVISION},
         )
         # Production, top level and the checked-in source stay untouched.
         self.assertEqual(generated["env"]["production"]["vars"], {"PRESERVED": "production-fixture"})
@@ -1152,6 +1159,50 @@ class OrchestrationTests(OfflineTestCase):
                 with self.assertRaises(rollout.GateError) as caught:
                     rollout.apply_gateway_fail_injection(cfg(**kwargs), False)
                 self.assertEqual(str(caught.exception), code)
+
+    def test_remediation_fault_injection_helper_fence(self):
+        def cfg(staging_vars=None, production_vars=None, top_vars=None):
+            config = {"env": {"staging": {}, "production": {}}}
+            if top_vars is not None:
+                config["vars"] = top_vars
+            if staging_vars is not None:
+                config["env"]["staging"]["vars"] = staging_vars
+            if production_vars is not None:
+                config["env"]["production"]["vars"] = production_vars
+            return config
+
+        # Disabled is a strict no-op on a clean config.
+        clean = cfg(staging_vars={"TWO_DEPLOY_ENV": "staging"})
+        rollout.apply_remediation_fault_injection(clean, False, False)
+        self.assertEqual(clean["env"]["staging"]["vars"], {"TWO_DEPLOY_ENV": "staging"})
+        # Each drill arms independently on the generated staging vars only.
+        voice = cfg(staging_vars={"TWO_DEPLOY_ENV": "staging"})
+        rollout.apply_remediation_fault_injection(voice, True, False)
+        self.assertEqual(voice["env"]["staging"]["vars"],
+                         {"TWO_DEPLOY_ENV": "staging", rollout.VOICE_STALL_FAULT_VAR: "1"})
+        both = cfg(staging_vars={"TWO_DEPLOY_ENV": "staging"})
+        rollout.apply_remediation_fault_injection(both, True, True)
+        self.assertEqual(both["env"]["staging"]["vars"],
+                         {"TWO_DEPLOY_ENV": "staging",
+                          rollout.VOICE_STALL_FAULT_VAR: "1",
+                          rollout.UNPAIRED_FAULT_VAR: "1"})
+        # Enabled without the exact staging marker refuses.
+        for staging_vars in (None, {}, {"TWO_DEPLOY_ENV": "production"}):
+            with self.subTest(staging_vars=staging_vars):
+                with self.assertRaises(rollout.GateError) as caught:
+                    rollout.apply_remediation_fault_injection(cfg(staging_vars=staging_vars), True, False)
+                self.assertEqual(str(caught.exception), "remediation_fault_fence_missing")
+        # A source config already carrying either switch refuses even
+        # disabled, wherever it hides.
+        for kwargs in [
+            {"staging_vars": {rollout.VOICE_STALL_FAULT_VAR: "1"}},
+            {"production_vars": {rollout.UNPAIRED_FAULT_VAR: "1"}},
+            {"top_vars": {rollout.VOICE_STALL_FAULT_VAR: "1"}},
+        ]:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(rollout.GateError) as caught:
+                    rollout.apply_remediation_fault_injection(cfg(**kwargs), False, False)
+                self.assertEqual(str(caught.exception), "remediation_fault_in_source_config")
 
     def test_main_prepare_uses_default_fixture_config_and_generated_paths(self):
         # argparse's first/default config and output paths, not the repository's config.
@@ -2572,7 +2623,7 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(self.stdout.getvalue().splitlines()[1:], [
             "staging rollout gate failed: wrong_wrangler_receipt",
             "staging rollout diagnostic: records deploy=1,wrangler-session=2; "
-            "sessions deploy=1,probe=0,other=1; v1/wrangler-4.142.0 v1/wrangler-4.149.0",
+            "sessions deploy=1,probe=0,other=1; v1/wrangler-4.142.0 v1/wrangler-4.151.0",
         ])
         self.assert_no_evidence()
         # The caller-owned NDJSON input legitimately holds the sentinel; only

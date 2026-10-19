@@ -104,6 +104,18 @@ test("unlisted names, secrets and non-string values are dropped", () => {
   assert.deepEqual(forwardedFlagVars(env), { TWO_ANNOUNCEMENTS: "1" });
 });
 
+test("hostile settings-map typo keys stay test-only and never reach the Container", () => {
+  const env = {
+    TWO_ASSISTANT_ENDPOINTS: "https://fixture.invalid/not-a-runtime-endpoint",
+    TWO_OWEN_USER_IDS: "123456789012345678",
+  };
+  for (const name of Object.keys(env)) {
+    assert.match(NOT_FORWARDED[name] ?? "", /test-only/, name);
+  }
+  assert.deepEqual(forwardedFlagVars(env), {});
+  assert.deepEqual(containerEnv(env), { LISTEN_ADDR: "0.0.0.0:8080" });
+});
+
 test("the existing 4 Container vars are unchanged and cannot be overridden", () => {
   const base = {
     DISCORD_TOKEN: "synthetic-discord-token",
@@ -150,6 +162,22 @@ test("gateway readiness failure injection forwards only under the staging marker
   assert.equal(armed["TWO_DEPLOY_ENV"], "staging");
 });
 
+test("remediation-drill switches never reach the Container: Worker-only trigger input", () => {
+  for (const key of ["TWO_VOICE_STALL_FAULT_INJECTION", "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"]) {
+    // Never on the generic flag allowlist, even armed.
+    assert.equal(forwardedFlagVars({ [key]: "1", TWO_DEPLOY_ENV: "staging" })[key], undefined, key);
+    // No Worker shape forwards them: the fault injector reads them in the
+    // keepalive tick, so the Container must never see them.
+    for (const env of [
+      { [key]: "1" },
+      { [key]: "1", TWO_DEPLOY_ENV: "staging" },
+      { [key]: "1", TWO_DEPLOY_ENV: "production" },
+    ]) {
+      assert.equal(containerEnv(env)[key], undefined, `${key} ${JSON.stringify(env)}`);
+    }
+  }
+});
+
 test("eventsub reconcile inputs and Helix credentials reach the Container on explicit lines while forwarded", () => {
   const env = {
     TWO_EVENTSUB: "1",
@@ -182,6 +210,41 @@ test("eventsub reconcile inputs and Helix credentials reach the Container on exp
   ]) {
     assert.equal(dark[name], undefined, name);
   }
+});
+
+test("eventsub delivery gate and its inputs travel only with an exactly-1 delivery gate inside the receiver forward", () => {
+  const receiver = {
+    TWO_EVENTSUB: "1",
+    TWO_TWITCH_WEBHOOK_SECRET: "fixture",
+    TWO_TWITCH_BROADCASTERS: "111,222",
+  };
+  const delivery = {
+    TWO_EVENTSUB_DELIVERY: "1",
+    TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID: "777",
+    TWO_EVENTSUB_INVITE_URL: "https://discord.gg/example",
+  };
+  const forwarded = containerEnv({ ...receiver, ...delivery });
+  for (const name of Object.keys(delivery) as (keyof typeof delivery)[]) {
+    assert.equal(forwarded[name], delivery[name], name);
+  }
+  // Gate not exactly "1": none of the three travel, inputs included.
+  for (const gate of [undefined, "0", "true", ""]) {
+    const dark = containerEnv({ ...receiver, ...delivery, TWO_EVENTSUB_DELIVERY: gate });
+    for (const name of Object.keys(delivery)) {
+      assert.equal(dark[name], undefined, `${name} with gate ${String(gate)}`);
+    }
+  }
+  // Receiver dark (no signing secret): delivery never travels alone.
+  const unforwarded = containerEnv({ TWO_EVENTSUB: "1", ...delivery });
+  for (const name of Object.keys(delivery)) {
+    assert.equal(unforwarded[name], undefined, name);
+  }
+  // Half-provisioned enable: the gate still travels and the missing inputs
+  // stay absent, so the Container refuses startup instead of staying dark.
+  const half = containerEnv({ ...receiver, TWO_EVENTSUB_DELIVERY: "1" });
+  assert.equal(half["TWO_EVENTSUB_DELIVERY"], "1");
+  assert.equal(half["TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID"], undefined);
+  assert.equal(half["TWO_EVENTSUB_INVITE_URL"], undefined);
 });
 
 test("configured voice infrastructure IDs reach the Container unchanged", () => {

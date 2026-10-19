@@ -124,7 +124,7 @@ Cloudflare deployment request, hands ownership to it, times the first `/readyz`
 The deployment request never sends `force`, so a target whose secrets changed
 since it was deployed is refused; Wrangler's non-interactive rollback would
 answer yes to that prompt. The request sets `code_update_strategy` to
-`immediate` because Wrangler 4.149's default is `deferred` with a 300 s maximum
+`immediate` because Wrangler 4.151's default is `deferred` with a 300 s maximum
 delay, which would keep the old Durable Object code serving for up to five
 minutes. A 401/403 stops the run and skips the restore; it never retries with
 another credential. Recovery then is a `deploy-staging` dispatch with
@@ -165,9 +165,19 @@ the client's error text, and writes only an ordinal, `event_type` and
 ## Production route
 
 `deploy-production.yml` (main #243) is the one live deployment workflow. The
-regression pins it as `workflow_dispatch`-only. Its `production` job must need
-`guard`, run in GitHub environment `production` and carry no job condition. The
-`guard` job may not have an environment, call a reusable workflow, or contain
+regression pins it to `workflow_dispatch`, a completed `deploy-staging` run on
+`main`, and the daily schedule backstop — never push or PR. Its `production`
+job must need `guard`, `soak`, `recheck`, `schema-gate` and `roles-gate`, run in GitHub environment `production`
+and carry exactly the pinned condition (not cancelled, guard success, no skip, a completed soak, a fresh recheck pass — or a
+skipped recheck on manual runs only — and both gates green unless a
+rollback or live-SHA redeploy waives them); any other condition fails the regression. The `recheck`
+job must need `guard`, `soak`, `schema-gate` and `roles-gate` so its fresh hold/live/dispatch read happens after the last long build,
+and must skip while an operator dispatch is active (the lane's single pending slot would otherwise let the
+automatic arrival cancel a queued recovery run). Only
+`production` and `release` hold the `deploy-production` lane (a job-level
+concurrency group, never workflow-level); the guard, gates, soak and recheck
+carry none, so a sleeping promotion can never delay a rollback behind it.
+The `guard` job may not have an environment, call a reusable workflow, or contain
 deploy/probe steps. Its script must still require a deploy-staging run with
 `status="success"` on the SHA, plus required reviewers on the production
 Environment. Negative fixtures cover extra triggers, removed `needs` or
@@ -204,7 +214,7 @@ python3 scripts/ci/check-src-snowflakes.py
 python3 scripts/ci/verify-codeowners.py
 ```
 
-The snowflake gate scans `crates/*/src/**/*.rs` for decimal literals/strings with
+The snowflake gate scans `crates/*/src/**/*.rs` alongside `src/**/*.rs` for decimal literals/strings with
 17–20 digits, including numeric separators and raw strings. Comments and exact
 `#[cfg(test)]` inline modules are excluded. External test modules must start with
 an explicit `#![cfg(test)]`; filenames alone do not exempt source. Integration-test
@@ -253,6 +263,15 @@ has one inline `adhoc-packages` suppression. The direct package is pinned; lifec
 no write grant. Transitive dependencies remain unlocked. A future fixture
 lockfile can remove this exception; it is not an exception for deployment
 package installation.
+
+`deploy-production.yml` carries two inline suppressions for its automatic
+promotion trigger. `dangerous-triggers` on the `workflow_run` notifier: the
+trigger only wakes the run, and the guard re-resolves the SHA from the API
+and refuses unless it is on `origin/main` with green `ci-ok`, `worker
+check` and a successful `deploy-staging` run, inside the protected
+`production` Environment. `github-env` on the deploy-config render step:
+the only value written is a fixed `$RUNNER_TEMP` path, with no trigger,
+input or API data reaching `GITHUB_ENV`.
 
 The former `if: ${{ false }}` staging suspension (and its narrow
 `obfuscation` suppression) is removed by this re-activation; the workflow

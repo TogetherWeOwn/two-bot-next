@@ -15,6 +15,14 @@ the `/mcp` route in `wrangler/src/index.ts` (method + bearer gate).
 | `get_config` | Worker snapshot | Redacted non-secret vars only; never secrets |
 | `get_audit` | Stub | `{"implemented": false}`; real audit read is follow-up work, never faked data |
 
+Inbound intake is bounded separately from container reads: after the bearer
+and rate gates, at most 64 KiB of request bytes are collected under a
+six-second body deadline before JSON parsing. The byte count is measured on
+the bytes actually read, never on Content-Length alone. Oversize,
+deadline-expired, aborted/errored and malformed bodies all produce the one
+fixed non-echoing `-32700 parse error` refusal (`id: null`), the body reader
+is cancelled/released, and no container request occurs.
+
 Every container-backed tool call is bounded: 6 s timeout plus a 64 KiB body
 cap (same bound as the metrics scrape). Oversize surfaces a generic
 `-32000` JSON-RPC error without echoing upstream bytes; timeouts and
@@ -45,8 +53,18 @@ Phase 1 enforces a shared bearer secret (`MCP_TOKEN` Worker secret, minimum
 Set the secret per environment (never in `wrangler.toml`):
 
 ```sh
-wrangler secret put --env staging MCP_TOKEN
+wrangler versions secret put --env staging MCP_TOKEN --message <sha>
+wrangler versions deploy --env staging
 ```
+
+Stamp with the live `/readyz` `build_revision` of staging: a plain `wrangler secret put`
+publishes an unstamped version that can never form a rollback receipt
+(see `docs/production-deploy.md`). Precheck first: `versions secret put` builds on the
+newest-created version, not necessarily the serving one — confirm the last block of
+`wrangler versions list --env staging` (the list prints oldest first, so the last
+block is the newest version) is the serving version (same id as
+`wrangler deployments status --env staging`), and if they differ redeploy the intended
+SHA through the workflow first (full rule in `docs/production-deploy.md`).
 
 Staging target (follow-up): `workers-oauth-provider` in resource-server
 mode with dynamic client registration, PKCE, and scopes. Phase-1 scope is

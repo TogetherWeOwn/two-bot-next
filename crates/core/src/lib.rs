@@ -7,7 +7,9 @@
 
 pub mod action_outcomes;
 pub mod activation;
+pub mod analytics_family;
 pub mod anchor_event;
+pub mod assistant_transport;
 pub mod audit;
 pub mod audit_mirror;
 #[cfg(feature = "db")]
@@ -53,6 +55,7 @@ pub mod disable_preflight;
 pub mod e2e_matrix;
 pub mod error_chain;
 pub mod events;
+pub mod eventsub_delivery_config;
 pub mod eventsub_receiver_config;
 pub mod evidence;
 pub mod expected_joins;
@@ -177,9 +180,10 @@ pub mod website_store;
 
 pub use action_outcomes::{
     backoff_ms, classify_kick_status, clear_send_bit, lockdown_overwrite, pace_wait_ms,
-    parse_retry_after_secs, retry_after_ms, set_send_bit, unlock_overwrite, ActionOutcome,
-    KickOutcome, KickResult, KickStatus, ModerationExecution, BACKOFF_BASE_MS, MAX_HTTP_TRIES,
-    MAX_RETRY_AFTER_MS, RETRY_AFTER_PADDING_MS,
+    parse_retry_after_secs, retry_after_ms, retry_after_ms_unclamped, set_send_bit,
+    unlock_overwrite, ActionOutcome, KickOutcome, KickResult, KickStatus, ModerationExecution,
+    BACKOFF_BASE_MS, MAX_BACKFILL_RETRY_AFTER_MS, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS,
+    RETRY_AFTER_PADDING_MS,
 };
 pub use automation_transfer::{
     diff_import, export_document, max_import_entries, parse_import_document, ExportDocument,
@@ -263,8 +267,8 @@ pub use funnel::{
 pub use handlers::{
     ChannelClass, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput, HandlerOutcome,
     JoinInput, LevelOutcome, LevelingHook, MemStore, MemberJoinFact, MessageFact, MessageInput,
-    NoopFacts, NoopLeveling, RecordOutcome, RulesAcceptedFact, StoredRow, VoiceEndedFact,
-    VoiceInput, VoiceStartedFact,
+    MessageShape, NoopFacts, NoopLeveling, RecordOutcome, RulesAcceptedFact, StoredRow,
+    VoiceEndedFact, VoiceInput, VoiceStartedFact,
 };
 pub use health::{
     classify_voice_error, ComponentStatus, HealthReport, VoiceComponent, VoiceDiagnostic,
@@ -390,17 +394,19 @@ pub use rsvp_conversion::{
 #[cfg(feature = "db")]
 pub use rsvp_store::{
     compensate_checkin_write, compensate_rsvp_write, list_rsvps, prune_rsvp_history, put_rsvp,
-    record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+    put_rsvp_with_audit, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
 };
 pub use scheduled::{
     advance_next_run_iso, advance_next_run_ms, clamp_retry_delay_ms, format_iso_ms, lease_until_ms,
-    next_run_at_ms, no_such_schedule_text, no_unique_match_text, parse_iso_ms,
-    post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text, schedule_confirm_text,
-    schedule_list_line, schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome,
-    ScheduleError, ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX,
-    EVERY_MINUTES_MIN, INTERVAL_SECONDS_MAX, INTERVAL_SECONDS_MIN, IN_MINUTES_MAX, IN_MINUTES_MIN,
+    neutralize_scheduled_body, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
+    parse_iso_ms, post_failure_retryable, resolve_scheduled_id, schedule_cancelled_text,
+    schedule_confirm_text, schedule_list_line, schedule_list_page, schedule_list_page_indicator,
+    schedule_list_page_out_of_range_text, schedule_list_page_underflow_text, schedule_list_pages,
+    schedule_list_text, validate_schedule, IdResolution, OccurrenceOutcome, ScheduleError,
+    ScheduleInput, ValidatedSchedule, CLAIM_LEASE_MS, EVERY_MINUTES_MAX, EVERY_MINUTES_MIN,
+    INTERVAL_SECONDS_MAX, INTERVAL_SECONDS_MIN, IN_MINUTES_MAX, IN_MINUTES_MIN,
     MAX_BODY_CHARS as SCHEDULED_MAX_BODY_CHARS, RETRY_DEFAULT_MS, RETRY_MAX_MS, RETRY_MIN_MS,
-    SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
+    SCHEDULER_TICK_MS, SCHEDULE_LIST_MESSAGE_LIMIT, TICKER_BATCH_LIMIT,
 };
 pub use scheduled_events::{
     normalize_event, normalize_events, EventStatus, RawScheduledEvent, ScheduledEvent,

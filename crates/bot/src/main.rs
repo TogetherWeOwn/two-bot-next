@@ -15,6 +15,8 @@ mod automod_gateway;
 mod backfill_error_chain_acceptance_tests;
 mod backfill_retention_chains;
 mod backup_cli;
+#[cfg(test)]
+mod backup_cli_pool_open_tests;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.
 #[allow(dead_code)]
 mod burn_rate;
@@ -40,8 +42,12 @@ mod event_cli;
 mod eventsub_delivery;
 mod eventsub_http;
 mod eventsub_reconcile;
+#[cfg(test)]
+mod fast_burn_page_tests;
 mod feed_jobs;
 mod gateway;
+#[cfg(test)]
+mod slow_burn_ticket_tests;
 // Bounded reconnect schedule and runner: no runtime caller yet. Test-only
 // until the gateway loop adopts it, so it lives in test builds instead of
 // shipping dead code to the container.
@@ -63,6 +69,8 @@ mod join_risk_runtime;
 #[cfg(test)]
 mod join_risk_runtime_tests;
 #[cfg(test)]
+mod join_risk_tuning_refusal_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod log_volume_guard_tests;
@@ -77,9 +85,12 @@ mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
+#[cfg(test)]
+mod onboarding_unknown_only_acceptance_tests;
 mod ops_backfill;
 mod ops_http;
 mod preflight;
+mod privacy_command;
 mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
@@ -179,6 +190,26 @@ async fn run(cli_args: &[String]) {
         );
         std::process::exit(1);
     });
+    // Go-live delivery is a second, independent gate on the receiver: an
+    // enabled-but-invalid delivery config (including delivery without the
+    // receiver) refuses startup, never silently acks only.
+    let eventsub_delivery_config =
+        two_bot_core::eventsub_delivery_config::EventsubDeliveryConfig::from_env().unwrap_or_else(
+            |_| {
+                tracing::error!(
+                    error_class = "receiver_config_invalid",
+                    "eventsub startup refused"
+                );
+                std::process::exit(1);
+            },
+        );
+    if eventsub_delivery_config.is_some() && eventsub_config.is_none() {
+        tracing::error!(
+            error_class = "receiver_config_invalid",
+            "eventsub startup refused"
+        );
+        std::process::exit(1);
+    }
     let config = Config::from_env().unwrap_or_else(|err| {
         if receiver_config.is_some() {
             tracing::error!(
@@ -353,21 +384,63 @@ async fn run(cli_args: &[String]) {
         None => None,
     };
 
-    // Private EventSub listener: verified deliveries only. Boot injects no
-    // delivery dependencies yet (no announcements-channel/invite config is
-    // provisioned), so notifications are acknowledged without a send; see
-    // `eventsub_delivery`. Enabled failures never fall back; a bound
-    // listener that later fails stops the container.
+    // Private EventSub listener: verified deliveries only. While delivery
+    // stays dark boot injects no dependencies and notifications are
+    // acknowledged without a send; with delivery enabled boot builds the
+    // production deps (bot pool ledger plus an admission-backed executor,
+    // the same send-admission construction as the command runtime) or
+    // refuses startup — see `eventsub_delivery`. The identity activation
+    // fence is evaluated first, like every other bot-identity posting job:
+    // a refused Announcements capability refuses startup rather than
+    // posting go-lives under an uncleared identity. Enabled failures never
+    // fall back; a bound listener that later fails stops the container.
     let eventsub_receiver = match eventsub_config {
-        Some(eventsub_config) => Some(eventsub_http::bind(eventsub_config).await.unwrap_or_else(
-            |_| {
-                tracing::error!(
-                    error_class = "receiver_bind_failed",
-                    "eventsub startup refused"
-                );
-                std::process::exit(1);
-            },
-        )),
+        Some(eventsub_config) => {
+            let delivery = eventsub_delivery_config.map(|delivery_config| {
+                let refuse = |error_class: &'static str| -> ! {
+                    tracing::error!(error_class, "eventsub startup refused");
+                    std::process::exit(1);
+                };
+                let Some(db) = store.as_ref() else {
+                    refuse("receiver_prerequisites_invalid")
+                };
+                let pool = db.pool().clone();
+                let Some(token) = config
+                    .discord_token
+                    .as_ref()
+                    .map(|secret| secret.expose().as_str())
+                    .filter(|token| !token.is_empty())
+                else {
+                    refuse("receiver_prerequisites_invalid")
+                };
+                let proxy = std::env::var("DISCORD_API_BASE")
+                    .ok()
+                    .filter(|value| !value.is_empty());
+                // One-line delegation: the capability choice lives in the
+                // tested `go_live_delivery_permitted` helper so a swap to a
+                // live-cleared capability cannot slip past the delivery tests.
+                let announcements_permitted = activation.go_live_delivery_permitted();
+                eventsub_delivery::build_delivery_deps(
+                    pool,
+                    token,
+                    proxy,
+                    &delivery_config,
+                    announcements_permitted,
+                )
+                .unwrap_or_else(|error_class| refuse(error_class))
+            });
+            Some(
+                eventsub_http::bind_with_delivery(eventsub_config, delivery)
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::error!(
+                            error_class = "receiver_bind_failed",
+                            "eventsub startup refused"
+                        );
+                        std::process::exit(1);
+                    }),
+            )
+        }
         None => None,
     };
 
@@ -501,17 +574,23 @@ async fn run(cli_args: &[String]) {
                         )
                     });
                     if let Some(runtime) = &runtime {
-                        let config = gateway_commands::GatewayCommandConfig::from_map(
-                            guild_id,
-                            &std::env::vars().collect(),
-                        )
-                        .map_err(|error| {
-                            step_failure(
-                                FailureClass::CustomCommandsInitFailed,
-                                "custom_commands_config",
-                                error,
+                        let vars: std::collections::HashMap<String, String> =
+                            std::env::vars().collect();
+                        let config =
+                            gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                                guild_id,
+                                &vars,
+                                activation.permitted(
+                                    two_bot_core::activation::LiveCapability::Moderation,
+                                ),
                             )
-                        })?;
+                            .map_err(|error| {
+                                step_failure(
+                                    FailureClass::CustomCommandsInitFailed,
+                                    "custom_commands_config",
+                                    error,
+                                )
+                            })?;
                         runtime
                             .initialize_custom_commands(config)
                             .await

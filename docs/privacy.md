@@ -111,7 +111,11 @@ are outside this implementation's scope.
   presence on, play aggregates still persist while voice-derived `in_voice_ms`
   stays 0 (voice spans drain and drop). The table is not a replay fence and
   holds no fence rows; member erasure and opt-out purges have no row to delete
-  there.
+  there. Stale rows do expire by age on the retention cadence (see
+  [Retention](#retention-and-explicit-exceptions)): aggregates whose
+  `updated_at` is older than the horizon are deleted per guild.
+  Operators read these rows through the [game-activity aggregate
+  report](game-activity-report.md).
 
 The authoritative, ordered deletion manifest is
 [`member_erasure_plan.json`](../crates/cutover/src/member_erasure_plan.json).
@@ -148,7 +152,7 @@ When your opt-out runs, the bot:
    invite keeps the joiner's row but with your inviter field blanked.
    Anonymous aggregate counters keep counting throughout.
 3. Writes exactly one audit receipt: the guild/member scope plus the
-   operator actor label and the database timestamp.
+   actor label and the database timestamp.
 
 Moderation, audit, XP/level, ticket, voice-room and settings rows are not
 part of an opt-out: they serve safety, delivery and accountability, not
@@ -160,11 +164,20 @@ already-purged rows. Afterwards the pair persists exactly as before, and
 the re-enable itself writes no purge receipt (the receipt table records
 purges, one row per purge).
 
-Until the member self-serve slash command lands, an opt-out is executed by
-a server operator through the reviewed `opt_out_member` service with an
-explicit operator actor label, against a disposable/staging binding first
-per the rollout gates. The actor label carries operator attribution only:
-never put a member ID, content, count or secret in it.
+Members run this themselves with `/privacy opt-out` (`opt-in` to resume,
+`status` to check). The command acts only on the invoker in the invoking
+guild and writes the receipt with the fixed `member:self-serve` actor label.
+A server operator can still execute an assisted opt-out through the reviewed
+`opt_out_member` service with an explicit operator actor label, against a
+disposable/staging binding first per the rollout gates. Either actor label
+carries attribution only: never put a member ID, content, count or secret
+in it.
+
+Repeat `/privacy opt-out` taps take no purge lock: an already-suppressed
+pair gets the already-opted-out reply, and a pair with a purge receipt
+younger than 10 minutes gets a cooldown reply. Either early return writes
+no new receipt; only a fresh purge locks, deletes and receipts. Assisted
+operator calls go through the service directly and are unaffected.
 
 **Policy note (verified 2026-10-12):** the live Discord Developer Policy
 now lives on Discord's developer support help center (the old
@@ -183,7 +196,31 @@ complete in under 72 hours with a receipt unless a replay guard is unresolved,
 in which case the request stays pending with no receipt and is reported as
 deferred (with overdue requests older than 72 hours counted separately).
 Long-term aggregates (counts,
-streaks) are never time-purged, and a departed guild's rows go only through
+streaks) are never time-purged, with one exception: game-activity guild
+aggregates (`game_activity_guild_aggregates`) expire by `updated_at` age on
+the retention cadence (default 90 days, `TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`
+accepts 1..=36,500 days and any missing, malformed, or out-of-range value
+falls back to 90 days, only when `TWO_RETENTION_MODE` is exactly
+`execute`; dry runs count the visited page's full stale rows without deleting).
+Each production pass visits at most 32 candidate guilds and deletes at most
+500 rows per visited guild (test builds page at 4 x 10 to keep fixtures
+meaningful): tens of single-statement deletes per tick, far inside the
+120-second attempt budget, for at most ~16k rows per 15-minute tick
+(~1.5M/day). Each per-guild delete runs with `lock_timeout = '5s'` / `statement_timeout = '15s'`
+(plus a 15 s pool statement timeout), so a lock held by a stuck session fails
+that guild fast as an isolated retryable error instead of blocking the pass
+until the supervisor cancels it and pins its pooled connection. The cursor is
+written per guild immediately before that guild's delete, so a failed or
+cancelled pass still advances past the last attempted guild and the next pass
+reaches the later guilds on the same page, even when the whole fleet fits on
+one page; `guilds_deferred` counts
+eligible guilds after the visited page (zero only at the end of the eligible
+list), so backlog lag is observable via `guilds_deferred`/`stale_rows` with no
+per-guild labels. Dry-run totals are a same-predicate upper bound per pass
+(execute deletes at most the per-guild batch), not an exact future-delete
+promise under concurrent writes. After
+expiry a returning game's totals restart from zero with no marker. Apart
+from that window, a departed guild's rows go only through
 the guild-purge queue keyed on a true guild removal (a rejoin cancels the
 queued purge). The live gateway invokes the queue/cancel paths on real
 `GUILD_DELETE`/`GUILD_CREATE` dispatches (outage payloads never queue; an
@@ -193,7 +230,16 @@ job runs on a bounded schedule: a dry run that deletes nothing unless
 purger is installed: do not claim a live 30/90-day TTL beyond the windows
 this job enforces. Every run reports per-class metrics, with partial runs
 (deferred/overdue deletions, failed guild purges) surfaced as warnings that
-stay retryable. When the database is behind the binary (an unapplied
+stay retryable. An authenticated erasure intake
+(`two-bot-cutover::deletion_intake`) exists for the published `/privacy`
+surface but is not yet invoked on live interactions, so members cannot yet
+submit requests through it. When wired, the request binds to the invoker's
+guild/member pair, acknowledges pending only, and persists to the same
+deletion-request ledger the scheduler drains — never the narrower opt-out
+purge. Status and completion receipts are readable by the requester without
+the interaction token; receipts name the guild/member footprint and the
+retained limits, never global erasure. Live-dispatch call sites that invoke
+the intake on real interactions are follow-up work. When the database is behind the binary (an unapplied
 migration or grant), the gateway acks dispatches whose queue write hits the
 schema gap instead of crash-looping, with one exception: a missing grant
 (`42501`) on an available rejoin holds the cursor (the gateway fails the
@@ -201,9 +247,16 @@ dispatch and replays it) until the ACL plan is applied, because the queue
 may hold a pending purge for that guild. A missing queue table (`42P01`) on
 a rejoin is still skipped — an absent table holds nothing to cancel — and
 a skipped true guild removal is logged at error level with the guild id
-(`retention purge skipped; schema gap, operator replay required`) and must be
-replayed by the Operator once the migration lands, running the same insert
-the live path runs: `INSERT INTO retention_guild_purge_queue (guild_id)
+(`retention purge skipped; schema gap, operator replay required`), increments
+the pollable `retention_replay_needed` counter on `/metrics`
+(`two_bot_retention_replay_needed_total`), and must be replayed by the
+Operator once the migration lands — a nonzero counter means at least one
+skip since the last restart and is only an early hint: the counter resets
+on process restart and carries no guild id, so the error log line
+(`operator replay required`) stays the source of truth for which guilds to
+replay. Always search that line over the whole schema-gap window, then run
+the same insert the live path runs:
+`INSERT INTO retention_guild_purge_queue (guild_id)
 VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;`
 Conditional: replay only if no `GUILD_CREATE` for that guild was acked after
 the `operator replay required` line — a later `retention lifecycle skipped;
@@ -282,9 +335,17 @@ never recreates the purged `member_inactive` row). Every gated writer serializes
 with concurrent opt-outs (a shared table lock, so a write that passes the
 gate can never land after the purge), and `member_join` rows strip a
 suppressed inviter's `inviterId` from metadata while keeping the joiner's
-own row. Under a disabled toggle `touch_activity` / `mark_bot` may still
-refresh `last_active_at` for non-suppressed members, which is a known
-residual for a follow-up, not silent per-user analytics. Duplicate
+own row. Gateway activity timestamps carry their originating family
+(message/activity versus voice) through the timestamp buffer, and the
+batch commit applies the matching guild toggle inside the same
+transaction before the monotonic `last_active_at` upsert, so a disabled
+family's touch creates or advances nothing and a newer disabled stamp
+can never replace the allowed family's timestamp; the runtime funnel
+store's `touch_activity` honors the same toggle. The standalone
+`cutover::db::{touch_activity, mark_bot}` helpers and the backfill
+binaries that call them stay suppression-only (they carry no family
+signal), which is the remaining residual for a follow-up, not silent
+per-user analytics. Duplicate
 reconfirmations for suppressed pairs advance nothing: the gate runs before
 the observation-maximum path too.
 

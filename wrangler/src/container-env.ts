@@ -105,6 +105,11 @@ export const FORWARDED_FLAGS = [
   // `dry-run`/`execute`/`off`, missing defaults to dry run. Non-secret
   // runtime flag read from the process environment.
   "TWO_RETENTION_MODE",
+  // Game-activity aggregate expiry horizon in days
+  // (game_activity_store.rs AGGREGATE_RETENTION_DAYS_SETTING): read on the
+  // retention cadence, defaulting to 90 when unset. Non-secret runtime flag
+  // read from the process environment.
+  "TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS",
   // Deployment-environment marker (server.rs drill fence): committed only
   // in [env.staging.vars] as exactly "staging" (check-env-bindings.py
   // denies it top-level and in production), so the container can refuse
@@ -260,7 +265,12 @@ const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not t
 /** Every other `TWO_*` name in crates/, with why it stays out of the Container. */
 export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_GATEWAY_READINESS_FAIL_INJECTION: "staging rollback-drill switch; reaches the Container only through an explicit containerEnvVars line while TWO_DEPLOY_ENV is exactly \"staging\" (index.ts), never this flag allowlist, and never a committed wrangler.toml var (check-env-bindings.py)",
+  TWO_VOICE_STALL_FAULT_INJECTION: "staging remediation-drill switch; Worker-only trigger input for the fault injector (staging-fault.ts), never forwarded to the Container, and never a committed wrangler.toml var (check-env-bindings.py)",
+  TWO_GATEWAY_UNPAIRED_FAULT_INJECTION: "staging remediation-drill switch; Worker-only trigger input for the fault injector (staging-fault.ts), never forwarded to the Container, and never a committed wrangler.toml var (check-env-bindings.py)",
   TWO_EVENTSUB: "EventSub gate; the Worker reads it for the public ingress and forwards exactly \"1\" alongside the secret on explicit containerEnvVars lines for the private receiver only while both are set, never this flag allowlist",
+  TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID: "go-live delivery destination channel; reaches the Container only through an explicit containerEnvVars line while the EventSub receiver is forwarded and the delivery gate is exactly \"1\", never this flag allowlist",
+  TWO_EVENTSUB_DELIVERY: "go-live delivery gate; reaches the Container only as exactly \"1\" on an explicit containerEnvVars line while the EventSub receiver is forwarded, never this flag allowlist",
+  TWO_EVENTSUB_INVITE_URL: "go-live delivery invite URL; reaches the Container only through an explicit containerEnvVars line while the EventSub receiver is forwarded and the delivery gate is exactly \"1\", never this flag allowlist",
   TWO_DATABASE_URL: "cutover/operator CLI secret; the Container reads DATABASE_URL",
   TWO_STAGING_DATABASE_URL: SECRET,
   TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: SECRET,
@@ -342,6 +352,9 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_INTERNAL_FUTURE_GATE: TEST,
   TWO_INTERNAL_NEW_GATE: TEST,
   TWO_INTERNALISED_GREETING: TEST,
+  // Deliberate unknown-key fixtures in settings_map_hostile.rs, not runtime inputs.
+  TWO_ASSISTANT_ENDPOINTS: TEST,
+  TWO_OWEN_USER_IDS: TEST,
   TWO_NEW_GATE: TEST,
   TWO_NEVER_EXISTED: TEST,
   TWO_SOMETHING_NEW: TEST,

@@ -152,9 +152,11 @@ line per pick; otherwise `Done. Here is where to go:` plus one
   there at all.
 - Dry run returns empty role deltas with `Dry run: no roles were changed.`
   and records nothing.
-- An empty grant is the clear branch: held game roles are removed, the
+- A raw empty grant is the clear branch: held game roles are removed, the
   reply is `Cleared your game roles. Open the menu again whenever you
-  like.`, and no funnel rows are written.
+  like.`, and no funnel rows are written. A nonempty grant with no
+  recognized keys is not a clear: every role is preserved, nothing is
+  recorded, and the ephemeral reply invites a retry from a fresh menu.
 - Otherwise roles are matched to the menu exactly (unticked held game roles
   are removed), the reply is ephemeral (only the clicker sees it),
   `record_selected` is true and `record_routed` is true only when
@@ -177,6 +179,19 @@ byte-identical acknowledgement (the idempotency the acceptance asks for).
 A routed plan records `channel_routed` with source `session-picker`; there
 is deliberately no `game_roles_selected` row and no dry-run branch (the
 picker always answers).
+
+Before routing selected session destinations, the runtime reads fresh member,
+role and channel evidence. The voice lobby's **Join voice now** recommendation
+requires effective **View Channel + Connect** on a voice or stage channel (types 2 and 13), using
+@everyone, combined-role and member-overwrite precedence, including the existing
+owner/administrator semantics. A visible lobby with Connect denied is unavailable:
+it contributes no actionable voice link or successful voice-route fact. If the
+text pick is also selected and accessible, it still routes, with `join-voice`
+listed under `unavailable`. Only selected destinations are read, once per channel;
+deduplication, catalog order and stale-key handling are unchanged. This is a
+recommendation filter, not a permission grant, capacity forecast or guarantee of
+a future join. Text/forum game-hub visibility remains View-only; welcome posting
+still uses its existing View/Send check and does not require Connect.
 
 Sunday Squad (`SUNDAY_SQUAD`, `:875`): Fall Guys, one hour, every Sunday
 20:00 America/New_York (wall-clock, so the US-DST weeks are 169/167 hours,

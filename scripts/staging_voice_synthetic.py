@@ -113,6 +113,37 @@ class BodyTooLarge(ValueError):
     """A response body exceeds MAX_BODY_BYTES (fixed vocabulary only)."""
 
 
+REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+class RedirectRefused(ValueError):
+    """An authenticated read answered a redirect (fixed vocabulary only)."""
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Turn every redirect into an HTTPError without contacting its target."""
+
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+def _open_no_redirect(req, timeout):
+    """One token-bearing request that never follows a redirect.
+
+    urllib's default redirect handler would replay the Authorization header
+    to the redirect target; rejecting redirects at the opener means only the
+    intended URL is ever contacted. A 3xx surfaces as HTTPError so each
+    reader reports its fixed-vocabulary redirect refusal.
+    """
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPSHandler(),
+        urllib.request.HTTPErrorProcessor(),
+        _NoRedirectHandler(),
+    )
+    return opener.open(req, timeout=timeout)
+
+
 # --------------------------------------------------------------------------
 # Pure verdict logic (offline-testable)
 # --------------------------------------------------------------------------
@@ -446,9 +477,12 @@ def metrics_snapshot(staging_url, token):
     req = urllib.request.Request(f"{staging_url.rstrip('/')}/ops/metrics", headers={
         "Authorization": f"Bearer {token}", "User-Agent": "two-bot-voice-synthetic (staging)"})
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with _open_no_redirect(req, timeout=20) as resp:
             raw = resp.read(MAX_BODY_BYTES + 1)
     except urllib.error.HTTPError as exc:
+        if exc.code in REDIRECT_STATUSES:
+            raise RedirectRefused(
+                f"metrics read refused redirect with status {exc.code}") from None
         raw = exc.read(MAX_BODY_BYTES + 1)
         if len(raw) > MAX_BODY_BYTES:
             raise BodyTooLarge("metrics read answered over the body cap") from None
@@ -551,9 +585,12 @@ def rest(token, path, timeout=20):
     req = urllib.request.Request(f"{API}{path}", headers={
         "Authorization": f"Bot {token}", "User-Agent": "two-bot-voice-synthetic (staging)"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open_no_redirect(req, timeout=timeout) as resp:
             raw = resp.read(MAX_BODY_BYTES + 1)
     except urllib.error.HTTPError as exc:
+        if exc.code in REDIRECT_STATUSES:
+            raise RedirectRefused(
+                f"Discord REST read refused redirect with status {exc.code}") from None
         raw = exc.read(MAX_BODY_BYTES + 1)
         if len(raw) > MAX_BODY_BYTES:
             raise BodyTooLarge("Discord REST read answered over the body cap") from None
@@ -575,10 +612,13 @@ def rest_patch(token, path, payload, timeout=20):
         "Authorization": f"Bot {token}", "User-Agent": "two-bot-voice-synthetic (staging)",
         "Content-Type": "application/json"}, method="PATCH")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open_no_redirect(req, timeout=timeout) as resp:
             raw = resp.read(MAX_BODY_BYTES + 1)
             status = resp.status
     except urllib.error.HTTPError as exc:
+        if exc.code in REDIRECT_STATUSES:
+            raise RedirectRefused(
+                f"Discord REST read refused redirect with status {exc.code}") from None
         raw = exc.read(MAX_BODY_BYTES + 1)
         if len(raw) > MAX_BODY_BYTES:
             raise BodyTooLarge("Discord REST read answered over the body cap") from None
@@ -594,9 +634,12 @@ def metrics_value(staging_url, token):
     req = urllib.request.Request(f"{staging_url.rstrip('/')}/ops/metrics", headers={
         "Authorization": f"Bearer {token}", "User-Agent": "two-bot-voice-synthetic (staging)"})
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with _open_no_redirect(req, timeout=20) as resp:
             raw = resp.read(MAX_BODY_BYTES + 1)
     except urllib.error.HTTPError as exc:
+        if exc.code in REDIRECT_STATUSES:
+            raise RedirectRefused(
+                f"metrics read refused redirect with status {exc.code}") from None
         raw = exc.read(MAX_BODY_BYTES + 1)
         if len(raw) > MAX_BODY_BYTES:
             raise BodyTooLarge("metrics read answered over the body cap") from None

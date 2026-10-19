@@ -116,6 +116,208 @@ pub async fn upsert_guild_aggregates(
     Ok(written)
 }
 
+/// How long a quiet guild's aggregate rows survive: rows whose `updated_at`
+/// is older than this many days expire on the retention cadence. Long enough
+/// to keep operator trend reports useful across quiet spells, short enough
+/// that abandoned guilds stop accumulating rows forever.
+pub const GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS: i32 = 90;
+
+/// Process-environment key overriding
+/// [`GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`]. Read on the retention cadence,
+/// never on the flush/send path.
+pub const AGGREGATE_RETENTION_DAYS_SETTING: &str = "TWO_GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS";
+
+/// Widest horizon the parser accepts: a century, far beyond any sane retention
+/// window yet safely inside the `timestamptz` range, so an absurd operator
+/// value can never push `now() - make_interval(days => $2)` out of range and
+/// fail every retention tick.
+pub const MAX_AGGREGATE_RETENTION_DAYS: i32 = 36_500;
+
+/// Parse the [`AGGREGATE_RETENTION_DAYS_SETTING`] value. Missing, malformed,
+/// non-positive, or unrepresentably large values fall back to
+/// [`GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS`], never to a wider horizon: an
+/// unreadable setting must not widen into a full-table wipe (out-of-range
+/// values refuse below in [`expire_stale_guild_aggregates`]).
+#[must_use]
+pub fn aggregate_retention_days_from_setting(value: Option<&str>) -> i32 {
+    match value.and_then(|raw| raw.trim().parse::<i32>().ok()) {
+        Some(days) if (1..=MAX_AGGREGATE_RETENTION_DAYS).contains(&days) => days,
+        _ => GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS,
+    }
+}
+
+/// Refuse horizons outside `1..=MAX_AGGREGATE_RETENTION_DAYS` (fail-closed):
+/// a sub-day value must not widen into a full-guild wipe, and an
+/// unrepresentable one must not push the interval arithmetic out of range.
+fn check_horizon(retention_days: i32) -> Result<(), GameActivityStoreError> {
+    if (1..=MAX_AGGREGATE_RETENTION_DAYS).contains(&retention_days) {
+        Ok(())
+    } else {
+        Err(GameActivityStoreError::Db(sqlx::Error::InvalidArgument(
+            "bad horizon".into(),
+        )))
+    }
+}
+
+/// Guilds holding stale aggregate rows plus each guild's stale row count,
+/// oldest guild key first, so the retention cadence sweeps each stale guild
+/// under its own guild scope without spending its bounded tick re-walking
+/// guilds whose rows are all fresh (a fresh-only prefix would otherwise
+/// starve later stale guilds when the attempt budget cancels the run).
+/// The per-guild counts are the dry-run preview behind the delete in
+/// [`expire_stale_guild_aggregates`]: same predicate, no writes.
+/// Horizons outside `1..=MAX_AGGREGATE_RETENTION_DAYS` are refused
+/// (fail-closed).
+///
+/// The per-pass sweep uses [`list_aggregate_guild_page`] instead: this full
+/// listing stays for small exact reads (reports, tests), never for a tick.
+pub async fn list_aggregate_guilds(
+    pool: &Pool<Postgres>,
+    retention_days: i32,
+) -> Result<Vec<(String, u64)>, GameActivityStoreError> {
+    check_horizon(retention_days)?;
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT guild_id, count(*) FROM game_activity_guild_aggregates WHERE updated_at < now() - make_interval(days => $1) GROUP BY guild_id ORDER BY guild_id ASC",
+    )
+    .bind(retention_days)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(guild_id, stale)| (guild_id, u64::try_from(stale.max(0)).unwrap_or(u64::MAX)))
+        .collect())
+}
+
+/// One bounded keyset page of stale-guild candidates: at most `limit` guilds
+/// holding stale rows, ordered by guild key ascending, resuming after
+/// `after_guild` (exclusive; `None` starts at the first key). The per-guild
+/// counts use the same stale predicate as [`expire_stale_guild_aggregates`],
+/// so a dry-run pass is a same-predicate upper bound per pass for the visited
+/// page: execute deletes at most the per-guild row batch per visited guild,
+/// so over-batch guilds report fewer deleted rows per pass than previewed.
+/// Stable under concurrent inserts: a guild sorts by
+/// key, never by position, so a pass never re-walks already visited keys.
+/// Horizons outside `1..=MAX_AGGREGATE_RETENTION_DAYS` are refused
+/// (fail-closed); a zero `limit` reads one guild.
+pub async fn list_aggregate_guild_page(
+    pool: &Pool<Postgres>,
+    retention_days: i32,
+    after_guild: Option<&str>,
+    limit: u32,
+) -> Result<Vec<(String, u64)>, GameActivityStoreError> {
+    check_horizon(retention_days)?;
+    let limit = i64::from(limit.max(1));
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT guild_id, count(*) FROM game_activity_guild_aggregates \
+         WHERE updated_at < now() - make_interval(days => $1) \
+         AND ($2 IS NULL OR guild_id > $2) \
+         GROUP BY guild_id ORDER BY guild_id ASC LIMIT $3",
+    )
+    .bind(retention_days)
+    .bind(after_guild)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(guild_id, stale)| (guild_id, u64::try_from(stale.max(0)).unwrap_or(u64::MAX)))
+        .collect())
+}
+
+/// How many stale-guild candidates sort after `after_guild` (exclusive;
+/// `None` counts the whole eligible list): the `guilds_deferred` evidence a
+/// pass reports, so a partial pass is distinguishable from a complete one.
+/// A single scalar, never the rows themselves, so the count stays bounded no
+/// matter how many guilds are stale. Same predicate and fail-closed horizon
+/// as [`list_aggregate_guild_page`].
+pub async fn count_stale_aggregate_guilds_after(
+    pool: &Pool<Postgres>,
+    retention_days: i32,
+    after_guild: Option<&str>,
+) -> Result<u64, GameActivityStoreError> {
+    check_horizon(retention_days)?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (SELECT DISTINCT guild_id \
+         FROM game_activity_guild_aggregates \
+         WHERE updated_at < now() - make_interval(days => $1) \
+         AND ($2 IS NULL OR guild_id > $2)) AS stale_guilds",
+    )
+    .bind(retention_days)
+    .bind(after_guild)
+    .fetch_one(pool)
+    .await?;
+    Ok(u64::try_from(count.max(0)).unwrap_or(u64::MAX))
+}
+
+/// Delete one guild's aggregate rows older than `retention_days`, leaving
+/// every other guild untouched. Only deletes: opt-out filtering stays at the
+/// write-time gate ([`aggregate_filtered`]/[`upsert_guild_aggregates`]), so
+/// expiry can neither persist an opted-out member's data nor resurrect it.
+/// Horizons outside `1..=MAX_AGGREGATE_RETENTION_DAYS` are refused
+/// (fail-closed): a sub-day value must not widen into a full-guild wipe, and
+/// an unrepresentable one must not push the interval arithmetic out of range.
+pub async fn expire_stale_guild_aggregates(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    retention_days: i32,
+) -> Result<u64, GameActivityStoreError> {
+    check_horizon(retention_days)?;
+    Ok(sqlx::query(
+        "DELETE FROM game_activity_guild_aggregates WHERE guild_id = $1 AND updated_at < now() - make_interval(days => $2)",
+    )
+    .bind(guild_id)
+    .bind(retention_days)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+/// Delete at most `limit` of one guild's stale aggregate rows, oldest game
+/// key first, leaving every other guild untouched. Same predicate as
+/// [`expire_stale_guild_aggregates`] plus the row cap, so an oversized guild
+/// drains across passes: remaining stale rows stay eligible for the next
+/// pass and are never silently lost. Same fail-closed horizon; a zero
+/// `limit` deletes one row.
+///
+/// Each batch runs in its own transaction with `lock_timeout = '5s'` and
+/// `statement_timeout = '15s'` (the cutover retention `SET LOCAL`
+/// precedent): a row lock held by a stuck session fails this guild fast as
+/// an isolated retryable error instead of blocking the pass until the
+/// supervisor cancels it. Cancelling a blocked delete would pin its pooled
+/// connection (sqlx 0.9 pings the dropped connection with no timeout), so
+/// without these bounds two cancelled passes would exhaust the retention
+/// pool and stop every later tick at `pool.begin()`.
+pub async fn expire_stale_guild_aggregates_batch(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    retention_days: i32,
+    limit: u32,
+) -> Result<u64, GameActivityStoreError> {
+    check_horizon(retention_days)?;
+    let limit = i64::from(limit.max(1));
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '15s'")
+        .execute(&mut *tx)
+        .await?;
+    let deleted = sqlx::query(
+        "DELETE FROM game_activity_guild_aggregates WHERE ctid IN \
+         (SELECT ctid FROM game_activity_guild_aggregates \
+         WHERE guild_id = $1 AND updated_at < now() - make_interval(days => $2) \
+         ORDER BY game ASC LIMIT $3)",
+    )
+    .bind(guild_id)
+    .bind(retention_days)
+    .bind(limit)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(deleted)
+}
+
 /// A guild's stored rows, oldest game key first (`''`/untitled first), for
 /// the operator trend report. No per-member reader exists by design.
 pub async fn read_guild_aggregates(
@@ -518,6 +720,152 @@ mod tests {
                 .iter()
                 .all(|(guild, game)| guild == "guild-a" && (game == "Apex" || game.is_empty())),
             "rows carry guild and game only, got {stored:?}"
+        );
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[test]
+    fn aggregate_retention_horizon_defaults_safe_and_never_widens() {
+        assert_eq!(aggregate_retention_days_from_setting(None), 90);
+        assert_eq!(
+            aggregate_retention_days_from_setting(None),
+            GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS
+        );
+        assert_eq!(aggregate_retention_days_from_setting(Some("30")), 30);
+        assert_eq!(aggregate_retention_days_from_setting(Some(" 45 ")), 45);
+        // Malformed, non-positive, or unrepresentably large input falls back
+        // to the safe default; nothing parses into a wider-than-default
+        // horizon here, and sane explicit values stay exact.
+        for fallback in [
+            None,
+            Some(""),
+            Some("soon"),
+            Some("0"),
+            Some("-7"),
+            Some("36501"),
+            Some("2147483647"),
+        ] {
+            assert_eq!(
+                aggregate_retention_days_from_setting(fallback),
+                GAME_ACTIVITY_AGGREGATE_RETENTION_DAYS,
+                "unreadable horizon must fall back, got {fallback:?}"
+            );
+        }
+        assert_eq!(aggregate_retention_days_from_setting(Some("365")), 365);
+        assert_eq!(
+            aggregate_retention_days_from_setting(Some("36500")),
+            MAX_AGGREGATE_RETENTION_DAYS
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_rows_expire_per_guild_and_fresh_rows_survive() {
+        let Some((pool, schema)) = test_pool("tog_28386_expire")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping game_activity_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // Guild-a holds one stale game and one fresh game; guild-b holds one
+        // stale game; guild-c holds one fresh game only. Backdating
+        // `updated_at` stands in for a quiet guild: the flush path always
+        // refreshes it on write.
+        upsert_guild_aggregates(
+            &pool,
+            &[
+                aggregate("guild-a", Some("Apex"), 30 * MIN_MS, MIN_MS, 1),
+                aggregate("guild-a", Some("Valorant"), 10 * MIN_MS, 0, 1),
+                aggregate("guild-b", Some("Apex"), 99 * MIN_MS, 0, 9),
+                aggregate("guild-c", Some("Apex"), 5 * MIN_MS, 0, 1),
+            ],
+        )
+        .await
+        .expect("seed flush");
+        for (guild, game) in [("guild-a", "Apex"), ("guild-b", "Apex")] {
+            sqlx::query(
+                "UPDATE game_activity_guild_aggregates
+                    SET updated_at = now() - make_interval(days => 100)
+                  WHERE guild_id = $1 AND game = $2",
+            )
+            .bind(guild)
+            .bind(game)
+            .execute(&pool)
+            .await
+            .expect("backdate stale row");
+        }
+        // The sweep listing names only guilds with stale rows with each
+        // guild's stale count: the fresh-only guild never spends the
+        // bounded tick. The counts are the dry-run preview of the same
+        // rows the delete takes, without writing.
+        assert_eq!(
+            list_aggregate_guilds(&pool, 90)
+                .await
+                .expect("guild listing"),
+            vec![("guild-a".to_owned(), 1), ("guild-b".to_owned(), 1),],
+        );
+        // Out-of-range horizons refuse instead of wiping the guild or
+        // pushing interval arithmetic out of range.
+        for bad in [0, -7, MAX_AGGREGATE_RETENTION_DAYS + 1, i32::MAX] {
+            assert!(
+                expire_stale_guild_aggregates(&pool, "guild-a", bad)
+                    .await
+                    .is_err(),
+                "{bad}-day horizon must fail closed"
+            );
+            assert!(
+                list_aggregate_guilds(&pool, bad).await.is_err(),
+                "{bad}-day listing must fail closed"
+            );
+        }
+        // Expiring guild-a deletes only its stale row: the fresh row stays,
+        // and guild-b's equally stale row is untouched (per-guild isolation).
+        assert_eq!(
+            expire_stale_guild_aggregates(&pool, "guild-a", 90)
+                .await
+                .expect("expire guild-a"),
+            1
+        );
+        let kept = read_guild_aggregates(&pool, "guild-a")
+            .await
+            .expect("read guild-a");
+        assert_eq!(kept.len(), 1, "fresh row survives, got {kept:?}");
+        assert_eq!(kept[0].game.as_deref(), Some("Valorant"));
+        assert_eq!(kept[0].total_play_ms, 10 * MIN_MS);
+        assert_eq!(
+            read_guild_aggregates(&pool, "guild-b")
+                .await
+                .expect("read guild-b")
+                .len(),
+            1,
+            "other guilds keep their rows until their own expiry"
+        );
+        // Guild-b's own expiry then clears it, and re-expiring an empty or
+        // fresh guild deletes nothing.
+        assert_eq!(
+            expire_stale_guild_aggregates(&pool, "guild-b", 90)
+                .await
+                .expect("expire guild-b"),
+            1
+        );
+        assert!(read_guild_aggregates(&pool, "guild-b")
+            .await
+            .expect("read emptied guild")
+            .is_empty());
+        assert_eq!(
+            expire_stale_guild_aggregates(&pool, "guild-a", 90)
+                .await
+                .expect("re-expire fresh guild"),
+            0
+        );
+        // The fresh-only guild was never listed, never counted stale, and
+        // keeps its row.
+        assert_eq!(
+            read_guild_aggregates(&pool, "guild-c")
+                .await
+                .expect("read fresh-only guild")
+                .len(),
+            1
         );
         drop_schema(&pool, &schema).await;
     }

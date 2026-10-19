@@ -225,6 +225,7 @@ pub const PREFIX_TRIGGER_REFUSED_REASONS: &[&str] = &["verdict", "other"];
 /// (`proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`);
 /// and each queued rename at dispatch (`rename_sent`, or why it was dropped
 /// or held, including `rename_duplicate` for a flush-time folded duplicate).
+/// `name_blocked` records a dispatch-time rename or custom-override refusal.
 /// Unknown outcomes collapse to `other`.
 pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "created_with_template",
@@ -241,6 +242,7 @@ pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "rename_no_access",
     "rename_held",
     "rename_duplicate",
+    "name_blocked",
     "other",
 ];
 /// Creator-join accept refusals for `two_bot_voice_join_refused_total{reason}`:
@@ -300,6 +302,31 @@ pub const VOICE_VOTE_KICK_OUTCOMES: &[&str] = &[
     "gave_up",
     "other",
 ];
+/// Moderation enforcement verbs for `two_bot_moderation_enforcements_total{verb,outcome}`
+/// (TOG-28482): exactly the nine `ModerationAction::command_name` verbs in
+/// legacy publish order. A test pins this list to
+/// `ModerationAction::ALL.map(command_name)` so a new verb fails the suite
+/// until the budget rows join it. Unknown verbs collapse to the trailing
+/// slot only when the allowlist grows; today every caller passes a real
+/// verb, so no user id, reason text or free-form detail ever becomes a label.
+pub const MODERATION_VERBS: &[&str] = &[
+    "ban", "tempban", "kick", "timeout", "warn", "purge", "slowmode", "lockdown", "unlock",
+];
+/// Terminal outcomes for `two_bot_moderation_enforcements_total{verb,outcome}`
+/// (TOG-28482): `success` for every completed enforcement (including
+/// idempotent replays served without a second effect), `refused` for
+/// policy/validation/definitive rejections that prove no mutation happened,
+/// `discord_error` for uncertain Discord failures (timeout, unreachable,
+/// rate-limited), `storage_error` for persistence failures, and `other` for
+/// anything else. Unknown outcomes collapse to the trailing `other`, never
+/// to a dynamic label. No IDs, tokens or bodies are retained.
+pub const MODERATION_ENFORCEMENT_OUTCOMES: &[&str] = &[
+    "success",
+    "refused",
+    "discord_error",
+    "storage_error",
+    "other",
+];
 /// Dispatch-lane names for `two_bot_dispatch_drops_total{lane}`, in the bot's
 /// `DISPATCH_LIMITS` order (messages, interactions, registry, privileged,
 /// busy, reactions). Length must equal the lane count; unknown names collapse
@@ -343,6 +370,27 @@ pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
 /// unrecognised outcome collapses to the last entry (`rejected`) rather than
 /// growing the series vocabulary.
 pub const PRESENCE_CAPTURE_OUTCOMES: &[&str] = &["inserted", "duplicate", "rejected"];
+/// Terminal automod decision outcomes for
+/// `two_bot_automod_decisions_total{outcome}`. Mirrors
+/// `automod_runtime::CompletionKind::as_str` in declaration order: `accepted`
+/// for clean content, `already_processed` for a counted retry, `dry_run` for
+/// a matched dry-run capture, `protected` for an exempt target, `deleted` /
+/// `warned` / `timed_out` for enforced ladders, and `sanction_refused` when
+/// the delete-adjacent sanction could not run. Exactly eight series from
+/// process start; no message text, excerpts or user IDs ever become labels.
+/// Unknown outcomes collapse to the trailing `sanction_refused` slot only
+/// when the allowlist grows; today every caller passes a member, so that
+/// slot stays zero unless hostile input arrives.
+pub const AUTOMOD_DECISION_OUTCOMES: &[&str] = &[
+    "accepted",
+    "already_processed",
+    "dry_run",
+    "protected",
+    "deleted",
+    "warned",
+    "timed_out",
+    "sanction_refused",
+];
 /// Website-action receiver families for
 /// `two_bot_internal_actions_total{family,outcome}` (TOG-20119, roadmap
 /// M4.23). The signed receiver (`crates/bot/src/internal_action_http.rs`)
@@ -405,6 +453,33 @@ pub const EVENTSUB_DELIVERY_KINDS: [&str; 6] = [
 /// Go-live post attempts by bounded outcome. The outcome vocabulary is fixed;
 /// post identifiers and error details are never retained.
 pub const EVENTSUB_POST_OUTCOMES: [&str; 4] = ["attempted", "succeeded", "failed", "other"];
+/// Feed-fetch attempts by bounded outcome (TOG-28423): `success` for a 2xx
+/// fetch, `invalid_source` for a source refused before dialling (bad URL or
+/// non-public address), `refused_redirect` for a redirect refused by policy,
+/// and `failure` for every other fetch failure (including non-2xx HTTP).
+/// Per-outcome, never per-feed: no source URL, host or feed id reaches a label.
+pub const FEED_FETCH_OUTCOMES: &[&str] =
+    &["success", "invalid_source", "refused_redirect", "failure"];
+/// Feed-fetch failure causes for `two_bot_feed_fetch_errors_total{error_class}`
+/// (TOG-28423). The vocabulary mirrors [`crate::feeds_http::FetchError`] plus
+/// the connector layers (`resolve`, `transport`, `deadline`,
+/// `unsupported_encoding`) and `http_error` for a completed non-2xx fetch.
+/// Unknown classes collapse to the trailing `other`. No URL, host, header or
+/// body bytes ever reach a label.
+pub const FEED_FETCH_ERROR_CLASSES: &[&str] = &[
+    "invalid_source",
+    "non_public_address",
+    "redirect_refused",
+    "too_large",
+    "invalid_encoding",
+    "unsupported_content_type",
+    "unsupported_encoding",
+    "resolve",
+    "transport",
+    "deadline",
+    "http_error",
+    "other",
+];
 /// Outcomes of one EventSub reconcile pass for
 /// `two_bot_eventsub_reconcile_passes_total{outcome}`: `healthy` when every
 /// desired broadcaster holds a healthy subscription afterwards, `pending` when
@@ -496,6 +571,9 @@ struct VoiceActorStall {
     halted: bool,
     queue_pending: [u64; VOICE_QUEUE_LANES.len()],
     oldest_age_secs: u64,
+    /// Seconds this actor's live view has been not ready while the gateway
+    /// is connected (joins are dropped meanwhile); 0 when ready or offline.
+    live_not_ready_secs: u64,
 }
 
 #[derive(Default)]
@@ -545,7 +623,10 @@ struct Values {
     voice_watchdog_stucks: u64,
     /// Halt-latch recoveries via credential re-probe.
     voice_halt_recoveries: u64,
+    /// Live views republished by the not-ready-while-connected self-heal.
+    voice_live_self_heals: u64,
     voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
+    moderation_enforcements: [[u64; MODERATION_ENFORCEMENT_OUTCOMES.len()]; MODERATION_VERBS.len()],
     voice_names: [u64; VOICE_NAME_OUTCOMES.len()],
     db_errors: [u64; DB_ERROR_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
@@ -553,6 +634,9 @@ struct Values {
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
     presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
+    feed_fetch: [u64; FEED_FETCH_OUTCOMES.len()],
+    feed_fetch_errors: [u64; FEED_FETCH_ERROR_CLASSES.len()],
+    automod_decisions: [u64; AUTOMOD_DECISION_OUTCOMES.len()],
     last_ready_unix: Option<u64>,
     last_resume_unix: Option<u64>,
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
@@ -563,6 +647,13 @@ struct Values {
     /// so the vocabulary is the single series name — no actor ID, timestamp,
     /// error text or row content ever reaches exposition.
     audit_delivery_halt: u64,
+    /// Skipped retention purges needing Operator replay: one per real guild
+    /// removal whose purge-queue write hit the schema gap (the
+    /// `retention_lifecycle` purge-skip arm). Successful queue writes and
+    /// rejoin-cancel skips never increment it. Label-free counter; resets on
+    /// process restart, so the runbook pairs it with the error log line. No
+    /// guild id, SQLSTATE or error text ever becomes a label.
+    retention_replay_needed: u64,
     /// Event-store consumer lag (S1): `received_at - event_time` spread in
     /// seconds for the newest observed capture row. Last writer wins; 0 when
     /// no row has been observed. Single label-free series — no message,
@@ -606,6 +697,7 @@ fn voice_actor_entry(
         entry.halted = false;
         entry.queue_pending = [0; VOICE_QUEUE_LANES.len()];
         entry.oldest_age_secs = 0;
+        entry.live_not_ready_secs = 0;
     }
     Some(entry)
 }
@@ -665,6 +757,51 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter =
             &mut values.presence_capture[bounded_index(outcome, PRESENCE_CAPTURE_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One feed-fetch attempt (TOG-28423): `success` for a 2xx fetch,
+    /// `invalid_source` for a source refused before dialling,
+    /// `refused_redirect` for a redirect refused by policy, `failure` for
+    /// every other failure. Call once per fetch, never per feed id: the
+    /// outcome is the whole label vocabulary and an unrecognised outcome
+    /// collapses to `failure`.
+    pub fn feed_fetch(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.feed_fetch[bounded_index(outcome, FEED_FETCH_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One failed feed fetch by bounded error class (see
+    /// [`FEED_FETCH_ERROR_CLASSES`]). Call once per failed fetch alongside
+    /// [`Self::feed_fetch`]; successes record nothing here. Unknown classes
+    /// collapse to `other`.
+    pub fn feed_fetch_error(&self, error_class: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.feed_fetch_errors[bounded_index(error_class, FEED_FETCH_ERROR_CLASSES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One terminal automod decision (see [`AUTOMOD_DECISION_OUTCOMES`]).
+    /// Call once per committed [`StoredOutcome`](crate::automod_runtime::StoredOutcome):
+    /// the shared activation settles exactly one receipt per inspection, so
+    /// replays and retained claims never call this. The outcome is the whole
+    /// label vocabulary — no message text, excerpts or user IDs ever become
+    /// labels — and an unrecognised outcome collapses to `sanction_refused`.
+    pub fn automod_decision(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.automod_decisions[bounded_index(outcome, AUTOMOD_DECISION_OUTCOMES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -854,6 +991,26 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
+    /// One moderation enforcement terminal outcome (TOG-28482). Call once per
+    /// terminal member/channel enforcement from each dispatch site (slash
+    /// member/channel runtimes and website member/channel executors): each
+    /// request records exactly once, so an idempotent replay counts as
+    /// `success` on its own serve while the in-flight duplicate that prompted
+    /// it counts on its own terminal outcome. `verb` is a
+    /// `ModerationAction::command_name` verb; `outcome` is one of
+    /// [`MODERATION_ENFORCEMENT_OUTCOMES`]. Unknown verbs/outcomes collapse
+    /// to the trailing slots only when the allowlists grow. No user id,
+    /// reason text or free-form detail ever becomes a label.
+    pub fn moderation_enforcement(&self, verb: &str, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.moderation_enforcements[bounded_index(verb, MODERATION_VERBS)]
+            [bounded_index(outcome, MODERATION_ENFORCEMENT_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
     /// One automatic room-name decision (see [`VOICE_NAME_OUTCOMES`]).
     pub fn voice_name(&self, outcome: &str) {
         let mut values = self
@@ -902,6 +1059,32 @@ impl Metrics {
         if let Some(entry) = voice_actor_entry(&mut values, actor, generation) {
             entry.halted = halted;
         }
+    }
+
+    /// Record how long one guild actor's live view has been not ready while
+    /// the gateway is connected (0 when ready or while the transport is
+    /// down). The public `two_bot_voice_live_not_ready_seconds` gauge is the
+    /// maximum across current actors, so a healthy guild cannot hide a
+    /// guild whose joins are being dropped. Generation fencing matches
+    /// [`Self::set_voice_actor_halted`].
+    pub fn set_voice_actor_live_not_ready(&self, actor: u64, generation: u64, secs: u64) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = voice_actor_entry(&mut values, actor, generation) {
+            entry.live_not_ready_secs = secs;
+        }
+    }
+
+    /// One live view republished from the gateway cache by the self-heal
+    /// path: it was not ready while the gateway was connected.
+    pub fn voice_live_self_heal(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_live_self_heals = values.voice_live_self_heals.saturating_add(1);
     }
 
     /// Record one guild actor's queued depth by lane plus its oldest
@@ -1039,6 +1222,19 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         values.voice_orphans = values.voice_orphans.saturating_add(1);
+    }
+
+    /// One skipped retention purge needing Operator replay: a real guild
+    /// removal whose purge-queue write hit the schema gap. Call exactly once
+    /// from the purge-skip arm of `retention_lifecycle`; successful queue
+    /// writes and rejoin-cancel skips never call this. Label-free counter;
+    /// no guild id, SQLSTATE or error text ever becomes a label.
+    pub fn retention_replay_needed(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.retention_replay_needed = values.retention_replay_needed.saturating_add(1);
     }
 
     /// One storage-layer failure. Unknown `op` values collapse
@@ -1324,6 +1520,51 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_feed_fetches_total",
+            "counter",
+            "Feed fetch attempts by bounded outcome; per-outcome, never per-feed.",
+        );
+        for (outcome, count) in FEED_FETCH_OUTCOMES.iter().zip(values.feed_fetch) {
+            writeln!(
+                out,
+                "two_bot_feed_fetches_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_feed_fetch_errors_total",
+            "counter",
+            "Failed feed fetches by bounded error class; successes record nothing here.",
+        );
+        for (error_class, count) in FEED_FETCH_ERROR_CLASSES
+            .iter()
+            .zip(values.feed_fetch_errors)
+        {
+            writeln!(
+                out,
+                "two_bot_feed_fetch_errors_total{{error_class=\"{error_class}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_automod_decisions_total",
+            "counter",
+            "Terminal automod inspection outcomes by bounded CompletionKind; fixed eight series.",
+        );
+        for (outcome, count) in AUTOMOD_DECISION_OUTCOMES
+            .iter()
+            .zip(values.automod_decisions)
+        {
+            writeln!(
+                out,
+                "two_bot_automod_decisions_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
             "two_bot_gateway_latency_seconds",
             "gauge",
             "Last heartbeat ACK latency; NaN until measured.",
@@ -1531,11 +1772,13 @@ impl Metrics {
         let voice_halted = u64::from(values.voice_actors.values().any(|actor| actor.halted));
         let mut voice_queue_pending = [0_u64; VOICE_QUEUE_LANES.len()];
         let mut voice_queue_oldest_age_secs = 0_u64;
+        let mut voice_live_not_ready_secs = 0_u64;
         for actor in values.voice_actors.values() {
             for (total, depth) in voice_queue_pending.iter_mut().zip(actor.queue_pending) {
                 *total = total.saturating_add(depth);
             }
             voice_queue_oldest_age_secs = voice_queue_oldest_age_secs.max(actor.oldest_age_secs);
+            voice_live_not_ready_secs = voice_live_not_ready_secs.max(actor.live_not_ready_secs);
         }
         header(
             &mut out,
@@ -1568,6 +1811,23 @@ impl Metrics {
             "two_bot_voice_queue_oldest_age_seconds {voice_queue_oldest_age_secs}"
         )
         .unwrap();
+        header(
+            &mut out,
+            "two_bot_voice_live_not_ready_seconds",
+            "gauge",
+            "Seconds a guild live voice view has been not ready while the gateway is connected (creator joins are dropped meanwhile), maximum across guild actors; 0 when every view is ready or the gateway is down.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_live_not_ready_seconds {voice_live_not_ready_secs}"
+        )
+        .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_voice_live_self_heal_total",
+            "counter",
+            values.voice_live_self_heals,
+        );
         header(
             &mut out,
             "two_bot_voice_rest_in_flight_age_seconds",
@@ -1738,6 +1998,21 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_moderation_enforcements_total",
+            "counter",
+            "Moderation enforcement terminal outcomes by bounded verb and outcome; retries and rate-limit backoffs are not outcomes.",
+        );
+        for (verb, outcomes) in MODERATION_VERBS.iter().zip(values.moderation_enforcements) {
+            for (outcome, count) in MODERATION_ENFORCEMENT_OUTCOMES.iter().zip(outcomes) {
+                writeln!(
+                    out,
+                    "two_bot_moderation_enforcements_total{{verb=\"{verb}\",outcome=\"{outcome}\"}} {count}"
+                )
+                .unwrap();
+            }
+        }
+        header(
+            &mut out,
             "two_bot_community_facts_drain_failures_total",
             "counter",
             "Community-facts drain failures by bounded reason; the worker warns and continues, so each failed dispatch counts once.",
@@ -1764,6 +2039,12 @@ impl Metrics {
             values.audit_delivery_halt
         )
         .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_retention_replay_needed_total",
+            "counter",
+            values.retention_replay_needed,
+        );
         header(
             &mut out,
             "two_bot_event_store_consumer_lag_seconds",
@@ -2077,7 +2358,10 @@ mod tests {
             metrics.voice_vote_kick(&hostile);
             metrics.checkpoint_failure(&hostile);
             metrics.presence_capture(&hostile);
+            metrics.feed_fetch(&hostile);
+            metrics.feed_fetch_error(&hostile);
             metrics.internal_action(&hostile, &hostile);
+            metrics.moderation_enforcement(&hostile, &hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
@@ -2401,6 +2685,68 @@ mod tests {
     }
 
     #[test]
+    fn moderation_verbs_match_the_nine_command_names() {
+        let names: Vec<&str> = crate::moderation::ModerationAction::ALL
+            .iter()
+            .map(|action| action.command_name())
+            .collect();
+        assert_eq!(names, MODERATION_VERBS);
+        assert_eq!(MODERATION_VERBS.len(), 9);
+        assert_eq!(MODERATION_ENFORCEMENT_OUTCOMES.len(), 5);
+        assert_eq!(MODERATION_ENFORCEMENT_OUTCOMES.last(), Some(&"other"));
+    }
+
+    #[test]
+    fn moderation_enforcements_cover_every_verb_and_outcome() {
+        // TOG-28482 acceptance: each verb/outcome pair records with no network.
+        let metrics = Metrics::default();
+        for verb in MODERATION_VERBS {
+            for outcome in MODERATION_ENFORCEMENT_OUTCOMES {
+                metrics.moderation_enforcement(verb, outcome);
+            }
+        }
+        let text = metrics.render(None);
+        for verb in MODERATION_VERBS {
+            for outcome in MODERATION_ENFORCEMENT_OUTCOMES {
+                assert!(
+                    text.contains(&format!(
+                        "two_bot_moderation_enforcements_total{{verb=\"{verb}\",outcome=\"{outcome}\"}} 1\n"
+                    )),
+                    "missing {verb}/{outcome}"
+                );
+            }
+        }
+        // Fixed cardinality: 9 verbs x 5 outcomes.
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_moderation_enforcements_total{"))
+                .count(),
+            MODERATION_VERBS.len() * MODERATION_ENFORCEMENT_OUTCOMES.len()
+        );
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn moderation_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.moderation_enforcement(&hostile, &hostile);
+            metrics.moderation_enforcement("ban", &hostile);
+            metrics.moderation_enforcement(&hostile, "success");
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+    }
+
+    #[test]
     fn db_and_admission_signals_stay_bounded_and_saturate() {
         let metrics = Metrics::default();
         metrics.db_error("admission");
@@ -2711,6 +3057,29 @@ mod tests {
     }
 
     #[test]
+    fn retention_replay_needed_counter_is_label_free_and_zero_fresh() {
+        // TOG-29785: skipped purges render as one label-free counter series —
+        // 0 on a fresh registry, +1 per purge-skip — so no guild id, SQLSTATE
+        // or error text can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_retention_replay_needed_total counter\n"));
+        assert!(text.contains("two_bot_retention_replay_needed_total 0\n"));
+        metrics.retention_replay_needed();
+        metrics.retention_replay_needed();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_retention_replay_needed_total 2\n"));
+        assert!(!text.contains("two_bot_retention_replay_needed_total{"));
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_retention_replay_needed_total "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+    }
+
+    #[test]
     fn event_store_consumer_lag_gauge_is_a_label_free_duration() {
         // S1 AC 4: the consumer lag setter renders as one label-free gauge
         // series — the newest observed `received_at - event_time` spread, 0
@@ -2792,6 +3161,40 @@ mod tests {
             let (_, value) = series[0].rsplit_once(' ').unwrap();
             value.parse::<u64>().expect("bad sample");
         }
+    }
+
+    #[test]
+    fn live_not_ready_gauge_is_the_label_free_maximum_across_actors() {
+        // A live voice view left not ready on a connected gateway drops every
+        // creator join silently (production 2026-10-17/18). The host watchdog
+        // alerts on this gauge directly; a healthy guild must not hide it.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_live_not_ready_seconds gauge\n"));
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 0\n"));
+        assert!(text.contains("two_bot_voice_live_self_heal_total 0\n"));
+        metrics.set_voice_actor_live_not_ready(1, 1, 0);
+        metrics.set_voice_actor_live_not_ready(2, 1, 95);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 95\n"));
+        assert!(!text.contains("two_bot_voice_live_not_ready_seconds{"));
+        // A stale incarnation cannot overwrite; a newer one resets the entry.
+        metrics.set_voice_actor_halted(2, 2, false);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 0\n"));
+        metrics.set_voice_actor_live_not_ready(2, 1, 400);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 0\n"));
+        // Retiring the stuck actor removes its contribution.
+        metrics.set_voice_actor_live_not_ready(2, 2, 30);
+        metrics.remove_voice_actor(2, 2);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_live_not_ready_seconds 0\n"));
+        metrics.voice_live_self_heal();
+        metrics.voice_live_self_heal();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_live_self_heal_total counter\n"));
+        assert!(text.contains("two_bot_voice_live_self_heal_total 2\n"));
     }
 
     #[test]
@@ -2941,6 +3344,187 @@ mod tests {
         assert!(text.contains(&format!("two_bot_gateway_disconnects_total {}\n", u64::MAX)));
         assert!(text.contains(&format!(
             "two_bot_gateway_missed_events_total {}\n",
+            u64::MAX
+        )));
+    }
+
+    #[test]
+    fn feed_fetches_stay_bounded_and_saturate() {
+        // TOG-28423: per-outcome, never per-feed. Four outcome series plus
+        // twelve error-class series exist from process start at zero.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_feed_fetches_total counter\n"));
+        assert!(text.contains("# TYPE two_bot_feed_fetch_errors_total counter\n"));
+        for outcome in FEED_FETCH_OUTCOMES {
+            assert!(text.contains(&format!(
+                "two_bot_feed_fetches_total{{outcome=\"{outcome}\"}} 0\n"
+            )));
+        }
+        for error_class in FEED_FETCH_ERROR_CLASSES {
+            assert!(text.contains(&format!(
+                "two_bot_feed_fetch_errors_total{{error_class=\"{error_class}\"}} 0\n"
+            )));
+        }
+        assert_eq!(FEED_FETCH_OUTCOMES.len(), 4);
+        assert_eq!(FEED_FETCH_ERROR_CLASSES.len(), 12);
+        metrics.feed_fetch("success");
+        metrics.feed_fetch("invalid_source");
+        metrics.feed_fetch("refused_redirect");
+        metrics.feed_fetch("failure");
+        metrics.feed_fetch_error("invalid_source");
+        metrics.feed_fetch_error("redirect_refused");
+        metrics.feed_fetch_error("http_error");
+        metrics.feed_fetch_error("transport");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"success\"} 1\n"));
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"invalid_source\"} 1\n"));
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"refused_redirect\"} 1\n"));
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"failure\"} 1\n"));
+        assert!(
+            text.contains("two_bot_feed_fetch_errors_total{error_class=\"invalid_source\"} 1\n")
+        );
+        assert!(
+            text.contains("two_bot_feed_fetch_errors_total{error_class=\"redirect_refused\"} 1\n")
+        );
+        assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"http_error\"} 1\n"));
+        assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"transport\"} 1\n"));
+        // Fixed cardinality: exactly the allowlisted series render.
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_feed_fetches_total{"))
+                .count(),
+            FEED_FETCH_OUTCOMES.len()
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_feed_fetch_errors_total{"))
+                .count(),
+            FEED_FETCH_ERROR_CLASSES.len()
+        );
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.feed_fetch = [u64::MAX; FEED_FETCH_OUTCOMES.len()];
+            values.feed_fetch_errors = [u64::MAX; FEED_FETCH_ERROR_CLASSES.len()];
+        }
+        metrics.feed_fetch("success");
+        metrics.feed_fetch_error("transport");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_feed_fetches_total{{outcome=\"success\"}} {}\n",
+            u64::MAX
+        )));
+        assert!(text.contains(&format!(
+            "two_bot_feed_fetch_errors_total{{error_class=\"transport\"}} {}\n",
+            u64::MAX
+        )));
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn feed_fetch_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.feed_fetch(&hostile);
+            metrics.feed_fetch_error(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"failure\"} 100\n"));
+        assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"other\"} 100\n"));
+    }
+
+    #[test]
+    fn automod_decisions_cover_each_completion_kind_without_new_series() {
+        // TOG-28481: one counter per terminal CompletionKind, fixed 8-value
+        // vocabulary. No message text, excerpts or user IDs ever reach labels.
+        use crate::automod_runtime::CompletionKind;
+        let kinds = [
+            CompletionKind::Accepted,
+            CompletionKind::AlreadyProcessed,
+            CompletionKind::DryRun,
+            CompletionKind::Protected,
+            CompletionKind::Deleted,
+            CompletionKind::Warned,
+            CompletionKind::TimedOut,
+            CompletionKind::SanctionRefused,
+        ];
+        assert_eq!(
+            kinds.map(CompletionKind::as_str).as_slice(),
+            AUTOMOD_DECISION_OUTCOMES,
+            "CompletionKind::as_str must mirror the metrics allowlist in order"
+        );
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        for outcome in AUTOMOD_DECISION_OUTCOMES {
+            assert!(text.contains(&format!(
+                "two_bot_automod_decisions_total{{outcome=\"{outcome}\"}} 0\n"
+            )));
+        }
+        for kind in kinds {
+            metrics.automod_decision(kind.as_str());
+        }
+        metrics.automod_decision("deleted");
+        let text = metrics.render(None);
+        for (kind, count) in [
+            (CompletionKind::Accepted, 1),
+            (CompletionKind::AlreadyProcessed, 1),
+            (CompletionKind::DryRun, 1),
+            (CompletionKind::Protected, 1),
+            (CompletionKind::Deleted, 2),
+            (CompletionKind::Warned, 1),
+            (CompletionKind::TimedOut, 1),
+            (CompletionKind::SanctionRefused, 1),
+        ] {
+            assert!(text.contains(&format!(
+                "two_bot_automod_decisions_total{{outcome=\"{}\"}} {count}\n",
+                kind.as_str()
+            )));
+        }
+        // Fixed cardinality: exactly eight series, parseable samples.
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_automod_decisions_total{"))
+            .collect();
+        assert_eq!(series.len(), AUTOMOD_DECISION_OUTCOMES.len());
+        let mut unique = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(unique.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn automod_decision_hostile_labels_collapse_and_saturate() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.automod_decision(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(
+            text.contains("two_bot_automod_decisions_total{outcome=\"sanction_refused\"} 100\n")
+        );
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.automod_decisions = [u64::MAX; AUTOMOD_DECISION_OUTCOMES.len()];
+        }
+        metrics.automod_decision("accepted");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_automod_decisions_total{{outcome=\"accepted\"}} {}\n",
             u64::MAX
         )));
     }

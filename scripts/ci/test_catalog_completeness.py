@@ -121,13 +121,6 @@ EXEMPT_SERIES = {
         "voice_join_fast_burn and voice_join_slow_burn (cumulative le=\"5\" "
         "count); documented in docs/metrics.md and the catalog alert-rule rows"
     ),
-    # Event-store S1 consumer-lag gauge: label-free manual check, not an
-    # alert input. Documented in docs/metrics.md; the catalog tracks event
-    # names, not this operational gauge.
-    "two_bot_event_store_consumer_lag_seconds": (
-        "manual check documented in docs/metrics.md, consumed by no alert "
-        "rule; label-free S1 consumer-lag gauge"
-    ),
 }
 
 _PREDATES_ROWS_REASON = (
