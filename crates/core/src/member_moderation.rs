@@ -4356,8 +4356,20 @@ mod tests {
     /// Process-wide log capture. A scoped subscriber loses events when a
     /// sibling test thread caches the callsite first, so install one global
     /// writer and let each test read only the text after its own mark.
+    /// Marks hold a process-wide assertion lock until consumed by
+    /// [`LogCapture::lines`], so two tests asserting on the same
+    /// event+action pair serialize their mark/execute/assert windows and a
+    /// sibling's emission cannot land inside this window.
     #[derive(Clone, Default)]
     struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    /// A position in the capture buffer. Holds the assertion lock from
+    /// [`LogCapture::mark`] until [`LogCapture::lines`] consumes it; dropping
+    /// it without calling `lines` (e.g. on panic) releases the lock.
+    struct Mark {
+        pos: usize,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl LogCapture {
         fn global() -> LogCapture {
@@ -4379,18 +4391,28 @@ mod tests {
                 .clone()
         }
 
-        fn mark(&self) -> usize {
-            self.0.lock().expect("capture lock").len()
+        fn mark(&self) -> Mark {
+            static ASSERT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // Lock first, then read the position: every earlier window's
+            // emissions are already in the buffer, so they fall before this
+            // mark. (Reading the length before locking would admit a
+            // sibling's emission between the read and the lock.)
+            // A sibling that panicked mid-window poisons the lock; the suite
+            // is already failing then, so recover instead of cascading.
+            let guard = ASSERT_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            let pos = self.0.lock().expect("capture lock").len();
+            Mark { pos, _guard: guard }
         }
 
         /// Lines logged since `mark` that carry `event` for `action` with
-        /// `cause`; other tests' lines are ignored so concurrent tests cannot
-        /// interfere. The cause pin matters: sibling tests share one global
-        /// capture, and two release-failure tests emit the same event for the
-        /// same action with different causes.
-        fn lines(&self, mark: usize, event: &str, action: &str, cause: &str) -> Vec<String> {
+        /// `cause`. Consumes the mark, releasing the assertion lock, so the
+        /// whole mark/execute/assert window ran alone. The cause pin applies
+        /// on top: concurrent tests share one global capture, and
+        /// release-failure tests emit the same event for the same action
+        /// with different causes.
+        fn lines(&self, mark: Mark, event: &str, action: &str, cause: &str) -> Vec<String> {
             let bytes = self.0.lock().expect("capture lock");
-            String::from_utf8_lossy(&bytes[mark..])
+            String::from_utf8_lossy(&bytes[mark.pos..])
                 .lines()
                 .filter(|line| {
                     line.contains(event) && line.contains(action) && line.contains(cause)
@@ -4414,6 +4436,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn log_capture_mark_serializes_assertion_windows() {
+        // Pins the process-wide assertion lock: a second `mark` must block
+        // until the first window is consumed via `lines`. Replacing the
+        // static lock with a per-call mutex lets the second mark complete
+        // while the first is still open, failing the timeout assert below.
+        // Never-matching filters keep this window silent for other tests.
+        const EVENT: &str = "never-matching-event-7f3a";
+        const ACTION: &str = "never-matching-action-9c1e";
+        const CAUSE: &str = "never-matching-cause-2b7e";
+        let capture = LogCapture::global();
+        let first = capture.mark();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let capture2 = capture.clone();
+        let handle = std::thread::spawn(move || {
+            ready_tx.send(()).expect("ready signal");
+            let second = capture2.mark();
+            done_tx.send(()).expect("done signal");
+            let _ = capture2.lines(second, EVENT, ACTION, CAUSE);
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawned thread never reached mark");
+        // The spawned thread is now blocked in `mark` (or would complete at
+        // once if the lock were broken). A held static lock cannot release
+        // early, so a timeout here is deterministic; a broken lock acquires
+        // within milliseconds.
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "second mark completed while the first window was still open"
+        );
+        let _ = capture.lines(first, EVENT, ACTION, CAUSE);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second mark never completed after the first window closed");
+        handle.join().expect("spawned thread panicked");
+    }
+
     const RELEASE_FAILED: &str = "moderation_idempotency_release_failed";
 
     // A sibling test's line for the same event and action but a different
@@ -4429,28 +4492,29 @@ mod tests {
             cause = "sibling_cause",
             "{RELEASE_FAILED}"
         );
-        assert!(
-            capture
-                .lines(
-                    mark,
-                    RELEASE_FAILED,
-                    "moderation.kick",
-                    "cause=\"own_cause\""
-                )
-                .is_empty(),
-            "a sibling cause must not match this test's window"
+        tracing::error!(
+            action = "moderation.kick",
+            cause = "own_cause",
+            "{RELEASE_FAILED}"
+        );
+        // One mark, one consuming read: the window holds both lines, so the
+        // cause pin must keep exactly the own line. Dropping the filter
+        // returns both lines and fails the length assert.
+        let lines = capture.lines(
+            mark,
+            RELEASE_FAILED,
+            "moderation.kick",
+            "cause=\"own_cause\"",
         );
         assert_eq!(
-            capture
-                .lines(
-                    mark,
-                    RELEASE_FAILED,
-                    "moderation.kick",
-                    "cause=\"sibling_cause\""
-                )
-                .len(),
+            lines.len(),
             1,
-            "the cause pin still matches its own lines"
+            "a sibling cause must not match this test's window"
+        );
+        assert!(
+            lines[0].contains("own_cause"),
+            "the cause pin still matches its own lines: {}",
+            lines[0]
         );
     }
 

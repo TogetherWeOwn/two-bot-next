@@ -151,8 +151,8 @@ Look for these literal messages:
   only a running-gateway failure lingers 75 s) and in Workers Logs as
   `container_gateway_failure` (see [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
-- Worker: `two-bot container started|stopped`, `two-bot /readyz unhealthy`,
-  `two-bot keepalive probe failed`, `two-bot container error`.
+- Worker: `two-bot container started|stopped`, `container_readyz_unhealthy`,
+  `container_keepalive_probe_failed`, `container_error`.
 
 The DO renews activity and probes `/readyz` every `KEEPALIVE_SECONDS` (default
 60); `sleepAfter` is 30 minutes. Outbound gateway traffic alone does not keep
@@ -919,6 +919,51 @@ The Container DO failed the container-internal `/metrics` scrape on 3 consecutiv
 First response: read the scrape through the existing authorized `/ops/metrics` path, check container `/readyz` and Worker/container logs for `two-bot metrics scrape failed`. Timeouts (6 s deadline), non-OK status, oversized bodies (64 KiB cap) and invalid exposition all count as failure; the deadline and cap are unchanged by this alert. Notifications and logs carry only this runbook link and build context, never response bodies.
 
 A lost scrape never resolves any metric-rule incident: missing evidence is not recovery evidence, so previously firing alerts stay firing through the loss, and the existing dispatch-drop interruption still applies. The first complete valid scrape after the incident resolves only the scrape-loss ticket; metric rules re-evaluate on that same scrape and resolve only on their own evidence. A valid scrape before the third failure silently resets the streak with no resolve.
+
+#### Alert: eventsub reconcile failed
+
+`two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rose between two
+keepalive samples. The Rust process records exactly one outcome per completed
+reconcile pass that reaches Helix (`healthy`, `pending` or `failed`); parked or
+refused startup passes never reach Helix and record no sample. A failed pass
+means a reconcile action failed or a healthy subscription is still missing,
+including listing failures — the detailed per-site error counters
+(`two_bot_eventsub_reconcile_errors_total`) add detail only and never multiply
+this alert. This is a **ticket, not a page**.
+
+Trigger: the first valid sample only stores a baseline and never fires. A later
+positive failed-pass delta fires once, however many internal error counters
+moved in the same window; a failed delta beside a healthy delta still fires.
+Healthy-only or pending-only growth never fires. Recovery: a flat failed counter
+never recovers, and a verification-pending pass never recovers — only a later
+healthy-pass increase with no failed-pass increase resolves, once. A backwards
+counter in any of the three outcomes means the process restarted: that sample
+re-baselines, firing when the new process already counted a failed pass (the
+startup pass runs before the first scrape, so a failed boot pass is a
+post-restart failure, not a fabricated delta), and otherwise holding a firing
+ticket instead of fabricating a RESOLVED. Missing or invalid samples (absent family on older containers,
+malformed values, extra labels, duplicates) and failed scrapes hold the firing
+state and keep the previous baseline; the next valid failed delta still fires
+and the next valid healthy increase still recovers.
+
+First response: read-only diagnosis only — no Helix request and no
+reconciliation behavior change. Run the read-only reconcile queries in
+[eventsub-subscription-health-queries.md](eventsub-subscription-health-queries.md)
+(Q2 last reconcile outcome plus the dashboard fields it drops: `failed`,
+`missing`, `prior_failed`, `action`, `error`) via the authorized `/ops/metrics`
+scrape and Workers Observability, correlate the window with recent deploys (a
+fresh deploy restarts the process and resets the counters), and confirm the
+firing key is the fixed `eventsub_reconcile_failed` with no broadcaster,
+subscription id, body, token or free-text labels. Forwarding, persistence and
+log context are the existing metrics-alert path above (persist before notify,
+at most once per transition); turning forwarding off retains monitoring.
+
+Do not retry Helix calls, re-list subscriptions, delete/re-create subscriptions
+by hand, or restart the container to "clear" the counter; a replacement resets
+the baseline without healing the subscription. This alert adds neither automatic
+ticket-system integration nor paging escalation: it labels the existing
+transition delivery as `(ticket)` and supplies this runbook. No new webhook,
+production activation or live load test is authorized.
 
 #### Alert: EventSub tampered
 
@@ -1902,8 +1947,8 @@ Gateway reconnect symptoms and REST send failures are different incidents:
 gateway-ready does not prove REST delivery, and HTTP liveness does not prove
 either. Use literal `gateway reconnect failed; Twilight will retry`,
 `durable gateway initialized; shard connecting` (`resume`) and
-`gateway ready; checkpoint committed` (`sequence`). Worker
-`two-bot /readyz unhealthy: <status>` is a readiness observation, not a Discord
+`gateway ready; checkpoint committed` (`sequence`). The Worker
+`container_readyz_unhealthy` line is a readiness observation, not a Discord
 cause. Do not infer a Discord outage from a Worker error or 403 alone.
 
 Existing **private** metrics are `two_bot_gateway_reconnects_total`,

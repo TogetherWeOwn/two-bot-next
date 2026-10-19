@@ -2451,6 +2451,14 @@ class WorkflowTests(unittest.TestCase):
             step["run"],
         )
         self.assertIn("MEMBER_TESTDB=agent-testdb", step["run"])
+        # The member-moderation suite guards on MEMBER_TESTDB, not a URL, so
+        # the export must precede the workspace sweeps: below them, every
+        # member test prints a FAILED guard line in the sweep (which uses
+        # --ignore-run-fail and stays green) and only passes in the re-run.
+        self.assertLess(
+            step["run"].index("export MEMBER_TESTDB=agent-testdb"),
+            step["run"].index('cov_run "$COV" llvm-cov --workspace --lib'),
+        )
         for target in (
             "channel_moderation_runtime",
             "internal_channel_moderation",
