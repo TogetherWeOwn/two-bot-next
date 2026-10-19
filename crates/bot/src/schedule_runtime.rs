@@ -10,9 +10,16 @@
 //!
 //! Audit parity with legacy `AutomationService`: creates and replaces audit
 //! `scheduled.create` / `scheduled.update` (`ok`, `rejected` on validation
-//! failure), removes audit `scheduled.delete` (`ok` / `absent`), and lists
-//! write no row. The 15 s ticker is a sibling card's job — nothing here posts
-//! to channels.
+//! failure), removes audit `scheduled.delete` (`ok` / `absent`), and
+//! successful lists write no row. The seven store-failure refusals (create
+//! read and write, remove resolve and delete, list first read, and the two
+//! deep-pagination list reads: hidden-window and unknown-overflow) each
+//! audit one row in the same refusal shape (`scheduled.create` /
+//! `scheduled.delete` / `scheduled.list`, outcome `rejected`, the invoking
+//! member as actor, the log line's fixed error-class token as reason, the
+//! attempted id or prefix as target, none for lists); a dead pool degrades
+//! to warn-plus-safe-reply because the audit write itself fails. The 15 s
+//! ticker is a sibling card's job — nothing here posts to channels.
 
 use sqlx::{Pool, Postgres};
 use twilight_model::application::interaction::{
@@ -102,6 +109,17 @@ pub(crate) async fn schedule_create(
         Ok(existing) => existing,
         Err(err) => {
             tracing::warn!(reason = db_class(&err), "schedule read failed");
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.create",
+                &id,
+                "rejected",
+                Some(db_class(&err)),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
             return;
         }
@@ -194,6 +212,17 @@ pub(crate) async fn schedule_create(
         }
         Err(err) => {
             tracing::warn!(reason = quota_write_class(&err), "schedule put failed");
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.create",
+                &id,
+                "rejected",
+                Some(quota_write_class(&err)),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
         }
     }
@@ -228,10 +257,25 @@ pub(crate) async fn schedule_remove(
         .await;
         return;
     }
+    // Actor and timestamp sit above resolution so the resolve-failure
+    // refusal audits with the same actor and clock as every other refusal.
+    let actor = actor_id(interaction);
+    let now_iso = format_iso_ms(now_millis());
     let resolved = match resolve_scheduled_id_store(pool, guild_id, &prefix).await {
         Ok(resolved) => resolved,
         Err(err) => {
             tracing::warn!(reason = db_class(&err), "schedule resolve failed");
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.delete",
+                &prefix,
+                "rejected",
+                Some(db_class(&err)),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
             return;
         }
@@ -240,8 +284,6 @@ pub(crate) async fn schedule_remove(
         finish(executor, interaction, no_unique_match_text(&prefix)).await;
         return;
     };
-    let actor = actor_id(interaction);
-    let now_iso = format_iso_ms(now_millis());
     match delete_scheduled(pool, guild_id, &id).await {
         Ok(true) => {
             audit(
@@ -274,6 +316,17 @@ pub(crate) async fn schedule_remove(
         }
         Err(err) => {
             tracing::warn!(reason = db_class(&err), "schedule delete failed");
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.delete",
+                &id,
+                "rejected",
+                Some(db_class(&err)),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
         }
     }
@@ -290,7 +343,10 @@ pub(crate) async fn schedule_remove(
 /// (see `docs/schedule-queue-order.md`). A failed
 /// hidden-window or overflow-count read fails closed with
 /// `STORE_FAILURE_REPLY` instead of reporting a possibly-false out-of-range
-/// page. Writes no audit row and never writes schedule rows.
+/// page. A failed first, hidden-window, or overflow-count read audits one
+/// `scheduled.list` / `rejected` row like the other store-failure refusals;
+/// a successful list writes no audit row, and no list path writes schedule
+/// rows.
 pub(crate) async fn schedule_list(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
@@ -323,10 +379,13 @@ pub(crate) async fn schedule_list(
             // cut without a number. Under-cap guilds skip the second query
             // and render exactly as before.
             if rows.len() as i64 == SCHEDULE_LIST_CAP {
+                let mut count_failure_class: Option<&str> = None;
                 let total_opt = match count_scheduled(pool, guild_id).await {
                     Ok(total) => Some(total),
                     Err(err) => {
-                        tracing::warn!(reason = db_class(&err), "schedule list count failed");
+                        let class = db_class(&err);
+                        tracing::warn!(reason = class, "schedule list count failed");
+                        count_failure_class = Some(class);
                         None
                     }
                 };
@@ -407,11 +466,26 @@ pub(crate) async fn schedule_list(
                                 // Fail closed: the hidden rows may exist, so a
                                 // failed window read must not report them as
                                 // out of range. Mirrors the list-read failure
-                                // path below.
+                                // path below, including its audit row.
                                 tracing::warn!(
                                     reason = db_class(&err),
                                     "schedule list hidden window failed"
                                 );
+                                // A failed list names no schedule id, so the
+                                // audit carries an empty target.
+                                let actor = actor_id(interaction);
+                                let now_iso = format_iso_ms(now_millis());
+                                audit(
+                                    pool,
+                                    guild_id,
+                                    &actor,
+                                    "scheduled.list",
+                                    "",
+                                    "rejected",
+                                    Some(db_class(&err)),
+                                    &now_iso,
+                                )
+                                .await;
                                 finish(executor, interaction, STORE_FAILURE_REPLY).await;
                                 return;
                             }
@@ -430,9 +504,26 @@ pub(crate) async fn schedule_list(
                     // unknown: a page past the packed first window may or may
                     // not exist. Fail closed instead of reporting a
                     // possibly-false out-of-range. Mirrors the list-read
-                    // failure path below.
+                    // failure path below, including its audit row; the count
+                    // failure already warned above, so the audit reuses its
+                    // captured error-class token as reason.
                     let first_total = schedule_list_pages(&lines).len() as i64;
                     if page > first_total {
+                        // A failed list names no schedule id, so the audit
+                        // carries an empty target.
+                        let actor = actor_id(interaction);
+                        let now_iso = format_iso_ms(now_millis());
+                        audit(
+                            pool,
+                            guild_id,
+                            &actor,
+                            "scheduled.list",
+                            "",
+                            "rejected",
+                            count_failure_class,
+                            &now_iso,
+                        )
+                        .await;
                         finish(executor, interaction, STORE_FAILURE_REPLY).await;
                         return;
                     }
@@ -442,6 +533,21 @@ pub(crate) async fn schedule_list(
         }
         Err(err) => {
             tracing::warn!(reason = db_class(&err), "schedule list failed");
+            // A failed list names no schedule id, so the audit carries an
+            // empty target; the success path still audits nothing.
+            let actor = actor_id(interaction);
+            let now_iso = format_iso_ms(now_millis());
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.list",
+                "",
+                "rejected",
+                Some(db_class(&err)),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
         }
     }

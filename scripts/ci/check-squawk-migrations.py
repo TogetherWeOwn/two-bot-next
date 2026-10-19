@@ -39,6 +39,23 @@ RULES = (
 )
 STRICT_RULES = frozenset(RULES) - {"dropping-object"}
 
+# These exact transactional indexes are narrowly waived: concurrent builds
+# deadlocked CI's parallel disposable-database migrators (40P01) while they
+# waited on SQLx's advisory lock with open snapshots. Keep every other
+# creating-index finding strict, including any other statement in these files.
+TRANSACTIONAL_INDEX_WAIVERS = {
+    (
+        "crates/cutover/migrations/0444_event_store_expiry_index.sql",
+        "create index if not exists idx_event_store_expiry_event_time_id "
+        "on event_store (event_time, id)",
+    ),
+    (
+        "crates/cutover/migrations/0445_event_store_expiry_class_index.sql",
+        "create index if not exists idx_event_store_expiry_class_time_id "
+        "on event_store (event_type, event_time, id)",
+    ),
+}
+
 ADVICE = {
     "adding-required-field": (
         "ADD COLUMN with NOT NULL and no DEFAULT rewrites the table under an "
@@ -397,7 +414,15 @@ def lint_statement(sql, created_tables=frozenset()):
     return found
 
 
-def lint_text(text):
+def is_waived_finding(path, rule, sql):
+    """Match only the explicitly reviewed transactional index statements."""
+    if rule != "creating-index":
+        return False
+    normalized = re.sub(r"\s+", " ", sql).strip().lower()
+    return (path, normalized) in TRANSACTIONAL_INDEX_WAIVERS
+
+
+def lint_text(text, path=None):
     """Return [(line, rule)] findings for one migration file's contents.
 
     Unconditional CREATE TABLE names accumulate in statement order so an
@@ -405,13 +430,14 @@ def lint_text(text):
     flagged, while an index on any other table still is. Conditional
     CREATE TABLE IF NOT EXISTS is a no-op when the relation already
     exists, so it proves nothing about emptiness and never qualifies the
-    relation for the exemption.
+    relation for the exemption. Waivers apply only when a path is given.
     """
     findings = []
     created = set()
     for line, sql in statements(text):
         for rule in lint_statement(sql, created):
-            findings.append((line, rule))
+            if path is None or not is_waived_finding(path, rule, sql):
+                findings.append((line, rule))
         for match in CREATE_TABLE.finditer(sql):
             if match.group("conditional") is None:
                 created.add(normalize_relation(match.group("name")))
@@ -473,8 +499,9 @@ def check(root, globs, excludes, base_ref):
             text = (root / relative).read_text()
         except OSError as error:
             raise SquawkError(f"{relative}: {error}") from error
-        for line, rule in lint_text(text):
-            findings.append((relative, line, rule))
+        findings.extend(
+            (relative, line, rule) for line, rule in lint_text(text, relative)
+        )
     return findings
 
 

@@ -7,6 +7,8 @@
 //! required: only the lane-admission variant (`LaneBusy`) uses the
 //! no-recovery copy, while the cumulative-deadline `Timeout` keeps the
 //! recovery guidance for operations interrupted after work was stored.
+//! The exact `LaneBusy`/`NoTicket` reply text is pinned below; `Timeout`
+//! keeps the generic fallback the copy-pin acceptance suite already pins.
 //! No DB, no Discord, no async.
 use super::*;
 
@@ -56,4 +58,13 @@ fn cumulative_timeout_keeps_recovery_guidance() {
         lower.contains("try again"),
         "cumulative timeout must keep retry guidance: {reply:?}"
     );
+}
+
+#[test]
+fn lane_busy_and_no_ticket_replies_are_pinned() {
+    assert_eq!(
+        Failure::LaneBusy.reply(),
+        "Ticket action timed out waiting for another operation. Try again later."
+    );
+    assert_eq!(Failure::NoTicket.reply(), "This channel is not a ticket.");
 }

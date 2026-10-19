@@ -3,6 +3,10 @@ use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
+#[path = "voice_admission_config_acceptance_tests.rs"]
+mod admission_config_acceptance;
+#[path = "voice_admission_spawn_tests.rs"]
+mod admission_spawn;
 #[path = "voice_cold_authority_tests.rs"]
 mod cold_authority;
 #[path = "voice_delete_guard_tests.rs"]
@@ -180,6 +184,9 @@ struct Store {
     claims: Mutex<Vec<(u64, i64)>>,
     /// The `leaving` list each claim carried.
     claim_leaving: Mutex<Vec<Vec<u64>>>,
+    /// The admission config each claim carried, in claim order. Shared out
+    /// so runtime-level tests can pin the config spawn installed.
+    claim_configs: Arc<Mutex<Vec<CreateAdmissionConfig>>>,
     settled: Mutex<Vec<(String, Option<u64>)>>,
     settle_errors: Mutex<VecDeque<StoreError>>,
     /// Claims bound to the channel Discord returned, as `(reservation, channel)`
@@ -246,6 +253,7 @@ impl Store {
             claim_script: Mutex::new(VecDeque::new()),
             claims: Mutex::new(Vec::new()),
             claim_leaving: Mutex::new(Vec::new()),
+            claim_configs: Arc::new(Mutex::new(Vec::new())),
             settled: Mutex::new(Vec::new()),
             settle_errors: Mutex::new(VecDeque::new()),
             bound: Mutex::new(Vec::new()),
@@ -478,10 +486,11 @@ impl RoomPersistence for Store {
         _: u64,
         user: u64,
         leaving: &[u64],
-        _: &CreateAdmissionConfig,
+        config: &CreateAdmissionConfig,
         now_secs: i64,
     ) -> Result<CreateClaim, StoreError> {
         self.claim_leaving.lock().unwrap().push(leaving.to_vec());
+        self.claim_configs.lock().unwrap().push(*config);
         if self.trace_claims {
             self.trace.lock().unwrap().push("claim".to_owned());
         }
@@ -4720,18 +4729,36 @@ fn setup_panel_lists_creators_failures_and_halt() {
 
 #[test]
 fn setup_panel_surfaces_store_errors() {
-    let panel = setup_panel(&SetupSummary {
-        guild_id: GUILD,
-        creators: vec![],
-        tracked_rooms: 0,
-        failures: vec![],
-        halted: false,
-        store_error: Some("Unavailable".to_owned()),
-    });
-    assert!(panel
-        .description
-        .contains("Could not load creator channels"));
-    assert!(!panel.description.contains("No creator channels yet"));
+    // The Setup arm stores `StoreError::to_string()`; pin each Display
+    // variant's exact line so a rewording fails here, not silently.
+    for (error, display) in [
+        (StoreError::Unavailable, "the store is unavailable"),
+        (
+            StoreError::CredentialRefused,
+            "the store refused the bot credential",
+        ),
+        (StoreError::Conflict, "the store reported a conflict"),
+    ] {
+        assert_eq!(error.to_string(), display);
+        let panel = setup_panel(&SetupSummary {
+            guild_id: GUILD,
+            creators: vec![],
+            tracked_rooms: 0,
+            failures: vec![],
+            halted: false,
+            store_error: Some(error.to_string()),
+        });
+        assert_eq!(
+            panel.description,
+            format!(
+                "Voice rooms are running.\n\
+                 Could not load creator channels ({display}); the worker state below is current.\n\
+                 Tracked rooms: 0.\n\
+                 No recent failures."
+            ),
+            "store-error line drifted for {display:?}"
+        );
+    }
 }
 
 #[test]
