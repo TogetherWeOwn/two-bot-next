@@ -198,7 +198,8 @@ fn webhook_signature_malformed_deliveries_are_bounded_failures() {
     assert_bounded(&message, "body tamper");
     assert_no_leak(&message, &[secret.as_str()], "body tamper");
     // An empty secret fails closed.
-    let message = failed_message(verify_signature("", body, &good), "empty secret");
+    let empty_secret = String::new();
+    let message = failed_message(verify_signature(&empty_secret, body, &good), "empty secret");
     assert_bounded(&message, "empty secret");
 }
 
