@@ -164,6 +164,8 @@ actor, guild, channel, member, token or body content ever reaches a label.
 | `two_bot_voice_worker_halted` | None (label-free gauge) | Additional series: accepted but not required by the scrape validator, which pins only the alert-input label sets; read manually from the container exposition or the authenticated pull | Consumed by no alert rule; manual check named in the runbook fast-burn, slow-burn and creator-map-stale first responses | 1 while any current guild actor is halted by a store CredentialRefused or Discord 401, otherwise 0; a healthy guild cannot hide another guild's halt |
 | `two_bot_voice_queue_pending` | Fixed `lane`: `urgent` or `deferred` (exactly two series) | Same additional-series handling as above | Consumed by no alert rule; manual queue-side complement to the join-budget burn rules | Queued (not in-flight) voice actions per lane, saturating-summed across all current guild actors |
 | `two_bot_voice_queue_oldest_age_seconds` | None (label-free gauge) | Same additional-series handling as above | Consumed by no alert rule; manual queue-side complement to the join-budget burn rules | Age in seconds of the oldest queued voice action, the maximum across all current guild actors; 0 when every queue is empty |
+| `two_bot_voice_live_not_ready_seconds` | None (label-free gauge) | Same additional-series handling as above | Consumed by no alert rule yet; the host watchdog reads it directly (alert when it stays above 120 s) | Seconds a guild's live voice view has been not ready while the gateway is connected (READY or RESUMED handled), the maximum across all current guild actors; 0 when every view is ready or the gateway is down. While above 0 that guild's creator joins are dropped without an accept or refusal line |
+| `two_bot_voice_live_self_heal_total` | None (label-free counter) | Same additional-series handling as above | Consumed by no alert rule; any increase means a live view was left not ready on a connected gateway and was republished from the gateway cache | Live voice views republished by the not-ready-while-connected self-heal |
 
 ## EventSub delivery series
 
@@ -179,6 +181,34 @@ body, broadcaster, subscription or secret data reaches any label.
 | `two_bot_eventsub_reconcile_passes_total{outcome}` | Reconcile passes by bounded outcome; `outcome` is `healthy`, `pending` or `failed`; exactly one sample per pass that reaches Helix, parked or refused startup passes stay log-only |
 | `two_bot_eventsub_reconcile_actions_total{action}` | Successful reconcile mutations by bounded action; `action` is `create` or `delete`; 409 already-exists confirmations fold into the pass outcome |
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | Reconcile failure sites by bounded log `error_class`; `error_class` is `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed` or `other`; no status, body or response bytes in labels |
+
+## Moderation enforcement series
+
+Counters emitted by the moderation enforcement render. Unknown outcomes
+collapse to `other` (unknown verbs collapse to the trailing verb slot,
+`unlock`, until the verb allowlist grows), and no member ID, reason text
+or message content reaches any label. Verbs are the bounded `ModerationAction`
+command vocabulary (`ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`,
+`slowmode`, `lockdown`, `unlock`); outcomes are `success`, `refused`,
+`discord_error`, `storage_error` and `other`. Each terminal member or
+channel enforcement counts once; retries and rate-limit backoffs are not
+outcomes. See `docs/metrics.md` for the full label table.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_moderation_enforcements_total{verb,outcome}` | Terminal moderation enforcements by bounded verb and outcome |
+
+## Retention replay series
+
+Label-free counter emitted by the retention purge-skip path in
+`crates/bot/src/gateway.rs` (`retention_lifecycle`) and rendered by
+`crates/core/src/metrics.rs`. No guild id, SQLSTATE or error text ever
+becomes a label. Manual check, not an alert input: consumed by no alert
+rule. Full semantics live in `docs/metrics.md`.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_retention_replay_needed_total` | Skipped retention purges needing Operator replay: one per real guild removal whose purge-queue write hit the schema gap; successful queue writes and rejoin-cancel skips never increment it |
 
 ## Scheduled job labels
 
@@ -214,6 +244,8 @@ is the single shared spelling also pinned in `evidence.rs`
 | `voice_join_slow_burn` | Same inputs as `voice_join_fast_burn` | Ticket, not page: same budget burning faster than 6x in both the 6 h and 30 min windows with the same per-window volume and bad-move floors; catches the sustained grind the fast rule never spikes on; do not close as "fast burn resolved" |
 | `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` with `two_bot_voice_creator_map_generation` | Pages when the age since the last successful creator-map merge passes 600 s (two missed 5 min refreshes) after at least one merge; generation 0 (never merged: boot or voice parked) never fires; the gauges are optional scrape inputs, so older containers hold the previous state |
 | `error_budget_fast_burn` | All `two_bot_rest_requests_total` samples (eligible requests) against `result="5xx"` plus `result="transport"` (budget spend) | Pages when the REST error budget (99.9% success over 48 h) burns faster than 12x in both the 15 min and 2 min windows; each window needs at least 10 eligible requests and two budget errors; incomplete post-restart windows stay inactive; missing or malformed inputs hold the previous state |
+| `error_budget_slow_burn` | Same inputs as `error_budget_fast_burn` | Ticket, not page: same budget burning faster than 3x in both the 2 h and 15 min windows with the same per-window volume and error floors; needs full 2 h history, holds on missing inputs, scrape gaps, or counter resets, and resolves on a covered quiet or below-threshold 15 min window |
+| `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` | Pages when the `tampered` counter (only `BadSignature`) rises in 3 consecutive samples; the first sample only baselines, a flat window resolves, a reset rebaselines, and missing/invalid scrapes hold firing |
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
@@ -312,6 +344,14 @@ actor respawns on the next guild snapshot (`publish_snapshot` on
 `GuildCreate`/resumed replay); voice, channel and role events for the guild
 are dropped until then.
 
+`voice live view was not ready on a connected gateway; republished from cache`
+(warn; `heal_not_ready` in `crates/bot/src/voice_rooms.rs`, guild-only field,
+no IDs): READY or RESUMED was handled but a guild's live voice view was still
+not ready, so creator joins in that guild were being dropped before a ticket.
+The next dispatch republished the view from the gateway cache; bumps
+`two_bot_voice_live_self_heal_total`. Rare by design: one line per repair,
+never per VOICE_STATE_UPDATE.
+
 Stall-watchdog actor messages without a `voice_event` field (all in
 `run_actor_with_limits` in `crates/bot/src/voice_rooms.rs`, guild-only fields,
 no IDs):
@@ -331,6 +371,13 @@ worker halted on a Discord 401 (or the writer latched one); the probe stays
 out because only a token fix and a restart clear that halt.
 `voice halt re-probe: store still refusing` / `voice halt re-probe timed out`
 (debug): the latch stays set; the next probe runs after the re-probe interval.
+
+Empty-grace override warning (in `stored_empty_grace_with` in
+`crates/bot/src/voice_rooms.rs`, guild-only fields, no IDs):
+`stored empty-grace override out of range; using boot fallback` (warn): the
+stored per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row is malformed or
+outside 0 to 600 whole seconds, so the sweep keeps the boot fallback. The
+line carries the setting key and the `out_of_range` reason.
 
 Creator-view refresh actor messages (all in `GuildRoomWorker::revalidate_creator`
 / `reload_creators` in `crates/bot/src/voice_rooms.rs`, guild-only fields,

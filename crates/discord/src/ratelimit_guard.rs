@@ -20,12 +20,16 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::time::Instant;
 
 pub const INVALID_REQUEST_WINDOW: Duration = Duration::from_secs(600);
 pub const DEFAULT_INVALID_REQUEST_THRESHOLD: usize = 5_000;
+/// Bound for a global pause learned with no usable timing: fail-closed, but
+/// capped at `min(window, 60 s)` instead of a full budget window, so a
+/// malformed or missing `Retry-After` cannot park admission for ten minutes.
+pub const GLOBAL_PAUSE_FALLBACK_CAP: Duration = Duration::from_secs(60);
 /// Bot-wide request ceiling, requests/second (official rate-limits page,
 /// verified 2026-10-12). No response header carries it, so the shared pacing
 /// floor below names the documented value instead of inferring one.
@@ -42,6 +46,11 @@ pub const GLOBAL_MIN_INTERVAL: Duration = Duration::from_millis(1000 / GLOBAL_RE
 /// acceptance threshold. Two milliseconds per slot (≈45 req/s) keeps wire
 /// spacing at or above the documented 50/s floor under loaded-runner jitter.
 pub const GLOBAL_PACING_SAFETY_PAD: Duration = Duration::from_millis(2);
+
+/// Floor installed when an exhausted bucket's absolute `Reset` epoch already
+/// lies in the past (local wall clock and Discord disagree). The raw skew is
+/// never waited out; admission reopens after this plus the legacy pad.
+const EPOCH_SKEW_FLOOR: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy)]
 pub struct GuardConfig {
@@ -432,8 +441,11 @@ impl RateLimitGuard {
     /// already expires on its own at reset plus the pad (`refresh` prunes it
     /// before every admission). Every number honored arrives in the headers — the relative
     /// `Reset-After` wins when present, the absolute `Reset` epoch is measured
-    /// against the wall clock otherwise, and the only constant is the legacy
-    /// 250 ms safety pad the 429 path already uses. Installing a deadline
+    /// against the wall clock otherwise, and the only constants are the legacy
+    /// 250 ms safety pad the 429 path already uses and the 1 s skew floor
+    /// below. Epoch-derived waits clamp to `[0, window]`; a past epoch with
+    /// an exhausted bucket installs the 1 s floor (plus the pad) and logs the
+    /// skew instead of waiting out the clock difference. Installing a deadline
     /// never wakes admission (sleepers wait on the deadline itself), and
     /// nothing here removes one.
     pub fn observe_bucket(&self, route: &str, headers: &http::HeaderMap) {
@@ -444,19 +456,61 @@ impl RateLimitGuard {
             None => route.to_owned(),
         };
         let remaining = value("x-ratelimit-remaining").and_then(|v| v.parse::<u64>().ok());
-        let reset_wait = value("x-ratelimit-reset-after")
+        let reset_after_wait = value("x-ratelimit-reset-after")
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|secs| secs.is_finite() && *secs >= 0.0)
-            .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
-            .or_else(|| {
-                let epoch = value("x-ratelimit-reset")?
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|secs| secs.is_finite() && *secs >= 0.0)?;
-                let target =
-                    std::time::UNIX_EPOCH.checked_add(Duration::try_from_secs_f64(epoch).ok()?)?;
-                target.duration_since(std::time::SystemTime::now()).ok()
-            });
+            .and_then(|secs| Duration::try_from_secs_f64(secs).ok());
+        // Absolute-epoch outcome, resolved only when no `Reset-After` wins.
+        // `Some(Ok(wait))` is a future epoch clamped to `[0, window]` below;
+        // `Some(Err(skew))` is a past epoch whose clock difference is never
+        // waited out (the exhausted-bucket floor applies instead).
+        let epoch_outcome: Option<Result<Duration, Duration>> = (|| {
+            let epoch = value("x-ratelimit-reset")?
+                .parse::<f64>()
+                .ok()
+                .filter(|secs| secs.is_finite() && *secs >= 0.0)?;
+            let target =
+                std::time::UNIX_EPOCH.checked_add(Duration::try_from_secs_f64(epoch).ok()?)?;
+            let now = std::time::SystemTime::now();
+            match target.duration_since(now) {
+                Ok(wait) => Some(Ok(wait)),
+                Err(_) => Some(Err(now.duration_since(target).unwrap_or(Duration::ZERO))),
+            }
+        })();
+        let (reset_wait, skew): (Option<Duration>, Option<Duration>) =
+            if let Some(wait) = reset_after_wait {
+                (Some(wait), None)
+            } else {
+                match epoch_outcome {
+                    Some(Ok(wait)) => (Some(wait.min(self.config.window)), None),
+                    Some(Err(skew)) => (None, Some(skew)),
+                    None => (None, None),
+                }
+            };
+        // The floor is per-bucket state on the observed route only: it
+        // installs a deadline through the same bucket/route tables admission
+        // already scopes, never a guard-wide pause.
+        if remaining == Some(0) && reset_wait.is_none() {
+            if let Some(skew) = skew {
+                tracing::warn!(
+                event = "discord_bucket_reset_skew",
+                skew_ms = skew.as_millis() as u64,
+                floor_ms = EPOCH_SKEW_FLOOR.as_millis() as u64,
+                "Discord bucket reset epoch is in the past (clock skew); installing the exhausted-bucket floor"
+            );
+                let wait = EPOCH_SKEW_FLOOR
+                    .checked_add(Duration::from_millis(two_bot_core::RETRY_AFTER_PADDING_MS))
+                    .unwrap_or(EPOCH_SKEW_FLOOR);
+                let until = observed_at
+                    .checked_add(wait)
+                    .unwrap_or(observed_at + self.config.window);
+                let mut state = self.state.lock().expect("Discord guard state");
+                let entry = state.buckets.0.entry(bucket.clone()).or_insert(until);
+                *entry = (*entry).max(until);
+                state.routes.0.insert(route.to_owned(), bucket);
+                return;
+            }
+        }
         let mut state = self.state.lock().expect("Discord guard state");
         match (remaining, reset_wait) {
             (Some(0), Some(wait)) => {
@@ -587,8 +641,9 @@ impl RateLimitGuard {
         self.refresh(state, now);
     }
 
-    /// Extend (never shorten) a global pause. Missing/invalid timing fails
-    /// closed for a full budget window, rather than repeatedly hitting 429.
+    /// Extend (never shorten) a global pause. Missing/invalid timing stays
+    /// fail-closed but is bounded at `min(window, 60 s)` instead of a full
+    /// budget window, rather than repeatedly hitting 429.
     pub fn observe_global(&self, retry_after_secs: Option<f64>) {
         let observed_at = Instant::now();
         let id = self.begin_global(retry_after_secs, observed_at);
@@ -605,14 +660,15 @@ impl RateLimitGuard {
     }
 
     fn global_until(&self, retry_after_secs: Option<f64>, observed_at: Instant) -> Instant {
+        let fallback = self.config.window.min(GLOBAL_PAUSE_FALLBACK_CAP);
         let wait = retry_after_secs
             .filter(|secs| secs.is_finite() && *secs >= 0.0)
             .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
             .and_then(|wait| wait.checked_add(Duration::from_millis(250)))
-            .unwrap_or(self.config.window);
+            .unwrap_or(fallback);
         observed_at
             .checked_add(wait)
-            .unwrap_or(observed_at + self.config.window)
+            .unwrap_or(observed_at + fallback)
     }
 
     fn begin_global(&self, timing: Option<f64>, observed_at: Instant) -> u64 {
@@ -691,6 +747,148 @@ pub fn process_guard() -> Arc<RateLimitGuard> {
     }))
 }
 
+/// Parse one `Retry-After` header value to delta-seconds before the
+/// no-usable-timing fallback applies: delta-seconds first, then an IMF-fixdate
+/// HTTP-date (`Sun, 06 Nov 1994 08:49:37 GMT`) measured against the wall
+/// clock. Returns `Some(v)` even for non-finite/negative numerics so the
+/// caller still fails closed to the capped fallback; returns `None` only when
+/// the value carries no usable timing at all (empty, garbage, or a past date).
+fn parse_retry_after_header(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = trimmed.parse::<f64>() {
+        return Some(value);
+    }
+    let date = parse_http_date(trimmed)?;
+    let delta = date.duration_since(SystemTime::now()).ok()?;
+    Some(delta.as_secs_f64())
+}
+
+/// Parse an IMF-fixdate HTTP-date (`Sun, 06 Nov 1994 08:49:37 GMT`, the form
+/// `Retry-After` may carry instead of delta-seconds) to a wall-clock time.
+/// Weekday is validated loosely (three letters) and otherwise ignored; the
+/// date fields are fully validated. Field widths follow RFC 9110 section
+/// 5.6.7 (2DIGIT day/hour/minute/second, 4DIGIT year, ASCII digits only), so
+/// an oversized year can never reach the day-count arithmetic below.
+/// Returns `None` for any other shape.
+fn parse_http_date(raw: &str) -> Option<SystemTime> {
+    let trimmed = raw.trim();
+    let without_zone = trimmed.strip_suffix(" GMT")?;
+    let (weekday, rest) = without_zone.split_once(',')?;
+    if weekday.trim().len() != 3 {
+        return None;
+    }
+    let mut parts = rest.split_whitespace();
+    let day_raw = parts.next()?;
+    if day_raw.len() != 2 || !day_raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let day: u32 = day_raw.parse().ok()?;
+    let month = month_number(parts.next()?)?;
+    let year_raw = parts.next()?;
+    if year_raw.len() != 4 || !year_raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = year_raw.parse().ok()?;
+    let time = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    let mut clock = time.split(':');
+    let hour_raw = clock.next()?;
+    let minute_raw = clock.next()?;
+    let second_raw = clock.next()?;
+    if clock.next().is_some() {
+        return None;
+    }
+    if hour_raw.len() != 2 || minute_raw.len() != 2 || second_raw.len() != 2 {
+        return None;
+    }
+    if !hour_raw.bytes().all(|b| b.is_ascii_digit())
+        || !minute_raw.bytes().all(|b| b.is_ascii_digit())
+        || !second_raw.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let hour: i64 = hour_raw.parse().ok()?;
+    let minute: i64 = minute_raw.parse().ok()?;
+    let mut second: i64 = second_raw.parse().ok()?;
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
+        return None;
+    }
+    if second == 60 {
+        // Leap second: no wall-clock instant names :60, so settle on :59.
+        second = 59;
+    }
+    if !(0..=59).contains(&second) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)?;
+    if secs >= 0 {
+        std::time::UNIX_EPOCH.checked_add(Duration::from_secs(secs as u64))
+    } else {
+        std::time::UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))
+    }
+}
+
+fn month_number(name: &str) -> Option<u32> {
+    match name {
+        "Jan" => Some(1),
+        "Feb" => Some(2),
+        "Mar" => Some(3),
+        "Apr" => Some(4),
+        "May" => Some(5),
+        "Jun" => Some(6),
+        "Jul" => Some(7),
+        "Aug" => Some(8),
+        "Sep" => Some(9),
+        "Oct" => Some(10),
+        "Nov" => Some(11),
+        "Dec" => Some(12),
+        _ => None,
+    }
+}
+
+/// Days in a civil month, with Gregorian leap years: divisible by 4, except
+/// centuries not divisible by 400. Rejects rollover dates like 31 Feb that
+/// the day-count below would otherwise silently carry into March.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Days since the Unix epoch for a civil date (Hinnant's `days_from_civil`).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let adjusted_year = if month <= 2 { year - 1 } else { year };
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = (month as i64 + 9) % 12;
+    let day_of_year = (153 * month_prime + 2) / 5 + (day as i64 - 1);
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 /// Keeps accounting correct if a response body errors or its future is dropped.
 pub(crate) struct ResponseAccounting<'a> {
     guard: &'a RateLimitGuard,
@@ -712,7 +910,9 @@ impl<'a> ResponseAccounting<'a> {
         let global_header = status == 429
             && (header("x-ratelimit-global").is_some_and(|v| v.eq_ignore_ascii_case("true"))
                 || header("x-ratelimit-scope").is_some_and(|v| v.eq_ignore_ascii_case("global")));
-        let retry_after_header = header("retry-after").and_then(|v| v.parse::<f64>().ok());
+        // `Retry-After` may carry delta-seconds or an IMF-fixdate HTTP-date;
+        // the date is parsed to delta-seconds before the capped fallback.
+        let retry_after_header = header("retry-after").and_then(parse_retry_after_header);
         // Bucket reset hint: the only timing when a 429 carries no
         // `retry-after` (official rate-limits page, verified 2026-10-12).
         let reset_after_header =
@@ -725,7 +925,7 @@ impl<'a> ResponseAccounting<'a> {
         let observed_at = Instant::now();
         // Status and the pending restriction are one transition: a notified
         // waiter must never see the invalid response without its global pause.
-        // With no usable header timing, Drop commits a full-window fallback.
+        // With no usable header timing, Drop commits the capped fallback.
         let mut state = guard.state.lock().expect("Discord guard state");
         let tallied = matches!(status, 401 | 403 | 429) && !shared_scope;
         if tallied {
@@ -877,7 +1077,7 @@ mod tests {
         let mut accounting = ResponseAccounting::new(&guard, 429, &headers, true);
         assert_eq!(
             guard.snapshot().global_pause_remaining,
-            INVALID_REQUEST_WINDOW
+            GLOBAL_PAUSE_FALLBACK_CAP
         );
         let waiter = tokio::spawn({
             let guard = guard.clone();
@@ -933,7 +1133,7 @@ mod tests {
         drop(accounting);
         assert_eq!(
             guard.snapshot().global_pause_remaining,
-            INVALID_REQUEST_WINDOW
+            GLOBAL_PAUSE_FALLBACK_CAP
         );
     }
 
@@ -1103,13 +1303,67 @@ mod tests {
         guard.observe_global(None);
         assert_eq!(
             guard.snapshot().global_pause_remaining,
-            INVALID_REQUEST_WINDOW
+            GLOBAL_PAUSE_FALLBACK_CAP
         );
         guard.observe_global(Some(0.0));
         assert_eq!(
             guard.snapshot().global_pause_remaining,
-            INVALID_REQUEST_WINDOW
+            GLOBAL_PAUSE_FALLBACK_CAP
         );
+    }
+
+    #[test]
+    fn http_date_edge_cases_fall_back_without_panicking() {
+        // Structural rejects: no usable timing, so the caller falls back to
+        // the capped pause. None of these may panic, however large the year.
+        for raw in [
+            // Impossible calendar dates (rollover into March is rejected).
+            "Sat, 31 Feb 2030 00:00:00 GMT",
+            "Wed, 29 Feb 2023 00:00:00 GMT",
+            // Wrong zone suffix and non-date shapes.
+            "Sun, 01 Jan 2030 00:00:00 UTC",
+            "not-a-number-or-date",
+            "",
+            // IMF-fixdate widths (RFC 9110 section 5.6.7): 2DIGIT day/time,
+            // 4DIGIT year, ASCII digits only.
+            "Sun, 1 Jan 2030 00:00:00 GMT",
+            "Sun, 01 Jan 203 00:00:00 GMT",
+            "Sun, 01 Jan 10000 00:00:00 GMT",
+            "Sun, 01 Jan 2030 0:00:00 GMT",
+            "Sun, 01 Jan 2030 00:0:00 GMT",
+            "Sun, 01 Jan 2030 00:00:0 GMT",
+            // Oversized and extreme years must not reach the day-count math.
+            "Sun, 01 Mar 99999999999999999 00:00:00 GMT",
+            "Sun, 01 Jan -9223372036854775808 00:00:00 GMT",
+        ] {
+            assert!(
+                parse_http_date(raw).is_none(),
+                "malformed HTTP-date must carry no timing: {raw:?}"
+            );
+            // `parse_retry_after_header` runs on every response: it must also
+            // report no usable timing rather than panic or mint a pause.
+            assert!(
+                parse_retry_after_header(raw).is_none(),
+                "malformed Retry-After must fall back: {raw:?}"
+            );
+        }
+        // A past date parses structurally but carries no future wait, so the
+        // header layer still reports no usable timing (capped fallback).
+        let past = "Thu, 01 Jan 1970 00:00:00 GMT";
+        assert_eq!(
+            parse_http_date(past),
+            Some(std::time::UNIX_EPOCH),
+            "a valid past date still parses"
+        );
+        assert!(
+            parse_retry_after_header(past).is_none(),
+            "a past date must fall back to the capped pause"
+        );
+        // Leap second :60 settles on :59 instead of rejecting the date.
+        let leap = parse_http_date("Sun, 01 Jan 2030 00:00:60 GMT");
+        let settled = parse_http_date("Sun, 01 Jan 2030 00:00:59 GMT");
+        assert!(leap.is_some(), "leap second :60 must settle, not reject");
+        assert_eq!(leap, settled, ":60 must name the same instant as :59");
     }
 
     #[tokio::test(start_paused = true)]

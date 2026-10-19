@@ -279,6 +279,8 @@ pub(crate) enum Failure {
     Rest(DiscordError),
     InvalidEvidence,
     Timeout,
+    LaneBusy,
+    NoTicket,
 }
 
 impl From<StoreError> for Failure {
@@ -295,6 +297,19 @@ impl Failure {
     pub fn reply(&self) -> String {
         match self {
             Self::Store(StoreError::Domain(error)) => error.to_string(),
+            // Lane admission times out before any store reservation exists, so
+            // no unfinished work was left for recovery to retry. Stay a
+            // truthful retry-later refusal without claiming a recovery job.
+            // This is deliberately distinct from `Timeout`: the cumulative
+            // deadline wrapping the whole lane-held operation can expire after
+            // `reserve`/`begin_close` stored a state that recovery resumes.
+            Self::LaneBusy => {
+                "Ticket action timed out waiting for another operation. Try again later.".into()
+            }
+            // Claim/close in a channel with no tracked ticket ends before any
+            // operation: name the refusal specifically without promising
+            // recovery or exposing storage details.
+            Self::NoTicket => "This channel is not a ticket.".into(),
             _ => {
                 "Ticket action failed; recovery will retry unfinished work. Try again later.".into()
             }
@@ -303,8 +318,10 @@ impl Failure {
     pub fn class(&self) -> ErrorClass {
         match self {
             Self::Store(_) => ErrorClass::Database,
-            Self::Timeout | Self::Rest(DiscordError::Timeout) => ErrorClass::Timeout,
-            Self::Rest(_) | Self::InvalidEvidence => ErrorClass::Rest,
+            Self::Timeout | Self::LaneBusy | Self::Rest(DiscordError::Timeout) => {
+                ErrorClass::Timeout
+            }
+            Self::Rest(_) | Self::InvalidEvidence | Self::NoTicket => ErrorClass::Rest,
         }
     }
 }
@@ -509,7 +526,7 @@ impl TicketRuntime {
     ) -> Result<String> {
         let _guard = tokio::time::timeout(LANE_WAIT_TIMEOUT, self.lane.lock())
             .await
-            .map_err(|_| Failure::Timeout)?;
+            .map_err(|_| Failure::LaneBusy)?;
         let user = interaction
             .member
             .as_ref()
@@ -528,7 +545,7 @@ impl TicketRuntime {
                     .store
                     .by_channel(&channel)
                     .await?
-                    .ok_or(StoreError::NotFound)?;
+                    .ok_or(Failure::NoTicket)?;
                 match action {
                     TicketAction::Claim => {
                         self.store.claim(&ticket.id, &actor).await?;
@@ -613,6 +630,38 @@ impl TicketRuntime {
     }
 
     async fn close(&self, ticket: &Ticket) -> Result<()> {
+        // State first: a repeat Close on a non-Open ticket (or a ticket with
+        // no channel) must fail with the state error before any Discord I/O,
+        // preserving the pre-gate behavior (no GET, InvalidTransition copy).
+        {
+            let mut probe = ticket.clone();
+            probe
+                .begin_close(now_millis_for_test())
+                .map_err(StoreError::Domain)
+                .map_err(Failure::Store)?;
+        }
+        // Resolve identity first so a cold-RESUMED bot id (0) propagates as
+        // InvalidEvidence (retry copy), not as a permission-loss refusal.
+        self.bot_id()?;
+        // Gate before any mutation: a hand-edited channel missing the bot's
+        // explicit overwrite refuses with the ticket still Open and the
+        // opener's writes untouched, instead of wedging in Closing until
+        // recovery reopens. Discord silently returns [] without
+        // READ_MESSAGE_HISTORY, so require the bot's explicit ticket
+        // overwrite before treating [] as complete. The opener's overwrite is
+        // validated next to the gate for the same reason: set_writes reads it
+        // after begin_close, and recovery restores through the same lookup,
+        // so a missing opener overwrite would wedge in Closing with no
+        // self-heal.
+        let channel = ticket
+            .channel_id
+            .as_deref()
+            .ok_or(Failure::InvalidEvidence)?;
+        let doc = self.channel_document(channel).await?;
+        self.require_history_access(&doc)
+            .map_err(|_| Failure::Store(StoreError::Domain(TicketError::MissingHistoryAccess)))?;
+        member_overwrite(&doc, &ticket.opener_id)
+            .map_err(|_| Failure::Store(StoreError::Domain(TicketError::MissingOpenerAccess)))?;
         let ticket = self
             .store
             .begin_close(&ticket.id, now_millis_for_test())
@@ -622,12 +671,8 @@ impl TicketRuntime {
             .channel_id
             .as_deref()
             .ok_or(Failure::InvalidEvidence)?;
-        let doc = self.channel_document(channel).await?;
         self.set_writes(&doc, channel, &ticket.opener_id, false)
             .await?;
-        // Discord silently returns [] without READ_MESSAGE_HISTORY. Require
-        // the bot's explicit ticket overwrite before treating [] as complete.
-        self.require_history_access(&doc)?;
         let snapshot = self.capture_history(channel).await?;
         self.store
             .save_transcript(&ticket.id, started_at, now_millis_for_test(), snapshot)
@@ -967,35 +1012,79 @@ fn member_overwrite(doc: &Value, member: &str) -> Result<(u64, u64)> {
     Ok((bits("allow")?, bits("deny")?))
 }
 
-fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
-    messages
-        .into_iter()
-        .map(|message| {
-            let author_id = message["author"]["id"]
-                .as_str()
-                .ok_or(Failure::InvalidEvidence)?
-                .to_owned();
-            let mut custom_ids = Vec::new();
-            let rows = match message.get("components") {
-                None => &[][..],
-                Some(value) => value.as_array().ok_or(Failure::InvalidEvidence)?.as_slice(),
-            };
+/// Discord allows at most 5 action rows of 5 buttons on one message, so a
+/// legitimate panel message never carries more than 25 button custom ids.
+/// Longer id lists are truncated to this bound; the message itself is kept.
+const MAX_PANEL_CUSTOM_IDS: usize = 25;
+
+/// Fixed process-wide count of isolated ticket panel rows: skipped malformed
+/// messages plus over-bound truncations share this one counter. Log fields
+/// echo only the count, never message content.
+static PANEL_ISOLATED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn panel_isolated_count_for_test() -> u64 {
+    PANEL_ISOLATED_ROWS.load(Ordering::Relaxed)
+}
+
+/// Parse one channel-document message into a panel row. Returns `None` when
+/// the message is malformed (bad author shape, bad components shape, or any
+/// bad action row drops the whole message). Buttons without a string
+/// `custom_id` are ignored, never fatal. The boolean is true when the
+/// message was kept with its `custom_ids` truncated to
+/// [`MAX_PANEL_CUSTOM_IDS`].
+fn parse_panel_message(message: &Value) -> Option<(PanelMessage, bool)> {
+    let author_id = message.get("author")?.get("id")?.as_str()?.to_owned();
+    let mut custom_ids = Vec::new();
+    let mut truncated = false;
+    match message.get("components") {
+        None => {}
+        Some(value) => {
+            let rows = value.as_array()?;
             for row in rows {
-                for button in row["components"]
-                    .as_array()
-                    .ok_or(Failure::InvalidEvidence)?
-                {
-                    if let Some(id) = button["custom_id"].as_str() {
-                        custom_ids.push(id.to_owned());
+                let buttons = row.get("components")?.as_array()?;
+                for button in buttons {
+                    if let Some(id) = button.get("custom_id").and_then(Value::as_str) {
+                        if custom_ids.len() < MAX_PANEL_CUSTOM_IDS {
+                            custom_ids.push(id.to_owned());
+                        } else {
+                            truncated = true;
+                        }
                     }
                 }
             }
-            Ok(PanelMessage {
-                author_id,
-                custom_ids,
-            })
-        })
-        .collect()
+        }
+    }
+    Some((
+        PanelMessage {
+            author_id,
+            custom_ids,
+        },
+        truncated,
+    ))
+}
+
+fn panels(messages: Vec<Value>) -> Result<Vec<PanelMessage>> {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut skipped = 0_u64;
+    for message in &messages {
+        match parse_panel_message(message) {
+            Some((panel, truncated)) => {
+                if truncated {
+                    skipped += 1;
+                }
+                out.push(panel);
+            }
+            None => {
+                skipped += 1;
+            }
+        }
+    }
+    if skipped > 0 {
+        PANEL_ISOLATED_ROWS.fetch_add(skipped, Ordering::Relaxed);
+        tracing::debug!(skipped, "ticket panel messages isolated");
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1013,3 +1102,15 @@ mod acceptance_tests;
 #[cfg(test)]
 #[path = "ticket_revision_tests.rs"]
 mod revision_tests;
+
+#[cfg(test)]
+#[path = "ticket_panels_isolation_tests.rs"]
+mod panels_isolation_tests;
+
+#[cfg(test)]
+#[path = "ticket_no_work_acceptance_tests.rs"]
+mod no_work_acceptance_tests;
+
+#[cfg(test)]
+#[path = "ticket_failure_class_tests.rs"]
+mod failure_class_tests;

@@ -233,8 +233,8 @@ class NightlyRoutingTests(unittest.TestCase):
         source = (ROOT / "crates/core/tests/leveling_store.rs").read_text()
         self.assertEqual(
             len(re.findall(r"#\[tokio::test", source)),
-            15,
-            "all 15 ordinary store tests must remain",
+            18,
+            "all 18 ordinary store tests must remain",
         )
         self.assertNotIn(
             "#[ignore",

@@ -5,6 +5,7 @@
 #![allow(clippy::print_stdout)]
 
 use sqlx::{postgres::PgConnectOptions, ConnectOptions, Connection, PgConnection};
+use two_bot_core::database_tls::{self, TlsPolicy};
 use two_bot_cutover::legacy_mapping::MappingSpec;
 use two_bot_cutover::legacy_verify::{verify, DEFAULT_SAMPLE_LIMIT, MAX_SAMPLE_LIMIT};
 use url::Url;
@@ -71,7 +72,15 @@ impl Args {
     }
 }
 
-fn connection_options(text: &str) -> Result<PgConnectOptions, &'static str> {
+/// Read the one TLS policy setting; an unset value is `Required`.
+fn tls_policy_from_env() -> Result<TlsPolicy, String> {
+    let value = std::env::var_os(database_tls::POLICY_SETTING);
+    // A non-UTF-8 value parses as "" and is refused like any unknown value.
+    TlsPolicy::from_setting(value.as_ref().map(|v| v.to_str().unwrap_or("")))
+        .map_err(|message| message.to_owned())
+}
+
+fn connection_options(text: &str, tls: TlsPolicy) -> Result<PgConnectOptions, &'static str> {
     // SQLx defaults consult libpq environment. Refuse those settings instead
     // of accidentally using a server credential or a different endpoint.
     for key in [
@@ -104,6 +113,13 @@ fn connection_options(text: &str) -> Result<PgConnectOptions, &'static str> {
     {
         return Err("URL must specify a PostgreSQL host, username and database (only sslmode query is supported)");
     }
+    // Threat-model F6: refuse plaintext/unverified modes and the wrong host
+    // class before SQLx parses the URL (see `docs/database-tls.md`). The
+    // allowlist check runs first so unsupported query values never reach the
+    // driver's WARN diagnostics; every refusal below is a fixed string with
+    // no URL, host or credential material.
+    two_bot_core::database_url::validate(text)?;
+    database_tls::enforce(text, tls)?;
     // The sslmode-only check above is a strict subset of the shared allowlist,
     // so the shared parser preserves it while suppressing the passfile
     // diagnostic target during the synchronous parse.
@@ -112,9 +128,12 @@ fn connection_options(text: &str) -> Result<PgConnectOptions, &'static str> {
     if url.password().is_none() {
         options = options.password("");
     }
-    Ok(options
-        .application_name("legacy_verify")
-        .disable_statement_logging())
+    Ok(database_tls::apply(
+        options
+            .application_name("legacy_verify")
+            .disable_statement_logging(),
+        tls,
+    ))
 }
 
 async fn run(args: Args) -> Result<bool, String> {
@@ -124,8 +143,11 @@ async fn run(args: Args) -> Result<bool, String> {
     spec.select(&args.groups).map_err(|e| e.to_string())?;
     // Validate BOTH endpoints before connecting. Stop on the first connection
     // failure; never retry with another credential or an inherited app URL.
-    let source_options = connection_options(&args.source)?;
-    let target_options = connection_options(&args.target)?;
+    // The TLS policy (unset means `required`) fences both URLs before SQLx
+    // parses them; a refusal is a fixed non-echoing string and exit code 2.
+    let tls = tls_policy_from_env()?;
+    let source_options = connection_options(&args.source, tls)?;
+    let target_options = connection_options(&args.target, tls)?;
     let mut source = PgConnection::connect_with(&source_options)
         .await
         .map_err(|_| "source connection failed (details omitted)")?;
@@ -349,7 +371,7 @@ mod tests {
                 "options=-csearch_path=other",
             ] {
                 let url = format!("postgres://operator:explicit@live.invalid:5432/bot?{query}");
-                let error = connection_options(&url).unwrap_err();
+                let error = connection_options(&url, TlsPolicy::Required).unwrap_err();
                 assert!(
                     !error.contains("fixture"),
                     "rejection echoed the query value for {query}"
@@ -368,20 +390,55 @@ mod tests {
     }
 
     #[test]
-    fn valid_sslmode_query_behavior_preserved() {
+    fn tls_policy_gates_hosts_and_modes_before_parsing() {
         let (_lock, _env, _home) = SavedEnv::clear_pg_and_isolate_home();
-        let base = "postgres://operator:explicit@live.invalid:5432/bot";
-        assert!(connection_options(base).is_ok());
-        assert!(connection_options(&format!("{base}?sslmode=require")).is_ok());
-        assert!(connection_options(&format!("{base}?sslmode=disable")).is_ok());
+        // `LocalOnly` admits the disposable service host with any known mode,
+        // preserving the sslmode query behavior operators rely on.
+        let local = "postgres://operator:explicit@agent-testdb:5432/bot";
+        assert!(connection_options(local, TlsPolicy::LocalOnly).is_ok());
+        assert!(
+            connection_options(&format!("{local}?sslmode=require"), TlsPolicy::LocalOnly).is_ok()
+        );
+        assert!(
+            connection_options(&format!("{local}?sslmode=disable"), TlsPolicy::LocalOnly).is_ok()
+        );
+        // `Required` (the unset default) refuses the local host outright and
+        // admits a remote host only with an explicit TLS mode.
+        let remote =
+            "postgres://operator:explicit@ep-fixture-host.us-east-2.aws.neon.tech:5432/bot";
+        assert_eq!(
+            connection_options(local, TlsPolicy::Required).unwrap_err(),
+            "local database host is refused under the required TLS policy"
+        );
+        assert_eq!(
+            connection_options(remote, TlsPolicy::Required).unwrap_err(),
+            "database URL must set sslmode under the required TLS policy"
+        );
+        assert!(
+            connection_options(&format!("{remote}?sslmode=require"), TlsPolicy::Required).is_ok()
+        );
+        assert_eq!(
+            connection_options(&format!("{remote}?sslmode=disable"), TlsPolicy::Required)
+                .unwrap_err(),
+            "database sslmode does not require TLS"
+        );
+        // `LocalOnly` never reaches a remote host, whatever the mode.
+        assert_eq!(
+            connection_options(&format!("{remote}?sslmode=require"), TlsPolicy::LocalOnly)
+                .unwrap_err(),
+            "remote database host is refused under the local-only TLS policy"
+        );
     }
 
     #[test]
     fn inherited_pgpassfile_is_forbidden() {
         let (_lock, _env, _home) = SavedEnv::clear_pg_and_isolate_home();
         std::env::set_var("PGPASSFILE", "/tmp/synthetic-passfile");
-        let error =
-            connection_options("postgres://operator:explicit@live.invalid:5432/bot").unwrap_err();
+        let error = connection_options(
+            "postgres://operator:explicit@live.invalid:5432/bot",
+            TlsPolicy::Required,
+        )
+        .unwrap_err();
         assert_eq!(
             error,
             "inherited PG connection settings are forbidden; provide explicit URLs"
@@ -394,7 +451,11 @@ mod tests {
         // Synthetic HOME is empty (no `~/.pgpass`) and all PG* are absent,
         // so no host credential can supply a fallback. The explicit
         // passwordless URL must still parse to a cleared password.
-        let options = connection_options("postgres://operator@live.invalid:5432/bot").unwrap();
+        let options = connection_options(
+            "postgres://operator@agent-testdb:5432/bot",
+            TlsPolicy::LocalOnly,
+        )
+        .unwrap();
         // Cleared to trust-authentication, never a fallback credential.
         // `PgConnectOptions` derives `Debug` with the password field visible
         // in-memory; the assertion message itself carries no credential.

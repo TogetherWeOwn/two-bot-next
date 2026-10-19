@@ -43,6 +43,18 @@ AUTO_ROLLBACK_STEP = "Auto-roll back Worker version and container image"
 SNAPSHOT_STEP = "Snapshot the pre-deploy rollback state"
 IMAGE = "registry.cloudflare.com/acct/two-bot-next-twobotcontainer-production@sha256:" + "c" * 64
 WRANGLER_ACTION = "cloudflare/wrangler-action@"
+# R1 short-SHA fixtures (TOG-28737 acceptance; builder TOG-28741 must not edit
+# these). SHORT_UNAMBIGUOUS is a 12-char prefix of SHA that resolves uniquely;
+# AMBIGUOUS_PREFIX is a 7-char prefix shared with COLLIDING_SHA and must refuse.
+# Builder contract: 7-39 hex prefixes resolve via
+# `GET repos/{repo}/commits/{short}` (gh api); success continues with the full
+# 40-char SHA, failure refuses with a message containing both "40-character hex"
+# and ACCEPTED_FORMAT below (e.g. "sha must be a full 40-character hex commit
+# SHA or an unambiguous 7-40 character hex prefix").
+SHORT_UNAMBIGUOUS = SHA[:12]
+AMBIGUOUS_PREFIX = SHA[:7]
+COLLIDING_SHA = SHA[:7] + "f" * 33
+ACCEPTED_FORMAT = "unambiguous 7-40 character hex prefix"
 
 
 def children(lines, indent):
@@ -426,27 +438,44 @@ class StaticGuardTests(unittest.TestCase):
 
 class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
-              ref="refs/heads/main", auto="", **responses):
+              ref="refs/heads/main", auto="", resolved_sha=None, **responses):
         if image is None:
             image = IMAGE if rollback else ""
         api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]},
                "production-readyz": {"status": 200, "build_revision": SHA}, **responses}
         calls = []
         resolved = sha.strip().lower() or (SHA if not rollback else "")
+        # R1 short-SHA fixture routing: a 7-39 hex prefix of SHA (other than the
+        # colliding AMBIGUOUS_PREFIX) resolves to the full SHA; the ambiguous
+        # prefix and any other short hex fail resolution. Downstream gates must
+        # use the full SHA after a successful resolution.
+        is_short = bool(re.fullmatch(r"[0-9a-f]{7,39}", resolved or ""))
+        is_unambiguous = is_short and resolved == SHA[:len(resolved)] and resolved != AMBIGUOUS_PREFIX
+        downstream = SHA if is_unambiguous else resolved
 
         def fake_check_output(args, **kwargs):
             self.assertEqual(args[:4], ["gh", "api", "--method", "GET"])
             self.assertTrue(all(flag == "-f" for flag in args[5::2]), args)
             path, query = args[4], dict(arg.split("=", 1) for arg in args[6::2])
             calls.append((path, query))
-            if path == f"repos/{REPO}/compare/{resolved}...main":
+            if is_short and path == f"repos/{REPO}/commits/{resolved}":
+                # Short-SHA resolution via the commits API (builder contract).
+                if resolved_sha is not None:
+                    # A branch or tag named with a hex string resolves to a
+                    # commit the operator did not type: return the injected
+                    # SHA so the prefix-match check is exercised.
+                    return json.dumps({"sha": resolved_sha})
+                if is_unambiguous:
+                    return json.dumps({"sha": SHA})
+                raise failed_call()
+            if path == f"repos/{REPO}/compare/{downstream}...main":
                 key = "compare"
-            elif path == f"repos/{REPO}/commits/{resolved}/check-runs":
+            elif path == f"repos/{REPO}/commits/{downstream}/check-runs":
                 self.assertEqual(query["app_id"], "15368")
                 self.assertEqual(query["filter"], "latest")
                 key = query["check_name"]
             elif path == f"repos/{REPO}/actions/workflows/check.yml/runs":
-                self.assertEqual(query["head_sha"], resolved)
+                self.assertEqual(query["head_sha"], downstream)
                 self.assertNotIn("status", query)
                 self.assertNotIn("branch", query)
                 key = "ci-runs"
@@ -465,13 +494,13 @@ class GuardBehaviourTests(unittest.TestCase):
                 # Automated approval: every run on the SHA, never a success-only filter.
                 self.assertEqual(
                     {k: query[k] for k in ("head_sha", "branch")},
-                    {"head_sha": resolved, "branch": "main"},
+                    {"head_sha": downstream, "branch": "main"},
                 )
                 key = "staging-all"
             elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs":
                 self.assertEqual(
                     {k: query[k] for k in ("head_sha", "branch", "status")},
-                    {"head_sha": resolved, "branch": "main", "status": "success"},
+                    {"head_sha": downstream, "branch": "main", "status": "success"},
                 )
                 key = "staging"
             elif path == f"repos/{REPO}/environments/production":
@@ -596,11 +625,77 @@ class GuardBehaviourTests(unittest.TestCase):
         )
 
     def test_malformed_sha_is_refused_before_any_api_call(self):
-        for sha in ("main", SHA[:39], SHA + "0", "g" * 40, "$(id)", f"{SHA};id", f"{SHA[:20]} {SHA[20:]}"):
+        # R1: 7-39 hex prefixes are valid short SHAs resolved via the commits
+        # API (see the short-SHA fixtures below); SHA[:39] is no longer
+        # malformed. Shorter than 7, longer than 40, or non-hex refuses before
+        # any API call with the exact accepted format.
+        for sha in ("main", SHA[:6], "abc", SHA + "0", "g" * 40, "g" * 7,
+                    "$(id)", f"{SHA};id", f"{SHA[:20]} {SHA[20:]}"):
             with self.subTest(sha=sha):
                 result = self.guard(sha=sha)
                 self.assertRefused(result, "40-character hex")
+                self.assertRefused(result, ACCEPTED_FORMAT)
                 self.assertEqual(result[3], [])
+
+    def test_unambiguous_short_sha_is_resolved_and_accepted(self):
+        # R1 acceptance (TOG-28737; builder TOG-28741 must not edit): given a
+        # 12-char unambiguous prefix of a green main commit, when the guard
+        # parses it, then it resolves via the commits API and passes with the
+        # full 40-char SHA in outputs. Covers deploy and rollback modes.
+        for rollback in ("", VERSION):
+            with self.subTest(mode="rollback" if rollback else "deploy"):
+                code, outputs, summary, calls, _ = self.guard(
+                    sha=SHORT_UNAMBIGUOUS, rollback=rollback)
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs["sha"], SHA)
+                self.assertEqual(outputs["mode"], "rollback" if rollback else "deploy")
+                self.assertIn(SHA, summary)
+                # Resolution first, then every downstream gate uses the full SHA.
+                self.assertEqual(calls[0][0], f"repos/{REPO}/commits/{SHORT_UNAMBIGUOUS}")
+                self.assertIn((f"repos/{REPO}/compare/{SHA}...main", {"per_page": "1"}), calls)
+                for path, query in calls:
+                    if "head_sha" in query:
+                        self.assertEqual(query["head_sha"], SHA)
+
+    def test_ambiguous_short_sha_is_refused_with_accepted_format(self):
+        # R1 acceptance (TOG-28737; builder TOG-28741 must not edit): given a
+        # 7-char prefix colliding with another commit (fixture: AMBIGUOUS_PREFIX
+        # matches SHA and COLLIDING_SHA), when the guard parses it, then it is
+        # refused with the exact accepted format and gates nothing on the
+        # collision.
+        self.assertEqual(AMBIGUOUS_PREFIX, SHA[:7])
+        self.assertEqual(COLLIDING_SHA[:7], SHA[:7])
+        self.assertNotEqual(COLLIDING_SHA, SHA)
+        result = self.guard(sha=AMBIGUOUS_PREFIX)
+        self.assertRefused(result, "40-character hex")
+        self.assertRefused(result, ACCEPTED_FORMAT)
+        code, outputs, _, calls, _ = result
+        self.assertEqual(code, 1)
+        self.assertEqual(outputs, {})
+        # Only the resolution attempt; no compare/CI/staging gates on ambiguity.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], f"repos/{REPO}/commits/{AMBIGUOUS_PREFIX}")
+
+    def test_short_sha_resolving_to_a_different_commit_is_refused(self):
+        # The commits endpoint resolves any ref, including a branch or tag
+        # named with a hex string: given a typed prefix whose resolution
+        # returns a full SHA that does not start with it, when the guard
+        # parses it, then it refuses with the exact accepted format and runs
+        # no downstream gate on the foreign commit. Mutant: deleting
+        # `not full.startswith(short)` from the guard fails this test.
+        foreign = "f" * 40
+        self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", foreign))
+        self.assertFalse(foreign.startswith(SHORT_UNAMBIGUOUS))
+        result = self.guard(sha=SHORT_UNAMBIGUOUS, resolved_sha=foreign)
+        self.assertRefused(result, "40-character hex")
+        self.assertRefused(result, ACCEPTED_FORMAT)
+        code, outputs, _, calls, _ = result
+        self.assertEqual(code, 1)
+        self.assertEqual(outputs, {})
+        # Only the resolution attempt; no compare/CI/staging gates on the
+        # foreign commit.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], f"repos/{REPO}/commits/{SHORT_UNAMBIGUOUS}")
 
     def test_rollback_needs_a_version_uuid(self):
         for bad in ("1234", "latest", "../v", f"{VERSION} --force", VERSION[:-1]):
@@ -1389,6 +1484,7 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(rendered["env"]["production"]["containers"][0]["image_vars"],
                          {"BOT_BUILD_REVISION": SHA, "BOT_BUILD_ID": "700-2"})
+        self.assertEqual(rendered["env"]["production"]["vars"]["CONTAINER_RELEASE"], SHA)
         self.assertNotIn("image_vars", rendered["env"]["staging"]["containers"][0])
         self.assertNotIn("image_vars", rendered["containers"][0])
 
@@ -1397,7 +1493,8 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(code, 0)
         original = tomllib.loads(WRANGLER_TOML.read_text())
         expected = {"/main", "/containers[0]/image", "/containers[0]/image_build_context",
-                    "/env/production/containers[0]/image_vars"}
+                    "/env/production/containers[0]/image_vars",
+                    "/env/production/vars/CONTAINER_RELEASE"}
         for env in ("staging", "production"):
             expected |= {f"/env/{env}/containers[0]/image", f"/env/{env}/containers[0]/image_build_context"}
         self.assertEqual(set(differences(original, rendered)), expected)
