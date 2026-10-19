@@ -1444,9 +1444,10 @@ def production_errors(workflow):
     needs = production.get("needs")
     needs = [needs] if isinstance(needs, str) else (needs or [])
     expected_production_if = (
-        "always() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
-        "(needs.recheck.result == 'skipped' || (needs.recheck.result == 'success' && "
-        "needs.recheck.outputs.skip == '')) && "
+        "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
+        "(needs.soak.result == 'success' || needs.soak.result == 'skipped') && "
+        "((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || "
+        "(needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && "
         "(needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || "
         "(needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))"
     )
@@ -1456,10 +1457,12 @@ def production_errors(workflow):
                       "the schema gate, the roles gate and the protected Environment")
     if production.get("if") != expected_production_if:
         errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates, "
-                      "a fresh recheck and no skip")
-    # Only production and release hold the deploy-production lane: the
-    # guard, gates, soak and recheck run outside it, so a sleeping
-    # automatic promotion can never delay or displace an operator rollback.
+                      "a completed soak, a fresh recheck and no skip; cancelled runs never deploy")
+    # Only production and release hold the deploy-production lane: the guard,
+    # gates, soak and recheck run outside it, so a sleeping automatic promotion
+    # can never delay an operator rollback. The lane keeps the default single
+    # pending slot, so the recheck must skip an automatic run while an operator
+    # dispatch is active instead of entering the lane behind it.
     if "concurrency" in workflow:
         errors.append(f"{name}: must not hold the deploy lane at workflow level")
     for job_id in ("production", "release"):
@@ -1484,22 +1487,29 @@ def production_errors(workflow):
     if "GREEN_AT" not in soak_env or "needs.guard.outputs.green_at" not in soak_env:
         errors.append(f"{name}:soak: must read the staging-green timestamp from the guard")
     expected_recheck_if = (
-        "always() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
+        "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.auto == 'true' && "
-        "(needs.soak.result == 'success' || needs.soak.result == 'skipped')"
+        "(needs.soak.result == 'success' || needs.soak.result == 'skipped') && "
+        "needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'"
     )
-    if recheck.get("needs") != ["guard", "soak"]:
-        errors.append(f"{name}:recheck: must wait for the guard and the soak (it re-reads before the deploy)")
+    if recheck.get("needs") != ["guard", "soak", "schema-gate", "roles-gate"]:
+        errors.append(f"{name}:recheck: must wait for the guard, the soak and both gates "
+                      "(the fresh read happens after the last long build)")
     if recheck.get("if") != expected_recheck_if:
-        errors.append(f"{name}:recheck: must recheck only automatic deploys after the soak")
+        errors.append(f"{name}:recheck: must recheck only automatic deploys after the soak and both gates")
     if (recheck.get("outputs") or {}).get("skip") != "${{ steps.recheck.outputs.skip }}":
         errors.append(f"{name}:recheck: must publish the skip output for production")
     recheck_text = str(recheck)
     for required in ("vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL", "needs.guard.outputs.sha",
                      'skip = "live"', 'skip = "older-than-live"',
-                     "compare/{target}...{live}"):
+                     'skip = "operator-dispatch-active"',
+                     'skip = "dispatch-check-unreadable"',
+                     "compare/{target}...{live}",
+                     "actions/workflows/deploy-production.yml/runs"):
         if required not in recheck_text:
             errors.append(f"{name}:recheck: missing check {required}")
+    if (recheck.get("permissions") or {}).get("actions") != "read":
+        errors.append(f"{name}:recheck: must read workflow runs to see an active operator dispatch")
     guard_outputs = guard.get("outputs") or {}
     for output in ("auto", "green_at"):
         if output not in guard_outputs:
@@ -2980,6 +2990,22 @@ class WorkflowTests(unittest.TestCase):
             "production skipping the recheck": lambda w: w["jobs"]["production"].__setitem__(
                 "needs", ["guard", "soak", "schema-gate", "roles-gate"]),
             "recheck without the soak": lambda w: w["jobs"]["recheck"].__setitem__("needs", "guard"),
+            "recheck before the gates": lambda w: w["jobs"]["recheck"].__setitem__(
+                "needs", ["guard", "soak"]),
+            "production deploying past a failed soak": lambda w: w["jobs"]["production"].__setitem__(
+                "if", w["jobs"]["production"]["if"].replace(
+                    " && (needs.soak.result == 'success' || needs.soak.result == 'skipped')", "")),
+            "automatic run without a fresh recheck": lambda w: w["jobs"]["production"].__setitem__(
+                "if", w["jobs"]["production"]["if"].replace(
+                    "(needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped')",
+                    "needs.recheck.result == 'skipped'")),
+            "production deploying after cancel": lambda w: w["jobs"]["production"].__setitem__(
+                "if", w["jobs"]["production"]["if"].replace("!cancelled()", "always()")),
+            "recheck ignoring operator dispatches": lambda w: w["jobs"]["recheck"]["steps"][0].__setitem__(
+                "run", w["jobs"]["recheck"]["steps"][0]["run"].replace(
+                    "actions/workflows/deploy-production.yml/runs", "")),
+            "recheck without the runs permission": lambda w: w["jobs"]["recheck"]["permissions"].pop(
+                "actions"),
             "soak without the guard": lambda w: w["jobs"]["soak"].__setitem__("needs", "recheck"),
             "guard without the auto output": lambda w: w["jobs"]["guard"]["outputs"].pop("auto"),
             "guard drill env removed": lambda w: w["jobs"]["guard"]["steps"][0]["env"].pop(
@@ -4281,6 +4307,10 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
+                    elif (name, job_id) == ("deploy-production.yml", "recheck"):
+                        # Reads workflow runs to skip while an operator
+                        # dispatch is active; the compare read needs contents.
+                        expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("release.yml", "tag"):
                         # Tags the promoted commit and publishes its release.
                         expected = {"contents": "write"}

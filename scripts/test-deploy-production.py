@@ -279,8 +279,11 @@ class StaticGuardTests(unittest.TestCase):
     def test_concurrency_queues_instead_of_cancelling(self):
         # Job-level concurrency on production and release only: the guard,
         # gates, soak and recheck run outside the lane, so an automatic run
-        # can neither delay nor displace an operator rollback. Queued runs
-        # wait (cancel-in-progress is false); nothing is cancelled.
+        # can never delay an operator rollback behind a sleeping promotion.
+        # The lane keeps the default single pending slot (a third arrival
+        # cancels the queued run), so the recheck skips an automatic run while
+        # an operator dispatch is active instead of entering the lane behind
+        # it. Running jobs are never cancelled (cancel-in-progress is false).
         self.assertNotIn("concurrency", TOP)
         for job in ("production", "release"):
             conc = children(JOBS[job][1:], 4).get("concurrency", [])
@@ -534,26 +537,50 @@ class StaticGuardTests(unittest.TestCase):
 
     def test_recheck_rereads_hold_and_live_before_the_deploy(self):
         # The guard's hold/live verdict goes stale while gates build and the
-        # soak sleeps: the recheck job gates production on a fresh read.
+        # soak sleeps: the recheck job gates production on a fresh read. It
+        # waits for the soak AND both gates, so the read happens after the
+        # last long build; a hold flipped during the gate builds still skips.
         recheck_job = "\n".join(JOBS["recheck"])
-        self.assertIn("needs: [guard, soak]", recheck_job)
+        self.assertIn("needs: [guard, soak, schema-gate, roles-gate]", recheck_job)
         condition = value(children(JOBS["recheck"][1:], 4)["if"])
-        for needle in ("needs.guard.result == 'success'",
+        for needle in ("!cancelled()",
+                       "needs.guard.result == 'success'",
                        "needs.guard.outputs.skip == ''",
                        "needs.guard.outputs.mode == 'deploy'",
                        "needs.guard.outputs.auto == 'true'",
-                       "(needs.soak.result == 'success' || needs.soak.result == 'skipped')"):
+                       "(needs.soak.result == 'success' || needs.soak.result == 'skipped')",
+                       "needs.schema-gate.result == 'success'",
+                       "needs.roles-gate.result == 'success'"):
             self.assertIn(needle, condition)
         self.assertIn("HOLD_UNTIL: ${{ vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL }}", recheck_job)
         self.assertIn("SHA: ${{ needs.guard.outputs.sha }}", recheck_job)
+        # Entering the single-pending lane behind a recovery dispatch would
+        # cancel the queued run, so the recheck skips while a dispatch is
+        # active — and when the runs cannot be listed, so a blind run never
+        # risks the lane.
+        granted = set(children(children(JOBS["recheck"][1:], 4)["permissions"][1:], 6))
+        self.assertEqual(granted, {"contents", "actions"})
         recheck = inline_script("Re-read the promotion hold and the live revision")
         for needle in ('f"held until {held.isoformat()}"', 'skip = "live"',
-                       'skip = "older-than-live"', "compare/{target}...{live}"):
+                       'skip = "older-than-live"',
+                       'skip = "operator-dispatch-active"',
+                       'skip = "dispatch-check-unreadable"',
+                       "actions/workflows/deploy-production.yml/runs",
+                       '"event=workflow_dispatch"',
+                       '("queued", "waiting", "in_progress"'):
             self.assertIn(needle, recheck)
         self.assertNotIn("${{", recheck)
         production_if = value(children(JOBS["production"][1:], 4)["if"])
-        self.assertIn("needs.recheck.result == 'skipped'", production_if)
-        self.assertIn("needs.recheck.outputs.skip == ''", production_if)
+        # A failed soak fails closed into no deploy, a cancelled run never
+        # deploys, and a skipped recheck counts only for manual runs: an
+        # automatic run always needs a fresh recheck pass with no skip.
+        self.assertIn("!cancelled()", production_if)
+        self.assertIn("(needs.soak.result == 'success' || needs.soak.result == 'skipped')",
+                      production_if)
+        self.assertIn("needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped'",
+                      production_if)
+        self.assertIn("needs.recheck.result == 'success' && needs.recheck.outputs.skip == ''",
+                      production_if)
 
     def test_production_error_rate_gate_uses_reviewed_tooling_and_production_bindings(self):
         production = "\n".join(JOBS["production"])
@@ -726,7 +753,8 @@ class GuardBehaviourTests(unittest.TestCase):
 
     def recheck(self, sha=SHA, hold="", **responses):
         api = {"production-readyz": {"status": 200, "build_revision": "f" * 40},
-               "compare-live": {"status": "behind"}, **responses}
+               "compare-live": {"status": "behind"},
+               "dispatch-runs": {"workflow_runs": []}, **responses}
         calls = []
 
         def fake_check_output(args, **kwargs):
@@ -736,6 +764,9 @@ class GuardBehaviourTests(unittest.TestCase):
             if (path.startswith(f"repos/{REPO}/compare/{sha.lower()}...")
                     and re.fullmatch(r"[0-9a-f]{40}", path.split("...")[-1])):
                 result = api["compare-live"]
+            elif path == f"repos/{REPO}/actions/workflows/deploy-production.yml/runs":
+                self.assertEqual(query.get("event"), "workflow_dispatch")
+                result = api["dispatch-runs"]
             else:
                 self.fail(f"unexpected API call {path}")
             if isinstance(result, Exception):
@@ -1475,6 +1506,35 @@ class GuardBehaviourTests(unittest.TestCase):
                "compare-live": failed_call()})
         self.assertEqual(code, 0)
         self.assertEqual(outputs, {"skip": ""})
+
+    def test_recheck_skips_while_an_operator_dispatch_is_active(self):
+        # Entering the single-pending lane behind a recovery dispatch would
+        # cancel the queued run: an active dispatch stops the promotion green.
+        # Completed dispatch history does not block it.
+        for status in ("queued", "waiting", "in_progress"):
+            with self.subTest(status=status):
+                code, outputs, _, _, _ = self.recheck(
+                    **{"dispatch-runs": {"workflow_runs": [
+                        {"status": "completed", "conclusion": "success"},
+                        {"status": status, "conclusion": None}]}})
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs, {"skip": "operator-dispatch-active"})
+        code, outputs, _, _, _ = self.recheck(
+            **{"dispatch-runs": {"workflow_runs": [
+                {"status": "completed", "conclusion": "success"}]}})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, {"skip": ""})
+
+    def test_recheck_skips_when_dispatch_runs_are_unreadable(self):
+        # A blind run never risks the lane: when the dispatch list cannot be
+        # read, the promotion skips green and the backstop retries it.
+        for unreadable in (failed_call(), {"workflow_runs": [7]},
+                           {"workflow_runs": None}, {"total_count": 0}):
+            with self.subTest(unreadable=unreadable):
+                code, outputs, _, _, _ = self.recheck(
+                    **{"dispatch-runs": unreadable})
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs, {"skip": "dispatch-check-unreadable"})
 
     def test_recheck_refuses_an_unparseable_hold(self):
         for hold in ("tomorrow", "2026-10-20T07:42:00"):

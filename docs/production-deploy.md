@@ -218,12 +218,18 @@ staging-green time, recomputed there from the staging-green timestamp the
 guard reports (an unreadable timestamp soaks the full window). The soak runs
 outside the `deploy-production` lane — only the `production` and `release`
 jobs hold it — so a sleeping promotion never queues an operator rollback
-behind it, and a new arrival never displaces a pending recovery run. A
-`recheck` job then re-reads the hold and the live revision immediately before
-the deploy: a hold set, or a target gone live or stale, while the gates built
-or the soak slept skips green instead of deploying through the incident. The
-run then deploys through the same schema gate, roles gate, readyz gate and
-error-rate gate as a manual dispatch. Automatic runs need either
+behind it. The lane keeps the default single pending slot, so a `recheck`
+job waits for the soak and both gates, then re-reads the hold, the live
+revision and the active dispatches immediately before the deploy: a hold set,
+a target gone live or stale, or an operator dispatch queued, waiting or in
+progress while the gates built or the soak slept skips green instead of
+deploying through the incident — or entering the lane behind a recovery run
+and cancelling it. A failed soak fails closed into no deploy, an unreadable
+dispatch list skips green (the backstop retries), and a cancelled run never
+deploys. The residual race is a dispatch queued in the seconds between the
+recheck and the lane entry: watch the lane when recovering. The run then
+deploys through the same schema gate, roles gate, readyz gate and error-rate
+gate as a manual dispatch. Automatic runs need either
 `PRODUCTION_AUTO_APPROVE=true` or Environment reviewers (which pause the run
 for approval); without either the guard refuses.
 

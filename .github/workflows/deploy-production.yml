@@ -86,8 +86,12 @@ permissions: {}
 # No workflow-level concurrency: only the `production` and `release` jobs
 # below hold the `deploy-production` lane. The guard, gates, soak and recheck
 # jobs run outside it, so a sleeping automatic promotion can never queue an
-# operator rollback behind it, and a new arrival can never displace a pending
-# recovery run.
+# operator rollback behind it. The lane keeps the default single pending
+# slot, so the `recheck` job skips an automatic run while an operator
+# dispatch is active — otherwise the automatic `production` job would enter
+# the lane as a new pending job and cancel the queued recovery run. A
+# dispatch queued in the seconds between the recheck and the lane entry is
+# the residual race; it needs the operator's eye on the lane, as before.
 
 jobs:
   guard:
@@ -824,17 +828,23 @@ jobs:
 
   # Pre-deploy recheck for automatic runs: the guard's hold and live checks
   # go stale while the gates build, the Environment approval waits and the
-  # soak sleeps. Immediately before the deploy, re-read the hold variable
-  # and the live revision: a hold set mid-run, an already-live target, or a
-  # target the live build already contains skips green instead of deploying
-  # through the incident. Manual dispatches skip this job (they ignore the
-  # hold, and a live-SHA redeploy is a legitimate manual cure).
+  # soak sleeps. It waits for the soak AND both gates, so the fresh read
+  # happens after the last long build, immediately before the deploy: a hold
+  # set mid-run, an already-live target, a target the live build already
+  # contains, or an active operator dispatch skips green instead of deploying
+  # through the incident — or cancelling a queued recovery run on lane entry.
+  # Manual dispatches skip this job (they ignore the hold, and a live-SHA
+  # redeploy is a legitimate manual cure). A cancelled run never rechecks:
+  # `!cancelled()` still bypasses skipped gates for rollback and live-SHA
+  # redeploys, while a cancelled soak or gate fails closed into a skipped
+  # production job.
   recheck:
     name: pre-deploy hold and live recheck (automatic runs only)
-    needs: [guard, soak]
-    if: always() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.auto == 'true' && (needs.soak.result == 'success' || needs.soak.result == 'skipped')
+    needs: [guard, soak, schema-gate, roles-gate]
+    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.auto == 'true' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'"
     permissions:
       contents: read # compare API: whether the live revision contains the target
+      actions: read # workflow runs: whether an operator dispatch is active
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'recheck') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5
@@ -938,17 +948,54 @@ jobs:
                   return False
               return compared.get("status") in ("ahead", "identical")
 
+          def recheck_dispatch_state():
+              """Whether an operator dispatch of this workflow is active.
+
+              The lane holds a single pending job: if this automatic run's
+              production job entered it while a recovery dispatch is queued
+              or running, it would arrive as a new pending job and cancel the
+              queued run. Returns "active" when any workflow_dispatch run is
+              queued, waiting or in progress, "idle" when none is, and
+              "unreadable" when the runs cannot be listed — which also skips,
+              so a blind run never risks the lane. The backstop retries the
+              promotion on the next staging completion or daily run.
+              """
+              try:
+                  runs = json.loads(subprocess.check_output(
+                      ["gh", "api", "--method", "GET",
+                       f"repos/{repo}/actions/workflows/deploy-production.yml/runs",
+                       "-f", "event=workflow_dispatch", "-f", "per_page=20"],
+                      text=True,
+                  ))
+              except (subprocess.CalledProcessError, ValueError):
+                  return "unreadable"
+              if not isinstance(runs, dict) or not isinstance(runs.get("workflow_runs"), list):
+                  return "unreadable"
+              for run in runs["workflow_runs"]:
+                  if not isinstance(run, dict):
+                      return "unreadable"
+                  if run.get("status") in ("queued", "waiting", "in_progress",
+                                           "requested", "pending"):
+                      return "active"
+              return "idle"
+
           held = recheck_hold_until(os.environ.get("HOLD_UNTIL", ""))
           now = time.time()
           if held is not None and now < held.timestamp():
               skip = f"held until {held.isoformat()}"
           else:
-              live = recheck_live_revision()
-              if live == sha:
-                  skip = "live"
-              elif (live and re.fullmatch(r"[0-9a-f]{40}", live)
-                      and recheck_live_contains(sha, live)):
-                  skip = "older-than-live"
+              dispatch = recheck_dispatch_state()
+              if dispatch == "active":
+                  skip = "operator-dispatch-active"
+              elif dispatch == "unreadable":
+                  skip = "dispatch-check-unreadable"
+              else:
+                  live = recheck_live_revision()
+                  if live == sha:
+                      skip = "live"
+                  elif (live and re.fullmatch(r"[0-9a-f]{40}", live)
+                          and recheck_live_contains(sha, live)):
+                      skip = "older-than-live"
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"skip={skip}\n")
@@ -962,18 +1009,27 @@ jobs:
               else:
                   summary.write(
                       "### Pre-deploy recheck passed\n\n"
-                      f"- SHA: `{sha}` (no hold set; target neither live nor older than live)\n"
+                      f"- SHA: `{sha}` (no hold set; no dispatch active; "
+                      "target neither live nor older than live)\n"
                   )
           print(f"recheck: {'skipped: ' + skip if skip else 'passed'} {sha}")
 
   production:
     name: wrangler ${{ needs.guard.outputs.mode }} + readyz gate
     needs: [guard, soak, recheck, schema-gate, roles-gate]
-    if: always() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.recheck.result == 'skipped' || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))
+    # `!cancelled()` (not `always()`): a cancelled run must never deploy, while
+    # skipped gates still bypass for rollback and live-SHA redeploys. The soak
+    # must have succeeded or been skipped (a failed soak fails closed: no bake,
+    # no deploy), and a skipped recheck counts only for manual runs — an
+    # automatic run always needs a fresh recheck pass with no skip.
+    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))"
     # One of the two jobs holding the deploy-production lane (with `release`
     # below): only a running or pending production job occupies it. The
     # guard, gates, soak and recheck jobs carry no concurrency, so recovery
-    # dispatches are never queued behind a sleeping promotion.
+    # dispatches are never queued behind a sleeping promotion. The lane keeps
+    # the default single pending slot: a third arrival cancels the queued run,
+    # so automatic runs recheck for an active operator dispatch first and skip
+    # instead of entering the lane behind one.
     concurrency:
       group: deploy-production
       cancel-in-progress: false
