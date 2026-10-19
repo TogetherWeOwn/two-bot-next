@@ -36,19 +36,28 @@ Usage (the workflow supplies the environment):
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 UA = "two-bot-next-staging-rollout/1.0"
 DEFAULT_URL = "https://two-bot-next-staging.5150.workers.dev/mcp"
 TOKEN_ENV = "STAGING_MCP_TOKEN"
 URL_ENV = "STAGING_MCP_URL"
 MIN_TOKEN_LENGTH = 32
+STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
+# Response bound (64 KiB, matching MCP_MAX_BODY_BYTES in wrangler/src/mcp.ts
+# and MAX_BODY_BYTES in the sibling staging readers): every response read
+# takes at most MAX_BODY_BYTES+1 bytes so a hidden suffix is detected. Any
+# longer body raises BodyTooLarge before decoding; the oversize bytes never
+# reach parsing, logs or the artifact. Refusals never echo the body or the
+# bearer.
+MAX_BODY_BYTES = 64 * 1024
 REQUEST_TIMEOUT_SECONDS = 25
 SCHEMA_VERSION = 1
-MAX_BODY_BYTES = 64 * 1024
 
 EXPECTED_TOOLS = [
     "get_status",
@@ -82,6 +91,24 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 def fail_refusal(message):
     print(f"REFUSED: {message}", flush=True)
     return 2
+
+
+def valid_staging_mcp_url(url):
+    """Only the exact staging https /mcp URL; refuse userinfo, port, query and fragment."""
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    return (parts.scheme == "https" and port is None
+            and parts.username is None and parts.password is None
+            and bool(STAGING_HOST.fullmatch(parts.hostname or ""))
+            and parts.path == "/mcp" and not parts.query and not parts.fragment)
 
 
 def redacted_request_line(rpc_method, rpc_id, extra=""):
@@ -155,8 +182,10 @@ def main():
     if not token or len(token) < MIN_TOKEN_LENGTH:
         return fail_refusal(f"${TOKEN_ENV} missing or shorter than {MIN_TOKEN_LENGTH}; nothing sent")
     url = os.environ.get(URL_ENV, DEFAULT_URL).strip() or DEFAULT_URL
-    if not (url.startswith("https://") and "/mcp" in url):
-        return fail_refusal("staging MCP URL must be an https URL containing /mcp; nothing sent")
+    if not valid_staging_mcp_url(url):
+        return fail_refusal(
+            "staging MCP URL must be the exact staging https URL "
+            "two-bot-next-staging.<sub>.workers.dev/mcp; nothing sent")
 
     probes = []
     failures = []
