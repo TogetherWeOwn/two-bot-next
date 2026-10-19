@@ -1484,6 +1484,7 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(rendered["env"]["production"]["containers"][0]["image_vars"],
                          {"BOT_BUILD_REVISION": SHA, "BOT_BUILD_ID": "700-2"})
+        self.assertEqual(rendered["env"]["production"]["vars"]["CONTAINER_RELEASE"], SHA)
         self.assertNotIn("image_vars", rendered["env"]["staging"]["containers"][0])
         self.assertNotIn("image_vars", rendered["containers"][0])
 
@@ -1492,7 +1493,8 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(code, 0)
         original = tomllib.loads(WRANGLER_TOML.read_text())
         expected = {"/main", "/containers[0]/image", "/containers[0]/image_build_context",
-                    "/env/production/containers[0]/image_vars"}
+                    "/env/production/containers[0]/image_vars",
+                    "/env/production/vars/CONTAINER_RELEASE"}
         for env in ("staging", "production"):
             expected |= {f"/env/{env}/containers[0]/image", f"/env/{env}/containers[0]/image_build_context"}
         self.assertEqual(set(differences(original, rendered)), expected)

@@ -45,8 +45,18 @@ Phase 1 enforces a shared bearer secret (`MCP_TOKEN` Worker secret, minimum
 Set the secret per environment (never in `wrangler.toml`):
 
 ```sh
-wrangler secret put --env staging MCP_TOKEN
+wrangler versions secret put --env staging MCP_TOKEN --message <sha>
+wrangler versions deploy --env staging
 ```
+
+Stamp with the live `/readyz` `build_revision` of staging: a plain `wrangler secret put`
+publishes an unstamped version that can never form a rollback receipt
+(see `docs/production-deploy.md`). Precheck first: `versions secret put` builds on the
+newest-created version, not necessarily the serving one — confirm the last block of
+`wrangler versions list --env staging` (the list prints oldest first, so the last
+block is the newest version) is the serving version (same id as
+`wrangler deployments status --env staging`), and if they differ redeploy the intended
+SHA through the workflow first (full rule in `docs/production-deploy.md`).
 
 Staging target (follow-up): `workers-oauth-provider` in resource-server
 mode with dynamic client registration, PKCE, and scopes. Phase-1 scope is
