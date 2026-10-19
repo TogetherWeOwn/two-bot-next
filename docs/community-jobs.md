@@ -70,8 +70,17 @@ except for the rank self-heal below, the one tick that writes to Discord:
   `rank_heal` capability: the tick grants the missing lower rungs (bounded,
   hierarchy-fenced, with an audit reason) and republishes; a refused identity
   keeps the old refusal.
-- Failed or malformed scheduled-event reads keep the previous mirror. Only a
-  valid empty event array clears it.
+- Failed or malformed scheduled-event reads keep the previous mirror. Before
+  normalization or storage, the REST adapter requires every row's `guild_id` to
+  match the configured guild and requires guild/event/non-null channel IDs to be
+  canonical decimal nonzero `u64` snowflakes (no sign, whitespace, leading zeros
+  or overflow). Missing/null channels remain valid for external events. A bad
+  identity anywhere, or a duplicate event ID, rejects the entire tick as `rest`
+  without changing rows or observation timestamps; identities are never silently
+  rewritten. The pure `RawScheduledEvent` / `normalize_events` fixture contract
+  stays unchanged; wire identity validation belongs to the adapter. Only a valid
+  empty event array clears the mirror. The observation timestamp is still taken
+  before the GET, preserving the store's last-observed-wins fencing.
 
 `/readyz` retains its existing `components` array and adds an informational
 `jobs` object keyed by the four names above plus the three community-job names below. Each entry carries `parked`, `running`,
