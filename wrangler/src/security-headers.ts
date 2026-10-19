@@ -7,9 +7,9 @@
  *   never be MIME-sniffed into scriptable content.
  * - `referrer-policy: no-referrer` — matches the long-standing 302 on the
  *   redirect path; machine-consumed responses leak no referrer either way.
- * - `x-frame-options: DENY` — these bodies are never framed HTML; deny framing
- *   outright. No `frame-ancestors` CSP: X-Frame-Options already states the
- *   posture with fewer bytes on these small bodies.
+ * - `x-frame-options: DENY` — deny framing outright. Machine-consumed text
+ *   and JSON need no CSP; the HTML dashboard adds its own strict CSP, including
+ *   `frame-ancestors 'none'`, in `dashboardPageResponse`.
  *
  * Proxied container bytes pass through untouched; only Worker-built status,
  * headers and bodies are hardened. `redirect.ts` mirrors this set inline: it
