@@ -973,17 +973,12 @@ async fn manage_missing_options_reply_exact_copy() {
     let pool = PgPoolOptions::new().connect_lazy_with(test_options());
     // A missed early gate fails immediately instead of trying a live connection.
     pool.close().await;
-    let cases: Vec<(u64, &str, Vec<(&str, &str)>, &str)> = vec![
-        (110, "command", vec![], "A command name is required."),
-        (111, "command-remove", vec![], "A command name is required."),
-        (
-            112,
-            "command",
-            vec![("name", "faq")],
-            "A template is required.",
-        ),
-    ];
-    for (id, name, options, expected) in cases {
+    for (id, name, expected) in [
+        (110u64, "command", "A command name is required."),
+        (111u64, "command-remove", "A command name is required."),
+        (112u64, "command", "A template is required."),
+    ] {
+        let options: &[(&str, &str)] = if id == 112 { &[("name", "faq")] } else { &[] };
         let mock = MockRest::start(
             vec![
                 ScriptedResponse::status(204),
@@ -995,7 +990,7 @@ async fn manage_missing_options_reply_exact_copy() {
         let runtime = runtime(pool.clone(), &mock, true);
         assert!(
             runtime
-                .handle_interaction(&slash(id, name, 32, &options), None)
+                .handle_interaction(&slash(id, name, 32, options), None)
                 .await
                 .unwrap(),
             "{expected}"
