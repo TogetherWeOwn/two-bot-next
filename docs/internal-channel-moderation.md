@@ -80,8 +80,12 @@ with zero affected messages.
 Rejected first lockdown (or a refreshed cycle) removes only its new seed;
 rejected repeated lockdown with an intact send deny keeps the original seed. Build-time validation and confirmed
 HTTP 400/401/403/404/405 rejections are safe; per-verb accepted statuses still
-complete normally. Uncertain mutation results (unexpected 2xx/3xx, HTTP 408 or
-other ambiguous statuses, timeouts, transport errors, rate limits, 5xx),
+complete normally. A mutation HTTP 429 also proves no effect
+(`DiscordError::proves_no_effect`): it releases only the failed attempt's
+reservations with a refused audit, retiring only a first lockdown's own new
+seed and preserving any prior recovery seed, so a same-key retry is a real
+second attempt. Uncertain mutation results (unexpected 2xx/3xx, HTTP 408 or
+other ambiguous statuses, timeouts, transport errors, 5xx),
 cancellation, or failed post-mutation database settlement keep the channel/request
 fences. Later same-key and distinct-key requests are refused as in progress,
 rather than repeating a possibly accepted effect.
@@ -118,5 +122,9 @@ failure. Regressions cover ambiguous PUT/DELETE permission responses, fault-inje
 recovery reads with same-key retry, rejected first/repeated recovery writes,
 SQLSTATE uncertainty classification, purge history 503/429/408/timeout and malformed
 body/ID recovery, valid empty history, and single/bulk-delete uncertainty without
-weakening same-key/distinct-key fences.
+weakening same-key/distinct-key fences. Mutation-429 release for single/bulk
+delete, overwrite and slowmode — with recovery seeds preserved and 5xx, timeout,
+cancellation and unexpected statuses still fenced — is covered by
+`crates/discord/tests/mutation_429_proves_no_effect_channel.rs`, run by its own
+CI step against the same disposable service.
 CI runs the suite against its existing disposable service container.

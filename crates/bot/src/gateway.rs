@@ -659,6 +659,7 @@ async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Opti
                         error_code = code,
                         "retention purge skipped; schema gap, operator replay required"
                     );
+                    two_bot_core::metrics::global().retention_replay_needed();
                 } else {
                     tracing::warn!(
                         guild = event_guild_id(event),
@@ -1893,7 +1894,9 @@ pub async fn build_voice_runtime(
     // Name restrictions are independent of chat counts, sanctions and gates:
     // a malformed unrelated setting must not discard the configured word list.
     let name_policy = AutomodPolicy::name_policy_from_map(&std::env::vars().collect());
-    match build_production_runtime(token, db.pool().clone(), name_policy) {
+    match build_production_runtime(token, db.pool().clone(), name_policy, || {
+        crate::settings_jobs::live()
+    }) {
         Ok(runtime) => {
             info!("voice rooms enabled; gateway sink attached");
             // Hourly guild-aggregate persist for the game-activity collector

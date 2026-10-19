@@ -1201,11 +1201,55 @@ pub fn days_in_guild(joined_at_ms: Option<i64>, left_at_ms: Option<i64>) -> Opti
     }
 }
 
+/// Rendered-username bound for the goodbye notice, in characters. Par with the
+/// vote-grade public bound (`VOTE_KICK_PUBLIC_REASON_LIMIT` in the bot crate):
+/// applied to the escaped output so the bound holds on the wire.
+pub const GOODBYE_USERNAME_LIMIT: usize = 512;
+
+/// Sanitize a display name for the goodbye-notice username slot
+/// (vote-reason grade): fold newlines to spaces so the notice stays one line,
+/// neutralize mass mentions with the shared neutralizer, split mention pills
+/// (`<@`, `<#`, `<:`, `<a:`) so they render literally, backslash-escape the
+/// vote-reason markdown set, and cap the escaped output at
+/// [`GOODBYE_USERNAME_LIMIT`] characters. Plain names pass through
+/// byte-identical.
+fn sanitize_goodbye_name(username: &str) -> String {
+    let mut single_line = String::with_capacity(username.len());
+    for chunk in username.split(['\r', '\n']) {
+        if !single_line.is_empty() {
+            single_line.push(' ');
+        }
+        single_line.push_str(chunk);
+    }
+    let neutralized = crate::message_safety::neutralize_mentions(&single_line);
+    let pills = neutralized
+        .replace("<@", "<\u{200b}@")
+        .replace("<#", "<\u{200b}#")
+        .replace("<:", "<\u{200b}:")
+        .replace("<a:", "<\u{200b}a:");
+    let mut escaped = String::with_capacity(pills.len());
+    for ch in pills.chars() {
+        if matches!(ch, '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    let mut capped: String = escaped.chars().take(GOODBYE_USERNAME_LIMIT).collect();
+    // A cut mid-escape would leave a lone backslash that eats the closing bold
+    // delimiter, so trim on escape-pair boundaries instead.
+    if capped.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 1 {
+        capped.pop();
+    }
+    capped
+}
+
 /// Goodbye copy (legacy `goodbyeText`). Plain on purpose: no guilt, no
 /// retention pitch. The notice (who, when, how long) is the product; the stay
 /// detail already lands in the funnel as `member_leave`.
 ///
-/// The username is legacy-trusted display text; the executor must render it
+/// The username is untrusted display text rendered through
+/// vote-reason-grade sanitizing (single-line, mention-neutralized,
+/// markdown-escaped, length-capped); the executor must still render it
 /// as plain text (no mention parsing) — `GoodbyeEffect::Post` explicitly
 /// supplies `MentionPolicy::None`.
 #[must_use]
@@ -1216,9 +1260,8 @@ pub fn goodbye_text(username: &str, days: Option<i64>) -> String {
         Some(1) => " (was here 1 day)".to_owned(),
         Some(d) => format!(" (was here {d} days)"),
     };
-    format!(
-        "**{username}** left the server{stay}. Their messages and voice history stay on the books."
-    )
+    let safe = sanitize_goodbye_name(username);
+    format!("**{safe}** left the server{stay}. Their messages and voice history stay on the books.")
 }
 
 /// Adjudicate the goodbye. Non-session modes have no goodbye surface at all
@@ -2195,6 +2238,21 @@ mod tests {
             Some(3)
         );
         assert_eq!(days_in_guild(None, Some(1_787_529_600_000)), None);
+    }
+
+    #[test]
+    fn goodbye_cap_trims_on_escape_pair_boundaries() {
+        // 511 plain chars plus a markdown char escape to 513 chars, so the
+        // 512-char cap would cut mid-escape; the slot must drop the lone
+        // backslash instead of letting it eat the closing bold delimiter.
+        let out = goodbye_text(
+            &format!("{}*", "a".repeat(GOODBYE_USERNAME_LIMIT - 1)),
+            None,
+        );
+        let pos = out.rfind("** left the server").expect("template close");
+        let slot = &out[2..pos];
+        assert_eq!(slot.len(), GOODBYE_USERNAME_LIMIT - 1);
+        assert!(!slot.ends_with('\\'));
     }
 
     #[test]

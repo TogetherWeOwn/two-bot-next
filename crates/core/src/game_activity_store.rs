@@ -168,6 +168,9 @@ fn check_horizon(retention_days: i32) -> Result<(), GameActivityStoreError> {
 /// [`expire_stale_guild_aggregates`]: same predicate, no writes.
 /// Horizons outside `1..=MAX_AGGREGATE_RETENTION_DAYS` are refused
 /// (fail-closed).
+///
+/// The per-pass sweep uses [`list_aggregate_guild_page`] instead: this full
+/// listing stays for small exact reads (reports, tests), never for a tick.
 pub async fn list_aggregate_guilds(
     pool: &Pool<Postgres>,
     retention_days: i32,
@@ -183,6 +186,67 @@ pub async fn list_aggregate_guilds(
         .into_iter()
         .map(|(guild_id, stale)| (guild_id, u64::try_from(stale.max(0)).unwrap_or(u64::MAX)))
         .collect())
+}
+
+/// One bounded keyset page of stale-guild candidates: at most `limit` guilds
+/// holding stale rows, ordered by guild key ascending, resuming after
+/// `after_guild` (exclusive; `None` starts at the first key). The per-guild
+/// counts use the same stale predicate as [`expire_stale_guild_aggregates`],
+/// so a dry-run pass is a same-predicate upper bound per pass for the visited
+/// page: execute deletes at most the per-guild row batch per visited guild,
+/// so over-batch guilds report fewer deleted rows per pass than previewed.
+/// Stable under concurrent inserts: a guild sorts by
+/// key, never by position, so a pass never re-walks already visited keys.
+/// Horizons outside `1..=MAX_AGGREGATE_RETENTION_DAYS` are refused
+/// (fail-closed); a zero `limit` reads one guild.
+pub async fn list_aggregate_guild_page(
+    pool: &Pool<Postgres>,
+    retention_days: i32,
+    after_guild: Option<&str>,
+    limit: u32,
+) -> Result<Vec<(String, u64)>, GameActivityStoreError> {
+    check_horizon(retention_days)?;
+    let limit = i64::from(limit.max(1));
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT guild_id, count(*) FROM game_activity_guild_aggregates \
+         WHERE updated_at < now() - make_interval(days => $1) \
+         AND ($2 IS NULL OR guild_id > $2) \
+         GROUP BY guild_id ORDER BY guild_id ASC LIMIT $3",
+    )
+    .bind(retention_days)
+    .bind(after_guild)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(guild_id, stale)| (guild_id, u64::try_from(stale.max(0)).unwrap_or(u64::MAX)))
+        .collect())
+}
+
+/// How many stale-guild candidates sort after `after_guild` (exclusive;
+/// `None` counts the whole eligible list): the `guilds_deferred` evidence a
+/// pass reports, so a partial pass is distinguishable from a complete one.
+/// A single scalar, never the rows themselves, so the count stays bounded no
+/// matter how many guilds are stale. Same predicate and fail-closed horizon
+/// as [`list_aggregate_guild_page`].
+pub async fn count_stale_aggregate_guilds_after(
+    pool: &Pool<Postgres>,
+    retention_days: i32,
+    after_guild: Option<&str>,
+) -> Result<u64, GameActivityStoreError> {
+    check_horizon(retention_days)?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (SELECT DISTINCT guild_id \
+         FROM game_activity_guild_aggregates \
+         WHERE updated_at < now() - make_interval(days => $1) \
+         AND ($2 IS NULL OR guild_id > $2)) AS stale_guilds",
+    )
+    .bind(retention_days)
+    .bind(after_guild)
+    .fetch_one(pool)
+    .await?;
+    Ok(u64::try_from(count.max(0)).unwrap_or(u64::MAX))
 }
 
 /// Delete one guild's aggregate rows older than `retention_days`, leaving
@@ -206,6 +270,52 @@ pub async fn expire_stale_guild_aggregates(
     .execute(pool)
     .await?
     .rows_affected())
+}
+
+/// Delete at most `limit` of one guild's stale aggregate rows, oldest game
+/// key first, leaving every other guild untouched. Same predicate as
+/// [`expire_stale_guild_aggregates`] plus the row cap, so an oversized guild
+/// drains across passes: remaining stale rows stay eligible for the next
+/// pass and are never silently lost. Same fail-closed horizon; a zero
+/// `limit` deletes one row.
+///
+/// Each batch runs in its own transaction with `lock_timeout = '5s'` and
+/// `statement_timeout = '15s'` (the cutover retention `SET LOCAL`
+/// precedent): a row lock held by a stuck session fails this guild fast as
+/// an isolated retryable error instead of blocking the pass until the
+/// supervisor cancels it. Cancelling a blocked delete would pin its pooled
+/// connection (sqlx 0.9 pings the dropped connection with no timeout), so
+/// without these bounds two cancelled passes would exhaust the retention
+/// pool and stop every later tick at `pool.begin()`.
+pub async fn expire_stale_guild_aggregates_batch(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    retention_days: i32,
+    limit: u32,
+) -> Result<u64, GameActivityStoreError> {
+    check_horizon(retention_days)?;
+    let limit = i64::from(limit.max(1));
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '15s'")
+        .execute(&mut *tx)
+        .await?;
+    let deleted = sqlx::query(
+        "DELETE FROM game_activity_guild_aggregates WHERE ctid IN \
+         (SELECT ctid FROM game_activity_guild_aggregates \
+         WHERE guild_id = $1 AND updated_at < now() - make_interval(days => $2) \
+         ORDER BY game ASC LIMIT $3)",
+    )
+    .bind(guild_id)
+    .bind(retention_days)
+    .bind(limit)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(deleted)
 }
 
 /// A guild's stored rows, oldest game key first (`''`/untitled first), for
