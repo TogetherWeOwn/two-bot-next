@@ -1734,7 +1734,9 @@ export default {
     // path only: only POST is served (browser probes get 405, never tool
     // execution). Unconfigured/short token → 404 (the route does not exist);
     // missing/wrong bearer → 401 with WWW-Authenticate, before the Container
-    // is touched. Every tool call below is bounded (6 s / 64 KiB) in mcp.ts.
+    // is touched. Authenticated request bodies are collected under their own
+    // inbound bound (64 KiB / 6 s, before parsing) in mcp.ts, and every tool
+    // call below keeps its separate outbound container bound (6 s / 64 KiB).
     if (url.pathname === "/mcp") {
       if (request.method !== "POST") {
         return new Response("method not allowed", {
