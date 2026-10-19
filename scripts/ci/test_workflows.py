@@ -2887,6 +2887,27 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        # One MEMBER_TESTDB export serves both the ignored sweep and the
+        # fail-closed member_moderation_db re-run. Pin its count and logical
+        # command order so a redundant later export cannot mask a deleted or
+        # moved sweep export.
+        member_exports = [
+            index for index, line in enumerate(logical_lines)
+            if line == "export MEMBER_TESTDB=agent-testdb"
+        ]
+        self.assertEqual(len(member_exports), 1)
+        ignored_sweep_index = next(
+            index for index, line in enumerate(logical_lines)
+            if line.startswith("cov_run ")
+            and "--workspace --lib --bins --tests" in line
+            and "-- --ignored" in line
+        )
+        member_rerun_index = next(
+            index for index, line in enumerate(logical_lines)
+            if "--test member_moderation_db" in line
+        )
+        self.assertLess(member_exports[0], ignored_sweep_index)
+        self.assertLess(ignored_sweep_index, member_rerun_index)
         self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
         main_sweep = [run for run in sweeps if "-- --ignored" not in run][0]
         # Guarded suites panic under the bootstrap URL; they run only in
