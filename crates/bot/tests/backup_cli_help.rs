@@ -33,7 +33,21 @@ impl Scratch {
     }
 
     fn is_empty(&self) -> bool {
-        std::fs::read_dir(&self.0).unwrap().next().is_none()
+        // Coverage harness artifact, not product output: an instrumented
+        // child (cargo-llvm-cov) writes its profile next to its cwd when
+        // LLVM_PROFILE_FILE is unset. `two_bot` forwards the parent's path
+        // so this is normally empty; ignore any stray profile so a harness
+        // change cannot re-flake the "touches nothing" assertion.
+        std::fs::read_dir(&self.0)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".profraw"))
+            })
+            .is_none()
     }
 }
 
@@ -110,6 +124,22 @@ fn backup_help_never_reaches_a_configured_database() {
     assert!(
         !dir.0.join("backups").exists(),
         "backup --help created its configured backup directory"
+    );
+}
+
+#[test]
+fn scratch_is_empty_ignores_stray_profraw_profiles() {
+    let dir = Scratch::new();
+    assert!(dir.is_empty());
+    std::fs::write(dir.0.join("default.profraw"), b"profile").unwrap();
+    assert!(
+        dir.is_empty(),
+        "stray coverage profile should not count as product output"
+    );
+    std::fs::write(dir.0.join("output.txt"), b"product").unwrap();
+    assert!(
+        !dir.is_empty(),
+        "non-profile output should still count as touching the directory"
     );
 }
 

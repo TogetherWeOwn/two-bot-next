@@ -838,6 +838,46 @@ as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
 
+#### Alert: EventSub post failed share
+
+`two_bot_eventsub_posts_total{outcome}` failed share across keepalive
+samples: failed posts exceed 10% of attempted posts in the window, with at
+least 10 attempted posts. `eventsub_post_failed_share` is a **ticket, not a
+page**. The denominator is attempted posts, not succeeded plus failed: growth
+in `succeeded` from earlier attempts or in `other` never counts as delivery
+failure. Announcement traffic is low-volume, so windows below the floor hold
+the baseline and accumulate attempts across consecutive valid samples until the
+floor is met; only the judged window rebaselines. Low-volume windows (fewer
+than 10 attempted) stay quiet at any share, and a judged window at or below
+the 10% line stays quiet. The first valid sample
+is baseline only, even when every post so far failed. Missing or invalid samples
+preserve the active ticket and the baseline; a counter reset (any outcome
+moving backwards, including a process restart) rebaselines without firing. Each
+each judged window recomputes the share, so only a judged window at or below
+the line resolves the ticket. Flat or sub-floor windows hold an active ticket
+until that judged window clears it, so a sustained outage stays one ALERT
+instead of flapping. Recovery is a healthy judged window with the failed share
+back at or below the line; confirm live delivery separately before closing out.
+The resolve transition fires exactly once.
+
+First response: read-only diagnosis only. Read the attempted/failed counters
+through the existing authorized `/ops/metrics` path and correlate the window
+with `eventsub_receiver` log lines; do not re-post announcements, touch the
+durable ledger, retry sends, or reconcile subscriptions from this alert. No
+broadcaster, body, token or free-text label ever reaches the alert. For delivery
+shape and subscription health, follow the existing [stream funnel](stream-funnel.md#transport-webhook)
+transport/webhook section and the [EventSub operator runbook](eventsub-runbook.md)
+(refusal matrix, challenge verification, dark-unless-enabled behavior) through
+their authorized read paths. Record only fixed outcome names and sanitized
+counts, never broadcaster IDs, tokens, bodies or scrape secrets.
+
+Do not post announcements, write ledger rows, retry deliveries, or reconcile
+subscriptions to clear this ticket. This alert adds neither posting, ledger,
+retry, nor reconciliation behavior: it labels the existing transition delivery
+as `(ticket)` and supplies this runbook. Route a continuing delivery failure to
+the on-call engineer through the normal triage path. No new webhook, production
+activation or live load test is authorized.
+
 #### Alert: metrics scrape lost
 
 The Container DO failed the container-internal `/metrics` scrape on 3 consecutive scheduled keepalive ticks. This is a **ticket, not a page**: the observer itself is blind, so every metric-rule alert is missing evidence while this fires. One failed scrape stays quiet and three consecutive failures ticket exactly once; further failures do not re-ticket while the incident fires.
@@ -964,6 +1004,75 @@ proves the two-failure CEO page and silence. Re-dispatching without the
 flags (or any plain push deploy) disarms the drill: the triggers resolve on
 their own rules and the guards reset. Rollback is disarm-by-redeploy; the
 Worker recommends only, so nothing executes from this path.
+
+#### Staging guard receipts (persisted remediation evidence)
+
+Each keepalive tick writes the evaluator guard to DO storage at
+`two-bot:remediation`, flushes it with `storage.sync()`, reads it back, and —
+in staging only (`TWO_DEPLOY_ENV` exactly `"staging"`) — logs one structured
+receipt proving what was persisted. The flush matters: without it the
+read-back is served from the DO in-memory cache/write buffer and always
+repeats the just-written value. Production emits none. No endpoint,
+permission, dump, or storage mutation beyond the existing evaluator write;
+thresholds and the state machine are untouched.
+
+Log query (staging Worker logs): filter for the receipt event, then narrow by
+decision or firing key. In Cloudflare dashboard open Workers & Pages →
+`two-bot-next-staging` → Observability → Logs and query
+`event = "remediation_guard_receipt"` (JSON: `{"event":"remediation_guard_receipt"}`).
+Narrow with `decision = "recommend"` (R1/R2), `decision = "ceo-page"`
+(STOP), `decision = "suppressed-quiet"` (quiet after two failures),
+`decision = "held-cooldown"` (inside the 1800 s window),
+`decision = "clear-hold"` (sustained-clear hold-down), or `decision = "idle"`
+(pre-drill baseline / reset). Correlate a tick with its alert by matching
+`firing` to the same tick's `metrics_alert` line and `build_revision` /
+`release` / `worker_version` to the keepalive probe.
+
+Capture schema (allowlist only; no tokens, webhooks, or arbitrary storage):
+
+```json
+{
+  "event": "remediation_guard_receipt",
+  "service": "two-bot-next",
+  "ok": true,
+  "deploy_env": "staging",
+  "evaluated_at_seconds": 1760001860,
+  "firing": ["voice_creator_map_stale"],
+  "decision": "recommend",
+  "action": "creator-map-reload",
+  "guard": {
+    "lastRecommendedAtSeconds": 1760001860,
+    "scopes": {
+      "voice-stall": { "phase": "reload-recommended", "consecutiveFailures": 0, "suppressed": false, "clearSinceSeconds": 0 },
+      "crash-loop": { "phase": "idle", "consecutiveFailures": 0, "suppressed": false, "clearSinceSeconds": 0 }
+    }
+  },
+  "build_revision": "abc1234",
+  "release": "abc1234",
+  "worker_version": "deployment-A",
+  "log_url": "https://developers.cloudflare.com/workers/observability/logs/workers-logs/"
+}
+```
+
+A storage failure never yields `ok: true`: a failed write keeps the existing
+`two-bot remediation guard failed` line with no success receipt, and a failed
+flush (`storage.sync()`), failed read-back, or mismatched read-back yields
+`ok: false` with `reason` of `readback_failed`, `mismatch`, or
+`invalid_persisted` (same correlation fields, no guard). At most one receipt
+per 60 s keepalive tick.
+
+Truthful limits: staging runs with `OPS_ALERT_FORWARDING=off`, so the STOP
+(`ceo-page`) decision is log-only — there is no external CEO-page delivery to
+capture. The full clean-start R1/R2/STOP/clear sequence takes more than 30
+minutes (R1 at first firing, R2 one 1800 s window later, STOP another window
+later, then a full 1800 s quiet window to reset; typically about 90 minutes),
+so a short soak can only prove the prefix it covers. The receipt proves the
+guard persisted, not that any remediation executed — the Worker recommends
+only. This receipt is application-level evidence through the Worker's own
+authorized guard-storage path: a provider storage query can return transport
+HTTP 200 / `success=true` while its nested result is still a denial (for
+example `access to _cf_KV.key is prohibited: SQLITE_AUTH` with no rows), so
+provider HTTP success alone is not guard evidence.
 
 ### Event-store capture gaps and lag
 

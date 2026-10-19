@@ -152,6 +152,27 @@ not production authorization or a migration tool.
    from the container. Re-read rollout/Worker control-plane state after the
    runtime probes.
 
+## Auto-rollback image completion
+
+The staging auto-rollback's `worker_container_rollback.py` pins the newly created
+rollback rollout ID, target version and snapshot image digest. A completed rollout
+with finished steps, one updated instance, and converged or already-supported
+active-lag counters completes the image leg even if the separate application
+listing still shows the previous image. Replaced/reverted rollouts and identity
+or image drift still fail closed. Production retains its application-listing
+check.
+
+Image completion is not rollback success: ownership takeover and the existing
+18 consecutive passing `/health` and `/readyz` polls still follow. Those polls
+require the restored Worker version, expected build revision (subject to the
+existing pre-stamp exception), and `gateway=ready`; any miss resets the streak.
+
+If the image leg times out, the log and failure evidence name the unmet condition
+as `waiting_for=target_version|rollout_completion|counters_or_progress|application_image`.
+The evidence file records `failure: image_rollout_timeout` and `image_restore_wait`,
+never a successful stable gate or a raw application configuration. `application_image`
+is only a production wait condition. Failure evidence is not a successful drill.
+
 ## Rollback drill: injected gateway failure (staging only)
 
 The one supported way to prove the auto-rollback end to end is a manual

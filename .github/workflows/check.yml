@@ -690,6 +690,11 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test --workspace --lib --bins --features two-bot-core/db --locked
 
+      # Global metric deltas must not be satisfied by a sibling hostile-name test.
+      # Reuse the compiled feature graph, in a fresh process with serial tests.
+      - name: cargo test (isolated voice-name filter acceptance)
+        run: cargo test -p two-bot --lib --features two-bot-core/db --locked voice_rooms::tests::name_filter_acceptance -- --test-threads=1
+
       # The standalone backup fixture has its own scratch-only URL guard.
       # Supplying it here executes the round trip rather than its local skip.
       - name: cargo test (integration, including website acceptance and backup round trip)
@@ -770,13 +775,12 @@ jobs:
             --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail \
-            --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs \
-            --skip channel_moderation_store
-          # Guarded suites accept only the exact agent_test URL (no password
-          # segment). Under the bootstrap URL above their guards panic, so
-          # skip them here (FAILED lines confuse flake detection) and
-          # re-run them below with their accepted URL; profiles merge below.
-          # Flags mirror the corresponding ignored-db lane steps.
+            --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          # Guarded channel suites accept the exact agent_test URL and the
+          # workspace bootstrap URL (they always connect to agent_test with
+          # an isolated schema). The sweep above already runs them green, and
+          # the re-runs below merge their profiles; flags mirror the
+          # corresponding ignored-db lane steps.
           export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test
           cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked -- channel_moderation --include-ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test channel_moderation_runtime -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
@@ -1123,7 +1127,7 @@ jobs:
       - name: Internal channel moderation executor (mock REST and CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored
+        run: cargo test -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored --test-threads=1
 
       - name: Mutation-429 channel acceptance (mock REST and CI service only)
         env:
@@ -1141,12 +1145,12 @@ jobs:
       - name: Internal member moderation executor (mock REST and CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot-discord --features db --locked --test internal_member_moderation -- --include-ignored
+        run: cargo test -p two-bot-discord --features db --locked --test internal_member_moderation -- --include-ignored --test-threads=1
 
       - name: Internal event executor mirror acceptance (CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
-        run: cargo test -p two-bot-discord --features db --locked --test internal_events -- --include-ignored
+        run: cargo test -p two-bot-discord --features db --locked --test internal_events -- --include-ignored --test-threads=1
 
       - name: Event-store S1 append-only core acceptance (CI service only)
         env:
@@ -2220,6 +2224,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill.py -v
       - name: Verify worker-container rollback (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback.py -v
+      - name: Verify worker-container rollback listing lag (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback_listing.py -v
       - name: Verify staging container backout/restore drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)
