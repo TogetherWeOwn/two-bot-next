@@ -1677,7 +1677,8 @@ impl CommandRuntime {
 
     /// `/sticky`: validate → upsert → audit → ephemeral confirmation.
     /// Rejected input still audits (`rejected`, Create vs Update by whether a
-    /// row already exists — the read only names the audit action).
+    /// row already exists — the read only names the audit action). A store
+    /// failure audits that same refusal shape with the `db_class` token.
     async fn sticky_set(&self, interaction: &Interaction) {
         let guild_id = self.guild_id.to_string();
         let Some(channel_id) = interaction_channel(interaction) else {
@@ -1748,13 +1749,32 @@ impl CommandRuntime {
             }
             Err(err) => {
                 warn!(reason = db_class(&err), "sticky put failed");
+                let existed = store::get_sticky(&self.pool, &guild_id, &channel_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some();
+                self.audit(
+                    &guild_id,
+                    Some(&actor_id),
+                    if existed {
+                        StickyAuditAction::Update
+                    } else {
+                        StickyAuditAction::Create
+                    },
+                    Some(&channel_id),
+                    StickyAuditOutcome::Rejected,
+                    Some(db_class(&err)),
+                )
+                .await;
                 self.finish(interaction, STORE_FAILURE_REPLY).await;
             }
         }
     }
 
     /// `/sticky-remove`: delete the row → best-effort delete the previous
-    /// Discord message → audit → ephemeral confirmation.
+    /// Discord message → audit → ephemeral confirmation. A store failure
+    /// audits a `rejected` row with the `db_class` token instead.
     async fn sticky_remove(&self, interaction: &Interaction) {
         let guild_id = self.guild_id.to_string();
         let Some(channel_id) = interaction_channel(interaction) else {
@@ -1796,6 +1816,15 @@ impl CommandRuntime {
             }
             Err(err) => {
                 warn!(reason = db_class(&err), "sticky delete failed");
+                self.audit(
+                    &guild_id,
+                    Some(&actor_id),
+                    StickyAuditAction::Delete,
+                    Some(&channel_id),
+                    StickyAuditOutcome::Rejected,
+                    Some(db_class(&err)),
+                )
+                .await;
                 self.finish(interaction, STORE_FAILURE_REPLY).await;
             }
         }
