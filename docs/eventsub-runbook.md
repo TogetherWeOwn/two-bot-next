@@ -244,9 +244,11 @@ against production Twitch, and never print a secret value to check one):
 - Lone `reconcile_failed`: read its `error` field first. An invalid
   broadcaster id or a more-than-100-entry allowlist means fix the
   `TWO_TWITCH_BROADCASTERS` format and redeploy/restart — no broadcaster
-  is reconciled until then. A token-endpoint or listing rejection means
+  is reconciled until then. A token-endpoint rejection means
   check the client id/secret provisioning (names, never values); do not
-  substitute another credential.
+  substitute another credential. A listing rejection is not always a
+  credentials problem: read its `error` field before touching
+  provisioning.
 - A `revocation` delivery is acknowledged by the receiver and healed by
   the next scheduled pass (the revoked entry is absent or
   `authorization_revoked`), not by an immediate revocation-triggered

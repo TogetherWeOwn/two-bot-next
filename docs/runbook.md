@@ -864,6 +864,42 @@ as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
 
+#### Alert: community facts drain failures
+
+`two_bot_community_facts_drain_failures_total{reason}` grew in three consecutive
+completed keepalive sample windows after a baseline. `community_facts_drain_failures`
+is a **ticket, not a page**: gateway dispatch deliberately warns and continues
+when the community-facts writer errors or misses its deadline, so scorecard data
+loss can otherwise remain log-only while checkpoints look healthy. Growth is
+summed over the fixed `error`, `timeout` and `other` reasons. A large single
+burst stays silent.
+
+First response: triage within the watch shift. Read the per-reason counter
+through the existing authorized `/ops/metrics` path, correlate the window with
+`gateway community facts dispatch failed` / `gateway community facts dispatch
+timed out` warn logs, and check scorecard coverage separately: the scorecard
+fails closed on missing coverage, so a drain-loss window means the scorecard
+undercounts rather than overcounts. Record only fixed reason names and
+sanitized counts, never member/channel IDs, payloads or scrape tokens.
+
+Flat samples clear the streak and resolve the ticket. A backwards counter in any
+fixed reason signals a process reset: all reasons re-baseline with a zero streak
+and resolve, even if another reason's new count overtook its old value.
+Missing/invalid series or a failed scrape break the streak and discard the
+baseline, **not** the active ticket; the first valid sample after a gap is only
+a baseline, ongoing growth retains the ticket, and a subsequent valid flat/reset
+window proves recovery. A new DO field or legacy state starts unbaselined.
+Counter-only monitoring cannot detect a restart whose replacement counter
+already exceeds the old value; correlate deployment evidence rather than
+claiming that case is proven quiet.
+
+Do not change facts capture, gateway commit semantics, privacy/retention or
+scorecard calculations to clear this alert, and do not restart the bot to clear
+a counter. This alert adds neither automatic ticket-system integration nor paging
+escalation: it labels the existing transition delivery as `(ticket)` and supplies
+this runbook. Persist sanitized incident evidence and route a continuing drain
+problem to the on-call engineer through the normal triage path. No new webhook,
+production activation or live load test is authorized.
 #### Alert: EventSub post failed share
 
 `two_bot_eventsub_posts_total{outcome}` failed share across keepalive
@@ -1101,10 +1137,41 @@ armed tick, the unpaired alert needs one baseline tick plus three
 outstanding ticks (about 4 min). Observe one full 30-minute cooldown window
 for R1-to-R2 escalation (`creator-map-reload`, no host action, then one
 Operator card for `same-sha-takeover` at the same SHA); a further window
-proves the two-failure CEO page and silence. Re-dispatching without the
-flags (or any plain push deploy) disarms the drill: the triggers resolve on
-their own rules and the guards reset. Rollback is disarm-by-redeploy; the
-Worker recommends only, so nothing executes from this path.
+proves the two-failure CEO page and silence. Disarming re-dispatches the
+same SHA without the flags: the triggers resolve on their own rules and the
+guards reset. Rollback is disarm-by-redeploy; the Worker recommends only, so
+nothing executes from this path.
+
+Drill procedure (Operator). The soak needs the armed build undisturbed for
+at least 90 minutes (R1, R2 30+ minutes later, STOP 30+ minutes after R2,
+disarm, then a 30-minute clear) while merges keep landing. Arm the hold
+first so no push redeploys staging mid-soak: without it, the next push
+disarms the drill by redeploy.
+
+1. Pick the drill SHA: the full 40-hex main commit staging currently serves
+   (the `build_revision` on staging `/readyz`, not a guess). The pin must be
+   an ancestor of `origin/main`. Save it once: `DRILL_SHA=<paste the 40-hex
+   SHA>` (replace the placeholder before running; the shell would read the
+   angle brackets as a redirection).
+2. Arm the hold: `gh variable set STAGING_SOAK_HOLD_UNTIL --body
+   "2026-10-19T20:00:00Z"` with an ISO-8601 UTC deadline at most 4h out
+   (past the planned disarm plus the 30-minute clear).
+3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
+   --ref main -f "sha=$DRILL_SHA" -f inject_voice_stall=true` (add
+   `-f inject_unpaired_disconnect=true` for the crash-loop scope).
+   Dispatches bypass the hold, so arm and disarm work while it is armed.
+   The arm run stays red by design: the history guard fails it after a green
+   deploy and synthetic so the pin never reads as staging history for the
+   head. Read the deploy and synthetic steps, not the run color.
+4. Run the R1/R2/STOP observation above. Pushes during the window fail fast
+   with the deferral message (red, by design: a quiet green would read as
+   staging history to the production guard); merges stay unblocked.
+5. Disarm at the SAME SHA with no flags: `gh workflow run
+   deploy-staging.yml --ref main -f "sha=$DRILL_SHA"`. The disarm run stays
+   red for the same reason while the pin sits below the head.
+6. Watch the 30-minute clear (triggers resolve, guards reset), then release
+   the hold: `gh variable delete STAGING_SOAK_HOLD_UNTIL`. Letting it expire
+   works too: expiry fails open and the next push deploys normally.
 
 #### Staging guard receipts (persisted remediation evidence)
 

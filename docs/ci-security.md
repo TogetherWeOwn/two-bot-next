@@ -69,9 +69,13 @@ environment-scoped with no unintended fallback:
 
 ## Staging schema-drift gate (automatic, plan-only)
 
-Every `deploy-staging` run starts with the `schema-gate` job, and `deploy`
-needs it, so a staging database behind the source fails the run before any
-deploy step instead of staying red silently. The gate job runs only in the
+Every `deploy-staging` run starts with the `soak-hold` job and then the
+`schema-gate` job, and `deploy` needs the gates, so a staging database behind
+the source fails the run before any deploy step instead of staying red
+silently. The hold reads only the Operator-owned `STAGING_SOAK_HOLD_UNTIL`
+repo variable and fails the run while a drill hold is armed, so a deferred
+push never reports a success the production guard could mistake for staging
+history. The gate job runs only in the
 `staging-migrate-plan` environment with `contents: read`, builds the reviewed
 `staging-migrate` binary at the exact deploy SHA, and runs
 `scripts/ci/staging_schema_gate.py`, which invokes the binary's read-only
@@ -192,7 +196,10 @@ the guard also refuses a docs-only head with `deploy-staging has no successful
 run`. This fails closed and is the intended trade: pin the latest
 runtime-affecting commit, or dispatch `deploy-staging` for the head you need
 ([production-deploy.md](production-deploy.md)). This change does not authorize
-a production bypass.
+a production bypass. A pinned drill dispatch (a `sha` below the workflow head)
+deploys the pin but fails its run red in the `pinned-history-guard` job after
+the synthetic, so it never mints a successful run the guard could mistake for
+staging history of the head.
 
 `supply-chain.yml` holds the required `pr-lint` and `gitleaks` jobs (main #187).
 The permitted same-repo reusable calls are the `pipeline-benchmark` call in
