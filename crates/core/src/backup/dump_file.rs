@@ -877,13 +877,11 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     Some(Value::Object(data)) => data,
                     _ => return Err(refuse("dump row has no data object")),
                 };
-                // The manifest column list gates unknown keys here, before any
+                // The manifest column list gates row keys here, before any
                 // publish/restore or `--dry-run` success: a row key it never
-                // declared refuses. This check does not verify column
-                // completeness: a row carrying a subset stays valid at
-                // inspect, while restore refuses a row with a missing cell
-                // (`missing cell`, dump.rs). The message is fixed vocabulary:
-                // it never echoes the hostile key.
+                // declared refuses, and so does a row missing a column it
+                // did declare. Both messages are fixed vocabulary: they
+                // never echo row content.
                 // Membership is tested against the per-table set built with the
                 // manifest, so the per-row cost is O(row keys). The fallback
                 // linear scan is unreachable (the set is built from the same
@@ -896,6 +894,19 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                 if has_outside_key {
                     return Err(refuse(format!(
                         "{table} row on line {line_no} has a column outside the manifest"
+                    )));
+                }
+                // Completeness is the other half of the restore contract:
+                // restore binds one parameter per kept manifest column and
+                // refuses a row with a missing cell (`missing cell`,
+                // dump.rs), so a row carrying a subset of its table's
+                // declared columns refuses here too. The check runs for
+                // every dump version including frozen v3, whose untyped
+                // rows still declare columns; the message names neither
+                // the missing column nor any cell value.
+                if info.columns.iter().any(|col| !data.contains_key(col)) {
+                    return Err(refuse(format!(
+                        "{table} row on line {line_no} is missing a manifest column"
                     )));
                 }
                 // Frozen v3 has native driver-decoded cells and no type metadata.
@@ -2582,16 +2593,23 @@ mod tests {
                 row
             }]
         );
-        // A row carrying only a subset of the declared columns stays valid:
-        // only keys outside the manifest refuse, never missing ones.
+    }
+
+    #[test]
+    fn acceptance_dump_inspect_refuses_row_missing_a_manifest_column() {
+        // Completeness is the restore contract: restore binds one parameter
+        // per kept manifest column and refuses a row with a missing cell, so
+        // a row carrying only a subset of the declared columns refuses at
+        // inspect with fixed vocabulary that never echoes row content.
         let mut subset = good_dump();
         subset[1]["data"]
             .as_object_mut()
             .unwrap()
             .shift_remove("guild_id");
-        let contents = inspect_bytes(&gzip_lines(&subset)).unwrap();
-        assert_eq!(contents.rows, 1);
-        assert_eq!(contents.buffers["events"][0].len(), 1);
+        subset[1]["data"]["id"] = serde_json::json!(ECHO_SENTINEL);
+        let err = acceptance_refusal(&subset);
+        assert!(err.contains("is missing a manifest column"), "{err}");
+        assert!(!err.contains(ECHO_SENTINEL), "{err}");
     }
 
     #[test]
