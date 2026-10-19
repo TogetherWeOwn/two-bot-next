@@ -38,6 +38,31 @@ Unknown tool names return `-32601`. `GET /mcp` returns `405` with
 `Allow: POST` and never executes tools. Client stream close aborts the
 in-flight container fetch via the request signal.
 
+## Request validation (before dispatch)
+
+Every parsed body is validated before any Durable Object resolution or
+container read. Malformed envelopes (non-object/array/batch roots, wrong
+`jsonrpc`, non-string `method`, object/array/boolean `id`) return the fixed
+`-32600 invalid request`; malformed `params` (anything but an omitted or
+plain-object value) and malformed `tools/call` fields return the fixed
+`-32602 invalid params`. Refusals echo only string/number correlation IDs
+(`0` and `""` included), otherwise `null`; they never echo untrusted input
+or credentials. All five tools take no arguments: `arguments` must be
+omitted or `{}`, and any scalar, array, null, or unexpected-key value
+(including falsy extras and an own `__proto__` key) is refused with
+`-32602`. A missing or non-string tool `name` is `-32602`; a well-formed
+but unknown name stays `-32601 unknown tool`. Harmless top-level padding
+and extra object keys in method `params` remain allowed.
+
+Notification policy is derived from the envelope as well as the method: a
+missing or `null` ID on an ordinary method (`initialize`, `tools/list`,
+`tools/call`, `ping`) is `-32600`, while a missing or `null` ID on a
+`notifications/*` method with well-formed params is an empty `202` with no
+dispatch (malformed params there are `-32602`, not a silent accept). Any
+string/number ID — including `0` and `""` — makes a `notifications/*`
+method a request, answered `-32601 method not found` with the ID
+preserved; it never silently returns `202`.
+
 ## Auth (phase 1: shared `mcp:read` bearer; staging target: OAuth resource server)
 
 Phase 1 enforces a shared bearer secret (`MCP_TOKEN` Worker secret, minimum
