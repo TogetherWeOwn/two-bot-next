@@ -2171,6 +2171,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(fail_closed, pin)
         self.assertLess(run.index("exit 1", fail_closed), pin)
         self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        # A failed lookup must empty the result, not kill the step under pipefail.
+        self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
     def test_rust_test_postgres_wal_budget_is_bounded(self):
@@ -2229,6 +2231,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(fail_closed, pin)
         self.assertLess(run.index("exit 1", fail_closed), pin)
         self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        # A failed lookup must empty the result, not kill the step under pipefail.
+        self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
     def test_stores_postgres_wal_budget_is_bounded(self):
