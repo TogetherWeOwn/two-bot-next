@@ -565,6 +565,11 @@ mod tests {
     };
     use tower::ServiceExt as _;
 
+    /// Protected delivery-capacity/shutdown acceptance (separate file; the
+    /// Builder must not edit it). A descendant of this module, so it reuses
+    /// the signing/request helpers and serializes on `RECEIVER_LOG_SERIAL`.
+    mod delivery_shutdown_tests;
+
     impl ReceiverState {
         fn reload_secret(&self, config: &EventsubReceiverConfig) {
             *self.secret.write().expect("EventSub secret lock poisoned") = config.secret().clone();
