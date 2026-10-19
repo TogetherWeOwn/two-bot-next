@@ -85,7 +85,10 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `eventsub reconcile action failed; continuing with the rest of the plan` | `crates/bot/src/eventsub_reconcile.rs` (`run_plan`) | Error; one delete or create was rejected or failed in transport (`action = "delete"` or `"create"`, `error` names the status, `error_class = "reconcile_action_failed"`); the later actions and the follow-up listing still run |
 | `eventsub reconcile did not converge: an action failed or a healthy subscription is missing` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all_with_metrics`) | Error; after the follow-up listing, at least one action failed or a desired broadcaster lacks a healthy subscription; the pass fails loudly with `failed` and `missing` counts (`error_class = "reconcile_unhealthy"`) |
 | `eventsub reconcile failed` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; the pass returned an error after the gate and config checks (`error_class = "reconcile_failed"`) |
-| `event = "eventsub_reconcile"` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all_with_metrics`, `run_plan`, `startup_reconcile`, `spawn_if_enabled`) | Bounded `event` field value every reconcile emission carries; scalar counts, statuses and error classes only, never a secret, header, challenge or body |
+| `eventsub reconcile pass interrupted by shutdown; remaining actions skipped and subscription state unverified until the next startup pass` | `crates/bot/src/eventsub_reconcile.rs` (`log_interrupted`) | Warn; shutdown latched between Helix calls, so remaining actions and verification were skipped (`completed`/`remaining` action counts, `error_class = "reconcile_shutdown_interrupted"`); the next startup pass re-lists and re-plans |
+| `eventsub reconcile task ended abnormally` | `crates/bot/src/eventsub_reconcile.rs` (`join`) | Error; the joined reconcile task panicked or was cancelled (`panicked` says which, `error_class = "reconcile_task_failed"`) |
+| `eventsub reconcile task did not finish within the shutdown drain; aborting it, so an in-flight remote mutation outcome is uncertain until the next startup pass re-checks` | `crates/bot/src/eventsub_reconcile.rs` (`join`) | Error; the reconcile task outlived the bounded shutdown drain (`drain_ms`) and was aborted, so an in-flight subscription mutation may or may not have landed (`error_class = "reconcile_shutdown_drain_exceeded"`); the next startup pass settles the real state |
+| `event = "eventsub_reconcile"` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`, `reconcile_all_with_metrics`, `run_plan`, `log_interrupted`, `startup_reconcile`, `spawn_if_enabled`, `join`) | Bounded `event` field value every reconcile emission carries; scalar counts, statuses and error classes only, never a secret, header, challenge or body |
 
 ## Gateway metric event labels
 
@@ -399,6 +402,15 @@ Empty-grace override warning (in `stored_empty_grace_with` in
 stored per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row is malformed or
 outside 0 to 600 whole seconds, so the sweep keeps the boot fallback. The
 line carries the setting key and the `out_of_range` reason.
+
+Boot admission warning (in `configured_admission` in
+`crates/bot/src/voice_rooms.rs`, key-only fields, no IDs):
+`temp-voice admission setting invalid; using default` (warn): one of the
+`TWO_TEMP_VOICE_MAX_PER_USER` (1 to 10), `TWO_TEMP_VOICE_MAX_PER_GUILD`
+(1 to 45) or `TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS` (0 to 3600) boot
+values is unparsable or out of range, so that knob alone falls back to
+its default (1, 40, 0 respectively) while the other knobs are still
+honored. The line carries the setting key and the `invalid_value` reason.
 
 Creator-view refresh actor messages (all in `GuildRoomWorker::revalidate_creator`
 / `reload_creators` in `crates/bot/src/voice_rooms.rs`, guild-only fields,

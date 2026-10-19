@@ -319,8 +319,8 @@ traffic while refusing the surge. Correlate with the container logs for
 `kind`/`class`/`key`/`action`) and for `msg=internal_action_unknown_state_persist_failed`
 and `msg=internal_action_terminal_persist_failed`
 error lines before acting. Those lines mean a best-effort unknown-state write, or a terminal
-(`persist_op=finish`) or proven-not-sent (`persist_op=release`) write including the `Malformed`
-finishes in `execute_member`, failed after the
+(`persist_op=finish`), proven-not-sent (`persist_op=release`) or event-key (`persist_op=event_key`)
+write including the `Malformed` finishes in `execute_member`, failed after the
 claim was committed; the claim is never released or resent. Read the `persist_class` before
 acting: `storage_unavailable` leaves the claim `in_flight`, so repeats answer `in_progress`
 until it goes stale. `transition_refused` means the row had already moved on (for example to a

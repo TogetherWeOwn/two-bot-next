@@ -362,7 +362,13 @@ test("lifecycle error replaces arbitrary exception without inspecting it", async
   const h = await harness(t);
   const unsafe = { toString() { throw new Error(WORKER_ENV.DISCORD_TOKEN); } };
   assert.throws(() => h.bot.onError(unsafe), { message: "container_lifecycle_failed" });
-  assert.ok(h.logs.includes(JSON.stringify({ event: "container_error", error_class: "container_lifecycle_failed" })));
+  assert.ok(h.logs.includes(JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })));
   assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DISCORD_TOKEN)));
 });
 
@@ -535,6 +541,8 @@ async function keepaliveSeeing(t: TestContext, body: string) {
 
 const gatewayFailureLogs = (logs: string[]) =>
   logs.filter((line) => line.includes("container_gateway_failure"));
+const containerErrorLogs = (logs: string[]) =>
+  logs.filter((line) => line.includes('"container_error"'));
 
 test("keepalive logs the gateway failure phase and class once, as strict tokens", async (t) => {
   const failure = { phase: "durable_gateway", class: "checkpoint_load_failed" };
@@ -654,6 +662,65 @@ test("keepalive tags the gateway failure with the container release and worker v
     release: RELEASE_SHA,
     worker_version: ID,
     log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
+  })]);
+});
+
+test("container_error stamps the parsed release once a probe has seen it", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: RELEASE_SHA, build_id: "123-1" },
+  ));
+  assert.throws(() => h.bot.onError(new Error("synthetic lifecycle failure")),
+    { message: "container_lifecycle_failed" });
+  assert.deepEqual(containerErrorLogs(h.logs), [JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: RELEASE_SHA,
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })]);
+});
+
+test("container_error after a container stop stamps unknown, not the previous release", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: RELEASE_SHA, build_id: "123-1" },
+  ));
+  // The old image stops; the replacement is unprobed when its startup fails.
+  h.bot.onStop();
+  assert.throws(() => h.bot.onError(new Error("synthetic restart failure")),
+    { message: "container_lifecycle_failed" });
+  assert.deepEqual(containerErrorLogs(h.logs), [JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })]);
+});
+
+test("container_error during a probe fetch stamps unknown, not the previous release", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: RELEASE_SHA, build_id: "123-1" },
+  ));
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") return new Response(metricsBody(0));
+    // The SDK awaits onError from startup/port checks inside containerFetch
+    // (SDK 0.3.7 waitForPort), before the fetch settles; handler errors are
+    // ignored and the original failure propagates.
+    try { h.bot.onError(new Error("synthetic startup failure")); }
+    catch { /* SDK ignores onError handler errors */ }
+    throw new Error("synthetic probe fetch failure");
+  });
+  await tickKeepalive(h.bot);
+  assert.deepEqual(containerErrorLogs(h.logs), [JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
   })]);
 });
 
