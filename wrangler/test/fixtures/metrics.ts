@@ -47,6 +47,7 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string>> = {
   two_bot_community_facts_drain_failures_total: { reason: "COMMUNITY_FACTS_DRAIN_REASONS" },
   two_bot_eventsub_posts_total: { outcome: "EVENTSUB_POST_OUTCOMES" },
   two_bot_eventsub_classified_total: { kind: "EVENTSUB_DELIVERY_KINDS" },
+  two_bot_event_store_consumer_lag_seconds: {},
 };
 
 /** Complete consumed-input fixture generated from the Rust label contract, not the validator. */

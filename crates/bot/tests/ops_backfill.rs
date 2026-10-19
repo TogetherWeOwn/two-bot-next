@@ -37,6 +37,7 @@
 //! step and no `nightly.yml` `--skip` line is required for this target.
 
 use std::{
+    cell::Cell,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     process::{Child, Command, Stdio},
@@ -159,19 +160,68 @@ fn raw_get(addr: SocketAddr, path: &str, headers: &[(&str, String)]) -> std::io:
     }
     request.push_str("\r\n");
     stream.write_all(request.as_bytes())?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    Ok(response)
+    // Read bytes (not `read_to_string`): a truncated or non-UTF-8 write still
+    // yields a diagnostic body instead of an `InvalidData` transport error.
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn status_code(response: &str) -> Option<u16> {
-    response
-        .lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
+    // Strict: only a complete `HTTP/<version> <code>` status line counts, so
+    // a truncated write (e.g. `HTTP/1.1 2`) or a non-HTTP first line falls
+    // through to the retry like the empty read does instead of returning a
+    // bogus code.
+    let line = response.lines().next()?;
+    let mut parts = line.split_whitespace();
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    let code: u16 = parts.next()?.parse().ok()?;
+    if !(100..=599).contains(&code) {
+        return None;
+    }
+    Some(code)
+}
+
+/// One-line diagnostic for failure context: length plus an escaped preview
+/// so an empty read (closed without a status line) or garbage bytes are
+/// visible in the failure output instead of a bare `None`.
+fn describe_response(response: &str) -> String {
+    let preview: String = response.chars().take(300).collect();
+    format!("len {} preview {preview:?}", response.len())
+}
+
+/// Bounded retry for the transient empty-read flake: the listener accepted
+/// the connection and then closed it without a status line, so `status_code`
+/// is `None`. Each attempt mints fresh headers (fresh timestamp/nonce, so no
+/// replay) and only unparseable/transport failures retry; a parseable status
+/// — even a wrong one — returns immediately so a real auth regression still
+/// fails instead of being retried away. No sleep here: the timing gate pins
+/// this file to its single 20 ms spawn backoff, so retries are immediate.
+fn get_with_fresh_headers(
+    addr: SocketAddr,
+    path: &str,
+    make_headers: impl Fn() -> Vec<(&'static str, String)>,
+) -> Result<String, String> {
+    const ATTEMPTS: usize = 3;
+    let mut last_note = String::from("no attempts");
+    for _ in 0..ATTEMPTS {
+        let headers = make_headers();
+        match raw_get(addr, path, &headers) {
+            Ok(response) if status_code(&response).is_some() => return Ok(response),
+            Ok(response) => {
+                last_note = describe_response(&response);
+            }
+            Err(error) => {
+                last_note = format!("transport error: {error}");
+            }
+        }
+    }
+    Err(format!(
+        "backfill read got no parseable status after {ATTEMPTS} attempts: {last_note}"
+    ))
 }
 
 fn body_json(response: &str) -> Value {
@@ -204,9 +254,10 @@ fn backfill_auth_headers(key_id: &str, secret: &str) -> Vec<(&'static str, Strin
 }
 
 fn signed_get(addr: SocketAddr) -> String {
-    let headers = backfill_auth_headers(FIXTURE_KEY_ID, &fixture_secret());
-    let refs: Vec<(&str, String)> = headers;
-    raw_get(addr, BACKFILL_PATH, &refs).expect("signed backfill read")
+    get_with_fresh_headers(addr, BACKFILL_PATH, || {
+        backfill_auth_headers(FIXTURE_KEY_ID, &fixture_secret())
+    })
+    .expect("signed backfill read")
 }
 
 fn families_of(body: &Value) -> &serde_json::Map<String, Value> {
@@ -263,7 +314,8 @@ fn signed_backfill_read_reports_per_family_progress_and_eta() {
     assert_eq!(
         status_code(&response),
         Some(200),
-        "authorized backfill read must succeed"
+        "authorized backfill read must succeed: {}",
+        describe_response(&response)
     );
     let body = body_json(&response);
     let families = families_of(&body);
@@ -312,18 +364,22 @@ fn unsigned_and_mistaken_backfill_callers_share_one_401_refusal() {
     // 401, carrying the shared failure message and no key, cursor or
     // progress material.
     let (_bot, addr) = spawn_bot();
-    let bare = raw_get(addr, BACKFILL_PATH, &[]).expect("bare backfill read");
+    let bare = get_with_fresh_headers(addr, BACKFILL_PATH, Vec::new).expect("bare backfill read");
     assert_eq!(
         status_code(&bare),
         Some(401),
-        "credential-less backfill read must be refused"
+        "credential-less backfill read must be refused: {}",
+        describe_response(&bare)
     );
-    let wrong_headers = backfill_auth_headers("fixture-unknown-key", &fixture_secret());
-    let wrong = raw_get(addr, BACKFILL_PATH, &wrong_headers).expect("wrong-key backfill read");
+    let wrong = get_with_fresh_headers(addr, BACKFILL_PATH, || {
+        backfill_auth_headers("fixture-unknown-key", &fixture_secret())
+    })
+    .expect("wrong-key backfill read");
     assert_eq!(
         status_code(&wrong),
         Some(401),
-        "unknown-key backfill read must be refused"
+        "unknown-key backfill read must be refused: {}",
+        describe_response(&wrong)
     );
     let bare_error = body_json(&bare)["error"].clone();
     let wrong_error = body_json(&wrong)["error"].clone();
@@ -357,13 +413,15 @@ fn backfill_exposition_keeps_fixed_cardinality() {
     assert_eq!(
         status_code(&first_raw),
         Some(200),
-        "authorized backfill read must succeed"
+        "authorized backfill read must succeed: {}",
+        describe_response(&first_raw)
     );
     let second_raw = signed_get(addr);
     assert_eq!(
         status_code(&second_raw),
         Some(200),
-        "authorized backfill read must succeed"
+        "authorized backfill read must succeed: {}",
+        describe_response(&second_raw)
     );
     let first = body_json(&first_raw);
     let second = body_json(&second_raw);
@@ -407,7 +465,8 @@ fn backfill_body_carries_ids_and_counts_only() {
     assert_eq!(
         status_code(&raw),
         Some(200),
-        "authorized backfill read must succeed"
+        "authorized backfill read must succeed: {}",
+        describe_response(&raw)
     );
     let body = body_json(&raw);
     let mut keys = Vec::new();
@@ -427,4 +486,79 @@ fn backfill_body_carries_ids_and_counts_only() {
             "free-text content {text:?} must never be exposed"
         );
     }
+}
+
+/// Serve one scripted payload per accepted connection: drain the request so
+/// the client write succeeds, then write the bytes (possibly empty) and close
+/// by drop. An empty payload reproduces the transient empty read (accept then
+/// close without a status line). Blocking accepts only; no backoff here.
+fn serve_scripted(listener: TcpListener, scripts: Vec<Vec<u8>>) {
+    for script in scripts {
+        let (mut conn, _) = listener.accept().expect("fake listener accept");
+        let mut drain = [0u8; 4096];
+        let _ = conn.read(&mut drain);
+        if !script.is_empty() {
+            conn.write_all(&script).expect("fake listener write");
+        }
+    }
+}
+
+#[test]
+fn retry_recovers_from_empty_and_truncated_reads() {
+    // Pins the flake fix: a dropped connection and a truncated status line
+    // must both retry with fresh headers and return the next good response.
+    // With `ATTEMPTS` reverted to 1 this goes red (the retry never runs).
+    let good = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_vec();
+    for first in [Vec::new(), b"HTTP/1.1 2".to_vec()] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake listener");
+        let addr = listener.local_addr().expect("fake listener addr");
+        let good_next = good.clone();
+        let handle = thread::spawn(move || serve_scripted(listener, vec![first, good_next]));
+        let attempts = Cell::new(0u32);
+        let response = get_with_fresh_headers(addr, BACKFILL_PATH, || {
+            attempts.set(attempts.get() + 1);
+            Vec::new()
+        })
+        .expect("retry must recover from an unparseable read");
+        assert_eq!(
+            status_code(&response),
+            Some(200),
+            "retry must return the good response: {}",
+            describe_response(&response)
+        );
+        assert_eq!(
+            attempts.get(),
+            2,
+            "empty/truncated read must cost exactly one retry"
+        );
+        handle.join().expect("fake server thread");
+    }
+}
+
+#[test]
+fn retry_returns_parseable_status_without_extra_attempt() {
+    // Pins the no-retry guard: a parseable denial must return immediately so
+    // a real auth regression fails instead of being retried away.
+    let denied = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_vec();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake listener");
+    let addr = listener.local_addr().expect("fake listener addr");
+    // Serve exactly one response, then close: a parseable status must return
+    // after one attempt, so the server thread must exit without a second
+    // accept (serving more would hang `join`). If the client ever retried, the
+    // refused connection would surface as a transport error and fail the test.
+    let handle = thread::spawn(move || serve_scripted(listener, vec![denied]));
+    let attempts = Cell::new(0u32);
+    let response = get_with_fresh_headers(addr, BACKFILL_PATH, || {
+        attempts.set(attempts.get() + 1);
+        Vec::new()
+    })
+    .expect("parseable denial must return");
+    assert_eq!(
+        status_code(&response),
+        Some(401),
+        "parseable denial must pass through: {}",
+        describe_response(&response)
+    );
+    assert_eq!(attempts.get(), 1, "parseable status must not retry");
+    handle.join().expect("fake server thread");
 }

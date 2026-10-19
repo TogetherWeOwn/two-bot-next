@@ -49,6 +49,7 @@ export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly
   two_bot_eventsub_posts_total: { outcome: ["attempted", "succeeded", "failed", "other"] },
   two_bot_voice_vote_kick_total: { outcome: ["started", "evidence_unavailable", "not_a_room", "initiator_not_occupant", "target_not_occupant", "self_target", "protected_target", "privileged_target", "authority_unavailable", "active_vote_exists", "cooldown", "initiator_limited", "reused_vote_id", "unknown_vote", "wrong_vote_boundary", "ineligible_voter", "repeated_vote", "invalid_time", "connect_denied_and_disconnected", "connect_denied_target_absent", "skipped_room_gone", "skipped_target_protected", "permission_missing", "discord_error", "gave_up", "other"] },
   two_bot_eventsub_classified_total: { kind: ["challenge", "notification", "revocation", "tampered", "ignored", "other"] },
+  two_bot_event_store_consumer_lag_seconds: {},
 };
 
 /** Every series the validator checks: required plus optional-when-present. */
@@ -104,7 +105,10 @@ export function parseAlertScrape(text: string): Sample[] | null {
     seen.add(key);
     if (Object.hasOwn(VALIDATED_INPUT_LABELS, name)) {
       const axes = VALIDATED_INPUT_LABELS[name]!;
-      if (Object.keys(labels).length !== Object.keys(axes).length
+      if (name === "two_bot_event_store_consumer_lag_seconds") {
+        if (Object.keys(labels).length !== 0
+          || !Number.isFinite(value) || value < 0 || value > 18446744073709551615) return null;
+      } else if (Object.keys(labels).length !== Object.keys(axes).length
         || Object.keys(axes).some((axis) => !labels[axis])
         || !Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > 18446744073709551615
         || (name === "two_bot_db_pool_configured" && value !== 0 && value !== 1)) return null;

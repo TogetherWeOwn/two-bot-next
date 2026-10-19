@@ -136,8 +136,9 @@ sum by (op) (increase(two_bot_db_errors_total[1h]))
 The `db_errors` rule fires at 3+ errors across all `op` labels between two
 keepalive samples (resets skip the window). Producers are send-admission SQL
 (`op="admission"`) and voice actor load (`op="other"`), not all stores.
-Correlate voice load failures with `voice actor load failed; actor respawns
-on the next guild snapshot` in container stdout; the warn is throttled to
+Correlate voice load failures with `voice actor load failed; retrying with
+capped backoff` in container stdout (a credential refusal logs `voice
+actor load failed; credential refused, not retrying`); the warn is throttled to
 once per 300 s process-wide, but every failure increments the counter.
 
 Pool saturation (a complementary proxy for DB trouble — SQLx bookkeeping,
