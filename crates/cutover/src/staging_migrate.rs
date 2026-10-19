@@ -3502,8 +3502,13 @@ mod tests {
             (&timeout, timeout_cause.as_str()),
             (&denied, denied_cause.as_str()),
         ] {
-            let RunError::Refused(message) = connect_refusal(READ_ONLY_ROLE, error) else {
-                panic!("connect failure must refuse, got cause {cause}");
+            let refusal = connect_refusal(READ_ONLY_ROLE, error);
+            assert!(
+                matches!(refusal, RunError::Refused(_)),
+                "connect failure must refuse, got cause {cause}"
+            );
+            let RunError::Refused(message) = refusal else {
+                continue;
             };
             assert!(
                 message.contains("could not connect and SET ROLE"),
@@ -3605,12 +3610,13 @@ mod tests {
             .ssl_mode(sqlx::postgres::PgSslMode::Disable);
         let verified = Arc::new(AtomicUsize::new(0));
         let outcome = connect(options, READ_ONLY_ROLE, Arc::clone(&verified)).await;
-        let error = match outcome {
-            Ok(_) => panic!("closed port must refuse"),
-            Err(error) => error,
-        };
+        let error = outcome.expect_err("closed port must refuse");
+        assert!(
+            matches!(error, RunError::Refused(_)),
+            "closed port must refuse fail-closed, got {error:?}"
+        );
         let RunError::Refused(message) = error else {
-            panic!("closed port must refuse fail-closed, got {error:?}");
+            return;
         };
         assert!(
             message.contains("[cause=pool-timeout]"),
@@ -3639,11 +3645,14 @@ mod tests {
         use sqlx::Connection as _;
         let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
             Ok(raw) => raw,
-            Err(std::env::VarError::NotPresent) => {
+            Err(error) => {
+                assert!(
+                    matches!(error, std::env::VarError::NotPresent),
+                    "invalid test bootstrap configuration: {error}"
+                );
                 eprintln!("skipped: TWO_TEST_DATABASE_URL not set");
                 return;
             }
-            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
         };
         two_bot_testsupport::guard_database_url(&raw).expect("test database only");
         let admin_options: PgConnectOptions = raw
@@ -3699,12 +3708,13 @@ mod tests {
             .await
             .expect("probe login dropped");
         admin.close().await.expect("admin close");
-        let error = match outcome {
-            Ok(_) => panic!("non-member SET ROLE must refuse"),
-            Err(error) => error,
-        };
+        let error = outcome.expect_err("non-member SET ROLE must refuse");
+        assert!(
+            matches!(error, RunError::Refused(_)),
+            "non-member SET ROLE must refuse fail-closed, got {error:?}"
+        );
         let RunError::Refused(message) = error else {
-            panic!("non-member SET ROLE must refuse fail-closed, got {error:?}");
+            return;
         };
         assert!(
             message.contains("[cause=set-role-denied:42501]"),
