@@ -759,8 +759,6 @@ jobs:
           # full parallelism, then ignored tests serially. The ignored stores
           # share tables and locks, so parallel runs race and
           # --ignore-run-fail would then drop their coverage silently.
-          # The two guarded suites below accept only their dedicated URLs, so
-          # they are skipped here and measured in their dedicated steps.
           # The reference-docs regen never runs in CI: it rewrites committed docs.
           # The publication regression and the game-report acceptance have
           # their own guarded DBs (dedicated step below / agent_test re-run);
