@@ -113,10 +113,14 @@ The pure core is now called by the runtime with persisted history:
 
 ## Residual parent work
 
-Caps and cooldown use the legacy defaults (1 room per member, 40 per guild,
-30 s) through `CreateAdmissionConfig::default`; wiring the `TWO_TEMP_VOICE_MAX_PER_USER`,
-`TWO_TEMP_VOICE_MAX_PER_GUILD` and `TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS`
-settings into `GuildRoomWorker::set_admission_config` is not part of this slice.
+Caps and cooldown resolve at boot from the `TWO_TEMP_VOICE_MAX_PER_USER`
+(1 to 10), `TWO_TEMP_VOICE_MAX_PER_GUILD` (1 to 45) and
+`TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS` (0 to 3600) settings through
+`configured_admission`, and each guild actor applies the result via
+`GuildRoomWorker::set_admission_config` at spawn. An unset or blank value
+keeps today's effective default (1 room per member, 40 per guild, no
+cooldown); an unparsable or out-of-range value warns with reason
+`invalid_value` and fails closed to that knob's default only.
 A refusal reaches the operator as a `/setup` failure line and a notice; there
 is no per-member reply on a gateway voice join. No retention job prunes
 `voice_create_reservations`. Unknown-outcome and crash-orphan holds are
