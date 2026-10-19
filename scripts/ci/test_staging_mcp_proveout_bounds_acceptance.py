@@ -387,7 +387,8 @@ class MainCapMappingTests(unittest.TestCase):
             argv = ["staging_mcp_proveout.py", "--output", output]
             env = {
                 proveout.TOKEN_ENV: BEARER,
-                proveout.URL_ENV: "https://127.0.0.1:1/mcp",
+                # Fence-passing dummy URL (do_post is mocked; never sent).
+                proveout.URL_ENV: proveout.DEFAULT_URL,
             }
             with mock.patch.object(proveout, "do_post", fake_do_post), \
                     mock.patch.object(sys, "argv", argv), \
