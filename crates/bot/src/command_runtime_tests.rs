@@ -17,6 +17,9 @@
 
 #![cfg(test)]
 
+#[path = "member_dispatch_authority_acceptance.rs"]
+mod member_dispatch_authority_acceptance;
+
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
