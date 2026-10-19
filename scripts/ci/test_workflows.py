@@ -2604,6 +2604,28 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
+    def assert_wal_reload_ordering_is_pinned(self, run):
+        # Order is load-bearing both ways: the ALTERs must precede the
+        # reload (ALTER SYSTEM only writes postgresql.auto.conf, which the
+        # reload reads), and the reload must precede the first createdb,
+        # since the bootstrap databases are created later in this same step.
+        reload = run.index("pg_reload_conf()")
+        self.assertLess(
+            run.index("ALTER SYSTEM SET max_wal_size = '512MB'"),
+            reload,
+            "max_wal_size ALTER must precede pg_reload_conf()",
+        )
+        self.assertLess(
+            run.index("ALTER SYSTEM SET min_wal_size = '64MB'"),
+            reload,
+            "min_wal_size ALTER must precede pg_reload_conf()",
+        )
+        self.assertLess(
+            reload,
+            run.index("createdb "),
+            "pg_reload_conf() must precede the first createdb",
+        )
+
     def test_rust_test_postgres_wal_budget_is_bounded(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
         prepare = next(
@@ -2617,6 +2639,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
@@ -2680,6 +2703,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
@@ -2746,6 +2770,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
@@ -5084,6 +5109,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
