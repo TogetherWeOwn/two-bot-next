@@ -179,8 +179,10 @@ const BOOT_ENV: &[&str] = &[
 /// `:170`), onboarding's per-event `CONFIG_KEYS` merge
 /// (`onboarding.rs:21-30`, `:175-182`), message-path automod's per-delivery
 /// live refresh (`automod_gateway.rs:211-222`, `:292`), the feed poller's
-/// per-tick schedule gate (`feed_jobs.rs:235-287`) and the voice sweep's
-/// per-guild empty-grace refresh (`voice_rooms.rs:3070-3093`, `:8741`).
+/// per-tick schedule gate (`feed_jobs.rs:235-287`), the voice sweep's
+/// per-guild empty-grace refresh (`voice_rooms.rs:3070-3093`, `:8741`) and
+/// the invite responder's per-interaction code resolution
+/// (`stored_invite_code_with`).
 /// These rows say “applied live by runtime refresh” in the table below;
 /// every other storable key keeps the legacy `HOT_WIRED`/boot-env labels.
 const STORE_READ_KEYS: &[&str] = &[
@@ -219,6 +221,7 @@ const STORE_READ_KEYS: &[&str] = &[
     "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
     "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
     "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
+    "TWO_GUILD_INVITE_CODE",
 ];
 
 fn repository_root() -> PathBuf {

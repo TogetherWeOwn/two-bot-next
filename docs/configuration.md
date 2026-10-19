@@ -129,7 +129,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 133.
+Catalog entries: 134.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -203,6 +203,7 @@ Catalog entries: 133.
 | `TWO_EVENTSUB_DELIVERY` | env_only | Not specified in Next | environment only | Delivery gate for EventSub go-live posts; exactly 1 requires the announcements channel, invite URL and broadcaster allowlist, any other enabled state refuses startup. |
 | `TWO_EVENTSUB_INVITE_URL` | env_only | Not specified in Next | environment only | Discord invite URL rendered into the go-live post; validated with the renderer's rule while TWO_EVENTSUB_DELIVERY is exactly 1. |
 | `TWO_FEED_POLL_SECONDS` | hot | `300` | stored, applied live by runtime refresh (reload-report hot) | Feed polling interval (validated from 60 to 86400 seconds). |
+| `TWO_GUILD_INVITE_CODE` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Stored per-guild invite code; wins over the gateway vanity code on the /invite path, invalid rows fail closed to the fallback. |
 | `TWO_HEALTH_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy health listener interface; environment-only network bind. |
 | `TWO_HEALTH_PORT` | env_only | Not specified in Next | environment only | Legacy health listener port; Container uses LISTEN_ADDR instead. |
 | `TWO_INACTIVITY_DAYS` | cold | Not specified in Next | stored unwired | Inactivity horizon used for community nudges. |

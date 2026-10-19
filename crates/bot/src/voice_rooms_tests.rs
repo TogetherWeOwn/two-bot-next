@@ -9,6 +9,8 @@ mod cold_authority;
 mod delete_guards;
 #[path = "voice_empty_grace_override_tests.rs"]
 mod empty_grace_override;
+#[path = "voice_invite_override_tests.rs"]
+mod invite_override;
 #[path = "voice_join_requests_tests.rs"]
 mod join;
 #[path = "voice_kick_tests.rs"]
