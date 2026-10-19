@@ -2294,6 +2294,17 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
         self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
+        main_sweep = [run for run in sweeps if "-- --ignored" not in run][0]
+        # Guarded suites panic under the bootstrap URL; they run only in
+        # their dedicated agent_test steps below, never in the main sweep.
+        self.assertIn(
+            "--skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump",
+            main_sweep,
+        )
+        self.assertIn(
+            "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only",
+            main_sweep,
+        )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
         self.assertEqual(len(guarded), 12)
         for run in guarded:
