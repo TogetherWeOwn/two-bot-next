@@ -157,7 +157,8 @@ fn valid_optional_combinations_keep_their_representation() {
 #[test]
 fn canonical_snowflake_extremes_are_accepted() {
     // Minimum nonzero (1) and maximum u64 snowflakes stay valid identities.
-    for (id, channel) in [("1", "18446744073709551615"), ("18446744073709551615", "1")] {
+    let max = u64::MAX.to_string();
+    for (id, channel) in [("1", max.as_str()), (max.as_str(), "1")] {
         let mut row = event(id);
         row["channel_id"] = json!(channel);
         let normalized = normalize_events(&[raw_event(&row, "2222").unwrap()]).unwrap();
