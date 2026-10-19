@@ -24,8 +24,10 @@ Probes against $STAGING_MCP_URL (default the staging Worker /mcp) with
 
 Output: redacted commands plus full response bodies on stdout (responses
 carry no credential), plus a sanitized JSON artifact with the same bodies
-and no bearer. Exit 0 proves the Worker-side slice; exit 1 is a probe
-failure; exit 2 is a pre-flight refusal (nothing was sent).
+and no bearer. Bodies over 64 KiB are refused before parsing and recorded
+as probe failures with the fixed cap verdict. Exit 0 proves the
+Worker-side slice; exit 1 is a probe failure; exit 2 is a pre-flight
+refusal (nothing was sent).
 
 Usage (the workflow supplies the environment):
   python3 scripts/staging_mcp_proveout.py --output staging-mcp-proveout-<run_id>.json
@@ -46,6 +48,7 @@ URL_ENV = "STAGING_MCP_URL"
 MIN_TOKEN_LENGTH = 32
 REQUEST_TIMEOUT_SECONDS = 25
 SCHEMA_VERSION = 1
+MAX_BODY_BYTES = 64 * 1024
 
 EXPECTED_TOOLS = [
     "get_status",
@@ -56,6 +59,10 @@ EXPECTED_TOOLS = [
 ]
 CONTAINER_BACKED = {"get_status", "get_gateway", "get_backfill_progress"}
 WRONG_BEARER = "wrong-bearer-probe-0000"
+
+
+class BodyTooLarge(ValueError):
+    """A response body exceeds MAX_BODY_BYTES (fixed vocabulary only)."""
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -92,6 +99,8 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
     The bearer is never included in any returned string. Redirects are
     refused (NoRedirect) so the bearer never leaves the target origin;
     a 3xx surfaces as its HTTP status and is recorded as a failure.
+    Both read paths take at most MAX_BODY_BYTES+1 bytes; a longer body
+    raises BodyTooLarge before decoding/parsing, never echoing body bytes.
     """
     data = json.dumps(payload).encode("utf-8")
     headers = {
@@ -107,15 +116,25 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
         with opener.open(req, timeout=timeout) as resp:
             status = resp.status
             resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-            body = resp.read().decode("utf-8", errors="replace")
+            raw = resp.read(MAX_BODY_BYTES + 1)
+            if len(raw) > MAX_BODY_BYTES:
+                raise BodyTooLarge("response body over the size cap")
+            body = raw.decode("utf-8", errors="replace")
             return status, resp_headers, body
     except urllib.error.HTTPError as e:
         try:
-            body = e.read().decode("utf-8", errors="replace")
+            raw = e.read(MAX_BODY_BYTES + 1)
+            if len(raw) > MAX_BODY_BYTES:
+                raise BodyTooLarge("response body over the size cap")
+            body = raw.decode("utf-8", errors="replace")
+        except BodyTooLarge:
+            raise
         except Exception:
             body = ""
         resp_headers = {k.lower(): v for k, v in (e.headers.items() if e.headers else [])}
         return e.code, resp_headers, body
+    except BodyTooLarge:
+        raise
     except Exception:
         return None, {}, "network-error"
 
@@ -124,7 +143,7 @@ def parse_json_or_text(body):
     try:
         return json.loads(body)
     except Exception:
-        return {"_text": body}
+        return {"_text": body[:MAX_BODY_BYTES]}
 
 
 def main():
@@ -165,6 +184,22 @@ def main():
         print(json.dumps(body_json, indent=2, sort_keys=True), flush=True)
         print(flush=True)
 
+    def fetch(name, redacted_cmd, payload, token_or_none):
+        """POST one probe, mapping BodyTooLarge to a bounded cap failure.
+
+        Returns (status, headers, body) on success; on refusal records a
+        bounded probe (no body bytes kept) with the fixed cap verdict and
+        returns (None, {}, None) so callers skip shape validation.
+        """
+        try:
+            status, headers, body = do_post(url, payload, token_or_none)
+        except BodyTooLarge:
+            record(name, redacted_cmd, None, {}, "")
+            failures.append(f"{name}: answered over the body cap")
+            return None, {}, None
+        record(name, redacted_cmd, status, headers, body)
+        return status, headers, body
+
     rpc_id = 1
 
     # 1. initialize (authenticated).
@@ -178,23 +213,23 @@ def main():
             "clientInfo": {"name": "staging-mcp-proveout", "version": "1.0"},
         },
     }
-    status, headers, body = do_post(url, payload, token)
-    record("initialize", redacted_request_line("initialize", rpc_id, '"params":{...}'), status, headers, body)
-    parsed = parse_json_or_text(body)
-    result = parsed.get("result") if isinstance(parsed, dict) else None
-    if status != 200 or not isinstance(result, dict) or not result.get("protocolVersion"):
-        failures.append("initialize: expected HTTP 200 with result.protocolVersion")
+    status, headers, body = fetch("initialize", redacted_request_line("initialize", rpc_id, '"params":{...}'), payload, token)
+    if body is not None:
+        parsed = parse_json_or_text(body)
+        result = parsed.get("result") if isinstance(parsed, dict) else None
+        if status != 200 or not isinstance(result, dict) or not result.get("protocolVersion"):
+            failures.append("initialize: expected HTTP 200 with result.protocolVersion")
     rpc_id += 1
 
     # 2. tools/list (authenticated).
     payload = {"jsonrpc": "2.0", "id": rpc_id, "method": "tools/list", "params": {}}
-    status, headers, body = do_post(url, payload, token)
-    record("tools/list", redacted_request_line("tools/list", rpc_id), status, headers, body)
-    parsed = parse_json_or_text(body)
-    tools = (parsed.get("result", {}) or {}).get("tools") if isinstance(parsed, dict) else None
-    names = sorted(t.get("name") for t in tools) if isinstance(tools, list) else None
-    if status != 200 or names != sorted(EXPECTED_TOOLS):
-        failures.append(f"tools/list: expected exactly {','.join(sorted(EXPECTED_TOOLS))}, got {names}")
+    status, headers, body = fetch("tools/list", redacted_request_line("tools/list", rpc_id), payload, token)
+    if body is not None:
+        parsed = parse_json_or_text(body)
+        tools = (parsed.get("result", {}) or {}).get("tools") if isinstance(parsed, dict) else None
+        names = sorted(t.get("name") for t in tools) if isinstance(tools, list) else None
+        if status != 200 or names != sorted(EXPECTED_TOOLS):
+            failures.append(f"tools/list: expected exactly {','.join(sorted(EXPECTED_TOOLS))}, got {names}")
     rpc_id += 1
 
     # 3-7. tools/call each of the five (authenticated, bodies recorded).
@@ -205,14 +240,15 @@ def main():
             "method": "tools/call",
             "params": {"name": tool, "arguments": {}},
         }
-        status, headers, body = do_post(url, payload, token)
-        record(
+        status, headers, body = fetch(
             f"tools/call {tool}",
             redacted_request_line("tools/call", rpc_id, f'"name":"{tool}"'),
-            status,
-            headers,
-            body,
+            payload,
+            token,
         )
+        if body is None:
+            rpc_id += 1
+            continue
         parsed = parse_json_or_text(body)
         if status != 200 or not isinstance(parsed, dict):
             failures.append(f"tools/call {tool}: expected HTTP 200 JSON-RPC envelope")
@@ -244,47 +280,44 @@ def main():
         "method": "tools/call",
         "params": {"name": "no_such_tool", "arguments": {}},
     }
-    status, headers, body = do_post(url, payload, token)
-    record(
+    status, headers, body = fetch(
         "tools/call unknown",
         redacted_request_line("tools/call", rpc_id, '"name":"no_such_tool"'),
-        status,
-        headers,
-        body,
+        payload,
+        token,
     )
-    parsed = parse_json_or_text(body)
-    err = (parsed.get("error") or {}) if isinstance(parsed, dict) else {}
-    if status != 200 or err.get("code") != -32601:
-        failures.append(f"tools/call unknown: expected JSON-RPC -32601, got HTTP {status} {err}")
+    if body is not None:
+        parsed = parse_json_or_text(body)
+        err = (parsed.get("error") or {}) if isinstance(parsed, dict) else {}
+        if status != 200 or err.get("code") != -32601:
+            failures.append(f"tools/call unknown: expected JSON-RPC -32601, got HTTP {status} {err}")
     rpc_id += 1
 
     # 9. Wrong bearer (fixed dummy, never the real token) -> 401 Bearer.
     payload = {"jsonrpc": "2.0", "id": rpc_id, "method": "tools/list", "params": {}}
-    status, headers, body = do_post(url, payload, WRONG_BEARER)
-    record(
+    status, headers, body = fetch(
         "wrong bearer",
         'POST /mcp {"jsonrpc":"2.0","method":"tools/list"} Authorization: Bearer ***wrong***',
-        status,
-        headers,
-        body,
+        payload,
+        WRONG_BEARER,
     )
-    www = (headers.get("www-authenticate") or "")
-    if status != 401 or "bearer" not in www.lower():
-        failures.append(f"wrong bearer: expected HTTP 401 WWW-Authenticate: Bearer, got HTTP {status}")
+    if body is not None:
+        www = (headers.get("www-authenticate") or "")
+        if status != 401 or "bearer" not in www.lower():
+            failures.append(f"wrong bearer: expected HTTP 401 WWW-Authenticate: Bearer, got HTTP {status}")
     rpc_id += 1
 
     # 10. No bearer -> 401 Bearer (cheap re-confirm of the Operator check).
-    status, headers, body = do_post(url, payload, None)
-    record(
+    status, headers, body = fetch(
         "no bearer",
         'POST /mcp {"jsonrpc":"2.0","method":"tools/list"} Authorization: (absent)',
-        status,
-        headers,
-        body,
+        payload,
+        None,
     )
-    www = (headers.get("www-authenticate") or "")
-    if status != 401 or "bearer" not in www.lower():
-        failures.append(f"no bearer: expected HTTP 401 WWW-Authenticate: Bearer, got HTTP {status}")
+    if body is not None:
+        www = (headers.get("www-authenticate") or "")
+        if status != 401 or "bearer" not in www.lower():
+            failures.append(f"no bearer: expected HTTP 401 WWW-Authenticate: Bearer, got HTTP {status}")
 
     artifact = {
         "schema_version": SCHEMA_VERSION,
