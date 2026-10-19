@@ -516,7 +516,7 @@ mod tests {
         let base = match std::env::var("TWO_TEST_DATABASE_URL") {
             Ok(raw) => raw,
             Err(std::env::VarError::NotPresent) => return None,
-            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+            Err(error) => Err(error).expect("invalid test bootstrap configuration"),
         };
         // Splice the path by hand: Url serialization drops the explicit empty
         // password colon, which the guard requires byte-for-byte.
@@ -557,7 +557,7 @@ mod tests {
         let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
             Ok(raw) => raw,
             Err(std::env::VarError::NotPresent) => return,
-            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+            Err(error) => Err(error).expect("invalid test bootstrap configuration"),
         };
         let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
             .await
@@ -691,7 +691,7 @@ mod tests {
         let url = match std::env::var("TWO_TEST_DATABASE_URL") {
             Ok(url) => url,
             Err(std::env::VarError::NotPresent) => return,
-            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+            Err(error) => Err(error).expect("invalid test bootstrap configuration"),
         };
         let db = TestDatabase::create(&url, &sqlx::migrate!("./tests/migrations"))
             .await
@@ -883,7 +883,7 @@ mod tests {
         let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
             Ok(raw) => raw,
             Err(std::env::VarError::NotPresent) => return,
-            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+            Err(error) => Err(error).expect("invalid test bootstrap configuration"),
         };
         let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
             .await
@@ -926,7 +926,7 @@ mod tests {
         let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
             Ok(raw) => raw,
             Err(std::env::VarError::NotPresent) => return,
-            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+            Err(error) => Err(error).expect("invalid test bootstrap configuration"),
         };
         let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
             .await
@@ -949,7 +949,7 @@ mod tests {
         let raw = match std::env::var("TWO_TEST_DATABASE_URL") {
             Ok(raw) => raw,
             Err(std::env::VarError::NotPresent) => return,
-            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+            Err(error) => Err(error).expect("invalid test bootstrap configuration"),
         };
         let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
             .await
