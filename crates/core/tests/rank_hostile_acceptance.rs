@@ -256,11 +256,11 @@ fn mention_pills_are_split_exactly() {
 fn markdown_bold_and_code_are_escaped_exactly() {
     assert_eq!(
         ranked("**pwned**"),
-        format!(r"**\*\*pwned\*\***") + "\n" + RANKED_TAIL
+        r"**\*\*pwned\*\***".to_string() + "\n" + RANKED_TAIL
     );
     assert_eq!(
         ranked("`code`"),
-        format!(r"**\`code\`**") + "\n" + RANKED_TAIL
+        r"**\`code\`**".to_string() + "\n" + RANKED_TAIL
     );
     assert_inert(&ranked("***x*** ```y```"), RANKED_TAIL);
 }
@@ -269,19 +269,19 @@ fn markdown_bold_and_code_are_escaped_exactly() {
 fn markdown_italic_spoiler_strike_and_link_chars_are_escaped() {
     assert_eq!(
         ranked("_under_"),
-        format!(r"**\_under\_**") + "\n" + RANKED_TAIL
+        r"**\_under\_**".to_string() + "\n" + RANKED_TAIL
     );
     assert_eq!(
         ranked("||secret||"),
-        format!(r"**\|\|secret\|\|**") + "\n" + RANKED_TAIL
+        r"**\|\|secret\|\|**".to_string() + "\n" + RANKED_TAIL
     );
     assert_eq!(
         ranked("~~gone~~"),
-        format!(r"**\~\~gone\~\~**") + "\n" + RANKED_TAIL
+        r"**\~\~gone\~\~**".to_string() + "\n" + RANKED_TAIL
     );
     assert_eq!(
         ranked("[click](target)"),
-        format!(r"**\[click\](target)**") + "\n" + RANKED_TAIL
+        r"**\[click\](target)**".to_string() + "\n" + RANKED_TAIL
     );
 }
 
@@ -289,10 +289,10 @@ fn markdown_italic_spoiler_strike_and_link_chars_are_escaped() {
 fn backslashes_are_escaped_so_escapes_cannot_be_forged() {
     // A raw `\*` in the slot reads as an escape to Discord; the backslash
     // itself must be escaped so an attacker cannot pre-forge one.
-    assert_eq!(ranked(r"a\b"), format!(r"**a\\b**") + "\n" + RANKED_TAIL);
+    assert_eq!(ranked(r"a\b"), r"**a\\b**".to_string() + "\n" + RANKED_TAIL);
     assert_eq!(
         ranked(r"\*pwn"),
-        format!(r"**\\\*pwn**") + "\n" + RANKED_TAIL
+        r"**\\\*pwn**".to_string() + "\n" + RANKED_TAIL
     );
 }
 
