@@ -402,6 +402,15 @@ stored per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row is malformed or
 outside 0 to 600 whole seconds, so the sweep keeps the boot fallback. The
 line carries the setting key and the `out_of_range` reason.
 
+Boot admission warning (in `configured_admission` in
+`crates/bot/src/voice_rooms.rs`, key-only fields, no IDs):
+`temp-voice admission setting invalid; using default` (warn): one of the
+`TWO_TEMP_VOICE_MAX_PER_USER` (1 to 10), `TWO_TEMP_VOICE_MAX_PER_GUILD`
+(1 to 45) or `TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS` (0 to 3600) boot
+values is unparsable or out of range, so that knob alone falls back to
+its default (1, 40, 0 respectively) while the other knobs are still
+honored. The line carries the setting key and the `invalid_value` reason.
+
 Creator-view refresh actor messages (all in `GuildRoomWorker::revalidate_creator`
 / `reload_creators` in `crates/bot/src/voice_rooms.rs`, guild-only fields,
 no IDs):
