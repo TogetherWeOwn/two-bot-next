@@ -2259,8 +2259,8 @@ class WorkflowTests(unittest.TestCase):
         # runs 26 sequential database suites, and a long run must not depend
         # on service-alias DNS staying up (EAI_AGAIN on agent-testdb hit a
         # stores run while Postgres PANIC-recovered on ENOSPC).
-        # The runtime WAL cap itself rides with the sibling WAL PR; this card
-        # carries only the hosts pin for the runtime lane.
+        # The runtime WAL cap lives in this lane too (see
+        # test_runtime_postgres_wal_budget_is_bounded below).
         job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
         prerequisites = next(
             step for step in job["steps"]
@@ -2297,7 +2297,28 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(fail_closed, pin)
         self.assertLess(run.index("exit 1", fail_closed), pin)
         self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        # A failed lookup must empty the result, not kill the step under pipefail.
+        self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
+
+    def test_runtime_postgres_wal_budget_is_bounded(self):
+        # Same budget as rust-tests and the stores lane: the runtime lane runs
+        # 26 sequential database suites against the same 1 GiB tmpfs service,
+        # so WAL recycling stays bounded with headroom for relation files.
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
+        prepare = next(
+            step for step in job["steps"]
+            if step.get("name") == "Prepare isolated test databases"
+        )
+        verify = next(
+            step for step in job["steps"]
+            if step.get("name") == "Verify disposable Postgres defaults"
+        )
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+        self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
@@ -4132,6 +4153,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(fail_closed, pin)
         self.assertLess(run.index("exit 1", fail_closed), pin)
         self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        # A failed lookup must empty the result, not kill the step under pipefail.
+        self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
     def test_nextest_postgres_wal_budget_is_bounded(self):
