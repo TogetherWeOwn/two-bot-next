@@ -17,6 +17,8 @@ mod kick;
 mod limit_command;
 #[path = "voice_name_tests.rs"]
 mod name;
+#[path = "voice_name_filter_acceptance_tests.rs"]
+mod name_filter_acceptance;
 #[path = "voice_name_rerender_tests.rs"]
 mod name_rerender;
 #[path = "voice_private_runtime_tests.rs"]
@@ -1893,15 +1895,14 @@ async fn failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it()
     assert!(!worker.deletes.contains(&500));
 }
 
-/// Cross-restart provenance for "retain provenance after a failed rollback" is
-/// proven by the disposable-database test
-/// `crates/cutover/tests/voice_create_admission_store.rs::bound_channel_witness_survives_restart_and_holds_the_slot_until_settled`,
-/// which binds the channel to its claim before any room row and rediscovers it
-/// on a fresh pool. This in-memory fixture stays ignored: only `rooms` crosses
-/// its simulated restart and a failed persist writes no room, so the `bound`
-/// witness cannot cross here and the test cannot pass unedited.
+/// In-memory restart proof for "retain provenance after a failed rollback":
+/// the failed persist writes no room row, but the `bound` witness is durable
+/// state (the SQL `bound_create_channels` rows), so it crosses the simulated
+/// restart like `rooms` does and `load` rediscovers the channel through
+/// `orphaned_create_channels`. The disposable-database test
+/// `crates/cutover/tests/voice_create_admission_store.rs::bound_channel_witness_survives_restart_and_holds_the_slot_until_settled`
+/// proves the same path against a real pool.
 #[tokio::test]
-#[ignore = "fixture gap: bound witness does not cross the simulated restart; durable proof is bound_channel_witness_survives_restart_and_holds_the_slot_until_settled"]
 async fn a_restarted_worker_rediscovers_a_channel_whose_rollback_failed() {
     let (live, mut store, http, _) = fixture();
     store.persist_error = Some(StoreError::Unavailable);
@@ -1920,6 +1921,7 @@ async fn a_restarted_worker_rediscovers_a_channel_whose_rollback_failed() {
     let (live, fresh_store, http, _) = fixture();
     live.publish(snapshot(&[500], vec![]));
     *fresh_store.rooms.lock().unwrap() = worker.store.rooms.lock().unwrap().clone();
+    *fresh_store.bound.lock().unwrap() = worker.store.bound.lock().unwrap().clone();
     drop(worker);
     let restarted = GuildRoomWorker::load(live, fresh_store, http)
         .await

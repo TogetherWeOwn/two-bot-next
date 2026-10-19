@@ -73,7 +73,9 @@ async fn admission_and_cumulative_work_deadlines_release_the_guild_lane() {
     );
     tokio::time::advance(LANE_WAIT_TIMEOUT).await;
     settle().await;
-    assert!(matches!(waiting.await.unwrap(), Err(Failure::Timeout)));
+    // Lane admission has its own variant so the no-recovery reply never fires
+    // for cumulative-deadline timeouts after work was stored.
+    assert!(matches!(waiting.await.unwrap(), Err(Failure::LaneBusy)));
     assert!(mock.requests().is_empty(), "failed admission cannot mutate");
     tokio::time::advance(BUTTON_TIMEOUT - LANE_WAIT_TIMEOUT).await;
     settle().await;

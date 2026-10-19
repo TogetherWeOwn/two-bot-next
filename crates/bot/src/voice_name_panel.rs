@@ -1330,6 +1330,39 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             self.queue.mark_succeeded(&action);
             return;
         }
+        // Member-requested overrides pass the same automod name filter as
+        // every other naming path: a blocked override is refused here,
+        // before any store write or Discord call, with the stable
+        // `name_blocked` outcome. A restore (`None`) carries no name.
+        if let Some(text) = custom_name.as_deref() {
+            let owner_id = self
+                .rooms
+                .get(&channel_id)
+                .map(|room| room.owner_id)
+                .unwrap_or(channel_id);
+            let context = NameFilterContext {
+                guild_id: self.live.guild_id.to_string(),
+                channel_id: channel_id.to_string(),
+                user_id: owner_id.to_string(),
+            };
+            if filter_channel_name(text, &self.name_policy, &context).is_err() {
+                log_rename_decision(
+                    self.live.guild_id,
+                    channel_id,
+                    "name_blocked",
+                    "name_blocked",
+                    0,
+                    false,
+                );
+                metrics::global().voice_name("name_blocked");
+                // Drop the hostile override so it never renders or renames;
+                // the store keeps its previous value (or none).
+                self.custom_names.remove(&channel_id);
+                self.desired_names.remove(&channel_id);
+                self.queue.mark_succeeded(&action);
+                return;
+            }
+        }
         match self
             .store
             .save_custom_name(self.live.guild_id, channel_id, custom_name.as_deref())

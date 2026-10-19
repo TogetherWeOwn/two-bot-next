@@ -6272,6 +6272,37 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     self.queue.mark_succeeded(&action);
                     return true;
                 }
+                // Member-requested renames pass the same automod name filter
+                // as every other naming path: a blocked name is refused
+                // here, before any Discord call, with the stable
+                // `name_blocked` outcome. Allowed names fall through
+                // unchanged.
+                {
+                    let owner_id = self
+                        .rooms
+                        .get(&channel_id)
+                        .map(|room| room.owner_id)
+                        .unwrap_or(channel_id);
+                    let context = NameFilterContext {
+                        guild_id: self.live.guild_id.to_string(),
+                        channel_id: channel_id.to_string(),
+                        user_id: owner_id.to_string(),
+                    };
+                    if filter_channel_name(&name, &self.name_policy, &context).is_err() {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            "name_blocked",
+                            "name_blocked",
+                            0,
+                            false,
+                        );
+                        metrics::global().voice_name("name_blocked");
+                        self.desired_names.remove(&channel_id);
+                        self.queue.mark_succeeded(&action);
+                        return true;
+                    }
+                }
                 // Flush-time uniqueness recheck (legacy 38041a1 drops a
                 // throttled rename that would now duplicate): a literal
                 // custom rename is dropped when the folded name is held by

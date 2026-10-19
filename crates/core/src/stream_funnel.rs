@@ -90,6 +90,13 @@ fn valid_started_at(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && crate::funnel::parse_iso_millis(value).is_some()
 }
 
+/// Validate a configured Discord invite URL with the exact rule the
+/// post renderer applies, so delivery configuration can refuse an
+/// unpostable invite at startup instead of failing every go-live.
+pub fn validated_invite_url(url: &str) -> Result<String, StreamFunnelError> {
+    message_invite_url(url)
+}
+
 /// Validate a caller-supplied Discord invite URL and return the exact string
 /// that is safe to post. The mass-mention and masked-link checks run on the
 /// parsed (`Url::as_str`) form, and that same form is what callers output, so
