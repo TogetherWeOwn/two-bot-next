@@ -1,4 +1,4 @@
--- 0444_assistant_monthly_builds: per-guild template-assistant monthly-cap ledger.
+-- 0446_assistant_monthly_builds: per-guild template-assistant monthly-cap ledger.
 --
 -- Durable half of the V12a monthly cap (spec `docs/voice-rooms.md` §V12:
 -- "200 builds per guild per month, resetting on the 1st"). One row per

@@ -3423,10 +3423,42 @@ impl TestDb {
         .expect("seed scheduled message");
     }
 
+    /// Seed a scheduled message with an explicit run time, interval and
+    /// enabled flag (listing-render fixtures). Direct insert, so a fixture
+    /// can hold more rows than the quota-admission write path allows.
+    async fn seed_schedule_row(
+        &self,
+        guild_id: &str,
+        id: &str,
+        next_run_at: &str,
+        interval_seconds: Option<i64>,
+        enabled: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO scheduled_messages
+               (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                created_by, created_at, updated_by, updated_at)
+             VALUES ($1, $2, $3, 'remember this', $4, $5, $6,
+                     '77', '2026-09-30T12:00:00.000Z', '77', '2026-09-30T12:00:00.000Z')",
+        )
+        .bind(id)
+        .bind(guild_id)
+        .bind(CHANNEL_S)
+        .bind(next_run_at)
+        .bind(interval_seconds)
+        .bind(enabled)
+        .execute(&self.pool)
+        .await
+        .expect("seed scheduled message row");
+    }
+
     /// Seed one scheduled message with caller-chosen channel, timing,
     /// recurrence and enabled state (full-quota list fixtures need rows
     /// whose rendered lines carry realistic lengths and state markers).
-    async fn seed_schedule_row(&self, guild_id: &str, row: &ScheduleListFixtureRow) {
+    /// Renamed from `seed_schedule_row` when the bounded-listing acceptance
+    /// tests landed their own helper under that name; call sites below use
+    /// this fixture-row form.
+    async fn seed_schedule_fixture_row(&self, guild_id: &str, row: &ScheduleListFixtureRow) {
         sqlx::query(
             "INSERT INTO scheduled_messages
                (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
@@ -4621,6 +4653,59 @@ async fn feed_list_is_scoped_to_the_configured_guild() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_list_at_capacity_keeps_every_configured_guild_id_discoverable() {
+    let db = TestDb::new().await;
+    // Real relay ids are 32 hex characters; seed the full supported
+    // capacity of 25 for the configured guild plus one foreign relay.
+    let own_ids: Vec<String> = (1..=25).map(|index| format!("{index:032x}")).collect();
+    for (position, id) in own_ids.iter().enumerate() {
+        let kind = ["rss", "youtube", "twitch"][position % 3];
+        db.seed_feed(GUILD_S, id, kind).await;
+    }
+    let foreign_id = "f".repeat(32);
+    db.seed_feed("9999", &foreign_id, "rss").await;
+    let rows_before = db.feed_rows().await;
+    assert_eq!(rows_before.len(), 25, "seeded capacity");
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("feed-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    // deferred_reply pins the ephemeral defer (flags 64) and mention safety
+    // (allowed_mentions parse []) on the single completion.
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("list content");
+    assert!(
+        content.encode_utf16().count() <= 2000,
+        "response exceeds the 2,000 UTF-16 unit limit ({} units): {content}",
+        content.encode_utf16().count()
+    );
+    for id in &own_ids {
+        assert!(
+            content.contains(&format!("`{id}`")),
+            "configured-guild relay {id} discoverable at capacity: {content}"
+        );
+    }
+    assert!(
+        !content.contains(&foreign_id),
+        "other guild's relay never listed: {content}"
+    );
+    assert_eq!(
+        db.feed_rows().await,
+        rows_before,
+        "list leaves feed configuration unchanged"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn feed_add_plan_errors_write_nothing() {
     let db = TestDb::new().await;
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
@@ -5317,7 +5402,7 @@ async fn schedule_list_full_quota_enumerates_every_id_across_pages() {
     // Seed in reverse order: neither insertion order nor a bare
     // `next_run_at` sort may decide the tied pair's order.
     for row in fixture.iter().rev() {
-        db.seed_schedule_row(GUILD_S, row).await;
+        db.seed_schedule_fixture_row(GUILD_S, row).await;
     }
     db.seed_schedule("9999", "sched-foreign-full").await;
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
@@ -5473,7 +5558,7 @@ async fn schedule_list_invalid_and_out_of_range_pages_refuse_without_writes() {
     let db = TestDb::new().await;
     let fixture = schedule_list_fixture_rows();
     for row in fixture.iter().take(3) {
-        db.seed_schedule_row(GUILD_S, row).await;
+        db.seed_schedule_fixture_row(GUILD_S, row).await;
     }
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;
 
@@ -5536,6 +5621,225 @@ async fn schedule_list_invalid_and_out_of_range_pages_refuse_without_writes() {
         db.schedule_rows().await.len(),
         3,
         "refused pages never write schedule rows"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_over_cap_shows_twenty_five_rows_and_an_overflow_line() {
+    let db = TestDb::new().await;
+    // 27 rows (direct seeds bypass quota admission), inserted newest-first.
+    // The listing cap is pinned at 25: raising it must break this test.
+    for n in (0..27u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("cap-{n:02}"),
+            &format!("2030-01-{:02}T00:00:00.000Z", n + 1),
+            None,
+            true,
+        )
+        .await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    // deferred_reply() already asserts the ephemeral defer (flags 64).
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("list content");
+    let mut expected_lines: Vec<String> = (0..25u32)
+        .map(|n| format!("`cap-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
+        .collect();
+    expected_lines.push("(truncated, 2 more)".to_owned());
+    assert_eq!(
+        content,
+        expected_lines.join("\n"),
+        "over-cap listing: 25 earliest rows, then the overflow line"
+    );
+    assert!(
+        !content.contains("cap-25") && !content.contains("cap-26"),
+        "rows past the cap are counted, not listed: {content}"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_at_cap_shows_every_row_without_an_overflow_line() {
+    let db = TestDb::new().await;
+    for n in (0..25u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("full-{n:02}"),
+            &format!("2030-01-{:02}T00:00:00.000Z", n + 1),
+            None,
+            true,
+        )
+        .await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("list content");
+    let expected_lines: Vec<String> = (0..25u32)
+        .map(|n| format!("`full-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
+        .collect();
+    assert_eq!(
+        content,
+        expected_lines.join("\n"),
+        "exactly at the cap nothing is truncated"
+    );
+    assert!(
+        !content.contains("truncated"),
+        "no overflow line at the cap: {content}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_over_cap_second_page_lists_hidden_rows() {
+    let db = TestDb::new().await;
+    // Same 27-row over-cap guild as the page-1 acceptance test: page 2 must
+    // reach the bounded hidden window instead of re-paging the first 25.
+    for n in (0..27u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("cap-{n:02}"),
+            &format!("2030-01-{:02}T00:00:00.000Z", n + 1),
+            None,
+            true,
+        )
+        .await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(2)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 1);
+    assert_eq!(
+        contents[0],
+        "`cap-25` `<#3333>` 2030-01-26T00:00:00.000Z\n\
+         `cap-26` `<#3333>` 2030-01-27T00:00:00.000Z",
+        "page 2 lists exactly the rows past the capped first window"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_far_over_cap_second_page_names_remaining_overflow() {
+    let db = TestDb::new().await;
+    // 52 rows: the hidden window itself fills (25 rows) with 2 more behind
+    // it, so page 2 carries its own overflow line; minute-spaced stamps keep
+    // (next_run_at, id) order aligned with id order.
+    for n in (0..52u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("big-{n:02}"),
+            &format!("2030-03-01T{:02}:{:02}:00.000Z", n / 60, n % 60),
+            None,
+            true,
+        )
+        .await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(99)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 2);
+    let mut expected_lines: Vec<String> = (25..50u32)
+        .map(|n| {
+            format!(
+                "`big-{n:02}` `<#3333>` 2030-03-01T{:02}:{:02}:00.000Z",
+                n / 60,
+                n % 60
+            )
+        })
+        .collect();
+    expected_lines.push("(truncated, 2 more)".to_owned());
+    assert_eq!(
+        contents[0],
+        expected_lines.join("\n"),
+        "page 2 lists the full hidden window plus its own overflow line"
+    );
+    assert!(
+        !contents[0].contains("big-50") && !contents[0].contains("big-51"),
+        "rows past the hidden window are counted, not listed: {}",
+        contents[0]
+    );
+    assert_eq!(
+        contents[1], "Page 99 is out of range: this server has 2 page(s) of schedules.",
+        "pages past both windows refuse with the combined page total"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_under_cap_renders_byte_identical_to_before() {
+    let db = TestDb::new().await;
+    db.seed_schedule_row(
+        GUILD_S,
+        "weekly",
+        "2030-02-03T04:05:06.000Z",
+        Some(604_800),
+        true,
+    )
+    .await;
+    db.seed_schedule_row(GUILD_S, "once", "2030-01-01T00:00:00.000Z", None, true)
+        .await;
+    db.seed_schedule_row(
+        GUILD_S,
+        "paused",
+        "2030-01-15T12:30:00.000Z",
+        Some(3_600),
+        false,
+    )
+    .await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    // deferred_reply() already asserts the ephemeral defer (flags 64).
+    let json = mock.deferred_reply();
+    assert_eq!(
+        json["content"],
+        "`once` `<#3333>` 2030-01-01T00:00:00.000Z\n\
+         `paused` `<#3333>` 2030-01-15T12:30:00.000Z every 60m (disabled)\n\
+         `weekly` `<#3333>` 2030-02-03T04:05:06.000Z every 10080m",
+        "under-cap listing must not change a single byte"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
     );
     mock.shutdown().await;
     db.close().await;
@@ -5933,6 +6237,423 @@ async fn schedule_store_failure_replies_generic() {
     );
     mock.shutdown().await;
     db.close().await;
+}
+
+// --- acceptance: store-failure refusals audit like other refusals ---------
+//
+// Locked contract: every schedule store-failure refusal (create read,
+// create write, remove resolve, remove delete, list read) writes exactly
+// one `automation_audit_log` row per refusal whenever the pool accepts it,
+// in the existing refusal shape: the command's `scheduled.*` action,
+// outcome `rejected`, the invoking member as `actor_id`, and a bounded
+// single-token `reason` (a fixed error class such as the log line's
+// `db_class` token, or an equivalent fixed token — never the raw sqlx /
+// Postgres message, which can carry statement or fixture detail).
+// `target_key` names the attempted row where one exists: the fresh attempt
+// id for creates, the user-supplied prefix when resolution itself fails,
+// the resolved id when the delete fails. A failed list has no schedule id,
+// so its `target_key` carries none (NULL or empty) rather than inventing
+// one. The user reply stays the existing fixed store-failure text. A dead
+// pool (audit write itself impossible) degrades to that same safe reply
+// with no panic and no leaked internals. Successful lists keep writing no
+// audit row; only the refusal audits.
+
+const SCHEDULE_STORE_FAILURE_REPLY: &str = "Schedule command failed; try again.";
+
+/// Drop the schedule table inside this test's isolated schema: every store
+/// call against it fails while `automation_audit_log` stays writable, so an
+/// audit attempt on the live pool can still land.
+async fn drop_scheduled_messages(db: &TestDb) {
+    sqlx::query("DROP TABLE scheduled_messages")
+        .execute(&db.pool)
+        .await
+        .expect("drop scheduled_messages");
+}
+
+/// Fail only INSERTs into `scheduled_messages`: the create path's read
+/// still succeeds, so the refusal comes from the write itself.
+async fn fail_scheduled_inserts(db: &TestDb) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_scheduled_insert() RETURNS trigger AS $$
+         BEGIN
+           RAISE EXCEPTION 'induced scheduled insert failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install insert fault function");
+    sqlx::query(
+        "CREATE TRIGGER fail_scheduled_insert_trg
+           BEFORE INSERT ON scheduled_messages FOR EACH ROW
+           EXECUTE FUNCTION fail_scheduled_insert()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install insert fault trigger");
+}
+
+/// Fail only DELETEs from `scheduled_messages`: prefix resolution still
+/// succeeds, so the refusal comes from the delete itself.
+async fn fail_scheduled_deletes(db: &TestDb) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_scheduled_delete() RETURNS trigger AS $$
+         BEGIN
+           RAISE EXCEPTION 'induced scheduled delete failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install delete fault function");
+    sqlx::query(
+        "CREATE TRIGGER fail_scheduled_delete_trg
+           BEFORE DELETE ON scheduled_messages FOR EACH ROW
+           EXECUTE FUNCTION fail_scheduled_delete()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install delete fault trigger");
+}
+
+/// The refusal shape every store-failure audit row must share.
+fn assert_schedule_store_failure_audit(
+    action: &str,
+    outcome: &str,
+    reason: Option<&str>,
+    actor_id: Option<&str>,
+    expected_action: &str,
+) {
+    assert_eq!(action, expected_action);
+    assert_eq!(outcome, "rejected");
+    assert_eq!(
+        actor_id,
+        Some("88"),
+        "audit names the invoking member, like a validation rejection"
+    );
+    let reason = reason.expect("store-failure refusal audits a reason");
+    assert!(
+        !reason.is_empty() && reason.len() <= 64 && !reason.chars().any(char::is_whitespace),
+        "reason is one bounded token, not raw error text: {reason:?}"
+    );
+    let lowered = reason.to_ascii_lowercase();
+    for leaked in ["sqlx", "postgres", "scheduled_messages", "induced"] {
+        assert!(
+            !lowered.contains(leaked),
+            "reason must not leak {leaked}: {reason:?}"
+        );
+    }
+}
+
+/// Every completion-edit `content`, in invocation order.
+fn schedule_store_failure_replies(mock: &MockRest, invocations: usize) -> Vec<String> {
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), invocations, "one completion per invocation");
+    edits
+        .iter()
+        .map(|edit| {
+            let json: serde_json::Value =
+                serde_json::from_slice(&edit.body).expect("completion json");
+            json["content"]
+                .as_str()
+                .expect("reply content is text")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn schedule_create_interaction() -> Interaction {
+    slash(
+        "schedule",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("hello".to_owned())),
+            option("in-minutes", CommandOptionValue::Integer(30)),
+        ],
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_read_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    drop_scheduled_messages(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime.on_interaction(&schedule_create_interaction()).await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        SCHEDULE_STORE_FAILURE_REPLY
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one create read failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_schedule_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "scheduled.create",
+    );
+    let target = target_key
+        .as_deref()
+        .expect("audit names the attempted schedule id");
+    assert!(!target.is_empty(), "target is the fresh attempt id");
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_put_store_failure_audits_one_rejected_row_per_refusal() {
+    let db = TestDb::new().await;
+    fail_scheduled_inserts(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime.on_interaction(&schedule_create_interaction()).await;
+    runtime.on_interaction(&schedule_create_interaction()).await;
+
+    assert_eq!(
+        schedule_store_failure_replies(&mock, 2),
+        vec![
+            SCHEDULE_STORE_FAILURE_REPLY.to_owned(),
+            SCHEDULE_STORE_FAILURE_REPLY.to_owned()
+        ],
+        "write failures keep the existing safe reply text"
+    );
+    assert!(
+        db.schedule_rows().await.is_empty(),
+        "failed writes store no schedule row"
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        2,
+        "each write failure writes exactly one audit row: {audits:?}"
+    );
+    for (action, _, outcome, reason, actor_id) in &audits {
+        assert_schedule_store_failure_audit(
+            action,
+            outcome,
+            reason.as_deref(),
+            actor_id.as_deref(),
+            "scheduled.create",
+        );
+    }
+    let targets: std::collections::BTreeSet<Option<String>> = audits
+        .iter()
+        .map(|(_, target_key, _, _, _)| target_key.clone())
+        .collect();
+    assert_eq!(
+        targets.len(),
+        2,
+        "each refusal audits its own fresh attempt id: {audits:?}"
+    );
+    assert!(
+        targets
+            .iter()
+            .all(|target| target.as_deref().is_some_and(|t| !t.is_empty())),
+        "every target names an attempted schedule id: {audits:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_remove_resolve_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    drop_scheduled_messages(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "schedule-remove",
+            Some(CHANNEL),
+            vec![option(
+                "id",
+                CommandOptionValue::String("sched-xyz".to_owned()),
+            )],
+        ))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        SCHEDULE_STORE_FAILURE_REPLY
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one resolve failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_schedule_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "scheduled.delete",
+    );
+    assert_eq!(
+        target_key.as_deref(),
+        Some("sched-xyz"),
+        "unresolved refusal names the user-supplied prefix"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_remove_delete_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    db.seed_schedule(GUILD_S, "xyz999").await;
+    fail_scheduled_deletes(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "schedule-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::String("xyz".to_owned()))],
+        ))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        SCHEDULE_STORE_FAILURE_REPLY
+    );
+    assert_eq!(
+        db.schedule_rows()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        vec!["xyz999".to_owned()],
+        "failed delete leaves the schedule row in place"
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one delete failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_schedule_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "scheduled.delete",
+    );
+    assert_eq!(
+        target_key.as_deref(),
+        Some("xyz999"),
+        "delete refusal names the resolved schedule id"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    drop_scheduled_messages(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        SCHEDULE_STORE_FAILURE_REPLY
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one list failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_schedule_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "scheduled.list",
+    );
+    assert!(
+        target_key.as_deref().is_none_or(str::is_empty),
+        "a failed list names no schedule id: {target_key:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Dead-pool control: with a closed pool, the audit write is impossible by
+/// construction, so every schedule command must still finish with the
+/// fixed safe reply — no panic, no hang, no sqlx internals, pool address
+/// or credentials in the user text. A closed pool fails every query
+/// immediately; an unreachable pool would hold each command for the full
+/// acquire timeout, so this control stays fast after the audit attempt
+/// adds a second store call per refusal.
+#[tokio::test]
+async fn schedule_store_failures_on_dead_pool_reply_safely() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let runtime = CommandRuntime::new(
+        pool,
+        executor_at(origin),
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+
+    runtime.on_interaction(&schedule_create_interaction()).await;
+    runtime
+        .on_interaction(&slash(
+            "schedule-remove",
+            Some(CHANNEL),
+            vec![option(
+                "id",
+                CommandOptionValue::String("sched-xyz".to_owned()),
+            )],
+        ))
+        .await;
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    let replies = schedule_store_failure_replies(&mock, 3);
+    assert_eq!(
+        replies,
+        vec![SCHEDULE_STORE_FAILURE_REPLY.to_owned(); 3],
+        "dead pool degrades every schedule command to the safe reply"
+    );
+    for reply in &replies {
+        for leaked in ["sqlx", "postgres", "127.0.0.1", "agent_test", "Pool"] {
+            assert!(
+                !reply.contains(leaked),
+                "dead-pool reply must not leak {leaked}: {reply}"
+            );
+        }
+    }
+    mock.shutdown().await;
 }
 
 #[tokio::test]
@@ -6956,7 +7677,8 @@ async fn worker_verdict_drives_prefix_trigger_from_call_site() {
     ]);
     runtime
         .initialize_custom_commands(
-            GatewayCommandConfig::from_map(GUILD, &vars).expect("dispatch command config"),
+            GatewayCommandConfig::from_map_for_activation(GUILD, &vars, true)
+                .expect("dispatch command config"),
         )
         .await
         .expect("custom-command bootstrap (loopback REST, isolated DB)");

@@ -83,6 +83,11 @@ pub const DUMP_TABLES: &[&str] = &[
     // no member column, archived like the other aggregate tables. No foreign
     // keys, so order is free.
     "game_activity_guild_aggregates",
+    // Assistant monthly-cap ledger (0446/0447): one guild-keyed counter row
+    // per guild with no member column, archived so caps survive a restore
+    // fail-closed (an excluded ledger would grant a fresh quota after every
+    // restore). No foreign keys, so order is free.
+    "assistant_monthly_builds",
     "member_levels",
     // Seasonal XP projection (0100): append-only mirror of lifetime XP per
     // quarter, guild-keyed with no foreign keys, so order beside

@@ -23,6 +23,7 @@ two-bot-core = { version = "0.4.0", path = "../crates/core", default-features = 
 two-bot-cutover = { version = "0.4.0", path = "../crates/cutover" } # x-release-please-version
 two-bot = { version = "0.4.0", path = "../crates/bot" } # x-release-please-version
 two-bot-discord = { version = "0.4.0", path = "../crates/discord", features = ["db"] } # x-release-please-version
+url = "2.5.8"
 
 [[bin]]
 name = "internal_action"
@@ -132,6 +133,34 @@ bench = false
 [[bin]]
 name = "helix_token"
 path = "fuzz_targets/helix_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "database_url"
+path = "fuzz_targets/database_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "feeds_http"
+path = "fuzz_targets/feeds_http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "custom_command_template"
+path = "fuzz_targets/custom_command_template.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fb_page_events"
+path = "fuzz_targets/fb_page_events.rs"
 test = false
 doc = false
 bench = false

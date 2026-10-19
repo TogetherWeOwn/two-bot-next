@@ -1,13 +1,14 @@
 /**
  * Release-tagged error events for Workers Logs.
  *
- * Workers Logs is the tracker: `container_gateway_failure` and `metrics_alert`
- * events carry `release` (the container git SHA from /readyz `build_revision`,
- * stamped at deploy time: staging uses `GITHUB_SHA` via
- * `scripts/staging_rollout.py`, and production uses the deploy SHA via
- * `scripts/production_deploy.py`) so a new error after a deploy points at that
- * release, plus `worker_version` (`CF_VERSION_METADATA.id`) to join the deploy
- * receipt. Group gateway
+ * Workers Logs is the tracker: the alert and failure lines carry `release`
+ * (the container git SHA from /readyz `build_revision`, stamped at deploy
+ * time: staging uses `GITHUB_SHA` via `scripts/staging_rollout.py`, and
+ * production uses the deploy SHA via `scripts/production_deploy.py`; lines
+ * logged where the tick parsed no probe body carry the visible `"unknown"`
+ * bucket) so a new error after a deploy points at that release, plus
+ * `worker_version` (`CF_VERSION_METADATA.id`) to join the deploy receipt.
+ * Group gateway
  * failures by `class` and metrics alerts by the alert rule in `content`; a
  * validated last error class appears in content only for
  * `job_consecutive_failures` alerts.
@@ -44,6 +45,15 @@ export function parseRelease(body: string): string | null {
 /** Render a parsed release for a log line; unparsed stays visible. */
 export function releaseTag(release: string | null): string {
   return release ?? UNKNOWN_RELEASE;
+}
+
+/**
+ * Render an edge-supplied release for a span log line. Only a hex SHA
+ * reaches the line; anything else (absent var, probe miss, hostile value)
+ * becomes the visible `"unknown"` bucket instead of echoed text.
+ */
+export function normalizeRelease(value: unknown): string {
+  return typeof value === "string" && RELEASE_TOKEN.test(value) ? value : UNKNOWN_RELEASE;
 }
 
 /** Render the platform Worker version for a log line; untrusted stays visible. */

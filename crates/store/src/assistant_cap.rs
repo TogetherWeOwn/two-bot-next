@@ -3,7 +3,7 @@
 //! the 1st").
 //!
 //! [`PgAssistantCapLedger`] persists one row per guild in
-//! `assistant_monthly_builds` (migration `0444`) and decides through the pure
+//! `assistant_monthly_builds` (migration `0446`) and decides through the pure
 //! V12a core (`two_bot_core::voice_assistant_cap`, limit
 //! [`MONTHLY_BUILD_LIMIT`]):
 //! under the cap an attempt increments the persisted count and reports the

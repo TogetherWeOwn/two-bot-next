@@ -754,11 +754,84 @@ const VOICE_ACTOR_LOAD_WARN_INTERVAL_SECS: u64 = 300;
 /// Last wall-clock second a load-failure warn was emitted.
 static VOICE_ACTOR_LOAD_WARN_LAST_SECS: AtomicU64 = AtomicU64::new(0);
 
+/// Deadline for one actor initialization load attempt. The load is
+/// store reads only (no Discord writes), so abandoning a hung attempt and
+/// retrying replays nothing; a healthy load finishes far inside this.
+const VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// First retry delay after a failed initialization attempt; each further
+/// consecutive failure doubles it up to [`VOICE_ACTOR_LOAD_RETRY_MAX`].
+const VOICE_ACTOR_LOAD_RETRY_INITIAL: Duration = Duration::from_secs(1);
+/// Cap on the initialization retry delay: a guild whose store stays down
+/// retries at most once a minute, never a hot loop, and recovers on its
+/// own within a minute of the store healing.
+const VOICE_ACTOR_LOAD_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Delay before retrying actor initialization after `failed_attempts`
+/// consecutive failures (1-based): exponential from
+/// [`VOICE_ACTOR_LOAD_RETRY_INITIAL`], capped at
+/// [`VOICE_ACTOR_LOAD_RETRY_MAX`]. Pure so the bounds are unit-pinned.
+fn voice_actor_load_backoff(failed_attempts: u32) -> Duration {
+    let doublings = failed_attempts.saturating_sub(1).min(6);
+    VOICE_ACTOR_LOAD_RETRY_INITIAL
+        .saturating_mul(1 << doublings)
+        .min(VOICE_ACTOR_LOAD_RETRY_MAX)
+}
+
+#[cfg(test)]
+mod voice_actor_load_backoff_tests {
+    use super::{
+        voice_actor_load_backoff, Duration, VOICE_ACTOR_LOAD_RETRY_INITIAL,
+        VOICE_ACTOR_LOAD_RETRY_MAX,
+    };
+
+    #[test]
+    fn backoff_doubles_from_initial_and_caps() {
+        assert_eq!(voice_actor_load_backoff(1), VOICE_ACTOR_LOAD_RETRY_INITIAL);
+        assert_eq!(
+            voice_actor_load_backoff(2),
+            VOICE_ACTOR_LOAD_RETRY_INITIAL * 2
+        );
+        assert_eq!(
+            voice_actor_load_backoff(3),
+            VOICE_ACTOR_LOAD_RETRY_INITIAL * 4
+        );
+        assert_eq!(voice_actor_load_backoff(7), VOICE_ACTOR_LOAD_RETRY_MAX);
+        assert_eq!(voice_actor_load_backoff(1_000), VOICE_ACTOR_LOAD_RETRY_MAX);
+        assert!(voice_actor_load_backoff(u32::MAX) <= VOICE_ACTOR_LOAD_RETRY_MAX);
+        // Ten virtual minutes of failures stay far from a hot loop and
+        // the first retry lands promptly after a one-off blip.
+        let mut elapsed = Duration::ZERO;
+        let mut attempts = 1u32;
+        while elapsed < Duration::from_secs(600) {
+            elapsed += voice_actor_load_backoff(attempts);
+            attempts += 1;
+        }
+        assert!((2..=600).contains(&attempts), "attempts: {attempts}");
+    }
+}
+
 /// A failed `GuildRoomWorker::load` must not silently drop the guild actor:
-/// count it and warn (throttled). The actor respawns on the next guild
-/// snapshot (`publish_snapshot` on `GuildCreate`/resumed replay); meanwhile
-/// voice, channel and role events for the guild are dropped by `live_actor`.
+/// count it and warn (throttled). Transient failures retry in place with
+/// capped backoff (see [`voice_actor_load_backoff`]); a credential refusal
+/// is not transient, so it is reported once and never retried — the actor
+/// then respawns only on the next guild snapshot (`publish_snapshot` on
+/// `GuildCreate`/resumed replay), and meanwhile voice, channel and role
+/// events for the guild are dropped by `live_actor`.
 fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
+    observe_voice_actor_load_failure_kind(
+        guild,
+        &error.to_string(),
+        *error != StoreError::CredentialRefused,
+    );
+}
+
+/// A load attempt that hit [`VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT`] is a
+/// transient failure like any other: counted, warned (throttled), retried.
+fn observe_voice_actor_load_timeout(guild: Snowflake) {
+    observe_voice_actor_load_failure_kind(guild, "the store load timed out", true);
+}
+
+fn observe_voice_actor_load_failure_kind(guild: Snowflake, error: &str, retrying: bool) {
     metrics::global().db_error("other");
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -770,11 +843,19 @@ fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
             .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
-        warn!(
-            guild_id = guild.to_string(),
-            error = %error,
-            "voice actor load failed; actor respawns on the next guild snapshot"
-        );
+        if retrying {
+            warn!(
+                guild_id = guild.to_string(),
+                error = %error,
+                "voice actor load failed; retrying with capped backoff"
+            );
+        } else {
+            warn!(
+                guild_id = guild.to_string(),
+                error = %error,
+                "voice actor load failed; credential refused, not retrying"
+            );
+        }
     }
 }
 
@@ -2685,6 +2766,16 @@ pub struct GuildRoomWorker<S, H> {
     name_settings_loaded: bool,
     /// Actor clock of the last settings read (periodic reload).
     name_settings_read_ms: Option<u64>,
+    /// Boot fallback for the empty-room grace (`TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS`
+    /// at boot). A stored per-guild row overrides it live; unset and
+    /// out-of-range rows keep it.
+    empty_grace_fallback: Duration,
+    /// Revision of the live snapshot the empty grace was last resolved from.
+    /// Revision-gated so steady-state maintenance costs two mutex reads.
+    empty_grace_revision: Option<i64>,
+    /// Live-settings source for the stored empty-grace override (production
+    /// poller snapshot; tests resolve explicit snapshots instead).
+    live_source: Arc<dyn Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync>,
     /// Cheap fingerprint of every input automatic names depend on; an idle
     /// guild skips the per-room work entirely.
     name_inputs: Option<u64>,
@@ -3002,6 +3093,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         let guild_id = live.guild_id;
         let creators_generation = live.read_state().generation;
+        let empty_grace_fallback = live.read_state().empty_grace.unwrap_or(EMPTY_ROOM_GRACE);
         let worker = Self {
             live,
             store,
@@ -3033,6 +3125,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             name_signatures: HashMap::new(),
             name_settings_loaded,
             name_settings_read_ms: None,
+            empty_grace_fallback,
+            empty_grace_revision: None,
+            live_source: Arc::new(|| None),
             name_inputs: None,
             room_status: HashMap::new(),
             pending_status: HashMap::new(),
@@ -3086,6 +3181,31 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             );
         }
         Ok(worker)
+    }
+
+    /// Re-resolve the empty-room grace from the live snapshot. Revision-gated,
+    /// so steady-state calls cost two mutex reads. A stored change applies
+    /// without a restart; unset and out-of-range rows keep the boot fallback.
+    /// Tests pass an explicit snapshot pair.
+    pub(crate) fn refresh_empty_grace_with(
+        &mut self,
+        live: Option<&two_bot_core::settings::LiveSettings>,
+    ) {
+        let revision = live.map(|live| live.revision());
+        if self.empty_grace_revision == revision {
+            return;
+        }
+        self.empty_grace_revision = revision;
+        let guild = self.live.guild_id.to_string();
+        let grace = stored_empty_grace_with(&guild, self.empty_grace_fallback, live);
+        self.live.set_empty_grace(grace);
+    }
+
+    /// Refresh from the runtime's live-settings source (production poller
+    /// snapshot; no reader in tests, so the boot fallback stands).
+    pub(crate) fn refresh_empty_grace(&mut self) {
+        let live = (self.live_source)();
+        self.refresh_empty_grace_with(live.as_ref());
     }
 
     /// Run the create-path name filter under `policy` from here on.
@@ -6233,6 +6353,37 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     self.queue.mark_succeeded(&action);
                     return true;
                 }
+                // Member-requested renames pass the same automod name filter
+                // as every other naming path: a blocked name is refused
+                // here, before any Discord call, with the stable
+                // `name_blocked` outcome. Allowed names fall through
+                // unchanged.
+                {
+                    let owner_id = self
+                        .rooms
+                        .get(&channel_id)
+                        .map(|room| room.owner_id)
+                        .unwrap_or(channel_id);
+                    let context = NameFilterContext {
+                        guild_id: self.live.guild_id.to_string(),
+                        channel_id: channel_id.to_string(),
+                        user_id: owner_id.to_string(),
+                    };
+                    if filter_channel_name(&name, &self.name_policy, &context).is_err() {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            "name_blocked",
+                            "name_blocked",
+                            0,
+                            false,
+                        );
+                        metrics::global().voice_name("name_blocked");
+                        self.desired_names.remove(&channel_id);
+                        self.queue.mark_succeeded(&action);
+                        return true;
+                    }
+                }
                 // Flush-time uniqueness recheck (legacy 38041a1 drops a
                 // throttled rename that would now duplicate): a literal
                 // custom rename is dropped when the folded name is held by
@@ -7015,6 +7166,130 @@ enum ActorCommand {
     },
 }
 
+impl ActorCommand {
+    /// True for fire-and-forget state that can wait for the worker:
+    /// snapshots, voice frames and config swaps apply in arrival order
+    /// once it loads. Anything else carries a one-shot reply no worker
+    /// exists to answer yet (status, room commands, vote-kick, test
+    /// probes), so [`load_actor_worker`] drops it while initialization is
+    /// pending: the caller sees `None` and takes the existing "syncing,
+    /// try again shortly" path instead of hanging until recovery.
+    /// Fail-fast is the default, so a future reply-bearing variant can
+    /// never hang the init window by omission.
+    fn is_bufferable(&self) -> bool {
+        matches!(
+            self,
+            ActorCommand::Reconcile
+                | ActorCommand::Display { .. }
+                | ActorCommand::NameSettingsChanged(_)
+                | ActorCommand::RoomFactsChanged(_)
+                | ActorCommand::Join { .. }
+                | ActorCommand::CreatorAdded(_)
+                | ActorCommand::RefreshCreators
+                | ActorCommand::AccessChanged(_)
+        )
+    }
+}
+
+/// Cap on commands buffered while actor initialization is pending: voice
+/// state converges on the latest frame and `Reconcile` is idempotent, so
+/// a long outage sheds the oldest instead of growing without bound.
+const VOICE_ACTOR_INIT_BUFFER_CAP: usize = 512;
+
+/// Buffer one command that arrived during a load attempt. Everything waits
+/// (capped, oldest shed): when the attempt succeeds the worker answers the
+/// reply-bearing commands in arrival order, so a status or vote-kick sent
+/// right after the snapshot still resolves. Shedding the oldest at the cap
+/// drops its one-shot sender, so an overflowed caller fails fast with `None`.
+fn buffer_attempt_command(buffered: &mut VecDeque<ActorCommand>, command: ActorCommand) {
+    if buffered.len() >= VOICE_ACTOR_INIT_BUFFER_CAP {
+        let _ = buffered.pop_front();
+    }
+    buffered.push_back(command);
+}
+
+/// Buffer one command that arrived while backing off between attempts.
+/// Reply-bearing commands are dropped (see [`ActorCommand::is_bufferable`]);
+/// the rest apply in arrival order once the worker loads.
+fn buffer_init_command(buffered: &mut VecDeque<ActorCommand>, command: ActorCommand) {
+    if !command.is_bufferable() {
+        return;
+    }
+    buffer_attempt_command(buffered, command);
+}
+
+/// Drop buffered reply-bearing commands after a failed attempt. Their
+/// one-shot senders are dropped with them, so each waiting caller resolves
+/// to `None` (the existing "syncing" fallback) instead of hanging across
+/// an unbounded backoff window. Fire-and-forget state stays queued.
+fn purge_unanswerable_buffered(buffered: &mut VecDeque<ActorCommand>) {
+    buffered.retain(|command| command.is_bufferable());
+}
+
+#[cfg(test)]
+mod voice_actor_init_buffer_tests {
+    use super::{
+        buffer_attempt_command, buffer_init_command, purge_unanswerable_buffered, ActorCommand,
+        VecDeque, VOICE_ACTOR_INIT_BUFFER_CAP,
+    };
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn reply_bearing_commands_fail_fast_while_fire_and_forget_buffers() {
+        let mut buffered = VecDeque::new();
+        buffer_init_command(&mut buffered, ActorCommand::Reconcile);
+        buffer_init_command(&mut buffered, ActorCommand::RefreshCreators);
+        let (status_tx, mut status_rx) = oneshot::channel();
+        buffer_init_command(&mut buffered, ActorCommand::Status(status_tx));
+        let (kick_tx, _) = oneshot::channel();
+        buffer_init_command(
+            &mut buffered,
+            ActorCommand::KickRoomOf {
+                member: 7,
+                reply: kick_tx,
+            },
+        );
+        assert_eq!(
+            buffered.len(),
+            2,
+            "replies must not hang the backoff buffer"
+        );
+        assert!(matches!(buffered[0], ActorCommand::Reconcile));
+        assert!(matches!(buffered[1], ActorCommand::RefreshCreators));
+        // The dropped status sender resolves the waiter to `None` (syncing
+        // fallback) instead of hanging until recovery.
+        assert!(matches!(
+            status_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn attempt_buffers_replies_then_failure_purges_them() {
+        let mut buffered = VecDeque::new();
+        buffer_attempt_command(&mut buffered, ActorCommand::Reconcile);
+        let (status_tx, mut status_rx) = oneshot::channel();
+        buffer_attempt_command(&mut buffered, ActorCommand::Status(status_tx));
+        assert_eq!(buffered.len(), 2, "attempt must wait for replies");
+        purge_unanswerable_buffered(&mut buffered);
+        assert_eq!(buffered.len(), 1, "failure fails fast, keeps state");
+        assert!(matches!(buffered[0], ActorCommand::Reconcile));
+        assert!(matches!(
+            status_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn init_buffer_sheds_oldest_at_cap() {
+        let mut buffered = VecDeque::new();
+        for _ in 0..VOICE_ACTOR_INIT_BUFFER_CAP + 10 {
+            buffer_init_command(&mut buffered, ActorCommand::Reconcile);
+        }
+        assert_eq!(buffered.len(), VOICE_ACTOR_INIT_BUFFER_CAP);
+    }
+}
+
 /// A V2 ownership command from an interaction. `Reclaim` takes the caller's
 /// room back as its original creator (or claims one whose owner is gone);
 /// `Transfer` hands the caller's room to an occupant and makes them the
@@ -7029,7 +7304,9 @@ pub type KickReply = Result<VoteKickUpdate, KickRefusal>;
 
 /// Per-guild actor registry. Actors spawn lazily on the first complete
 /// snapshot and exit when their guild leaves (sender dropped) or their store
-/// load fails (respawned on the next guild snapshot via `UnboundedSender::is_closed`).
+/// load refuses the credential (respawned on the next guild snapshot via
+/// `UnboundedSender::is_closed`); transient load failures retry inside the
+/// spawned task instead (see `load_actor_worker`).
 /// How long an `/import` preview stays confirmable. Past that the Confirm
 /// button answers "expired" and writes nothing; the member uploads again.
 pub const PENDING_IMPORT_TTL: Duration = Duration::from_secs(15 * 60);
@@ -7088,6 +7365,10 @@ pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,
     enabled: bool,
+    /// Live-settings source for the per-guild empty-grace override. Production
+    /// reads the settings-poller snapshot; tests default to no reader (boot
+    /// fallback, byte-identical).
+    live_source: Arc<dyn Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync>,
     protected_channels: HashSet<Snowflake>,
     /// Boot creator set (the generator channel): copied into each new actor's
     /// `creator_channels` alongside the store creators loaded later.
@@ -7135,6 +7416,7 @@ where
             make: Arc::new(make),
             tick,
             enabled,
+            live_source: Arc::new(|| None),
             protected_channels: HashSet::new(),
             creator_channels: HashSet::new(),
             empty_grace: None,
@@ -7174,6 +7456,17 @@ where
     /// production; fixtures shorten it for unrelated lifecycle races).
     pub fn with_empty_grace(mut self, grace: Duration) -> Self {
         self.empty_grace = Some(grace);
+        self
+    }
+
+    /// Live-settings source for the stored per-guild empty-grace override.
+    /// Production passes the settings-poller snapshot reader; tests keep the
+    /// default (no reader, boot fallback).
+    pub fn with_live_source(
+        mut self,
+        source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
+    ) -> Self {
+        self.live_source = Arc::new(source);
         self
     }
 
@@ -7311,9 +7604,21 @@ where
         actor
             .live
             .protect_creators(self.creator_channels.iter().copied());
-        if let Some(grace) = self.empty_grace {
+        // Boot fallback first, then the stored per-guild override: a stored
+        // change reaches new actors without a restart; unset and out-of-range
+        // rows keep the boot value.
+        let fallback = self.empty_grace.unwrap_or(EMPTY_ROOM_GRACE);
+        let guild_id = guild.to_string();
+        let snapshot = (self.live_source)();
+        let stored = snapshot
+            .as_ref()
+            .and_then(|live| live.get(&guild_id, EMPTY_GRACE_KEY));
+        let grace = stored_empty_grace_with(&guild_id, fallback, snapshot.as_ref());
+        if self.empty_grace.is_some() || stored.is_some() {
             actor.live.set_empty_grace(grace);
         }
+        // Else leave `empty_grace` unset: `empty_grace_elapsed` falls back to
+        // `EMPTY_ROOM_GRACE`, byte-identical to today.
         let synthetic = synthetic_humans_for(guild, &self.synthetic_humans);
         if !synthetic.is_empty() {
             actor.live.set_synthetic_humans(synthetic);
@@ -7322,18 +7627,24 @@ where
         let make = Arc::clone(&self.make);
         let tick = self.tick;
         let name_policy = Arc::clone(&self.name_policy);
+        let live_source = Arc::clone(&self.live_source);
         tokio::spawn(async move {
-            let (store, http) = make();
-            let guild_id = live.guild_id;
-            let worker = match GuildRoomWorker::load(live, store, http).await {
-                Ok(worker) => worker,
-                Err(error) => {
-                    observe_voice_actor_load_failure(guild_id, &error);
-                    return;
-                }
+            let mut rx = rx;
+            let Some((worker, buffered)) = load_actor_worker(make.as_ref(), live, &mut rx).await
+            else {
+                return;
             };
             let mut worker = worker.with_name_policy(name_policy);
-            run_actor(&mut worker, rx, tick).await;
+            worker.live_source = live_source;
+            // `load` captures the fallback from the shared live state, which
+            // already holds the stored override here; restore the true boot
+            // value so a later row removal or out-of-range edit falls back
+            // to boot, not to the stale stored grace.
+            worker.empty_grace_fallback = fallback;
+            // Apply the stored override at spawn; later stored changes arrive
+            // through the maintenance refresh without a restart.
+            worker.refresh_empty_grace();
+            run_actor_with_initial(&mut worker, rx, tick, buffered).await;
         });
         actors.insert(guild, actor.clone());
         Some(actor)
@@ -8054,8 +8365,27 @@ where
                 // Prefer the event's role list when the cache has not caught up.
                 let roles =
                     roles.or_else(|| Some(updated.roles.iter().map(|id| id.get()).collect()));
+                // A nickname change renders into `@@owner@@` rooms: forward it
+                // as a display update so the worker's directory (which the
+                // background re-render reads) never stays behind the fresh
+                // directory a `/name` submit just rendered from. Read the name
+                // from the event itself, not the cache, so a lagging cache
+                // cannot re-apply the old nickname.
+                let display = updated
+                    .nick
+                    .clone()
+                    .filter(|nick| !nick.is_empty())
+                    .or_else(|| {
+                        updated
+                            .user
+                            .global_name
+                            .clone()
+                            .filter(|name| !name.is_empty())
+                    })
+                    .unwrap_or_else(|| updated.user.name.clone());
                 if let Some(actor) = self.live_actor(guild_id) {
                     actor.live.set_member_roles(member_id, roles);
+                    let _ = actor.tx.send(ActorCommand::Display { member_id, display });
                 }
             }
             // A warm RESUME replays missed dispatches before RESUMED; only then
@@ -8100,12 +8430,123 @@ where
     }
 }
 
+/// Load one guild worker, retrying transient store failures in place so a
+/// brief database outage during `GuildCreate` no longer leaves the guild
+/// actorless until the next snapshot. Bounds: each attempt is abandoned
+/// after [`VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT`] (the load is reads only, so
+/// abandoning it replays nothing), consecutive failures wait
+/// [`voice_actor_load_backoff`] between attempts, and the same single
+/// spawned task owns every attempt — retries never spawn a second actor.
+///
+/// While a load attempt is in flight, every inbox command waits in order
+/// (capped, oldest shed) and is handed to `run_actor_with_initial` on
+/// success, so a status sent right after the snapshot still resolves once
+/// the worker exists. When the attempt fails or times out, buffered
+/// reply-bearing commands are purged (see [`ActorCommand::is_bufferable`])
+/// so their callers get the existing "syncing" fallback instead of hanging
+/// across the backoff window; commands arriving during the backoff itself
+/// are dropped unless fire-and-forget. Cancellation is the inbox closing
+/// (every sender dropped):
+/// `remove_guild` and runtime drop both end the retry loop, and a load
+/// that finishes after removal is discarded instead of resurrecting the
+/// guild. A [`StoreError::CredentialRefused`] attempt is never retried:
+/// no credential replacement or permission repair is attempted here.
+async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
+    make: &(dyn Fn() -> (S, H) + Send + Sync),
+    live: LiveGuild,
+    inbox: &mut mpsc::UnboundedReceiver<ActorCommand>,
+) -> Option<(GuildRoomWorker<S, H>, VecDeque<ActorCommand>)> {
+    let guild_id = live.guild_id;
+    let mut buffered = VecDeque::new();
+    let mut failed_attempts = 0u32;
+    loop {
+        let (store, http) = make();
+        let attempt = GuildRoomWorker::load(live.clone(), store, http);
+        tokio::pin!(attempt);
+        let deadline = tokio::time::sleep(VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT);
+        tokio::pin!(deadline);
+        let mut finished = None;
+        let mut timed_out = false;
+        loop {
+            tokio::select! {
+                result = &mut attempt => {
+                    finished = Some(result);
+                    break;
+                }
+                () = &mut deadline => {
+                    timed_out = true;
+                    break;
+                }
+                command = inbox.recv() => match command {
+                    Some(command) => buffer_attempt_command(&mut buffered, command),
+                    None => return None,
+                },
+            }
+        }
+        // A timed-out attempt future is dropped here, abandoning its
+        // in-flight reads; the next attempt starts from a fresh pair.
+        match finished {
+            Some(Ok(worker)) => {
+                // Drain what is already queued and re-check the cancel
+                // signal: a load that finished after every sender dropped
+                // (guild removed) is discarded, never published.
+                loop {
+                    match inbox.try_recv() {
+                        Ok(command) => buffer_attempt_command(&mut buffered, command),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                    }
+                }
+                return Some((worker, buffered));
+            }
+            Some(Err(error)) => {
+                observe_voice_actor_load_failure(guild_id, &error);
+                if error == StoreError::CredentialRefused {
+                    return None;
+                }
+            }
+            None => {
+                debug_assert!(timed_out);
+                observe_voice_actor_load_timeout(guild_id);
+            }
+        }
+        // The attempt failed: waiting reply-bearing callers resolve now
+        // instead of hanging across the backoff window. State stays queued.
+        purge_unanswerable_buffered(&mut buffered);
+        failed_attempts = failed_attempts.saturating_add(1);
+        let wait = tokio::time::sleep(voice_actor_load_backoff(failed_attempts));
+        tokio::pin!(wait);
+        loop {
+            tokio::select! {
+                () = &mut wait => break,
+                command = inbox.recv() => match command {
+                    Some(command) => buffer_init_command(&mut buffered, command),
+                    None => return None,
+                },
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 async fn run_actor<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
     inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
 ) {
     run_actor_with_limits(worker, inbox, tick, ActorLimits::default()).await;
+}
+
+/// Run the actor loop after [`load_actor_worker`], applying the commands
+/// buffered during initialization (in arrival order) before any command
+/// that arrives afterwards.
+async fn run_actor_with_initial<S: RoomPersistence, H: RoomWrites + 'static>(
+    worker: &mut GuildRoomWorker<S, H>,
+    inbox: mpsc::UnboundedReceiver<ActorCommand>,
+    tick: Duration,
+    initial: VecDeque<ActorCommand>,
+) {
+    run_actor_inner(worker, inbox, tick, ActorLimits::default(), initial).await;
 }
 
 /// Bounds for the per-guild actor loop (TOG stall follow-up). All bounds are
@@ -8360,11 +8801,22 @@ impl<H: RoomWrites> StallShared<H> {
     }
 }
 
+#[cfg(test)]
 async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
+    worker: &mut GuildRoomWorker<S, H>,
+    inbox: mpsc::UnboundedReceiver<ActorCommand>,
+    tick: Duration,
+    limits: ActorLimits,
+) {
+    run_actor_inner(worker, inbox, tick, limits, VecDeque::new()).await;
+}
+
+async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
     mut inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
     limits: ActorLimits,
+    initial: VecDeque<ActorCommand>,
 ) {
     let generation = next_voice_actor_generation();
     let start = tokio::time::Instant::now();
@@ -8427,6 +8879,22 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
             }
         })
     };
+    // Commands buffered while the worker loaded (initialization retry)
+    // apply first, in arrival order, under the same read-through and
+    // apply path as inbox commands; stale joins are refused by the usual
+    // ticket guards inside `apply_command`.
+    for command in initial {
+        let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        if let ActorCommand::Join { ticket, .. } = &command {
+            worker.revalidate_creator(ticket.creator_id).await;
+        }
+        let accepted = apply_command(worker, command, now_ms);
+        if accepted {
+            last_progress = tokio::time::Instant::now();
+        }
+        dispatch_ready |= accepted;
+    }
+    stall.snapshot(worker, last_progress);
     loop {
         tokio::select! {
             biased;
@@ -8557,6 +9025,9 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 // the watchdog sibling would keep ageing the pre-merge stamp.
                 stall.snapshot(worker, last_progress);
                 worker.reload_name_settings(now_ms).await;
+                // A stored empty-grace change applies without a restart;
+                // revision-gated so steady-state ticks stay cheap.
+                worker.refresh_empty_grace();
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
                 dispatch_budget = 8;
@@ -8716,6 +9187,7 @@ pub fn build_production_runtime(
     token: &str,
     pool: sqlx::PgPool,
     name_policy: AutomodPolicy,
+    live_source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
     // Malformed protection IDs refuse the whole runtime. The gateway reports it
     // through its cataloged `voice HTTP setup failed` event.
@@ -8749,7 +9221,8 @@ pub fn build_production_runtime(
             .with_creator_channels(generator.into_iter().collect())
             .with_empty_grace(empty_grace)
             .with_synthetic_humans(synthetic_humans)
-            .with_name_policy(name_policy),
+            .with_name_policy(name_policy)
+            .with_live_source(live_source),
         ),
         Arc::new(replies),
     ))
@@ -8778,6 +9251,50 @@ pub fn configured_empty_grace(value: Option<&str>) -> Result<Duration, InvalidEm
 /// `0..=600`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidEmptyGrace;
+
+/// The stored per-guild empty-grace key served from the live settings snapshot.
+pub(crate) const EMPTY_GRACE_KEY: &str = "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS";
+
+/// Effective empty-room grace: the stored per-guild value wins over the boot
+/// fallback, an absent/malformed/out-of-range stored value falls back
+/// (store-first, like the feed interval). Pure for tests via `live`.
+pub(crate) fn stored_empty_grace_with(
+    guild: &str,
+    fallback: Duration,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> Duration {
+    let Some(live) = live else {
+        return fallback;
+    };
+    let Some(value) = live.get(guild, EMPTY_GRACE_KEY) else {
+        return fallback;
+    };
+    let seconds: Option<u64> = match &value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                trimmed.parse::<u64>().ok()
+            }
+        }
+        _ => None,
+    };
+    match seconds {
+        Some(seconds) if seconds <= MAX_EMPTY_ROOM_GRACE_SECONDS => Duration::from_secs(seconds),
+        _ => {
+            warn!(
+                guild = guild.to_string(),
+                key = EMPTY_GRACE_KEY,
+                reason = "out_of_range",
+                value = %value,
+                "stored empty-grace override out of range; using boot fallback"
+            );
+            fallback
+        }
+    }
+}
 
 /// The synthetic test identities a guild's actor may use: none for the live
 /// guild, whatever `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` says.

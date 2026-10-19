@@ -156,7 +156,7 @@ tripwire without wedging ordinary code changes. A later event-executors head
 measured 15,770,928 bytes (15.04 MiB) in the [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38062362788/job/114254309361),
 42,288 bytes above the former ceiling. The internal-actions families (event
 executors plus channel-moderation union) measured 15,741,344 bytes (15.01 MiB).
-The 16 MiB working tripwire leaves 1,006,288 bytes (0.96 MiB, 6.4%) above the
+The then-current 16 MiB working tripwire left 1,006,288 bytes (0.96 MiB, 6.4%) above the
 event-executors measurement. No new dependencies or release-profile changes;
 revisit if the binary approaches the limit. The 112 MiB image ceiling is
 unchanged.
@@ -172,7 +172,11 @@ the binary ceiling moves to 17 MiB; revisit if the binary approaches it. The
 
 On 2026-10-17, the landed slices since the 16 MiB bump consumed its headroom:
 main at `89c859b1` measured 16,777,376 bytes (16.00 MiB), 160 bytes over the
-ceiling, so the gate trips on main itself. The moderation-enforcement-outcomes
+ceiling, so the gate trips on main itself. The PR-1093 merge_group against
+the same base measured the identical 16,777,376 bytes in [its container smoke
+job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39061090833),
+confirming the trip is main-red, not PR-introduced. The
+moderation-enforcement-outcomes
 head measured 16,778,152 bytes (16.00 MiB), 936 bytes over, with no new
 dependencies and the same minimal release profile. The budget is therefore
 rebumped to 17 MiB, leaving about 1 MiB of headroom above the measured heads;

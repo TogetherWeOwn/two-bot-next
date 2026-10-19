@@ -922,8 +922,12 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "voice_join_fast_burn",
     "voice_join_slow_burn",
     "voice_creator_map_stale",
+    "eventsub_post_failed_share",
     "error_budget_fast_burn",
+    "error_budget_slow_burn",
     "eventsub_tampered",
+    "eventsub_reconcile_failed",
+    "event_store_consumer_lag",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -944,12 +948,45 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("voice_join_fast_burn", window), `evidence-voice_join_fast_burn-${window}.json`);
   assert.equal(packetFilename("voice_join_slow_burn", window), `evidence-voice_join_slow_burn-${window}.json`);
   assert.equal(packetFilename("voice_creator_map_stale", window), `evidence-voice_creator_map_stale-${window}.json`);
+  assert.equal(packetFilename("eventsub_post_failed_share", window), `evidence-eventsub_post_failed_share-${window}.json`);
+  assert.equal(packetFilename("event_store_consumer_lag", window), `evidence-event_store_consumer_lag-${window}.json`);
   assert.equal(packetFilename("error_budget_fast_burn", window), `evidence-error_budget_fast_burn-${window}.json`);
+  assert.equal(packetFilename("error_budget_slow_burn", window), `evidence-error_budget_slow_burn-${window}.json`);
   assert.equal(packetFilename("eventsub_tampered", window), `evidence-eventsub_tampered-${window}.json`);
+  assert.equal(packetFilename("eventsub_reconcile_failed", window), `evidence-eventsub_reconcile_failed-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
   assert.equal(packetFilename("rest_429_rate", "2026-10-09T20:11:06Z"), "evidence-rest_429_rate-2026-10-09T20-11-06Z.json");
+});
+
+test("eventsub post failures accumulate across low-volume samples until the floor", () => {
+  const posts = (attempted: number, succeeded: number, failed: number, other: number) => [
+    `two_bot_eventsub_posts_total{outcome="attempted"} ${attempted}`,
+    `two_bot_eventsub_posts_total{outcome="succeeded"} ${succeeded}`,
+    `two_bot_eventsub_posts_total{outcome="failed"} ${failed}`,
+    `two_bot_eventsub_posts_total{outcome="other"} ${other}`,
+  ];
+  // One failed post per sample: every window is sub-floor, so nothing fires
+  // while attempts accumulate toward the 10-attempt floor.
+  let state = ev(posts(10, 9, 1, 0)).state;
+  for (let n = 11; n <= 18; n++) {
+    const next = ev(posts(n, 9, n - 9, 0), state);
+    assert.deepEqual(next.firing, [], `one failure per sample stays quiet with ${n - 10} accumulated`);
+    state = next.state;
+  }
+  // The tenth accumulated attempt reaches the floor at a 100% share: fires.
+  const fired = ev(posts(20, 9, 11, 0), state);
+  assert.deepEqual(fired.firing, ["eventsub_post_failed_share"]);
+  // The judged window rebaselines but the ticket holds: the next sub-floor
+  // window accumulates toward the next floor instead of resolving.
+  const held = ev(posts(21, 9, 12, 0), fired.state);
+  assert.deepEqual(held.firing, ["eventsub_post_failed_share"]);
+  assert.deepEqual(transitionMessages(fired.firing, held.firing), [], "holding is not a new ALERT");
+  // A healthy accumulation (floor met, share at the line) rebaselines quietly.
+  let healthy = ev(posts(0, 0, 0, 0)).state;
+  for (let n = 1; n <= 9; n++) healthy = ev(posts(n, n, 0, 0), healthy).state;
+  assert.deepEqual(ev(posts(10, 10, 0, 0), healthy).firing, []);
 });
 
 test("every rule links to an existing runbook heading", () => {
@@ -1063,32 +1100,58 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   burn = evaluateMetrics(parseExposition(body(joinLines(1000, 10, 800))), burn.state, burnBase + 3600);
   firing.push(...burn.firing);
   // Forced REST error-budget burn: ~10k eligible events/hour with 2 budget
-  // errors/min over 16 min burns near 12x in both the 15 min and 2 min
-  // windows and pages exactly once (the per-sample 5xx share stays ~1%, so
-  // rest_5xx_rate stays silent).
+  // errors/min over 125 min burns near 12x in the 15 min / 2 min windows
+  // (fast page) and near 12x in the 2 h / 15 min windows (slow ticket); the
+  // per-sample 5xx share stays ~1%, so rest_5xx_rate stays silent.
   const restBudget = (total: number, errors5xx: number) => [
     `two_bot_rest_requests_total{route="other",result="2xx"} ${total - errors5xx}`,
     `two_bot_rest_requests_total{route="other",result="5xx"} ${errors5xx}`,
   ];
-  let budget = evaluateMetrics(parseExposition(body(restBudget(100_000, 1_000))), EMPTY_STATE, NOW - 1100);
+  let budget = evaluateMetrics(parseExposition(body(restBudget(100_000, 1_000))), EMPTY_STATE, NOW - 7600);
   let budgetTotal = 100_000;
   let budgetErrors = 1_000;
-  for (let minute = 1; minute <= 16; minute += 1) {
+  for (let minute = 1; minute <= 125; minute += 1) {
     budgetTotal += 167;
     budgetErrors += 2;
     budget = evaluateMetrics(
       parseExposition(body(restBudget(budgetTotal, budgetErrors))),
       budget.state,
-      NOW - 1100 + minute * 60,
+      NOW - 7600 + minute * 60,
     );
   }
   firing.push(...budget.firing);
   firing.push(...ev(["two_bot_voice_creator_map_generation 3", "two_bot_voice_creator_map_age_seconds 601"]).firing);
+  firing.push(
+    ...ev(
+      [
+        `two_bot_eventsub_posts_total{outcome="attempted"} 120`,
+        `two_bot_eventsub_posts_total{outcome="succeeded"} 90`,
+        `two_bot_eventsub_posts_total{outcome="failed"} 25`,
+        `two_bot_eventsub_posts_total{outcome="other"} 5`,
+      ],
+      ev([
+        `two_bot_eventsub_posts_total{outcome="attempted"} 100`,
+        `two_bot_eventsub_posts_total{outcome="succeeded"} 90`,
+        `two_bot_eventsub_posts_total{outcome="failed"} 5`,
+        `two_bot_eventsub_posts_total{outcome="other"} 5`,
+      ]).state,
+    ).firing,
+  );
   let tampered = ev([`two_bot_eventsub_classified_total{kind="tampered"} 0`]);
   for (const n of [1, 2, 3]) {
     tampered = ev([`two_bot_eventsub_classified_total{kind="tampered"} ${n}`], tampered.state);
   }
   firing.push(...tampered.firing);
+  let lag = ev(["two_bot_event_store_consumer_lag_seconds 90"]);
+  lag = ev(["two_bot_event_store_consumer_lag_seconds 90"], lag.state);
+  lag = ev(["two_bot_event_store_consumer_lag_seconds 90"], lag.state);
+  firing.push(...lag.firing);
+  const reconcilePasses = (healthy: number, pending: number, failed: number) => [
+    `two_bot_eventsub_reconcile_passes_total{outcome="healthy"} ${healthy}`,
+    `two_bot_eventsub_reconcile_passes_total{outcome="pending"} ${pending}`,
+    `two_bot_eventsub_reconcile_passes_total{outcome="failed"} ${failed}`,
+  ];
+  firing.push(...ev(reconcilePasses(3, 1, 1), ev(reconcilePasses(3, 1, 0)).state).firing);
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);
@@ -1131,4 +1194,94 @@ test("/ops/metrics: 404 without a configured token, 401 without/with a wrong bea
   assert.equal(calls.length, 1);
   const post = await worker.fetch(new Request("https://w.invalid/ops/metrics", { method: "POST", headers: { authorization: `Bearer ${token}` } }), env(token), ctx);
   assert.equal(post.status, 404);
+});
+
+test("slow-burn ticket survives a counter reset instead of resolving", () => {
+  // Firing ~6x slow burn (167 eligible/min, 1 budget error/min), then a
+  // container restart sends the cumulative counters backwards while the
+  // leak continues: the ticket must hold, never post RESOLVED, and must
+  // not need a fresh 2 h ring to stay filed.
+  const restBudget = (total: number, errors5xx: number) => [
+    `two_bot_rest_requests_total{route="other",result="2xx"} ${total - errors5xx}`,
+    `two_bot_rest_requests_total{route="other",result="5xx"} ${errors5xx}`,
+  ];
+  const base = NOW - 200 * 60;
+  let state = evaluateMetrics(parseExposition(body(restBudget(100_000, 1_000))), EMPTY_STATE, base).state;
+  let total = 100_000;
+  let errors = 1_000;
+  for (let minute = 1; minute <= 125; minute += 1) {
+    total += 167;
+    errors += 1;
+    state = evaluateMetrics(parseExposition(body(restBudget(total, errors))), state, base + minute * 60).state;
+  }
+  const firingAt = base + 125 * 60;
+  assert.ok(
+    evaluateMetrics(parseExposition(body(restBudget(total, errors))), state, firingAt + 60).firing.includes(
+      "error_budget_slow_burn",
+    ),
+    "125 min of ~6x burn must ticket before the restart",
+  );
+  const reset = evaluateMetrics(parseExposition(body(restBudget(2_000, 20))), state, firingAt + 60);
+  assert.ok(
+    reset.firing.includes("error_budget_slow_burn"),
+    "counter reset must hold the firing slow ticket, not resolve it",
+  );
+  // The leak continues after the restart: the held ticket stays filed while
+  // the ring rebuilds, instead of re-ticketing as a new incident 2 h later.
+  let rebuilt = reset;
+  let rebuiltTotal = 2_000;
+  let rebuiltErrors = 20;
+  for (let minute = 1; minute <= 20; minute += 1) {
+    rebuiltTotal += 167;
+    rebuiltErrors += 1;
+    rebuilt = evaluateMetrics(
+      parseExposition(body(restBudget(rebuiltTotal, rebuiltErrors))),
+      rebuilt.state,
+      firingAt + 60 + minute * 60,
+    );
+    assert.ok(
+      rebuilt.firing.includes("error_budget_slow_burn"),
+      `ticket must stay filed while the ring rebuilds (minute ${minute} after restart)`,
+    );
+  }
+});
+
+test("slow-burn ticket resolves on a covered quiet short window while the long window is unknown", () => {
+  // Firing slow burn, then a ~2 h scrape stall with quiet counters ages the
+  // 2 h baseline out of tolerance while later quiet scrapes cover the
+  // 15 min window: the covered quiet short window must resolve the ticket
+  // instead of holding it on history alone.
+  const restBudget = (total: number, errors5xx: number) => [
+    `two_bot_rest_requests_total{route="other",result="2xx"} ${total - errors5xx}`,
+    `two_bot_rest_requests_total{route="other",result="5xx"} ${errors5xx}`,
+  ];
+  const base = NOW - 200 * 60;
+  let state = evaluateMetrics(parseExposition(body(restBudget(100_000, 1_000))), EMPTY_STATE, base).state;
+  let total = 100_000;
+  let errors = 1_000;
+  for (let minute = 1; minute <= 125; minute += 1) {
+    total += 167;
+    errors += 1;
+    state = evaluateMetrics(parseExposition(body(restBudget(total, errors))), state, base + minute * 60).state;
+  }
+  const firingAt = base + 125 * 60;
+  total += 100;
+  const stalledAt = firingAt + 7500;
+  let current = evaluateMetrics(parseExposition(body(restBudget(total, errors))), state, stalledAt);
+  assert.ok(
+    current.firing.includes("error_budget_slow_burn"),
+    "ticket must hold across the stall while the short window is uncovered",
+  );
+  for (let minute = 1; minute <= 16; minute += 1) {
+    total += 167;
+    current = evaluateMetrics(
+      parseExposition(body(restBudget(total, errors))),
+      current.state,
+      stalledAt + minute * 60,
+    );
+  }
+  assert.ok(
+    !current.firing.includes("error_budget_slow_burn"),
+    "covered quiet 15 min window must resolve the ticket even with the 2 h window unknown",
+  );
 });

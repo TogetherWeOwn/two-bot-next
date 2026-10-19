@@ -720,10 +720,17 @@ mod tests {
     }
 
     // Deliberately reject arbitrary URLs before opening any connection. Only
-    // the mandated empty-password test service (or its CI counterpart) is allowed.
+    // the mandated empty-password test service (or its CI counterpart) is
+    // allowed, plus the workspace bootstrap database used by the check.yml
+    // coverage sweep: the store always connects to `agent_test` with an
+    // isolated schema, so the bootstrap URL never changes where data lands.
+    // Accepting it here keeps the sweep green instead of emitting expected
+    // guard panics that flake detection misattributes as test flakes.
     fn test_database_url_allowed(url: &str, github_actions: bool) -> bool {
         url == "postgres://agent_test@agent-testdb:5432/agent_test"
+            || url == "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci"
             || (github_actions && url == "postgres://agent_test@127.0.0.1:5432/agent_test")
+            || (github_actions && url == "postgres://agent_test:@127.0.0.1:5432/two_bot_test_ci")
     }
 
     async fn test_store() -> TestStore {
@@ -791,11 +798,20 @@ mod tests {
             false
         ));
         assert!(test_database_url_allowed(
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+            false
+        ));
+        assert!(test_database_url_allowed(
             "postgres://agent_test@127.0.0.1:5432/agent_test",
+            true
+        ));
+        assert!(test_database_url_allowed(
+            "postgres://agent_test:@127.0.0.1:5432/two_bot_test_ci",
             true
         ));
         for url in [
             "postgres://agent_test@127.0.0.1:5432/agent_test",
+            "postgres://agent_test:@127.0.0.1:5432/two_bot_test_ci",
             "postgres://agent_test@production:5432/agent_test",
             "postgres://admin@agent-testdb:5432/agent_test",
             "postgres://agent_test:secret@agent-testdb:5432/agent_test",

@@ -55,7 +55,7 @@ The OpenAI-compatible endpoint call with the validated payload, the
 Apply/Refine/Cancel flow, the six-scenario output validation, and the
 admin-only command gate all remain outside this slice. The per-guild
 month-start/build-count column has landed since (`assistant_monthly_builds`,
-migration `0444`, decided through this module by the `two-bot-store`
+migration `0446`, decided through this module by the `two-bot-store`
 `PgAssistantCapLedger`), as has the "disabled unless configured"
 before-send gate (`two_bot_core::voice_assistant::require_send_allowed`,
 refusing `assistant_not_configured` before any send and `monthly_cap_reached`

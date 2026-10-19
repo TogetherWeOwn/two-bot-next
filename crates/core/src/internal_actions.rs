@@ -2836,11 +2836,15 @@ mod tests {
         // TOG-23387 adds five env-only EventSub keys (TWO_EVENTSUB,
         // TWO_EVENTSUB_BIND, TWO_TWITCH_CLIENT_ID, TWO_TWITCH_CLIENT_SECRET,
         // TWO_TWITCH_WEBHOOK_SECRET). This change adds two env-only keys
-        // (TWO_TWITCH_BROADCASTERS, TWO_TWITCH_CALLBACK_URL).
+        // (TWO_TWITCH_BROADCASTERS, TWO_TWITCH_CALLBACK_URL). The delivery
+        // provisioning slice adds three env-only keys (TWO_EVENTSUB_DELIVERY,
+        // TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID, TWO_EVENTSUB_INVITE_URL).
+        // TOG-29862 moves TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS from cold to hot,
+        // shifting one entry between those classes.
         for (class, expected) in [
-            (SettingClass::Hot, 42),
-            (SettingClass::Cold, 27),
-            (SettingClass::EnvOnly, 61),
+            (SettingClass::Hot, 43),
+            (SettingClass::Cold, 26),
+            (SettingClass::EnvOnly, 64),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),

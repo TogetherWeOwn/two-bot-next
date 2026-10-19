@@ -7,13 +7,21 @@ written, stop and escalate instead of changing the tests.
 
 The slice under test adds only a persistent per-guild monthly-cap
 ledger (migration + store) and a disabled-unless-configured before-send
-gate in the existing pure assistant modules. It must not introduce an
-endpoint call, an HTTP/transport change, a credential binding or a
-command handler anywhere in its diff. This file pins that negatively:
+gate in the existing pure assistant modules. A new table also needs its
+deployment classification in the same slice: a cutover-chain mirror
+migration (plus its checksum-lock entry) so deployed environments
+create the table, a backup dump classification and a rollback table
+spec so backup/rollback tooling never meets an unclassified table.
+Those classification paths are admitted below as exact files (and the
+cutover migrations directory); every other cutover/backup path stays
+forbidden by omission. The slice must not introduce an endpoint call,
+an HTTP/transport change, a credential binding or a command handler
+anywhere in its diff. This file pins that negatively:
 
 * Every changed path must sit inside the allowlist below (store
   migration/store code, the two pure assistant core modules, tests,
-  docs, the migration checksum lock, schema-tripwire SQL, and the CI
+  docs, the migration checksum lock, schema-tripwire SQL, the exact
+  backup/rollback classification files, cutover migrations, and the CI
   workflow steps that wire the new tests).
 * Changed paths under transport/credential/handler/endpoint-call areas
   are violations even before content is considered.
@@ -38,6 +46,9 @@ ALLOWED_PREFIXES = (
     "crates/store/src/",
     "crates/store/tests/",
     "crates/core/tests/",
+    # Cutover mirror migration only; cutover sources stay out except the
+    # exact rollback classification file below.
+    "crates/cutover/migrations/",
     "docs/",
     "scripts/ci/",
     "sql/",
@@ -48,6 +59,10 @@ ALLOWED_FILES = frozenset(
         "crates/core/src/voice_assistant.rs",
         "crates/core/src/voice_assistant_cap.rs",
         "crates/core/src/lib.rs",
+        # Backup/rollback classification of the new table (exact files;
+        # added lines there still face the content scan below).
+        "crates/core/src/backup/dump_file.rs",
+        "crates/cutover/src/rollback_delta.rs",
         "migrations.lock",
         ".github/workflows/check.yml",
     }
@@ -146,6 +161,14 @@ BUILDER_SHAPED_PATHS = [
     "docs/voice-assistant-cap-core.md",
     "migrations.lock",
     ".github/workflows/check.yml",
+    # Backup/rollback classification + cutover mirror of the new table.
+    "crates/core/src/backup/dump_file.rs",
+    "crates/core/tests/fixtures/backup_schema_seed.sql",
+    "crates/core/tests/fixtures/pre-reservation-v4.ndjson",
+    "crates/cutover/migrations/0444_assistant_monthly_builds.sql",
+    "crates/cutover/src/rollback_delta.rs",
+    "docs/database-roles.md",
+    "sql/database_role_matrix.sql",
 ]
 
 
@@ -158,6 +181,39 @@ class AllowlistCheckerTest(unittest.TestCase):
             ]
         }
         self.assertEqual(diff_violations(BUILDER_SHAPED_PATHS, added), [])
+
+    def test_backup_rollback_classification_paths_pass(self):
+        added = {
+            "crates/core/src/backup/dump_file.rs": ['    "assistant_monthly_builds",'],
+            "crates/cutover/src/rollback_delta.rs": [
+                '    TableSpec { table: "assistant_monthly_builds", measure: TableMeasure::Columns(&["updated_at"]) },'
+            ],
+            "crates/cutover/migrations/0444_assistant_monthly_builds.sql": [
+                "CREATE TABLE IF NOT EXISTS assistant_monthly_builds ("
+            ],
+        }
+        self.assertEqual(diff_violations(list(added), added), [])
+
+    def test_other_cutover_and_backup_paths_fail_closed(self):
+        for path in (
+            "crates/cutover/src/lib.rs",
+            "crates/cutover/src/legacy_copy/options.rs",
+            "crates/cutover/tests/legacy_verify_db.rs",
+            "crates/core/src/backup/mod.rs",
+            "crates/core/src/backup/restore.rs",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(diff_violations([path], {}))
+
+    def test_transport_content_in_classification_files_fails(self):
+        for path in (
+            "crates/core/src/backup/dump_file.rs",
+            "crates/cutover/src/rollback_delta.rs",
+            "crates/cutover/migrations/0444_assistant_monthly_builds.sql",
+        ):
+            with self.subTest(path=path):
+                added = {path: ["let client = reqwest::Client::new();"]}
+                self.assertTrue(diff_violations([path], added))
 
     def test_handler_paths_fail(self):
         for path in ("crates/core/src/handlers.rs", "crates/core/src/router.rs", "crates/discord/src/lib.rs", "src/main.rs"):
@@ -241,6 +297,45 @@ class RepoStateTest(unittest.TestCase):
         self.assertIn("require_send_allowed", body)
         self.assertIn("assistant_not_configured", body)
         self.assertIn("monthly_cap_reached", body)
+
+    def test_cutover_migration_mirrors_assistant_monthly_builds(self):
+        migrations = sorted((REPO_ROOT / "crates/cutover/migrations").glob("*.sql"))
+        creating = [
+            m.name
+            for m in migrations
+            if re.search(
+                r"CREATE TABLE[^;]*assistant_monthly_builds",
+                m.read_text(encoding="utf-8", errors="replace"),
+                re.IGNORECASE | re.DOTALL,
+            )
+        ]
+        self.assertTrue(
+            creating,
+            "no cutover migration creates assistant_monthly_builds yet "
+            "(store-only tables are never deployed)",
+        )
+
+    def test_backup_dump_classifies_assistant_monthly_builds(self):
+        body = _read("crates/core/src/backup/dump_file.rs")
+
+        def table_list(const_name):
+            start = body.find(f"pub const {const_name}")
+            self.assertGreaterEqual(start, 0, f"{const_name} not found in dump_file.rs")
+            end = body.find("pub const ", start + 1)
+            return body[start:] if end < 0 else body[start:end]
+
+        # Dumped, not excluded: an excluded ledger would hand back a
+        # fresh monthly quota after every restore.
+        self.assertIn('"assistant_monthly_builds"', table_list("DUMP_TABLES"))
+        self.assertNotIn('"assistant_monthly_builds"', table_list("EXCLUDED_TABLES"))
+
+    def test_rollback_delta_classifies_assistant_monthly_builds(self):
+        body = _read("crates/cutover/src/rollback_delta.rs")
+        self.assertRegex(
+            body,
+            r"TableSpec\s*\{[^}]*\"assistant_monthly_builds\"",
+            "no rollback TableSpec classifies assistant_monthly_builds yet",
+        )
 
 
 class LiveDiffTest(unittest.TestCase):

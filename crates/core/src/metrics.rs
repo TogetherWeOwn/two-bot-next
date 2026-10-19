@@ -225,6 +225,7 @@ pub const PREFIX_TRIGGER_REFUSED_REASONS: &[&str] = &["verdict", "other"];
 /// (`proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`);
 /// and each queued rename at dispatch (`rename_sent`, or why it was dropped
 /// or held, including `rename_duplicate` for a flush-time folded duplicate).
+/// `name_blocked` records a dispatch-time rename or custom-override refusal.
 /// Unknown outcomes collapse to `other`.
 pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "created_with_template",
@@ -241,6 +242,7 @@ pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "rename_no_access",
     "rename_held",
     "rename_duplicate",
+    "name_blocked",
     "other",
 ];
 /// Creator-join accept refusals for `two_bot_voice_join_refused_total{reason}`:
@@ -451,6 +453,33 @@ pub const EVENTSUB_DELIVERY_KINDS: [&str; 6] = [
 /// Go-live post attempts by bounded outcome. The outcome vocabulary is fixed;
 /// post identifiers and error details are never retained.
 pub const EVENTSUB_POST_OUTCOMES: [&str; 4] = ["attempted", "succeeded", "failed", "other"];
+/// Feed-fetch attempts by bounded outcome (TOG-28423): `success` for a 2xx
+/// fetch, `invalid_source` for a source refused before dialling (bad URL or
+/// non-public address), `refused_redirect` for a redirect refused by policy,
+/// and `failure` for every other fetch failure (including non-2xx HTTP).
+/// Per-outcome, never per-feed: no source URL, host or feed id reaches a label.
+pub const FEED_FETCH_OUTCOMES: &[&str] =
+    &["success", "invalid_source", "refused_redirect", "failure"];
+/// Feed-fetch failure causes for `two_bot_feed_fetch_errors_total{error_class}`
+/// (TOG-28423). The vocabulary mirrors [`crate::feeds_http::FetchError`] plus
+/// the connector layers (`resolve`, `transport`, `deadline`,
+/// `unsupported_encoding`) and `http_error` for a completed non-2xx fetch.
+/// Unknown classes collapse to the trailing `other`. No URL, host, header or
+/// body bytes ever reach a label.
+pub const FEED_FETCH_ERROR_CLASSES: &[&str] = &[
+    "invalid_source",
+    "non_public_address",
+    "redirect_refused",
+    "too_large",
+    "invalid_encoding",
+    "unsupported_content_type",
+    "unsupported_encoding",
+    "resolve",
+    "transport",
+    "deadline",
+    "http_error",
+    "other",
+];
 /// Outcomes of one EventSub reconcile pass for
 /// `two_bot_eventsub_reconcile_passes_total{outcome}`: `healthy` when every
 /// desired broadcaster holds a healthy subscription afterwards, `pending` when
@@ -605,6 +634,8 @@ struct Values {
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
     presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
+    feed_fetch: [u64; FEED_FETCH_OUTCOMES.len()],
+    feed_fetch_errors: [u64; FEED_FETCH_ERROR_CLASSES.len()],
     automod_decisions: [u64; AUTOMOD_DECISION_OUTCOMES.len()],
     last_ready_unix: Option<u64>,
     last_resume_unix: Option<u64>,
@@ -616,6 +647,13 @@ struct Values {
     /// so the vocabulary is the single series name — no actor ID, timestamp,
     /// error text or row content ever reaches exposition.
     audit_delivery_halt: u64,
+    /// Skipped retention purges needing Operator replay: one per real guild
+    /// removal whose purge-queue write hit the schema gap (the
+    /// `retention_lifecycle` purge-skip arm). Successful queue writes and
+    /// rejoin-cancel skips never increment it. Label-free counter; resets on
+    /// process restart, so the runbook pairs it with the error log line. No
+    /// guild id, SQLSTATE or error text ever becomes a label.
+    retention_replay_needed: u64,
     /// Event-store consumer lag (S1): `received_at - event_time` spread in
     /// seconds for the newest observed capture row. Last writer wins; 0 when
     /// no row has been observed. Single label-free series — no message,
@@ -719,6 +757,35 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter =
             &mut values.presence_capture[bounded_index(outcome, PRESENCE_CAPTURE_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One feed-fetch attempt (TOG-28423): `success` for a 2xx fetch,
+    /// `invalid_source` for a source refused before dialling,
+    /// `refused_redirect` for a redirect refused by policy, `failure` for
+    /// every other failure. Call once per fetch, never per feed id: the
+    /// outcome is the whole label vocabulary and an unrecognised outcome
+    /// collapses to `failure`.
+    pub fn feed_fetch(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.feed_fetch[bounded_index(outcome, FEED_FETCH_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One failed feed fetch by bounded error class (see
+    /// [`FEED_FETCH_ERROR_CLASSES`]). Call once per failed fetch alongside
+    /// [`Self::feed_fetch`]; successes record nothing here. Unknown classes
+    /// collapse to `other`.
+    pub fn feed_fetch_error(&self, error_class: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.feed_fetch_errors[bounded_index(error_class, FEED_FETCH_ERROR_CLASSES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -1157,6 +1224,19 @@ impl Metrics {
         values.voice_orphans = values.voice_orphans.saturating_add(1);
     }
 
+    /// One skipped retention purge needing Operator replay: a real guild
+    /// removal whose purge-queue write hit the schema gap. Call exactly once
+    /// from the purge-skip arm of `retention_lifecycle`; successful queue
+    /// writes and rejoin-cancel skips never call this. Label-free counter;
+    /// no guild id, SQLSTATE or error text ever becomes a label.
+    pub fn retention_replay_needed(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.retention_replay_needed = values.retention_replay_needed.saturating_add(1);
+    }
+
     /// One storage-layer failure. Unknown `op` values collapse
     /// to `other`; no error text, query or identifier is retained.
     pub fn db_error(&self, op: &str) {
@@ -1435,6 +1515,35 @@ impl Metrics {
             writeln!(
                 out,
                 "two_bot_presence_capture_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_feed_fetches_total",
+            "counter",
+            "Feed fetch attempts by bounded outcome; per-outcome, never per-feed.",
+        );
+        for (outcome, count) in FEED_FETCH_OUTCOMES.iter().zip(values.feed_fetch) {
+            writeln!(
+                out,
+                "two_bot_feed_fetches_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_feed_fetch_errors_total",
+            "counter",
+            "Failed feed fetches by bounded error class; successes record nothing here.",
+        );
+        for (error_class, count) in FEED_FETCH_ERROR_CLASSES
+            .iter()
+            .zip(values.feed_fetch_errors)
+        {
+            writeln!(
+                out,
+                "two_bot_feed_fetch_errors_total{{error_class=\"{error_class}\"}} {count}"
             )
             .unwrap();
         }
@@ -1930,6 +2039,12 @@ impl Metrics {
             values.audit_delivery_halt
         )
         .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_retention_replay_needed_total",
+            "counter",
+            values.retention_replay_needed,
+        );
         header(
             &mut out,
             "two_bot_event_store_consumer_lag_seconds",
@@ -2243,6 +2358,8 @@ mod tests {
             metrics.voice_vote_kick(&hostile);
             metrics.checkpoint_failure(&hostile);
             metrics.presence_capture(&hostile);
+            metrics.feed_fetch(&hostile);
+            metrics.feed_fetch_error(&hostile);
             metrics.internal_action(&hostile, &hostile);
             metrics.moderation_enforcement(&hostile, &hostile);
         }
@@ -2940,6 +3057,29 @@ mod tests {
     }
 
     #[test]
+    fn retention_replay_needed_counter_is_label_free_and_zero_fresh() {
+        // TOG-29785: skipped purges render as one label-free counter series —
+        // 0 on a fresh registry, +1 per purge-skip — so no guild id, SQLSTATE
+        // or error text can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_retention_replay_needed_total counter\n"));
+        assert!(text.contains("two_bot_retention_replay_needed_total 0\n"));
+        metrics.retention_replay_needed();
+        metrics.retention_replay_needed();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_retention_replay_needed_total 2\n"));
+        assert!(!text.contains("two_bot_retention_replay_needed_total{"));
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_retention_replay_needed_total "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+    }
+
+    #[test]
     fn event_store_consumer_lag_gauge_is_a_label_free_duration() {
         // S1 AC 4: the consumer lag setter renders as one label-free gauge
         // series — the newest observed `received_at - event_time` spread, 0
@@ -3206,6 +3346,100 @@ mod tests {
             "two_bot_gateway_missed_events_total {}\n",
             u64::MAX
         )));
+    }
+
+    #[test]
+    fn feed_fetches_stay_bounded_and_saturate() {
+        // TOG-28423: per-outcome, never per-feed. Four outcome series plus
+        // twelve error-class series exist from process start at zero.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_feed_fetches_total counter\n"));
+        assert!(text.contains("# TYPE two_bot_feed_fetch_errors_total counter\n"));
+        for outcome in FEED_FETCH_OUTCOMES {
+            assert!(text.contains(&format!(
+                "two_bot_feed_fetches_total{{outcome=\"{outcome}\"}} 0\n"
+            )));
+        }
+        for error_class in FEED_FETCH_ERROR_CLASSES {
+            assert!(text.contains(&format!(
+                "two_bot_feed_fetch_errors_total{{error_class=\"{error_class}\"}} 0\n"
+            )));
+        }
+        assert_eq!(FEED_FETCH_OUTCOMES.len(), 4);
+        assert_eq!(FEED_FETCH_ERROR_CLASSES.len(), 12);
+        metrics.feed_fetch("success");
+        metrics.feed_fetch("invalid_source");
+        metrics.feed_fetch("refused_redirect");
+        metrics.feed_fetch("failure");
+        metrics.feed_fetch_error("invalid_source");
+        metrics.feed_fetch_error("redirect_refused");
+        metrics.feed_fetch_error("http_error");
+        metrics.feed_fetch_error("transport");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"success\"} 1\n"));
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"invalid_source\"} 1\n"));
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"refused_redirect\"} 1\n"));
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"failure\"} 1\n"));
+        assert!(
+            text.contains("two_bot_feed_fetch_errors_total{error_class=\"invalid_source\"} 1\n")
+        );
+        assert!(
+            text.contains("two_bot_feed_fetch_errors_total{error_class=\"redirect_refused\"} 1\n")
+        );
+        assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"http_error\"} 1\n"));
+        assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"transport\"} 1\n"));
+        // Fixed cardinality: exactly the allowlisted series render.
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_feed_fetches_total{"))
+                .count(),
+            FEED_FETCH_OUTCOMES.len()
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_feed_fetch_errors_total{"))
+                .count(),
+            FEED_FETCH_ERROR_CLASSES.len()
+        );
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.feed_fetch = [u64::MAX; FEED_FETCH_OUTCOMES.len()];
+            values.feed_fetch_errors = [u64::MAX; FEED_FETCH_ERROR_CLASSES.len()];
+        }
+        metrics.feed_fetch("success");
+        metrics.feed_fetch_error("transport");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_feed_fetches_total{{outcome=\"success\"}} {}\n",
+            u64::MAX
+        )));
+        assert!(text.contains(&format!(
+            "two_bot_feed_fetch_errors_total{{error_class=\"transport\"}} {}\n",
+            u64::MAX
+        )));
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn feed_fetch_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.feed_fetch(&hostile);
+            metrics.feed_fetch_error(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(text.contains("two_bot_feed_fetches_total{outcome=\"failure\"} 100\n"));
+        assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"other\"} 100\n"));
     }
 
     #[test]

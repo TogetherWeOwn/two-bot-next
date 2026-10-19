@@ -7,6 +7,8 @@ use std::sync::Mutex;
 mod cold_authority;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
+#[path = "voice_empty_grace_override_tests.rs"]
+mod empty_grace_override;
 #[path = "voice_join_requests_tests.rs"]
 mod join;
 #[path = "voice_kick_tests.rs"]
@@ -15,6 +17,10 @@ mod kick;
 mod limit_command;
 #[path = "voice_name_tests.rs"]
 mod name;
+#[path = "voice_name_filter_acceptance_tests.rs"]
+mod name_filter_acceptance;
+#[path = "voice_name_rerender_tests.rs"]
+mod name_rerender;
 #[path = "voice_private_runtime_tests.rs"]
 mod private;
 #[path = "voice_rooms_sink_tests.rs"]
@@ -131,6 +137,9 @@ struct Store {
     creators: Mutex<Vec<CreatorChannel>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
     rooms_errors: Mutex<VecDeque<StoreError>>,
+    /// One-shot hang for the next `rooms()` call, consumed when it
+    /// starts, so a test can prove a load attempt is deadline-bounded.
+    rooms_delay: Mutex<Option<Duration>>,
     after_rooms: Option<Hook>,
     owner_intents: Mutex<HashMap<u64, OwnerGrantIntent>>,
     owner_pending: Mutex<HashSet<u64>>,
@@ -205,6 +214,7 @@ impl Store {
             creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
             rooms: Mutex::new(HashMap::new()),
             rooms_errors: Mutex::new(VecDeque::new()),
+            rooms_delay: Mutex::new(None),
             after_rooms: None,
             owner_intents: Mutex::new(HashMap::new()),
             owner_pending: Mutex::new(HashSet::new()),
@@ -295,6 +305,10 @@ impl RoomPersistence for Store {
         Ok(())
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
+        let delay = self.rooms_delay.lock().unwrap().take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if let Some(error) = self.rooms_errors.lock().unwrap().pop_front() {
             return Err(error);
         }
@@ -1889,15 +1903,14 @@ async fn failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it()
     assert!(!worker.deletes.contains(&500));
 }
 
-/// Cross-restart provenance for "retain provenance after a failed rollback" is
-/// proven by the disposable-database test
-/// `crates/cutover/tests/voice_create_admission_store.rs::bound_channel_witness_survives_restart_and_holds_the_slot_until_settled`,
-/// which binds the channel to its claim before any room row and rediscovers it
-/// on a fresh pool. This in-memory fixture stays ignored: only `rooms` crosses
-/// its simulated restart and a failed persist writes no room, so the `bound`
-/// witness cannot cross here and the test cannot pass unedited.
+/// In-memory restart proof for "retain provenance after a failed rollback":
+/// the failed persist writes no room row, but the `bound` witness is durable
+/// state (the SQL `bound_create_channels` rows), so it crosses the simulated
+/// restart like `rooms` does and `load` rediscovers the channel through
+/// `orphaned_create_channels`. The disposable-database test
+/// `crates/cutover/tests/voice_create_admission_store.rs::bound_channel_witness_survives_restart_and_holds_the_slot_until_settled`
+/// proves the same path against a real pool.
 #[tokio::test]
-#[ignore = "fixture gap: bound witness does not cross the simulated restart; durable proof is bound_channel_witness_survives_restart_and_holds_the_slot_until_settled"]
 async fn a_restarted_worker_rediscovers_a_channel_whose_rollback_failed() {
     let (live, mut store, http, _) = fixture();
     store.persist_error = Some(StoreError::Unavailable);
@@ -1916,6 +1929,7 @@ async fn a_restarted_worker_rediscovers_a_channel_whose_rollback_failed() {
     let (live, fresh_store, http, _) = fixture();
     live.publish(snapshot(&[500], vec![]));
     *fresh_store.rooms.lock().unwrap() = worker.store.rooms.lock().unwrap().clone();
+    *fresh_store.bound.lock().unwrap() = worker.store.bound.lock().unwrap().clone();
     drop(worker);
     let restarted = GuildRoomWorker::load(live, fresh_store, http)
         .await
@@ -4706,18 +4720,36 @@ fn setup_panel_lists_creators_failures_and_halt() {
 
 #[test]
 fn setup_panel_surfaces_store_errors() {
-    let panel = setup_panel(&SetupSummary {
-        guild_id: GUILD,
-        creators: vec![],
-        tracked_rooms: 0,
-        failures: vec![],
-        halted: false,
-        store_error: Some("Unavailable".to_owned()),
-    });
-    assert!(panel
-        .description
-        .contains("Could not load creator channels"));
-    assert!(!panel.description.contains("No creator channels yet"));
+    // The Setup arm stores `StoreError::to_string()`; pin each Display
+    // variant's exact line so a rewording fails here, not silently.
+    for (error, display) in [
+        (StoreError::Unavailable, "the store is unavailable"),
+        (
+            StoreError::CredentialRefused,
+            "the store refused the bot credential",
+        ),
+        (StoreError::Conflict, "the store reported a conflict"),
+    ] {
+        assert_eq!(error.to_string(), display);
+        let panel = setup_panel(&SetupSummary {
+            guild_id: GUILD,
+            creators: vec![],
+            tracked_rooms: 0,
+            failures: vec![],
+            halted: false,
+            store_error: Some(error.to_string()),
+        });
+        assert_eq!(
+            panel.description,
+            format!(
+                "Voice rooms are running.\n\
+                 Could not load creator channels ({display}); the worker state below is current.\n\
+                 Tracked rooms: 0.\n\
+                 No recent failures."
+            ),
+            "store-error line drifted for {display:?}"
+        );
+    }
 }
 
 #[test]
@@ -13062,6 +13094,130 @@ fn empty_grace_config_accepts_zero_to_ten_minutes_and_refuses_garbage() {
     assert_eq!(configured_empty_grace(Some("601")), Err(InvalidEmptyGrace));
     assert_eq!(configured_empty_grace(Some("-1")), Err(InvalidEmptyGrace));
     assert_eq!(configured_empty_grace(Some("1m")), Err(InvalidEmptyGrace));
+}
+
+/// Regression for the stored-grace fallback bug: a guild that spawns with a
+/// stored `0` must return to the true boot grace once the row is deleted
+/// (the documented undo path), not keep sweeping instantly. Driven through
+/// the real `ensure_actor` spawn path, so the boot-fallback restore line in
+/// `ensure_actor` is what makes this pass: with that line removed the final
+/// assert sees `Some(ZERO)` instead of `Some(EMPTY_ROOM_GRACE)`.
+#[tokio::test]
+async fn spawn_with_stored_zero_then_row_removal_restores_boot_grace() {
+    use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+
+    let trace = Trace::default();
+    let (mut writer, reader) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_string(),
+            key: EMPTY_GRACE_KEY.to_owned(),
+            value: json!(0),
+            version: 1,
+        }],
+    });
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || (Store::new(trace.clone()), Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+    .with_live_source(move || Some(reader.clone()));
+    let actor = runtime.ensure_actor(GUILD).expect("spawn the guild actor");
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(Duration::ZERO) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(Duration::ZERO),
+        "spawn with a stored 0 applies the stored override first"
+    );
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![],
+    });
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(EMPTY_ROOM_GRACE) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(EMPTY_ROOM_GRACE),
+        "deleting the stored row must restore the boot grace, never a stale zero"
+    );
+    runtime.remove_guild(GUILD);
+}
+
+/// Same fallback bug via the out-of-range path: a stored `0` at spawn
+/// followed by a `601` edit must fail closed to the boot grace. Driven
+/// through the real `ensure_actor` spawn path, like the row-removal test
+/// above: with the boot-fallback restore line removed the final assert
+/// sees `Some(ZERO)` instead of `Some(EMPTY_ROOM_GRACE)`.
+#[tokio::test]
+async fn spawn_with_stored_zero_then_out_of_range_restores_boot_grace() {
+    use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+
+    let trace = Trace::default();
+    let (mut writer, reader) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_string(),
+            key: EMPTY_GRACE_KEY.to_owned(),
+            value: json!(0),
+            version: 1,
+        }],
+    });
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || (Store::new(trace.clone()), Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+    .with_live_source(move || Some(reader.clone()));
+    let actor = runtime.ensure_actor(GUILD).expect("spawn the guild actor");
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(Duration::ZERO) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(Duration::ZERO),
+        "spawn with a stored 0 applies the stored override first"
+    );
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_string(),
+            key: EMPTY_GRACE_KEY.to_owned(),
+            value: json!(601),
+            version: 2,
+        }],
+    });
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(EMPTY_ROOM_GRACE) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(EMPTY_ROOM_GRACE),
+        "an out-of-range edit after a stored zero must fail closed to boot"
+    );
+    runtime.remove_guild(GUILD);
 }
 
 #[test]

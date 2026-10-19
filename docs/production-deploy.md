@@ -1,10 +1,15 @@
 # Production Worker deploy
 
 `.github/workflows/deploy-production.yml` is the only path that deploys the
-`production` Wrangler environment. It runs only when someone dispatches it, never
-on push, PR or schedule. The B4 cutover executor (TOG-9699) dispatches it from
-`main`. Agents never do. The cutover gates in [cutover.md](cutover.md) still
-apply.
+`production` Wrangler environment. It runs on manual dispatch, on a completed
+`deploy-staging` run on `main`, and on a daily schedule backstop — never on
+push or PR. A completed-but-unsuccessful staging run promotes nothing; a green
+one promotes the commit of the latest successful staging deploy — never its
+own run SHA, so a re-run of an older staging run cannot downgrade production —
+after a 30-minute soak past the staging-green time
+(see [Automatic promotion](#automatic-promotion)). The B4 cutover executor
+(TOG-9699) dispatches it from `main`. Agents never do. The cutover gates in
+[cutover.md](cutover.md) still apply.
 
 **Before the first dispatch**, a repository admin verifies three things. The
 first and the branch policy were verified live on 2026-10-03 (commands under
@@ -116,9 +121,47 @@ from the failed run's summary, `image` set to the previous container image
 digest from the same summary's rollback-snapshot line, and `takeover: true`.
 Set `sha` to the commit that version was built
 from (full SHA or an unambiguous 7-40 character hex prefix; the guard resolves
-a prefix and records the full SHA). It is recorded as the rollback message, and the `/readyz` gate after the
+a prefix and records the full SHA): take all three from that summary line, which the pre-deploy snapshot
+(the provenance receipt) fills in. Use that line only when it names all
+three (`rollback`, `image` and `sha`): a line without `sha` is not a
+complete receipt, and a manual rollback must not be dispatched from it.
+The three inputs are validated as one
+receipt before anything is restored: the rollback script refuses unless the
+Worker version's stamped deploy message (`wrangler deploy --message <sha>`)
+equals `sha` (the resolved full SHA), the version appears in the 100%-serving deployment history,
+and the image comes from a completed rollout. A merely CI-green SHA paired
+with the wrong version therefore refuses before traffic moves instead of
+failing the gate after the restore; do not widen the guard to admit one.
+The `/readyz` gate after the
 rollback must report that revision, or a pre-stamp version on 200 with
-gateway ready (see below). The
+gateway ready (see below). A version with no stamped SHA — deployed before
+SHA stamping began, or created by a secret change without `--message` —
+cannot form a receipt and a manual rollback to it refuses; the
+in-run auto-rollback to such a snapshot keeps its legacy version-header
+identity and records `provenance: legacy-no-sha` in its evidence. Keep
+every serving version stamped: a secret change publishes a new Worker
+version too, so stage secrets with `wrangler versions secret put --env <env> <KEY>
+--message <sha>` — where `<sha>` is the SHA of the last successful deploy
+(the run summary's `SHA:` line, or the live `/readyz` `build_revision`),
+not the pre-deploy snapshot's `serving_sha` (that snapshot describes the
+version being replaced, so stamping with it would label the new version with
+the previous build's SHA and trip the post-restore gate) — then deploy that
+staged version with `wrangler versions deploy --env <env>`, on staging
+and production alike. Precheck first: `versions secret put` builds on the
+newest-created version (`PATCH .../versions/latest`), not necessarily the
+serving one. Confirm the last block of `wrangler versions list --env <env>`
+(the list prints oldest first, so the last block is the newest version)
+is the serving version (same id as `wrangler deployments status --env <env>`);
+the stamp is the SHA that serving version was built from (its
+`workers/message`, or the live `/readyz` `build_revision`). If they differ
+(after an auto-rollback, a manual rollback, or a `versions upload`), do not
+stage secrets — redeploy the intended SHA through the workflow first, then
+stage. A secret-change version created by `wrangler secret
+put` or by a `versions secret put` without `--message` carries no stamped
+SHA and can never form a receipt. If the pre-deploy snapshot records
+`serving_sha: None`, the serving version is unstamped: stamp it (secret
+change with `--message` as above) before the deploy the snapshot precedes,
+or the next manual rollback to it will refuse. The
 rollback passes the same guard and the same Environment approval, except the
 guard never needs deploy-staging history for a rollback: aged-out staging
 runs must not block recovery. It still needs a human Environment reviewer:
@@ -151,6 +194,72 @@ fence, unforced deployment with immediate Durable Object update, takeover and
 restore, which matches this dispatch's rollback immediate Durable Object
 update. The deploy-mode path with a prior good SHA has no
 production drill record.
+
+## Automatic promotion
+
+A green staging commit reaches production with nobody dispatching it. The
+workflow starts on every completed `deploy-staging` run on `main` and once
+daily as a backstop (a missed trigger, an expired hold, an incident pause).
+An automatic run is exactly the empty-`sha` manual dispatch — the commit of
+the latest successful staging deploy — with takeover on, so the owned probes
+can certify it. Every guard still applies to it. Four skips keep it green
+while deploying nothing:
+
+- the triggering staging run did not succeed (`staging-not-green`);
+- the hold variable is still in the future (see below);
+- the target is already live: production `/readyz` already reports the SHA;
+- the live build already contains the target (`older-than-live`): an older
+  build never replaces a newer one automatically, so a re-run of an older
+  staging run cannot downgrade production (intentional downgrades stay an
+  explicit operator rollback, which also serves the older container image).
+
+Otherwise the `soak` job sleeps the remainder of 30 minutes past the
+staging-green time, recomputed there from the staging-green timestamp the
+guard reports (an unreadable timestamp soaks the full window). The soak runs
+outside the `deploy-production` lane — only the `production` and `release`
+jobs hold it — so a sleeping promotion never queues an operator rollback
+behind it. The lane keeps the default single pending slot, so a `recheck`
+job waits for the soak and both gates, then re-reads the hold, the live
+revision and the active dispatches immediately before the deploy: a hold set,
+a target gone live or stale, or an operator dispatch queued, waiting or in
+progress while the gates built or the soak slept skips green instead of
+deploying through the incident — or entering the lane behind a recovery run
+and cancelling it. A failed soak fails closed into no deploy, an unreadable
+dispatch list skips green (the backstop retries), and a cancelled run never
+deploys. The residual race is a dispatch queued in the seconds between the
+recheck and the lane entry: watch the lane when recovering. The run then
+deploys through the same schema gate, roles gate, readyz gate and error-rate
+gate as a manual dispatch. Automatic runs need either
+`PRODUCTION_AUTO_APPROVE=true` or Environment reviewers (which pause the run
+for approval); without either the guard refuses.
+
+Hold: the repository variable `PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL` holds
+automatic promotion until an ISO-8601 UTC expiry (empty means no hold).
+Manual dispatches ignore it. An unparseable hold refuses the run instead of
+promoting through it. Setting or clearing the hold is an operator action;
+like `PRODUCTION_AUTO_APPROVE`, who set it and why needs a CEO and CISO
+decision first. After a manual rollback, set the hold until the incident is
+resolved: otherwise the next automatic run re-selects the staged build that
+was just rolled back and redeploys it (the live check only skips builds the
+live revision already contains, and a rolled-back target is newer than live).
+
+## Production error-rate gate
+
+The `production` job ends with the same REST 5xx promotion gate staging
+runs (`wrangler/scripts/promotion-error-gate.mjs`, `--user-agent
+two-bot-next-production-rollout/1.0`): it scrapes live production
+`/ops/metrics` and fails the stage on a `rest_5xx_rate` firing, so the
+auto-rollback below restores the pre-deploy snapshot (Worker version AND
+container image). Live enforcement needs the `PRODUCTION_METRICS_SCRAPE_TOKEN`
+secret (a `production` environment secret, 32+ chars); without it the step
+records a skip, never a pass. The dispatch-only `inject_error_rate_spike`
+input judges a rehearsal 5xx firing instead, proving the fail-to-rollback
+chain with no traffic — a push or an automatic trigger can never arm it.
+The drill needs `takeover: true` in deploy mode: without takeover a failed
+gate cannot roll back (so the drill would leave its build serving and prove
+nothing), and after a rollback restore there is nothing to roll back to (so
+the gate does not run in rollback mode at all). Any other combination
+refuses in the guard before anything deploys.
 
 ## Build identity and the `/readyz` gate
 

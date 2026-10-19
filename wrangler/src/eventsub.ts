@@ -15,10 +15,11 @@
  * before parsing anything; this module only bounds what may reach it (POST,
  * exact path, no query, content type, 64 KiB body, timeouts, header
  * allowlist, rate caps) and never relays Container error text. Nothing here
- * is ever logged except scalar event/status/error_class/request_id: no header
- * values, challenge, body bytes or query. The request id is the validated
- * `x-request-id` shape (or a fresh one), so it joins the DO and container
- * logs without carrying secrets.
+ * is ever logged except scalar event/status/error_class/request_id plus the
+ * container `release` (deploy-stamped SHA, `"unknown"` when the edge has no
+ * SHA yet) and the stable `log_url`: no header values, challenge, body bytes
+ * or query. The request id is the validated `x-request-id` shape (or a fresh
+ * one), so it joins the DO and container logs without carrying secrets.
  *
  * The receiver listener itself (port below) lands in the follow-up slice with
  * the Operator secret provisioning. Until it does, an enabled route forwards
@@ -28,6 +29,8 @@
  */
 
 import { TokenBuckets } from "./redirect.ts";
+import { LOG_QUERY_URL } from "./alert-rules.ts";
+import { UNKNOWN_RELEASE, normalizeRelease } from "./error-events.ts";
 import { REQUEST_ID_HEADER, ensureRequestId, newRequestId } from "./request-id.ts";
 
 export const EVENTSUB_PATH = "/hooks/twitch";
@@ -133,8 +136,16 @@ function refuse(
   retryable: boolean,
   headers?: Record<string, string>,
   requestId: string = newRequestId(),
+  release: unknown = UNKNOWN_RELEASE,
 ): Response {
-  console.warn(JSON.stringify({ event: "eventsub_ingress", status, error_class: code, request_id: requestId }));
+  console.warn(JSON.stringify({
+    event: "eventsub_ingress",
+    status,
+    error_class: code,
+    request_id: requestId,
+    release: normalizeRelease(release),
+    log_url: LOG_QUERY_URL,
+  }));
   return envelope(status, code, retryable, headers, requestId);
 }
 
@@ -158,30 +169,31 @@ export function isEventsubRequest(request: Request): boolean {
 export function allowlistedHeaders(
   source: Headers,
   requestId: string = ensureRequestId(source.get(REQUEST_ID_HEADER)),
+  release: unknown = UNKNOWN_RELEASE,
 ): { headers: Headers } | { refusal: Response } {
   const media = source.get("content-type");
   if (
     media === null || media.length > 128 || !CONTENT_TYPES.includes(media.toLowerCase()) ||
     source.has("content-encoding")
   ) {
-    return { refusal: refuse(415, "unsupported_media_type", false, undefined, requestId) };
+    return { refusal: refuse(415, "unsupported_media_type", false, undefined, requestId, release) };
   }
   const headers = new Headers({ "content-type": media });
   for (const [name, max, alphabet] of DELIVERY_HEADERS) {
     const value = source.get(name);
-    if (value === null || value === "") return { refusal: refuse(401, "unauthorized", false, undefined, requestId) };
+    if (value === null || value === "") return { refusal: refuse(401, "unauthorized", false, undefined, requestId, release) };
     if (value.length > max || !alphabet.test(value)) {
-      return { refusal: refuse(400, "malformed", false, undefined, requestId) };
+      return { refusal: refuse(400, "malformed", false, undefined, requestId, release) };
     }
     headers.set(name, value);
   }
   const signature = source.get(SIGNATURE_HEADER);
-  if (signature === null || signature === "") return { refusal: refuse(401, "unauthorized", false, undefined, requestId) };
+  if (signature === null || signature === "") return { refusal: refuse(401, "unauthorized", false, undefined, requestId, release) };
   if (
     signature.length > SIGNATURE_MAX || !HEADER_VALUE.test(signature) ||
     !signature.startsWith(SIGNATURE_PREFIX)
   ) {
-    return { refusal: refuse(400, "malformed", false, undefined, requestId) };
+    return { refusal: refuse(400, "malformed", false, undefined, requestId, release) };
   }
   headers.set(SIGNATURE_HEADER, signature);
   headers.set(REQUEST_ID_HEADER, requestId);
@@ -194,13 +206,14 @@ export type BodyRead = { bytes: Uint8Array } | { refusal: Response };
 export async function readBody(
   request: Request,
   requestId: string = ensureRequestId(request.headers.get(REQUEST_ID_HEADER)),
+  release: unknown = UNKNOWN_RELEASE,
 ): Promise<BodyRead> {
   const declared = request.headers.get("content-length");
   if (declared !== null) {
-    if (!/^\d{1,10}$/.test(declared)) return { refusal: refuse(400, "malformed", false, undefined, requestId) };
-    if (Number(declared) > MAX_BODY_BYTES) return { refusal: refuse(413, "payload_too_large", false, undefined, requestId) };
+    if (!/^\d{1,10}$/.test(declared)) return { refusal: refuse(400, "malformed", false, undefined, requestId, release) };
+    if (Number(declared) > MAX_BODY_BYTES) return { refusal: refuse(413, "payload_too_large", false, undefined, requestId, release) };
   }
-  if (request.body === null) return { refusal: refuse(400, "malformed", false, undefined, requestId) };
+  if (request.body === null) return { refusal: refuse(400, "malformed", false, undefined, requestId, release) };
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -213,22 +226,22 @@ export async function readBody(
       const step = await Promise.race([reader.read(), timeout]);
       if (step === "timeout") {
         void reader.cancel().catch(() => {});
-        return { refusal: refuse(408, "request_timeout", true, undefined, requestId) };
+        return { refusal: refuse(408, "request_timeout", true, undefined, requestId, release) };
       }
       if (step.done) break;
       total += step.value.byteLength;
       if (total > MAX_BODY_BYTES) {
         void reader.cancel().catch(() => {});
-        return { refusal: refuse(413, "payload_too_large", false, undefined, requestId) };
+        return { refusal: refuse(413, "payload_too_large", false, undefined, requestId, release) };
       }
       chunks.push(step.value);
     }
   } catch {
-    return { refusal: refuse(400, "malformed", false, undefined, requestId) };
+    return { refusal: refuse(400, "malformed", false, undefined, requestId, release) };
   } finally {
     clearTimeout(timer);
   }
-  if (total === 0) return { refusal: refuse(400, "malformed", false, undefined, requestId) };
+  if (total === 0) return { refusal: refuse(400, "malformed", false, undefined, requestId, release) };
   const bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
@@ -256,20 +269,21 @@ export async function handleEventsubIngress(
   request: Request,
   clientKey: string,
   forward: (sanitized: Request) => Promise<Response>,
+  release: unknown = UNKNOWN_RELEASE,
 ): Promise<Response> {
   if (!isEventsubRequest(request)) return notFound();
   const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
   const verdict = eventsubBuckets.take(clientKey);
   if (!verdict.allowed) {
-    return refuse(429, "rate_limited", true, { "retry-after": String(verdict.retryAfter) }, requestId);
+    return refuse(429, "rate_limited", true, { "retry-after": String(verdict.retryAfter) }, requestId, release);
   }
-  const checked = allowlistedHeaders(request.headers, requestId);
+  const checked = allowlistedHeaders(request.headers, requestId, release);
   if ("refusal" in checked) return checked.refusal;
-  if (inFlight >= MAX_IN_FLIGHT) return refuse(429, "rate_limited", true, { "retry-after": "1" }, requestId);
+  if (inFlight >= MAX_IN_FLIGHT) return refuse(429, "rate_limited", true, { "retry-after": "1" }, requestId, release);
   inFlight++;
   let forwardPromise: Promise<Response> | undefined;
   try {
-    const body = await readBody(request, requestId);
+    const body = await readBody(request, requestId, release);
     if ("refusal" in body) return body.refusal;
     const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
     const abortController = new AbortController();
@@ -293,7 +307,7 @@ export async function handleEventsubIngress(
       forwardPromise = forward(sanitized);
     } catch {
       // DO construction/binding failures: never serialize the exception.
-      return refuse(503, "unavailable", true, undefined, requestId);
+      return refuse(503, "unavailable", true, undefined, requestId, release);
     }
     // Hold the slot until the forward settles; observe now so a late
     // rejection after the deadline never surfaces as unhandled.
@@ -313,14 +327,14 @@ export async function handleEventsubIngress(
       const upstream = await Promise.race([forwardPromise, deadline]);
       if (upstream === "timeout") {
         abortOrphan();
-        return refuse(504, "upstream_timeout", true, undefined, requestId);
+        return refuse(504, "upstream_timeout", true, undefined, requestId, release);
       }
       return upstream;
     } catch {
       // An abort-driven rejection after the deadline is still a timeout.
-      if (signal.aborted) return refuse(504, "upstream_timeout", true, undefined, requestId);
+      if (signal.aborted) return refuse(504, "upstream_timeout", true, undefined, requestId, release);
       // DO construction/binding failures: never serialize the exception.
-      return refuse(503, "unavailable", true, undefined, requestId);
+      return refuse(503, "unavailable", true, undefined, requestId, release);
     } finally {
       clearTimeout(timer);
       timeoutSignal.removeEventListener("abort", abortOrphan);
@@ -397,11 +411,15 @@ function releaseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
  * races it: a stalled tail settles the caller at the deadline instead of
  * holding the wrapper critical section. Cancellation is best-effort and never
  * awaited, so a never-settling cancel hook cannot hold the caller either.
+ *
+ * `release` stamps the container SHA on the span/refusal log line so it joins
+ * the flow's container logs; hostile values bucket to `unknown` and never echo.
  */
 export async function relayEventsubResponse(
   upstream: Response,
   requestId: string = newRequestId(),
   signal?: AbortSignal,
+  release: unknown = UNKNOWN_RELEASE,
 ): Promise<Response> {
   const media = upstream.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
   const bodyless = upstream.status === 204 || upstream.status === 205 || upstream.status === 304;
@@ -413,7 +431,7 @@ export async function relayEventsubResponse(
     // be drained here. The cancel is best-effort and never awaited: a
     // never-settling hook still yields the fixed refusal promptly.
     releaseUpstream(upstream);
-    return refuse(503, "unavailable", true, undefined, requestId);
+    return refuse(503, "unavailable", true, undefined, requestId, release);
   }
   const limit = isChallenge ? MAX_CHALLENGE_BYTES : MAX_RESPONSE_BYTES;
   const reader = upstream.body?.getReader();
@@ -427,25 +445,25 @@ export async function relayEventsubResponse(
     for (;;) {
       if (signal?.aborted) {
         releaseReader(reader);
-        return refuse(503, "unavailable", true, undefined, requestId);
+        return refuse(503, "unavailable", true, undefined, requestId, release);
       }
       let step: ReadableStreamReadResult<Uint8Array>;
       try {
         step = await boundRead(reader.read(), signal);
       } catch {
         releaseReader(reader);
-        return refuse(503, "unavailable", true, undefined, requestId);
+        return refuse(503, "unavailable", true, undefined, requestId, release);
       }
       if (step.done) break;
       total += step.value.byteLength;
       if (total > limit) {
         releaseReader(reader);
-        return refuse(503, "unavailable", true, undefined, requestId);
+        return refuse(503, "unavailable", true, undefined, requestId, release);
       }
       chunks.push(step.value);
     }
   } catch {
-    return refuse(503, "unavailable", true, undefined, requestId);
+    return refuse(503, "unavailable", true, undefined, requestId, release);
   }
   const body = new Uint8Array(total);
   let offset = 0;

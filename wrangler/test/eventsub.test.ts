@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import { DEPLOYMENT_HEADER, OWNER_KEY } from "../src/ownership.ts";
+import { LOG_QUERY_URL } from "../src/alert-rules.ts";
 import { isRequestId } from "../src/request-id.ts";
 import {
   EVENTSUB_PATH,
@@ -614,7 +615,7 @@ test("public ingress never starts the container: a cold instance answers 503 wit
   assert.deepEqual(h.starts, [], "container not started");
 });
 
-test("logs carry only scalar event/status/error_class/request_id: no header value, challenge or body ever lands", async (t) => {
+test("logs carry only scalar event/status/error_class/request_id/release/log_url: no header value, challenge or body ever lands", async (t) => {
   const h = await harness(t, ENABLED_ENV);
   await h.warm();
   h.serveEventsubReceiver();
@@ -633,8 +634,85 @@ test("logs carry only scalar event/status/error_class/request_id: no header valu
   assert.ok(ingress.length >= 1, "refusals are logged");
   for (const line of ingress) {
     const record = JSON.parse(line) as Record<string, unknown>;
-    assert.deepEqual(Object.keys(record).sort(), ["error_class", "event", "request_id", "status"]);
+    assert.deepEqual(Object.keys(record).sort(), ["error_class", "event", "log_url", "release", "request_id", "status"]);
     assert.ok(isRequestId(String(record["request_id"])), `bad id shape: ${line}`);
+    assert.match(String(record["release"]), /^(?:[0-9a-f]{7,40}|unknown)$/, `bad release shape: ${line}`);
+    assert.equal(record["log_url"], LOG_QUERY_URL, `bad log url: ${line}`);
+  }
+});
+
+// Paperclip Review (PR #1116): pin the EventSub edge wiring with an exact SHA.
+// The shape test above accepts `sha|unknown`, so replacing
+// `env.CONTAINER_RELEASE` with `undefined` at this edge call site stays green.
+// This test drives a real 40-hex SHA through `worker.fetch` and asserts the
+// span line carries it verbatim.
+test("edge stamps the deploy CONTAINER_RELEASE on eventsub span lines", async (t) => {
+  const sha = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
+  const h = await harness(t, { ...ENABLED_ENV, CONTAINER_RELEASE: sha });
+  await h.warm();
+  const refused = await h.call(post(BODY, { ...DELIVERY_HEADERS, "content-type": "text/plain" }));
+  assert.equal(refused.status, 415);
+  await refused.arrayBuffer();
+  const span = h.logs.filter((line) => line.includes("eventsub_ingress"));
+  assert.ok(span.length >= 1, "expected a span line");
+  for (const line of span) {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    assert.equal(record["release"], sha, `edge must stamp the deploy SHA: ${line}`);
+    assert.equal(record["log_url"], LOG_QUERY_URL, `bad log url: ${line}`);
+  }
+});
+
+// Paperclip Review round 4 (PR #1116): pin the merged-in #1181 refusal sites
+// with an exact SHA. The abort/throw/relay branches arrived from main without
+// the trailing `release` argument and logged `unknown` despite a valid SHA.
+test("abort/throw/relay refusals stamp the SHA (no unknown leak)", async (t) => {
+  const sha = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
+  const lines: string[] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  });
+  resetEventsubIngressLimits();
+  t.after(() => resetEventsubIngressLimits());
+
+  // 1. Synchronous forward throw -> 503 unavailable.
+  const syncThrow = await handleEventsubIngress(
+    post(),
+    "span-release-sync-throw",
+    () => { throw new Error("synthetic binding failure"); },
+    sha,
+  );
+  assert.equal(syncThrow.status, 503);
+  await syncThrow.arrayBuffer();
+
+  // 2. Abort-driven forward rejection -> 504 upstream_timeout.
+  const timeoutMock = t.mock.method(AbortSignal, "timeout", () => AbortSignal.abort());
+  try {
+    const aborted = await handleEventsubIngress(
+      post(),
+      "span-release-abort",
+      async () => { throw new Error("synthetic abort rejection"); },
+      sha,
+    );
+    assert.equal(aborted.status, 504);
+    await aborted.arrayBuffer();
+  } finally {
+    timeoutMock.mock.restore();
+  }
+
+  // 3. Relay with an already-aborted signal -> 503 unavailable.
+  const relayed = await relayEventsubResponse(
+    Response.json({ ok: true }),
+    "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    AbortSignal.abort(),
+    sha,
+  );
+  assert.equal(relayed.status, 503);
+  await relayed.arrayBuffer();
+
+  const span = lines.filter((line) => line.includes("eventsub_ingress"));
+  assert.ok(span.length >= 3, `expected 3 span lines, got: ${JSON.stringify(lines)}`);
+  for (const line of span) {
+    assert.equal((JSON.parse(line) as Record<string, unknown>)["release"], sha, line);
   }
 });
 
