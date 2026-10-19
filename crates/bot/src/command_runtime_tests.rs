@@ -4439,6 +4439,298 @@ async fn sticky_set_rejection_audits_rejected_and_still_replies() {
     db.close().await;
 }
 
+// --- acceptance: sticky store-failure refusals audit like rejections ------
+//
+// Locked contract: every sticky store-failure refusal (the `put_sticky`
+// failure in `/sticky` and the `delete_sticky` failure in `/sticky-remove`)
+// writes exactly one `automation_audit_log` row per refusal whenever the
+// pool accepts it, in the existing refusal shape: the attempted `sticky.*`
+// action (`sticky.create` when no row exists yet, `sticky.update` when one
+// does — the same existence read the validation rejection already uses to
+// name its action — and `sticky.delete` for a remove), outcome `rejected`,
+// the invoking channel as `target_key`, the invoking member as `actor_id`,
+// and a bounded single-token `reason` (a fixed error class such as the log
+// line's `db_class` token, or an equivalent fixed token — never the raw
+// sqlx / Postgres message, which can carry statement or fixture detail).
+// The user reply stays the existing fixed store-failure text. A dead pool
+// (audit write itself impossible) degrades to that same safe reply with no
+// panic and no leaked internals. Every other sticky path keeps its existing
+// audit behavior.
+
+const STICKY_STORE_FAILURE_REPLY: &str = "Sticky command failed; try again.";
+
+/// Fail only writes to `sticky_messages`: reads still succeed, so the
+/// refusal comes from the upsert itself while `automation_audit_log` stays
+/// writable and an audit attempt on the live pool can still land.
+async fn fail_sticky_writes(db: &TestDb) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_sticky_write() RETURNS trigger AS $$
+         BEGIN
+           RAISE EXCEPTION 'induced sticky write failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install write fault function");
+    sqlx::query(
+        "CREATE TRIGGER fail_sticky_write_trg
+           BEFORE INSERT OR UPDATE ON sticky_messages FOR EACH ROW
+           EXECUTE FUNCTION fail_sticky_write()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install write fault trigger");
+}
+
+/// Fail only DELETEs from `sticky_messages`: the row stays readable, so the
+/// refusal comes from the delete itself.
+async fn fail_sticky_deletes(db: &TestDb) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_sticky_delete() RETURNS trigger AS $$
+         BEGIN
+           RAISE EXCEPTION 'induced sticky delete failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install delete fault function");
+    sqlx::query(
+        "CREATE TRIGGER fail_sticky_delete_trg
+           BEFORE DELETE ON sticky_messages FOR EACH ROW
+           EXECUTE FUNCTION fail_sticky_delete()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install delete fault trigger");
+}
+
+/// The refusal shape every sticky store-failure audit row must share.
+fn assert_sticky_store_failure_audit(
+    action: &str,
+    target_key: Option<&str>,
+    outcome: &str,
+    reason: Option<&str>,
+    actor_id: Option<&str>,
+    expected_action: &str,
+) {
+    assert_eq!(action, expected_action);
+    assert_eq!(
+        target_key,
+        Some(CHANNEL_S),
+        "audit names the invoking channel, like every other sticky row"
+    );
+    assert_eq!(outcome, "rejected");
+    assert_eq!(
+        actor_id,
+        Some("88"),
+        "audit names the invoking member, like a validation rejection"
+    );
+    let reason = reason.expect("store-failure refusal audits a reason");
+    assert!(
+        !reason.is_empty() && reason.len() <= 64 && !reason.chars().any(char::is_whitespace),
+        "reason is one bounded token, not raw error text: {reason:?}"
+    );
+    let lowered = reason.to_ascii_lowercase();
+    for leaked in ["sqlx", "postgres", "sticky_messages", "induced"] {
+        assert!(
+            !lowered.contains(leaked),
+            "reason must not leak {leaked}: {reason:?}"
+        );
+    }
+}
+
+/// Every completion-edit `content`, in invocation order.
+fn sticky_store_failure_replies(mock: &MockRest, invocations: usize) -> Vec<String> {
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), invocations, "one completion per invocation");
+    edits
+        .iter()
+        .map(|edit| {
+            let json: serde_json::Value =
+                serde_json::from_slice(&edit.body).expect("completion json");
+            json["content"]
+                .as_str()
+                .expect("reply content is text")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn sticky_set_interaction() -> Interaction {
+    slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![option(
+            "body",
+            CommandOptionValue::String("pin me".to_owned()),
+        )],
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn sticky_set_create_store_failure_audits_one_rejected_row_per_refusal() {
+    let db = TestDb::new().await;
+    fail_sticky_writes(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime.on_interaction(&sticky_set_interaction()).await;
+    runtime.on_interaction(&sticky_set_interaction()).await;
+
+    assert_eq!(
+        sticky_store_failure_replies(&mock, 2),
+        vec![
+            STICKY_STORE_FAILURE_REPLY.to_owned(),
+            STICKY_STORE_FAILURE_REPLY.to_owned()
+        ],
+        "write failures keep the existing safe reply text"
+    );
+    assert!(
+        db.row().await.is_none(),
+        "failed writes store no sticky row"
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        2,
+        "each create failure writes exactly one audit row: {audits:?}"
+    );
+    for (action, target_key, outcome, reason, actor_id) in &audits {
+        assert_sticky_store_failure_audit(
+            action,
+            target_key.as_deref(),
+            outcome,
+            reason.as_deref(),
+            actor_id.as_deref(),
+            "sticky.create",
+        );
+    }
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn sticky_set_update_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000005"), 120_000, 5).await;
+    fail_sticky_writes(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime.on_interaction(&sticky_set_interaction()).await;
+
+    assert_eq!(mock.deferred_reply()["content"], STICKY_STORE_FAILURE_REPLY);
+    let (body, _, _) = db.row().await.expect("seeded row survives the refusal");
+    assert_eq!(body, "remember this", "failed update changes no sticky row");
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one update failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_sticky_store_failure_audit(
+        action,
+        target_key.as_deref(),
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "sticky.update",
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn sticky_remove_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000005"), 120_000, 5).await;
+    fail_sticky_deletes(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("sticky-remove", Some(CHANNEL), Vec::new()))
+        .await;
+
+    assert_eq!(mock.deferred_reply()["content"], STICKY_STORE_FAILURE_REPLY);
+    assert!(
+        db.row().await.is_some(),
+        "failed delete keeps the sticky row"
+    );
+    assert!(
+        mock.deletes().is_empty(),
+        "no Discord message delete on a store refusal"
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one delete failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_sticky_store_failure_audit(
+        action,
+        target_key.as_deref(),
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "sticky.delete",
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Dead-pool control: with a closed pool, the audit write is impossible by
+/// construction, so every sticky command must still finish with the fixed
+/// safe reply — no panic, no hang, no sqlx internals, pool address or
+/// credentials in the user text. A closed pool fails every query
+/// immediately; an unreachable pool would hold each command for the full
+/// acquire timeout, so this control stays fast after the audit attempt
+/// adds a second store call per refusal.
+#[tokio::test]
+async fn sticky_store_failures_on_dead_pool_reply_safely() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let runtime = CommandRuntime::new(
+        pool,
+        executor_at(origin),
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+
+    runtime.on_interaction(&sticky_set_interaction()).await;
+    runtime
+        .on_interaction(&slash("sticky-remove", Some(CHANNEL), Vec::new()))
+        .await;
+
+    let replies = sticky_store_failure_replies(&mock, 2);
+    assert_eq!(
+        replies,
+        vec![STICKY_STORE_FAILURE_REPLY.to_owned(); 2],
+        "dead pool degrades every sticky command to the safe reply"
+    );
+    for reply in &replies {
+        for leaked in ["sqlx", "postgres", "127.0.0.1", "agent_test", "Pool"] {
+            assert!(
+                !reply.contains(leaked),
+                "dead-pool reply must not leak {leaked}: {reply}"
+            );
+        }
+    }
+    mock.shutdown().await;
+}
+
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn automation_quota_refusals_reply_with_a_remedy_and_write_no_rows_or_audits() {

@@ -112,6 +112,8 @@ export const EVENTSUB_POST_OUTCOMES: readonly string[] = ["attempted", "succeede
  * classes. See docs/runbook.md#alert-rest-5xx.
  */
 export const PROMOTION_ERROR_GATE_RULES: readonly string[] = ["rest_5xx_rate"];
+/** Engaged audit halt for three valid keepalive samples (~2 min from first to third). */
+export const AUDIT_HALT_SAMPLES = 3;
 /** Pool at max with zero idle for this many consecutive samples. */
 export const POOL_SATURATED_SAMPLES = 3;
 /** DB errors must reach this many between two samples... */
@@ -263,6 +265,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "eventsub_post_failed_share", summary: `EventSub announcement post failures exceed ${EVENTSUB_POST_FAILED_SHARE_RATIO * 100}% of attempted posts (min ${EVENTSUB_POST_FAILED_SHARE_MIN_ATTEMPTED} attempted)`, runbook: "runbook.md#alert-eventsub-post-failed-share", severity: "ticket" },
   { id: "error_budget_fast_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_FAST_BURN}x over ${ERROR_BUDGET_FAST_LONG_SECONDS / 60} min and ${ERROR_BUDGET_FAST_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-fast-burn" },
   { id: "error_budget_slow_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_SLOW_BURN}x over ${ERROR_BUDGET_SLOW_LONG_SECONDS / 3600} h and ${ERROR_BUDGET_SLOW_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-slow-burn", severity: "ticket" },
+  { id: "audit_delivery_halt", summary: `audit delivery halt engaged for ${AUDIT_HALT_SAMPLES} consecutive valid samples`, runbook: "runbook.md#alert-audit-delivery-halt", severity: "ticket" },
   { id: "eventsub_tampered", summary: `EventSub tampered-signature deliveries rose in ${EVENTSUB_TAMPERED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-eventsub-tampered" },
   { id: "eventsub_reconcile_failed", summary: `EventSub reconcile failed passes increased between samples`, runbook: "runbook.md#alert-eventsub-reconcile-failed", severity: "ticket" },
   { id: "event_store_consumer_lag", summary: `event-store consumer lag above ${EVENT_STORE_LAG_THRESHOLD_SECONDS} s sustained for ${EVENT_STORE_LAG_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-event-store-consumer-lag", severity: "ticket" },
@@ -320,6 +323,8 @@ export interface MetricsAlertState {
   rest5xx?: number;
   restTotal: number;
   poolStreak: number;
+  /** Consecutive valid engaged halt samples; absent in older DO storage. */
+  auditHaltStreak?: number;
   dbErrors: number;
   sendBlocked: number;
   sendBlockedStreak: number;
@@ -587,6 +592,11 @@ export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {},
 /** An unsuccessful scrape breaks the dispatch and lag streaks, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
   return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, eventStoreLagStreak: 0 };
+}
+
+/** A failed scrape breaks the engaged run, but cannot prove a halt cleared. */
+export function interruptAuditHalt(state: MetricsAlertState): MetricsAlertState {
+  return { ...state, auditHaltStreak: 0 };
 }
 
 /** A failed scrape breaks drain-growth evidence, never an active drain ticket. */
@@ -885,6 +895,30 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
       && s.value > 0 && nowSeconds - s.value > UNKNOWN_JOB_STALE_SECONDS) {
       firing.push(`job_unknown_stale:${job}`);
     }
+  }
+
+  // An unreadable sweep retains the old gauge, not an absent sample. Its
+  // supervisor failure count is therefore a veto on both firing and recovery.
+  // Conservatively hold on other failed audit sweeps too, until one succeeds.
+  // Standalone evaluator callers may supply just the halt; real scrapes require
+  // the complete job-failure family in parseAlertScrape.
+  const haltRows = gauge("two_bot_audit_delivery_halt");
+  const halt = haltRows.length === 1 ? exactSeries(haltRows, {}) : undefined;
+  const jobFailures = gauge("two_bot_job_consecutive_failures");
+  const auditHealthy = jobFailures.length === 0
+    || exactSeries(jobFailures, { job: "audit_retry" }) === 0;
+  // The gauge defaults to 0 at process boot. Unlike an observed 1, a zero
+  // cannot prove a read happened: require a successful sweep before recovery.
+  const auditSuccessRows = gauge("two_bot_job_last_success_timestamp_seconds").filter((s) => s.labels["job"] === "audit_retry");
+  const auditSuccess = exactSeries(auditSuccessRows, { job: "audit_retry" });
+  const recoveryConfirmed = auditSuccessRows.length === 0 || (auditSuccess !== undefined && auditSuccess > 0);
+  const validHalt = auditHealthy && (halt === 1 || (halt === 0 && recoveryConfirmed));
+  const auditHaltStreak = validHalt && halt === 1
+    ? Math.min((prev.auditHaltStreak ?? 0) + 1, AUDIT_HALT_SAMPLES) : 0;
+  const haltWasFiring = prev.firing.includes("audit_delivery_halt");
+  if ((!validHalt && haltWasFiring) || (validHalt && halt === 1
+    && (haltWasFiring || auditHaltStreak >= AUDIT_HALT_SAMPLES))) {
+    firing.push("audit_delivery_halt");
   }
 
   let rest429 = 0;
@@ -1482,7 +1516,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     else if (!healthyGrew && wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

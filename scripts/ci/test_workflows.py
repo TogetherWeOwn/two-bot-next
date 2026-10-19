@@ -2729,6 +2729,28 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
+    def assert_wal_reload_ordering_is_pinned(self, run):
+        # Order is load-bearing both ways: the ALTERs must precede the
+        # reload (ALTER SYSTEM only writes postgresql.auto.conf, which the
+        # reload reads), and the reload must precede the first createdb,
+        # since the bootstrap databases are created later in this same step.
+        reload = run.index("pg_reload_conf()")
+        self.assertLess(
+            run.index("ALTER SYSTEM SET max_wal_size = '512MB'"),
+            reload,
+            "max_wal_size ALTER must precede pg_reload_conf()",
+        )
+        self.assertLess(
+            run.index("ALTER SYSTEM SET min_wal_size = '64MB'"),
+            reload,
+            "min_wal_size ALTER must precede pg_reload_conf()",
+        )
+        self.assertLess(
+            reload,
+            run.index("createdb "),
+            "pg_reload_conf() must precede the first createdb",
+        )
+
     def test_rust_test_postgres_wal_budget_is_bounded(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
         prepare = next(
@@ -2742,6 +2764,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
@@ -2805,6 +2828,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
@@ -2871,6 +2895,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
@@ -2987,6 +3012,27 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        # One MEMBER_TESTDB export serves both the ignored sweep and the
+        # fail-closed member_moderation_db re-run. Pin its count and logical
+        # command order so a redundant later export cannot mask a deleted or
+        # moved sweep export.
+        member_exports = [
+            index for index, line in enumerate(logical_lines)
+            if line == "export MEMBER_TESTDB=agent-testdb"
+        ]
+        self.assertEqual(len(member_exports), 1)
+        ignored_sweep_index = next(
+            index for index, line in enumerate(logical_lines)
+            if line.startswith("cov_run ")
+            and "--workspace --lib --bins --tests" in line
+            and "-- --ignored" in line
+        )
+        member_rerun_index = next(
+            index for index, line in enumerate(logical_lines)
+            if "--test member_moderation_db" in line
+        )
+        self.assertLess(member_exports[0], ignored_sweep_index)
+        self.assertLess(ignored_sweep_index, member_rerun_index)
         self.assertEqual(len([run for run in sweeps if "-- --ignored" not in run]), 1)
         main_sweep = [run for run in sweeps if "-- --ignored" not in run][0]
         # Guarded suites panic under the bootstrap URL; they run only in
@@ -5209,6 +5255,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
