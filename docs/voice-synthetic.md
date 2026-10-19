@@ -98,7 +98,7 @@ Bindings:
 |---|---|---|
 | GitHub environment `voice-synthetic` (main only, no reviewer) | secret `TWO_VOICE_SYNTHETIC_BOT_TOKEN` | the test bot token |
 | GitHub repository variable (optional) | `VOICE_SYNTHETIC_REQUIRED` | `false` only while the test bot is being provisioned; required by default |
-| GitHub repository variable (optional) | `STAGING_EMPTY_GRACE_SECONDS` | staging empty grace, default 60 |
+| GitHub repository variable (optional) | `STAGING_EMPTY_GRACE_SECONDS` | staging empty grace, default 60 (every timing input — `--create-within`, `--settle`, `--grace`, `--delete-slack`, flag or env — must be finite, above 0 and at most 600 s, else the run refuses with exit 2 before any live call) |
 | Staging Worker setting | `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` | the test bot's user ID |
 
 A missing token fails the run: the voice gate is required by default, so an
