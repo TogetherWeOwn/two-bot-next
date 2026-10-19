@@ -4383,8 +4383,26 @@ mod tests {
             self.0.lock().expect("capture lock").len()
         }
 
-        /// Lines logged since `mark` that carry `event` for `action`; other
-        /// tests' lines are ignored so concurrent tests cannot interfere.
+        /// Serializes the mark-execute-read window across tests that share an
+        /// (event, action) filter. The capture is process-wide and the filter
+        /// cannot tell two same-action tests apart (per-test identity stays
+        /// out of the lines by design), so a concurrent same-action line
+        /// would otherwise land in the window and flake the `== 1` asserts.
+        /// Every test that reads via [`LogCapture::lines`] must hold this
+        /// guard for its whole body. The guard is async-only and never
+        /// re-acquired, so holders cannot deadlock each other.
+        async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+            static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+            SERIAL
+                .get_or_init(|| tokio::sync::Mutex::new(()))
+                .lock()
+                .await
+        }
+
+        /// Lines logged since `mark` that carry `event` for `action`. Tests
+        /// with a different (event, action) filter are ignored, but
+        /// same-action tests are indistinguishable here: callers must hold
+        /// [`LogCapture::serial`] so concurrent tests cannot interfere.
         fn lines(&self, mark: usize, event: &str, action: &str) -> Vec<String> {
             let bytes = self.0.lock().expect("capture lock");
             String::from_utf8_lossy(&bytes[mark..])
@@ -4417,6 +4435,7 @@ mod tests {
     // the key, an id nor the raw store error, and must change nothing else.
     #[tokio::test]
     async fn failed_release_is_logged_without_changing_the_result() {
+        let _serial = LogCapture::serial().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());
@@ -4478,6 +4497,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_release_after_rate_limit_names_the_rate_limit_cause() {
+        let _serial = LogCapture::serial().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());
@@ -4507,6 +4527,7 @@ mod tests {
     // key, and a failed release is named with the storage cause.
     #[tokio::test]
     async fn failed_release_after_a_rolled_back_stage_names_the_store_cause() {
+        let _serial = LogCapture::serial().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());
