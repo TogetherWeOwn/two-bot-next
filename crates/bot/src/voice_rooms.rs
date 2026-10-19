@@ -636,7 +636,7 @@ const ADMISSION_MAX_PER_GUILD_KEY: &str = "TWO_TEMP_VOICE_MAX_PER_GUILD";
 const ADMISSION_COOLDOWN_KEY: &str = "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS";
 
 /// Resolve the boot temp-voice create admission from the process environment
-/// (shaped like [`configured_protected_channels`]). Each knob validates
+/// (shaped like `configured_protected_channels`). Each knob validates
 /// independently against the [`CreateAdmissionConfig`] ranges: a
 /// missing/blank value keeps today's effective default, while a
 /// present-but-unparsable or out-of-range value warns once with the setting
