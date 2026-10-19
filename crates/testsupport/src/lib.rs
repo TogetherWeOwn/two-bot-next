@@ -114,10 +114,10 @@ static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
 
 // A DNS blip on the disposable Postgres service fails every fixture created
 // while it lasts (each connect fails fast, so a whole suite goes red in
-// seconds). Retry the bootstrap connect on transport errors only, with
+// seconds). Retry every fixture-setup connect on transport errors only, with
 // exponential backoff from this base; the sleeps below total ~7.5s.
-const ADMIN_CONNECT_ATTEMPTS: u32 = 5;
-const ADMIN_CONNECT_RETRY_BASE: Duration = Duration::from_millis(500);
+const BOOTSTRAP_CONNECT_ATTEMPTS: u32 = 5;
+const BOOTSTRAP_CONNECT_RETRY_BASE: Duration = Duration::from_millis(500);
 
 /// Only transport-level failures are retried: DNS blips and refused/reset
 /// connections. Auth, TLS, protocol and config errors fail immediately, so a
@@ -220,12 +220,16 @@ impl TestDatabase {
     pub async fn create(raw: &str, migrations: &Migrator) -> Result<Self> {
         let options = connect_options(raw, FIXTURE_STATEMENT_TIMEOUT)?;
         let admin_options = connect_options(raw, ADMIN_DDL_STATEMENT_TIMEOUT)?;
-        let admin = retry_on_transient(ADMIN_CONNECT_ATTEMPTS, ADMIN_CONNECT_RETRY_BASE, || {
-            PgPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(Duration::from_secs(10))
-                .connect_with(admin_options.clone())
-        })
+        let admin = retry_on_transient(
+            BOOTSTRAP_CONNECT_ATTEMPTS,
+            BOOTSTRAP_CONNECT_RETRY_BASE,
+            || {
+                PgPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(Duration::from_secs(10))
+                    .connect_with(admin_options.clone())
+            },
+        )
         .await
         .context("connect to test bootstrap database")?;
         let name = database_name();
@@ -258,6 +262,23 @@ impl TestDatabase {
                 name,
             }),
         };
+        // The pool above is lazy, so its first acquire is the fixture's first
+        // real connection to the new database. Retry it on transport errors:
+        // the cleanup owner already exists, so a persistent failure still
+        // drops the created database.
+        if let Err(error) = retry_on_transient(
+            BOOTSTRAP_CONNECT_ATTEMPTS,
+            BOOTSTRAP_CONNECT_RETRY_BASE,
+            || async { fixture.pool().acquire().await.map(|_| ()) },
+        )
+        .await
+        {
+            fixture
+                .close()
+                .await
+                .context("cleanup after fixture connect failure")?;
+            return Err(error).context("connect to disposable test database");
+        }
         if let Err(error) = migrations.run(fixture.pool()).await {
             fixture
                 .close()
@@ -279,23 +300,33 @@ impl TestDatabase {
 
     /// Set a bound search_path within this fixture, never a connection redirect.
     pub async fn pool_with_search_path(&self, path: &str) -> Result<PgPool> {
-        let path = path.to_owned();
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(Duration::from_secs(10))
-            .after_connect(move |conn, _| {
-                let path = path.clone();
-                Box::pin(async move {
-                    sqlx::query("SELECT set_config('search_path', $1, false)")
-                        .bind(path)
-                        .execute(conn)
-                        .await?;
-                    Ok(())
-                })
-            })
-            .connect_with(self.pool().connect_options().as_ref().clone())
-            .await
-            .context("connect independent fixture pool")?;
+        let pool = retry_on_transient(
+            BOOTSTRAP_CONNECT_ATTEMPTS,
+            BOOTSTRAP_CONNECT_RETRY_BASE,
+            || {
+                let path = path.to_owned();
+                let options = self.pool().connect_options().as_ref().clone();
+                async move {
+                    PgPoolOptions::new()
+                        .max_connections(5)
+                        .acquire_timeout(Duration::from_secs(10))
+                        .after_connect(move |conn, _| {
+                            let path = path.clone();
+                            Box::pin(async move {
+                                sqlx::query("SELECT set_config('search_path', $1, false)")
+                                    .bind(path)
+                                    .execute(conn)
+                                    .await?;
+                                Ok(())
+                            })
+                        })
+                        .connect_with(options)
+                        .await
+                }
+            },
+        )
+        .await
+        .context("connect independent fixture pool")?;
         self.cleanup
             .as_ref()
             .expect("fixture not closed")
@@ -633,10 +664,18 @@ mod tests {
         ))
     }
 
+    /// The production retry budget covers a short DNS blip on every
+    /// fixture-setup connect (admin, fixture first-acquire, independent pool).
+    #[test]
+    fn bootstrap_retry_budget_covers_a_dns_blip() {
+        assert_eq!(BOOTSTRAP_CONNECT_ATTEMPTS, 5);
+        assert_eq!(BOOTSTRAP_CONNECT_RETRY_BASE, Duration::from_millis(500));
+    }
+
     #[tokio::test]
     async fn transient_connect_errors_are_retried_until_success() {
         let mut calls = 0;
-        let result = retry_on_transient(5, Duration::ZERO, || {
+        let result = retry_on_transient(BOOTSTRAP_CONNECT_ATTEMPTS, Duration::ZERO, || {
             calls += 1;
             let attempt = calls;
             async move {
@@ -655,24 +694,95 @@ mod tests {
     #[tokio::test]
     async fn persistent_transient_errors_give_up_after_max_attempts() {
         let mut calls = 0;
-        let result: Result<(), sqlx::Error> = retry_on_transient(3, Duration::ZERO, || {
-            calls += 1;
-            async { Err(transient_io_error()) }
-        })
-        .await;
+        let result: Result<(), sqlx::Error> =
+            retry_on_transient(BOOTSTRAP_CONNECT_ATTEMPTS, Duration::ZERO, || {
+                calls += 1;
+                async { Err(transient_io_error()) }
+            })
+            .await;
         assert!(result.is_err());
-        assert_eq!(calls, 3);
+        assert_eq!(calls, BOOTSTRAP_CONNECT_ATTEMPTS);
+    }
+
+    /// Backoff sleeps grow exponentially with no sleep after the final
+    /// attempt. Lower bound only: loaded CI timers fire late, never early
+    /// enough to matter at this scale.
+    #[tokio::test]
+    async fn retry_backoff_sleeps_grow_exponentially() {
+        let start = std::time::Instant::now();
+        let result: Result<(), sqlx::Error> =
+            retry_on_transient(4, Duration::from_millis(50), || async {
+                Err(transient_io_error())
+            })
+            .await;
+        assert!(result.is_err());
+        // Ladder is 50ms, 100ms, 200ms; assert well under the 350ms total so
+        // timer granularity cannot flake, while a flat or missing backoff
+        // (150ms or ~0ms) still fails.
+        assert!(
+            start.elapsed() >= Duration::from_millis(300),
+            "backoff did not follow the 50/100/200ms ladder"
+        );
+    }
+
+    /// What a real Postgres auth failure returns during connect.
+    #[derive(Debug)]
+    struct FakeDatabaseError(&'static str);
+
+    impl std::fmt::Display for FakeDatabaseError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for FakeDatabaseError {}
+
+    impl sqlx::error::DatabaseError for FakeDatabaseError {
+        fn message(&self) -> &str {
+            self.0
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    async fn assert_fails_fast(error: sqlx::Error) {
+        let mut slot = Some(error);
+        let mut calls = 0;
+        let result: Result<(), sqlx::Error> =
+            retry_on_transient(BOOTSTRAP_CONNECT_ATTEMPTS, Duration::ZERO, || {
+                calls += 1;
+                let error = slot.take().expect("non-transient error was retried");
+                async move { Err(error) }
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[tokio::test]
     async fn non_transient_errors_are_not_retried() {
-        let mut calls = 0;
-        let result: Result<(), sqlx::Error> = retry_on_transient(5, Duration::ZERO, || {
-            calls += 1;
-            async { Err(sqlx::Error::RowNotFound) }
-        })
+        assert_fails_fast(sqlx::Error::from(FakeDatabaseError(
+            "password authentication failed",
+        )))
         .await;
-        assert!(matches!(result, Err(sqlx::Error::RowNotFound)));
-        assert_eq!(calls, 1);
+        assert_fails_fast(sqlx::Error::Protocol("unexpected auth message".to_string())).await;
+        assert_fails_fast(sqlx::Error::Configuration(
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad connect option").into(),
+        ))
+        .await;
     }
 }
