@@ -1041,7 +1041,8 @@ jobs:
           # lane runs ~30 sequential suites that each create, migrate and drop
           # disposable databases, so keep WAL recycling bounded with headroom
           # for relation files and segment creation (two main runs PANIC'd on
-          # No space left on device mid-suite before this cap).
+          # No space left on device mid-suite before this cap; run 39197217315
+          # tore the service down and failed the whole binary on DNS).
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'

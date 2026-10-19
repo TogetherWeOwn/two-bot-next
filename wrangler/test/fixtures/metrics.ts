@@ -37,6 +37,7 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string>> = {
   two_bot_voice_join_to_move_seconds_bucket: { le: "VOICE_JOIN_TO_MOVE_BUCKET_LE" },
   two_bot_voice_creator_map_generation: {},
   two_bot_voice_creator_map_age_seconds: {},
+  two_bot_audit_delivery_halt: {},
   two_bot_gateway_missed_events_total: {},
   two_bot_gateway_disconnects_total: {},
   two_bot_gateway_resumes_total: {},
