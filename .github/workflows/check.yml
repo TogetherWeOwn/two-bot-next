@@ -2135,7 +2135,7 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Builds all twenty-three libFuzzer targets. No campaign or generated corpus
+      # Builds all twenty-four libFuzzer targets. No campaign or generated corpus
       # output; the existing weekly run replays the bounded eventsub_delivery,
       # helix_token, and custom_command_template seeds below. Bounded vote_kick
       # and helix_token smokes are manual (README).
@@ -2155,7 +2155,7 @@ jobs:
       # the custom_command_template oracle and the renderer, or seed
       # misrouting panics an assertion here instead of passing a
       # compile-only gate. Compile stays the only gate for the other
-      # twenty targets.
+      # twenty-one targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048

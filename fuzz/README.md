@@ -3,10 +3,10 @@
 This is a separate `cargo-fuzz` workspace, explicitly excluded from the root
 workspace. Normal `cargo build`, workspace tests/clippy, `check` and cargo-deny
 keep their existing members, dependency lockfile and stable toolchain. The required
-`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all twenty-three targets
+`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all twenty-four targets
 on pinned nightly `nightly-2026-10-01` + `cargo-fuzz 0.13.2` and then replays
 the `eventsub_delivery`, `helix_token` and `custom_command_template` seed corpora once each (`-runs=0`,
-no fuzzing). The other twenty targets are compile-only in required CI;
+no fuzzing). The other twenty-one targets are compile-only in required CI;
 bounded manual smokes exist for `vote_kick` and `helix_token`. No scheduled
 or continuous fuzz campaign exists.
 

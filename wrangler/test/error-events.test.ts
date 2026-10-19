@@ -44,7 +44,6 @@ test("parseRelease drops everything that is not a hex SHA", () => {
   ] as const;
   for (const [name, body] of hostile) {
     assert.equal(parseRelease(body), null, name);
-    assert.ok(!String(body).includes("hunter2") || true, name);
   }
 });
 
