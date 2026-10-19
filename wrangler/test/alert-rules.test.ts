@@ -922,6 +922,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "voice_join_fast_burn",
     "voice_join_slow_burn",
     "voice_creator_map_stale",
+    "community_facts_drain_failures",
     "eventsub_post_failed_share",
     "error_budget_fast_burn",
     "error_budget_slow_burn",
@@ -948,6 +949,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("voice_join_fast_burn", window), `evidence-voice_join_fast_burn-${window}.json`);
   assert.equal(packetFilename("voice_join_slow_burn", window), `evidence-voice_join_slow_burn-${window}.json`);
   assert.equal(packetFilename("voice_creator_map_stale", window), `evidence-voice_creator_map_stale-${window}.json`);
+  assert.equal(packetFilename("community_facts_drain_failures", window), `evidence-community_facts_drain_failures-${window}.json`);
   assert.equal(packetFilename("eventsub_post_failed_share", window), `evidence-eventsub_post_failed_share-${window}.json`);
   assert.equal(packetFilename("event_store_consumer_lag", window), `evidence-event_store_consumer_lag-${window}.json`);
   assert.equal(packetFilename("error_budget_fast_burn", window), `evidence-error_budget_fast_burn-${window}.json`);
@@ -1121,6 +1123,16 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   }
   firing.push(...budget.firing);
   firing.push(...ev(["two_bot_voice_creator_map_generation 3", "two_bot_voice_creator_map_age_seconds 601"]).firing);
+  const drainFamily = (error: number) => [
+    `two_bot_community_facts_drain_failures_total{reason="error"} ${error}`,
+    `two_bot_community_facts_drain_failures_total{reason="timeout"} 0`,
+    `two_bot_community_facts_drain_failures_total{reason="other"} 0`,
+  ];
+  let drained = ev(drainFamily(0));
+  for (const n of [1, 2, 3]) {
+    drained = ev(drainFamily(n), drained.state);
+  }
+  firing.push(...drained.firing);
   firing.push(
     ...ev(
       [
