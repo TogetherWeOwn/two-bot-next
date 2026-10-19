@@ -2171,10 +2171,75 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(fail_closed, pin)
         self.assertLess(run.index("exit 1", fail_closed), pin)
         self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        # A failed lookup must empty the result, not kill the step under pipefail.
+        self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
     def test_rust_test_postgres_wal_budget_is_bounded(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        prepare = next(
+            step for step in job["steps"]
+            if step.get("name") == "Prepare isolated test databases"
+        )
+        verify = next(
+            step for step in job["steps"]
+            if step.get("name") == "Verify disposable Postgres defaults"
+        )
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+        self.assertIn("pg_reload_conf()", prepare["run"])
+        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assertIn("'min_wal_size': '64MB'", verify["run"])
+
+    def test_stores_container_pins_disposable_database_service_address(self):
+        # Same hardening as rust-tests: the stores lane runs ~30 sequential
+        # database suites, and a main run lost service-alias DNS mid-suite
+        # (EAI_AGAIN on agent-testdb while Postgres PANIC-recovered on ENOSPC).
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-stores"]
+        prerequisites = next(
+            step for step in job["steps"]
+            if step.get("name") == "Job-container prerequisites (loopback forward to agent-testdb)"
+        )
+        self.assertEqual(prerequisites.get("shell"), "bash")
+        run = prerequisites["run"]
+        self.assertIn("set -e", run)
+        hosts_tmp = run.index('hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"')
+        resolve = run.index("getent ahostsv4 agent-testdb")
+        remove_stale_pin = run.index("sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > \"$hosts_tmp\"")
+        self.assertNotIn("sed -i -E", run)
+        self.assertLess(hosts_tmp, remove_stale_pin)
+        copy_hosts = run.index('cat "$hosts_tmp" > /etc/hosts')
+        cleanup_hosts = run.index('rm -f "$hosts_tmp"')
+        self.assertLess(remove_stale_pin, copy_hosts)
+        self.assertLess(copy_hosts, cleanup_hosts)
+        pin = run.index("printf '%s agent-testdb\\n' \"$service_ip\" >> /etc/hosts")
+        verify_pin = run.index('getent ahostsv4 agent-testdb | awk \'NR == 1 { print $1; exit }\'')
+        forward = run.index("TCP:agent-testdb:5432")
+        ready = run.index("pg_isready -q -h 127.0.0.1")
+        self.assertIn("for attempt in $(seq 1 30)", run[:resolve])
+        self.assertLess(remove_stale_pin, resolve)
+        self.assertLess(resolve, pin)
+        self.assertLess(pin, verify_pin)
+        mismatch_check = run.index('if [ "$pinned_ip" != "$service_ip" ]; then')
+        mismatch_exit = run.index("exit 1", mismatch_check)
+        self.assertLess(verify_pin, mismatch_check)
+        self.assertLess(mismatch_exit, forward)
+        self.assertLess(verify_pin, forward)
+        self.assertLess(forward, ready)
+        self.assertIn("sleep 1", run)
+        fail_closed = run.index('if [ -z "$service_ip" ]; then')
+        self.assertLess(fail_closed, pin)
+        self.assertLess(run.index("exit 1", fail_closed), pin)
+        self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
+        # A failed lookup must empty the result, not kill the step under pipefail.
+        self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
+        self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
+
+    def test_stores_postgres_wal_budget_is_bounded(self):
+        # Same budget as rust-tests: two main runs PANIC'd the 1 GiB tmpfs
+        # service with No space left on device mid-suite (runs 39149193652,
+        # 39197217315 attempt 1), failing every test in internal_member_store.
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-stores"]
         prepare = next(
             step for step in job["steps"]
             if step.get("name") == "Prepare isolated test databases"
