@@ -21,6 +21,14 @@ its own job container, so each keeps the guards (TOG-12134):
 - the `rust-tests` integration step still runs the full
   `--workspace --test '*'` graph: coverage must not be narrowed as a
   substitute for freeing disk.
+- every lane carries a disk-headroom guard right after its prerequisites
+  step: it logs `df` evidence and fails fast below a 1 GiB floor instead of
+  dying mid-suite (run 39209332791: ignored-db-stores died with Postgres
+  `PANIC: could not write to file "pg_wal/xlogtemp.*": No space left on
+  device` on the 1 GiB tmpfs).
+- every Postgres lane reports storage headroom right after verify: per-DB
+  sizes, WAL bytes and the bounded WAL budget, so the next incident has a
+  prepare-time baseline.
 
 Toolchain ordering guard: pip 23 probes `rustc --version` from the workspace
 with a 0.5 s timeout for its user agent. If the pinned toolchain still lacks
@@ -87,6 +95,9 @@ def step_body(body, step_name):
 
 LANES = ("check", "rust-tests", "ignored-db-stores", "ignored-db-runtime")
 PREREQUISITES = "Job-container prerequisites"
+GUARD = "Guard runner disk headroom"
+VERIFY = "Verify disposable Postgres defaults"
+REPORT = "Report Postgres storage headroom"
 
 
 def step_names(body):
@@ -154,6 +165,43 @@ class CheckDiskHygieneTests(unittest.TestCase):
         # The test lanes never run cargo-deny: it belongs to the lint lane.
         for lane in LANES[1:]:
             self.assertNotIn("cargo-deny", step_names(self.jobs[lane]))
+
+    def test_disk_guard_follows_prerequisites_in_every_lane(self):
+        for lane, body in self.jobs.items():
+            with self.subTest(lane=lane):
+                names = step_names(body)
+                prereq = next(name for name in names if name.startswith(PREREQUISITES))
+                self.assertIn(GUARD, names, f"missing step {GUARD!r} in {lane}")
+                self.assertEqual(
+                    names.index(GUARD), names.index(prereq) + 1,
+                    f"{GUARD} must run right after prerequisites ({lane}), "
+                    "before the toolchain install and cache restore",
+                )
+                guard = step_body(body, GUARD)
+                self.assertIn("shell: bash", guard)
+                self.assertIn("df -h", guard)
+                self.assertIn("floor=1073741824", guard)
+                self.assertIn("::error::runner disk exhausted", guard)
+                self.assertIn("Infra flake: rerun the job.", guard)
+
+    def test_postgres_headroom_report_follows_verify(self):
+        for lane, body in self.jobs.items():
+            with self.subTest(lane=lane):
+                names = step_names(body)
+                if lane == "check":
+                    self.assertNotIn(REPORT, names, "the lint lane has no Postgres service")
+                    continue
+                self.assertIn(REPORT, names, f"missing step {REPORT!r} in {lane}")
+                self.assertEqual(
+                    names.index(REPORT), names.index(VERIFY) + 1,
+                    f"{REPORT} must run right after verify ({lane})",
+                )
+                report = step_body(body, REPORT)
+                self.assertIn("ON_ERROR_STOP=1", report)
+                self.assertIn("pg_database_size", report)
+                self.assertIn("pg_ls_waldir()", report)
+                self.assertIn("max_wal_size", report)
+                self.assertIn("min_wal_size", report)
 
     def test_toolchain_components_installed_before_first_pip_run(self):
         install = "Install pinned Rust toolchain components"

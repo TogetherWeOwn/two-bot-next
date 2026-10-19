@@ -2173,21 +2173,84 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("[[ \"$service_ip\" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]", run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
-    def test_rust_test_postgres_wal_budget_is_bounded(self):
-        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+    def test_tmpfs_postgres_wal_budget_is_bounded_in_every_lane(self):
+        # Run 39209332791: only rust-tests bounded WAL while the ignored lanes
+        # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
+        # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
+        # the bounded service must carry the budget and verify it.
+        for job_id in ("rust-tests", "ignored-db-stores", "ignored-db-runtime"):
+            with self.subTest(job=job_id):
+                job = self.workflows["check.yml"]["jobs"][job_id]
+                prepare = next(
+                    step for step in job["steps"]
+                    if step.get("name") == "Prepare isolated test databases"
+                )
+                verify = next(
+                    step for step in job["steps"]
+                    if step.get("name") == "Verify disposable Postgres defaults"
+                )
+                self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+                self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
+                self.assertIn("pg_reload_conf()", prepare["run"])
+                self.assertIn("'max_wal_size': '512MB'", verify["run"])
+                self.assertIn("'min_wal_size': '64MB'", verify["run"])
+
+    def test_nextest_lane_bounds_tmpfs_wal_and_reports_headroom(self):
+        lane = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        steps = lane["steps"]
+        names = [step.get("name") for step in steps]
         prepare = next(
-            step for step in job["steps"]
+            step for step in steps
             if step.get("name") == "Prepare isolated test databases"
-        )
-        verify = next(
-            step for step in job["steps"]
-            if step.get("name") == "Verify disposable Postgres defaults"
         )
         self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
-        self.assertIn("'max_wal_size': '512MB'", verify["run"])
-        self.assertIn("'min_wal_size': '64MB'", verify["run"])
+        self.assertIn("Report Postgres storage headroom", names)
+        report = next(
+            step for step in steps
+            if step.get("name") == "Report Postgres storage headroom"
+        )
+        self.assertEqual(
+            names.index("Report Postgres storage headroom"),
+            names.index("Prepare isolated test databases") + 1,
+        )
+        self.assertIn("ON_ERROR_STOP=1", report["run"])
+        self.assertIn("pg_database_size", report["run"])
+        self.assertIn("pg_ls_waldir()", report["run"])
+
+    def test_every_rust_lane_guards_runner_disk_headroom(self):
+        lanes = [
+            (workflow, job_id)
+            for workflow, job_id in (
+                ("check.yml", "check"),
+                ("check.yml", "rust-tests"),
+                ("check.yml", "ignored-db-stores"),
+                ("check.yml", "ignored-db-runtime"),
+                ("reusable-rust-nextest.yml", "nextest"),
+            )
+        ]
+        self.assertEqual(len(lanes), 5)
+        for workflow, job_id in lanes:
+            with self.subTest(workflow=workflow, job=job_id):
+                steps = self.workflows[workflow]["jobs"][job_id]["steps"]
+                names = [step.get("name") for step in steps]
+                prereq = next(
+                    name for name in names
+                    if str(name).startswith("Job-container prerequisites")
+                )
+                self.assertIn("Guard runner disk headroom", names)
+                self.assertEqual(
+                    names.index("Guard runner disk headroom"),
+                    names.index(prereq) + 1,
+                )
+                guard = next(
+                    step for step in steps
+                    if step.get("name") == "Guard runner disk headroom"
+                )
+                self.assertEqual(guard.get("shell"), "bash")
+                self.assertIn("floor=1073741824", guard["run"])
+                self.assertIn("::error::runner disk exhausted", guard["run"])
 
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]

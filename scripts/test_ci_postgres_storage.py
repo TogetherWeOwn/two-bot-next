@@ -21,10 +21,14 @@ SERVICES = [part.split("    steps:\n", 1)[0] for part in WORKFLOW_TEXT.split("  
 SERVICE = SERVICES[0]
 TOKENS = shlex.split(SERVICE.split("        options: >-\n", 1)[1])
 OPTIONS = dict(zip(TOKENS[::2], TOKENS[1::2]))
-STEP = WORKFLOW_TEXT.split("      - name: Verify disposable Postgres defaults\n", 1)[1].split(
-    "      # Preserve cargo test's default", 1
-)[0]
-SCRIPT = textwrap.dedent(STEP.split("python3 - <<'PY'\n", 1)[1].rsplit("          PY", 1)[0])
+VERIFY_TAILS = WORKFLOW_TEXT.split("      - name: Verify disposable Postgres defaults\n")[1:]
+PREPARE_TAILS = WORKFLOW_TEXT.split("      - name: Prepare isolated test databases\n")[1:]
+SCRIPTS = [
+    textwrap.dedent(tail.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+    for tail in VERIFY_TAILS
+]
+PREPARES = [tail.split("\n      - name: ", 1)[0] for tail in PREPARE_TAILS]
+SCRIPT = SCRIPTS[0]
 EXPECTED = {
     "data_directory": "/var/lib/postgresql/18/docker",
     "fsync": "on",
@@ -69,6 +73,22 @@ class PostgresStorageTests(unittest.TestCase):
                 )
                 result = subprocess.run(["sh", "-c", stubs + command], check=False)
                 self.assertEqual(result.returncode, expected)
+
+    def test_all_three_lanes_bound_wal_and_verify_it(self):
+        # Run 39209332791: only rust-tests bounded WAL while the ignored lanes
+        # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
+        # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
+        # the bounded service must carry the budget and verify it.
+        self.assertEqual(len(PREPARE_TAILS), 3)
+        self.assertEqual(len(VERIFY_TAILS), 3)
+        for prepare in PREPARES:
+            self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare)
+            self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare)
+            self.assertIn("pg_reload_conf()", prepare)
+        for script in SCRIPTS:
+            self.assertIn("'max_wal_size': '512MB'", script)
+            self.assertIn("'min_wal_size': '64MB'", script)
+        self.assertEqual(len(set(SCRIPTS)), 1, "the lanes' verify probes drifted apart")
 
     def test_probe_preserves_durability_and_uses_only_explicit_test_connection(self):
         output = io.StringIO()
