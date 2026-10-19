@@ -29,6 +29,10 @@ pub(crate) fn router_with_state(
         .route("/ops/summary", get(summary))
         .route("/ops/gateway", get(gateway))
         .route("/ops/backfill", get(backfill))
+        .route(
+            "/ops/audit",
+            get(audit).head(|| async { axum::http::StatusCode::METHOD_NOT_ALLOWED }),
+        )
         .with_state((state, jobs))
         .layer(Extension(guard))
 }
@@ -292,6 +296,133 @@ async fn backfill(
     ))
 }
 
+const AUDIT_MAX_ROWS: usize = 50;
+const AUDIT_MAX_BYTES: usize = 64 * 1024;
+
+/// Deliberately separate from StoredAudit: private metadata and delivery
+/// capabilities must never even be loaded by an operator excerpt read.
+#[derive(serde::Serialize, sqlx::FromRow)]
+struct AuditRow {
+    entry_id: String,
+    kind: String,
+    guild_id: String,
+    occurred_at: String,
+    actor_id: Option<String>,
+    target_id: Option<String>,
+    source_channel_id: Option<String>,
+    destination_channel_id: Option<String>,
+    message_id: Option<String>,
+    action: Option<String>,
+    delivery_state: String,
+}
+
+impl AuditRow {
+    fn valid(&self) -> bool {
+        let id = |s: &str| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit());
+        let optional_ids = [
+            &self.actor_id,
+            &self.target_id,
+            &self.source_channel_id,
+            &self.destination_channel_id,
+            &self.message_id,
+        ];
+        !self.entry_id.is_empty()
+            && self.entry_id.len() <= 128
+            && self
+                .entry_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
+            && id(&self.guild_id)
+            && optional_ids
+                .into_iter()
+                .all(|v| v.as_deref().is_none_or(id))
+            && matches!(
+                self.kind.as_str(),
+                "message_edit"
+                    | "message_delete"
+                    | "member_update"
+                    | "voice_join"
+                    | "voice_leave"
+                    | "voice_move"
+                    | "moderation_action"
+            )
+            && matches!(
+                self.delivery_state.as_str(),
+                "none" | "pending" | "delivering" | "delivered" | "quarantined"
+            )
+            && self.action.as_deref().is_none_or(|action| {
+                two_bot_core::classify::ModerationAuditAction::ALL
+                    .iter()
+                    .any(|value| value.as_str() == action)
+                    || two_bot_core::mac::is_auditable_action(action)
+            })
+    }
+}
+
+#[derive(serde::Serialize)]
+struct AuditExcerpt {
+    available: bool,
+    rows: Vec<AuditRow>,
+    truncated: bool,
+}
+
+impl AuditExcerpt {
+    fn unavailable() -> Self {
+        Self {
+            available: false,
+            rows: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    fn bounded(mut rows: Vec<AuditRow>) -> Self {
+        if !rows.iter().all(AuditRow::valid) {
+            return Self::unavailable();
+        }
+        let truncated = rows.len() > AUDIT_MAX_ROWS;
+        rows.truncate(AUDIT_MAX_ROWS);
+        let excerpt = Self {
+            available: true,
+            rows,
+            truncated,
+        };
+        // Field bounds keep valid excerpts below this budget; pin the actual
+        // serialized size too, so future schema growth cannot lift the cap.
+        if serde_json::to_vec(&excerpt).is_ok_and(|bytes| bytes.len() <= AUDIT_MAX_BYTES) {
+            excerpt
+        } else {
+            Self::unavailable()
+        }
+    }
+}
+
+async fn audit(
+    State((state, _)): State<(SharedState, SharedStatus)>,
+) -> ([(header::HeaderName, &'static str); 1], Json<AuditExcerpt>) {
+    let Some(pool) = state.database.as_ref() else {
+        return no_store_json(AuditExcerpt::unavailable());
+    };
+    // Fixed SELECT only. Bound TEXT at the database boundary before allocating;
+    // 129-byte/character sentinels fail validation, never become truncated facts.
+    // One extra row detects truncation in the same snapshot as the excerpt.
+    let fetch = sqlx::query_as::<_, AuditRow>(
+        "SELECT left(entry_id, 129) AS entry_id, left(event_kind, 129) AS kind,
+                left(guild_id, 129) AS guild_id,
+                to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS occurred_at,
+                left(actor_id, 129) AS actor_id, left(target_id, 129) AS target_id,
+                left(source_channel_id, 129) AS source_channel_id,
+                left(destination_channel_id, 129) AS destination_channel_id,
+                left(message_id, 129) AS message_id, left(action, 129) AS action,
+                left(delivery_state, 129) AS delivery_state
+         FROM operational_audit_log ORDER BY created_at DESC, entry_id DESC LIMIT 51",
+    ).fetch_all(pool);
+    let excerpt = match tokio::time::timeout(EVENT_STORE_TIMEOUT, fetch).await {
+        Ok(Ok(rows)) => AuditExcerpt::bounded(rows),
+        _ => AuditExcerpt::unavailable(),
+    };
+    no_store_json(excerpt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +432,100 @@ mod tests {
     };
     use tokio::sync::RwLock;
     use tower::ServiceExt as _;
+
+    fn audit_row() -> AuditRow {
+        AuditRow {
+            entry_id: "synthetic-entry".to_owned(),
+            kind: "message_delete".to_owned(),
+            guild_id: "424242".to_owned(),
+            occurred_at: "2026-10-19T00:00:00.000Z".to_owned(),
+            actor_id: None,
+            target_id: None,
+            source_channel_id: None,
+            destination_channel_id: None,
+            message_id: None,
+            action: None,
+            delivery_state: "none".to_owned(),
+        }
+    }
+
+    #[test]
+    fn audit_excerpt_empty_and_exact_row_cap_are_not_truncated() {
+        for count in [0, 1, AUDIT_MAX_ROWS] {
+            let excerpt = AuditExcerpt::bounded((0..count).map(|_| audit_row()).collect());
+            assert!(excerpt.available);
+            assert!(!excerpt.truncated);
+            assert_eq!(excerpt.rows.len(), count);
+        }
+    }
+
+    #[test]
+    fn audit_excerpt_maximum_fields_and_row_overflow_stay_within_byte_cap() {
+        let excerpt = AuditExcerpt::bounded(
+            (0..=AUDIT_MAX_ROWS)
+                .map(|_| {
+                    let mut row = audit_row();
+                    row.entry_id = "e".repeat(128);
+                    row.guild_id = "9".repeat(20);
+                    row.actor_id = Some("9".repeat(20));
+                    row.target_id = Some("9".repeat(20));
+                    row.source_channel_id = Some("9".repeat(20));
+                    row.destination_channel_id = Some("9".repeat(20));
+                    row.message_id = Some("9".repeat(20));
+                    row.action = Some("channel_overwrite_delete".to_owned());
+                    row
+                })
+                .collect(),
+        );
+        assert!(excerpt.available);
+        assert!(excerpt.truncated);
+        assert_eq!(excerpt.rows.len(), AUDIT_MAX_ROWS);
+        assert!(serde_json::to_vec(&excerpt).unwrap().len() <= AUDIT_MAX_BYTES);
+    }
+
+    #[test]
+    fn audit_excerpt_rejects_oversize_and_non_identifier_facts_without_echo() {
+        for field in [
+            "entry", "guild", "actor", "kind", "state", "action", "bytes",
+        ] {
+            let mut row = audit_row();
+            match field {
+                "entry" => row.entry_id = "synthetic-private-marker".repeat(10),
+                "guild" => row.guild_id = "synthetic-private-marker".to_owned(),
+                "actor" => row.actor_id = Some("synthetic-private-marker".to_owned()),
+                "kind" => row.kind = "synthetic-private-marker".to_owned(),
+                "state" => row.delivery_state = "synthetic-private-marker".to_owned(),
+                "action" => row.action = Some("synthetic-private-marker".to_owned()),
+                _ => row.occurred_at = "synthetic-private-marker".repeat(AUDIT_MAX_BYTES),
+            }
+            let excerpt = AuditExcerpt::bounded(vec![row]);
+            assert!(!excerpt.available, "invalid {field} must fail closed");
+            assert!(excerpt.rows.is_empty());
+            assert!(!excerpt.truncated);
+            assert!(!serde_json::to_string(&excerpt)
+                .unwrap()
+                .contains("synthetic-private-marker"));
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_head_is_refused_without_reading_database() {
+        let response = app(
+            GatewayState::Connected,
+            None,
+            crate::jobs::statuses(&[], true),
+        )
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/ops/audit")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
 
     fn state_with(gateway: GatewayState, database: Option<sqlx::PgPool>) -> SharedState {
         SharedState::new(Arc::new(RwLock::new(gateway)), database)

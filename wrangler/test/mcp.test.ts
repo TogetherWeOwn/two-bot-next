@@ -430,8 +430,9 @@ test("tools/call get_config reports the Worker version, never unknown here", asy
   assert.deepEqual(h.forwarded, [], "get_config must not touch the container");
 });
 
-test("tools/call get_audit pins the implemented=false stub", async () => {
-  const h = harness(() => Response.json({ synthetic: true }));
+test("tools/call get_audit returns a real empty excerpt with one fenced GET", async () => {
+  const excerpt = { available: true, rows: [], truncated: false };
+  const h = harness(() => Response.json(excerpt));
   const res = await worker.fetch(
     rpc("tools/call", { name: "get_audit", arguments: {} }),
     h.env,
@@ -439,8 +440,12 @@ test("tools/call get_audit pins the implemented=false stub", async () => {
   );
   assert.equal(res.status, 200);
   const body = await rpcBody(res);
-  assert.deepEqual(body.result?.structuredContent, { implemented: false });
-  assert.deepEqual(h.forwarded, [], "get_audit must not touch the container");
+  assert.deepEqual(body.result?.structuredContent, excerpt);
+  assert.equal(h.forwarded.length, 1);
+  assert.equal(h.forwarded[0]!.method, "GET");
+  assert.equal(new URL(h.forwarded[0]!.url).pathname, "/ops/audit");
+  assert.equal(h.forwarded[0]!.headers["x-two-bot-deployment-id"], "synthetic-mcp-deployment");
+  assert.equal(h.forwarded[0]!.headers.authorization, undefined);
 });
 
 test("initialize falls back to a supported version for unknown requests", async () => {
