@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -361,6 +362,20 @@ fn posted_contents(mock: &MockRest) -> Vec<String> {
 
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 
+fn schema_name_at(nanos: u128) -> String {
+    format!(
+        "tog10430_risk_{}_{}_{}",
+        std::process::id(),
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
+        nanos
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -368,15 +383,16 @@ struct TestSchema {
 
 impl TestSchema {
     async fn new() -> Self {
-        // PID + process-local counter: wall-clock nanos can repeat across
-        // parallel tests on a coarse clock (run 39175965289 attempt 1:
-        // duplicate schema `tog10430_risk_*` -> 23505), while a counter is
-        // unique per process and the PID separates test binaries.
-        let schema = format!(
-            "tog10430_risk_{}_{}",
-            std::process::id(),
-            NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
-        );
+        // PID + counter + nanos: wall-clock nanos can repeat across parallel
+        // tests on a coarse clock (run 39175965289 attempt 1: duplicate
+        // schema `tog10430_risk_*` -> 23505). The counter keeps same-tick
+        // names distinct, the PID separates test binaries, and nanos keeps a
+        // leaked schema plus PID reuse from ever repeating a name.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let schema = schema_name_at(nanos);
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");

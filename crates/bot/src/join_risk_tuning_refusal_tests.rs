@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
@@ -239,6 +240,20 @@ async fn discord() -> MockRest {
 
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 
+fn schema_name_at(nanos: u128) -> String {
+    format!(
+        "joinrisk_refusal_{}_{}_{}",
+        std::process::id(),
+        NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed),
+        nanos
+    )
+}
+
+#[test]
+fn schema_names_are_distinct_when_the_clock_repeats() {
+    assert_ne!(schema_name_at(42), schema_name_at(42));
+}
+
 struct TestSchema {
     pool: PgPool,
     schema: String,
@@ -246,13 +261,15 @@ struct TestSchema {
 
 impl TestSchema {
     async fn new() -> Self {
-        // Same PID + counter scheme as join_risk_runtime_tests: nanos can
-        // repeat across parallel tests sharing one test binary.
-        let schema = format!(
-            "joinrisk_refusal_{}_{}",
-            std::process::id(),
-            NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
-        );
+        // Same PID + counter + nanos scheme as join_risk_runtime_tests:
+        // nanos can repeat across parallel tests sharing one test binary,
+        // so the counter keeps same-tick names distinct and nanos keeps a
+        // leaked schema plus PID reuse from ever repeating a name.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let schema = schema_name_at(nanos);
         let mut admin = PgConnection::connect(TEST_DATABASE)
             .await
             .expect("only agent-testdb, agent_test, empty password");
