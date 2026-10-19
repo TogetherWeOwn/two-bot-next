@@ -2941,7 +2941,10 @@ async fn shared_component_orchestration(pool: &PgPool) -> TestResult {
                 assert_eq!(mutations[1].method, "PUT");
             }
             let reply: serde_json::Value = serde_json::from_slice(&calls.last().unwrap().body)?;
-            assert!(reply["content"].as_str().unwrap().contains("already"));
+            assert_eq!(
+                reply["content"].as_str().unwrap(),
+                "This selection is already being handled or was handled earlier."
+            );
         } else {
             assert!(row.is_none());
             assert_eq!(mock.requests().len(), usize::from(enabled));
