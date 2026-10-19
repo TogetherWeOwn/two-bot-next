@@ -1,5 +1,8 @@
 //! Loopback-only tests of the actual Twilight request builders and transport.
 
+#[path = "voice_creation_receipt_acceptance_tests.rs"]
+mod creation_receipt_acceptance;
+
 use super::*;
 use axum::{
     body::Body,

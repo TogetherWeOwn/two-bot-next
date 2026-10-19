@@ -9,6 +9,8 @@ mod admission_config_acceptance;
 mod admission_spawn;
 #[path = "voice_cold_authority_tests.rs"]
 mod cold_authority;
+#[path = "voice_creation_receipt_acceptance_tests.rs"]
+mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_empty_grace_override_tests.rs"]
