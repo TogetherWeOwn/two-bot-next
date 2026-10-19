@@ -185,38 +185,170 @@ pub fn normalize_source(kind: FeedKind, source: &str) -> Result<String, FeedErro
 
 const MAX_FEED_LIST_SOURCE_UNITS: usize = 128;
 
-fn truncate_feed_list_source(source: &str) -> String {
-    let truncated = truncate_utf16(source, MAX_FEED_LIST_SOURCE_UNITS);
+fn truncate_feed_list_source_with_budget(source: &str, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    let truncated = truncate_utf16(source, budget);
     if truncated == source {
         truncated
     } else {
-        format!(
-            "{}…",
-            truncate_utf16(&truncated, MAX_FEED_LIST_SOURCE_UNITS - 1)
-        )
+        format!("{}…", truncate_utf16(&truncated, budget - 1))
     }
+}
+
+fn feed_list_row_with_budget(feed: &FeedRelay, source_budget: usize) -> String {
+    let source = truncate_feed_list_source_with_budget(&feed.source, source_budget);
+    format!(
+        "`{}` {} → <#{}> {source}",
+        feed.id,
+        feed.kind.as_str(),
+        feed.channel_id
+    )
+}
+
+/// Display-only scheme/host prefix strip for the capacity path. The stored
+/// source is unchanged; dropping `https://`/`http://` and a leading `www.`
+/// reclaims ~8-12 UTF-16 units for the distinguishing tail.
+fn strip_feed_list_display_prefix(source: &str) -> &str {
+    let without_scheme = source
+        .strip_prefix("https://")
+        .or_else(|| source.strip_prefix("http://"))
+        .unwrap_or(source);
+    without_scheme
+        .strip_prefix("www.")
+        .unwrap_or(without_scheme)
+}
+
+/// Keep the last `limit` UTF-16 units without splitting surrogate pairs.
+/// A char straddling the cut is dropped whole, so the result is <= limit.
+fn truncate_utf16_tail(value: &str, limit: usize) -> String {
+    let units = value.encode_utf16().count();
+    if units <= limit {
+        return value.to_string();
+    }
+    let mut skip = units - limit;
+    let mut result = String::new();
+    for ch in value.chars() {
+        let width = ch.len_utf16();
+        if skip == 0 {
+            result.push(ch);
+        } else if skip >= width {
+            skip -= width;
+        } else {
+            // Skip lands inside an astral char: drop it whole.
+            skip = 0;
+        }
+    }
+    result
+}
+
+/// Capacity-path source rendering that keeps same-host relays
+/// distinguishable. Prefix truncation collapses every YouTube row to the same
+/// `https://w…` at ~11 units, so an admin sees all ids but cannot map any id
+/// to a source. Middle-eliding the scheme-stripped form keeps the
+/// distinguishing tail (`channel_id=UC…` / path) plus a recognizable head.
+fn truncate_feed_list_source_distinguishing(source: &str, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    if source.encode_utf16().count() <= budget {
+        return source.to_string();
+    }
+    let compact = strip_feed_list_display_prefix(source);
+    if compact.encode_utf16().count() <= budget {
+        return compact.to_string();
+    }
+    if budget == 1 {
+        return "…".to_string();
+    }
+    // Tail-biased split: the tail carries the id/path that differs.
+    let remaining = budget - 1;
+    let head_units = remaining / 3;
+    let tail_units = remaining - head_units;
+    let head = truncate_utf16(compact, head_units);
+    let tail = truncate_utf16_tail(compact, tail_units);
+    format!("{head}…{tail}")
+}
+
+fn feed_list_row_distinguishing(feed: &FeedRelay, source_budget: usize) -> String {
+    let source = truncate_feed_list_source_distinguishing(&feed.source, source_budget);
+    format!(
+        "`{}` {} → <#{}> {source}",
+        feed.id,
+        feed.kind.as_str(),
+        feed.channel_id
+    )
 }
 
 pub fn feed_list_text(feeds: &[FeedRelay]) -> String {
     if feeds.is_empty() {
         return "No feed relays configured.".into();
     }
-    truncate_utf16(
-        &feeds
-            .iter()
-            .map(|feed| {
-                let source = truncate_feed_list_source(&feed.source);
-                format!(
-                    "`{}` {} → <#{}> {source}",
-                    feed.id,
-                    feed.kind.as_str(),
-                    feed.channel_id
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        2000,
-    )
+    // Fast path: today's per-row 128-unit rendering when the whole list fits.
+    // This preserves empty/short output exactly.
+    let full = feeds
+        .iter()
+        .map(|feed| feed_list_row_with_budget(feed, MAX_FEED_LIST_SOURCE_UNITS))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if full.encode_utf16().count() <= DISCORD_MESSAGE_CONTENT_LIMIT {
+        return full;
+    }
+    // At capacity the fixed per-row overhead alone (~66-70 units for a
+    // 32-hex id plus kind/channel) fits, but 25 long sources do not. Shrink
+    // every source to a uniform budget so all exact `id` removal ids stay
+    // discoverable in list order within the single 2,000-unit response,
+    // instead of truncating trailing rows away. Short sources keep their
+    // full text; only long ones shrink to the shared budget. The capacity
+    // path middle-elides the scheme-stripped source (head…tail) so same-host
+    // relays stay pairwise distinguishable; the 128-unit fast path above
+    // keeps legacy prefix truncation byte-identical.
+    let fixed_units = feeds
+        .iter()
+        .map(|feed| {
+            format!(
+                "`{}` {} → <#{}> ",
+                feed.id,
+                feed.kind.as_str(),
+                feed.channel_id
+            )
+            .encode_utf16()
+            .count()
+        })
+        .sum::<usize>()
+        + feeds.len().saturating_sub(1);
+    let available = DISCORD_MESSAGE_CONTENT_LIMIT.saturating_sub(fixed_units);
+    let budget = (available / feeds.len()).min(MAX_FEED_LIST_SOURCE_UNITS);
+    let bounded = feeds
+        .iter()
+        .map(|feed| feed_list_row_distinguishing(feed, budget))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if bounded.encode_utf16().count() <= DISCORD_MESSAGE_CONTENT_LIMIT {
+        return bounded;
+    }
+    // Defensive: fixed overhead alone exceeds the limit (e.g. pathological
+    // max-length ids or legacy-restored rows beyond the 25-relay cap). Emit
+    // the smallest exact-id rows, bounded to the message cap; the executor's
+    // message-safety clamp enforces the final 2,000-unit bound.
+    let mut id_only = String::new();
+    for feed in feeds {
+        let row = format!("`{}`", feed.id);
+        let extra = if id_only.is_empty() { 0 } else { 1 };
+        if id_only.encode_utf16().count() + extra + row.encode_utf16().count()
+            > DISCORD_MESSAGE_CONTENT_LIMIT
+        {
+            break;
+        }
+        if !id_only.is_empty() {
+            id_only.push('\n');
+        }
+        id_only.push_str(&row);
+    }
+    // Second fence so the return is bounded even if a single id row alone
+    // exceeds the cap (max 128-char ids cannot, but legacy data is untrusted).
+    truncate_utf16(&id_only, DISCORD_MESSAGE_CONTENT_LIMIT)
 }
 
 pub fn feed_removed_text(removed: bool) -> &'static str {
