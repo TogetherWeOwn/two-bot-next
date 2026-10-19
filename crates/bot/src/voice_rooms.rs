@@ -681,7 +681,6 @@ fn admission_knob(raw: Option<&str>, key: &str, default: u32, min: u32, max: u32
             warn!(
                 key = key,
                 reason = "invalid_value",
-                value = %raw,
                 "temp-voice admission setting invalid; using default"
             );
             default
