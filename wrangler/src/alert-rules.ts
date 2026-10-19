@@ -154,6 +154,16 @@ export const VOICE_FAILURE_MIN_OPS = 10;
 export const VOICE_VOTE_KICK_FAILURE_OUTCOMES = ["discord_error", "gave_up", "permission_missing"] as const;
 /** Dispatch drops must grow in this many consecutive completed sample windows. */
 export const DISPATCH_DROP_SAMPLES = 3;
+/** Sustained above-threshold event-store consumer lag samples before the ticket. */
+export const EVENT_STORE_LAG_SAMPLES = 3;
+/**
+ * Lag above this many seconds counts toward the ticket; a valid sample at or
+ * below it resolves. 60 s is one keepalive window (`docs/event-store.md`):
+ * a healthy `received_at - event_time` spread is always slightly positive
+ * (insert latency), so a bare `> 0` bar would fire forever once the setter
+ * has a caller.
+ */
+export const EVENT_STORE_LAG_THRESHOLD_SECONDS = 60;
 /** Mirrors the fixed DISPATCH_LANES allowlist in crates/core/src/metrics.rs. */
 export const DISPATCH_LANES: readonly string[] = ["messages", "interactions", "registry", "privileged", "busy", "reactions"];
 /** Creator-join SLO: this share of genuine joins must move within 5 s (99.5%). */
@@ -252,6 +262,8 @@ export const RULES: readonly RuleDef[] = [
   { id: "error_budget_slow_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_SLOW_BURN}x over ${ERROR_BUDGET_SLOW_LONG_SECONDS / 3600} h and ${ERROR_BUDGET_SLOW_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-slow-burn", severity: "ticket" },
   { id: "audit_delivery_halt", summary: `audit delivery halt engaged for ${AUDIT_HALT_SAMPLES} consecutive valid samples`, runbook: "runbook.md#alert-audit-delivery-halt", severity: "ticket" },
   { id: "eventsub_tampered", summary: `EventSub tampered-signature deliveries rose in ${EVENTSUB_TAMPERED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-eventsub-tampered" },
+  { id: "eventsub_reconcile_failed", summary: `EventSub reconcile failed passes increased between samples`, runbook: "runbook.md#alert-eventsub-reconcile-failed", severity: "ticket" },
+  { id: "event_store_consumer_lag", summary: `event-store consumer lag above ${EVENT_STORE_LAG_THRESHOLD_SECONDS} s sustained for ${EVENT_STORE_LAG_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-event-store-consumer-lag", severity: "ticket" },
 ];
 
 /**
@@ -357,6 +369,16 @@ export interface MetricsAlertState {
   dispatchDrops?: Record<string, number>;
   /** Consecutive positive deltas, capped at DISPATCH_DROP_SAMPLES. */
   dispatchDropStreaks?: Record<string, number>;
+  /** Consecutive valid positive event-store lag samples; absent in legacy storage reads as 0. */
+  eventStoreLagStreak?: number;
+  /** Healthy reconcile passes at the last valid baseline; absent in legacy storage. */
+  reconcileHealthy?: number;
+  /** Verification-pending reconcile passes at the last valid baseline; absent in legacy storage. */
+  reconcilePending?: number;
+  /** Failed reconcile passes at the last valid baseline; absent in legacy storage. */
+  reconcileFailed?: number;
+  /** False until a valid sample stores the reconcile baseline: the first sample never fires. */
+  reconcileSeen?: boolean;
   /**
    * Creator-join burn snapshots for the SLO windows, oldest first. Each entry
    * carries the scrape time plus cumulative counters (received joins,
@@ -556,11 +578,11 @@ function errorBudgetBurnEvaluation(
   };
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, eventsubPosts: {}, eventsubPostsSeen: false, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0 };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false };
 
-/** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
+/** An unsuccessful scrape breaks the dispatch and lag streaks, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
-  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {} };
+  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, eventStoreLagStreak: 0 };
 }
 
 /** A failed scrape breaks the engaged run, but cannot prove a halt cleared. */
@@ -1318,7 +1340,95 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, auditHaltStreak, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak } };
+  // Event-store consumer lag is a ticket, not a page. The label-free duration
+  // gauge reads 0 when unobserved; only sustained samples above
+  // EVENT_STORE_LAG_THRESHOLD_SECONDS (fractional counts) across
+  // EVENT_STORE_LAG_SAMPLES consecutive valid samples fire. A valid sample
+  // at or below the threshold resets the streak and resolves; missing/invalid
+  // samples (absent, duplicate, labeled, non-finite, negative) break the
+  // streak but preserve a firing ticket, and never let label values reach
+  // state or keys. A process restart reads 0, so restarts rebaseline the
+  // same way. Failed scrapes reset the streak through interruptDispatchDrops.
+  const EVENT_STORE_LAG_RULE = "event_store_consumer_lag";
+  const wasLagFiring = prev.firing.includes(EVENT_STORE_LAG_RULE);
+  const lagRows = gauge("two_bot_event_store_consumer_lag_seconds");
+  let lagValue: number | undefined;
+  if (lagRows.length === 1) {
+    const row = lagRows[0]!;
+    if (Object.keys(row.labels).length === 0 && Number.isFinite(row.value) && row.value >= 0) {
+      lagValue = row.value;
+    }
+  }
+  const prevLagStreak = prev.eventStoreLagStreak ?? 0;
+  let eventStoreLagStreak: number;
+  if (lagValue === undefined) {
+    eventStoreLagStreak = 0;
+    if (wasLagFiring) firing.push(EVENT_STORE_LAG_RULE);
+  } else if (lagValue <= EVENT_STORE_LAG_THRESHOLD_SECONDS) {
+    eventStoreLagStreak = 0;
+  } else {
+    eventStoreLagStreak = Math.min(prevLagStreak + 1, EVENT_STORE_LAG_SAMPLES);
+    if (wasLagFiring || eventStoreLagStreak >= EVENT_STORE_LAG_SAMPLES) firing.push(EVENT_STORE_LAG_RULE);
+  }
+
+  // Failed EventSub reconciliation passes (one ticket per failed pass). The
+  // Rust process records exactly one outcome per completed pass that reaches
+  // Helix (`two_bot_eventsub_reconcile_passes_total{outcome}` with the fixed
+  // `healthy`/`pending`/`failed` outcomes); parked or refused startup passes
+  // never reach Helix and record no sample. Only the pass outcome is an alert
+  // input: the detailed per-site error counters stay exposition-only so one
+  // failed pass raises one ticket however many error sites moved. The first
+  // valid sample only stores a baseline. A later positive failed-pass delta
+  // fires (even beside a healthy delta); healthy-only or pending-only growth
+  // never fires. A flat failed counter never recovers: only a healthy-pass
+  // increase with no failed-pass increase resolves, once. Any backwards
+  // counter means the process restarted: that sample re-baselines, firing
+  // when the new process has already counted a failed pass (the startup pass
+  // runs before the first scrape, so a reset sample with failed > 0 is a
+  // post-restart failure, not a fabricated delta) and otherwise holding a
+  // firing ticket instead of fabricating a RESOLVED. Missing or
+  // invalid samples (absent family on older containers, malformed values,
+  // extra labels, duplicates) hold the firing state and keep the previous
+  // baseline; `??` covers DO storage written before this rule existed.
+  const RECONCILE_FAILED_RULE = "eventsub_reconcile_failed";
+  const wasReconcileFiring = prev.firing.includes(RECONCILE_FAILED_RULE);
+  const passSamples = gauge("two_bot_eventsub_reconcile_passes_total");
+  const reconcileHealthyNow = exactSeries(passSamples, { outcome: "healthy" });
+  const reconcilePendingNow = exactSeries(passSamples, { outcome: "pending" });
+  const reconcileFailedNow = exactSeries(passSamples, { outcome: "failed" });
+  let reconcileHealthy = prev.reconcileHealthy ?? 0;
+  let reconcilePending = prev.reconcilePending ?? 0;
+  let reconcileFailed = prev.reconcileFailed ?? 0;
+  let reconcileSeen = prev.reconcileSeen ?? false;
+  if (reconcileHealthyNow === undefined || reconcilePendingNow === undefined || reconcileFailedNow === undefined) {
+    if (wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
+  } else if (!reconcileSeen) {
+    reconcileHealthy = reconcileHealthyNow;
+    reconcilePending = reconcilePendingNow;
+    reconcileFailed = reconcileFailedNow;
+    reconcileSeen = true;
+  } else if (
+    reconcileHealthyNow < reconcileHealthy
+    || reconcilePendingNow < reconcilePending
+    || reconcileFailedNow < reconcileFailed
+  ) {
+    reconcileHealthy = reconcileHealthyNow;
+    reconcilePending = reconcilePendingNow;
+    reconcileFailed = reconcileFailedNow;
+    reconcileSeen = true;
+    if (reconcileFailedNow > 0 || wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
+  } else {
+    const failedGrew = reconcileFailedNow > reconcileFailed;
+    const healthyGrew = reconcileHealthyNow > reconcileHealthy;
+    reconcileHealthy = reconcileHealthyNow;
+    reconcilePending = reconcilePendingNow;
+    reconcileFailed = reconcileFailedNow;
+    reconcileSeen = true;
+    if (failedGrew) firing.push(RECONCILE_FAILED_RULE);
+    else if (!healthyGrew && wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
+  }
+
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

@@ -5,6 +5,9 @@ use twilight_model::gateway::payload::incoming::{
 };
 use two_bot_discord::MemPipeline;
 
+#[path = "voice_actor_init_recovery_tests.rs"]
+mod init_recovery;
+
 impl RoomPersistence for Arc<Store> {
     async fn creators(&self, guild: u64) -> Result<Vec<CreatorChannel>, StoreError> {
         self.as_ref().creators(guild).await

@@ -182,6 +182,17 @@ body, broadcaster, subscription or secret data reaches any label.
 | `two_bot_eventsub_reconcile_actions_total{action}` | Successful reconcile mutations by bounded action; `action` is `create` or `delete`; 409 already-exists confirmations fold into the pass outcome |
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | Reconcile failure sites by bounded log `error_class`; `error_class` is `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed` or `other`; no status, body or response bytes in labels |
 
+## Feed fetch series
+
+Counters emitted by the feed poller render. Unknown `outcome` values collapse
+to `failure` and unknown `error_class` values collapse to `other`, and no
+source URL, host, header, body or feed id reaches any label.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_feed_fetches_total{outcome}` | Feed fetch attempts by bounded outcome; `outcome` is `success` (2xx fetch), `invalid_source` (source refused before dialling), `refused_redirect` (redirect refused by policy) or `failure` (every other failure, including non-2xx HTTP) |
+| `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class; `error_class` is `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`; successes record nothing here |
+
 ## Moderation enforcement series
 
 Counters emitted by the moderation enforcement render. Unknown outcomes
@@ -245,10 +256,12 @@ is the single shared spelling also pinned in `evidence.rs`
 | `voice_join_slow_burn` | Same inputs as `voice_join_fast_burn` | Ticket, not page: same budget burning faster than 6x in both the 6 h and 30 min windows with the same per-window volume and bad-move floors; catches the sustained grind the fast rule never spikes on; do not close as "fast burn resolved" |
 | `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` with `two_bot_voice_creator_map_generation` | Pages when the age since the last successful creator-map merge passes 600 s (two missed 5 min refreshes) after at least one merge; generation 0 (never merged: boot or voice parked) never fires; the gauges are optional scrape inputs, so older containers hold the previous state |
 | `eventsub_post_failed_share` | `two_bot_eventsub_posts_total` by fixed `outcome` (`attempted`, `succeeded`, `failed`, `other`) | Ticket, not page: failed posts exceed 10% of attempted posts with at least 10 attempted (sub-floor windows hold the baseline and accumulate across consecutive valid samples until the floor is met); the first valid sample is baseline only, missing/invalid samples preserve, any backwards counter rebaselines, and flat/sub-floor windows hold an active ticket until a judged window clears it |
+| `event_store_consumer_lag` | `two_bot_event_store_consumer_lag_seconds` | Ticket, not page: lag above 60 s (one keepalive window, fractional counts) in 3 consecutive valid samples; a valid sample at or below 60 s resolves and rebaselines, missing/invalid samples and failed scrapes break the streak but preserve a firing ticket; the gauge is an optional scrape input, so older containers without it reset `eventStoreLagStreak` to `0` while retaining an existing firing ticket |
 | `error_budget_fast_burn` | All `two_bot_rest_requests_total` samples (eligible requests) against `result="5xx"` plus `result="transport"` (budget spend) | Pages when the REST error budget (99.9% success over 48 h) burns faster than 12x in both the 15 min and 2 min windows; each window needs at least 10 eligible requests and two budget errors; incomplete post-restart windows stay inactive; missing or malformed inputs hold the previous state |
 | `error_budget_slow_burn` | Same inputs as `error_budget_fast_burn` | Ticket, not page: same budget burning faster than 3x in both the 2 h and 15 min windows with the same per-window volume and error floors; needs full 2 h history, holds on missing inputs, scrape gaps, or counter resets, and resolves on a covered quiet or below-threshold 15 min window |
 | `audit_delivery_halt` | `two_bot_audit_delivery_halt` with `two_bot_job_consecutive_failures{job="audit_retry"}` and `two_bot_job_last_success_timestamp_seconds{job="audit_retry"}` | Ticket when the label-free halt gauge reads `1` for 3 consecutive valid samples (about two minutes at the 60 s cadence); any nonzero `audit_retry` failure count vetoes both firing and recovery, and missing, duplicate, labeled or non-boolean readings break the streak while holding an active ticket; a valid `0` after a healthy sweep resolves once, and a boot-default zero cannot resolve until `audit_retry` has a nonzero success timestamp |
 | `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` | Pages when the `tampered` counter (only `BadSignature`) rises in 3 consecutive samples; the first sample only baselines, a flat window resolves, a reset rebaselines, and missing/invalid scrapes hold firing |
+| `eventsub_reconcile_failed` | `two_bot_eventsub_reconcile_passes_total{outcome}` with the fixed `healthy`/`pending`/`failed` outcomes | Ticket, not page: fires when the failed-pass counter grows between valid samples, even beside healthy growth; the first valid sample only stores a baseline, healthy-only or pending-only growth never fires, and a flat failed counter never recovers (only healthy growth with no failed growth resolves, once); any backwards counter re-baselines: the reset sample fires when the new process already counted a failed pass (failed startup pass) and otherwise holds a firing ticket instead of fabricating a transition; missing or invalid samples hold the previous state; the family is an optional scrape input, so older containers hold the previous state |
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
@@ -337,15 +350,19 @@ and `activity_detected`, so "no game was ever seen" is distinguishable
 from "the rename was refused"; the retry-only `channel_unseen` decision
 logs at debug, since the naming pass retries it on every pass.
 
-Adjacent actor message without a `voice_event` field:
-`voice actor load failed; actor respawns on the next guild snapshot`
+Adjacent actor messages without a `voice_event` field:
+`voice actor load failed; retrying with capped backoff` and
+`voice actor load failed; credential refused, not retrying`
 (`observe_voice_actor_load_failure` in `crates/bot/src/voice_rooms.rs`):
 the guild actor's store load failed. Every failure bumps
 `two_bot_db_errors_total{op="other"}`; the warn is throttled process-wide to
-one line per 5 minutes, so a burst across guilds names only the first. The
-actor respawns on the next guild snapshot (`publish_snapshot` on
-`GuildCreate`/resumed replay); voice, channel and role events for the guild
-are dropped until then.
+one line per 5 minutes, so a burst across guilds names only the first.
+Transient failures (including a load attempt abandoned at its 30 s
+deadline) retry inside the same actor task: 1 s doubling to a 60 s cap,
+until the load succeeds or the guild is removed. A credential refusal is
+never retried; that actor respawns only on the next guild snapshot
+(`publish_snapshot` on `GuildCreate`/resumed replay), and voice, channel
+and role events for the guild are dropped until then.
 
 `voice live view was not ready on a connected gateway; republished from cache`
 (warn; `heal_not_ready` in `crates/bot/src/voice_rooms.rs`, guild-only field,

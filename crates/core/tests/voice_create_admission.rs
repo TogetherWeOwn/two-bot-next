@@ -293,3 +293,21 @@ fn decision_helpers_report_the_verdict() {
     assert!(!denied.allowed());
     assert_eq!(denied.refusal(), Some(RefusalReason::Cooldown));
 }
+
+// ---- display pins ----
+
+#[test]
+fn admission_config_error_display_strings_are_pinned() {
+    assert_eq!(
+        AdmissionConfigError::MaxPerUser.to_string(),
+        "max rooms per user must be between 1 and 10"
+    );
+    assert_eq!(
+        AdmissionConfigError::MaxPerGuild.to_string(),
+        "max rooms per guild must be between 1 and 45"
+    );
+    assert_eq!(
+        AdmissionConfigError::Cooldown.to_string(),
+        "create cooldown must be between 0 and 3600 seconds"
+    );
+}
