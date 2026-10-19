@@ -386,6 +386,14 @@ stored per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row is malformed or
 outside 0 to 600 whole seconds, so the sweep keeps the boot fallback. The
 line carries the setting key and the `out_of_range` reason.
 
+Invite-code override warning (in `stored_invite_code_with` in
+`crates/bot/src/voice_rooms.rs`, guild-only fields, no IDs):
+`stored invite-code override invalid; using vanity fallback` (warn): the
+stored per-guild `TWO_GUILD_INVITE_CODE` row is not a JSON string of 2 to
+32 ASCII alphanumerics plus `-`/`_`, so the `/invite` reply keeps the
+gateway vanity fallback. The line carries the setting key and the
+`invalid_invite_code` reason, never the rejected value.
+
 Creator-view refresh actor messages (all in `GuildRoomWorker::revalidate_creator`
 / `reload_creators` in `crates/bot/src/voice_rooms.rs`, guild-only fields,
 no IDs):

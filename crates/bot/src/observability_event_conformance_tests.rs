@@ -194,7 +194,7 @@ const MAIN_RS_ADJACENT: [&str; 14] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 19] = [
+const VOICE_RS_ADJACENT: [&str; 20] = [
     "voice succession refused",
     "voice actor load failed; retrying with capped backoff",
     "voice actor load failed; credential refused, not retrying",
@@ -213,6 +213,7 @@ const VOICE_RS_ADJACENT: [&str; 19] = [
     "voice worker halt cleared: store credentials healthy",
     "voice worker stuck: queued actions with no progress",
     "stored empty-grace override out of range; using boot fallback",
+    "stored invite-code override invalid; using vanity fallback",
     "voice live view was not ready on a connected gateway; republished from cache",
 ];
 
