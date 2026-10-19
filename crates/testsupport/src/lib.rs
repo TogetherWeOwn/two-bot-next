@@ -139,27 +139,78 @@ async fn prepare_cleanup_connection(conn: &mut sqlx::PgConnection) -> Result<()>
     Ok(())
 }
 
+/// Substrings marking a teardown failure as transient hosted-runner
+/// infrastructure (DNS, dropped connection) rather than a deterministic
+/// teardown bug (unknown database, permission). Anything outside this list
+/// fails fast and is never retried.
+fn is_transient_teardown_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_lowercase();
+    const MARKERS: &[&str] = &[
+        "temporary failure in name resolution",
+        "failed to lookup address information",
+        "name or service not known",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "unexpected eof",
+        "got 0 bytes",
+        "expected to read",
+        "could not connect",
+        "server closed the connection",
+        "connection timed out",
+        "timed out",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
+
 impl Cleanup {
+    async fn drop_once(admin: &PgPool, name: &str) -> Result<()> {
+        let _ddl = DATABASE_DDL.lock().await;
+        let mut conn = admin.acquire().await?;
+        prepare_cleanup_connection(&mut conn).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE \"{}\" WITH (FORCE)",
+            name
+        )))
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     async fn close(self) -> Result<()> {
-        for pool in self.independent_pools.into_inner().unwrap() {
+        let Self {
+            admin,
+            pool,
+            independent_pools,
+            name,
+        } = self;
+        for pool in independent_pools.into_inner().unwrap() {
             pool.close().await;
         }
-        self.pool.close().await;
+        pool.close().await;
         // The name is generated internally, not supplied by a caller.
-        let result: Result<()> = async {
-            let _ddl = DATABASE_DDL.lock().await;
-            let mut conn = self.admin.acquire().await?;
-            prepare_cleanup_connection(&mut conn).await?;
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DROP DATABASE \"{}\" WITH (FORCE)",
-                self.name
-            )))
-            .execute(&mut *conn)
-            .await?;
-            Ok(())
-        }
-        .await;
-        self.admin.close().await;
+        // Hosted runners occasionally lose the service hostname for seconds;
+        // the same blip that fails bootstrap connects can also kill an
+        // in-flight DROP with EOF. Retry only transient teardown failures;
+        // anything else fails fast with its original context. The DDL guard
+        // is per attempt, never held across the backoff sleep.
+        const ATTEMPTS: usize = 4;
+        let mut attempt = 0;
+        let result: Result<()> = loop {
+            attempt += 1;
+            match Self::drop_once(&admin, &name).await {
+                Ok(()) => break Ok(()),
+                Err(error) if attempt < ATTEMPTS && is_transient_teardown_error(&error) => {
+                    eprintln!(
+                        "transient test-database teardown failure (attempt {attempt}/{ATTEMPTS}): {error:#}; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250u64 << (attempt - 1))).await;
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        admin.close().await;
         result.context("drop disposable test database")?;
         Ok(())
     }
@@ -578,6 +629,33 @@ mod tests {
         for name in [first, second] {
             guard_database_url(&format!("postgres://agent_test:@agent-testdb:5432/{name}"))
                 .unwrap();
+        }
+    }
+
+    #[test]
+    fn teardown_retry_covers_transient_infra_but_not_teardown_bugs() {
+        for transient in [
+            "drop disposable test database: error communicating with database: \
+             expected to read 5 bytes, got 0 bytes at EOF",
+            "server closed the connection unexpectedly",
+            "connection reset by peer",
+            "pool timed out while waiting for an open connection",
+        ] {
+            assert!(
+                is_transient_teardown_error(&anyhow::anyhow!("{transient}")),
+                "should retry: {transient}"
+            );
+        }
+        for deterministic in [
+            "database \"two_bot_test_deadbeef\" does not exist",
+            "permission denied to drop database",
+            "cannot drop the currently open database",
+            "set disposable database teardown timeout: statement timeout",
+        ] {
+            assert!(
+                !is_transient_teardown_error(&anyhow::anyhow!("{deterministic}")),
+                "must fail fast: {deterministic}"
+            );
         }
     }
 }
