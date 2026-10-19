@@ -85,7 +85,10 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `eventsub reconcile action failed; continuing with the rest of the plan` | `crates/bot/src/eventsub_reconcile.rs` (`run_plan`) | Error; one delete or create was rejected or failed in transport (`action = "delete"` or `"create"`, `error` names the status, `error_class = "reconcile_action_failed"`); the later actions and the follow-up listing still run |
 | `eventsub reconcile did not converge: an action failed or a healthy subscription is missing` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all_with_metrics`) | Error; after the follow-up listing, at least one action failed or a desired broadcaster lacks a healthy subscription; the pass fails loudly with `failed` and `missing` counts (`error_class = "reconcile_unhealthy"`) |
 | `eventsub reconcile failed` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; the pass returned an error after the gate and config checks (`error_class = "reconcile_failed"`) |
-| `event = "eventsub_reconcile"` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all_with_metrics`, `run_plan`, `startup_reconcile`, `spawn_if_enabled`) | Bounded `event` field value every reconcile emission carries; scalar counts, statuses and error classes only, never a secret, header, challenge or body |
+| `eventsub reconcile pass interrupted by shutdown; remaining actions skipped and subscription state unverified until the next startup pass` | `crates/bot/src/eventsub_reconcile.rs` (`log_interrupted`) | Warn; shutdown latched between Helix calls, so remaining actions and verification were skipped (`completed`/`remaining` action counts, `error_class = "reconcile_shutdown_interrupted"`); the next startup pass re-lists and re-plans |
+| `eventsub reconcile task ended abnormally` | `crates/bot/src/eventsub_reconcile.rs` (`join`) | Error; the joined reconcile task panicked or was cancelled (`panicked` says which, `error_class = "reconcile_task_failed"`) |
+| `eventsub reconcile task did not finish within the shutdown drain; aborting it, so an in-flight remote mutation outcome is uncertain until the next startup pass re-checks` | `crates/bot/src/eventsub_reconcile.rs` (`join`) | Error; the reconcile task outlived the bounded shutdown drain (`drain_ms`) and was aborted, so an in-flight subscription mutation may or may not have landed (`error_class = "reconcile_shutdown_drain_exceeded"`); the next startup pass settles the real state |
+| `event = "eventsub_reconcile"` | `crates/bot/src/eventsub_reconcile.rs` (`reconcile_all`, `reconcile_all_with_metrics`, `run_plan`, `log_interrupted`, `startup_reconcile`, `spawn_if_enabled`, `join`) | Bounded `event` field value every reconcile emission carries; scalar counts, statuses and error classes only, never a secret, header, challenge or body |
 
 ## Gateway metric event labels
 
@@ -182,6 +185,17 @@ body, broadcaster, subscription or secret data reaches any label.
 | `two_bot_eventsub_reconcile_actions_total{action}` | Successful reconcile mutations by bounded action; `action` is `create` or `delete`; 409 already-exists confirmations fold into the pass outcome |
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | Reconcile failure sites by bounded log `error_class`; `error_class` is `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed` or `other`; no status, body or response bytes in labels |
 
+## Feed fetch series
+
+Counters emitted by the feed poller render. Unknown `outcome` values collapse
+to `failure` and unknown `error_class` values collapse to `other`, and no
+source URL, host, header, body or feed id reaches any label.
+
+| Series | Meaning |
+| --- | --- |
+| `two_bot_feed_fetches_total{outcome}` | Feed fetch attempts by bounded outcome; `outcome` is `success` (2xx fetch), `invalid_source` (source refused before dialling), `refused_redirect` (redirect refused by policy) or `failure` (every other failure, including non-2xx HTTP) |
+| `two_bot_feed_fetch_errors_total{error_class}` | Failed feed fetches by bounded error class; `error_class` is `invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error` (completed non-2xx fetch) or `other`; successes record nothing here |
+
 ## Moderation enforcement series
 
 Counters emitted by the moderation enforcement render. Unknown outcomes
@@ -244,11 +258,13 @@ is the single shared spelling also pinned in `evidence.rs`
 | `voice_join_fast_burn` | `two_bot_voice_joins_received_total` minus benign `duplicate` refusals in `two_bot_voice_join_refused_total` against `two_bot_voice_join_to_move_seconds_bucket{le="5"}` | Pages when the creator-join budget (99.5% moved within 5 s) burns faster than 14.4x in both the 1 h and 5 min windows; every non-duplicate refusal, failed move and slow (>5 s) move is burn; each window needs at least 10 genuine joins and two bad moves, receive counts lag one scrape, and incomplete post-restart windows stay inactive; missing inputs hold the previous state |
 | `voice_join_slow_burn` | Same inputs as `voice_join_fast_burn` | Ticket, not page: same budget burning faster than 6x in both the 6 h and 30 min windows with the same per-window volume and bad-move floors; catches the sustained grind the fast rule never spikes on; do not close as "fast burn resolved" |
 | `voice_creator_map_stale` | `two_bot_voice_creator_map_age_seconds` with `two_bot_voice_creator_map_generation` | Pages when the age since the last successful creator-map merge passes 600 s (two missed 5 min refreshes) after at least one merge; generation 0 (never merged: boot or voice parked) never fires; the gauges are optional scrape inputs, so older containers hold the previous state |
+| `community_facts_drain_failures` | `two_bot_community_facts_drain_failures_total{reason}` for `reason` in `error`, `timeout`, `other` (optional scrape input; a rollback container without it holds the previous state) | Ticket, not page: summed per-reason growth across 3 consecutive completed windows after a baseline sample; a flat sample or counter reset clears the streak; missing/invalid samples break growth evidence but never falsely resolve an active ticket; a single failed drain never pages |
 | `eventsub_post_failed_share` | `two_bot_eventsub_posts_total` by fixed `outcome` (`attempted`, `succeeded`, `failed`, `other`) | Ticket, not page: failed posts exceed 10% of attempted posts with at least 10 attempted (sub-floor windows hold the baseline and accumulate across consecutive valid samples until the floor is met); the first valid sample is baseline only, missing/invalid samples preserve, any backwards counter rebaselines, and flat/sub-floor windows hold an active ticket until a judged window clears it |
 | `event_store_consumer_lag` | `two_bot_event_store_consumer_lag_seconds` | Ticket, not page: lag above 60 s (one keepalive window, fractional counts) in 3 consecutive valid samples; a valid sample at or below 60 s resolves and rebaselines, missing/invalid samples and failed scrapes break the streak but preserve a firing ticket; the gauge is an optional scrape input, so older containers without it reset `eventStoreLagStreak` to `0` while retaining an existing firing ticket |
 | `error_budget_fast_burn` | All `two_bot_rest_requests_total` samples (eligible requests) against `result="5xx"` plus `result="transport"` (budget spend) | Pages when the REST error budget (99.9% success over 48 h) burns faster than 12x in both the 15 min and 2 min windows; each window needs at least 10 eligible requests and two budget errors; incomplete post-restart windows stay inactive; missing or malformed inputs hold the previous state |
 | `error_budget_slow_burn` | Same inputs as `error_budget_fast_burn` | Ticket, not page: same budget burning faster than 3x in both the 2 h and 15 min windows with the same per-window volume and error floors; needs full 2 h history, holds on missing inputs, scrape gaps, or counter resets, and resolves on a covered quiet or below-threshold 15 min window |
 | `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` | Pages when the `tampered` counter (only `BadSignature`) rises in 3 consecutive samples; the first sample only baselines, a flat window resolves, a reset rebaselines, and missing/invalid scrapes hold firing |
+| `eventsub_reconcile_failed` | `two_bot_eventsub_reconcile_passes_total{outcome}` with the fixed `healthy`/`pending`/`failed` outcomes | Ticket, not page: fires when the failed-pass counter grows between valid samples, even beside healthy growth; the first valid sample only stores a baseline, healthy-only or pending-only growth never fires, and a flat failed counter never recovers (only healthy growth with no failed growth resolves, once); any backwards counter re-baselines: the reset sample fires when the new process already counted a failed pass (failed startup pass) and otherwise holds a firing ticket instead of fabricating a transition; missing or invalid samples hold the previous state; the family is an optional scrape input, so older containers hold the previous state |
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
@@ -393,6 +409,15 @@ stored per-guild `TWO_GUILD_INVITE_CODE` row is not a JSON string of 2 to
 32 ASCII alphanumerics plus `-`/`_`, so the `/invite` reply keeps the
 gateway vanity fallback. The line carries the setting key and the
 `invalid_invite_code` reason, never the rejected value.
+
+Boot admission warning (in `configured_admission` in
+`crates/bot/src/voice_rooms.rs`, key-only fields, no IDs):
+`temp-voice admission setting invalid; using default` (warn): one of the
+`TWO_TEMP_VOICE_MAX_PER_USER` (1 to 10), `TWO_TEMP_VOICE_MAX_PER_GUILD`
+(1 to 45) or `TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS` (0 to 3600) boot
+values is unparsable or out of range, so that knob alone falls back to
+its default (1, 40, 0 respectively) while the other knobs are still
+honored. The line carries the setting key and the `invalid_value` reason.
 
 Creator-view refresh actor messages (all in `GuildRoomWorker::revalidate_creator`
 / `reload_creators` in `crates/bot/src/voice_rooms.rs`, guild-only fields,

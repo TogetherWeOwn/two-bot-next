@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
-import { EMPTY_STATE, type MetricsAlertState } from "../src/alert-rules.ts";
+import { EMPTY_STATE, LOG_QUERY_URL, type MetricsAlertState } from "../src/alert-rules.ts";
 import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
 
 const ID = "deployment-A";
@@ -264,6 +264,13 @@ for (const path of ["/health", "/readyz"]) {
       assert.equal(response.status, 500);
       assert.equal(response.headers.get("x-two-worker-version"), metadata?.id ?? null);
       assert.deepEqual(await response.json(), { ready: false, error_class: "container_unavailable" });
+      assert.ok(h.logs.includes(JSON.stringify({
+        event: "container_probe_failed",
+        error_class: "container_unavailable",
+        release: "unknown",
+        worker_version: ID,
+        log_url: LOG_QUERY_URL,
+      })));
       assert.ok(h.logs.every((line) =>
         !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.DATABASE_URL)));
     });
@@ -355,7 +362,13 @@ test("lifecycle error replaces arbitrary exception without inspecting it", async
   const h = await harness(t);
   const unsafe = { toString() { throw new Error(WORKER_ENV.DISCORD_TOKEN); } };
   assert.throws(() => h.bot.onError(unsafe), { message: "container_lifecycle_failed" });
-  assert.ok(h.logs.includes(JSON.stringify({ event: "container_error", error_class: "container_lifecycle_failed" })));
+  assert.ok(h.logs.includes(JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })));
   assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DISCORD_TOKEN)));
 });
 
@@ -421,7 +434,12 @@ for (const failure of ["lookup", "insert"] as const) {
           assert.ok(h.requests.filter((r) => r.pathname === path).length > forwardedBefore);
           assert.equal(h.starts.length, 1, "monitoring must not cause an extra startup");
           assert.equal(h.pending().length, 0);
-          assert.ok(h.logs.includes(JSON.stringify({ event: "container_keepalive_arm_failed" })));
+          assert.ok(h.logs.includes(JSON.stringify({
+            event: "container_keepalive_arm_failed",
+            release: "unknown",
+            worker_version: ID,
+            log_url: LOG_QUERY_URL,
+          })));
           assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DISCORD_TOKEN) && !line.includes(WORKER_ENV.OPS_ALERT_WEBHOOK_URL)));
 
           failing = false;
@@ -442,7 +460,64 @@ test("cold keepalive passes env through the SDK's string-URL fetch path", async 
   await tickKeepalive(h.bot);
   assert.equal(h.starts.length, 1);
   assert.deepEqual(h.starts[0]?.env, EXPECTED_ENV);
-  assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
+  assert.ok(h.logs.includes(JSON.stringify({
+    event: "container_readyz_unhealthy",
+    status: 503,
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })));
+});
+
+// Each probe-failure branch stamps the same attribution line: release stays
+// "unknown" (no probe body was parsed this tick) and worker_version names the
+// serving deployment, so Workers Logs can join the line to the deploy receipt.
+const PROBE_FAILED_LINE = JSON.stringify({
+  event: "container_keepalive_probe_failed",
+  release: "unknown",
+  worker_version: ID,
+  log_url: LOG_QUERY_URL,
+});
+
+test("keepalive probe failure (transport throws) stamps release and worker version", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => {
+    throw new Error("synthetic probe transport failure");
+  });
+  await tickKeepalive(h.bot);
+  assert.ok(h.logs.includes(PROBE_FAILED_LINE));
+});
+
+test("keepalive probe failure (oversized body) stamps release and worker version", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => new Response("x".repeat(70 * 1024), {
+    status: 200, headers: { "content-type": "application/json" },
+  }));
+  await tickKeepalive(h.bot);
+  assert.ok(h.logs.includes(PROBE_FAILED_LINE));
+});
+
+test("keepalive probe failure (completes past deadline) stamps release and worker version", async (t) => {
+  const h = await harness(t);
+  const ac = new AbortController();
+  const realTimeout = AbortSignal.timeout;
+  t.mock.method(AbortSignal, "timeout", (ms: number) => (ms === 6000 ? ac.signal : realTimeout(ms)));
+  let pulls = 0;
+  t.mock.method(h.bot, "containerFetch", async () => new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulls += 1;
+      if (pulls === 1) {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({ ready: true })));
+        return;
+      }
+      // Complete the body and trip the deadline in the same pull: the read
+      // finishes, but the probe signal is aborted before the tick trusts it.
+      controller.close();
+      ac.abort();
+    },
+  }, { highWaterMark: 0 }), { status: 200, headers: { "content-type": "application/json" } }));
+  await tickKeepalive(h.bot);
+  assert.ok(h.logs.includes(PROBE_FAILED_LINE));
 });
 
 // TOG-13044: the bot reports why its gateway task failed on /readyz; the
@@ -466,6 +541,8 @@ async function keepaliveSeeing(t: TestContext, body: string) {
 
 const gatewayFailureLogs = (logs: string[]) =>
   logs.filter((line) => line.includes("container_gateway_failure"));
+const containerErrorLogs = (logs: string[]) =>
+  logs.filter((line) => line.includes('"container_error"'));
 
 test("keepalive logs the gateway failure phase and class once, as strict tokens", async (t) => {
   const failure = { phase: "durable_gateway", class: "checkpoint_load_failed" };
@@ -585,6 +662,65 @@ test("keepalive tags the gateway failure with the container release and worker v
     release: RELEASE_SHA,
     worker_version: ID,
     log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
+  })]);
+});
+
+test("container_error stamps the parsed release once a probe has seen it", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: RELEASE_SHA, build_id: "123-1" },
+  ));
+  assert.throws(() => h.bot.onError(new Error("synthetic lifecycle failure")),
+    { message: "container_lifecycle_failed" });
+  assert.deepEqual(containerErrorLogs(h.logs), [JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: RELEASE_SHA,
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })]);
+});
+
+test("container_error after a container stop stamps unknown, not the previous release", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: RELEASE_SHA, build_id: "123-1" },
+  ));
+  // The old image stops; the replacement is unprobed when its startup fails.
+  h.bot.onStop();
+  assert.throws(() => h.bot.onError(new Error("synthetic restart failure")),
+    { message: "container_lifecycle_failed" });
+  assert.deepEqual(containerErrorLogs(h.logs), [JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })]);
+});
+
+test("container_error during a probe fetch stamps unknown, not the previous release", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: RELEASE_SHA, build_id: "123-1" },
+  ));
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") return new Response(metricsBody(0));
+    // The SDK awaits onError from startup/port checks inside containerFetch
+    // (SDK 0.3.7 waitForPort), before the fetch settles; handler errors are
+    // ignored and the original failure propagates.
+    try { h.bot.onError(new Error("synthetic startup failure")); }
+    catch { /* SDK ignores onError handler errors */ }
+    throw new Error("synthetic probe fetch failure");
+  });
+  await tickKeepalive(h.bot);
+  assert.deepEqual(containerErrorLogs(h.logs), [JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
   })]);
 });
 
@@ -781,8 +917,14 @@ for (const port of ["9090", "1", "65535", "09090"]) {
       const h = await harness(t, { ...WORKER_ENV, BOT_PORT: port });
       if (path === "keepalive") {
         await tickKeepalive(h.bot);
-        assert.ok(h.logs.includes("two-bot /readyz unhealthy: 503"));
-        assert.ok(!h.logs.some((line) => line.includes("probe failed")));
+        assert.ok(h.logs.includes(JSON.stringify({
+    event: "container_readyz_unhealthy",
+    status: 503,
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })));
+        assert.ok(!h.logs.some((line) => line.includes("probe_failed")));
       } else {
         const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`, {
           signal: AbortSignal.timeout(1000),
@@ -1416,6 +1558,38 @@ test("Worker gates the ops JSON roll-ups behind the scrape bearer, before the re
   assert.equal(upstream.mock.callCount(), before);
 });
 
+test("short scrape token stamps release and worker version on the misconfigured line", async (t) => {
+  // The misconfiguration line fires once per isolate; this is the only test
+  // in this file that trips it.
+  const logs: string[] = [];
+  t.mock.method(console, "error", (...args: unknown[]) => {
+    logs.push(args.map(String).join(" "));
+  });
+  const short = "short-token";
+  const env = {
+    REDIRECT_MAPPINGS_JSON: "[]",
+    REDIRECT_FALLBACK_CODE: "fallbackCode",
+    CF_VERSION_METADATA: { id: ID },
+    METRICS_SCRAPE_TOKEN: short,
+    TWO_BOT: { getByName: () => ({ fetch: async () => new Response("must not forward") }) },
+  } as unknown as Env;
+  const response = await worker.fetch(
+    new Request("https://worker.invalid/ops/metrics", { headers: { authorization: `Bearer ${short}` } }),
+    env, { waitUntil: () => {} } as ExecutionContext,
+  );
+  assert.equal(response.status, 404);
+  await response.text();
+  assert.ok(logs.includes(JSON.stringify({
+    event: "metrics_scrape_token_misconfigured",
+    reason: "token_below_minimum_length",
+    minimum_length: 32,
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })));
+  assert.ok(logs.every((line) => !line.includes(short)));
+});
+
 test("Worker forwards /ops/backfill/progress with x-two-* headers and no scrape bearer", async () => {
   // The signed progress read is container-authenticated (x-two-* HMAC), so
   // unlike the scrape-gated roll-ups it forwards with no bearer and no
@@ -1571,7 +1745,13 @@ async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map
     schedules,
     setStatus: (next: number | Error) => { status = next; },
     tick: () => tickKeepalive(h.bot),
-    events: () => h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line)),
+    // Transition/webhook sequence without the per-tick readiness
+    // observations: container_readyz_unhealthy and
+    // container_keepalive_probe_failed ride every failing tick and are pinned
+    // by the alert-line release battery, not by the alert-sequence tests.
+    events: () => h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line))
+      .filter((event) => event.event !== "container_readyz_unhealthy"
+        && event.event !== "container_keepalive_probe_failed"),
   };
 }
 
@@ -1638,6 +1818,56 @@ for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) 
     assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
   });
 }
+
+test("DO failed EventSub reconcile passes ticket once, survive a failed scrape, and recover on a healthy pass", async (t) => {
+  const h = await alertHarness(t, ALERT_ENV);
+  let healthy = 10;
+  let pending = 2;
+  let failedPasses = 4;
+  let scrapeFails = false;
+  // Complete scrapes from the shared fixture with only the pass counters moving.
+  const bodyWithPasses = () => metricsBody()
+    .replace('two_bot_eventsub_reconcile_passes_total{outcome="healthy"} 0', `two_bot_eventsub_reconcile_passes_total{outcome="healthy"} ${healthy}`)
+    .replace('two_bot_eventsub_reconcile_passes_total{outcome="pending"} 0', `two_bot_eventsub_reconcile_passes_total{outcome="pending"} ${pending}`)
+    .replace('two_bot_eventsub_reconcile_passes_total{outcome="failed"} 0', `two_bot_eventsub_reconcile_passes_total{outcome="failed"} ${failedPasses}`);
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path !== "/metrics") return new Response(null, { status: 200 });
+    if (scrapeFails) return new Response(null, { status: 503 });
+    return new Response(bodyWithPasses());
+  });
+  await h.tick();
+  assert.equal(h.posts.length, 0, "the first valid sample is only a baseline");
+  assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
+
+  failedPasses = 5;
+  await h.tick();
+  assert.equal(h.posts.length, 1, "one failed-pass increase raises one ticket");
+  assert.match(JSON.parse(h.posts[0]!.init.body as string).content, /ALERT eventsub_reconcile_failed \(ticket\):/);
+  assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["eventsub_reconcile_failed"]);
+
+  failedPasses = 6;
+  await h.tick();
+  assert.equal(h.posts.length, 1, "repeated failed passes do not re-alert");
+
+  scrapeFails = true;
+  await h.tick();
+  assert.equal(h.posts.length, 1, "a failed scrape must not send RESOLVED");
+  assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["eventsub_reconcile_failed"]);
+
+  scrapeFails = false;
+  await h.tick();
+  assert.equal(h.posts.length, 1, "a flat failed counter after the gap is not recovery");
+  pending = 3;
+  await h.tick();
+  assert.equal(h.posts.length, 1, "a verification-pending pass is not recovery");
+
+  healthy = 11;
+  await h.tick();
+  assert.equal(h.posts.length, 2, "a healthy-pass increase with no failed increase recovers");
+  assert.match(JSON.parse(h.posts[1]!.init.body as string).content, /RESOLVED eventsub_reconcile_failed\. Build: unknown\. Logs: /);
+  assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
+});
 
 type AlertSender = "readiness" | "metrics";
 async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<Env>, values?: Map<string, unknown>) {
@@ -1712,13 +1942,18 @@ test("real SDK keeps one persistent chain across concurrent health traffic, rest
     assert.equal(h.values.get("two-bot:readiness")?.failures, failures);
     assert.equal(h.pending().length, 1, "exactly one successor per firing");
     assert.equal(h.requests.filter((r) => r.pathname === "/readyz").length, failures);
-    const events = h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
+    const events = h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line))
+      .filter((event) => event.event !== "container_readyz_unhealthy"
+        && event.event !== "container_keepalive_probe_failed");
     assert.equal(events.length, failures === 2 ? 1 : failures > 2 ? 1 : 0, "traffic must not accelerate the threshold");
   }
   h.setProbeStatus(200);
   await fireSdkAlarm(t, h.bot);
   await fireSdkAlarm(t, h.bot);
-  assert.deepEqual(h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line).event),
+  assert.deepEqual(h.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line))
+    .filter((event) => event.event !== "container_readyz_unhealthy"
+      && event.event !== "container_keepalive_probe_failed")
+    .map((event) => event.event),
     ["container_unready_alert", "container_unready_recovery"]);
 });
 
@@ -1778,7 +2013,10 @@ for (const warm of [false, true]) {
       assert.equal(resumed.values.get("two-bot:readiness")?.failures, 0);
       assert.equal(resumed.pending().length, 1);
       const events = [...h.logs, ...resumed.logs].filter((line) => line.startsWith("{"))
-        .map((line) => JSON.parse(line).event);
+        .map((line) => JSON.parse(line))
+        .filter((event) => event.event !== "container_readyz_unhealthy"
+          && event.event !== "container_keepalive_probe_failed")
+        .map((event) => event.event);
       assert.deepEqual(events, status === 503
         ? ["container_unready_alert", "container_unready_recovery"] : []);
     });
@@ -1865,7 +2103,7 @@ for (const status of [200, 503]) {
     assert.equal(h.bot["inflightRequests"], 0, "proxy pipe must settle cleanly");
     assert.equal(h.values.get("two-bot:readiness")?.lastStatus, status);
     assert.equal(h.values.get("two-bot:readiness")?.failures, status === 200 ? 0 : 1);
-    assert.ok(!h.logs.some((line) => line.includes("probe failed")));
+    assert.ok(!h.logs.some((line) => line.includes("probe_failed")));
     assert.equal(h.pending().length, 1, "onStart during a cold tick must not create another chain");
   });
 }
@@ -1984,6 +2222,7 @@ for (const failure of [429, 500, "throw"] as const) {
     assert.equal(webhook.mock.callCount(), 1);
     assert.equal(h.events()[0].event, "container_unready_alert");
     assert.equal(h.events()[1].event, "container_unready_webhook_failed");
+    assert.equal(h.events()[1].worker_version, ID);
     h.setStatus(200);
     await h.tick();
     await h.tick();
@@ -1992,6 +2231,21 @@ for (const failure of [429, 500, "throw"] as const) {
     assert.ok(h.logs.every((line) => !line.includes(ALERT_ENV.OPS_ALERT_WEBHOOK_URL)));
   });
 }
+
+test("metrics webhook 500 stamps the serving worker version on the failure line", async (t) => {
+  const h = await senderHarness(t, "metrics", {
+    OPS_ALERT_FORWARDING: "on", OPS_ALERT_WEBHOOK_URL: ALERT_ENV.OPS_ALERT_WEBHOOK_URL,
+  });
+  const webhook = t.mock.method(globalThis, "fetch", async () =>
+    new Response("synthetic error", { status: 500 }));
+  await h.tick();
+  await h.tick();
+  assert.equal(webhook.mock.callCount(), 1);
+  assertAlertRecorded(h, "metrics");
+  assert.equal(h.events()[1].event, "metrics_alert_webhook_failed");
+  assert.equal(h.events()[1].status, 500);
+  assert.equal(h.events()[1].worker_version, ID);
+});
 
 const WEBHOOK_PATH = new URL(ALERT_ENV.OPS_ALERT_WEBHOOK_URL).pathname;
 const INVALID_WEBHOOKS = {
@@ -2032,6 +2286,7 @@ for (const sender of ["readiness", "metrics"] as const) {
       assert.equal(h.events()[1].event, sender === "readiness"
         ? "container_unready_webhook_failed" : "metrics_alert_webhook_failed");
       assert.equal(h.events()[1].status, null);
+      assert.equal(h.events()[1].worker_version, ID);
       assert.ok(h.logs.every((line) => !line.includes(binding)));
       assert.equal(h.schedules.mock.callCount(), 2);
     });

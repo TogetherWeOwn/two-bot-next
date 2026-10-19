@@ -69,9 +69,13 @@ environment-scoped with no unintended fallback:
 
 ## Staging schema-drift gate (automatic, plan-only)
 
-Every `deploy-staging` run starts with the `schema-gate` job, and `deploy`
-needs it, so a staging database behind the source fails the run before any
-deploy step instead of staying red silently. The gate job runs only in the
+Every `deploy-staging` run starts with the `soak-hold` job and then the
+`schema-gate` job, and `deploy` needs the gates, so a staging database behind
+the source fails the run before any deploy step instead of staying red
+silently. The hold reads only the Operator-owned `STAGING_SOAK_HOLD_UNTIL`
+repo variable and fails the run while a drill hold is armed, so a deferred
+push never reports a success the production guard could mistake for staging
+history. The gate job runs only in the
 `staging-migrate-plan` environment with `contents: read`, builds the reviewed
 `staging-migrate` binary at the exact deploy SHA, and runs
 `scripts/ci/staging_schema_gate.py`, which invokes the binary's read-only
@@ -165,9 +169,19 @@ the client's error text, and writes only an ordinal, `event_type` and
 ## Production route
 
 `deploy-production.yml` (main #243) is the one live deployment workflow. The
-regression pins it as `workflow_dispatch`-only. Its `production` job must need
-`guard`, run in GitHub environment `production` and carry no job condition. The
-`guard` job may not have an environment, call a reusable workflow, or contain
+regression pins it to `workflow_dispatch`, a completed `deploy-staging` run on
+`main`, and the daily schedule backstop — never push or PR. Its `production`
+job must need `guard`, `soak`, `recheck`, `schema-gate` and `roles-gate`, run in GitHub environment `production`
+and carry exactly the pinned condition (not cancelled, guard success, no skip, a completed soak, a fresh recheck pass — or a
+skipped recheck on manual runs only — and both gates green unless a
+rollback or live-SHA redeploy waives them); any other condition fails the regression. The `recheck`
+job must need `guard`, `soak`, `schema-gate` and `roles-gate` so its fresh hold/live/dispatch read happens after the last long build,
+and must skip while an operator dispatch is active (the lane's single pending slot would otherwise let the
+automatic arrival cancel a queued recovery run). Only
+`production` and `release` hold the `deploy-production` lane (a job-level
+concurrency group, never workflow-level); the guard, gates, soak and recheck
+carry none, so a sleeping promotion can never delay a rollback behind it.
+The `guard` job may not have an environment, call a reusable workflow, or contain
 deploy/probe steps. Its script must still require a deploy-staging run with
 `status="success"` on the SHA, plus required reviewers on the production
 Environment. Negative fixtures cover extra triggers, removed `needs` or
@@ -182,7 +196,10 @@ the guard also refuses a docs-only head with `deploy-staging has no successful
 run`. This fails closed and is the intended trade: pin the latest
 runtime-affecting commit, or dispatch `deploy-staging` for the head you need
 ([production-deploy.md](production-deploy.md)). This change does not authorize
-a production bypass.
+a production bypass. A pinned drill dispatch (a `sha` below the workflow head)
+deploys the pin but fails its run red in the `pinned-history-guard` job after
+the synthetic, so it never mints a successful run the guard could mistake for
+staging history of the head.
 
 `supply-chain.yml` holds the required `pr-lint` and `gitleaks` jobs (main #187).
 The permitted same-repo reusable calls are the `pipeline-benchmark` call in
@@ -253,6 +270,15 @@ has one inline `adhoc-packages` suppression. The direct package is pinned; lifec
 no write grant. Transitive dependencies remain unlocked. A future fixture
 lockfile can remove this exception; it is not an exception for deployment
 package installation.
+
+`deploy-production.yml` carries two inline suppressions for its automatic
+promotion trigger. `dangerous-triggers` on the `workflow_run` notifier: the
+trigger only wakes the run, and the guard re-resolves the SHA from the API
+and refuses unless it is on `origin/main` with green `ci-ok`, `worker
+check` and a successful `deploy-staging` run, inside the protected
+`production` Environment. `github-env` on the deploy-config render step:
+the only value written is a fixed `$RUNNER_TEMP` path, with no trigger,
+input or API data reaching `GITHUB_ENV`.
 
 The former `if: ${{ false }}` staging suspension (and its narrow
 `obfuscation` suppression) is removed by this re-activation; the workflow

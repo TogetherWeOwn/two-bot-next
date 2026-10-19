@@ -249,12 +249,12 @@ Catalog entries: 134.
 | `TWO_STAGING_RESTART_SYNTHETIC_ACTORS` | env_only | Not specified in Next | environment only | Synthetic-actor allowlist for staging restart containment; legacy input with no Next reader. |
 | `TWO_TEMP_VOICE` | cold | Not specified in Next | stored unwired | Temporary-voice capability flag; classification does not imply runtime wiring. |
 | `TWO_TEMP_VOICE_CATEGORY_ID` | cold | Not specified in Next | env at boot; stored unwired | Category for generated temporary voice rooms. |
-| `TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS` | cold | Not specified in Next | stored unwired | Cooldown between a member's temporary-room creations. |
+| `TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS` | cold | Not specified in Next | env at boot; stored unwired | Cooldown between a member's temporary-room creations. |
 | `TWO_TEMP_VOICE_DISABLED_CONTROLS` | cold | Not specified in Next | stored unwired | Temporary-room controls; classification does not imply runtime wiring. |
 | `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Grace period before an empty temporary room is removed. |
 | `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID` | cold | Not specified in Next | env at boot; stored unwired | Voice channel used to request a temporary room. |
-| `TWO_TEMP_VOICE_MAX_PER_GUILD` | cold | Not specified in Next | stored unwired | Maximum temporary rooms per guild. |
-| `TWO_TEMP_VOICE_MAX_PER_USER` | cold | Not specified in Next | stored unwired | Maximum temporary rooms owned by one member. |
+| `TWO_TEMP_VOICE_MAX_PER_GUILD` | cold | Not specified in Next | env at boot; stored unwired | Maximum temporary rooms per guild. |
+| `TWO_TEMP_VOICE_MAX_PER_USER` | cold | Not specified in Next | env at boot; stored unwired | Maximum temporary rooms owned by one member. |
 | `TWO_TEMP_VOICE_NAME_TEMPLATE` | cold | Not specified in Next | stored unwired | Temporary-room naming template; classification does not imply runtime wiring. |
 | `TWO_TEMP_VOICE_PANEL_CHANNEL_ID` | cold | Not specified in Next | stored unwired | Destination for temporary-room control panels. |
 | `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` | cold | Not specified in Next | env at boot; stored unwired | Channels temporary-room cleanup may not remove. |
