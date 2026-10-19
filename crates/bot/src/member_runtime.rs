@@ -634,9 +634,18 @@ mod tests {
             error_text(MemberError::Discord(MemberDiscordError::RateLimited)),
             "Discord rate-limited the request; nothing was applied. Try again shortly."
         );
+        // Literal copy, not `UNCERTAIN_REPLY`: a changed constant must fail.
         assert_eq!(
             error_text(MemberError::Discord(MemberDiscordError::Timeout)),
-            UNCERTAIN_REPLY
+            "Discord did not confirm the action. It may still land; ask an operator to reconcile before retrying."
+        );
+        // `Unavailable` carries a detail but renders the same fenced copy: the
+        // detail must never leak into the ephemeral reply.
+        assert_eq!(
+            error_text(MemberError::Discord(MemberDiscordError::Unavailable(
+                "503 service unavailable".to_owned()
+            ))),
+            "Discord did not confirm the action. It may still land; ask an operator to reconcile before retrying."
         );
     }
 
