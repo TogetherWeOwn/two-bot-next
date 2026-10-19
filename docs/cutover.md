@@ -273,7 +273,35 @@ Those writers still need their own containment receipts.
 #### Authenticated control contract
 
 `GET /internal/ownership` reads the current version, owner record (or `null`) and
-native `running` flag without starting the Container. `POST` takes JSON:
+native `running` flag without starting the Container. Both environment-bound
+clients validate every successful GET and POST response before using it. Their
+returned/printed receipt contains only `{deploymentId, owner, running}`:
+
+- `deploymentId` is a string matching `[A-Za-z0-9_-]{1,128}`; `running` is boolean.
+- `owner` is `null` or a non-array record with `phase=active|fenced` and a valid
+  deployment ID. Only a fenced record may have a null deployment ID; a pending
+  takeover may still name its intended deployment while fenced.
+- A supplied `epoch` is a positive safe integer (at most `2^53-1`). Historical
+  abbreviated records may omit audit fields. Only an active legacy owner may
+  omit `epoch`: staging deployment takeover retains its expected-epoch-zero
+  fallback, and production's first POST still requires an explicit epoch. A
+  supplied null, string, zero, fractional or out-of-range epoch is not missing.
+- Supported owner fields are `deploymentId`, `epoch`, `phase`, `actor`,
+  `timestamp`, `oldEpoch`, `oldDeploymentId`. When supplied, actor uses the
+  request's audit-label syntax, timestamp must parse as a finite date, oldEpoch
+  is a nonnegative safe integer equal to `epoch-1` when epoch is present, and
+  oldDeploymentId is null or a valid deployment ID. Omitted fields stay omitted;
+  arbitrary extra fields at either level are dropped, never logged or receipted.
+
+Invalid response shapes fail with `Invalid ownership control response`. An
+invalid GET causes no POST or retry; an invalid POST cannot confirm a transition.
+Existing transition checks, deployment pins, redirect refusal and bounded retry
+rules still apply. This client compatibility does not relax persisted
+`OwnerRecord` validation or the stricter staging-status wrapper: that wrapper
+requires the full record and retains `Invalid ownership status response` for
+shape errors, emitting only `{owner_id, observed_at}`.
+
+`POST` takes JSON:
 
 ```json
 {"action":"takeover","expectedEpoch":0,"actor":"release-operator"}

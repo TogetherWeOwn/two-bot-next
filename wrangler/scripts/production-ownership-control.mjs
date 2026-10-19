@@ -10,6 +10,8 @@
 // the singleton: a fenced/pristine record needs OWNERSHIP_RELEASE_FENCE=true,
 // which the production workflow sets only when its `takeover` dispatch input
 // is true (B4 cutover execution). Production activation (GO) stays separate.
+import { parseOwnershipResponse } from "./ownership-control-response.mjs";
+
 class ControlError extends Error {}
 
 class HttpFailure extends ControlError {
@@ -134,10 +136,8 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
       const reason = await refusalReason(response);
       throw new HttpFailure(`Ownership control failed (HTTP ${response.status}) reason=${reason} attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`, response.status, reason);
     }
-    const state = await response.json();
-    if (!state.deploymentId || !("owner" in state) || typeof state.running !== "boolean") {
-      throw new ControlError("Invalid ownership control response");
-    }
+    const state = parseOwnershipResponse(await response.json());
+    if (!state) throw new ControlError("Invalid ownership control response");
     return state;
   };
   // P2: read control state without starting the container. A deployment

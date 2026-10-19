@@ -2331,6 +2331,8 @@ jobs:
         run: node --test scripts/test-ownership-control.mjs
       - name: Verify ownership control response validation (offline fixtures)
         run: node --test scripts/test-ownership-control-response-validation.mjs
+      - name: Verify ownership response audit fields and CLI projection (offline fixtures)
+        run: node --test scripts/test-ownership-control-response.mjs
       - name: Verify staging ownership status read (offline fixtures)
         run: node --test scripts/test-staging-ownership-status.mjs
       - name: Verify staging ownership status workflow (offline fixtures)
