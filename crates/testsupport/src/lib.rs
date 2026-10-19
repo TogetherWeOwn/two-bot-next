@@ -1010,4 +1010,93 @@ mod tests {
             "lost the teardown error context: {chain}"
         );
     }
+
+    #[tokio::test]
+    async fn public_create_still_retries_past_the_first_production_delay() {
+        let Some(missing) = missing_bootstrap_url() else {
+            return;
+        };
+        // Pins the public TestDatabase::create delegate to the 1s/2s/4s/8s
+        // production backoff: at 1.5s the first delay is consumed and the
+        // second attempt is in flight, so the timeout must elapse. Emptying
+        // the delegate delays fails fast and the timeout returns the error.
+        let probe = tokio::time::timeout(
+            Duration::from_millis(1500),
+            TestDatabase::create(&missing, &sqlx::migrate!("./tests/migrations")),
+        )
+        .await;
+        assert!(
+            probe.is_err(),
+            "public TestDatabase::create returned before the 1s production delay elapsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_close_still_retries_past_the_first_production_delay() {
+        let Some(missing) = missing_bootstrap_url() else {
+            return;
+        };
+        let admin_options =
+            connect_options(&missing, ADMIN_DDL_STATEMENT_TIMEOUT).expect("probe options parse");
+        let fixture_options =
+            connect_options(&missing, FIXTURE_STATEMENT_TIMEOUT).expect("probe options parse");
+        let cleanup = Cleanup {
+            admin: PgPoolOptions::new()
+                .max_connections(1)
+                .connect_lazy_with(admin_options),
+            pool: PgPoolOptions::new()
+                .max_connections(1)
+                .connect_lazy_with(fixture_options),
+            independent_pools: std::sync::Mutex::new(Vec::new()),
+            name: "two_bot_test_missing_cleanup_probe".to_string(),
+        };
+        // Pins the public Cleanup::close delegate to the 1s/2s production
+        // teardown backoff via the same 1.5s timeout probe as create.
+        let probe = tokio::time::timeout(Duration::from_millis(1500), cleanup.close()).await;
+        assert!(
+            probe.is_err(),
+            "public Cleanup::close returned before the 1s production delay elapsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_pool_connect_still_retries_past_the_first_production_delay() {
+        let raw = match std::env::var_os("TWO_TEST_DATABASE_URL") {
+            Some(os) => os
+                .into_string()
+                .expect("invalid test bootstrap configuration"),
+            None => return,
+        };
+        let fixture = TestDatabase::create(&raw, &sqlx::migrate!("./tests/migrations"))
+            .await
+            .unwrap();
+        // Drop the database out from under the fixture so the next
+        // independent-pool connect fails fast per attempt and only the
+        // production backoff keeps it in flight past 1.5s.
+        let name = fixture.name().to_owned();
+        let admin = fixture.cleanup.as_ref().unwrap().admin.clone();
+        {
+            let _ddl = DATABASE_DDL.lock().await;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE \"{name}\" WITH (FORCE)"
+            )))
+            .execute(&admin)
+            .await
+            .unwrap();
+        }
+        let probe = tokio::time::timeout(
+            Duration::from_millis(1500),
+            fixture.pool_with_search_path("public"),
+        )
+        .await;
+        assert!(
+            probe.is_err(),
+            "public pool_with_search_path returned before the 1s production delay elapsed"
+        );
+        // Teardown sees the externally dropped database as already gone.
+        fixture
+            .close()
+            .await
+            .expect("teardown must treat an externally dropped database as dropped");
+    }
 }
