@@ -769,15 +769,20 @@ jobs:
           # their own guarded DBs (dedicated step below / agent_test re-run);
           # never feed them the round-trip/bootstrap URL here, mirroring the
           # integration step's skips so their guards don't fail the sweep.
-          # channel_moderation_store is skipped in the ignored sweep below:
-          # its exact-URL guard rejects the bootstrap URL by design, so
-          # running it there only prints FAILED lines that look like
-          # regressions. It is re-run below with its accepted URL, which
+          # channel_moderation_store runs green in the ignored sweep below:
+          # its guard accepts the bootstrap URL, so no skip is needed. The
+          # re-runs below execute it again with the agent_test URL, which
           # also collects its coverage.
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail --no-report -- \
             --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump \
             --skip seeded_aggregates_render_exactly_guild_scoped_and_read_only
+          # member_moderation_db only runs behind MEMBER_TESTDB; without it
+          # the suite's fail-closed guard panics and the sweep prints 32
+          # tolerated FAILED lines that trip failure triage. Export it so the
+          # suite runs green here. The fail-closed re-run below and the
+          # moderation-db lane still execute the same suite.
+          export MEMBER_TESTDB=agent-testdb
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail \
             --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs
