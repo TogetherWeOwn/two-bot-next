@@ -4653,6 +4653,59 @@ async fn feed_list_is_scoped_to_the_configured_guild() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_list_at_capacity_keeps_every_configured_guild_id_discoverable() {
+    let db = TestDb::new().await;
+    // Real relay ids are 32 hex characters; seed the full supported
+    // capacity of 25 for the configured guild plus one foreign relay.
+    let own_ids: Vec<String> = (1..=25).map(|index| format!("{index:032x}")).collect();
+    for (position, id) in own_ids.iter().enumerate() {
+        let kind = ["rss", "youtube", "twitch"][position % 3];
+        db.seed_feed(GUILD_S, id, kind).await;
+    }
+    let foreign_id = "f".repeat(32);
+    db.seed_feed("9999", &foreign_id, "rss").await;
+    let rows_before = db.feed_rows().await;
+    assert_eq!(rows_before.len(), 25, "seeded capacity");
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("feed-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    // deferred_reply pins the ephemeral defer (flags 64) and mention safety
+    // (allowed_mentions parse []) on the single completion.
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("list content");
+    assert!(
+        content.encode_utf16().count() <= 2000,
+        "response exceeds the 2,000 UTF-16 unit limit ({} units): {content}",
+        content.encode_utf16().count()
+    );
+    for id in &own_ids {
+        assert!(
+            content.contains(&format!("`{id}`")),
+            "configured-guild relay {id} discoverable at capacity: {content}"
+        );
+    }
+    assert!(
+        !content.contains(&foreign_id),
+        "other guild's relay never listed: {content}"
+    );
+    assert_eq!(
+        db.feed_rows().await,
+        rows_before,
+        "list leaves feed configuration unchanged"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn feed_add_plan_errors_write_nothing() {
     let db = TestDb::new().await;
     let (runtime, mock) = db_runtime(&db, Vec::new()).await;

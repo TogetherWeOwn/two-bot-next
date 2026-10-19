@@ -40,7 +40,12 @@ test("every consumed series rejects nonfinite, negative, fractional and nonnumer
   const lines = metricsLines();
   for (const name of Object.keys(validatedLabels)) {
     const index = lines.findIndex((line) => line.startsWith(`${name}{`) || line.startsWith(`${name} `));
-    for (const value of ["NaN", "+Inf", "-Inf", "Infinity", "1e999", "-1", "0.5", "0x10", "garbage", "1e20"]) {
+    // The lag gauge is a duration, not a counter: fractional positives are
+    // valid samples, while non-finite, negative and non-numeric stay rejected.
+    const values = name === "two_bot_event_store_consumer_lag_seconds"
+      ? ["NaN", "+Inf", "-Inf", "Infinity", "1e999", "-1", "0x10", "garbage", "1e20"]
+      : ["NaN", "+Inf", "-Inf", "Infinity", "1e999", "-1", "0.5", "0x10", "garbage", "1e20"];
+    for (const value of values) {
       const bad = [...lines];
       bad[index] = bad[index]!.replace(/ 0$/, ` ${value}`);
       assert.equal(parseAlertScrape(bad.join("\n")), null, `${name}: ${value}`);

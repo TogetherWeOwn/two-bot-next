@@ -115,7 +115,9 @@ import {
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
 import {
+  buildRemediationGuardReceipt,
   evaluateRemediation,
+  remediationTriggerFiring,
   sanitizeRemediationState,
   type RemediationState,
 } from "./remediation.ts";
@@ -218,6 +220,12 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_TWITCH_CLIENT_ID?: string;
   /** Operator-set Helix client secret. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
   TWO_TWITCH_CLIENT_SECRET?: string;
+  /** Operator-set go-live delivery gate. Forwarded as exactly "1" on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
+  TWO_EVENTSUB_DELIVERY?: string;
+  /** Operator-set announcements channel for go-live posts. Forwarded on its own explicit containerEnvVars line while the delivery gate travels, never flag-forwarded. */
+  TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID?: string;
+  /** Operator-set Discord invite URL for go-live posts. Forwarded on its own explicit containerEnvVars line while the delivery gate travels, never flag-forwarded. */
+  TWO_EVENTSUB_INVITE_URL?: string;
   /** Staging rollback-drill switch (docs/staging-rollout-gate.md). Set only
    * in the generated staging deploy config by a manual deploy-staging
    * dispatch, never a committed var (check-env-bindings.py). Reaches the
@@ -741,6 +749,15 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     if (env.TWO_TWITCH_BROADCASTERS) vars["TWO_TWITCH_BROADCASTERS"] = env.TWO_TWITCH_BROADCASTERS;
     if (env.TWO_TWITCH_CLIENT_ID) vars["TWO_TWITCH_CLIENT_ID"] = env.TWO_TWITCH_CLIENT_ID;
     if (env.TWO_TWITCH_CLIENT_SECRET) vars["TWO_TWITCH_CLIENT_SECRET"] = env.TWO_TWITCH_CLIENT_SECRET;
+    // Go-live delivery is a second gate inside the receiver forward: only
+    // exactly "1" travels, with its channel and invite inputs on their own
+    // lines. Absent stays absent so a half-provisioned delivery enable
+    // fails loudly in the Container instead of silently staying ack-only.
+    if (env.TWO_EVENTSUB_DELIVERY === "1") {
+      vars["TWO_EVENTSUB_DELIVERY"] = "1";
+      if (env.TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID) vars["TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID"] = env.TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID;
+      if (env.TWO_EVENTSUB_INVITE_URL) vars["TWO_EVENTSUB_INVITE_URL"] = env.TWO_EVENTSUB_INVITE_URL;
+    }
   }
   return vars;
 }
@@ -1591,6 +1608,55 @@ export class TwoBotContainer extends Container<Env> {
             log_url: LOG_QUERY_URL,
           }));
           await this.postWebhookText(content);
+        }
+        // Staging-only persisted guard receipt: read back the guard just
+        // written and log the allowlisted counters/timestamps/phases with
+        // evaluation time, firing trigger keys, decision and build correlation.
+        // Exactly one receipt per keepalive tick in staging, none in production.
+        // No endpoint, permission, dump, or storage mutation beyond the
+        // evaluator persistence above; thresholds and state-machine semantics
+        // are untouched.
+        if (this.env.TWO_DEPLOY_ENV === "staging") {
+          try {
+            // Flush the just-written guard before the read-back: DO storage
+            // serves recent writes from its in-memory cache/write buffer and
+            // put() resolves before the flush, so without sync() the get()
+            // below always repeats the in-memory value and can never prove
+            // durability. A failed flush throws here and lands in the
+            // readback_failed branch below.
+            await this.ctx.storage.sync();
+            const persisted = await this.ctx.storage.get<RemediationState>(REMEDIATION_KEY);
+            const receipt = buildRemediationGuardReceipt({
+              persisted,
+              expected: remediation.state,
+              firing,
+              messages: remediation.messages,
+              nowSeconds,
+              buildRevision: context?.buildRevision ?? "unknown",
+              release: releaseTag(this.lastRelease),
+              workerVersion: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+            });
+            console.warn(JSON.stringify({
+              event: "remediation_guard_receipt",
+              service: "two-bot-next",
+              ...receipt,
+              log_url: LOG_QUERY_URL,
+            }));
+          } catch {
+            console.warn(JSON.stringify({
+              event: "remediation_guard_receipt",
+              service: "two-bot-next",
+              ok: false,
+              deploy_env: "staging",
+              evaluated_at_seconds: nowSeconds,
+              firing: remediationTriggerFiring(firing),
+              reason: "readback_failed",
+              build_revision: context?.buildRevision ?? "unknown",
+              release: releaseTag(this.lastRelease),
+              worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+              log_url: LOG_QUERY_URL,
+            }));
+          }
         }
       } catch {
         console.warn("two-bot remediation guard failed; alerts already delivered");
