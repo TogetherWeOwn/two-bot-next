@@ -4411,12 +4411,23 @@ mod tests {
 
     const RELEASE_FAILED: &str = "moderation_idempotency_release_failed";
 
+    /// Process-wide serialiser for the release-failure log window. The
+    /// three `failed_release_*` tests share one global capture buffer and
+    /// two of them filter by the same `(event, action)` pair, so a parallel
+    /// sibling can land its line inside another test's mark→lines window
+    /// and turn an exact-count assert into a flake (CI saw 2 lines where 1
+    /// was expected). Every `failed_release_*` test holds this for its
+    /// whole body; an async mutex stays silent under clippy while held
+    /// across awaits.
+    static RELEASE_LOG_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     // A provably mutation-free refusal gives the key back. When that release
     // itself fails the row stays `in_flight` (a retry answers `InFlight`), and
     // the only trace used to be nothing at all. The signal must name neither
     // the key, an id nor the raw store error, and must change nothing else.
     #[tokio::test]
     async fn failed_release_is_logged_without_changing_the_result() {
+        let _serial = RELEASE_LOG_SERIAL.lock().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());
@@ -4478,6 +4489,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_release_after_rate_limit_names_the_rate_limit_cause() {
+        let _serial = RELEASE_LOG_SERIAL.lock().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());
@@ -4507,6 +4519,7 @@ mod tests {
     // key, and a failed release is named with the storage cause.
     #[tokio::test]
     async fn failed_release_after_a_rolled_back_stage_names_the_store_cause() {
+        let _serial = RELEASE_LOG_SERIAL.lock().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());
