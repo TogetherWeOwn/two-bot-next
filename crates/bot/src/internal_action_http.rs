@@ -2371,15 +2371,16 @@ async fn mutate_event(
             // Upsert registers (or re-points) the key only after Discord
             // confirms; cancel retains the mapping so a later edit cannot
             // silently recreate the event.
-            if upsert
-                && state
+            if upsert {
+                if let Err(put_error) = state
                     .store
                     .put_event_key(guild_id, &event_key, event_id.as_str())
                     .await
-                    .is_err()
-            {
-                mark_unknown_best_effort(&state.store, &claim, action).await;
-                return reject(Failure::reconciliation());
+                {
+                    log_terminal_persist_failed(action, "event_key", put_error);
+                    mark_unknown_best_effort(&state.store, &claim, action).await;
+                    return reject(Failure::reconciliation());
+                }
             }
             let response = TerminalResponse::Success {
                 resource_id: Some(event_id),
@@ -3239,11 +3240,12 @@ async fn mark_unknown_best_effort(
     }
 }
 
-/// A failed terminal (`finish`) or proven-not-sent (`release`) write never
-/// releases the claim or resends; this only surfaces the gap. Mirrors
-/// [`mark_unknown_best_effort`]: fixed `msg`, bounded `action`, fixed
-/// `persist_op` (`finish` or `release`) and fixed `persist_class`. No store
-/// error text, claim, nonce, body, key, request ID or credential is logged.
+/// A failed terminal (`finish`), proven-not-sent (`release`) or event-key
+/// (`event_key`) write never releases the claim or resends; this only
+/// surfaces the gap. Mirrors [`mark_unknown_best_effort`]: fixed `msg`,
+/// bounded `action`, fixed `persist_op` (`finish`, `release` or `event_key`)
+/// and fixed `persist_class`. No store error text, claim, nonce, body, key,
+/// request ID or credential is logged.
 fn log_terminal_persist_failed(action: ActionLabel, op: &'static str, error: InternalStoreError) {
     tracing::error!(
         msg = "internal_action_terminal_persist_failed",
