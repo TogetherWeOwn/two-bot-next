@@ -174,8 +174,59 @@ pub struct TestDatabase {
     cleanup: Option<Cleanup>,
 }
 
+/// Substrings marking a bootstrap failure as transient hosted-runner
+/// infrastructure (DNS, dropped connection, refused/reset) rather than a
+/// deterministic guard, auth or schema error. Anything outside this list
+/// fails fast and is never retried.
+fn is_transient_bootstrap_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_lowercase();
+    const MARKERS: &[&str] = &[
+        "temporary failure in name resolution",
+        "failed to lookup address information",
+        "name or service not known",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "unexpected eof",
+        "got 0 bytes",
+        "expected to read",
+        "could not connect",
+        "server closed the connection",
+        "connection timed out",
+        "timed out",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
+
 impl TestDatabase {
     pub async fn create(raw: &str, migrations: &Migrator) -> Result<Self> {
+        // Validate once and fail fast: guard/auth errors are deterministic and
+        // must never be retried.
+        connect_options(raw, ADMIN_DDL_STATEMENT_TIMEOUT)?;
+        // Hosted runners occasionally lose the service hostname for seconds
+        // (run 39186954211: every internal_member_store fixture failed with
+        // EAI_AGAIN/EOF after all earlier store steps passed on the same
+        // host). Retry only transient bootstrap failures; anything else fails
+        // fast with its original context.
+        const ATTEMPTS: usize = 4;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match Self::create_once(raw, migrations).await {
+                Ok(fixture) => return Ok(fixture),
+                Err(error) if attempt < ATTEMPTS && is_transient_bootstrap_error(&error) => {
+                    eprintln!(
+                        "transient test-database bootstrap failure (attempt {attempt}/{ATTEMPTS}): {error:#}; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250u64 << (attempt - 1))).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn create_once(raw: &str, migrations: &Migrator) -> Result<Self> {
         let options = connect_options(raw, FIXTURE_STATEMENT_TIMEOUT)?;
         let admin = PgPoolOptions::new()
             .max_connections(1)
@@ -393,6 +444,33 @@ mod tests {
     #[should_panic(expected = "missing the roles column")]
     fn event_store_allowlist_requires_the_slice_columns() {
         assert_event_store_columns(&names(&["id", "dedup_key"]), &["roles"]);
+    }
+
+    #[test]
+    fn bootstrap_retry_covers_transient_infra_but_not_guard_errors() {
+        for transient in [
+            "connect to test bootstrap database: failed to lookup address information: \
+             Temporary failure in name resolution",
+            "create disposable test database: expected to read 5 bytes, got 0 bytes at EOF",
+            "pool timed out while waiting for an open connection",
+            "connection refused",
+        ] {
+            assert!(
+                is_transient_bootstrap_error(&anyhow::anyhow!("{transient}")),
+                "should retry: {transient}"
+            );
+        }
+        for deterministic in [
+            "test database must use agent-testdb on explicit port 5432",
+            "invalid test database URL",
+            "test database URL must not contain whitespace or control characters",
+            "relation \"event_store\" does not exist",
+        ] {
+            assert!(
+                !is_transient_bootstrap_error(&anyhow::anyhow!("{deterministic}")),
+                "must fail fast: {deterministic}"
+            );
+        }
     }
 
     const SAFE: &str = "postgres://agent_test:@agent-testdb:5432/two_bot_test_guard";
