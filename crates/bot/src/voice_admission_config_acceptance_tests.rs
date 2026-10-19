@@ -368,7 +368,7 @@ fn production_runtime_wires_the_loader_into_workers() {
             .find(|line| line.contains(key))
             .unwrap_or_else(|| panic!("docs/configuration.md must keep a row for {key}"));
         assert!(
-            !row.contains("stored unwired"),
+            row.contains("env at boot"),
             "{key} is wired now; its docs row must say so: {row}"
         );
     }
