@@ -49,6 +49,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `event_store_consumer_lag` | **ticket**: consumer lag above 60 s in 3 consecutive valid samples (fractional counts); a valid sample at or below 60 s resolves, missing/invalid samples and failed scrapes preserve a firing ticket | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-event-store-consumer-lag) |
 | `error_budget_fast_burn` | **page**: REST error budget burns faster than 12x in both the 15 min and 2 min windows (each needs at least 10 requests and two budget errors; incomplete startup/restart windows stay inactive) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-error-budget-fast-burn) |
 | `error_budget_slow_burn` | **ticket**: same budget burns faster than 3x in both the 2 h and 15 min windows (same floors; needs full 2 h history, holds on gaps, covered quiet 15 min resolves) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-error-budget-slow-burn) |
+| `eventsub_reconcile_failed` | **ticket**: failed EventSub reconcile passes rise between samples (first sample is baseline-only; a restart sample fires when the new process already counted a failed pass, else holds) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-eventsub-reconcile-failed) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via
