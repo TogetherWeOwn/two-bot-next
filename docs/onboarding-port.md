@@ -60,6 +60,23 @@ this slice.
    general parsing lists. Attach the games/session menu according to
    `PickerKind`; anchor attaches **nothing**, not even a footer. Build games
    with min 0/max 10 and current game-role defaults; session min 1/max 2.
+   A queued welcome re-reads `GET /guilds/{guild}/members/{member}` after the
+   postable-channel check and before `begin_prompt`. That read may narrow the
+   eligibility captured at dispatch, never widen it: the captured guild,
+   trigger, bot and pending filter still runs first and performs no member
+   read. HTTP 404, `pending: true` and `user.bot: true` are terminal skips
+   with no post and no prompt or route marker, so a later genuine gate-clear
+   can still send. A wrong user id, a missing user, a non-boolean `pending`
+   or `bot`, a missing or non-array `roles` field, a non-snowflake role id,
+   HTTP 403 or 5xx, and a timed-out read return before the prompt lock and
+   leave the durable job retryable. The worker claims no job until the shard
+   has flushed the Resume or Identify that Hello queued, so that failure cannot
+   drop the socket before the frame is written. Games-menu defaults come from
+   that fresh role list, not the roles captured at dispatch. Omitted `pending`
+   and `bot` mean false. The read is the shared strict GET (only 404 is
+   absence) on its existing five-second moderation deadline, inside the
+   worker's ninety-second budget. This does not enable onboarding as a live
+   flow or claim deployment parity.
 5. Dispatch `two:onboarding:games` only outside session mode, and
    `two:onboarding:session` in session mode. Defer ephemerally. Execute game
    add/remove-to-match effects; on role failure use `PICKER_ROLE_FAILURE_REPLY`

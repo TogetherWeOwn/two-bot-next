@@ -19,7 +19,7 @@ use std::sync::{
 
 use crate::onboarding::OnboardingJob;
 
-use futures_util::StreamExt as _;
+use futures_util::{Stream as _, StreamExt as _};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Message, Session, Shard, ShardId};
@@ -1186,6 +1186,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let error = Arc::new(std::sync::Mutex::new(None));
     let worker_error = Arc::clone(&error);
     let (failed, failure) = tokio::sync::watch::channel(false);
+    // Hello queues Resume or Identify; Twilight writes that frame on the next
+    // poll. The worker waits so a fast member-read error cannot drop the socket
+    // before the write.
+    let (opening_tx, opening_rx) = tokio::sync::watch::channel(false);
     let receive_generation = Arc::clone(&generation);
     let automod_enabled = automod.is_some();
     // The worker dispatches text automations itself once automod has decided.
@@ -1214,6 +1218,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             let in_flight_acks = Arc::clone(&in_flight_acks);
             let pipeline = Arc::clone(&receive_pipeline);
             let voice = receive_voice.clone();
+            let opening_tx = opening_tx.clone();
             async move {
                 // Failure is emitted to the ordered worker, never skipped past.
                 let work: Result<Option<ReceivedWork>, sqlx::Error> = async {
@@ -1231,7 +1236,18 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         shard = Shard::with_config(shard.id(), shard.config().clone());
                         info!("cold resume committed; requesting voice snapshot via identify");
                     }
-                    while let Some(item) = shard.next().await {
+                    let mut prefetched: Option<
+                        Result<Message, twilight_gateway::error::ReceiveMessageError>,
+                    > = None;
+                    loop {
+                        let item = if let Some(item) = prefetched.take() {
+                            item
+                        } else {
+                            match shard.next().await {
+                                Some(item) => item,
+                                None => break,
+                            }
+                        };
                         let received_at = tokio::time::Instant::now();
                         let message = match item {
                             Ok(message) => message,
@@ -1263,6 +1279,21 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             let hello: HelloPacket = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway hello".into()))?;
                             if hello.d.heartbeat_interval == 0 { return Err(sqlx::Error::InvalidArgument("zero heartbeat interval".into())); }
                             deadline = CHECKPOINT_IO_MAX.min(std::time::Duration::from_millis(hello.d.heartbeat_interval) / 4);
+                            // Flush the Hello-queued Resume/Identify before this
+                            // task yields. A frame that arrives in the same wake
+                            // is kept; Pending means the write finished or the
+                            // socket will finish it on the next poll.
+                            if let Some(item) = std::future::poll_fn(|cx| {
+                                match std::pin::Pin::new(&mut shard).poll_next(cx) {
+                                    std::task::Poll::Pending => std::task::Poll::Ready(None),
+                                    std::task::Poll::Ready(item) => std::task::Poll::Ready(item),
+                                }
+                            })
+                            .await
+                            {
+                                prefetched = Some(item);
+                            }
+                            let _ = opening_tx.send(true);
                         }
                         if header.op == 9 {
                             let packet: serde_json::Value = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway session packet".into()))?;
@@ -1437,6 +1468,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             Arc::clone(&live_interactions),
             Arc::clone(&queue_signal),
             Arc::clone(&writer_drained),
+            opening_rx,
         )
     });
     // The blocking dispatch worker inherits no span context: capture the
@@ -1598,6 +1630,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
 /// on a fatal error (the runner then fails closed), or once the writer drain
 /// flag is set and the durable queue is empty with no effect in flight
 /// (cooperative shutdown drain).
+#[allow(clippy::too_many_arguments)]
 async fn onboarding_queue(
     runtime: Arc<crate::onboarding::OnboardingRuntime>,
     store: GatewaySessionStore,
@@ -1606,7 +1639,38 @@ async fn onboarding_queue(
     live_interactions: LiveInteractions,
     signal: Arc<tokio::sync::Notify>,
     writer_drained: Arc<std::sync::atomic::AtomicBool>,
+    mut opening_flushed: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), sqlx::Error> {
+    // Claim nothing until the opening frame is written. A cooperative shutdown
+    // before Hello leaves the durable jobs for the next boot instead of waiting
+    // out the drain budget. A dropped sender stays pending so the dispatch
+    // result is the one the runner reports.
+    loop {
+        let notified = signal.notified();
+        if *opening_flushed.borrow() {
+            break;
+        }
+        if writer_drained.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            // Drop the watch guard inside this future. Holding it across the
+            // pending await below makes run_shard !Send.
+            closed = async {
+                opening_flushed
+                    .wait_for(|flushed| *flushed)
+                    .await
+                    .is_err()
+            } => {
+                if closed {
+                    std::future::pending::<()>().await;
+                }
+                break;
+            }
+            _ = notified => {}
+        }
+    }
     let deadline = CHECKPOINT_IO_MAX;
     let mut feature_jobs = tokio::task::JoinSet::new();
     let mut queue_dirty = true;
