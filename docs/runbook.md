@@ -239,7 +239,7 @@ names, never error text or payloads. Take the first action for the reported clas
 | `timeout` | Check the job status and pool-pressure metrics to locate the bounded operation before considering a restart. |
 | `panic` | Correlate the sanitized failure log with the deployed revision; the panic payload is intentionally unavailable. |
 | `feed` | Check the configured feed source's availability and recent fetch status through authorized diagnostics; do not copy response bodies. |
-| `recovery_required` | Preserve feed cursor and pending recovery state; follow the established recovery path before any manual replay or cursor change. |
+| `recovery_required` | Preserve feed cursor and pending recovery state; follow the established recovery path before any manual replay or cursor change. `/feed-remove` refuses while pending delivery evidence is unresolved, so a parked poller or deleted channel blocks removal until recovery can run; no force path exists. |
 
 The streak clears on the next successful completion. For feed delivery
 specifically, follow the [feed supervisor operator guide](feed-supervisor.md).
