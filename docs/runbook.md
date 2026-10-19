@@ -488,6 +488,28 @@ Same signals, same first response, same escalation, lower urgency. Do not
 close it as "fast burn resolved": the fast window can clear while the slow
 grind continues.
 
+The first firing also files one tracking issue by itself. Every five minutes
+the `slow-burn-tracker` workflow scrapes staging `/ops/metrics`, replays the
+checked-in slow-burn verdict over its cached ring and reconciles the
+`slow-burn` label: no open card means file one, an open card stays untouched
+(a refresh comment lands at most every six hours, so a refire never
+duplicates the card), and a cleared burn resolves and closes it. An unknown
+verdict — a failed scrape or evaluation, unusable join series, or slow
+windows without full history — never closes the card, and a lost ring
+rebuilds instead of firing. The five-minute cadence is load-bearing for
+the six-hour baseline: GitHub runs `*/5` best-effort, so when the newest
+ring entry is 600 s or older the run emits a `::warning::` instead of
+reading green-with-unknown. Entry age alone cannot prove coverage — sub-600 s
+spacings can also leave the baseline window empty — so the tracker records
+the most recent covered moment beside the ring, seeds the tracking start on
+the first live unknown run when it never covered, and warns once the slow
+windows go ~6.5 h uncovered: while coverage is gone genuine burns go unfiled
+and open cards stay unclosed. The tracker needs the `slow-burn-tracker` environment
+bearer for `/ops/metrics`; without it the run warns and stays green. Prove
+the path by dispatching the workflow with the fire and clear fixtures: they
+run the real verdict and the real issue calls under the `slow-burn-test`
+label without touching the live ring.
+
 #### Alert: voice creator-map stale
 
 The voice actor re-merges the creator map from the store every 5 minutes;
