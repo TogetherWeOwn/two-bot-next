@@ -4356,8 +4356,20 @@ mod tests {
     /// Process-wide log capture. A scoped subscriber loses events when a
     /// sibling test thread caches the callsite first, so install one global
     /// writer and let each test read only the text after its own mark.
+    /// Marks hold a process-wide assertion lock until consumed by
+    /// [`LogCapture::lines`], so two tests asserting on the same
+    /// event+action pair serialize their mark/execute/assert windows and a
+    /// sibling's emission cannot land inside this window.
     #[derive(Clone, Default)]
     struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    /// A position in the capture buffer. Holds the assertion lock from
+    /// [`LogCapture::mark`] until [`LogCapture::lines`] consumes it; dropping
+    /// it without calling `lines` (e.g. on panic) releases the lock.
+    struct Mark {
+        pos: usize,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl LogCapture {
         fn global() -> LogCapture {
@@ -4379,15 +4391,26 @@ mod tests {
                 .clone()
         }
 
-        fn mark(&self) -> usize {
-            self.0.lock().expect("capture lock").len()
+        fn mark(&self) -> Mark {
+            static ASSERT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // Lock first, then read the position: every earlier window's
+            // emissions are already in the buffer, so they fall before this
+            // mark. (Reading the length before locking would admit a
+            // sibling's emission between the read and the lock.)
+            // A sibling that panicked mid-window poisons the lock; the suite
+            // is already failing then, so recover instead of cascading.
+            let guard = ASSERT_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            let pos = self.0.lock().expect("capture lock").len();
+            Mark { pos, _guard: guard }
         }
 
-        /// Lines logged since `mark` that carry `event` for `action`; other
-        /// tests' lines are ignored so concurrent tests cannot interfere.
-        fn lines(&self, mark: usize, event: &str, action: &str) -> Vec<String> {
+        /// Lines logged since `mark` that carry `event` for `action`.
+        /// Consumes the mark, releasing the assertion lock: the whole
+        /// mark/execute/assert window ran alone, so no sibling emission for
+        /// this pair can appear here.
+        fn lines(&self, mark: Mark, event: &str, action: &str) -> Vec<String> {
             let bytes = self.0.lock().expect("capture lock");
-            String::from_utf8_lossy(&bytes[mark..])
+            String::from_utf8_lossy(&bytes[mark.pos..])
                 .lines()
                 .filter(|line| line.contains(event) && line.contains(action))
                 .map(str::to_owned)
@@ -4409,20 +4432,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn log_capture_mark_serializes_assertion_windows() {
+        // Pins the process-wide assertion lock: a second `mark` must block
+        // until the first window is consumed via `lines`. Replacing the
+        // static lock with a per-call mutex lets the second mark complete
+        // while the first is still open, failing the timeout assert below.
+        // Never-matching filters keep this window silent for other tests.
+        const EVENT: &str = "never-matching-event-7f3a";
+        const ACTION: &str = "never-matching-action-9c1e";
+        let capture = LogCapture::global();
+        let first = capture.mark();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let capture2 = capture.clone();
+        let handle = std::thread::spawn(move || {
+            ready_tx.send(()).expect("ready signal");
+            let second = capture2.mark();
+            done_tx.send(()).expect("done signal");
+            let _ = capture2.lines(second, EVENT, ACTION);
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawned thread never reached mark");
+        // The spawned thread is now blocked in `mark` (or would complete at
+        // once if the lock were broken). A held static lock cannot release
+        // early, so a timeout here is deterministic; a broken lock acquires
+        // within milliseconds.
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "second mark completed while the first window was still open"
+        );
+        let _ = capture.lines(first, EVENT, ACTION);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second mark never completed after the first window closed");
+        handle.join().expect("spawned thread panicked");
+    }
+
     const RELEASE_FAILED: &str = "moderation_idempotency_release_failed";
 
-    /// Process-wide serialiser for the global log capture: the three
-    /// `moderation_idempotency_release_failed` tests share one capture
-    /// buffer whose (event, action) filter cannot tell their lines apart —
-    /// the line deliberately carries no request id — so every test that can
-    /// emit the line and every test that counts it holds this lock for its
-    /// whole body, and a parallel sibling cannot pollute an exact-count (or
-    /// empty) assertion. A `tokio::sync::Mutex` (not `std`) because the
-    /// guard is held across `.await`s.
-    fn release_log_serial() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
+    /// The release tests share one process-global capture, and the two kick
+    /// tests emit the identical event+action pair, so overlapping runs
+    /// double-count lines. Serialize all three; the guard is held across
+    /// `.await` by design.
+    static RELEASE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     // A provably mutation-free refusal gives the key back. When that release
     // itself fails the row stays `in_flight` (a retry answers `InFlight`), and
@@ -4430,7 +4486,7 @@ mod tests {
     // the key, an id nor the raw store error, and must change nothing else.
     #[tokio::test]
     async fn failed_release_is_logged_without_changing_the_result() {
-        let _serial = release_log_serial().lock().await;
+        let _guard = RELEASE_TEST_LOCK.lock().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());
@@ -4492,7 +4548,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_release_after_rate_limit_names_the_rate_limit_cause() {
-        let _serial = release_log_serial().lock().await;
+        let _guard = RELEASE_TEST_LOCK.lock().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());
@@ -4522,7 +4578,7 @@ mod tests {
     // key, and a failed release is named with the storage cause.
     #[tokio::test]
     async fn failed_release_after_a_rolled_back_stage_names_the_store_cause() {
-        let _serial = release_log_serial().lock().await;
+        let _guard = RELEASE_TEST_LOCK.lock().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());

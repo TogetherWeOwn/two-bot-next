@@ -769,11 +769,6 @@ jobs:
           # their own guarded DBs (dedicated step below / agent_test re-run);
           # never feed them the round-trip/bootstrap URL here, mirroring the
           # integration step's skips so their guards don't fail the sweep.
-          # channel_moderation_store is skipped in the ignored sweep below:
-          # its exact-URL guard rejects the bootstrap URL by design, so
-          # running it there only prints FAILED lines that look like
-          # regressions. It is re-run below with its accepted URL, which
-          # also collects its coverage.
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail --no-report -- \
             --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump \
@@ -1225,6 +1220,11 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test event_store_s4
+
+      - name: Raw event-store retention acceptance (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-cutover --locked --test retention_raw_expiry --test retention_raw_expiry_bounds --test retention_guarded_purge_raw_expiry -- --test-threads=1
 
       - name: Event-store S5 message/reaction capture acceptance (CI service only)
         env:
