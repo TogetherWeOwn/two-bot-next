@@ -45,6 +45,10 @@ mod tests;
 #[path = "scheduled_stale_audit_acceptance_tests.rs"]
 mod acceptance_tests;
 
+#[cfg(test)]
+#[path = "scheduled_store_failure_audit_acceptance_tests.rs"]
+mod store_failure_acceptance_tests;
+
 /// The supervised ticker for the configured guild, or `None` while
 /// `TWO_AUTOMATIONS` is off (legacy only started the scheduler when automations
 /// were enabled, and a disabled scheduler fired zero jobs) or the boot
