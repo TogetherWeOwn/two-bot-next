@@ -20,8 +20,8 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import staging_events_read as reader  # noqa: E402
-import test_staging_events_read as base  # noqa: E402
+import staging_events_read as reader
+import test_staging_events_read as base
 
 WINDOW = ("2026-10-07T14:00:00.000Z", "2026-10-07T14:15:00.000Z")
 # Ten real minutes across the 2026 (non-leap) February/March boundary. The
