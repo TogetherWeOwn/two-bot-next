@@ -355,7 +355,13 @@ test("lifecycle error replaces arbitrary exception without inspecting it", async
   const h = await harness(t);
   const unsafe = { toString() { throw new Error(WORKER_ENV.DISCORD_TOKEN); } };
   assert.throws(() => h.bot.onError(unsafe), { message: "container_lifecycle_failed" });
-  assert.ok(h.logs.includes(JSON.stringify({ event: "container_error", error_class: "container_lifecycle_failed" })));
+  assert.ok(h.logs.includes(JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })));
   assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DISCORD_TOKEN)));
 });
 

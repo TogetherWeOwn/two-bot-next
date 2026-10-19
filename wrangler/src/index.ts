@@ -1802,7 +1802,13 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   override onError(_error: unknown): void {
-    console.error(JSON.stringify({ event: "container_error", error_class: "container_lifecycle_failed" }));
+    console.error(JSON.stringify({
+      event: "container_error",
+      error_class: "container_lifecycle_failed",
+      release: releaseTag(this.lastRelease),
+      worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+      log_url: LOG_QUERY_URL,
+    }));
     // The SDK logs errors thrown by hooks too; replace rather than rethrow the
     // original exception, and do not retain a credential-bearing cause.
     throw new Error("container_lifecycle_failed");
