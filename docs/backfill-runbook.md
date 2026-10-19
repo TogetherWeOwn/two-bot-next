@@ -17,13 +17,18 @@ live database or Discord to write it; see [Verification](#verification).
 ## 1. Rate limits: the 50/s budget and `Retry-After`
 
 Discord caps bots at 50 requests/second globally. Both REST paths below
-stay far under it with a 110 ms pacing floor (≈9/s per lane), and both
-honor the response's own wait on 429. Header-driven per-route buckets and
-`X-RateLimit-Reset-After` parsing are pinned only by the currently failing
-acceptance suite (`crates/discord/tests/backfill_ratelimit.rs`); the
-shipped code reads `Retry-After` / body `retry_after`, not `Reset-After`.
-Do not promise bucket-accurate pacing until that builder work lands and
-its flag names settle.
+use local pacing and honor the response's own wait on 429; the durable
+send lane remains the token-wide admission authority. The runtime executor
+also shares header-driven bucket deadlines through its process-wide guard.
+A bare 429 has `Retry-After` but no `X-RateLimit-*` headers or body
+`retry_after`/`global`/`scope` signals. After body classification, its usable
+header installs or extends the learned route's deadline from header receipt
+by the observed wait plus 250 ms. A shorter hint never shortens a live
+deadline, and unrelated routes are not globally paused. Responses with body
+signals keep their existing retry policy, including its wait ceilings.
+The unchanged acceptance suite
+`crates/discord/tests/bare_429_shared_state_acceptance.rs` covers the bare
+header, concurrent executors, and the existing single-worker/full-header paths.
 
 ### Cutover CLIs (`crates/cutover/src/rest.rs`)
 
