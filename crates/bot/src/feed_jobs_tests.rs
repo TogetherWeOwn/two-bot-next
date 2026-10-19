@@ -1745,7 +1745,12 @@ async fn held_post_removal_never_confirms_before_settlement() {
 
     gate.release();
     poll.await.unwrap().unwrap();
-    removal.await.unwrap();
+    // The 750ms timeout above drives `removal` to completion on the
+    // fast-refusal path; awaiting a completed JoinHandle panics, so only
+    // await when the timeout elapsed. Both serializations stay acceptable.
+    if finished_early.is_err() {
+        removal.await.unwrap();
+    }
     assert_eq!(post_count(&mock), 1, "exactly the one held POST was sent");
     if relay_count(db.pool(), &relay.id).await == 1 {
         assert_eq!(
