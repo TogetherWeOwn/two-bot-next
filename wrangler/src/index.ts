@@ -104,6 +104,7 @@ import {
   SCRAPE_LOSS_THRESHOLD,
   alertContextSuffix,
   evaluateMetrics,
+  interruptCommunityFactsDrain,
   interruptDispatchDrops,
   sanitizeScrapeLossState,
   scrapeLossFiringMessage,
@@ -1376,6 +1377,11 @@ export class TwoBotContainer extends Container<Env> {
           let status: number | null = null;
           let probe: ProbeDetail = { failure: null };
           try {
+            // Refresh the release tag before any error event below: a failed
+            // probe must not reuse a previous image's SHA. containerFetch can
+            // trigger startup and port checks, and the SDK awaits onError from
+            // those paths, so the clear must precede the fetch.
+            this.lastRelease = null;
             const probeSignal = AbortSignal.timeout(6000);
             const res = await deadlineFetch(
               this.containerFetch("http://c/readyz", { signal: probeSignal }), probeSignal);
@@ -1397,9 +1403,6 @@ export class TwoBotContainer extends Container<Env> {
             // is a failed probe, never a buffered parse. Small bodies still
             // drain fully, so the SDK 0.3.7 proxy pipe settles cleanly.
             const body = await readBoundedText(res, MAX_PROBE_BODY_BYTES, probeSignal);
-            // Refresh the release tag before any error event below: a failed
-            // probe must not reuse a previous image's SHA.
-            this.lastRelease = null;
             if (probeSignal.aborted) {
               // A probe that only completed past its deadline is no evidence
               // of readiness: record it as failed, never as recovery.
@@ -1569,7 +1572,7 @@ export class TwoBotContainer extends Container<Env> {
         const justFired = firing && !scrapeLoss.firing;
         // Persist before notifying: at most one attempt per transition, even
         // if the webhook fails or an alarm is retried.
-        await this.ctx.storage.put(METRICS_ALERT_KEY, interruptDispatchDrops(previous));
+        await this.ctx.storage.put(METRICS_ALERT_KEY, interruptCommunityFactsDrain(interruptDispatchDrops(previous)));
         await this.ctx.storage.put(SCRAPE_LOSS_KEY, { streak, firing });
         if (justFired) {
           const content = scrapeLossFiringMessage(context);
@@ -1798,11 +1801,20 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   override onStop(): void {
+    // A stop invalidates the parsed release: the replacement image is
+    // unprobed, so its startup failure must stamp "unknown", not the old SHA.
+    this.lastRelease = null;
     console.log("two-bot container stopped");
   }
 
   override onError(_error: unknown): void {
-    console.error(JSON.stringify({ event: "container_error", error_class: "container_lifecycle_failed" }));
+    console.error(JSON.stringify({
+      event: "container_error",
+      error_class: "container_lifecycle_failed",
+      release: releaseTag(this.lastRelease),
+      worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+      log_url: LOG_QUERY_URL,
+    }));
     // The SDK logs errors thrown by hooks too; replace rather than rethrow the
     // original exception, and do not retain a credential-bearing cause.
     throw new Error("container_lifecycle_failed");

@@ -4474,12 +4474,19 @@ mod tests {
 
     const RELEASE_FAILED: &str = "moderation_idempotency_release_failed";
 
+    /// The release tests share one process-global capture, and the two kick
+    /// tests emit the identical event+action pair, so overlapping runs
+    /// double-count lines. Serialize all three; the guard is held across
+    /// `.await` by design.
+    static RELEASE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     // A provably mutation-free refusal gives the key back. When that release
     // itself fails the row stays `in_flight` (a retry answers `InFlight`), and
     // the only trace used to be nothing at all. The signal must name neither
     // the key, an id nor the raw store error, and must change nothing else.
     #[tokio::test]
     async fn failed_release_is_logged_without_changing_the_result() {
+        let _guard = RELEASE_TEST_LOCK.lock().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());
@@ -4541,6 +4548,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_release_after_rate_limit_names_the_rate_limit_cause() {
+        let _guard = RELEASE_TEST_LOCK.lock().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());
@@ -4570,6 +4578,7 @@ mod tests {
     // key, and a failed release is named with the storage cause.
     #[tokio::test]
     async fn failed_release_after_a_rolled_back_stage_names_the_store_cause() {
+        let _guard = RELEASE_TEST_LOCK.lock().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());

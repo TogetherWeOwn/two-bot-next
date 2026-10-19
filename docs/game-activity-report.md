@@ -21,7 +21,9 @@ the [privacy analytics note](privacy.md#what-is-stored).
 
 Two report arguments exist (`--guild`, `--allow-live-guild`), plus `--help`.
 Anything else is refused. `--help` short-circuits: combined with any other
-argument it still prints usage and exits 0 without further validation.
+argument it still prints usage and exits 0 without further validation,
+except a malformed safety opt-in (`--allow-live-guild=x` or a repeat),
+which is refused at parse with exit 2 before help is reached.
 
 ```sh
 cargo run -p two-bot-cutover --bin game-activity-report -- --guild <GUILD_ID>
