@@ -151,8 +151,10 @@ async fn refusal_maps_to_rejected_without_retry() {
 
 #[tokio::test]
 async fn uncertain_failures_stay_uncertain_without_retry() {
-    // Transport/5xx failures and rate limits leave the outcome unknowable:
-    // the claim stays fenced, and the lane makes no second attempt.
+    // At this trait seam both map to their own variants with no in-lane
+    // retry: 5xx stays uncertain and fenced upstream, while a 429 proves no
+    // effect and releases only the failed attempt (see
+    // mutation_429_proves_no_effect_member.rs).
     let mock = MockRest::start(
         vec![ScriptedResponse::status(500), ScriptedResponse::status(429)],
         ScriptedResponse::status(500),

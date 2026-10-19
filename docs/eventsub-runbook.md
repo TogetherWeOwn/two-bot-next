@@ -306,9 +306,9 @@ and log one scalar warn line (`event="eventsub_receiver"`, `status`,
 404 below, which is plain-text `not found`, and log
 `event="eventsub_ingress"`. Retryable refusals are the container
 timeout/busy rows, the Worker 429 / 504 / 503 rows, and the container's
-unknown/future classification fallback (503 `unavailable`). Boot injects no
-go-live delivery dependencies yet, so ordinary verified deliveries have no
-side effects before acknowledgement; once provisioning injects them, a
+unknown/future classification fallback (503 `unavailable`). While the
+delivery gate stays dark, ordinary verified deliveries have no side
+effects before acknowledgement; with delivery enabled (next section), a
 transient ledger/send failure on a verified notification also answers the
 retryable 503 `unavailable`, and the durable claim fences keep that
 redelivery from double-posting.
@@ -346,8 +346,8 @@ direct `containerFetch`, because the Worker answers those shapes first):
 Verified deliveries that need no operator action answer `200`:
 
 - `notification` and `revocation`: acknowledged as `200 {"ok": true}`.
-  Until delivery provisioning lands the receiver only acks a notification;
-  afterwards a 200 also covers a posted or deduplicated go-live. The
+  While delivery stays dark the receiver only acks a notification; with
+  delivery enabled a 200 also covers a posted or deduplicated go-live. The
   reconciler (above) re-creates a revoked subscription on its next
   scheduled pass when the broadcaster is still in the allowlist, so
   re-subscription after a revocation is automatic, not manual and not
@@ -379,9 +379,42 @@ Log lines to expect (scalar fields only):
 
 Source: `crates/bot/src/eventsub_http.rs:131-148,324-439`.
 
+## Go-live delivery enablement
+
+Posting a go-live to Discord is a second, independent gate on top of the
+receiver (`crates/core/src/eventsub_delivery_config.rs`). It stays dark
+until the Operator provisions four Worker secrets, all forwarded to the
+container on explicit lines only while the receiver forward is active:
+
+1. `TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID`: the announcements channel
+   snowflake (canonical decimal) the post lands in.
+2. `TWO_EVENTSUB_INVITE_URL`: the Discord invite rendered into the post;
+   it must pass the renderer's own validation (postable https invite).
+3. `TWO_TWITCH_BROADCASTERS`: the broadcaster allowlist, shared with the
+   subscription reconcile, so the subscribed set and the announceable set
+   are one list. Entries must be canonical numeric Twitch user ids.
+4. `TWO_EVENTSUB_DELIVERY` set to exactly `"1"` **last**.
+
+An enabled-but-invalid delivery state — the gate at `"1"` with any input
+missing or invalid, or delivery requested without the receiver —
+refuses container startup (`eventsub startup refused`); it never
+degrades to ack-only. An enabled delivery on a boot identity where
+Announcements is not cleared (live or unknown identity) refuses startup
+the same way, like every other bot-identity posting job. Because a bad value
+crash-loops the container, set
+the three inputs first, redeploy, and flip the gate last. Enable on
+staging first and keep the posted go-live as enablement evidence;
+production enablement is its own rollout decision. To stop posting
+without touching the receiver, unset the gate (or set it to `"0"`) and
+redeploy: verified deliveries return to ack-only.
+
 ## Dark-unless-enabled behavior
 
 Dark is the normal state, not an outage:
+
+- `TWO_EVENTSUB_DELIVERY` unset or `"0"`: the receiver (when enabled)
+  acknowledges verified notifications without posting; no delivery input
+  is read.
 
 - `TWO_EVENTSUB` unset or `"0"`: no listener, no bind attempt, no secret
   read, and no reconcile task — the reconciler logs one parked line

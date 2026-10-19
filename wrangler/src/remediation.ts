@@ -285,3 +285,167 @@ export function evaluateRemediation(
   }
   return { messages, state: { lastRecommendedAtSeconds, scopes } };
 }
+
+/**
+ * Staging-only persisted guard receipt (TOG-30294 evidence, not authority).
+ *
+ * The keepalive tick writes the evaluator state to DO storage, flushes it via
+ * storage.sync(), reads it back, and logs exactly one receipt per tick in
+ * staging. The receipt carries only
+ * the allowlisted fields below — guard counters/timestamps/phases, evaluation
+ * time, firing trigger keys, decision category, and build/version correlation
+ * — so it can prove cooldown, R1→R2, STOP/quiet, sustained-clear/reset and the
+ * pre-drill baseline without exposing tokens, webhooks, or arbitrary storage.
+ */
+
+/** Receipt decisions: what the tick proved about the persisted guard. */
+export type RemediationReceiptDecision =
+  | "recommend"
+  | "ceo-page"
+  | "held-cooldown"
+  | "suppressed-quiet"
+  | "clear-hold"
+  | "idle";
+
+const REMEDIATION_FIRING_KEYS: ReadonlySet<string> = new Set(
+  REMEDIATION_TRIGGERS.map((trigger) => trigger.firingKey),
+);
+
+/** Keep only remediation trigger keys; other alert keys never enter a receipt. */
+export function remediationTriggerFiring(firing: string[]): string[] {
+  return firing.filter((key) => REMEDIATION_FIRING_KEYS.has(key));
+}
+
+function isIdleGuard(guard: ScopeGuard): boolean {
+  return (
+    guard.phase === "idle" &&
+    guard.consecutiveFailures === 0 &&
+    !guard.suppressed &&
+    guard.clearSinceSeconds === 0
+  );
+}
+
+function isIdleState(state: RemediationState): boolean {
+  return isIdleGuard(state.scopes["voice-stall"]) && isIdleGuard(state.scopes["crash-loop"]);
+}
+
+/**
+ * Pure decision for the receipt: which bucket the tick falls in. Messages win
+ * (recommend / ceo-page); otherwise a firing trigger on a suppressed scope is
+ * quiet, a firing trigger inside the global window is held, a quiet tick on a
+ * non-idle guard is the sustained-clear hold-down, and a quiet tick on an idle
+ * guard is the pre-drill baseline / reset.
+ */
+export function remediationReceiptDecision(
+  messages: RemediationMessage[],
+  firing: string[],
+  state: RemediationState,
+  nowSeconds: number,
+): { decision: RemediationReceiptDecision; action?: RemediationAction | undefined } {
+  const [first] = messages;
+  if (first?.kind === "recommend" && first.action !== undefined) {
+    return { decision: "recommend", action: first.action };
+  }
+  if (first?.kind === "ceo-page") {
+    return { decision: "ceo-page" };
+  }
+  const triggerFiring = remediationTriggerFiring(firing);
+  if (triggerFiring.length > 0) {
+    const suppressed = triggerFiring.some((key) => {
+      const scope = REMEDIATION_TRIGGERS.find((trigger) => trigger.firingKey === key)?.scope;
+      return scope !== undefined && state.scopes[scope]?.suppressed === true;
+    });
+    if (suppressed) return { decision: "suppressed-quiet" };
+    if (Math.floor(nowSeconds) - state.lastRecommendedAtSeconds < REMEDIATION_COOLDOWN_SECONDS) {
+      return { decision: "held-cooldown" };
+    }
+    // Firing outside the window with no message only happens when a sibling
+    // scope consumed the single window first; it is still a hold, never idle.
+    return { decision: "held-cooldown" };
+  }
+  return isIdleState(state) ? { decision: "idle" } : { decision: "clear-hold" };
+}
+
+export interface RemediationReceiptCorrelation {
+  buildRevision: string;
+  release: string;
+  workerVersion: string;
+}
+
+export interface RemediationGuardReceiptOk {
+  ok: true;
+  deploy_env: "staging";
+  evaluated_at_seconds: number;
+  firing: string[];
+  decision: RemediationReceiptDecision;
+  action?: RemediationAction | undefined;
+  guard: RemediationState;
+  build_revision: string;
+  release: string;
+  worker_version: string;
+}
+
+export interface RemediationGuardReceiptFailure {
+  ok: false;
+  deploy_env: "staging";
+  evaluated_at_seconds: number;
+  firing: string[];
+  reason: "mismatch" | "invalid_persisted";
+  build_revision: string;
+  release: string;
+  worker_version: string;
+}
+
+export type RemediationGuardReceipt = RemediationGuardReceiptOk | RemediationGuardReceiptFailure;
+
+function receiptGuardEqual(a: RemediationState, b: RemediationState): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * Build the receipt from the read-back guard. Success only when the persisted
+ * value is exactly the valid guard just written; any mismatch or corrupt shape
+ * is a failure receipt, never a false success. Callers gate the log line on
+ * staging and emit at most one per keepalive tick.
+ */
+export function buildRemediationGuardReceipt(input: {
+  persisted: unknown;
+  expected: RemediationState;
+  firing: string[];
+  messages: RemediationMessage[];
+  nowSeconds: number;
+} & RemediationReceiptCorrelation): RemediationGuardReceipt {
+  const nowSeconds = Math.floor(input.nowSeconds);
+  const firing = remediationTriggerFiring(input.firing);
+  const base = {
+    deploy_env: "staging" as const,
+    evaluated_at_seconds: nowSeconds,
+    firing,
+    build_revision: input.buildRevision,
+    release: input.release,
+    worker_version: input.workerVersion,
+  };
+  const sanitized = sanitizeRemediationState(input.persisted, nowSeconds);
+  // A corrupt shape never equals its sanitized restart, and a stale read never
+  // equals the just-written guard: both are failures, never successes.
+  if (!receiptGuardEqual(input.persisted as RemediationState, sanitized)) {
+    return { ...base, ok: false, reason: "invalid_persisted" };
+  }
+  if (!receiptGuardEqual(sanitized, input.expected)) {
+    return { ...base, ok: false, reason: "mismatch" };
+  }
+  const { decision, action } = remediationReceiptDecision(
+    input.messages,
+    input.firing,
+    sanitized,
+    nowSeconds,
+  );
+  return {
+    ...base,
+    ok: true,
+    decision,
+    ...(action === undefined ? {} : { action }),
+    guard: sanitized,
+  };
+}
+

@@ -417,7 +417,9 @@ async fn ambiguous_permission_responses_retain_request_channel_and_recovery_fenc
         ("moderation.unlock", Some("3072")),
         ("moderation.unlock", None),
     ] {
-        for status in [202, 302, 408, 409, 425, 429, 503] {
+        // Mutation 429 proves no effect and releases the attempt instead;
+        // see mutation_429_proves_no_effect_channel.rs.
+        for status in [202, 302, 408, 409, 425, 503] {
             let db = TestDb::new().await;
             let original = if action == "moderation.unlock" {
                 Some(seed_lockdown(&db, prior_allow).await)
@@ -457,11 +459,7 @@ async fn ambiguous_permission_responses_retain_request_channel_and_recovery_fenc
                 .unwrap_err();
             assert_eq!(
                 failure.code,
-                if status == 429 {
-                    ErrorCode::RateLimited
-                } else {
-                    ErrorCode::DiscordUnavailable
-                },
+                ErrorCode::DiscordUnavailable,
                 "{action}: {status}"
             );
             let recovery = db.store().get_lockdown(CHANNEL).await.unwrap().unwrap();
@@ -927,7 +925,9 @@ async fn purge_history_failures_are_retryable_without_any_deletion() {
 #[ignore = "requires agent-testdb or CI service container"]
 async fn uncertain_purge_deletions_keep_same_key_and_distinct_key_fenced() {
     for count in [1, 2] {
-        for status in [202, 302, 408, 429, 503] {
+        // Mutation 429 proves no effect and releases the attempt instead;
+        // see mutation_429_proves_no_effect_channel.rs.
+        for status in [202, 302, 408, 503] {
             let db = TestDb::new().await;
             let messages: Vec<Value> = [fresh_message_id(1), fresh_message_id(2)]
                 .iter()
@@ -956,11 +956,7 @@ async fn uncertain_purge_deletions_keep_same_key_and_distinct_key_fenced() {
                 .await
                 .unwrap_err()
                 .code,
-                if status == 429 {
-                    ErrorCode::RateLimited
-                } else {
-                    ErrorCode::DiscordUnavailable
-                }
+                ErrorCode::DiscordUnavailable
             );
             assert_eq!(
                 exec.execute(
@@ -1150,8 +1146,13 @@ const CHANNEL: &str = "222222222222222222";
 const TIME: &str = "2026-09-30T00:00:00.000Z";
 
 fn allowed_test_url(url: &str, ci: bool) -> bool {
+    // Also accept the workspace bootstrap URL used by the check.yml coverage
+    // sweep; callers still connect to `agent_test` with an isolated schema,
+    // so data never lands in the bootstrap database.
     url == "postgres://agent_test@agent-testdb:5432/agent_test"
+        || url == "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci"
         || (ci && url == "postgres://agent_test@127.0.0.1:5432/agent_test")
+        || (ci && url == "postgres://agent_test:@127.0.0.1:5432/two_bot_test_ci")
 }
 
 #[test]
@@ -1161,11 +1162,20 @@ fn database_guard_refuses_credentials_and_non_test_targets() {
         false
     ));
     assert!(allowed_test_url(
+        "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        false
+    ));
+    assert!(allowed_test_url(
         "postgres://agent_test@127.0.0.1:5432/agent_test",
+        true
+    ));
+    assert!(allowed_test_url(
+        "postgres://agent_test:@127.0.0.1:5432/two_bot_test_ci",
         true
     ));
     for url in [
         "postgres://agent_test@127.0.0.1:5432/agent_test",
+        "postgres://agent_test:@127.0.0.1:5432/two_bot_test_ci",
         "postgres://agent_test@production:5432/agent_test",
         "postgres://agent_test@staging:5432/agent_test",
         "postgres://admin@agent-testdb:5432/agent_test",
