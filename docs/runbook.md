@@ -1047,12 +1047,14 @@ disarms the drill by redeploy.
 
 1. Pick the drill SHA: the full 40-hex main commit staging currently serves
    (the `build_revision` on staging `/readyz`, not a guess). The pin must be
-   an ancestor of `origin/main`.
+   an ancestor of `origin/main`. Save it once: `DRILL_SHA=<paste the 40-hex
+   SHA>` (replace the placeholder before running; the shell would read the
+   angle brackets as a redirection).
 2. Arm the hold: `gh variable set STAGING_SOAK_HOLD_UNTIL --body
    "2026-10-19T20:00:00Z"` with an ISO-8601 UTC deadline at most 4h out
    (past the planned disarm plus the 30-minute clear).
 3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
-   --ref main -f sha=<40hex> -f inject_voice_stall=true` (add
+   --ref main -f "sha=$DRILL_SHA" -f inject_voice_stall=true` (add
    `-f inject_unpaired_disconnect=true` for the crash-loop scope).
    Dispatches bypass the hold, so arm and disarm work while it is armed.
    The arm run stays red by design: the history guard fails it after a green
@@ -1062,7 +1064,7 @@ disarms the drill by redeploy.
    with the deferral message (red, by design: a quiet green would read as
    staging history to the production guard); merges stay unblocked.
 5. Disarm at the SAME SHA with no flags: `gh workflow run
-   deploy-staging.yml --ref main -f sha=<same-40hex>`. The disarm run stays
+   deploy-staging.yml --ref main -f "sha=$DRILL_SHA"`. The disarm run stays
    red for the same reason while the pin sits below the head.
 6. Watch the 30-minute clear (triggers resolve, guards reset), then release
    the hold: `gh variable delete STAGING_SOAK_HOLD_UNTIL`. Letting it expire

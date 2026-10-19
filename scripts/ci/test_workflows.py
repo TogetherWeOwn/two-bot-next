@@ -433,11 +433,15 @@ def staging_pinned_sha_errors(workflows):
     dispatch-or-head ref at full depth, and each carries one SHA step that
     resolves the same expression through the environment, proves HEAD equals
     it, enforces a full 40-hex shape and refuses anything that is not an
-    ancestor of origin/main. Exactly eight reads exist (three checkout refs,
-    three SHA-step envs, the schema gate's --source-sha env, the history
-    guard's comparison env): seven use the pinned expression and the eighth
-    is the guard's raw pin-vs-head comparison, so no other step can resolve
-    or judge a different commit. Every other workflow must not mention the
+    ancestor of origin/main. Each SHA step refuses exactly four ways (shape,
+    length, checkout equality, ancestry), pinned by exit count so no refusal
+    can go green. Exactly eight reads exist (three checkout refs, three
+    SHA-step envs, the schema gate's --source-sha env, the history guard's
+    comparison env): seven use the pinned expression and the eighth is the
+    guard's raw pin-vs-head comparison, so no other step can resolve or judge
+    a different commit. Build identity and provenance then follow the
+    validated SHA through the deploy job's DEPLOY_SHA export, pinned by
+    staging_deploy_identity_errors. Every other workflow must not mention the
     switch at all, except deploy-production and release, which carry their
     own reviewed sha inputs (the production guard's verified SHA, the
     published release tag) pinned by their own checks.
@@ -486,6 +490,11 @@ def staging_pinned_sha_errors(workflows):
                        "[!0-9a-f]", '"${#SOURCE_SHA}"', "-eq 40"):
             if needle not in run:
                 errors.append(f"deploy-staging.yml:{job_id}: SHA step must contain {needle}")
+        # Four refusals, four exits: flipping any refusal green (in
+        # particular the ancestry rejection) trips this count.
+        if run.count("exit 1") != 4:
+            errors.append(f"deploy-staging.yml:{job_id}: SHA step must refuse exactly four ways "
+                          "(shape, length, checkout equality, ancestry)")
         # The shape check runs before the checkout equality: HEAD is always a
         # full SHA, so an equality-first order would refuse a short or branch
         # pin with no message before the shape refusal could explain it.
@@ -612,6 +621,66 @@ def pinned_history_guard_errors(workflow, name="deploy-staging.yml"):
     if "uses" in step or "${{" in run:
         errors.append(f"{name}:pinned-history-guard: step must use the environment only, "
                       "never an inline expression")
+    return errors
+
+
+def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
+    """A pinned drill deploy stamps the pin, never the workflow head.
+
+    The checkout builds the pinned commit, so every build-identity and
+    provenance consumer in the deploy job must stamp the validated
+    dispatch-or-head SHA: the deploy SHA step exports it as DEPLOY_SHA, the
+    prepare step overrides GITHUB_SHA with it (staging_rollout.py prepare
+    reads GITHUB_SHA as the build revision for BOT_BUILD_REVISION,
+    CONTAINER_RELEASE and the baseline receipt the verify step judges
+    against), and the wrangler --message, the ownership and rollback actors
+    and the promotion-gate SHA resolve it. Stamping the head instead would
+    serve the pin labeled as the head, break the runbook's read-the-serving-
+    SHA-from-build_revision step and poison the next rollback snapshot's
+    serving_sha (recorded from the workers/message annotation). No other
+    github.sha may appear in the deploy job outside the two pinned
+    dispatch-or-head expressions (checkout ref, SHA-step env).
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    deploy = jobs.get("deploy") or {}
+    steps = deploy.get("steps") or []
+
+    def find(label, predicate):
+        found = [step for step in steps if predicate(step)]
+        if len(found) != 1:
+            errors.append(f"{name}:deploy: must carry exactly one {label}")
+            return None
+        return found[0]
+
+    sha_step = find("SHA check step",
+                    lambda step: step.get("name") == "Deploy SHA must be exact and reachable from main")
+    if sha_step is not None and 'echo "DEPLOY_SHA=$SOURCE_SHA" >> "$GITHUB_ENV"' not in str(sha_step.get("run") or ""):
+        errors.append(f"{name}:deploy: SHA step must export the validated dispatch-or-head SHA")
+    prepare = find("staging identity snapshot step",
+                   lambda step: step.get("name") == "Snapshot staging identity and generate per-deploy image provenance")
+    if prepare is not None and (prepare.get("env") or {}).get("GITHUB_SHA") != "${{ env.DEPLOY_SHA }}":
+        errors.append(f"{name}:deploy: prepare step must stamp the validated deploy SHA as GITHUB_SHA")
+    wrangler = find("wrangler deploy step", lambda step: step.get("id") == "deploy")
+    if wrangler is not None:
+        command = str((wrangler.get("with") or {}).get("command") or "")
+        if "--message ${{ env.DEPLOY_SHA }}" not in command or "github.sha" in command:
+            errors.append(f"{name}:deploy: wrangler deploy must message the validated deploy SHA")
+    takeover = find("ownership takeover step", lambda step: step.get("id") == "takeover")
+    if takeover is not None and (takeover.get("env") or {}).get("OWNERSHIP_ACTOR") != \
+            "github-actions:${{ github.run_id }}:${{ env.DEPLOY_SHA }}":
+        errors.append(f"{name}:deploy: ownership actor must name the validated deploy SHA")
+    gate = find("promotion error-rate gate step", lambda step: step.get("id") == "error_rate_gate")
+    if gate is not None and (gate.get("env") or {}).get("SHA") != "${{ env.DEPLOY_SHA }}":
+        errors.append(f"{name}:deploy: promotion gate must judge the validated deploy SHA")
+    rollback = find("auto-rollback step", lambda step: step.get("id") == "auto_rollback")
+    if rollback is not None and (rollback.get("env") or {}).get("ROLLBACK_ACTOR") != \
+            "github-actions:${{ github.run_id }}:${{ env.DEPLOY_SHA }}":
+        errors.append(f"{name}:deploy: rollback actor must name the validated deploy SHA")
+    text = str(deploy)
+    if text.count("github.sha") != text.count(DEPLOY_SHA_EXPRESSION) or text.count("github.sha") != 2:
+        errors.append(f"{name}:deploy: github.sha may only appear in the checkout ref and "
+                      "SHA-step dispatch-or-head expressions")
     return errors
 
 
@@ -2215,6 +2284,7 @@ def workflow_policy_errors(workflows):
             errors.extend(staging_dispatch_errors(workflow))
             errors.extend(staging_active_errors(workflow))
             errors.extend(staging_pinned_sha_errors(workflows))
+            errors.extend(staging_deploy_identity_errors(workflow))
             errors.extend(soak_hold_errors(workflow))
             errors.extend(pinned_history_guard_errors(workflow))
             errors.extend(schema_gate_errors(workflow))
@@ -2968,6 +3038,17 @@ class WorkflowTests(unittest.TestCase):
                 .__setitem__("run", "\n".join(line for line in
                                              w["jobs"]["deploy"]["steps"][1]["run"].splitlines()
                                              if "merge-base" not in line)),
+            "ancestry rejection goes green": lambda w: w["jobs"]["deploy"]["steps"][1]
+                .__setitem__("run", w["jobs"]["deploy"]["steps"][1]["run"]
+                             .replace("exit 1", "exit 0")),
+            "ancestry-only rejection goes green": lambda w: [
+                job["steps"][1].__setitem__(
+                    "run", job["steps"][1]["run"].replace(
+                        'git merge-base --is-ancestor "$SOURCE_SHA" origin/main || '
+                        '{ echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 1; }',
+                        'git merge-base --is-ancestor "$SOURCE_SHA" origin/main || '
+                        '{ echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 0; }'))
+                for job in (w["jobs"]["schema-gate"], w["jobs"]["roles-gate"], w["jobs"]["deploy"])],
             "hex enforcement dropped": lambda w: w["jobs"]["deploy"]["steps"][1]
                 .__setitem__("run", "\n".join(line for line in
                                              w["jobs"]["deploy"]["steps"][1]["run"].splitlines()
@@ -3159,6 +3240,155 @@ class WorkflowTests(unittest.TestCase):
                         self.assertIn("not staging history", output)
                         self.assertIn(pinned, output)
                         self.assertIn(head_sha, output)
+
+    def test_pinned_sha_shell_behaves(self):
+        # Execute the actual SHA-check shells in a scratch git repo: a valid
+        # ancestor passes and (in the deploy job) exports DEPLOY_SHA, while a
+        # short, uppercase, empty or branch pin, a non-ancestor and a
+        # HEAD-mismatch all refuse with their reason. The temp remote's
+        # origin/main is the ancestry root; each case checks out its commit
+        # first, exactly as the workflow checkout lands on the pin before the
+        # SHA step runs. The deploy shell runs from a subdirectory, mirroring
+        # the deploy job's wrangler working directory.
+        import os
+        import subprocess
+        import tempfile
+        shells = {}
+        for job_id in ("schema-gate", "roles-gate", "deploy"):
+            job = self.workflows["deploy-staging.yml"]["jobs"][job_id]
+            shells[job_id] = next(
+                step for step in job["steps"]
+                if step.get("name") == "Deploy SHA must be exact and reachable from main")["run"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            repo, origin = temp / "repo", temp / "origin.git"
+            # Hermetic git: caller identity overrides (even empty ones),
+            # ambient config paths and shell-startup injections (BASH_ENV,
+            # ENV) must not leak into the scratch repo or redirect git.
+            base_env = {key: value for key, value in os.environ.items()
+                        if not (key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"))}
+            for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                        "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+                        "GIT_CONFIG_COUNT", "BASH_ENV", "ENV"):
+                base_env.pop(key, None)
+            base_env.update(HOME=str(temp),
+                            GIT_CONFIG_GLOBAL=str(temp / "gitconfig"),
+                            GIT_CONFIG_SYSTEM=str(temp / "gitconfig-system"))
+            # The SHA shells start with `git config --global`, which a
+            # managed/shimmed git forbids; probe that capability and skip
+            # there (the static needle, exit-count and mutation pins above
+            # still run everywhere). Real runners execute the shells.
+            probe = subprocess.run(
+                ["git", "config", "--global", "--add", "paperclip.probe", "1"],
+                cwd=str(temp), env=base_env,
+                capture_output=True, text=True, timeout=30)
+            if probe.returncode != 0:
+                self.skipTest("git cannot write global config here; "
+                              "SHA shells execute on real runners only")
+
+            def git(*args, cwd):
+                return subprocess.run(
+                    ["git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                     "-c", "init.defaultBranch=main", *args],
+                    cwd=str(cwd), env=base_env,
+                    capture_output=True, text=True, timeout=30, check=True)
+
+            git("init", "--bare", origin.name, cwd=temp)
+            git("init", repo.name, cwd=temp)
+            (repo / "file.txt").write_text("ancestor\n", encoding="utf-8")
+            git("add", "file.txt", cwd=repo)
+            git("commit", "-m", "ancestor", cwd=repo)
+            ancestor = git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+            (repo / "file.txt").write_text("head\n", encoding="utf-8")
+            git("commit", "-am", "head", cwd=repo)
+            head = git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+            git("remote", "add", "origin", str(origin), cwd=repo)
+            git("push", "origin", "main", cwd=repo)
+            git("checkout", "-b", "feature", ancestor, cwd=repo)
+            (repo / "feature.txt").write_text("unmerged\n", encoding="utf-8")
+            git("add", "feature.txt", cwd=repo)
+            git("commit", "-m", "unmerged", cwd=repo)
+            unmerged = git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+            (repo / "wrangler").mkdir()
+            cases = (
+                ("valid ancestor passes", head, head, 0, ""),
+                ("short pin refuses", head, "abc123", 1, "full 40-hex"),
+                ("uppercase pin refuses", head, head.upper(), 1, "full 40-hex"),
+                ("empty pin refuses", head, "", 1, "full 40-hex"),
+                ("branch pin refuses", head, "main", 1, "full 40-hex"),
+                ("non-ancestor refuses", unmerged, unmerged, 1, "not an ancestor"),
+                ("head mismatch refuses", head, ancestor, 1, "did not land"),
+            )
+            for label, checkout_ref, source_sha, expected_code, needle in cases:
+                with self.subTest(label):
+                    git("checkout", checkout_ref, cwd=repo)
+                    for job_id, shell in shells.items():
+                        with self.subTest(job=job_id):
+                            exported = temp / f"github-env-{job_id}"
+                            exported.write_text("", encoding="utf-8")
+                            env = dict(base_env, GITHUB_WORKSPACE=str(repo),
+                                       SOURCE_SHA=source_sha, GITHUB_ENV=str(exported))
+                            workdir = repo / "wrangler" if job_id == "deploy" else repo
+                            proc = subprocess.run(
+                                ["bash", "-e", "-c", shell], cwd=str(workdir), env=env,
+                                capture_output=True, text=True, timeout=30,
+                            )
+                            output = proc.stdout + proc.stderr
+                            self.assertEqual(proc.returncode, expected_code, output)
+                            if expected_code == 1:
+                                self.assertIn("::error::", output)
+                                self.assertIn(needle, output)
+                                self.assertEqual(exported.read_text(encoding="utf-8"), "")
+                            elif job_id == "deploy":
+                                self.assertEqual(exported.read_text(encoding="utf-8"),
+                                                 f"DEPLOY_SHA={source_sha}\n")
+                            else:
+                                self.assertEqual(exported.read_text(encoding="utf-8"), "")
+
+    def test_deploy_identity_follows_the_pin(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(staging_deploy_identity_errors(staging), [])
+
+        def sha_step(w):
+            return next(step for step in w["jobs"]["deploy"]["steps"]
+                        if step.get("name") == "Deploy SHA must be exact and reachable from main")
+
+        def prepare_step(w):
+            return next(step for step in w["jobs"]["deploy"]["steps"]
+                        if step.get("name") == "Snapshot staging identity and generate per-deploy image provenance")
+
+        def step_by_id(w, step_id):
+            return next(step for step in w["jobs"]["deploy"]["steps"]
+                        if step.get("id") == step_id)
+
+        mutations = {
+            "identity export dropped": lambda w: sha_step(w)
+                .__setitem__("run", "\n".join(line for line in sha_step(w)["run"].splitlines()
+                                             if "DEPLOY_SHA" not in line)),
+            "prepare stamps the head": lambda w: prepare_step(w)["env"]
+                .__setitem__("GITHUB_SHA", "${{ github.sha }}"),
+            "deploy message stamps the head": lambda w: step_by_id(w, "deploy")["with"]
+                .__setitem__("command", step_by_id(w, "deploy")["with"]["command"]
+                             .replace("${{ env.DEPLOY_SHA }}", "${{ github.sha }}")),
+            "ownership actor stamps the head": lambda w: step_by_id(w, "takeover")["env"]
+                .__setitem__("OWNERSHIP_ACTOR", "github-actions:${{ github.run_id }}:${{ github.sha }}"),
+            "promotion gate stamps the head": lambda w: step_by_id(w, "error_rate_gate")["env"]
+                .__setitem__("SHA", "${{ github.sha }}"),
+            "rollback actor stamps the head": lambda w: step_by_id(w, "auto_rollback")["env"]
+                .__setitem__("ROLLBACK_ACTOR", "github-actions:${{ github.run_id }}:${{ github.sha }}"),
+            "second head reader": lambda w: prepare_step(w)["env"]
+                .__setitem__("EXTRA_SHA", "${{ github.sha }}"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(self.workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(
+                    staging_deploy_identity_errors(changed["deploy-staging.yml"])
+                    or staging_pinned_sha_errors(changed),
+                    label,
+                )
+                self.assertTrue(workflow_policy_errors(changed), label)
 
     def test_docs_only_push_skips_staging_but_runtime_paths_deploy(self):
         # A docs-only merge to main must start no run (the soak needs a stable

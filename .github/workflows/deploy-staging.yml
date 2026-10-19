@@ -303,6 +303,11 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA" || { echo "::error::Checkout did not land on $SOURCE_SHA" >&2; exit 1; }
           git fetch origin main
           git merge-base --is-ancestor "$SOURCE_SHA" origin/main || { echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 1; }
+          # Export the validated dispatch-or-head SHA: every build-identity
+          # and provenance consumer below stamps this, never the workflow
+          # head, so a pinned drill labels the commit it actually serves
+          # (as deploy-production's guard SHA does for the same reason).
+          echo "DEPLOY_SHA=$SOURCE_SHA" >> "$GITHUB_ENV"
       # The runner context is not available in job-level env, so derive the
       # per-attempt paths here and export them to every later step.
       - name: Set per-attempt rollout paths
@@ -329,6 +334,12 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           STAGING_URL: ${{ vars.STAGING_WORKER_URL }}
+          # staging_rollout.py prepare reads GITHUB_SHA as the build revision
+          # (BOT_BUILD_REVISION, CONTAINER_RELEASE, the baseline receipt the
+          # verify step judges against), so stamp the validated deploy SHA, not
+          # the runner's workflow-head default, or a pinned drill would serve
+          # the pin labeled as the head.
+          GITHUB_SHA: ${{ env.DEPLOY_SHA }}
           # Dispatch-only drill switches: a push run has no inputs and each
           # expression requires workflow_dispatch besides, so every one is
           # 'false' on every push. test_workflows.py pins these exact
@@ -378,9 +389,10 @@ jobs:
           environment: staging
           wranglerVersion: "4.151.0"
           # --message stamps the version's immutable workers/message
-          # annotation with this commit, the SHA member of the rollback
-          # provenance receipt the next snapshot records (as production).
-          command: deploy --config ${{ env.ROLLOUT_DIR }}/staging-deploy.json --env staging --message ${{ github.sha }}
+          # annotation with the deployed commit, the SHA member of the
+          # rollback provenance receipt the next snapshot records (as
+          # production): the validated deploy SHA, never the workflow head.
+          command: deploy --config ${{ env.ROLLOUT_DIR }}/staging-deploy.json --env staging --message ${{ env.DEPLOY_SHA }}
       # Ordering (TOG-12939): ownership must not move to a deploy whose Wrangler
       # receipt is not valid, fresh and pinned, so that part of the gate runs
       # here, before the transfer. It reads only the local NDJSON (no network,
@@ -402,7 +414,7 @@ jobs:
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
-          OWNERSHIP_ACTOR: github-actions:${{ github.run_id }}:${{ github.sha }}
+          OWNERSHIP_ACTOR: github-actions:${{ github.run_id }}:${{ env.DEPLOY_SHA }}
           OWNERSHIP_RELEASE_FENCE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_fence && 'true' || 'false' }}
         run: |
           set -euo pipefail
@@ -472,7 +484,7 @@ jobs:
           # expression requires workflow_dispatch besides, so it is 'false'
           # on every push. test_workflows.py pins this exact expression.
           INJECT_ERROR_RATE_SPIKE: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_rate_spike && 'true' || 'false' }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ env.DEPLOY_SHA }}
         run: |
           set -euo pipefail
           rehearsal=()
@@ -498,7 +510,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          ROLLBACK_ACTOR: github-actions:${{ github.run_id }}:${{ github.sha }}
+          ROLLBACK_ACTOR: github-actions:${{ github.run_id }}:${{ env.DEPLOY_SHA }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
         run: |
           set -euo pipefail
