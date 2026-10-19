@@ -1466,9 +1466,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
             Arc::clone(&state),
             Arc::clone(&generation),
             Arc::clone(&live_interactions),
-            Arc::clone(&queue_signal),
-            Arc::clone(&writer_drained),
-            opening_rx,
+            OnboardingQueueSignals {
+                signal: Arc::clone(&queue_signal),
+                writer_drained: Arc::clone(&writer_drained),
+                opening_flushed: opening_rx,
+            },
         )
     });
     // The blocking dispatch worker inherits no span context: capture the
@@ -1630,27 +1632,35 @@ pub async fn run_shard<I: InviteSource + 'static>(
 /// on a fatal error (the runner then fails closed), or once the writer drain
 /// flag is set and the durable queue is empty with no effect in flight
 /// (cooperative shutdown drain).
-#[allow(clippy::too_many_arguments)]
+///
+/// Coordination signals for the queue worker: wakeups for newly committed
+/// jobs, the writer-drained shutdown flag, and the gateway opening-frame gate
+/// (claims wait until the Hello-queued Resume/Identify is flushed, so a fast
+/// member-read error cannot drop the socket before the write).
+struct OnboardingQueueSignals {
+    signal: Arc<tokio::sync::Notify>,
+    writer_drained: Arc<std::sync::atomic::AtomicBool>,
+    opening_flushed: tokio::sync::watch::Receiver<bool>,
+}
+
 async fn onboarding_queue(
     runtime: Arc<crate::onboarding::OnboardingRuntime>,
     store: GatewaySessionStore,
     state: Arc<RwLock<GatewayState>>,
     generation: Arc<AtomicU64>,
     live_interactions: LiveInteractions,
-    signal: Arc<tokio::sync::Notify>,
-    writer_drained: Arc<std::sync::atomic::AtomicBool>,
-    mut opening_flushed: tokio::sync::watch::Receiver<bool>,
+    mut signals: OnboardingQueueSignals,
 ) -> Result<(), sqlx::Error> {
     // Claim nothing until the opening frame is written. A cooperative shutdown
     // before Hello leaves the durable jobs for the next boot instead of waiting
     // out the drain budget. A dropped sender stays pending so the dispatch
     // result is the one the runner reports.
     loop {
-        let notified = signal.notified();
-        if *opening_flushed.borrow() {
+        let notified = signals.signal.notified();
+        if *signals.opening_flushed.borrow() {
             break;
         }
-        if writer_drained.load(Ordering::Acquire) {
+        if signals.writer_drained.load(Ordering::Acquire) {
             return Ok(());
         }
         tokio::select! {
@@ -1658,7 +1668,8 @@ async fn onboarding_queue(
             // Drop the watch guard inside this future. Holding it across the
             // pending await below makes run_shard !Send.
             closed = async {
-                opening_flushed
+                signals
+                    .opening_flushed
                     .wait_for(|flushed| *flushed)
                     .await
                     .is_err()
@@ -1687,7 +1698,7 @@ async fn onboarding_queue(
         // Once the writer has drained, no new job can be committed: force a
         // final claim probe (a commit may have raced the drain return) and
         // exit once no claimed effect is in flight either.
-        let draining = writer_drained.load(Ordering::Acquire);
+        let draining = signals.writer_drained.load(Ordering::Acquire);
         if draining {
             queue_dirty = true;
         }
@@ -1759,7 +1770,7 @@ async fn onboarding_queue(
             }
         }
         tokio::select! {
-            _ = signal.notified() => queue_dirty = true,
+            _ = signals.signal.notified() => queue_dirty = true,
             _ = queue_tick.tick(), if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT => {}
             result = feature_jobs.join_next(), if !feature_jobs.is_empty() => {
                 let Some(Ok(Ok((id, interrupted)))) = result else {
