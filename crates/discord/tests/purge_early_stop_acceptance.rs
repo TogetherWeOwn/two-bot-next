@@ -118,7 +118,7 @@ async fn first_delete_refusal_still_errors_with_nothing_deleted() {
     let result = executor_for(&mock).purge(CHANNEL, 2, REASON).await;
     assert!(
         matches!(result, Err(DiscordError::Rejected(_))),
-        "nothing deleted yet, so the refusal is an error, not an early stop: {result:?}"
+        "nothing deleted yet, so the refusal is an error, not an early stop"
     );
     assert_eq!(mock.requests().len(), 2);
     mock.shutdown().await;
