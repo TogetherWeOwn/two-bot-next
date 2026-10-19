@@ -408,7 +408,9 @@ field plus bounded `op` and `outcome`, no notice text or mention payload):
 `voice notice configured channel failed; trying fallback` (warn): the
 configured `/logging` channel refused the notice send, so delivery falls
 through to the system channel, owner DM and creator chat in order. One line
-per failed configured-channel attempt; a working channel logs nothing.
+per failed configured-channel attempt; a working channel logs nothing, and a
+rate-limited attempt falls through silently (a rate limit is a retry, not an
+outcome).
 
 Boot admission warning (in `configured_admission` in
 `crates/bot/src/voice_rooms.rs`, key-only fields, no IDs):

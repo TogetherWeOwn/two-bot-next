@@ -4952,7 +4952,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// tried. A failing configured channel warns once (op name plus the
     /// bounded outcome, never the notice text or the mention) so a
     /// misconfigured channel is distinguishable from a working one; a
-    /// successful send stays silent.
+    /// successful send stays silent, and so does a rate limit, which is a
+    /// retry rather than an outcome (the channel may be healthy).
     async fn deliver_notice(&self, settings: &LoggingSettings, text: &str) -> bool {
         let mention = settings
             .mention_role_id
@@ -4967,6 +4968,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 .await
             {
                 Ok(()) => return true,
+                // Rate limits are retries, never outcomes: skip the warn
+                // before the classifier, like its other callers.
+                Err(RoomHttpError::RateLimited { .. }) => {}
                 Err(error) => {
                     let guild = self.live.guild_id.to_string();
                     let outcome = voice_outcome_from_http(&error);
