@@ -433,5 +433,68 @@ class ConnectionWarningTests(unittest.TestCase):
                 self.assertIsNone(connection_warning(bad))
 
 
+class DuplicateManifestRefusalTests(unittest.TestCase):
+    """Duplicate manifest fields refuse with fixed vocabulary, never last-wins.
+
+    A duplicated ``pending_before`` must not read last-wins (the gate
+    could pass on the second copy); every object at any depth is
+    strict, and an excessively nested manifest maps to the existing
+    invalid-JSON refusal instead of escaping as a traceback.
+    """
+
+    def run_with_stdout(self, stdout):
+        def fake_run(argv, **kwargs):
+            return types.SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+        with mock.patch.object(production_schema_gate.subprocess, "run", fake_run):
+            return run_gate("bin", SHA, PROD_URL, PROD_HOST, PROD_DB, "")
+
+    def test_top_level_duplicate_pending_refused_both_orders(self):
+        for stdout in (
+            '{"pending_before": [], "pending_before": [424], "pending_store_before": []}\n',
+            '{"pending_before": [424], "pending_before": [], "pending_store_before": []}\n',
+        ):
+            with self.subTest(stdout=stdout[:44]):
+                with self.assertRaises(Refused) as caught:
+                    self.run_with_stdout(stdout)
+                self.assertEqual(str(caught.exception), "plan manifest has duplicate fields")
+                self.assertNotIn("424", str(caught.exception))
+
+    def test_nested_duplicate_refused_without_echo(self):
+        stdout = (
+            '{"pending_before": [], "pending_store_before": [], '
+            '"audit": {"connection_usage": {"used": 25, "used": 1, '
+            '"max_connections": 25}}}\n'
+        )
+        with self.assertRaises(Refused) as caught:
+            self.run_with_stdout(stdout)
+        self.assertEqual(str(caught.exception), "plan manifest has duplicate fields")
+
+    def test_escaped_key_spelling_counts_as_duplicate(self):
+        stdout = (
+            '{"pending_before": [], "pending_store_before": [], '
+            '"audit": {"used": 25, "\\u0075sed": 1}}\n'
+        )
+        with self.assertRaises(Refused) as caught:
+            self.run_with_stdout(stdout)
+        self.assertEqual(str(caught.exception), "plan manifest has duplicate fields")
+
+    def test_deeply_nested_manifest_maps_recursion_to_invalid_json(self):
+        stdout = '{"a":' * 10000 + "0" + "}" * 10000 + "\n"
+        with self.assertRaises(Refused) as caught:
+            self.run_with_stdout(stdout)
+        self.assertEqual(str(caught.exception), "plan manifest is not valid JSON")
+
+    def test_unique_nested_manifest_still_parses(self):
+        stdout = (
+            '{"pending_before": [], "pending_store_before": [], '
+            '"audit": {"connection_usage": {"used": 25, "max_connections": 25}}}\n'
+        )
+        manifest = self.run_with_stdout(stdout)
+        self.assertEqual(manifest["pending_before"], [])
+        self.assertEqual(manifest["pending_store_before"], [])
+        self.assertIsNotNone(connection_warning(manifest))
+
+
 if __name__ == "__main__":
     unittest.main()

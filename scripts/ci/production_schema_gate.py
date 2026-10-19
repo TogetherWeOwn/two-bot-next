@@ -58,6 +58,20 @@ def require(condition, message):
         raise Refused(message)
 
 
+def unique_object(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    refusal is a fixed string: it names no key, value or path.
+    """
+    result = {}
+    for key, value in pairs:
+        require(key not in result, "plan manifest has duplicate fields")
+        result[key] = value
+    return result
+
+
 def is_staging_host(host_lower):
     """Mirror the binary's staging fence: production never targets these."""
     return (
@@ -263,8 +277,9 @@ def run_gate(binary, source_sha, url, expected_host, expected_database, expected
             f"{proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else 'no detail'}"
         )
     try:
-        manifest = json.loads(proc.stdout.strip().splitlines()[-1])
-    except (json.JSONDecodeError, IndexError):
+        manifest = json.loads(proc.stdout.strip().splitlines()[-1],
+                              object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, IndexError, RecursionError):
         raise Refused("plan manifest is not valid JSON")
     return manifest
 
