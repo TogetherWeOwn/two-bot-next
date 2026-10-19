@@ -2380,6 +2380,9 @@ jobs:
       - name: Verify runner routing for every workflow job
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-runner-routing.py
+      - name: Verify commit-parser step attribution (offline fixtures)
+        if: needs.job-inputs.outputs.worker != 'false'
+        run: python3 ../scripts/test-commit-parse-guard-ci.py
       - name: Verify offline release on promote
         if: needs.job-inputs.outputs.worker != 'false'
         # Version bumps, notes, rollback guard and off-main refusal against a
@@ -2390,13 +2393,15 @@ jobs:
         # Repairing an older tag's missing release must not move "Latest"
         # backward (mocked gh against a throwaway git repository).
         run: node --test ../scripts/test-release-on-promote-latest-repair.cjs
-      - name: Verify the commit-parse guard
+      - name: Install pinned commit-parser fixture
         if: needs.job-inputs.outputs.worker != 'false'
         # The PR-side guard uses release-please's pinned conventional-commit
         # parser, in an isolated install with lifecycle scripts disabled.
         run: | # zizmor: ignore[adhoc-packages] pinned commit parser fixture only
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
-          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs
+      - name: Verify the commit-parse guard
+        if: needs.job-inputs.outputs.worker != 'false'
+        run: NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs
 
   # Single always-run aggregator for the path-filtered matrix. GitHub counts
   # a skipped job as passing and leaves a required context pending when its
