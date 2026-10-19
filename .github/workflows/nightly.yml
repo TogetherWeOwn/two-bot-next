@@ -251,6 +251,15 @@ jobs:
           --skip uncertain_lockdown_keeps_seed_and_channel_fence_against_distinct_key_unlock
           --skip rejected_lockdown_removes_only_new_seed_and_allows_same_key_retry
           --skip permission_actor_and_guild_refusals_never_mutate
+          --skip single_delete_429_releases_attempt_for_same_key_retry
+          --skip bulk_delete_429_releases_attempt_for_same_key_retry
+          --skip channel_overwrite_429_releases_attempt_and_retires_only_its_seed
+          --skip slowmode_429_releases_attempt_for_same_and_distinct_keys
+          --skip unlock_429_releases_lane_but_preserves_recovery_seed
+          --skip lockdown_429_preserves_prior_seed_while_releasing_the_lane
+          --skip slowmode_5xx_and_unexpected_statuses_stay_fenced
+          --skip slowmode_timeout_stays_fenced
+          --skip cancelled_lockdown_stays_fenced_with_seed_retained
           --skip feed_crud_audit_scope_and_timestamp_roundtrip
           --skip claim_is_owned_once_then_in_flight
           --skip failed_send_releases_the_claim_for_the_retry
@@ -277,7 +286,6 @@ jobs:
           --skip store_failure_keeps_committed_cutover_evidence
           --skip connection_count_sees_other_roles_from_plan_login
           --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
-          --skip a_restarted_worker_rediscovers_a_channel_whose_rollback_failed
           --skip blocklisted_members_skip_per_user_rows_but_count_in_aggregates
           --skip persisted_member_rows_hold_ids_timestamps_enums_only
           --skip resume_continues_from_the_persisted_cursor
@@ -358,6 +366,13 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
         run: >-
           cargo test -p two-bot-discord --all-features --test internal_channel_moderation --locked
+          -- --include-ignored --test-threads=1
+      - name: Mutation-429 channel acceptance ignored tests with their guarded URL
+        if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
+        run: >-
+          cargo test -p two-bot-discord --all-features --test mutation_429_proves_no_effect_channel --locked
           -- --include-ignored --test-threads=1
       - name: Feed store ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
