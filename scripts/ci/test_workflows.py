@@ -1716,10 +1716,10 @@ def production_errors(workflow):
         errors.append(f"{name}: production must run on dispatch, staging completion or schedule only")
     else:
         run_trigger = (on.get("workflow_run") or {})
-        if (run_trigger.get("workflows") != ["deploy-staging"]
+        if (run_trigger.get("workflows") != ["deploy-staging", "check"]
                 or run_trigger.get("types") != ["completed"]
                 or run_trigger.get("branches") != ["main"]):
-            errors.append(f"{name}: workflow_run must be a completed deploy-staging run on main only")
+            errors.append(f"{name}: workflow_run must be a completed deploy-staging or check run on main only")
         if not isinstance(on.get("schedule"), list) or not on.get("schedule"):
             errors.append(f"{name}: schedule must carry the daily backstop")
     jobs = workflow.get("jobs", {})

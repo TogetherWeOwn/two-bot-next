@@ -198,14 +198,23 @@ production drill record.
 ## Automatic promotion
 
 A green staging commit reaches production with nobody dispatching it. The
-workflow starts on every completed `deploy-staging` run on `main` and once
-daily as a backstop (a missed trigger, an expired hold, an incident pause).
+workflow starts on every completed `deploy-staging` run and every completed
+`check` run on `main`, and once daily as a backstop (a missed trigger, an
+expired hold, an incident pause). Staging and CI finish in either order on the
+same commit (on 10-20 staging went green ~23 minutes before CI, and 12 promotions
+in a row refused), so whichever finishes last promotes and the earlier one skips.
 An automatic run is exactly the empty-`sha` manual dispatch — the commit of
 the latest successful staging deploy — with takeover on, so the owned probes
-can certify it. Every guard still applies to it. Four skips keep it green
+can certify it. Every guard still applies to it. These skips keep it green
 while deploying nothing:
 
 - the triggering staging run did not succeed (`staging-not-green`);
+- the triggering `check` run did not succeed (`ci-not-green`) or was not a
+  push to `main` (`ci-not-push`);
+- CI finished on a commit that is not the latest successful staging deploy
+  (`staging-pending`): the staging completion promotes it;
+- `check.yml` is still running on the target (`ci-pending`): its completion
+  promotes it (a completed red CI still refuses);
 - the hold variable is still in the future (see below);
 - the target is already live: production `/readyz` already reports the SHA;
 - the live build already contains the target (`older-than-live`): an older
