@@ -17,6 +17,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 
 | Metric | Meaning |
 | --- | --- |
+| `two_bot_process_incarnation{part}` | Nonzero random process-lifetime identity in four unsigned 32-bit numeric parts (`0`, `1`, `2`, `3`), emitted with the counters in the same scrape; no PID, timestamp, build or identity-valued label. Stable across renders and new on process replacement. Optional for older containers; partial, duplicate, mislabeled or invalid parts invalidate the scrape. Used only to attribute gateway pairing windows, not as recovery or health evidence |
 | `two_bot_gateway_latency_seconds` | Last heartbeat round-trip from Twilight's completed ACK sample |
 | `two_bot_gateway_reconnects_total` | New HELLOs after the first HELLO in the running loop (successful transport reconnections, not failed dial attempts) |
 | `two_bot_gateway_resumes_total` | Received RESUMED dispatches |
@@ -643,7 +644,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
 | `voice_failures` | room-op failures > 5% of >= 10 ops between samples, any new dead-letter/orphan, or any new vote-kick enforcement failure (`discord_error`/`gave_up`/`permission_missing`; benign refusals and terminal skips never fire; missing/invalid samples hold, restarts skip the window) | [voice failures](runbook.md#alert-voice-failures) |
 | `gateway_missed_events` | any increase of `two_bot_gateway_missed_events_total` between samples (first sample and restarts skip the window) | [gateway missed events](runbook.md#alert-gateway-missed-events) |
-| `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` grew and RESUMED plus fresh READY (`two_bot_gateway_events_total{event="READY"}`) have not grown for 3 consecutive samples; any RESUMED or fresh READY growth clears at once (first sample sets the baseline, restarts re-baseline and hold a firing alert, invalid samples change nothing) | [gateway unpaired disconnect](runbook.md#alert-gateway-unpaired-disconnect) |
+| `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` grew and RESUMED plus fresh READY (`two_bot_gateway_events_total{event="READY"}`) have not grown for 3 consecutive samples; any RESUMED or fresh READY growth clears at once (first sample sets the baseline; counter decreases or validated same-scrape process-identity changes re-baseline and hold a firing alert for one sample; legacy identity adoption never clears by itself; missing identity after attribution and invalid samples hold state) | [gateway unpaired disconnect](runbook.md#alert-gateway-unpaired-disconnect) |
 | `gateway_not_ready` | `/readyz` gateway component non-ready (`starting`/`down`) for 3 consecutive valid samples with no disconnect edge required; any ready sample clears at once (first valid sample sets the baseline, restarts re-baseline and hold a firing alert, invalid probes/scrapes change nothing) | [gateway not ready](runbook.md#alert-gateway-not-ready) |
 | `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | [ticker stale](runbook.md#alert-ticker-stale) |
 | `receiver_refusals:<family>` | refused `two_bot_internal_actions_total` outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak) | [receiver refusals](runbook.md#alert-receiver-refusals) |
@@ -658,6 +659,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `event_store_consumer_lag` | **ticket**, not page: `two_bot_event_store_consumer_lag_seconds` > 60 in 3 consecutive valid samples (fractional counts); a valid sample at or below 60 resolves and rebaselines, missing/invalid samples and failed scrapes break the streak but preserve a firing ticket | [event-store consumer lag](runbook.md#alert-event-store-consumer-lag) |
 | `error_budget_fast_burn` | REST error budget (99.9% success over 48 h) burning faster than 12x in both the 15 min and 2 min windows; each window needs at least 10 eligible requests and two budget errors (`5xx` plus `transport`); incomplete post-restart windows stay inactive and missing inputs hold the previous state | [error budget fast burn](runbook.md#alert-error-budget-fast-burn) |
 | `error_budget_slow_burn` | **ticket**, not page: same budget burning faster than 3x in both the 2 h and 15 min windows, with the same per-window volume and error floors; needs full 2 h history, holds on missing inputs, scrape gaps, or counter resets, and resolves on a covered quiet or below-threshold 15 min window | [error budget slow burn](runbook.md#alert-error-budget-slow-burn) |
+| `rest_admission_breaker_open` | **ticket**, not page: `two_bot_rest_guard_breaker_open` = 1 for 3 consecutive samples (local refusals precede any REST wire attempt, so the 429/5xx rules cannot see them); one valid closed sample recovers, missing/invalid samples hold a firing ticket without manufacturing evidence | [REST admission breaker open](runbook.md#alert-rest-admission-breaker-open) |
 | `audit_delivery_halt` | **ticket**, not page: label-free halt gauge `1` for 3 consecutive valid samples with no current `audit_retry` failure; valid `0` recovers once, missing/invalid data holds an active ticket | [audit delivery halt](runbook.md#alert-audit-delivery-halt) |
 | `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` rises in 3 consecutive samples (first sample is baseline-only, flat resolves, resets rebaseline, missing/invalid preserves firing alerts) | [EventSub tampered](runbook.md#alert-eventsub-tampered) |
 | `eventsub_reconcile_failed` | **ticket**, not page: `two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rises between samples (one ticket per failed pass however many error sites moved; first sample is baseline-only, a restart sample re-baselines and fires when the new process already counted a failed pass (failed startup pass) else holds a firing ticket, a healthy-pass increase with no failed increase resolves, flat/pending-only growth and missing/invalid samples hold) | [eventsub reconcile failed](runbook.md#alert-eventsub-reconcile-failed) |
@@ -688,8 +690,9 @@ it, while a valid flat or backwards window resolves it. Legacy DO state without
 the new per-lane maps reads as unbaselined. A backwards counter in any observed
 lane signals a process reset: all valid lanes re-baseline with zero streaks and
 resolve, even if another lane's new count overtook its previous value. Missing
-lanes still retain active tickets. Without a process identity in the exposition a restart whose
-new count already exceeds the old count cannot be distinguished from growth.
+lanes still retain active tickets. Dispatch-drop rules do not consume the
+process-incarnation family: a restart whose new count already exceeds the old
+count cannot be distinguished from growth by this rule.
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
 Rust `*_INTERVAL_MS / 1000`. The 15 s tickers (`scheduled_messages`,

@@ -84,9 +84,15 @@ mod moderation_release_cli;
 mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
+mod onboarding_queue_cause_forwarding_tests;
+#[cfg(test)]
 mod onboarding_tests;
 #[cfg(test)]
 mod onboarding_unknown_only_acceptance_tests;
+#[cfg(test)]
+mod onboarding_worker_failure_acceptance_tests;
+#[cfg(test)]
+mod ops_audit_acceptance_tests;
 mod ops_backfill;
 mod ops_http;
 mod preflight;
@@ -118,6 +124,8 @@ mod ticket_runtime;
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
 mod website_jobs;
+#[cfg(test)]
+mod website_roster_cap_acceptance_tests;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

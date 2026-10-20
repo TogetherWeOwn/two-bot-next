@@ -12,12 +12,12 @@ Probes against $STAGING_MCP_URL (default the staging Worker /mcp) with
   * initialize -> result must carry a non-empty protocolVersion.
   * tools/list -> result.tools must be exactly the five read-only tools.
   * tools/call each of the five -> bodies are recorded. While staging is
-    fenced (/readyz 503 ownership_fenced/not_owner) the container-backed trio
-    (get_status, get_gateway, get_backfill_progress) may return JSON-RPC
-    -32000 "container request failed"; that is expected, not a failure.
-    get_config (redacted Worker snapshot), get_audit (implemented:false stub),
-    initialize, tools/list and unknown-tool -32601 are Worker-side and must
-    succeed regardless.
+    fenced (/readyz 503 ownership_fenced/not_owner) the container-backed tools
+    (get_status, get_gateway, get_backfill_progress, get_audit) may return
+    JSON-RPC -32000 "container request failed"; that is expected, not a failure.
+    A successful get_audit must carry the bounded {available, rows, truncated}
+    excerpt envelope. get_config (redacted Worker snapshot), initialize,
+    tools/list and unknown-tool -32601 are Worker-side and must succeed regardless.
   * tools/call unknown tool -> JSON-RPC -32601.
   * wrong bearer (fixed dummy, never the real token) and no bearer ->
     HTTP 401 with WWW-Authenticate: Bearer.
@@ -34,16 +34,26 @@ Usage (the workflow supplies the environment):
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 UA = "two-bot-next-staging-rollout/1.0"
 DEFAULT_URL = "https://two-bot-next-staging.5150.workers.dev/mcp"
 TOKEN_ENV = "STAGING_MCP_TOKEN"
 URL_ENV = "STAGING_MCP_URL"
 MIN_TOKEN_LENGTH = 32
+STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
+# Response bound matching MCP_MAX_BODY_BYTES in wrangler/src/mcp.ts: every
+# response read takes at most MCP_MAX_BODY_BYTES+1 bytes so a hidden suffix
+# is detected. Any longer body is refused before decoding with the fixed
+# BODY_TOO_LARGE_TEXT; the oversize bytes never reach parsing, logs or the
+# artifact. Refusals never echo the body or the bearer.
+MCP_MAX_BODY_BYTES = 64 * 1024
+BODY_TOO_LARGE_TEXT = "MCP response answered over the body cap"
 REQUEST_TIMEOUT_SECONDS = 25
 SCHEMA_VERSION = 1
 
@@ -54,7 +64,7 @@ EXPECTED_TOOLS = [
     "get_config",
     "get_audit",
 ]
-CONTAINER_BACKED = {"get_status", "get_gateway", "get_backfill_progress"}
+CONTAINER_BACKED = {"get_status", "get_gateway", "get_backfill_progress", "get_audit"}
 WRONG_BEARER = "wrong-bearer-probe-0000"
 
 
@@ -77,12 +87,37 @@ def fail_refusal(message):
     return 2
 
 
+def valid_staging_mcp_url(url):
+    """Only the exact staging https /mcp URL; refuse userinfo, port, query and fragment."""
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    return (parts.scheme == "https" and port is None
+            and parts.username is None and parts.password is None
+            and bool(STAGING_HOST.fullmatch(parts.hostname or ""))
+            and parts.path == "/mcp" and not parts.query and not parts.fragment)
+
+
 def redacted_request_line(rpc_method, rpc_id, extra=""):
     base = f'POST /mcp {{"jsonrpc":"2.0","id":{rpc_id},"method":"{rpc_method}"'
     if extra:
         base += f",{extra}"
     base += '} Authorization: Bearer ***'
     return base
+
+
+def _bounded_body_text(raw):
+    """Decode a capped read, or the fixed over-cap refusal text (never the body)."""
+    if len(raw) > MCP_MAX_BODY_BYTES:
+        return BODY_TOO_LARGE_TEXT
+    return raw.decode("utf-8", errors="replace")
 
 
 def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
@@ -92,6 +127,8 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
     The bearer is never included in any returned string. Redirects are
     refused (NoRedirect) so the bearer never leaves the target origin;
     a 3xx surfaces as its HTTP status and is recorded as a failure.
+    Every body read is capped at MCP_MAX_BODY_BYTES+1 bytes; an oversize
+    body is refused before decoding with BODY_TOO_LARGE_TEXT.
     """
     data = json.dumps(payload).encode("utf-8")
     headers = {
@@ -107,11 +144,11 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
         with opener.open(req, timeout=timeout) as resp:
             status = resp.status
             resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-            body = resp.read().decode("utf-8", errors="replace")
+            body = _bounded_body_text(resp.read(MCP_MAX_BODY_BYTES + 1))
             return status, resp_headers, body
     except urllib.error.HTTPError as e:
         try:
-            body = e.read().decode("utf-8", errors="replace")
+            body = _bounded_body_text(e.read(MCP_MAX_BODY_BYTES + 1))
         except Exception:
             body = ""
         resp_headers = {k.lower(): v for k, v in (e.headers.items() if e.headers else [])}
@@ -127,6 +164,20 @@ def parse_json_or_text(body):
         return {"_text": body}
 
 
+def is_audit_excerpt(value):
+    """Check the bounded envelope; the Worker enforces the row-field allowlist."""
+    return (
+        isinstance(value, dict)
+        and set(value) == {"available", "rows", "truncated"}
+        and isinstance(value["available"], bool)
+        and isinstance(value["truncated"], bool)
+        and isinstance(value["rows"], list)
+        and len(value["rows"]) <= 50
+        and all(isinstance(row, dict) for row in value["rows"])
+        and (value["available"] or (not value["rows"] and not value["truncated"]))
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--output", required=True)
@@ -136,8 +187,10 @@ def main():
     if not token or len(token) < MIN_TOKEN_LENGTH:
         return fail_refusal(f"${TOKEN_ENV} missing or shorter than {MIN_TOKEN_LENGTH}; nothing sent")
     url = os.environ.get(URL_ENV, DEFAULT_URL).strip() or DEFAULT_URL
-    if not (url.startswith("https://") and "/mcp" in url):
-        return fail_refusal("staging MCP URL must be an https URL containing /mcp; nothing sent")
+    if not valid_staging_mcp_url(url):
+        return fail_refusal(
+            "staging MCP URL must be the exact staging https URL "
+            "two-bot-next-staging.<sub>.workers.dev/mcp; nothing sent")
 
     probes = []
     failures = []
@@ -223,8 +276,6 @@ def main():
                 print(f"NOTE: tools/call {tool} returned -32000 (fenced container); expected while staging is fenced.", flush=True)
             elif tool == "get_config":
                 failures.append(f"tools/call get_config: must succeed Worker-side, got error {code}")
-            elif tool == "get_audit":
-                failures.append(f"tools/call get_audit: must succeed Worker-side, got error {code}")
             else:
                 failures.append(f"tools/call {tool}: unexpected JSON-RPC error code {code}")
         else:
@@ -232,9 +283,8 @@ def main():
             if not isinstance(result, dict) or "content" not in result:
                 failures.append(f"tools/call {tool}: expected result.content envelope")
             elif tool == "get_audit":
-                structured = result.get("structuredContent") or {}
-                if structured.get("implemented") is not False:
-                    failures.append("tools/call get_audit: expected structuredContent.implemented=false stub")
+                if not is_audit_excerpt(result.get("structuredContent")):
+                    failures.append("tools/call get_audit: expected bounded audit excerpt envelope")
         rpc_id += 1
 
     # 8. tools/call unknown tool (authenticated) -> -32601.
@@ -305,7 +355,7 @@ def main():
         for item in failures:
             print(f"- {item}", flush=True)
         return 1
-    print("OK: Worker-side MCP slice proved out (container trio may show expected -32000 while fenced).", flush=True)
+    print("OK: MCP slice proved out (container-backed tools may show expected -32000 while fenced).", flush=True)
     return 0
 
 

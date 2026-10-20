@@ -97,6 +97,33 @@ definitions and their alert-response sections in
 [the operations runbook](runbook.md#metrics-alerts) and
 [metrics reference](metrics.md#off-container-scrape-and-alert-rules).
 
+## Voice boot-setting refusal
+
+If the gateway logs `voice HTTP setup failed`, look earlier in the same
+Container boot window for `temp-voice boot setting invalid; refusing voice
+runtime` at WARN. Match the JSON `message` field, not `msg`. Its `key` names
+the exact fixed environment key to inspect; `reason` is always
+`invalid_value`. The log intentionally contains no configured value, raw
+parser error, token, channel/member list or synthetic identity input.
+
+The first invalid setting wins: protected channels (lobby, generator,
+category, protected list), generator, empty-room grace, then synthetic humans.
+The generator key is already checked during protection. Later invalid keys
+are not reported until the earlier refusal is corrected. See the
+[event catalog](observability-event-catalog.md#voice-structured-fields-gateway-sink-adjacent)
+for the complete key list and field shape.
+
+Record the build revision, boot timestamp, fixed key and reason only. Have
+the authorized configuration executor inspect that one setting privately
+against its existing contract; use the normal configuration/restart gates
+for any correction. Do not dump environment values or paste lists into an
+incident. This runbook does not authorize a live setting change or restart.
+The runtime still refuses setup with `InvalidRequest`; process health alone
+is not evidence that voice initialized. Absent, blank and valid settings do
+not emit this diagnostic. Do not confuse it with `temp-voice admission
+setting invalid; using default`: admission knobs remain nonfatal and fall
+back per knob without refusing voice setup.
+
 ## Request-id correlation
 
 One `request_id` joins the Worker, Durable Object, container and queued-work

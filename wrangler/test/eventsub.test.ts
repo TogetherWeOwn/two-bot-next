@@ -817,7 +817,7 @@ test("abort/throw/relay refusals stamp the SHA (no unknown leak)", async (t) => 
 
   // 3. Relay with an already-aborted signal -> 503 unavailable.
   const relayed = await relayEventsubResponse(
-    Response.json({ ok: true }),
+    Response.json({ ok: true, request_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
     "01ARZ3NDEKTSV4RRFFQ69G5FAV",
     AbortSignal.abort(),
     sha,

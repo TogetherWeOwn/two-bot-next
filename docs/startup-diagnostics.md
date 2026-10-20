@@ -98,7 +98,11 @@ python3 scripts/container_stdout_read.py --service <container-application-id> \
     --minutes 5 [--end 2026-10-11T12:00:00Z] [--contains "durable gateway failed"]
 ```
 
-Zero events means "not observed in this window". Offline fixtures
+Zero events means "not observed in this window". Integer values are redacted too:
+a numeric `run_id` never survives and snowflake-shaped integers become `[id]`,
+while bounded counters keep their values. Events outside the requested window
+fail the read, and a response with more events than the requested limit fails
+the read; both print no partial JSON. Offline fixtures
 (`scripts/test_container_stdout_read.py`) pin the request body to the example above.
 
 Structured fields are filterable by key (`error_class exists`, `startup_phase exists`);

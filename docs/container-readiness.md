@@ -59,9 +59,11 @@ signal, not a readiness sample or proof that a successor has been scheduled.
   query/fragment delimiters (even empty), whitespace, encoded paths and normalized
   aliases are rejected before fetch. A valid URL is not proof of approved channel
   ACLs or webhook ownership; the operator must verify those separately. Redirects
-  are rejected, requests time out after six seconds, and `allowed_mentions.parse`
-  is empty. Messages contain no mentions, credentials, guild/user identifiers or
-  probe response bodies.
+  are rejected. All of a tick's readiness, metric and remediation notifications
+  share **one six-second forwarding allowance**, not six seconds per POST; fetch
+  and response-body cancellation race that same deadline even if they ignore abort.
+  `allowed_mentions.parse` is empty. Messages contain no mentions, credentials,
+  guild/user identifiers or probe response bodies.
 - Only the operator creates/configures the webhook and per-environment Worker
   secret. Never put the URL in `wrangler.toml`, a plain var, a PR or a log.
   `wrangler/scripts/check-env-bindings.py` rejects plaintext use of this binding
@@ -84,10 +86,27 @@ the message. A crash between persistence and notification can lose that
 notification. The structured transition log is the primary operational signal
 when emitted; a webhook error emits `container_unready_webhook_failed` with the
 notification type, HTTP status (or null), release, worker version and log URL —
-never the binding, error text or body. Recovery is attempted once even if
-the alert webhook failed. Both webhook and storage failures still re-arm the
-keepalive; storage failures propagate to the scheduler rather than falsely
-claiming an alert was recorded.
+never the binding, error text or body. Recovery remains eligible for one attempt
+even if the alert webhook failed, subject to its own tick's allowance. Both
+webhook and storage failures still re-arm the keepalive; storage failures
+propagate to the scheduler rather than falsely claiming an alert was recorded.
+
+Each owned tick finishes readiness/metric/remediation persistence and primary
+logs, then inserts its successor **before** optional forwarding starts. A local
+list retains notification order only for this tick: it is not a durable outbox.
+The two existing probes each have a six-second budget; forwarding adds at most
+six seconds total (18 seconds of network waits, leaving 12 seconds of the
+[30-second ownership gate](https://developers.cloudflare.com/durable-objects/api/state/#blockconcurrencywhile)
+for essential work). Forwarding is further clipped to end no later than 24 seconds
+from entering the owned callback, reserving six seconds of gate headroom when
+storage/arming took longer. This bounds optional transport, not storage outages,
+scheduler failures or runtime reset behavior. Ownership ordering is unchanged.
+
+When the allowance expires, remaining optional POSTs are omitted without losing
+already-recorded state/logs, and are never replayed on a later tick. A timed-out
+fetch has a rejection sink; a late response is cancelled best-effort without
+awaiting cleanup. A late fetch or cancellation settlement cannot restart the
+notification list, retry delivery or hold the next owned turn.
 
 ### Responding to an alert
 
@@ -126,6 +145,12 @@ Fake-clock regressions invoke the SDK's actual alarm handler to prove one sample
 per interval through concurrent traffic, startup, eviction and old duplicate
 chains; nonempty JSON exercises its real response pipe. They never contact
 Discord or deployed Workers, and never use staging/production databases.
+The protected notification-budget acceptance covers a six-notification burst
+with 5.5-second probes/replies, uncooperative fetch, stuck/rejecting cleanup,
+late settlement, fast delivery, no replay, durable logs/state and exactly one
+successor. Its fake clock observes real owned callback promises, not Cloudflare
+admission/reset machinery; passing tests do not demonstrate installed health or
+live webhook delivery.
 
 ### API references
 

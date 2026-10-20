@@ -16,6 +16,7 @@
 //! The runtime pipeline calls from one ordered blocking dispatch worker;
 //! the shard is polled independently on the multi-thread Tokio runtime.
 
+pub mod assistant_cap;
 pub mod backfill_cursors;
 pub mod backfill_history;
 pub mod journal;
@@ -25,6 +26,7 @@ pub mod snapshots;
 pub mod store;
 pub mod web;
 
+pub use assistant_cap::PgAssistantCapLedger;
 pub use migrations::{migrate, MigrationError, MIGRATOR, TABLE_NAME};
 pub use pool::{
     connect_pool, connect_pool_with_tls, ping, ConnectError, Store, DB_POOL_MAX,

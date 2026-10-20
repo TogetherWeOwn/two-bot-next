@@ -9,7 +9,7 @@ use two_bot_core::voice_private::PrivacyRecord;
 use two_bot_core::voice_rooms::{
     CreatorChannel, PermissionSource, RoomPosition, TextCompanion, VoiceRoom,
 };
-use two_bot_cutover::voice_rooms::PgRoomStore;
+use two_bot_cutover::voice_rooms::{JoinGrantIntent, PgRoomStore};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -425,10 +425,24 @@ async fn verify_join_grants(store: &PgRoomStore, pool: &PgPool) -> TestResult {
     // No grants yet.
     assert!(store.join_grants_in_guild(100).await?.is_empty());
     assert!(store.join_grants_in_guild(101).await?.is_empty());
-    // Intent is idempotent: a retry is a no-op.
-    assert!(store.save_join_grant(100, 520, 901).await?);
-    assert!(store.save_join_grant(100, 520, 901).await?);
-    assert!(store.save_join_grant(100, 520, u64::MAX).await?);
+    // Only an insert is fresh; retries retain an earlier access obligation.
+    assert_eq!(
+        store.save_join_grant(100, 520, 901).await?,
+        JoinGrantIntent::Fresh
+    );
+    assert_eq!(
+        store.save_join_grant(100, 520, 901).await?,
+        JoinGrantIntent::Retained
+    );
+    let restarted = PgRoomStore::new(pool.clone());
+    assert_eq!(
+        restarted.save_join_grant(100, 520, 901).await?,
+        JoinGrantIntent::Retained
+    );
+    assert_eq!(
+        store.save_join_grant(100, 520, u64::MAX).await?,
+        JoinGrantIntent::Fresh
+    );
     assert_eq!(
         store.join_grants_in_guild(100).await?,
         BTreeMap::from([(520, BTreeSet::from([901, u64::MAX]))])
@@ -436,7 +450,10 @@ async fn verify_join_grants(store: &PgRoomStore, pool: &PgPool) -> TestResult {
     // Another guild never sees it.
     assert!(store.join_grants_in_guild(101).await?.is_empty());
     // A grant never outlives its room.
-    assert!(!store.save_join_grant(100, 599, 902).await?);
+    assert_eq!(
+        store.save_join_grant(100, 599, 902).await?,
+        JoinGrantIntent::RoomMissing
+    );
     let orphans: i64 =
         sqlx::query_scalar("SELECT count(*) FROM voice_join_grants WHERE room_channel_id = '599'")
             .fetch_one(pool)

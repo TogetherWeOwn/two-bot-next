@@ -76,17 +76,17 @@ fn is_snowflake(value: &str) -> bool {
 /// The containment fences for one boot. Cold reads: evaluated once at
 /// construction, never re-read per observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AntiNukeFences {
+pub struct AntiNukeFences {
     /// Exact `TWO_ANTI_NUKE=1` on the staging guild. Without it the chain is
     /// the raid watch alone and no claim is ever recorded.
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     /// Dry-run explicitly `0` outside session mode. R2 has no armed path;
     /// R3 refuses every armed action while this is false.
-    pub(crate) armed: bool,
+    pub armed: bool,
 }
 
 impl AntiNukeFences {
-    pub(crate) fn from_vars(vars: &HashMap<String, String>, guild_id: u64) -> Self {
+    pub fn from_vars(vars: &HashMap<String, String>, guild_id: u64) -> Self {
         let staging = guild_id.to_string() == STAGING_GUILD_ID;
         let flag = vars.get(ENABLE_KEY).is_some_and(|value| value == "1");
         let session = vars
@@ -102,11 +102,11 @@ impl AntiNukeFences {
 
 /// The join-risk configuration for one observation.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct JoinRiskSettings {
-    pub(crate) tuning: RaidTuning,
-    pub(crate) bulk_join_window_until_ms: Option<i64>,
+pub struct JoinRiskSettings {
+    pub tuning: RaidTuning,
+    pub bulk_join_window_until_ms: Option<i64>,
     /// `None` means log only: no channel is guessed on a live server.
-    pub(crate) staff_channel: Option<String>,
+    pub staff_channel: Option<String>,
 }
 
 /// A present-but-unusable tuning key that refuses scoring and arming.
@@ -115,12 +115,12 @@ pub(crate) struct JoinRiskSettings {
 /// the value, so the operator-visible signal identifies the bad key without
 /// echoing a possibly secret value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct JoinRiskTuningRefusal {
+pub struct JoinRiskTuningRefusal {
     key: &'static str,
 }
 
 impl JoinRiskTuningRefusal {
-    pub(crate) fn key(&self) -> &'static str {
+    pub fn key(&self) -> &'static str {
         self.key
     }
 }
@@ -144,9 +144,7 @@ impl JoinRiskSettings {
     /// value (unparsable, non-finite, non-positive, or a rejected tuning
     /// pair) refuses the whole read: no default is substituted and no
     /// settings value is produced.
-    pub(crate) fn try_from_vars(
-        vars: &HashMap<String, String>,
-    ) -> Result<Self, JoinRiskTuningRefusal> {
+    pub fn try_from_vars(vars: &HashMap<String, String>) -> Result<Self, JoinRiskTuningRefusal> {
         let number = |key: &'static str, default: f64| -> Result<f64, JoinRiskTuningRefusal> {
             match vars.get(key).map(|raw| raw.trim()) {
                 None | Some("") => Ok(default),
@@ -189,7 +187,7 @@ impl JoinRiskSettings {
 /// Where the live [`JoinRiskSettings`] come from. A present-but-unusable
 /// key refuses the read; the worker drops the observation with no scoring
 /// side effects.
-pub(crate) trait SettingsSource: Send + 'static {
+pub trait SettingsSource: Send + 'static {
     fn current(
         &mut self,
     ) -> impl Future<Output = Result<JoinRiskSettings, JoinRiskTuningRefusal>> + Send;
@@ -197,9 +195,9 @@ pub(crate) trait SettingsSource: Send + 'static {
 
 /// Tuning, the bulk window and the staff channel are store-first (hot rows win
 /// over the deployment environment) and re-read at most every
-/// [`SETTINGS_MAX_AGE`]; a failed refresh keeps the last outcome (good
+/// `SETTINGS_MAX_AGE`; a failed refresh keeps the last outcome (good
 /// settings or the cached refusal).
-pub(crate) struct StoreSettings {
+pub struct StoreSettings {
     pool: PgPool,
     guild_id: String,
     deployment: HashMap<String, String>,
@@ -210,7 +208,7 @@ pub(crate) struct StoreSettings {
 }
 
 impl StoreSettings {
-    pub(crate) fn new(pool: PgPool, guild_id: u64, deployment: HashMap<String, String>) -> Self {
+    pub fn new(pool: PgPool, guild_id: u64, deployment: HashMap<String, String>) -> Self {
         Self {
             pool,
             guild_id: guild_id.to_string(),
@@ -227,14 +225,14 @@ impl StoreSettings {
     /// (good to refused, refused to steady refused, tuning changes) are
     /// coverable without waiting out [`SETTINGS_MAX_AGE`].
     #[cfg(test)]
-    pub(crate) fn expire_for_tests(&mut self) {
+    pub fn expire_for_tests(&mut self) {
         self.checked = None;
     }
 
     /// Test seam: replace the boot-time deployment values under test, so one
     /// [`StoreSettings`] can walk through deployment transitions.
     #[cfg(test)]
-    pub(crate) fn set_deployment_for_tests(&mut self, deployment: HashMap<String, String>) {
+    pub fn set_deployment_for_tests(&mut self, deployment: HashMap<String, String>) {
         self.deployment = deployment;
     }
 
@@ -476,7 +474,7 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
 }
 
 /// The pipeline-facing half: queue only, never block.
-pub(crate) struct JoinRiskRuntime {
+pub struct JoinRiskRuntime {
     joins: mpsc::Sender<JoinObservation>,
 }
 
@@ -495,9 +493,9 @@ impl JoinObserver for JoinRiskRuntime {
 
 /// One pipeline slot, two runtimes: the raid watch always observes, and the
 /// join-risk runtime additionally observes when constructed.
-pub(crate) struct Fanout {
-    pub(crate) first: Arc<dyn JoinObserver>,
-    pub(crate) second: Arc<dyn JoinObserver>,
+pub struct Fanout {
+    pub first: Arc<dyn JoinObserver>,
+    pub second: Arc<dyn JoinObserver>,
 }
 
 impl JoinObserver for Fanout {
@@ -508,7 +506,7 @@ impl JoinObserver for Fanout {
 }
 
 /// Spawn the worker. It ends when the last [`JoinRiskRuntime`] reference drops.
-pub(crate) fn start<S: SettingsSource>(
+pub fn start<S: SettingsSource>(
     guild_id: u64,
     settings: S,
     store: JoinRiskStore,
@@ -532,7 +530,7 @@ pub(crate) fn start<S: SettingsSource>(
 /// inside the anti-nuke fences. Cold reads (`TWO_ANTI_NUKE`,
 /// `TWO_ANTI_NUKE_DRY_RUN`, `TWO_ONBOARDING_MODE`) come from the deployment
 /// environment; Hot tuning comes from the settings store.
-pub(crate) fn chain_from_env(
+pub fn chain_from_env(
     pool: PgPool,
     executor: ActionExecutor,
     guild_id: u64,

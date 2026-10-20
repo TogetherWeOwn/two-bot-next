@@ -175,13 +175,7 @@ pub async fn import(
             });
         }
     };
-    let planned: HashSet<&str> = diff
-        .to_create
-        .iter()
-        .chain(diff.to_update.iter())
-        .chain(diff.unchanged.iter())
-        .map(String::as_str)
-        .collect();
+    let planned: HashSet<usize> = diff.accepted_entry_indices.iter().copied().collect();
     let preexisting: HashSet<&str> = existing.iter().map(|row| row.name.as_str()).collect();
     // Enabled flags as the sequential legacy loop would see them: stored rows
     // first, then earlier rows of this same import.
@@ -192,13 +186,15 @@ pub async fn import(
     let mut seen: HashSet<&str> = HashSet::new();
     let mut occurrences: HashMap<&str, usize> = HashMap::new();
     let mut imported = 0usize;
-    for entry in &parsed.entries {
+    for (index, entry) in parsed.entries.iter().enumerate() {
         let name: &str = &entry.name;
-        if !planned.contains(name) {
-            continue;
-        }
+        // Audit identity follows the original parsed occurrence, including
+        // rejections, rather than renumbering only the accepted entries.
         let occurrence = occurrences.get(name).copied().unwrap_or(0);
         occurrences.insert(name, occurrence + 1);
+        if !planned.contains(&index) {
+            continue;
+        }
         let live = enabled.get(name).copied().unwrap_or(true);
         let row = StoredCommand {
             guild_id: guild.to_owned(),

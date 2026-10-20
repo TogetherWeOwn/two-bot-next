@@ -331,7 +331,58 @@ pub fn grouped_number(n: u64) -> String {
     String::from_utf8(out).expect("grouped digits are ASCII")
 }
 
+/// Rendered display-name bound for the `/rank` reply, in characters. Par with
+/// the vote-grade public bound (`VOTE_KICK_PUBLIC_REASON_LIMIT` in the bot
+/// crate, also `GOODBYE_USERNAME_LIMIT`): applied to the escaped output so the
+/// bound holds on the wire.
+pub const RANK_DISPLAY_NAME_LIMIT: usize = 512;
+
+/// Sanitize a display name for the `/rank` reply name slot (goodbye grade):
+/// fold newlines to spaces so the reply keeps its three template lines,
+/// neutralize mass mentions with the shared neutralizer, split mention pills,
+/// timestamps, slash-command and guild-navigation tokens (`<@`, `<#`, `<:`,
+/// `<a:`, `<t:`, `</`, `<id:`) so they render literally, escape the
+/// vote-reason markdown set, and cap the escaped output at
+/// [`RANK_DISPLAY_NAME_LIMIT`] characters. Plain names pass through
+/// byte-identical.
+fn sanitize_rank_name(display_name: &str) -> String {
+    let mut single_line = String::with_capacity(display_name.len());
+    for chunk in display_name.split(['\r', '\n']) {
+        if !single_line.is_empty() {
+            single_line.push(' ');
+        }
+        single_line.push_str(chunk);
+    }
+    let neutralized = crate::message_safety::neutralize_mentions(&single_line);
+    let pills = neutralized
+        .replace("<@", "<\u{200b}@")
+        .replace("<#", "<\u{200b}#")
+        .replace("<:", "<\u{200b}:")
+        .replace("<a:", "<\u{200b}a:")
+        .replace("<t:", "<\u{200b}t:")
+        .replace("</", "<\u{200b}/")
+        .replace("<id:", "<\u{200b}id:");
+    let mut escaped = String::with_capacity(pills.len());
+    for ch in pills.chars() {
+        if matches!(ch, '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    let mut capped: String = escaped.chars().take(RANK_DISPLAY_NAME_LIMIT).collect();
+    // A cut mid-escape would leave a lone backslash that eats the closing bold
+    // delimiter, so trim on escape-pair boundaries instead.
+    if capped.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 1 {
+        capped.pop();
+    }
+    capped
+}
+
 /// `/rank` reply body (legacy `rankText`).
+///
+/// `display_name` is untrusted text rendered through goodbye-grade sanitizing
+/// (single-line, mention-neutralized, markdown-escaped, length-capped); plain
+/// names render byte-identical to legacy.
 #[must_use]
 pub fn rank_text(
     display_name: &str,
@@ -349,8 +400,9 @@ pub fn rank_text(
     let progress = xp - floor;
     let span = next_floor - floor;
     let to_next = next_floor - xp;
+    let safe = sanitize_rank_name(display_name);
     format!(
-        "**{display_name}**\nLevel **{level}** · {rank_label}\nXP **{xp}** · {progress}/{span} this level · **{to_next}** to level {}",
+        "**{safe}**\nLevel **{level}** · {rank_label}\nXP **{xp}** · {progress}/{span} this level · **{to_next}** to level {}",
         level + 1,
         xp = grouped_number(xp),
         progress = grouped_number(progress),
@@ -729,6 +781,101 @@ mod tests {
         let text = rank_text("Test", 1, Some(3), 50, 114);
         assert!(text.starts_with("**Test**\nLevel **1** · Rank **#3** of **50**"));
         assert!(text.contains("XP **114** · 14/155 this level · **141** to level 2"));
+    }
+
+    fn assert_rank_name_slot(name: &str, expected_slot: &str) {
+        let profile = LevelProfile {
+            guild_id: "g".to_owned(),
+            member_id: "100000000000000001".to_owned(),
+            xp: 114,
+            level: 1,
+            message_xp: 114,
+            voice_xp: 0,
+            imported_xp: 0,
+            rank: Some(3),
+            member_count: 50,
+            next_level_xp: total_xp_for_level(2),
+        };
+        let expected = format!(
+            "**{expected_slot}**\nLevel **1** · Rank **#3** of **50**\nXP **114** · 14/155 this level · **141** to level 2"
+        );
+        assert_eq!(rank_text(name, 1, Some(3), 50, 114), expected);
+        let reply = rank_reply(&profile, name);
+        assert!(reply.ephemeral);
+        assert_eq!(reply.content, expected);
+        let rendered_slot = reply
+            .content
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("**"))
+            .and_then(|line| line.strip_suffix("**"))
+            .expect("rank name inside bold markers");
+        assert!(rendered_slot.chars().count() <= RANK_DISPLAY_NAME_LIMIT);
+        for pill in ["<@", "<#", "<:", "<a:", "<t:", "</", "<id:"] {
+            assert!(!rendered_slot.contains(pill));
+        }
+        let mut escaped = false;
+        for ch in rendered_slot.chars() {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else {
+                assert!(!matches!(ch, '`' | '*' | '_' | '~' | '|' | '[' | ']'));
+            }
+        }
+        assert!(
+            !escaped,
+            "a lone escape must not eat the closing bold marker"
+        );
+    }
+
+    #[test]
+    fn rank_name_splits_timestamp_tokens_exactly() {
+        for suffix in ["", ":t", ":T", ":d", ":D", ":f", ":F", ":R"] {
+            assert_rank_name_slot(
+                &format!("before <t:1618953630{suffix}> after"),
+                &format!("before <\u{200b}t:1618953630{suffix}> after"),
+            );
+        }
+        assert_rank_name_slot(
+            "<t:0> <t:1618953630:R>",
+            "<\u{200b}t:0> <\u{200b}t:1618953630:R>",
+        );
+    }
+
+    #[test]
+    fn rank_name_splits_slash_command_and_navigation_tokens_exactly() {
+        assert_rank_name_slot(
+            "</rank:123456789012345678>",
+            "<\u{200b}/rank:123456789012345678>",
+        );
+        assert_rank_name_slot(
+            "</rank stats:123456789012345678> <id:guide> <id:customize> <id:browse> <id:linked-roles>",
+            "<\u{200b}/rank stats:123456789012345678> <\u{200b}id:guide> <\u{200b}id:customize> <\u{200b}id:browse> <\u{200b}id:linked-roles>",
+        );
+    }
+
+    #[test]
+    fn rank_name_cap_trims_partial_escape_for_every_markdown_character() {
+        for prefix in ["a".repeat(511), "界".repeat(511)] {
+            for ch in ['\\', '`', '*', '_', '~', '|', '[', ']'] {
+                assert_rank_name_slot(&format!("{prefix}{ch}"), &prefix);
+            }
+        }
+    }
+
+    #[test]
+    fn rank_name_cap_preserves_complete_trailing_escape_pairs() {
+        assert_rank_name_slot(&"\\".repeat(256), &"\\\\".repeat(256));
+        assert_rank_name_slot(
+            &format!("a{}", "\\".repeat(256)),
+            &format!("a{}", "\\\\".repeat(255)),
+        );
+        assert_rank_name_slot(
+            &format!("{}*", "a".repeat(510)),
+            &format!("{}\\*", "a".repeat(510)),
+        );
     }
 
     #[test]

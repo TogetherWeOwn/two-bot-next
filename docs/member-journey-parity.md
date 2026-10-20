@@ -108,7 +108,24 @@ cold restart. Onboarding/leveling runtime effects remain out of scope.
 
 ## Run and database containment
 
+On the persistent controller, run from the isolated worktree through the
+[bounded build-cache wrapper](build-cache.md#local-builds), with a 600000 ms
+Bash timeout or in the background. Refused or missing admission never permits
+direct compiling Cargo or an alternate target/cache; follow the
+[Operator path](build-cache.md#operator-handoff-and-rollback-one-host-step).
+This recipe does not establish current pool health.
+
 ```sh
+# Persistent controller only.
+TWO_GATEWAY_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test \
+  python3 scripts/cargo_cache.py run -- test -p two-bot --locked gateway_tests::member_journey \
+  -- --ignored --test-threads=1
+```
+
+Ephemeral hosted CI retains the same test filter and disposable-database guard:
+
+```sh
+# Ephemeral hosted CI only, not a controller fallback.
 TWO_GATEWAY_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test \
   cargo test -p two-bot --locked gateway_tests::member_journey \
   -- --ignored --test-threads=1
@@ -120,5 +137,5 @@ an isolated schema. It never falls back to runtime `DATABASE_URL`. Both journey
 tests drop their own schema even when their assertions panic, then propagate the
 failure. The existing `Gateway restart and transaction tests`
 CI step includes this module, so these are executed tests, not silently skipped
-coverage on `check`. Build output belongs in a run-owned `CARGO_TARGET_DIR` and
-is removed at handoff; no shared cache should be deleted.
+coverage on `check`. Controller build output stays in the wrapper's leased,
+quota-covered target and scratch; do not create or delete a separate cache.

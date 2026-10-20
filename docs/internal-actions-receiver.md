@@ -137,6 +137,50 @@ Stable caller mapping, idempotency claim, action validation, outbound admission,
 execution and durable finalization remain receiver responsibilities; this
 capability does not itself permit a Discord effect.
 
+## Automation import contract
+
+`automations.import` accepts the version-1 command document produced by
+`automations.export`; the existing MEE6 translation path is unchanged. Parsing
+preserves command document order and duplicate names. Malformed wire entries
+contribute to `skipped`; parsed definitions still undergo normal name,
+description, template and trigger validation.
+
+Planning simulates current content and case-insensitive trigger ownership in
+document order. Each accepted occurrence sees the results of earlier accepted
+occurrences, including those with the same name. Changed content requires
+`overwrite: true`, even for a name first created earlier in this import;
+identical content converges without overwrite. An accepted update releases its
+previous trigger, including when it becomes slash-only. The next accepted
+claimant owns a released trigger. Refused occurrences never change simulated
+content or acquire/release triggers. Validation refusals are reported first,
+followed by overwrite/trigger refusals in document order.
+
+The transactional service applies only the exact parsed-entry indices accepted
+by that plan, in document order, while holding the guild capacity lock. The
+capacity precheck still counts the union of existing names and validated
+candidate names and refuses the whole import before command writes if it is
+over budget. Accepted same-content occurrences are rewritten and count as
+`imported`; each rejected occurrence and malformed wire entry counts as
+`skipped`. `conflicts` retains translation collisions followed by refused
+overwrite/trigger names. Fresh rows are enabled; rewrites preserve the current
+enabled flag and original creator/timestamp.
+
+Each accepted occurrence has one audit ID
+`<import-audit-id>#cmd:<name>#<ordinal>`, with a zero-based per-name ordinal among
+all parsed occurrences, including rejected ones. The command writes, occurrence
+audits and `<import-audit-id>#summary` commit together. The receiver replays the
+committed summary's original counts and conflict names without replanning or
+rewriting commands after later admin edits.
+
+Authentication, durable nonce burn, action claims and feature gates are
+unchanged. Overwrite still requires the separately configured
+`TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE` capability in addition to the base
+automations flag. These import semantics do not enable ingress, publish
+commands, grant capabilities or authorize a rollout. Parser/planner coverage
+lives in `automation_import_occurrence_planner_acceptance`; the corresponding
+`automation_import_occurrence_service_acceptance` suite checks transactional
+rows, provenance, audit facts and replay readback on disposable databases only.
+
 ## Configuration contract
 
 `two_bot_core::internal_action_config::InternalActionConfig::from_env` returns
@@ -220,7 +264,10 @@ refused as a version conflict and needs a new key. Event reads and mutations sha
 one process-wide gate, so a mutation that has registered its key is visible to the
 next read or mutation for that key. A request that cannot enter the gate within 8
 seconds is refused `in_progress` before any claim. A claimed mutation runs to its
-receipt in its own task, even if the client has timed out. A create whose Discord
+receipt in its own receiver-tracked task, even if the client has timed out, and
+carries its admission permit with it: capacity stays held through receipt
+persistence, so repeated timed-out clients cannot admit more than the 32-slot
+work limit. A create whose Discord
 call times out, gets a 5xx or an unreadable reply, or whose key mapping or mirror
 write fails, can leave a Discord event with no key mapping; a create under a new
 Idempotency-Key for that key would then make a second event. The same can happen
@@ -230,6 +277,18 @@ hand first. An in-flight intent whose owner has stopped answers `in_progress` to
 until its claim goes stale, then `needs_reconciliation`; a live owner can still
 finish after that. A panic after a claim answers `needs_reconciliation`. A 504 on a
 mutation is an unknown outcome that may still complete: retry the same key only.
+Shutdown latches drain mode — and a single shutdown deadline inside the shared
+5-second HTTP drain budget — at the request: the Axum drain and the child join
+share that deadline's remaining time, so an admitted handler holding a
+connection cannot starve the child drain past the supervisor's backstop.
+Shutdown stops new mutation effects after the claim (replay, in-flight and
+reconciliation answers keep working) and releases the fresh provably-never-sent
+claim so the same key may retry, then joins tracked children within the
+deadline's remainder: clean completion is reported only after every child is
+reaped, and work still in flight at the deadline is aborted and reported as a
+drain timeout, never waited on past the budget. Aborted or failed children keep
+their claim fence occupied, so a retry sees `in_progress`/`needs_reconciliation`
+and never a second effect.
 A claimed mutation holds the gate until it finishes, so a slow database can keep
 queued requests waiting for their 8 seconds. The events poller writes the mirror
 outside the gate, but both writers stamp `updated_at` with the same UTC-millis

@@ -87,7 +87,10 @@ pub fn post_metric_counts(outcome: &GoLiveOutcome) -> (bool, bool, bool) {
     match outcome {
         GoLiveOutcome::Posted { .. } => (true, true, false),
         GoLiveOutcome::Failed { reason } => {
-            let attempted = matches!(*reason, "send_failed" | "ambiguous_send" | "stamp_failed");
+            let attempted = matches!(
+                *reason,
+                "send_failed" | "send_failed_unreleased" | "ambiguous_send" | "stamp_failed"
+            );
             (attempted, false, attempted)
         }
         GoLiveOutcome::Duplicate | GoLiveOutcome::NotAllowed => (false, false, false),
@@ -278,7 +281,12 @@ mod tests {
             }),
             (true, true, false)
         );
-        for reason in ["send_failed", "ambiguous_send", "stamp_failed"] {
+        for reason in [
+            "send_failed",
+            "send_failed_unreleased",
+            "ambiguous_send",
+            "stamp_failed",
+        ] {
             assert_eq!(
                 post_metric_counts(&GoLiveOutcome::Failed { reason }),
                 (true, false, true),

@@ -120,6 +120,8 @@ export const POOL_SATURATED_SAMPLES = 3;
 export const DB_ERROR_MIN_ERRORS = 3;
 /** ...and send-admission refusals must appear in this many consecutive samples. */
 export const SEND_BLOCKED_SAMPLES = 3;
+/** REST admission breaker openings must appear in this many consecutive samples. */
+export const REST_BREAKER_OPEN_SAMPLES = 3;
 /** Website-action receiver refusals must appear in this many consecutive samples. */
 export const RECEIVER_REFUSAL_SAMPLES = 3;
 /** EventSub tampered-signature deliveries must rise in this many consecutive samples. */
@@ -266,6 +268,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "error_budget_fast_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_FAST_BURN}x over ${ERROR_BUDGET_FAST_LONG_SECONDS / 60} min and ${ERROR_BUDGET_FAST_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-fast-burn" },
   { id: "error_budget_slow_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_SLOW_BURN}x over ${ERROR_BUDGET_SLOW_LONG_SECONDS / 3600} h and ${ERROR_BUDGET_SLOW_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-slow-burn", severity: "ticket" },
   { id: "audit_delivery_halt", summary: `audit delivery halt engaged for ${AUDIT_HALT_SAMPLES} consecutive valid samples`, runbook: "runbook.md#alert-audit-delivery-halt", severity: "ticket" },
+  { id: "rest_admission_breaker_open", summary: `REST admission breaker open for ${REST_BREAKER_OPEN_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-rest-admission-breaker-open", severity: "ticket" },
   { id: "eventsub_tampered", summary: `EventSub tampered-signature deliveries rose in ${EVENTSUB_TAMPERED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-eventsub-tampered" },
   { id: "eventsub_reconcile_failed", summary: `EventSub reconcile failed passes increased between samples`, runbook: "runbook.md#alert-eventsub-reconcile-failed", severity: "ticket" },
   { id: "event_store_consumer_lag", summary: `event-store consumer lag above ${EVENT_STORE_LAG_THRESHOLD_SECONDS} s sustained for ${EVENT_STORE_LAG_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-event-store-consumer-lag", severity: "ticket" },
@@ -328,6 +331,12 @@ export interface MetricsAlertState {
   dbErrors: number;
   sendBlocked: number;
   sendBlockedStreak: number;
+  /**
+   * Consecutive valid samples with the REST admission breaker open, capped
+   * at REST_BREAKER_OPEN_SAMPLES. Absent on state stored by older Worker
+   * versions; legacy storage reads as no streak, never as sustained evidence.
+   */
+  breakerOpenStreak?: number;
   voiceOps: number;
   voiceFailures: number;
   voiceDeadLetters: number;
@@ -366,6 +375,8 @@ export interface MetricsAlertState {
   gatewayUnpaired: number;
   /** Consecutive completed samples with an unpaired disconnect outstanding. */
   gatewayUnpairedStreak: number;
+  /** Same-scrape process identity for the gateway baseline; absent in legacy storage. */
+  gatewayProcessIncarnation?: string | undefined;
   /** False until the first valid gateway-readiness sample: the first sample never fires. */
   gatewayNotReadySeen: boolean;
   /** Consecutive valid samples with the /readyz gateway component non-ready. */
@@ -587,11 +598,11 @@ function errorBudgetBurnEvaluation(
   };
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, breakerOpenStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false };
 
-/** An unsuccessful scrape breaks the dispatch and lag streaks, never an existing alert. */
+/** An unsuccessful scrape breaks the dispatch, breaker, and lag streaks, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
-  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, eventStoreLagStreak: 0 };
+  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, eventStoreLagStreak: 0 };
 }
 
 /** A failed scrape breaks the engaged run, but cannot prove a halt cleared. */
@@ -620,10 +631,11 @@ export function parseExposition(text: string): Sample[] {
 }
 
 const GATEWAY_UNPAIRED_RULE = "gateway_unpaired_disconnect";
+const REST_BREAKER_OPEN_RULE = "rest_admission_breaker_open";
 
 type GatewayPairingFields = Pick<
   MetricsAlertState,
-  "gatewayDisconnects" | "gatewayRecoveries" | "gatewayUnpairedSeen" | "gatewayUnpaired" | "gatewayUnpairedStreak"
+  "gatewayDisconnects" | "gatewayRecoveries" | "gatewayUnpairedSeen" | "gatewayUnpaired" | "gatewayUnpairedStreak" | "gatewayProcessIncarnation"
 >;
 
 /**
@@ -632,27 +644,50 @@ type GatewayPairingFields = Pick<
  * scrape-validation guard ("New consumed families cannot silently bypass
  * validation") covers these series: a Rust rename or malformed value fails
  * the scrape instead of silently holding the rule off. The
- * finite/nonnegative/single-row checks stay as a backstop for direct
+ * safe-integer/exact-label/single-row checks stay as a backstop for direct
  * `evaluateMetrics` callers.
  */
 function gatewayCounter(matches: Sample[], event?: string): number | undefined {
   const scoped = event === undefined ? matches : matches.filter((s) => s.labels["event"] === event);
   if (scoped.length !== 1) return undefined;
-  const value = scoped[0]!.value;
-  return Number.isFinite(value) && value >= 0 ? value : undefined;
+  const row = scoped[0]!;
+  if (Object.keys(row.labels).length !== (event === undefined ? 0 : 1)) return undefined;
+  return Number.isSafeInteger(row.value) && row.value >= 0 ? row.value : undefined;
+}
+
+/** Validates the complete optional family, shared with the strict scrape parser. */
+export function processIncarnation(rows: Sample[]): string | undefined {
+  if (rows.length !== 4) return undefined;
+  const parts = ["0", "1", "2", "3"].map((part) => exactSeries(rows, { part }));
+  if (parts.some((part) => part === undefined || part > 4294967295)
+    || parts.every((part) => part === 0)) return undefined;
+  return parts.map((part) => part!.toString(16).padStart(8, "0")).join("");
+}
+
+function validProcessIncarnation(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{32}$/.test(value) && value !== "0".repeat(32);
 }
 
 /** Pairs disconnects with RESUMED plus fresh READY; invalid samples hold, restarts re-baseline. */
 function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { firing: boolean; fields: GatewayPairingFields; restarted: boolean } {
+  const previousIncarnation = validProcessIncarnation(prev.gatewayProcessIncarnation) ? prev.gatewayProcessIncarnation : undefined;
   const carried: GatewayPairingFields = {
     gatewayDisconnects: prev.gatewayDisconnects ?? 0,
     gatewayRecoveries: prev.gatewayRecoveries ?? 0,
     gatewayUnpairedSeen: prev.gatewayUnpairedSeen ?? false,
     gatewayUnpaired: prev.gatewayUnpaired ?? 0,
     gatewayUnpairedStreak: prev.gatewayUnpairedStreak ?? 0,
+    gatewayProcessIncarnation: previousIncarnation,
   };
   const wasFiring = prev.firing.includes(GATEWAY_UNPAIRED_RULE);
   const gauge = (name: string) => samples.filter((s) => s.name === name);
+  const incarnationRows = gauge("two_bot_process_incarnation");
+  const incarnation = processIncarnation(incarnationRows);
+  // Missing identity remains compatible with old state + old containers. Once
+  // attributed, losing identity is not a valid counter window or a recovery.
+  if (incarnation === undefined && (incarnationRows.length > 0 || previousIncarnation !== undefined)) {
+    return { firing: wasFiring, fields: carried, restarted: false };
+  }
   const disconnects = gatewayCounter(gauge("two_bot_gateway_disconnects_total"));
   const resumes = gatewayCounter(gauge("two_bot_gateway_resumes_total"));
   const ready = gatewayCounter(gauge("two_bot_gateway_events_total"), "READY");
@@ -660,15 +695,20 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
     return { firing: wasFiring, fields: carried, restarted: false };
   }
   const recoveries = resumes + ready;
+  if (!Number.isSafeInteger(recoveries)) return { firing: wasFiring, fields: carried, restarted: false };
   const baseline: GatewayPairingFields = {
     gatewayDisconnects: disconnects,
     gatewayRecoveries: recoveries,
     gatewayUnpairedSeen: true,
     gatewayUnpaired: 0,
     gatewayUnpairedStreak: 0,
+    gatewayProcessIncarnation: incarnation,
   };
   if (!carried.gatewayUnpairedSeen) return { firing: false, fields: baseline, restarted: false };
-  if (disconnects < carried.gatewayDisconnects || recoveries < carried.gatewayRecoveries) {
+  // Only two validated, attributed samples prove a process change. Adopting
+  // identity into legacy state is not itself evidence of restart or recovery.
+  if ((previousIncarnation !== undefined && incarnation !== previousIncarnation)
+    || disconnects < carried.gatewayDisconnects || recoveries < carried.gatewayRecoveries) {
     return { firing: wasFiring, fields: baseline, restarted: true };
   }
   // Any recovery growth means the gateway came back: a RESUMED or fresh READY
@@ -683,13 +723,7 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
   if (recoveries > carried.gatewayRecoveries) {
     return {
       firing: false,
-      fields: {
-        gatewayDisconnects: disconnects,
-        gatewayRecoveries: recoveries,
-        gatewayUnpairedSeen: true,
-        gatewayUnpaired: 0,
-        gatewayUnpairedStreak: 0,
-      },
+      fields: baseline,
       restarted: false,
     };
   }
@@ -707,6 +741,7 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
       gatewayUnpairedSeen: true,
       gatewayUnpaired: outstanding ? 1 : 0,
       gatewayUnpairedStreak: streak,
+      gatewayProcessIncarnation: incarnation,
     },
     restarted: false,
   };
@@ -1045,6 +1080,31 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const sendBlockedStreak = sendReset || sendBlocked === prevSendBlocked ? 0 : (prev.sendBlockedStreak ?? 0) + 1;
   if (sendBlockedStreak >= SEND_BLOCKED_SAMPLES) firing.push("send_admission_blocked");
 
+  // REST admission breaker (local refusals before any REST wire attempt, so
+  // the request counter and its 429/5xx rules never see them): three
+  // consecutive valid open samples of the label-free 0/1 gauge file one
+  // ticket, and one valid closed sample recovers it. Missing or malformed
+  // samples break the streak but hold a firing ticket: they manufacture
+  // neither sustained evidence nor recovery. `?? 0` covers DO storage
+  // written before this field existed, and the cap keeps persisted state
+  // bounded no matter how long the breaker stays open.
+  const breakerRows = gauge("two_bot_rest_guard_breaker_open");
+  const breakerOpen = breakerRows.length === 1 && Object.keys(breakerRows[0]!.labels).length === 0
+    && (breakerRows[0]!.value === 0 || breakerRows[0]!.value === 1)
+    ? breakerRows[0]!.value
+    : undefined;
+  const wasBreakerFiring = prev.firing.includes(REST_BREAKER_OPEN_RULE);
+  let breakerOpenStreak: number;
+  if (breakerOpen === 1) {
+    breakerOpenStreak = Math.min((prev.breakerOpenStreak ?? 0) + 1, REST_BREAKER_OPEN_SAMPLES);
+    if (breakerOpenStreak >= REST_BREAKER_OPEN_SAMPLES || wasBreakerFiring) firing.push(REST_BREAKER_OPEN_RULE);
+  } else if (breakerOpen === 0) {
+    breakerOpenStreak = 0;
+  } else {
+    breakerOpenStreak = 0;
+    if (wasBreakerFiring) firing.push(REST_BREAKER_OPEN_RULE);
+  }
+
   // Voice lifecycle failures (T3 room create/move/delete budget in
   // docs/voice-cutover-rollback-triggers.md): any outcome other than
   // `success` (`category_full`, `discord`, `persistence`, `cancelled`)
@@ -1188,8 +1248,8 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // holds the current state. `gateway_failure.failed_step` cannot serve here:
   // it is absent until a failure is recorded, so a shard stuck starting with
   // no recorded failure has no step to read. The first valid sample only
-  // stores the baseline and never fires; a process restart (gateway pairing
-  // counters went backwards, detected above) re-baselines the streak even
+  // stores the baseline and never fires; a process restart (gateway counter
+  // decrease or validated incarnation change above) re-baselines the streak even
   // when this sample's readiness is invalid, and holds a firing non-ready or
   // invalid alert rather than clearing it; any ready sample clears at once,
   // even across a restart. A failed /metrics scrape never reaches this
@@ -1516,7 +1576,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     else if (!healthyGrew && wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, breakerOpenStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

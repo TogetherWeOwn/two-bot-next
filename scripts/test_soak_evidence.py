@@ -15,6 +15,16 @@ from soak_evidence import main, summarize
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "scripts/fixtures/soak_evidence_sample.jsonl"
 EXPECTED = ROOT / "scripts/fixtures/soak_evidence_sample.summary.json"
+UNRECOGNISED_EVENT_FIELDS = (
+    {"event": "frobnicate"},
+    {},
+    {"event": None},
+    {"event": ""},
+    {"event": True},
+    {"event": 7},
+    {"event": []},
+    {"event": {}},
+)
 
 
 def run(text):
@@ -34,6 +44,114 @@ class SoakEvidenceTests(unittest.TestCase):
         self.assertEqual(actual["missed_events"], 2)
         self.assertEqual(len(actual["unknown_intervals"]), 2)
         self.assertEqual(actual["verdict"], "NEEDS WORK")
+
+    def test_invalid_sequence_does_not_advance_timestamp_state(self):
+        for event, seq in (("dispatch", True), ("resume", "bad")):
+            with self.subTest(event=event):
+                records = [
+                    {"ts": "2026-09-20T00:00:00Z", "event": "connect", "session": "a"},
+                    {"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 0},
+                    {"ts": "2026-09-20T00:00:02Z", "event": "disconnect"},
+                    {"ts": "2026-09-20T00:00:10Z", "event": event, "session": "a", "seq": seq},
+                    {"ts": "2026-09-20T00:00:04Z", "event": "resume", "session": "a"},
+                    {"ts": "2026-09-20T00:00:05Z", "event": "dispatch", "session": "a", "seq": 1},
+                ]
+                summary = run("".join(json.dumps(record) + "\n" for record in records))
+                self.assertEqual(summary["dispatches"], 2)
+                self.assertEqual(summary["resumes"], 1)
+                self.assertEqual(summary["redeploy_gaps_s"], [2.0])
+                self.assertEqual(summary["missed_events"], 0)
+                self.assertEqual(summary["window"], {
+                    "start": "2026-09-20T00:00:00+00:00",
+                    "end": "2026-09-20T00:00:05+00:00",
+                })
+                self.assertEqual(len(summary["unknown_intervals"]), 1)
+                self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_invalid_unknown_endpoint_does_not_advance_timestamp_state(self):
+        for field in ("start", "end"):
+            for value in ("bad", "0001-01-01T00:00:00+01:00",
+                          "9999-12-31T23:59:59-01:00"):
+                with self.subTest(field=field, value=value):
+                    records = [
+                        {"ts": "2026-09-20T00:00:00Z", "event": "connect", "session": "a"},
+                        {"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 0},
+                        {"ts": "2026-09-20T00:00:02Z", "event": "disconnect"},
+                        {"ts": "2026-09-20T00:00:20Z", "event": "unknown", field: value},
+                        {"ts": "2026-09-20T00:00:14Z", "event": "resume", "session": "a"},
+                        {"ts": "2026-09-20T00:00:15Z", "event": "dispatch", "session": "a", "seq": 1},
+                    ]
+                    summary = run("".join(json.dumps(record) + "\n" for record in records))
+                    self.assertEqual(summary["resumes"], 1)
+                    self.assertEqual(summary["dispatches"], 2)
+                    self.assertEqual(summary["redeploy_gaps_s"], [12.0])
+                    self.assertEqual(summary["window"]["end"], "2026-09-20T00:00:15+00:00")
+                    self.assertEqual(summary["unknown_intervals"], [{
+                        "start": "2026-09-20T00:00:20+00:00",
+                        "end": "2026-09-20T00:00:20+00:00",
+                        "reason": "unknown interval with bad start/end",
+                    }])
+                    self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_unrecognised_event_does_not_advance_timestamp_state(self):
+        for fields in UNRECOGNISED_EVENT_FIELDS:
+            records = [
+                {"ts": "2026-09-20T00:00:00Z", "event": "connect", "session": "a"},
+                {"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 0},
+                {"ts": "2026-09-20T00:00:02Z", "event": "disconnect"},
+                {"ts": "2026-09-20T00:00:20Z", **fields},
+                {"ts": "2026-09-20T00:00:14Z", "event": "resume", "session": "a"},
+                {"ts": "2026-09-20T00:00:15Z", "event": "dispatch", "session": "a", "seq": 1},
+            ]
+            text = "".join(json.dumps(record) + "\n" for record in records)
+            for boundary in ("summarize", "cli"):
+                with self.subTest(fields=fields, boundary=boundary):
+                    if boundary == "summarize":
+                        summary = run(text)
+                    else:
+                        with tempfile.TemporaryDirectory() as directory:
+                            path = Path(directory) / "unrecognised.jsonl"
+                            path.write_text(text, encoding="utf-8")
+                            result = subprocess.run(
+                                [sys.executable, str(ROOT / "scripts/soak_evidence.py"), str(path)],
+                                capture_output=True, text=True, check=False, timeout=10,
+                            )
+                        self.assertEqual(result.returncode, 1)
+                        self.assertEqual(result.stderr, "")
+                        summary = json.loads(result.stdout)
+                    self.assertEqual(summary["connects"], 1)
+                    self.assertEqual(summary["disconnects"], 1)
+                    self.assertEqual(summary["resumes"], 1)
+                    self.assertEqual(summary["dispatches"], 2)
+                    self.assertEqual(summary["redeploy_gaps_s"], [12.0])
+                    self.assertEqual(summary["max_redeploy_gap_s"], 12.0)
+                    self.assertEqual(summary["missed_events"], 0)
+                    self.assertEqual(summary["missed_sequence_windows"], [])
+                    self.assertEqual(summary["window"], {
+                        "start": "2026-09-20T00:00:00+00:00",
+                        "end": "2026-09-20T00:00:15+00:00",
+                    })
+                    self.assertEqual(summary["unknown_intervals"], [{
+                        "start": "2026-09-20T00:00:20+00:00",
+                        "end": "2026-09-20T00:00:20+00:00",
+                        "reason": f"unrecognised event {fields.get('event')!r}",
+                    }])
+                    self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_unrecognised_events_do_not_define_evidence_window(self):
+        good = {"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 0}
+        for fields in UNRECOGNISED_EVENT_FIELDS:
+            bad = {"ts": "2026-09-20T00:00:20Z", **fields}
+            for records in ([bad], [bad, good], [good, bad]):
+                with self.subTest(fields=fields, records=records):
+                    summary = run("".join(json.dumps(record) + "\n" for record in records))
+                    accepted_ts = "2026-09-20T00:00:01+00:00" if len(records) > 1 else None
+                    self.assertEqual(summary["window"], {
+                        "start": accepted_ts, "end": accepted_ts,
+                    })
+                    self.assertEqual(summary["dispatches"], int(len(records) > 1))
+                    self.assertEqual(len(summary["unknown_intervals"]), 1)
+                    self.assertEqual(summary["verdict"], "NEEDS WORK")
 
     def test_clean_week_passes(self):
         summary = run(
