@@ -359,6 +359,51 @@ fn missing_ingress_ticket_failure() -> sqlx::Error {
     )
 }
 
+/// An onboarding worker failure keeps its cause in the gateway failure line:
+/// one fixed literal per [`RuntimeError`](crate::onboarding::RuntimeError)
+/// variant, plus the 90-second worker timeout and a join failure or panic.
+/// Payload-free: no guild, member or channel text, no ids, no error rendering.
+/// A failed job is never finished, so the durable job is retained for bounded
+/// restart recovery.
+pub(crate) enum OnboardingWorkerFailure {
+    Runtime(crate::onboarding::RuntimeError),
+    Timeout,
+    Join,
+}
+
+pub(crate) fn onboarding_worker_failure(cause: OnboardingWorkerFailure) -> sqlx::Error {
+    let message = match cause {
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Config) => {
+            "onboarding worker failed (config); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Settings) => {
+            "onboarding worker failed (settings); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Identity) => {
+            "onboarding worker failed (identity); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Member) => {
+            "onboarding worker failed (member); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Role) => {
+            "onboarding worker failed (role); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Discord) => {
+            "onboarding worker failed (discord); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Store) => {
+            "onboarding worker failed (store); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Timeout => {
+            "onboarding worker failed (timeout); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Join => {
+            "onboarding worker failed (join); durable job retained for bounded restart recovery"
+        }
+    };
+    sqlx::Error::InvalidArgument(message.into())
+}
+
 /// Bounded detached-ACK admission is full: reception refuses the interaction
 /// instead of queueing unbounded acknowledgement work.
 fn ingress_capacity_failure() -> sqlx::Error {
@@ -1669,8 +1714,9 @@ async fn onboarding_queue(
                                 Ok::<_, crate::onboarding::RuntimeError>(false)
                             })
                             .await
-                            .map_err(|_| crate::onboarding::RuntimeError::Discord)??;
-                        Ok::<_, crate::onboarding::RuntimeError>((saved.id, interrupted))
+                            .map_err(|_| OnboardingWorkerFailure::Timeout)?
+                            .map_err(OnboardingWorkerFailure::Runtime)?;
+                        Ok::<_, OnboardingWorkerFailure>((saved.id, interrupted))
                     });
                 } else {
                     // Callback credentials never survive a process boundary.
@@ -1698,10 +1744,10 @@ async fn onboarding_queue(
             _ = signal.notified() => queue_dirty = true,
             _ = queue_tick.tick(), if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT => {}
             result = feature_jobs.join_next(), if !feature_jobs.is_empty() => {
-                let Some(Ok(Ok((id, interrupted)))) = result else {
-                    return Err(sqlx::Error::InvalidArgument(
-                        "onboarding worker failed; durable job retained for bounded restart recovery".into(),
-                    ));
+                let (id, interrupted) = match result {
+                    Some(Ok(Ok(finished))) => finished,
+                    Some(Ok(Err(cause))) => return Err(onboarding_worker_failure(cause)),
+                    _ => return Err(onboarding_worker_failure(OnboardingWorkerFailure::Join)),
                 };
                 checkpoint_io(&state, &generation, deadline, store.finish_onboarding_job(id, interrupted)).await?;
                 queue_dirty = true;

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Offline fixtures for scripts/staging_voice_synthetic.py (no network, no token)."""
 
+import contextlib
 import io
 import json
+import math
 import os
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -501,11 +504,126 @@ class MetricsSnapshotTest(unittest.TestCase):
         self.assertEqual(synth.metrics_snapshot(None, None), (None, None))
 
 
+class TimingInputTest(unittest.TestCase):
+    BAD = ("nan", "NaN", "inf", "-inf", "0", "-1", "0.0", "601", "1e999", "abc", "")
+
+    def parse_times(self, argv, grace_env=None):
+        """Parse the four timing flags with the env-sourced grace default."""
+        env = {} if grace_env is None else {
+            "TWO_STAGING_EMPTY_GRACE_SECONDS": grace_env}
+        with mock.patch.dict(os.environ, env, clear=False):
+            if grace_env is None:
+                os.environ.pop("TWO_STAGING_EMPTY_GRACE_SECONDS", None)
+            stderr = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(stderr):
+                    args = synth.parse_args(argv)
+            except SystemExit as exc:
+                return exc.code, stderr.getvalue(), None
+        return 0, stderr.getvalue(), args
+
+    def refused(self, argv, grace_env=None):
+        """A bad timing value refuses with exit 2 and the fixed message."""
+        code, stderr, _ = self.parse_times(argv, grace_env)
+        self.assertEqual(code, 2)
+        self.assertIn(synth.TIMING_REFUSAL, stderr)
+
+    def test_all_four_flags_share_one_bounded_type(self):
+        for flag in ("--create-within", "--settle", "--grace", "--delete-slack"):
+            for value in self.BAD:
+                with self.subTest(flag=flag, value=value):
+                    # A bare -inf reads as an option flag to argparse (its
+                    # negative-number matcher only allows numerics), so the
+                    # same value goes through the --flag=value form.
+                    argv = [f"{flag}={value}"] if value == "-inf" else [flag, value]
+                    self.refused(argv)
+
+    def test_refusal_names_no_input_value(self):
+        # Fixed vocabulary only: for one flag the echo must not vary with
+        # the rejected value (argparse prefixes the flag name by design).
+        _, first, _ = self.parse_times(["--settle", "nan"])
+        _, second, _ = self.parse_times(["--settle", "-3"])
+        self.assertEqual(first, second)
+        self.assertNotIn("nan", first)
+        self.assertNotIn("-3", second)
+
+    def test_refusal_happens_before_any_live_call(self):
+        with mock.patch.object(synth, "Session") as session, \
+                mock.patch.object(synth, "rest") as rest, \
+                mock.patch.dict(os.environ, {
+                    "TWO_VOICE_SYNTHETIC_BOT_TOKEN": "t",
+                    "TWO_STAGING_EMPTY_GRACE_SECONDS": "nan"}):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    synth.main([])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn(synth.TIMING_REFUSAL, stderr.getvalue())
+        session.assert_not_called()
+        rest.assert_not_called()
+
+    def test_env_sourced_grace_uses_the_same_type(self):
+        for value in self.BAD:
+            with self.subTest(value=value):
+                self.refused([], value)
+        code, _, args = self.parse_times([], "45")
+        self.assertEqual(code, 0)
+        self.assertEqual(args.grace, 45.0)
+
+    def test_defaults_and_cap_boundary_pass(self):
+        code, _, args = self.parse_times([])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            (args.create_within, args.settle, args.grace, args.delete_slack),
+            (20.0, 8.0, 60.0, 20.0))
+        code, _, args = self.parse_times(
+            ["--create-within", "600", "--settle", "600",
+             "--grace", "600", "--delete-slack", "600"])
+        self.assertEqual(code, 0)
+        self.assertTrue(all(v == 600.0 for v in
+                             (args.create_within, args.settle, args.grace,
+                              args.delete_slack)))
+
+    def test_bad_flag_refuses_in_main_before_any_live_call(self):
+        with mock.patch.dict(os.environ, {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "t"}), \
+                mock.patch.object(synth, "run_live") as live:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    synth.main(["--settle", "nan"])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn(synth.TIMING_REFUSAL, stderr.getvalue())
+        live.assert_not_called()
+
+    def test_evidence_from_a_live_run_carries_only_finite_values(self):
+        # json.dump would serialize NaN/inf as bare literals, so the evidence
+        # file is parsed strictly: any non-finite constant refuses, which the
+        # bounded timing type plus this parse make unreachable.
+        def strict(raw):
+            return json.loads(raw, parse_constant=lambda c: (_ for _ in ()).throw(
+                ValueError(f"non-finite evidence value: {c}")))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "out.json")
+            with mock.patch.dict(os.environ, {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "t"}), \
+                    mock.patch.object(synth, "run_live", return_value=obs()) as live, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(synth.main(["--evidence", out]), 0)
+            live.assert_called_once()
+            parsed = strict(Path(out).read_text())
+        self.assertEqual(parsed["guild"], synth.STAGING_GUILD_ID)
+        floats = [value for check in parsed["checks"] for value in check.values()
+                  if isinstance(value, float)]
+        self.assertTrue(floats or True)  # shape guard: no crash when none
+        self.assertTrue(all(math.isfinite(value) for value in floats))
+
+
 class FenceTest(unittest.TestCase):
     def test_only_the_staging_guild_and_creator_pass(self):
         synth.fence(synth.STAGING_GUILD_ID, synth.STAGING_CREATOR_ID, None)
         synth.fence(synth.STAGING_GUILD_ID, synth.STAGING_CREATOR_ID,
                     "https://two-bot-next-staging.example.workers.dev")
+        synth.fence(synth.STAGING_GUILD_ID, synth.STAGING_CREATOR_ID,
+                    "https://two-bot-next-staging.example.workers.dev/")
         for guild in (synth.LIVE_GUILD_ID, "1", ""):
             with self.assertRaises(synth.Refusal):
                 synth.fence(guild, synth.STAGING_CREATOR_ID, None)
@@ -514,6 +632,26 @@ class FenceTest(unittest.TestCase):
         for url in ("http://two-bot-next-staging.x.workers.dev", "https://two-bot-next-production.x.workers.dev"):
             with self.assertRaises(synth.Refusal):
                 synth.fence(synth.STAGING_GUILD_ID, synth.STAGING_CREATOR_ID, url)
+
+    def test_suffix_userinfo_port_and_path_urls_refuse(self):
+        evil = (
+            "https://two-bot-next-staging.evil.example",
+            "https://two-bot-next-staging.example.workers.dev.evil.example",
+            "https://two-bot-next-staging@evil.example",
+            "https://user@two-bot-next-staging.example.workers.dev",
+            "https://@two-bot-next-staging.example.workers.dev",
+            "https://:@two-bot-next-staging.example.workers.dev",
+            "https://two-bot-next-staging.example.workers.dev:8443",
+            "https://two-bot-next-staging.example.workers.dev/ops/metrics",
+            "https://two-bot-next-staging.example.workers.dev?x=1",
+            "https://two-bot-next-staging.example.workers.dev#x",
+        )
+        for url in evil:
+            with self.subTest(url=url):
+                with self.assertRaises(synth.Refusal) as caught:
+                    synth.fence(synth.STAGING_GUILD_ID, synth.STAGING_CREATOR_ID, url)
+                self.assertEqual(str(caught.exception),
+                                 "staging URL must be the two-bot-next-staging workers.dev origin")
 
     def test_live_guild_refuses_before_any_request(self):
         with mock.patch.object(synth, "Session") as session, mock.patch.object(synth, "rest") as rest, \

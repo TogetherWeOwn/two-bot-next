@@ -14,6 +14,8 @@ use two_bot_testsupport::TestDatabase;
 
 mod adapter;
 mod automations;
+mod drain_shutdown;
+mod receipt_lifecycle;
 mod settings;
 
 /// Stored `internal_idempotency` receipt row: action, state, response code,
@@ -1036,6 +1038,16 @@ async fn terminal_persist_helper_emits_one_fixed_vocabulary_line_per_op() {
             InternalStoreError::TransitionRefused,
             "transition_refused",
         ),
+        (
+            "event_key",
+            InternalStoreError::Unavailable,
+            "storage_unavailable",
+        ),
+        (
+            "event_key",
+            InternalStoreError::TransitionRefused,
+            "transition_refused",
+        ),
     ] {
         let before = terminal_persist_failures(start).len();
         log_terminal_persist_failed(ActionLabel::Known("announcement.post"), op, error);
@@ -1050,7 +1062,7 @@ async fn terminal_persist_helper_emits_one_fixed_vocabulary_line_per_op() {
             assert!(!line.contains(secret));
         }
     }
-    assert_eq!(terminal_persist_failures(start).len(), 4);
+    assert_eq!(terminal_persist_failures(start).len(), 6);
 }
 
 #[tokio::test]
@@ -1137,16 +1149,19 @@ async fn finish_failure_after_effect_is_not_success_or_permission_to_resend() {
     db.close().await.unwrap();
 }
 
-/// Counted scripted mutation double for the release-failure test: records
-/// every entry so a second dispatch fails the test instead of panicking on
-/// an exhausted reply queue. `break_release` renames the audit relation
-/// inside the effect (after the claim committed, like
+/// Counted scripted mutation double for the release/event-key-failure tests:
+/// records every entry so a second dispatch fails the test instead of
+/// panicking on an exhausted reply queue. `break_release` renames the audit
+/// relation inside the effect (after the claim committed, like
 /// `MockEffect::break_finish`), so the follow-up `release_proven_not_sent`
-/// fails while the claim itself succeeded.
+/// fails while the claim itself succeeded. `break_event_keys` renames the
+/// event-key map instead, so the follow-up `put_event_key` fails after a
+/// confirmed write.
 struct CountedScriptedMutate {
     calls: AtomicUsize,
     replies: Mutex<Vec<Result<Value, EventActionError>>>,
     break_release: Option<sqlx::PgPool>,
+    break_event_keys: Option<sqlx::PgPool>,
 }
 
 impl EventMutateEffect for CountedScriptedMutate {
@@ -1160,6 +1175,13 @@ impl EventMutateEffect for CountedScriptedMutate {
             if let Some(pool) = &self.break_release {
                 // Dispose only a migrated TestDatabase relation, not a live DB.
                 sqlx::query("ALTER TABLE internal_action_log RENAME TO receiver_hidden_audit")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            if let Some(pool) = &self.break_event_keys {
+                // Dispose only a migrated TestDatabase relation, not a live DB.
+                sqlx::query("ALTER TABLE internal_event_keys RENAME TO receiver_hidden_event_keys")
                     .execute(pool)
                     .await
                     .unwrap();
@@ -1185,6 +1207,7 @@ async fn event_release_failure_is_logged_without_releasing_claim() {
             DiscordError::Unavailable(blocked),
         ))]),
         break_release: Some(db.pool().clone()),
+        break_event_keys: None,
     });
     let app = router(Arc::new(ReceiverState::new(
         config(),
@@ -1250,6 +1273,7 @@ async fn event_release_failure_is_logged_without_releasing_claim() {
             Ok(json!({"event_id": CREATE_EVENT_ID})),
         ]),
         break_release: None,
+        break_event_keys: None,
     });
     let ok_app = router(Arc::new(ReceiverState::new(
         config(),
@@ -1276,6 +1300,76 @@ async fn event_release_failure_is_logged_without_releasing_claim() {
     assert_eq!(ok_mutates.calls.load(Ordering::SeqCst), 2);
     assert_eq!(terminal_persist_failures(start).len(), 1);
     assert_eq!(unknown_persist_failures(start).len(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_key_failure_after_confirmed_write_is_logged_as_reconciliation() {
+    let Some(db) = database().await else { return };
+    // Union of main (#941) and PR locks: same global capture, same order.
+    let _capture = PERSIST_DIAGNOSTIC_LOCK.lock().await;
+    let _tracing = TRACING_DIAGNOSTIC_LOCK.lock().await;
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(false);
+    let start = crate::tracing_capture::global().text().len();
+    let mutates: Arc<CountedScriptedMutate> = Arc::new(CountedScriptedMutate {
+        calls: AtomicUsize::new(0),
+        replies: Mutex::new(vec![Ok(json!({"event_id": CREATE_EVENT_ID}))]),
+        break_release: None,
+        break_event_keys: Some(db.pool().clone()),
+    });
+    let app = router(Arc::new(ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEventRead::default()),
+        mutates.clone(),
+        Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
+    )));
+    // The effect confirms the write, then the follow-up key registration
+    // fails: the response stays reconciliation and one terminal diagnostic
+    // names the `event_key` op. Previously this path was silent.
+    let raw = upsert_payload("key-fail");
+    let (status, _, first) = answer(app.clone(), signed(&raw, "old", "intent-key-fail")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(first["error"]["code"], "needs_reconciliation");
+    let terminal = terminal_persist_failures(start);
+    assert_eq!(terminal.len(), 1, "{terminal:?}");
+    assert!(terminal[0].contains(r#"persist_op="event_key""#));
+    assert!(terminal[0].contains(r#"persist_class="storage_unavailable""#));
+    assert!(terminal[0].contains(r#"action="event.upsert""#));
+    // The key write failed but the unknown-state mark succeeded, so no
+    // unknown-state diagnostic is emitted.
+    assert_eq!(unknown_persist_failures(start).len(), 0);
+    for secret in [
+        first["request_id"].as_str().unwrap(),
+        "intent-key-fail",
+        "key-fail",
+        CREATE_EVENT_ID,
+    ] {
+        assert!(!terminal[0].contains(secret));
+    }
+    assert_eq!(mutates.calls.load(Ordering::SeqCst), 1);
+    sqlx::query("ALTER TABLE receiver_hidden_event_keys RENAME TO internal_event_keys")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    // The claim is retained as unknown: the same key replays
+    // `needs_reconciliation` with no second dispatch and no new diagnostic.
+    let (status, _, repeat) = answer(app.clone(), signed(&raw, "old", "intent-key-fail")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(repeat["error"]["code"], "needs_reconciliation");
+    assert_eq!(mutates.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(terminal_persist_failures(start).len(), 1);
+    assert_eq!(unknown_persist_failures(start).len(), 0);
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM internal_idempotency WHERE action = 'event.upsert'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, "unknown");
     db.close().await.unwrap();
 }
 
