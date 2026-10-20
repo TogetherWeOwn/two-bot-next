@@ -12,12 +12,12 @@ Probes against $STAGING_MCP_URL (default the staging Worker /mcp) with
   * initialize -> result must carry a non-empty protocolVersion.
   * tools/list -> result.tools must be exactly the five read-only tools.
   * tools/call each of the five -> bodies are recorded. While staging is
-    fenced (/readyz 503 ownership_fenced/not_owner) the container-backed trio
-    (get_status, get_gateway, get_backfill_progress) may return JSON-RPC
-    -32000 "container request failed"; that is expected, not a failure.
-    get_config (redacted Worker snapshot), get_audit (implemented:false stub),
-    initialize, tools/list and unknown-tool -32601 are Worker-side and must
-    succeed regardless.
+    fenced (/readyz 503 ownership_fenced/not_owner) the container-backed tools
+    (get_status, get_gateway, get_backfill_progress, get_audit) may return
+    JSON-RPC -32000 "container request failed"; that is expected, not a failure.
+    A successful get_audit must carry the bounded {available, rows, truncated}
+    excerpt envelope. get_config (redacted Worker snapshot), initialize,
+    tools/list and unknown-tool -32601 are Worker-side and must succeed regardless.
   * tools/call unknown tool -> JSON-RPC -32601.
   * wrong bearer (fixed dummy, never the real token) and no bearer ->
     HTTP 401 with WWW-Authenticate: Bearer.
@@ -64,7 +64,7 @@ EXPECTED_TOOLS = [
     "get_config",
     "get_audit",
 ]
-CONTAINER_BACKED = {"get_status", "get_gateway", "get_backfill_progress"}
+CONTAINER_BACKED = {"get_status", "get_gateway", "get_backfill_progress", "get_audit"}
 WRONG_BEARER = "wrong-bearer-probe-0000"
 
 
@@ -162,6 +162,20 @@ def parse_json_or_text(body):
         return json.loads(body)
     except Exception:
         return {"_text": body}
+
+
+def is_audit_excerpt(value):
+    """Check the bounded envelope; the Worker enforces the row-field allowlist."""
+    return (
+        isinstance(value, dict)
+        and set(value) == {"available", "rows", "truncated"}
+        and isinstance(value["available"], bool)
+        and isinstance(value["truncated"], bool)
+        and isinstance(value["rows"], list)
+        and len(value["rows"]) <= 50
+        and all(isinstance(row, dict) for row in value["rows"])
+        and (value["available"] or (not value["rows"] and not value["truncated"]))
+    )
 
 
 def main():
@@ -262,8 +276,6 @@ def main():
                 print(f"NOTE: tools/call {tool} returned -32000 (fenced container); expected while staging is fenced.", flush=True)
             elif tool == "get_config":
                 failures.append(f"tools/call get_config: must succeed Worker-side, got error {code}")
-            elif tool == "get_audit":
-                failures.append(f"tools/call get_audit: must succeed Worker-side, got error {code}")
             else:
                 failures.append(f"tools/call {tool}: unexpected JSON-RPC error code {code}")
         else:
@@ -271,9 +283,8 @@ def main():
             if not isinstance(result, dict) or "content" not in result:
                 failures.append(f"tools/call {tool}: expected result.content envelope")
             elif tool == "get_audit":
-                structured = result.get("structuredContent") or {}
-                if structured.get("implemented") is not False:
-                    failures.append("tools/call get_audit: expected structuredContent.implemented=false stub")
+                if not is_audit_excerpt(result.get("structuredContent")):
+                    failures.append("tools/call get_audit: expected bounded audit excerpt envelope")
         rpc_id += 1
 
     # 8. tools/call unknown tool (authenticated) -> -32601.
@@ -344,7 +355,7 @@ def main():
         for item in failures:
             print(f"- {item}", flush=True)
         return 1
-    print("OK: Worker-side MCP slice proved out (container trio may show expected -32000 while fenced).", flush=True)
+    print("OK: MCP slice proved out (container-backed tools may show expected -32000 while fenced).", flush=True)
     return 0
 
 

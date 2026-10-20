@@ -4977,7 +4977,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// First working destination: the configured channel, then the guild
     /// system channel, a DM to the guild owner, and finally a creator
     /// channel's chat. A destination that fails is dropped and the next is
-    /// tried.
+    /// tried. A failing configured channel warns once (op name plus the
+    /// bounded outcome, never the notice text or the mention) so a
+    /// misconfigured channel is distinguishable from a working one; a
+    /// successful send stays silent, and so does a rate limit, which is a
+    /// retry rather than an outcome (the channel may be healthy).
     async fn deliver_notice(&self, settings: &LoggingSettings, text: &str) -> bool {
         let mention = settings
             .mention_role_id
@@ -4986,13 +4990,25 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .channel_id
             .filter(|channel| self.live.text_notice_channel(*channel))
         {
-            if self
+            match self
                 .http
                 .send_notice(NoticeTarget::Channel(channel), text, mention)
                 .await
-                .is_ok()
             {
-                return true;
+                Ok(()) => return true,
+                // Rate limits are retries, never outcomes: skip the warn
+                // before the classifier, like its other callers.
+                Err(RoomHttpError::RateLimited { .. }) => {}
+                Err(error) => {
+                    let guild = self.live.guild_id.to_string();
+                    let outcome = voice_outcome_from_http(&error);
+                    warn!(
+                        guild,
+                        op = "send_notice",
+                        outcome,
+                        "voice notice configured channel failed; trying fallback"
+                    );
+                }
             }
         }
         let Some((system_channel_id, owner_id)) = self.live.notice_context() else {
