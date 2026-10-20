@@ -1003,6 +1003,7 @@ mod tests {
             resource_id: None,
             affected: 1,
             outcome: None,
+            stop_reason: None,
         };
         let failure = TerminalResponse::Failure(TerminalFailure::NoEffect);
         assert!(ReconciliationEvidence::DiscordConfirmedEffect.supports(&success));

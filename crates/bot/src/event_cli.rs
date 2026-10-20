@@ -496,6 +496,7 @@ mod tests {
                 resource_id: Some(DiscordId::new("333333333333333333").unwrap()),
                 affected: 1,
                 outcome: Some(EventOutcome::Created),
+                stop_reason: None,
             }
         );
         assert_eq!(evidence, ReconciliationEvidence::DiscordConfirmedEffect);

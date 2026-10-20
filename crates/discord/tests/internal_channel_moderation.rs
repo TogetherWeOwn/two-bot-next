@@ -1807,6 +1807,67 @@ async fn purge_stopped_early_reports_the_reason_in_the_result_and_the_audit_row(
     db.cleanup().await;
 }
 
+/// A corrupt completed receipt must fail closed, not silently flatten an
+/// unrecognized reason into a successful replay or send another Discord request.
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn purge_corrupt_stop_reason_replay_fails_closed_without_discord_requests() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let req = request("moderation.purge", json!({"count":3}));
+    let key = "purge-corrupt-stop-reason";
+    // Hand-built legacy request shape, including the normalized reason. The
+    // claim must match exactly or the test would only exercise hash mismatch.
+    let hash = two_bot_core::body_hash(
+        json!({
+            "action":"moderation.purge", "guildId":GUILD,
+            "targetId":null, "channelId":CHANNEL, "reason":"cleanup",
+            "durationSeconds":null, "count":3, "seconds":null,
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let store = db.store();
+    let two_bot_core::channel_moderation_store::ChannelClaim::Claimed { ticket } = store
+        .claim(GUILD, key, "moderation.purge", &hash, TIME)
+        .await
+        .unwrap()
+    else {
+        panic!("fresh corrupt-replay fixture must own its claim");
+    };
+    let corrupt = r#"{"outcome":"purged","affected":1,"stop_reason":"bogus"}"#;
+    assert!(store
+        .complete(&ticket, "purged", corrupt, TIME)
+        .await
+        .unwrap());
+    let exec = executor(db.pool.clone(), &mock);
+    let result = exec
+        .execute(&req, &actor(), "corrupt-stop-replay", key, TIME)
+        .await;
+    let wire_count = mock.requests().len();
+    let stored: String = sqlx::query_scalar(
+        "SELECT result_json FROM moderation_idempotency WHERE guild_id = $1 AND idempotency_key = $2",
+    )
+    .bind(GUILD)
+    .bind(key)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_audit")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    mock.shutdown().await;
+    db.cleanup().await;
+    assert!(matches!(result, Err(error) if error.code == ErrorCode::Internal));
+    assert_eq!(wire_count, 0, "corrupt replay must never reach Discord");
+    assert_eq!(
+        stored, corrupt,
+        "replay must not repair or overwrite evidence"
+    );
+    assert_eq!(audits, 0, "replay must not invent a second effect audit");
+}
+
 /// Acceptance control: a purge that runs to completion keeps today's audit
 /// metadata and stored replay payload byte for byte, with no stop-reason
 /// key.
