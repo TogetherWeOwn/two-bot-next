@@ -71,10 +71,24 @@ fn script(position: i64, permissions: &str, overwrite: serde_json::Value) -> Vec
 #[tokio::test]
 async fn fresh_member_and_complete_live_policy_use_shared_paced_reads() {
     let mock = MockRest::start(script(2, "0", json!([])), ScriptedResponse::status(500)).await;
-    let snapshot = executor(&mock)
+    let exec = executor(&mock);
+    // Client-side baseline, not the mock's server `received_at`: the shared
+    // pacing stamp is taken on the client just before each send, while the
+    // server stamps arrival after TCP transit and its own scheduling. A
+    // late-stamped first receipt shrinks the measured gap, so any per-gap
+    // receipt threshold can flake under load (a 50 ms floor flaked on main).
+    // Four sequential paced reads need three 110 ms lane waits back to back
+    // by construction, so 300 ms of client elapsed keeps its bite (unpaced
+    // loopback reads land in ~1 ms each) with no server clock in the loop.
+    let started = tokio::time::Instant::now();
+    let snapshot = exec
         .fetch_self_role_snapshot(GUILD, USER, BOT)
         .await
         .unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "shared paced reads completed without the pacing waits",
+    );
     assert!(snapshot.member_role_ids.contains(OTHER));
     assert!(!snapshot.member_role_ids.contains(ROLE));
     assert!(!snapshot.member_is_bot);
@@ -89,21 +103,6 @@ async fn fresh_member_and_complete_live_policy_use_shared_paced_reads() {
             format!("/api/v10/guilds/{GUILD}/channels"),
         ]
     );
-    // Coarse pacing pin: the exact 110 ms interval is pinned by
-    // `PACE_INTERVAL_MS` and the virtual-clock admission tests. Wire receipts
-    // mix client pacing with mock-side scheduling, so a 100 ms threshold
-    // leaves only ~10 ms for loopback jitter and flakes under load. 50 ms
-    // still proves each gap was paced (unpaced gaps are ~1 ms).
-    for adjacent in calls.windows(2) {
-        assert!(
-            adjacent[1]
-                .received_at
-                .duration_since(adjacent[0].received_at)
-                >= Duration::from_millis(50),
-            "shared paced reads burst past the pacing floor: {:?}",
-            calls.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
-        );
-    }
     assert!(calls.iter().all(|c| c.method == "GET"));
     mock.shutdown().await;
 }
