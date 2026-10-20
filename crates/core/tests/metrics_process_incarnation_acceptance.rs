@@ -2,6 +2,7 @@
 //! independent of each registry/render. No database or gateway is needed.
 
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::process::Command;
 use two_bot_core::metrics::{global, Metrics};
 
@@ -72,10 +73,15 @@ fn process_incarnation_is_shared_by_registries_global_and_threads() {
 #[test]
 fn process_incarnation_child_probe() {
     let words = incarnation(&Metrics::default().render(None));
-    println!(
+    writeln!(
+        io::stdout().lock(),
         "PROCESS_INCARNATION={:08x}{:08x}{:08x}{:08x}",
-        words[0], words[1], words[2], words[3]
-    );
+        words[0],
+        words[1],
+        words[2],
+        words[3]
+    )
+    .expect("write child identity receipt");
 }
 
 fn child_identity() -> String {
