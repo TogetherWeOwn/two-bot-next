@@ -1125,7 +1125,9 @@ pub async fn persist_guild(
         );
         // No writes to commit: queue rollback on drop so a cleanup error
         // cannot bypass retention of the already-drained voice spans.
-        drop(tx);
+        // Fully qualified: `drop` here names the carry-drop list from
+        // `plan_flush`, shadowing `std::mem::drop`.
+        std::mem::drop(tx);
         // Same span retention as [`GameActivityCollector::flush`]: with play
         // still carried, drained spans wait for the bridged session instead
         // of dropping covered voice time. Voice-off drops them above.
