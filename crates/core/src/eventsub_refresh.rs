@@ -642,6 +642,98 @@ mod tests {
     }
 
     #[test]
+    fn freshness_within_tolerance_decides_at_guarded_time() {
+        // Pins `within_skew(.., guarded_ms / 1000)` against a raw-clock
+        // regression. The rollback test above only exercises the guard's Err
+        // branch (300 s below the mark); this test stays 5 s below the mark
+        // (within tolerance) where the guarded and raw clocks disagree by
+        // exactly the tolerance.
+        use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
+        let (verifier, key) = verifier();
+        let old = fresh_material();
+        let capture_secret = fresh_material();
+        let sweep_secret = fresh_material();
+        let current = lock_for(&old);
+        // Future-edge capture: signed 120 s ahead, accepted at B.
+        let capture = signed_headers(
+            &key,
+            &capture_secret,
+            now_secs() + SKEW_SECONDS,
+            &fresh_nonce(),
+        );
+        assert_eq!(
+            refresh_before_verify(&verifier, &current, lookup(&capture), REQUEST_ID, NOW_MS),
+            Ok(())
+        );
+        // Sweep at B + 242 s advances the mark and drops the capture nonce
+        // (242 s over the 241 s TTL).
+        let sweep_ms = NOW_MS + (NONCE_TTL_SECONDS + 1) * 1000;
+        let sweep = signed_headers(&key, &sweep_secret, sweep_ms / 1000, &fresh_nonce());
+        assert_eq!(
+            refresh_before_verify(&verifier, &current, lookup(&sweep), REQUEST_ID, sweep_ms),
+            Ok(())
+        );
+        // Replay 5 s below the mark: fresh at the raw clock (117 s) but stale
+        // at the guarded clock (122 s), so it must refuse without re-arming.
+        let replay_ms = sweep_ms - CLOCK_SKEW_TOLERANCE_MS;
+        assert_eq!(
+            refresh_before_verify(&verifier, &current, lookup(&capture), REQUEST_ID, replay_ms),
+            Err(RefreshRejection::Stale)
+        );
+        assert_eq!(
+            *current.read().expect("snapshot lock must be readable"),
+            WebhookSecret::new(sweep_secret).expect("sweep secret must parse")
+        );
+    }
+
+    #[test]
+    fn nonce_burn_within_tolerance_decides_at_guarded_time() {
+        // Pins `cache.offer(nonce, guarded_ms)` against a raw-clock
+        // regression. A capture burned while the raw sample sits 5 s below
+        // the mark must be stored at the mark: stored 5 s early it would
+        // expire at +242 s raw while still guarded-fresh, reopening the F8
+        // replay. The capture timestamp also requires guarded freshness to
+        // accept (125 s raw-stale, 120 s guarded-fresh).
+        use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
+        let tolerance_secs = CLOCK_SKEW_TOLERANCE_MS / 1000;
+        let (verifier, key) = verifier();
+        let old = fresh_material();
+        let primer_secret = fresh_material();
+        let capture_secret = fresh_material();
+        let current = lock_for(&old);
+        // Primer advances the mark to B + 5 s.
+        let primer_ms = NOW_MS + CLOCK_SKEW_TOLERANCE_MS;
+        let primer = signed_headers(&key, &primer_secret, primer_ms / 1000, &fresh_nonce());
+        assert_eq!(
+            refresh_before_verify(&verifier, &current, lookup(&primer), REQUEST_ID, primer_ms),
+            Ok(())
+        );
+        // Capture accepted at raw B with the mark at B + 5 s.
+        let capture = signed_headers(
+            &key,
+            &capture_secret,
+            now_secs() + SKEW_SECONDS + tolerance_secs,
+            &fresh_nonce(),
+        );
+        assert_eq!(
+            refresh_before_verify(&verifier, &current, lookup(&capture), REQUEST_ID, NOW_MS),
+            Ok(())
+        );
+        // Replay at B + 242 s is guarded-fresh (117 s) with the nonce still
+        // live (237 s at the guarded burn): it must be a Replay, not an
+        // accept. A raw-clock burn would have expired (242 s) and re-armed.
+        let replay_ms = NOW_MS + (NONCE_TTL_SECONDS + 1) * 1000;
+        assert_eq!(
+            refresh_before_verify(&verifier, &current, lookup(&capture), REQUEST_ID, replay_ms),
+            Err(RefreshRejection::Replay)
+        );
+        assert_eq!(
+            *current.read().expect("snapshot lock must be readable"),
+            WebhookSecret::new(capture_secret).expect("capture secret must parse")
+        );
+    }
+
+    #[test]
     fn invalid_candidate_is_rejected_without_swapping() {
         let (verifier, key) = verifier();
         let old = fresh_material();
