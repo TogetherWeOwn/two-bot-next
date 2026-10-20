@@ -1687,7 +1687,10 @@ jobs:
         run: cargo test -p two-bot --locked join_risk_runtime_ -- --include-ignored
 
       - name: containment runtime acceptance (mock Discord and CI service only)
-        run: cargo test -p two-bot --locked containment_runtime_ -- --include-ignored
+        run: cargo test -p two-bot --locked --lib --bins containment_worker_ -- --include-ignored
+
+      - name: containment worker-path soak (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked --test containment_worker_soak -- --include-ignored
 
       - name: Raid cohort query (CI service container only)
         env:
