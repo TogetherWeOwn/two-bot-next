@@ -455,6 +455,24 @@ test("older rejection cannot overwrite a newer completed result", async () => {
   assert.deepEqual(page.snapshot(), beforeStale);
 });
 
+test("older READY cannot overwrite a newer fetch rejection", async () => {
+  const page = makePage(await dashboardScript());
+  await page.clickConnect();
+  await page.tick();
+  assert.equal(page.fetches.length, 2);
+  page.fetches[1]!.reject(new Error("synthetic network failure"));
+  await flush();
+  const beforeStale = page.snapshot();
+  assert.equal(beforeStale.status, "fetch failed");
+  assert.ok(
+    beforeStale.summary.includes("summary unavailable: fetch failed"),
+    "control: the newer rejection replaces the summary",
+  );
+  page.fetches[0]!.resolve(jsonResponse(200, readyBody("older-marker")));
+  await flush();
+  assert.deepEqual(page.snapshot(), beforeStale);
+});
+
 test("older HTTP refusal cannot overwrite a newer completed result", async () => {
   const page = makePage(await dashboardScript());
   await page.clickConnect();

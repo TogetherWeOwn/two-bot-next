@@ -272,6 +272,8 @@ struct Hello {
 
 /// Client-side bound from pool acquisition through COMMIT, including stalled
 /// responses on an acquired connection. Never restore readiness during drain.
+/// A successful call restores only the snapshot it armed itself: a newer Ready
+/// publication in the same generation, or a disconnect that bumped it, stays.
 /// Source: <https://docs.rs/tokio/1/tokio/time/fn.timeout.html>
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
@@ -292,7 +294,9 @@ async fn checkpoint_io<T>(
         .map_err(|_| sqlx::Error::InvalidArgument("gateway checkpoint deadline exceeded".into()))?;
     if result.is_ok() {
         let mut state = state.write().await;
-        if *state != GatewayState::Draining
+        // Armed is this call's own in-flight mark. Connected means a later
+        // publication already won; Draining and a bumped generation must win too.
+        if *state == GatewayState::Armed
             && generation.load(Ordering::Acquire) == observed_generation
         {
             *state = previous;
@@ -1231,6 +1235,12 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let error = Arc::new(std::sync::Mutex::new(None));
     let worker_error = Arc::clone(&error);
     let (failed, failure) = tokio::sync::watch::channel(false);
+    // Hello queues Resume or Identify and Twilight writes it on a later poll.
+    // The worker waits for the first validated authenticated dispatch (READY,
+    // RESUMED or a replay with a valid session), the only proof Discord
+    // accepted the opening frame, so a fast member-read error cannot drop the
+    // socket before that write lands.
+    let (opening_tx, opening_rx) = tokio::sync::watch::channel(false);
     let receive_generation = Arc::clone(&generation);
     let automod_enabled = automod.is_some();
     // The worker dispatches text automations itself once automod has decided.
@@ -1259,6 +1269,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             let in_flight_acks = Arc::clone(&in_flight_acks);
             let pipeline = Arc::clone(&receive_pipeline);
             let voice = receive_voice.clone();
+            let opening_tx = opening_tx.clone();
             async move {
                 // Failure is emitted to the ordered worker, never skipped past.
                 let work: Result<Option<ReceivedWork>, sqlx::Error> = async {
@@ -1276,7 +1287,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         shard = Shard::with_config(shard.id(), shard.config().clone());
                         info!("cold resume committed; requesting voice snapshot via identify");
                     }
-                    while let Some(item) = shard.next().await {
+                    loop {
+                        let item = match shard.next().await {
+                            Some(item) => item,
+                            None => break,
+                        };
                         let received_at = tokio::time::Instant::now();
                         let message = match item {
                             Ok(message) => message,
@@ -1322,6 +1337,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         let resume_url = shard.resume_url().or_else(|| received.as_ref().filter(|saved| saved.session_id == session.id()).map(|saved| saved.resume_url.as_str()))
                             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
                         let checkpoint = GatewaySession { session_id: session.id().to_owned(), sequence, resume_url: resume_url.to_owned(), updated_at_ms: two_bot_core::funnel::now_millis_for_test() };
+                        // A dispatch with a valid session proves Discord accepted
+                        // the opening frame, even when it is a duplicate replay.
+                        let _ = opening_tx.send(true);
                         if dispatch_action(received.as_ref(), &checkpoint.session_id, sequence) == DispatchAction::Duplicate { continue; }
                         // Sequence jumps inside one session are dispatches
                         // Discord assigned but this process never received
@@ -1480,8 +1498,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
             Arc::clone(&state),
             Arc::clone(&generation),
             Arc::clone(&live_interactions),
-            Arc::clone(&queue_signal),
-            Arc::clone(&writer_drained),
+            OnboardingQueueSignals {
+                signal: Arc::clone(&queue_signal),
+                writer_drained: Arc::clone(&writer_drained),
+                opening_confirmed: opening_rx,
+            },
         )
     });
     // The blocking dispatch worker inherits no span context: capture the
@@ -1643,15 +1664,65 @@ pub async fn run_shard<I: InviteSource + 'static>(
 /// on a fatal error (the runner then fails closed), or once the writer drain
 /// flag is set and the durable queue is empty with no effect in flight
 /// (cooperative shutdown drain).
+///
+/// Coordination signals for the queue worker: wakeups for newly committed
+/// jobs, the writer-drained shutdown flag, and the gateway opening-frame gate
+/// (claims wait for the first validated authenticated dispatch, so a fast
+/// member-read error cannot drop the socket before the opening write).
+struct OnboardingQueueSignals {
+    signal: Arc<tokio::sync::Notify>,
+    writer_drained: Arc<std::sync::atomic::AtomicBool>,
+    opening_confirmed: tokio::sync::watch::Receiver<bool>,
+}
+
 async fn onboarding_queue(
     runtime: Arc<crate::onboarding::OnboardingRuntime>,
     store: GatewaySessionStore,
     state: Arc<RwLock<GatewayState>>,
     generation: Arc<AtomicU64>,
     live_interactions: LiveInteractions,
-    signal: Arc<tokio::sync::Notify>,
-    writer_drained: Arc<std::sync::atomic::AtomicBool>,
+    mut signals: OnboardingQueueSignals,
 ) -> Result<(), sqlx::Error> {
+    // Claim nothing until the opening is confirmed. A cooperative shutdown
+    // before Hello leaves the durable jobs for the next boot instead of waiting
+    // out the drain budget. A closed sender (reception ended) waits for the
+    // writer drain, never returns first, so the dispatch result is the one the
+    // runner reports.
+    loop {
+        let notified = signals.signal.notified();
+        if *signals.opening_confirmed.borrow() {
+            break;
+        }
+        if signals.writer_drained.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            // Drop the watch guard inside this future. Holding it across the
+            // pending await below makes run_shard !Send.
+            closed = async {
+                signals
+                    .opening_confirmed
+                    .wait_for(|flushed| *flushed)
+                    .await
+                    .is_err()
+            } => {
+                if closed {
+                    // The stored Notify permit makes a drain notification that
+                    // raced this await safe; recheck the flag each wake.
+                    loop {
+                        let drained = signals.signal.notified();
+                        if signals.writer_drained.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        drained.await;
+                    }
+                }
+                break;
+            }
+            _ = notified => {}
+        }
+    }
     let deadline = CHECKPOINT_IO_MAX;
     let mut feature_jobs = tokio::task::JoinSet::new();
     let mut queue_dirty = true;
@@ -1668,7 +1739,7 @@ async fn onboarding_queue(
         // Once the writer has drained, no new job can be committed: force a
         // final claim probe (a commit may have raced the drain return) and
         // exit once no claimed effect is in flight either.
-        let draining = writer_drained.load(Ordering::Acquire);
+        let draining = signals.writer_drained.load(Ordering::Acquire);
         if draining {
             queue_dirty = true;
         }
@@ -1741,7 +1812,7 @@ async fn onboarding_queue(
             }
         }
         tokio::select! {
-            _ = signal.notified() => queue_dirty = true,
+            _ = signals.signal.notified() => queue_dirty = true,
             _ = queue_tick.tick(), if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT => {}
             result = feature_jobs.join_next(), if !feature_jobs.is_empty() => {
                 let (id, interrupted) = match result {
@@ -2127,6 +2198,79 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(*state.read().await, GatewayState::Armed);
+    }
+
+    mod readiness_acceptance {
+        use super::*;
+
+        #[tokio::test]
+        async fn checkpoint_io_stale_armed_snapshot_cannot_erase_committed_ready() {
+            let state = RwLock::new(GatewayState::Armed);
+            let generation = AtomicU64::new(0);
+            let (entered, entering) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let operation = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+                entered.send(()).unwrap();
+                released.await.unwrap();
+                Ok(())
+            });
+            let promote = async {
+                entering.await.unwrap();
+                assert_eq!(*state.read().await, GatewayState::Armed);
+                // The ordered writer has committed READY in this generation.
+                *state.write().await = GatewayState::Connected;
+                release.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+                tokio::join!(operation, promote)
+            })
+            .await
+            .expect("bounded checkpoint/promotion coordination");
+            result.expect("healthy IO completes");
+            assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(state.read().await.status(), ComponentStatus::Ready);
+        }
+
+        #[tokio::test]
+        async fn checkpoint_io_overlapping_successes_cannot_leave_readiness_armed() {
+            let state = RwLock::new(GatewayState::Connected);
+            let generation = AtomicU64::new(0);
+            let (first_entered, first_entering) = tokio::sync::oneshot::channel();
+            let (second_entered, second_entering) = tokio::sync::oneshot::channel();
+            let (release_first, first_released) = tokio::sync::oneshot::channel();
+            let (first_finished, first_finishing) = tokio::sync::oneshot::channel();
+            let first = async {
+                checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+                    first_entered.send(()).unwrap();
+                    first_released.await.unwrap();
+                    Ok(())
+                })
+                .await
+                .expect("first healthy IO");
+                first_finished.send(()).unwrap();
+            };
+            let second = async {
+                first_entering.await.unwrap();
+                checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+                    second_entered.send(()).unwrap();
+                    first_finishing.await.unwrap();
+                    Ok(())
+                })
+                .await
+                .expect("second healthy IO");
+            };
+            let release = async {
+                second_entering.await.unwrap();
+                release_first.send(()).unwrap();
+            };
+            tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+                tokio::join!(first, second, release)
+            })
+            .await
+            .expect("bounded overlapping checkpoint coordination");
+            assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(state.read().await.status(), ComponentStatus::Ready);
+        }
     }
 
     #[tokio::test]
