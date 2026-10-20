@@ -106,7 +106,7 @@ use two_bot_core::{
         OverwriteTarget as TextOverwriteTarget, TextChannelPlan, VoiceRoomFacts,
         DEFAULT_TEXT_CHANNEL_NAME, MAX_TEXT_CHANNEL_NAME_CHARS,
     },
-    voice_utilities::{invite_render, ping_render},
+    voice_utilities::{invite_render, is_valid_invite_code, ping_render},
     voice_vote_kick::{
         VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
         VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts,
@@ -9411,6 +9411,42 @@ pub(crate) fn stored_empty_grace_with(
     }
 }
 
+/// The stored per-guild invite-code key served from the live settings snapshot.
+/// Store-only: no environment variable of this name is ever read.
+pub(crate) const INVITE_CODE_KEY: &str = "TWO_GUILD_INVITE_CODE";
+
+/// Effective guild invite code: the stored per-guild value wins over the
+/// gateway vanity fallback, an absent row or one for another guild keeps the
+/// fallback, and an invalid stored value fails closed to it (store-first, like
+/// the empty grace). Only a JSON string passing `is_valid_invite_code` can win;
+/// it passes through unchanged, never trimmed. The rejected value is never
+/// logged: a stale code may be a rotated secret. Pure for tests via `live`.
+pub(crate) fn stored_invite_code_with(
+    guild: &str,
+    fallback: Option<&str>,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> Option<String> {
+    let fallback = fallback.map(str::to_owned);
+    let Some(live) = live else {
+        return fallback;
+    };
+    let Some(value) = live.get(guild, INVITE_CODE_KEY) else {
+        return fallback;
+    };
+    match &value {
+        serde_json::Value::String(code) if is_valid_invite_code(code) => Some(code.clone()),
+        _ => {
+            warn!(
+                guild = guild.to_string(),
+                key = INVITE_CODE_KEY,
+                reason = "invalid_invite_code",
+                "stored invite-code override invalid; using vanity fallback"
+            );
+            fallback
+        }
+    }
+}
+
 /// The synthetic test identities a guild's actor may use: none for the live
 /// guild, whatever `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` says.
 fn synthetic_humans_for(guild: Snowflake, ids: &HashSet<Snowflake>) -> HashSet<Snowflake> {
@@ -13136,7 +13172,24 @@ where
                 return;
             }
             let interaction = created.0.clone();
-            let invite_code = vanity_code_from_cache(cache, &interaction);
+            let vanity_code = vanity_code_from_cache(cache, &interaction);
+            // The stored override resolves only for `/invite` (the sole
+            // renderer of `invite_code`): other interactions keep the plain
+            // vanity code, so an invalid row warns on invites, not on every
+            // voice interaction.
+            let invite_code = if matches!(command, Some(VoiceCommand::Invite)) {
+                let snapshot = (self.runtime.live_source)();
+                stored_invite_code_with(
+                    &interaction
+                        .guild_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    vanity_code.as_deref(),
+                    snapshot.as_ref(),
+                )
+            } else {
+                vanity_code
+            };
             let inventory = interaction_guild(&interaction)
                 .and_then(|guild_id| inventory_from_cache(cache, guild_id));
             let names = name_directory_from_cache(cache, &interaction);
