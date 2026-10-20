@@ -372,6 +372,94 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn opt_in_obeys_pair_lock_and_recovers_after_lock_timeout() {
+        let base_url = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                assert_ne!(
+                    std::env::var("GITHUB_ACTIONS").as_deref(),
+                    Ok("true"),
+                    "CI must configure the privacy pair-lock database test"
+                );
+                eprintln!("SKIP privacy pair-lock test: TWO_TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let fixture =
+            two_bot_testsupport::TestDatabase::create(&base_url, &sqlx::migrate!("./migrations"))
+                .await
+                .expect("disposable migrated database");
+        let db = CutoverDb::from_pool(
+            fixture
+                .independent_pool()
+                .await
+                .expect("independent service pool"),
+        );
+        let guild = "1545644954272137297";
+        let member = "123456789012345678";
+        opt_out_member(&db, guild, member, "operator:pair-lock-test")
+            .await
+            .expect("commit suppression before taking the external lock");
+
+        // Hold only the advisory lock: a row/table lock could also block the
+        // old pool-level DELETE and hide an unserialized opt-in regression.
+        // Spell out the key instead of calling the helper under test.
+        let mut holder = fixture.pool().begin().await.expect("external transaction");
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("privacy:{guild}:{member}"))
+            .execute(&mut *holder)
+            .await
+            .expect("hold the target pair lock");
+        let other_guild = opt_back_in(&db, "1545644954272137298", member).await;
+        let other_member = opt_back_in(&db, guild, "123456789012345679").await;
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            opt_back_in(&db, guild, member),
+        )
+        .await;
+        let still_suppressed = is_opted_out(&db, guild, member).await;
+        holder.rollback().await.expect("release the external lock");
+        let removed = opt_back_in(&db, guild, member).await;
+        let already_enabled = opt_back_in(&db, guild, member).await;
+        let suppressed_after_release = is_opted_out(&db, guild, member).await;
+        let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM privacy_opt_out_audit")
+            .fetch_one(db.pool())
+            .await
+            .expect("read purge receipts");
+
+        // Tear down before outcome assertions, including on the no-lock mutant.
+        db.close().await;
+        fixture.close().await.expect("close disposable database");
+        assert!(
+            matches!(other_guild, Ok(false)),
+            "guild is part of the lock key"
+        );
+        assert!(
+            matches!(other_member, Ok(false)),
+            "member is part of the lock key"
+        );
+        assert!(
+            matches!(blocked, Ok(Err(sqlx::Error::Database(ref error)))
+                if error.code().as_deref() == Some("55P03")),
+            "opt-in must fail with lock_timeout while its pair lock is held"
+        );
+        assert!(
+            matches!(still_suppressed, Ok(true)),
+            "timeout must not remove suppression"
+        );
+        assert!(
+            matches!(removed, Ok(true)),
+            "opt-in succeeds after lock release"
+        );
+        assert!(
+            matches!(already_enabled, Ok(false)),
+            "repeat opt-in removes nothing"
+        );
+        assert!(matches!(suppressed_after_release, Ok(false)));
+        assert_eq!(receipts, 1, "opt-in never adds a purge receipt");
+    }
+
+    #[tokio::test]
     async fn invalid_cooldown_refuses_before_connecting() {
         // No connection is opened: argument validation must finish first.
         let db = CutoverDb::from_pool(
