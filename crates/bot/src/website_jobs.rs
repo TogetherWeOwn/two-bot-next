@@ -812,9 +812,18 @@ async fn snapshot_once(
         if publication_stopped(shutdown) {
             return Ok(());
         }
-        return replace_events(pool, guild, &fetched_at, &events)
-            .await
-            .map_err(|_| ErrorClass::Database);
+        return match replace_events(pool, guild, &fetched_at, &events).await {
+            Ok(None) => Ok(()),
+            Ok(Some(skip)) => {
+                tracing::info!(
+                    job = "events",
+                    skip = ?skip,
+                    "stale snapshot lost the epoch claim; publication skipped"
+                );
+                Ok(())
+            }
+            Err(_) => Err(ErrorClass::Database),
+        };
     }
     // Both kinds publish the denominator. Hold one shared lane from the first
     // observation through commit so a slow rank tick cannot overwrite a newer
