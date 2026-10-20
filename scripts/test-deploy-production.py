@@ -599,6 +599,21 @@ class StaticGuardTests(unittest.TestCase):
         conditions = [line.strip() for line in gate if line.strip().startswith("if:")]
         self.assertEqual(conditions, ["if: env.MODE == 'deploy'"], gate)
 
+    def test_workflow_run_context_reaches_the_guard(self):
+        # Behaviour tests inject env directly; pin the real workflow wiring
+        # on the guard step so missing or misbound event fields cannot pass.
+        guard_step = next(step for step in steps(JOBS["guard"])
+                          if step[0].strip() == f"- name: {GUARD_STEP}")
+        env = children(children(guard_step[1:], 8)["env"][1:], 10)
+        for name, field in (("WORKFLOW_RUN_SHA", "head_sha"),
+                            ("WORKFLOW_RUN_CONCLUSION", "conclusion"),
+                            ("WORKFLOW_RUN_UPDATED_AT", "updated_at"),
+                            ("WORKFLOW_RUN_PATH", "path"),
+                            ("WORKFLOW_RUN_EVENT", "event")):
+            with self.subTest(name=name):
+                self.assertIn(name, env)
+                self.assertEqual(value(env[name]), "${{ github.event.workflow_run." + field + " }}")
+
     def test_drill_switch_reaches_the_guard_and_refuses_unrollbackable_runs(self):
         # The drill proves the fail-to-rollback chain, which exists only on
         # a deploy-mode run with takeover: anything else refuses in the
