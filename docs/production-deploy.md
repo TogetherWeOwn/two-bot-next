@@ -304,7 +304,7 @@ only, because the serving version was built by an older run.
 | `build_revision` and `build_id` are both `unknown` (not stamped) | Deploy: keep polling; fail at the end. Rollback: recorded as a pre-stamp version, not a failure, but only on 200 with gateway `ready`; otherwise keep polling, then fail |
 | `build_revision` is `unknown` and `build_id` is not | Keep polling; fail at the end |
 | `build_revision` or `build_id` is missing or not a string, or the body is not a JSON object | Keep polling; fail at the end |
-| JSON repeats an object key, nests past the depth bound, or `build_revision`/`build_id` has an unexpected shape | Keep polling; fail at the end with a fixed single-line reason that echoes no remote value |
+| Body exceeds 65,536 bytes, JSON repeats an object key, nests past the depth bound, or `build_revision`/`build_id` has an unexpected shape | Keep polling; fail at the end with a fixed single-line reason that echoes no remote value |
 | Any other status, including `000` (no answer) | Keep polling; fail at the end |
 
 A single 503 (gateway `starting`) poll never passes the gate — the 10-15
@@ -326,6 +326,13 @@ same stable gate on the restored build, uploads the evidence artifact, and
 still fails the run red. The rollback restores service; it never certifies
 the build. Without a takeover nothing moved, so there is nothing to restore;
 without a deploy or a snapshot the run just fails for the operator.
+
+Both gate curls enforce `--max-filesize 65536` (64 KiB). Any transfer
+failure counts as `000`, even if curl reports HTTP 200 and leaves a valid
+JSON prefix. The readiness judge independently reads at most 65,537 bytes
+and refuses over-cap evidence with `/readyz answered over the body cap`
+before UTF-8 decoding or JSON parsing; exact-cap valid evidence is still
+graded normally. This byte limit matches the staging probe's body cap.
 
 Remote identity shapes are validated before any value enters diagnostics:
 only `unknown`, a 40-character hex revision, or a bounded digits-digits
