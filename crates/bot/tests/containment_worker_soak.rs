@@ -22,9 +22,8 @@
 //!
 //! Everything else comes from crates that are already public: the
 //! durable store (`two_bot_core::containment_store`), the shared
-//! executor (`two_bot_discord::ActionExecutor`) and the shared mock
-//! Discord fixture included by path, exactly like the other bot
-//! integration tests.
+//! executor (`two_bot_discord::ActionExecutor`) and a loopback-only REST
+//! fixture containing just the surface these worker journeys use.
 //!
 //! # What is pinned
 //!
@@ -56,8 +55,7 @@
 //! per-test schema (same fence as the in-crate runtime tests).
 //! `DATABASE_URL` is never read.
 
-#[path = "../../discord/tests/common/mod.rs"]
-#[allow(dead_code)]
+#[path = "support/containment_rest.rs"]
 mod common;
 
 use std::collections::HashSet;

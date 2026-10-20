@@ -5,8 +5,8 @@ pub mod voice_rooms;
 
 // Worker-path runtimes: the staging-soak acceptance pins
 // `containment_runtime::{start, ContainmentSettings, SettingsSource}` as its
-// seam, and the binary consumes the same modules from here. Visibility widens
-// (`pub(crate)` -> `pub`) with no logic change.
+// seam. The binary compiles these same source files as crate-local modules.
+// Visibility widens (`pub(crate)` -> `pub`) with no logic change.
 pub mod containment_runtime;
 pub mod join_risk_runtime;
 pub mod raid_runtime;
