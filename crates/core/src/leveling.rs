@@ -339,8 +339,9 @@ pub const RANK_DISPLAY_NAME_LIMIT: usize = 512;
 
 /// Sanitize a display name for the `/rank` reply name slot (goodbye grade):
 /// fold newlines to spaces so the reply keeps its three template lines,
-/// neutralize mass mentions with the shared neutralizer, split mention pills
-/// and timestamps (`<@`, `<#`, `<:`, `<a:`, `<t:`) so they render literally, escape the
+/// neutralize mass mentions with the shared neutralizer, split mention pills,
+/// timestamps, slash-command and guild-navigation tokens (`<@`, `<#`, `<:`,
+/// `<a:`, `<t:`, `</`, `<id:`) so they render literally, escape the
 /// vote-reason markdown set, and cap the escaped output at
 /// [`RANK_DISPLAY_NAME_LIMIT`] characters. Plain names pass through
 /// byte-identical.
@@ -358,7 +359,9 @@ fn sanitize_rank_name(display_name: &str) -> String {
         .replace("<#", "<\u{200b}#")
         .replace("<:", "<\u{200b}:")
         .replace("<a:", "<\u{200b}a:")
-        .replace("<t:", "<\u{200b}t:");
+        .replace("<t:", "<\u{200b}t:")
+        .replace("</", "<\u{200b}/")
+        .replace("<id:", "<\u{200b}id:");
     let mut escaped = String::with_capacity(pills.len());
     for ch in pills.chars() {
         if matches!(ch, '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']') {
@@ -808,7 +811,7 @@ mod tests {
             .and_then(|line| line.strip_suffix("**"))
             .expect("rank name inside bold markers");
         assert!(rendered_slot.chars().count() <= RANK_DISPLAY_NAME_LIMIT);
-        for pill in ["<@", "<#", "<:", "<a:", "<t:"] {
+        for pill in ["<@", "<#", "<:", "<a:", "<t:", "</", "<id:"] {
             assert!(!rendered_slot.contains(pill));
         }
         let mut escaped = false;
@@ -838,6 +841,18 @@ mod tests {
         assert_rank_name_slot(
             "<t:0> <t:1618953630:R>",
             "<\u{200b}t:0> <\u{200b}t:1618953630:R>",
+        );
+    }
+
+    #[test]
+    fn rank_name_splits_slash_command_and_navigation_tokens_exactly() {
+        assert_rank_name_slot(
+            "</rank:123456789012345678>",
+            "<\u{200b}/rank:123456789012345678>",
+        );
+        assert_rank_name_slot(
+            "</rank stats:123456789012345678> <id:guide> <id:customize> <id:browse> <id:linked-roles>",
+            "<\u{200b}/rank stats:123456789012345678> <\u{200b}id:guide> <\u{200b}id:customize> <\u{200b}id:browse> <\u{200b}id:linked-roles>",
         );
     }
 
