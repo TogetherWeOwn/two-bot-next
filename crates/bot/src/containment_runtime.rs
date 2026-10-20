@@ -91,9 +91,73 @@ pub struct ContainmentSettings {
     pub staff_channel: Option<String>,
 }
 
+/// Key-only diagnostic: malformed configuration refuses the whole observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainmentTuningRefusal {
+    key: String,
+}
+
+impl ContainmentTuningRefusal {
+    fn new(key: &str) -> Self {
+        Self {
+            key: key.to_owned(),
+        }
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl std::fmt::Display for ContainmentTuningRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "containment tuning refused: {} present but unusable",
+            self.key
+        )
+    }
+}
+
+impl std::error::Error for ContainmentTuningRefusal {}
+
 impl ContainmentSettings {
-    /// A missing or unusable number falls back to the shipped default rather
-    /// than disabling containment. Present-but-bad values warn.
+    /// Live reader: absent/empty keys retain defaults; malformed values refuse
+    /// the whole read. No input value is retained in the diagnostic.
+    pub fn try_from_vars(vars: &HashMap<String, String>) -> Result<Self, ContainmentTuningRefusal> {
+        let seconds = |key: &str, default_ms: i64| match vars.get(key).map(|raw| raw.trim()) {
+            None | Some("") => Ok(default_ms),
+            Some(raw) => raw
+                .parse::<f64>()
+                .ok()
+                .and_then(seconds_to_ms)
+                .ok_or_else(|| ContainmentTuningRefusal::new(key)),
+        };
+        let window_ms = seconds(WINDOW_KEY, DEFAULT_CONTAINMENT_WINDOW_MS)?;
+        let max_age_ms = seconds(MAX_AGE_KEY, DEFAULT_CONTAINMENT_MAX_AGE_MS)?;
+        let heat_threshold = match vars.get(HEAT_KEY).map(|raw| raw.trim()) {
+            None | Some("") => DEFAULT_CONTAINMENT_HEAT_THRESHOLD,
+            Some(raw) => match raw.parse::<u64>() {
+                Ok(value) if value > 0 => value,
+                _ => return Err(ContainmentTuningRefusal::new(HEAT_KEY)),
+            },
+        };
+        let staff_channel = match vars.get(CHANNEL_KEY).map(|raw| raw.trim()) {
+            None | Some("") => None,
+            Some(raw) if is_snowflake(raw) => Some(raw.to_owned()),
+            Some(_) => return Err(ContainmentTuningRefusal::new(CHANNEL_KEY)),
+        };
+        Ok(Self {
+            window_ms,
+            max_age_ms,
+            heat_threshold,
+            staff_channel,
+        })
+    }
+
+    /// Legacy compatibility reader, only for tests. Live callers must refuse
+    /// malformed values rather than substitute defaults or log-only delivery.
+    #[cfg(test)]
     pub fn from_vars(vars: &HashMap<String, String>) -> Self {
         let seconds = |key: &str, default_ms: i64| match vars.get(key).map(|raw| raw.trim()) {
             None | Some("") => default_ms,
@@ -144,29 +208,50 @@ fn is_snowflake(value: &str) -> bool {
     (17..=20).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Cold user lists: comma-separated snowflakes, read once at boot.
-pub fn id_list(vars: &HashMap<String, String>, key: &str) -> HashSet<String> {
+/// Cold user lists: comma-separated snowflakes, read once at boot. One
+/// malformed nonempty entry refuses the entire list; never return a partial set.
+pub fn id_list(
+    vars: &HashMap<String, String>,
+    key: &str,
+) -> Result<HashSet<String>, ContainmentTuningRefusal> {
     vars.get(key)
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .map(str::to_owned)
-                .collect()
+        .into_iter()
+        .flat_map(|raw| raw.split(','))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            if is_snowflake(id) {
+                Ok(id.to_owned())
+            } else {
+                Err(ContainmentTuningRefusal::new(key))
+            }
         })
-        .unwrap_or_default()
+        .collect()
 }
 
-/// Where the live [`ContainmentSettings`] come from. `Sync` is required: the
-/// worker is shared by reference across awaits (`contain`, `plan`) and the
-/// spawned `run` future must stay `Send`.
+/// Compatibility seam for callers supplying already-constructed settings.
+/// Raw live configuration uses [`CheckedSettingsSource`] instead. `Sync` is
+/// required because the worker is shared by reference across awaits.
 pub trait SettingsSource: Send + Sync + 'static {
     fn current(&mut self) -> impl Future<Output = ContainmentSettings> + Send;
 }
 
+/// Live settings reads can refuse an observation before any durable claim.
+pub trait CheckedSettingsSource: Send + Sync + 'static {
+    fn try_current(
+        &mut self,
+    ) -> impl Future<Output = Result<ContainmentSettings, ContainmentTuningRefusal>> + Send;
+}
+
+impl<S: SettingsSource> CheckedSettingsSource for S {
+    async fn try_current(&mut self) -> Result<ContainmentSettings, ContainmentTuningRefusal> {
+        Ok(self.current().await)
+    }
+}
+
 /// Tuning and the staff channel are store-first (hot rows win over the
 /// deployment environment) and re-read at most every [`SETTINGS_MAX_AGE`]; a
-/// failed refresh keeps the last good values.
+/// failed refresh keeps the last outcome, including a refusal.
 pub(crate) struct StoreSettings {
     pool: PgPool,
     guild_id: String,
@@ -174,7 +259,7 @@ pub(crate) struct StoreSettings {
     max_age: Duration,
     cache: Option<SettingsCache>,
     checked: Option<Instant>,
-    last: Option<ContainmentSettings>,
+    last: Option<Result<ContainmentSettings, ContainmentTuningRefusal>>,
 }
 
 impl StoreSettings {
@@ -190,11 +275,9 @@ impl StoreSettings {
         }
     }
 
-    async fn refresh(&mut self) {
+    async fn refresh(&mut self) -> Result<ContainmentSettings, ContainmentTuningRefusal> {
         let store = SettingsStore::new(&self.pool);
         let stale = self.cache.as_ref();
-        // Bound to a local so the timeout future is dropped before the borrows
-        // above end (edition-2021 tail-expression temporaries).
         let loaded = tokio::time::timeout(SETTINGS_READ_MAX, async {
             let (revision, rows) = store.poll_marks().await?;
             if stale.is_some_and(|cache| !cache.needs_refresh(revision, rows)) {
@@ -204,30 +287,29 @@ impl StoreSettings {
             Ok(Some(SettingsCache::load(&snapshot)))
         })
         .await;
-        match loaded {
-            Ok(Ok(Some(cache))) => self.cache = Some(cache),
-            Ok(Ok(None)) => {}
-            Ok(Err(_)) | Err(_) => {
-                warn!("containment settings refresh failed; keeping the last good values");
-            }
-        }
+        self.apply_refresh(match loaded {
+            Ok(Ok(cache)) => Ok(cache),
+            Ok(Err(_)) | Err(_) => Err(()),
+        })
     }
-}
 
-impl SettingsSource for StoreSettings {
-    async fn current(&mut self) -> ContainmentSettings {
-        if let (Some(at), Some(last)) = (self.checked, &self.last) {
-            if at.elapsed() < self.max_age {
-                return last.clone();
+    fn apply_refresh(
+        &mut self,
+        loaded: Result<Option<SettingsCache>, ()>,
+    ) -> Result<ContainmentSettings, ContainmentTuningRefusal> {
+        match loaded {
+            Ok(Some(cache)) => self.cache = Some(cache),
+            Ok(None) => {}
+            Err(()) => {
+                warn!("containment settings refresh failed; keeping the last outcome");
+                if let Some(last) = &self.last {
+                    return last.clone();
+                }
             }
         }
-        self.checked = Some(Instant::now());
-        self.refresh().await;
         let mut vars = self.deployment.clone();
         if let Some(cache) = &self.cache {
-            // Tuning and the staff channel are live (`HOT_WIRED`): a stored
-            // row moves the next observation, a delete hands the key back to
-            // the boot-time deployment value.
+            // A stored row wins; deletion hands the key back to deployment.
             vars.extend(
                 cache
                     .env_snapshot(Some(self.guild_id.as_str()))
@@ -235,8 +317,20 @@ impl SettingsSource for StoreSettings {
                     .filter(|(key, _)| HOT_KEYS.contains(&key.as_str())),
             );
         }
-        let settings = ContainmentSettings::from_vars(&vars);
-        if self.last.as_ref() != Some(&settings) {
+        let settings = match ContainmentSettings::try_from_vars(&vars) {
+            Ok(settings) => settings,
+            Err(refusal) => {
+                if !matches!(&self.last, Some(Err(previous)) if previous.key() == refusal.key()) {
+                    error!(
+                        key = refusal.key(),
+                        "containment_tuning_refused: observations disabled"
+                    );
+                }
+                self.last = Some(Err(refusal.clone()));
+                return Err(refusal);
+            }
+        };
+        if !matches!(&self.last, Some(Ok(previous)) if previous == &settings) {
             info!(
                 window_ms = settings.window_ms,
                 max_age_ms = settings.max_age_ms,
@@ -248,8 +342,20 @@ impl SettingsSource for StoreSettings {
                 "containment_tuning"
             );
         }
-        self.last = Some(settings.clone());
-        settings
+        self.last = Some(Ok(settings.clone()));
+        Ok(settings)
+    }
+}
+
+impl CheckedSettingsSource for StoreSettings {
+    async fn try_current(&mut self) -> Result<ContainmentSettings, ContainmentTuningRefusal> {
+        if let (Some(at), Some(last)) = (self.checked, &self.last) {
+            if at.elapsed() < self.max_age {
+                return last.clone();
+            }
+        }
+        self.checked = Some(Instant::now());
+        self.refresh().await
     }
 }
 
@@ -291,7 +397,7 @@ struct ContainmentWorker<S> {
     entries: mpsc::Receiver<AuditLogObservation>,
 }
 
-impl<S: SettingsSource> ContainmentWorker<S> {
+impl<S: CheckedSettingsSource> ContainmentWorker<S> {
     async fn run(mut self) {
         // Verified identity before any entry: the staging application check
         // fails closed, and the bot ID seeds the protected-executor fence.
@@ -353,7 +459,11 @@ impl<S: SettingsSource> ContainmentWorker<S> {
             );
             return;
         };
-        let settings = self.settings.current().await;
+        // State changes are logged at the source, not once per entry. Refuse
+        // before building policy, claiming heat or attempting any Discord IO.
+        let Ok(settings) = self.settings.try_current().await else {
+            return;
+        };
         let mut policy = match ContainmentPolicy::new(
             settings.window_ms,
             settings.max_age_ms,
@@ -728,7 +838,7 @@ impl AuditEntryObserver for ContainmentRuntime {
 
 /// Spawn the worker. It ends when the last [`ContainmentRuntime`] reference
 /// drops. Identity is verified inside `run`, before any entry is claimed.
-pub fn start<S: SettingsSource>(
+pub fn start<S: CheckedSettingsSource>(
     guild_id: u64,
     settings: S,
     store: ContainmentStore,
@@ -767,12 +877,32 @@ pub fn start_from_env(
     executor: ActionExecutor,
     guild_id: u64,
 ) -> Option<Arc<dyn AuditEntryObserver>> {
-    let vars: HashMap<String, String> = std::env::vars().collect();
-    let fences = AntiNukeFences::from_vars(&vars, guild_id);
+    start_from_vars(pool, executor, guild_id, &std::env::vars().collect())
+}
+
+fn start_from_vars(
+    pool: PgPool,
+    executor: ActionExecutor,
+    guild_id: u64,
+    vars: &HashMap<String, String>,
+) -> Option<Arc<dyn AuditEntryObserver>> {
+    let fences = AntiNukeFences::from_vars(vars, guild_id);
     if !fences.enabled {
         info!("containment_disabled: no audit-entry observer without the fences");
         return None;
     }
+    let lists = id_list(vars, TRUSTED_KEY)
+        .and_then(|trusted| id_list(vars, PROTECTED_KEY).map(|protected| (trusted, protected)));
+    let (trusted, protected) = match lists {
+        Ok(lists) => lists,
+        Err(refusal) => {
+            error!(
+                key = refusal.key(),
+                "containment_tuning_refused: no audit-entry observer"
+            );
+            return None;
+        }
+    };
     info!(
         armed = fences.armed,
         "containment_fences: dry-run default; removals execute only when armed"
@@ -789,9 +919,13 @@ pub fn start_from_env(
         StoreSettings::new(pool.clone(), guild_id, deployment),
         ContainmentStore::from_pool(pool),
         executor,
-        id_list(&vars, TRUSTED_KEY),
-        id_list(&vars, PROTECTED_KEY),
+        trusted,
+        protected,
         fences.armed,
     );
     Some(runtime)
 }
+
+#[cfg(test)]
+#[path = "containment_tuning_runtime_tests.rs"]
+mod tuning_runtime_tests;
