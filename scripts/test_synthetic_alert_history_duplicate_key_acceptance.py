@@ -103,7 +103,7 @@ class HistoryDuplicateKeyAcceptanceTests(unittest.TestCase):
                               ("workflow_dispatch", "schedule")):
             with self.subTest(first=first, second=second):
                 body = ('{"total_count": 1, "workflow_runs": [{"id": 7,'
-                        f'"run_number": 1, "event": {first!r}, "event": {second!r}}}]}}')
+                        f'"run_number": 1, "event": {json.dumps(first)}, "event": {json.dumps(second)}}}]}}')
                 with self.served(body, valid_jobs_body()):
                     self.expect_history_error(lambda: history._get("/runs", "t"))
 
@@ -127,7 +127,7 @@ class HistoryDuplicateKeyAcceptanceTests(unittest.TestCase):
                 body = ('{"jobs": [{"name": ' + json.dumps(history.JOB_NAMES["staging"])
                         + ', "conclusion": "failure", "steps": [{"name": '
                         + json.dumps(name)
-                        + f', "conclusion": {first!r}, "conclusion": {second!r}}}]}}]}}')
+                        + f', "conclusion": {json.dumps(first)}, "conclusion": {json.dumps(second)}}}]}}]}}')
                 with self.served(valid_runs_body(), body):
                     self.expect_history_error(lambda: history._get("/jobs", "t"))
 
