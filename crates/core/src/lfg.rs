@@ -1470,13 +1470,14 @@ mod tests {
             22,
             "the #718 matrix must stay pinned"
         );
-        // Every LFG audit outcome code written by `lfg_interactions::audit`
+        // Every LFG audit outcome code written by the `lfg_interactions` adapter
         // (`posted`/`failed` on create, `closed`/`already_closed_or_missing`
         // on close, `signup_lfg` wire words on signup, `left`/`not_signed_up`
         // on leave; see the `LfgRequest` arms in
         // `crates/discord/src/lfg_interactions.rs`). Audit rows carry these
-        // codes plus snowflake IDs with `reason: None` — never titles or
-        // labels. The signup half is cross-checked against the real
+        // codes plus resource IDs, with no titles or labels in `reason`:
+        // Select receipts use a bounded request digest; create/close use None.
+        // The signup half is cross-checked against the real
         // `SignupOutcome` enum below; the create/close/leave codes live in
         // the discord adapter, so a new adapter outcome needs a matching
         // entry here by review.
