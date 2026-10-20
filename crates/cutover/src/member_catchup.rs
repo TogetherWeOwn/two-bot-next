@@ -50,8 +50,9 @@ pub struct ApplyReport {
 /// page). Every call issues exactly one wire request through `rest`, so
 /// `rest.requests()` agrees with the wire count.
 ///
-/// `next_after` is the last retained member's id, or `None` when no rows
-/// survive validation. Skipped rows do not supply a resume cursor.
+/// `next_after` is the last non-empty member id in the raw page, even when
+/// that row is skipped for a malformed bot flag. `None` means the page has
+/// no non-empty member ids (including the empty end-of-list page).
 pub async fn fetch_member_page(
     rest: &RestClient,
     guild_id: Id<GuildMarker>,
@@ -76,6 +77,7 @@ pub async fn fetch_member_page(
         .fetch_members_page_json(guild_id, limit, after_id)
         .await?;
     let mut members = Vec::with_capacity(raw.len());
+    let mut next_after = None;
     for value in &raw {
         let member_id = value
             .get("user")
@@ -86,6 +88,7 @@ pub async fn fetch_member_page(
         if member_id.is_empty() {
             continue;
         }
+        next_after = Some(member_id.clone());
         let joined_at = value
             .get("joined_at")
             .and_then(|v| v.as_str())
@@ -109,7 +112,6 @@ pub async fn fetch_member_page(
         });
     }
     let aggregate_count = members.len();
-    let next_after = members.last().map(|row| row.member_id.clone());
     Ok(MemberCatchupPage {
         members,
         aggregate_count,
