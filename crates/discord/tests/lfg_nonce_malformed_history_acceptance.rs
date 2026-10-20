@@ -92,6 +92,135 @@ fn assert_unavailable_without_raw_echo(result: &Result<Option<String>, DiscordEr
     );
 }
 
+fn noncanonical_identity_row(message_id: &str, author_id: &str) -> Value {
+    let mut row = valid_row(5002, BOT, Some(&nonce()));
+    row["id"] = json!(message_id);
+    row["author"]["id"] = json!(author_id);
+    row
+}
+
+fn bot_nonce_row(nonce: Value) -> Value {
+    let mut row = valid_row(5002, BOT, None);
+    row["nonce"] = nonce;
+    row
+}
+
+async fn assert_review_row_is_unreadable(mut row: Value, later_page: bool) {
+    row["content"] = json!(RAW_SENTINEL);
+    let mut history = Vec::new();
+    if later_page {
+        history.push(ScriptedResponse::json(200, valid_page(10_000, 100)));
+    }
+    history.push(ScriptedResponse::json(200, json!([row])));
+    let (result, mock) = recover(history).await;
+    let gets = history_gets(&mock);
+    mock.shutdown().await;
+    assert_eq!(gets.len(), if later_page { 2 } else { 1 });
+    if later_page {
+        assert!(gets[1].contains("before=9901"));
+    }
+    assert_unavailable_without_raw_echo(&result, "unreadable review row");
+    match result {
+        Err(DiscordError::Unavailable(message)) => {
+            assert_eq!(message, "unreadable message history");
+        }
+        other => panic!("expected fixed unreadable-history error, got {other:?}"),
+    }
+}
+
+// Separate tests keep every malformed form observable in the baseline RED run,
+// including rows reached only after a full, readable first page.
+macro_rules! unreadable_on_first_and_later_page {
+    ($first:ident, $later:ident, $row:expr) => {
+        #[tokio::test]
+        async fn $first() {
+            assert_review_row_is_unreadable($row, false).await;
+        }
+
+        #[tokio::test]
+        async fn $later() {
+            assert_review_row_is_unreadable($row, true).await;
+        }
+    };
+}
+
+unreadable_on_first_and_later_page!(
+    leading_zero_author_is_unreadable_on_first_page,
+    leading_zero_author_is_unreadable_on_later_page,
+    noncanonical_identity_row("5002", "01111")
+);
+unreadable_on_first_and_later_page!(
+    plus_author_is_unreadable_on_first_page,
+    plus_author_is_unreadable_on_later_page,
+    noncanonical_identity_row("5002", "+1111")
+);
+unreadable_on_first_and_later_page!(
+    leading_zero_message_is_unreadable_on_first_page,
+    leading_zero_message_is_unreadable_on_later_page,
+    noncanonical_identity_row("05002", "1111")
+);
+unreadable_on_first_and_later_page!(
+    plus_message_is_unreadable_on_first_page,
+    plus_message_is_unreadable_on_later_page,
+    noncanonical_identity_row("+5002", "1111")
+);
+unreadable_on_first_and_later_page!(
+    boolean_bot_nonce_is_unreadable_on_first_page,
+    boolean_bot_nonce_is_unreadable_on_later_page,
+    bot_nonce_row(json!(true))
+);
+unreadable_on_first_and_later_page!(
+    object_bot_nonce_is_unreadable_on_first_page,
+    object_bot_nonce_is_unreadable_on_later_page,
+    bot_nonce_row(json!({}))
+);
+unreadable_on_first_and_later_page!(
+    array_bot_nonce_is_unreadable_on_first_page,
+    array_bot_nonce_is_unreadable_on_later_page,
+    bot_nonce_row(json!([]))
+);
+unreadable_on_first_and_later_page!(
+    fractional_bot_nonce_is_unreadable_on_first_page,
+    fractional_bot_nonce_is_unreadable_on_later_page,
+    bot_nonce_row(json!(1.5))
+);
+
+#[tokio::test]
+async fn readable_optional_bot_nonces_and_foreign_malformed_nonces_prove_absence() {
+    let mut rows = vec![valid_row(5100, BOT, None)];
+    for nonce in [
+        Value::Null,
+        json!(0),
+        json!(42),
+        json!(-42),
+        json!(u64::MAX),
+        json!(""),
+        json!("readable-nonmatching-nonce"),
+    ] {
+        rows.push(bot_nonce_row(nonce));
+    }
+    for nonce in [json!(true), json!({}), json!([]), json!(1.5)] {
+        let mut row = valid_row(5101, OTHER_AUTHOR, None);
+        row["nonce"] = nonce;
+        rows.push(row);
+    }
+    for later_page in [false, true] {
+        let mut history = Vec::new();
+        if later_page {
+            history.push(ScriptedResponse::json(200, valid_page(10_000, 100)));
+        }
+        history.push(ScriptedResponse::json(200, json!(rows)));
+        let (result, mock) = recover(history).await;
+        let gets = history_gets(&mock);
+        mock.shutdown().await;
+        assert_eq!(result.expect("readable nonmatching history"), None);
+        assert_eq!(gets.len(), if later_page { 2 } else { 1 });
+        if later_page {
+            assert!(gets[1].contains("before=9901"));
+        }
+    }
+}
+
 #[tokio::test]
 async fn malformed_rows_on_first_short_page_are_unavailable_not_absent() {
     let cases: Vec<(&str, Value)> = vec![
@@ -446,6 +575,107 @@ mod routed {
         rt.handle(&create(id)).await.unwrap();
         drop(rt);
         mock
+    }
+
+    async fn assert_review_row_retains_post(id: u64, mut row: Value, later_page: bool) {
+        let db = TestDb::new().await;
+        row["content"] = json!(RAW_SENTINEL);
+        let mut history = Vec::new();
+        if later_page {
+            history.push(ScriptedResponse::json(200, valid_page(10_000, 100)));
+        }
+        history.push(ScriptedResponse::json(200, json!([row])));
+        let mock = ambiguous_create(&db.pool, id, history).await;
+        let post = format!("lfg-{id}");
+        let stored = store::get_lfg(&db.pool, GUILD, &post).await.unwrap();
+        let roles = store::list_lfg_roles(&db.pool, &post).await.unwrap();
+        let reply = last_reply(&mock);
+        let gets = history_gets(&mock);
+        let posts = channel_posts(&mock);
+        let requests = mock.requests();
+        mock.shutdown().await;
+        db.cleanup().await;
+
+        // Clean the disposable fixture even when the baseline deletes the post.
+        let stored = stored.expect("unreadable nonce evidence must retain the uncertain post");
+        assert!(
+            stored.message_id.is_none(),
+            "no recovered message is invented"
+        );
+        assert_eq!(
+            roles.len(),
+            2,
+            "the retained post keeps both configured roles"
+        );
+        assert!(reply.contains("acceptance is uncertain"), "got {reply:?}");
+        assert!(
+            !reply.contains(RAW_SENTINEL),
+            "no upstream content in replies"
+        );
+        assert_eq!(posts, 1, "no replacement channel POST");
+        assert_eq!(gets.len(), if later_page { 2 } else { 1 });
+        if later_page {
+            assert!(gets[1].contains("before=9901"));
+        }
+        let sent = requests
+            .iter()
+            .find(|request| {
+                request.method == "POST" && request.path.starts_with("/api/v10/channels/")
+            })
+            .expect("the ambiguous original channel POST was sent");
+        assert_eq!(body(sent)["nonce"], json!(lfg::lfg_nonce(&post)));
+        assert!(requests.iter().all(|request| request.method != "DELETE"));
+    }
+
+    async fn assert_noncanonical_identity_retention(later_page: bool) {
+        for (offset, (message_id, author_id)) in [
+            ("5002", "01111"),
+            ("5002", "+1111"),
+            ("05002", "1111"),
+            ("+5002", "1111"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = 7700 + offset as u64;
+            let mut row = noncanonical_identity_row(message_id, author_id);
+            row["nonce"] = json!(lfg::lfg_nonce(&format!("lfg-{id}")));
+            assert_review_row_retains_post(id, row, later_page).await;
+        }
+    }
+
+    async fn assert_malformed_bot_nonce_retention(later_page: bool) {
+        for (offset, nonce) in [json!(true), json!({}), json!([]), json!(1.5)]
+            .into_iter()
+            .enumerate()
+        {
+            assert_review_row_retains_post(7710 + offset as u64, bot_nonce_row(nonce), later_page)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs agent-testdb or the CI service container"]
+    async fn router_retains_noncanonical_identity_on_first_short_page() {
+        assert_noncanonical_identity_retention(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs agent-testdb or the CI service container"]
+    async fn router_retains_noncanonical_identity_on_later_page() {
+        assert_noncanonical_identity_retention(true).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs agent-testdb or the CI service container"]
+    async fn router_retains_malformed_bot_nonce_on_first_short_page() {
+        assert_malformed_bot_nonce_retention(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs agent-testdb or the CI service container"]
+    async fn router_retains_malformed_bot_nonce_on_later_page() {
+        assert_malformed_bot_nonce_retention(true).await;
     }
 
     #[tokio::test]
