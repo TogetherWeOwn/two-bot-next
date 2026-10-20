@@ -1103,8 +1103,8 @@ async fn queued_lfg_work_leaves_pool_connections_for_the_gateway() {
 // ── Saved-state outcomes when audit or message refresh fails ────────────────
 // Standalone acceptance for the documented non-atomic boundary: store
 // mutations commit through the pool before the separate announcement audit,
-// and the audit is not atomic with the mutation. A rejected audit surfaces
-// as failure (never a false success) with no refresh; a failed refresh keeps
+// and the audit is not atomic with the mutation. A rejected audit reports
+// the applied outcome and audit loss with no refresh; a failed refresh keeps
 // the saved mutation and says so. Direct-service replay of an audited signup
 // reuses the saved outcome without duplicating signup/audit rows or
 // resurrecting a member who left. (Routed gateway redelivery is not claimed
@@ -1163,7 +1163,7 @@ fn channel_requests(mock: &MockRest, method: &str) -> usize {
 
 #[tokio::test]
 #[ignore = "needs agent-testdb or the CI service container"]
-async fn rejected_signup_audit_keeps_mutation_without_refresh_or_success_claim() {
+async fn rejected_signup_audit_reports_saved_join_and_audit_loss_without_refresh() {
     let db = TestDb::new().await;
     let post = "lfg-8101";
     open_post_with_message(&db.pool, post, "5000").await;
@@ -1176,14 +1176,15 @@ async fn rejected_signup_audit_keeps_mutation_without_refresh_or_success_claim()
     reject_lfg_audits(&db.pool).await;
     assert!(rt.handle(&select(8101, post, 3333, "tank")).await.unwrap());
     allow_lfg_audits(&db.pool).await;
-    // The durable mutation remains, but the reply never claims audited success.
-    let reply = last_reply(&mock);
+    // Report the applied join without pretending the separate audit succeeded.
     assert_eq!(
-        reply,
-        "LFG operation failed; check the saved state before retrying."
+        last_reply(&mock),
+        "LFG joined. Audit could not be recorded; check the saved state before retrying."
     );
-    assert!(!reply.contains("joined"));
-    assert!(!reply.contains("audit"));
+    assert_eq!(
+        body(mock.requests().last().unwrap())["allowed_mentions"]["parse"],
+        json!([])
+    );
     // An independent pool sees the saved signup and the missing audit.
     let fresh = db.fresh_pool().await;
     let signups = store::list_lfg_signups(&fresh, post).await.unwrap();
@@ -1208,7 +1209,7 @@ async fn rejected_signup_audit_keeps_mutation_without_refresh_or_success_claim()
 
 #[tokio::test]
 #[ignore = "needs agent-testdb or the CI service container"]
-async fn rejected_close_audit_keeps_closure_without_refresh_or_success_claim() {
+async fn rejected_close_audit_reports_saved_closure_and_audit_loss_without_refresh() {
     let db = TestDb::new().await;
     let post = "lfg-8201";
     open_post_with_message(&db.pool, post, "5000").await;
@@ -1234,13 +1235,14 @@ async fn rejected_close_audit_keeps_closure_without_refresh_or_success_claim() {
         .await
         .unwrap());
     allow_lfg_audits(&db.pool).await;
-    let reply = last_reply(&mock);
     assert_eq!(
-        reply,
-        "LFG operation failed; check the saved state before retrying."
+        last_reply(&mock),
+        "LFG closed. Audit could not be recorded; check the saved state before retrying."
     );
-    assert!(!reply.contains("closed"));
-    assert!(!reply.contains("audit"));
+    assert_eq!(
+        body(mock.requests().last().unwrap())["allowed_mentions"]["parse"],
+        json!([])
+    );
     // The durable closure remains, verified through an independent pool.
     let fresh = db.fresh_pool().await;
     let stored = store::get_lfg(&fresh, GUILD, post).await.unwrap().unwrap();
@@ -1377,4 +1379,490 @@ async fn direct_replay_retries_refresh_without_duplicating_signup_audit_or_resur
     replay_mock.shutdown().await;
     fresh.close().await;
     db.cleanup().await;
+}
+
+// Real PostgreSQL counterparts to the offline acceptance suite. New cases use
+// the guarded disposable-database fixture and run in the normal db test lane.
+async fn durable_select_db() -> two_bot_testsupport::TestDatabase {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("test bootstrap required");
+    two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("disposable LFG test database")
+}
+
+async fn replay_post(pool: &sqlx::PgPool, id: &str, guild: &str) {
+    let post = lfg::LfgPost {
+        id: id.into(),
+        guild_id: guild.into(),
+        channel_id: CHANNEL.into(),
+        message_id: Some("5000".into()),
+        title: "Replay raid".into(),
+        starts_at: "2099-09-11T20:00:00Z".into(),
+        status: lfg::LfgStatus::Open,
+        created_by: "3333".into(),
+        created_at: "2026-09-30T00:00:00.000Z".into(),
+        closed_at: None,
+    };
+    let roles = lfg::spec_roles(
+        &post.id,
+        &lfg::parse_role_spec("tank:Tank:2,healer:Healer:2").unwrap(),
+    );
+    store::put_lfg(pool, &post, &roles, true).await.unwrap();
+}
+
+fn signup_action(post: &str, role: &str) -> lfg::LfgSelectAction {
+    lfg::LfgSelectAction::Signup {
+        post_id: post.into(),
+        role_key: role.into(),
+    }
+}
+
+fn leave_action(post: &str) -> lfg::LfgSelectAction {
+    lfg::LfgSelectAction::Leave {
+        post_id: post.into(),
+    }
+}
+
+// Compare complete rows, not just counts: a replay must not switch a role,
+// rewrite joined_at, close a post, or overwrite the original audit identity.
+async fn select_snapshot(pool: &sqlx::PgPool) -> Value {
+    sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+            'posts', (SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY to_jsonb(p)::text), '[]'::jsonb) FROM lfg_posts p),
+            'roles', (SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)::text), '[]'::jsonb) FROM lfg_roles r),
+            'signups', (SELECT coalesce(jsonb_agg(to_jsonb(s) ORDER BY to_jsonb(s)::text), '[]'::jsonb) FROM lfg_signups s),
+            'audits', (SELECT coalesce(jsonb_agg(to_jsonb(a) ORDER BY to_jsonb(a)::text), '[]'::jsonb) FROM announcements_audit_log a))",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn refuse_divergent_select(
+    original: lfg::LfgSelectAction,
+    divergent: lfg::LfgSelectAction,
+    guild: &str,
+    actor: &str,
+) {
+    let db = durable_select_db().await;
+    let posts = [("replay-a", GUILD), ("replay-b", GUILD)];
+    let leaving = matches!(&original, lfg::LfgSelectAction::Leave { .. });
+    for (post, guild) in posts {
+        replay_post(db.pool(), post, guild).await;
+        if leaving {
+            store::signup_lfg(
+                db.pool(),
+                guild,
+                post,
+                "tank",
+                "3333",
+                "2026-09-30T00:01:00Z",
+            )
+            .await
+            .unwrap();
+        }
+    }
+    if leaving {
+        // A different actor/target would have a real membership to remove.
+        store::signup_lfg(
+            db.pool(),
+            GUILD,
+            "replay-a",
+            "healer",
+            "3334",
+            "2026-09-30T00:01:00Z",
+        )
+        .await
+        .unwrap();
+    }
+    let mock = MockRest::start(vec![], ScriptedResponse::status(200)).await;
+    let executor =
+        ActionExecutor::with_proxy("lfg-test-token".into(), Some(mock.origin())).unwrap();
+    let service = LfgInteractions::new(db.pool().clone());
+    assert_eq!(
+        service
+            .execute(
+                &executor,
+                LfgRequest::Select(original),
+                GUILD,
+                "3333",
+                8501,
+                BOT
+            )
+            .await
+            .unwrap(),
+        if leaving { "LFG left." } else { "LFG joined." }
+    );
+    assert_eq!(channel_requests(&mock, "PATCH"), 1);
+    drop(service);
+    mock.shutdown().await;
+
+    // A new service AND independent pool exclude cooldown/process-local state.
+    let fresh = db.independent_pool().await.unwrap();
+    let before = select_snapshot(&fresh).await;
+    assert_eq!(before["audits"].as_array().unwrap().len(), 1);
+    let replay_mock = MockRest::start(vec![], ScriptedResponse::status(200)).await;
+    let executor =
+        ActionExecutor::with_proxy("lfg-test-token".into(), Some(replay_mock.origin())).unwrap();
+    let restarted = LfgInteractions::new(fresh.clone());
+    let result = restarted
+        .execute(
+            &executor,
+            LfgRequest::Select(divergent),
+            guild,
+            actor,
+            8501,
+            BOT,
+        )
+        .await;
+    let after = select_snapshot(&fresh).await;
+    let requests = replay_mock.requests();
+    replay_mock.shutdown().await;
+    drop(restarted);
+    fresh.close().await;
+    db.close().await.unwrap();
+    assert!(
+        result.is_err(),
+        "divergent Select reused an interaction: {result:?}"
+    );
+    assert_eq!(
+        after, before,
+        "divergent Select changed durable state or audit"
+    );
+    assert!(
+        requests.is_empty(),
+        "refused replay must not refresh or post"
+    );
+}
+
+macro_rules! durable_select_divergence {
+    ($name:ident, $original:expr, $divergent:expr, $guild:expr, $actor:expr) => {
+        #[tokio::test]
+        #[ignore = "needs TWO_TEST_DATABASE_URL disposable database"]
+        async fn $name() {
+            refuse_divergent_select($original, $divergent, $guild, $actor).await;
+        }
+    };
+}
+
+durable_select_divergence!(
+    durable_select_signup_binds_guild,
+    signup_action("replay-a", "tank"),
+    signup_action("replay-a", "tank"),
+    "9999",
+    "3333"
+);
+durable_select_divergence!(
+    durable_select_signup_binds_actor,
+    signup_action("replay-a", "tank"),
+    signup_action("replay-a", "tank"),
+    GUILD,
+    "3334"
+);
+durable_select_divergence!(
+    durable_select_signup_binds_target,
+    signup_action("replay-a", "tank"),
+    signup_action("replay-b", "tank"),
+    GUILD,
+    "3333"
+);
+durable_select_divergence!(
+    durable_select_signup_binds_role,
+    signup_action("replay-a", "tank"),
+    signup_action("replay-a", "healer"),
+    GUILD,
+    "3333"
+);
+durable_select_divergence!(
+    durable_select_leave_cannot_reuse_signup_identity,
+    signup_action("replay-a", "tank"),
+    leave_action("replay-a"),
+    GUILD,
+    "3333"
+);
+durable_select_divergence!(
+    durable_select_leave_binds_guild,
+    leave_action("replay-a"),
+    leave_action("replay-a"),
+    "9999",
+    "3333"
+);
+durable_select_divergence!(
+    durable_select_leave_binds_actor,
+    leave_action("replay-a"),
+    leave_action("replay-a"),
+    GUILD,
+    "3334"
+);
+durable_select_divergence!(
+    durable_select_leave_binds_target,
+    leave_action("replay-a"),
+    leave_action("replay-b"),
+    GUILD,
+    "3333"
+);
+durable_select_divergence!(
+    durable_select_signup_cannot_reuse_leave_identity,
+    leave_action("replay-a"),
+    signup_action("replay-a", "tank"),
+    GUILD,
+    "3333"
+);
+
+#[tokio::test]
+#[ignore = "needs TWO_TEST_DATABASE_URL disposable database"]
+async fn durable_select_identical_leave_replay_preserves_later_signup() {
+    let db = durable_select_db().await;
+    replay_post(db.pool(), "replay-a", GUILD).await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(200)).await;
+    let executor =
+        ActionExecutor::with_proxy("lfg-test-token".into(), Some(mock.origin())).unwrap();
+    let service = LfgInteractions::new(db.pool().clone());
+    for (id, action, reply) in [
+        (8601, signup_action("replay-a", "tank"), "LFG joined."),
+        (8602, leave_action("replay-a"), "LFG left."),
+        (8603, signup_action("replay-a", "healer"), "LFG joined."),
+    ] {
+        if id == 8603 {
+            // Leave is cooldown-exempt, but the same actor's next signup is not.
+            // This DB test uses an unpaused clock, so wait out the signup cooldown.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+        assert_eq!(
+            service
+                .execute(
+                    &executor,
+                    LfgRequest::Select(action),
+                    GUILD,
+                    "3333",
+                    id,
+                    BOT
+                )
+                .await
+                .unwrap(),
+            reply
+        );
+    }
+    drop(service);
+    mock.shutdown().await;
+    let fresh = db.independent_pool().await.unwrap();
+    let saved = store::list_lfg_signups(&fresh, "replay-a").await.unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].user_id, "3333");
+    assert_eq!(saved[0].role_key, "healer");
+    let before = select_snapshot(&fresh).await;
+    assert_eq!(before["audits"].as_array().unwrap().len(), 3);
+    let replay_mock = MockRest::start(vec![], ScriptedResponse::status(200)).await;
+    let executor =
+        ActionExecutor::with_proxy("lfg-test-token".into(), Some(replay_mock.origin())).unwrap();
+    let restarted = LfgInteractions::new(fresh.clone());
+    let result = restarted
+        .execute(
+            &executor,
+            LfgRequest::Select(leave_action("replay-a")),
+            GUILD,
+            "3333",
+            8602,
+            BOT,
+        )
+        .await;
+    let after = select_snapshot(&fresh).await;
+    let requests = replay_mock.requests();
+    replay_mock.shutdown().await;
+    drop(restarted);
+    fresh.close().await;
+    db.close().await.unwrap();
+    assert_eq!(result.unwrap(), "LFG left.");
+    assert_eq!(
+        after, before,
+        "an identical leave must not remove a later signup or append an audit"
+    );
+    assert_eq!(
+        requests.len(),
+        1,
+        "replay only refreshes the existing message"
+    );
+    assert_eq!(requests[0].method, "PATCH");
+    assert_eq!(requests[0].path, "/api/v10/channels/4444/messages/5000");
+    assert_eq!(body(&requests[0])["allowed_mentions"]["parse"], json!([]));
+    assert!(body(&requests[0])["content"]
+        .as_str()
+        .unwrap()
+        .contains("<@3333>"));
+}
+
+#[tokio::test]
+#[ignore = "needs TWO_TEST_DATABASE_URL disposable database"]
+async fn durable_select_legacy_null_reason_cannot_prove_request_identity() {
+    let db = durable_select_db().await;
+    replay_post(db.pool(), "replay-a", GUILD).await;
+    // Historical rows lack the role/action binding; matching the other fields
+    // and a prior joined outcome is not proof this request is identical.
+    sqlx::query("INSERT INTO announcements_audit_log
+        (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
+        VALUES ('lfg:signup:8701', $1, '3333', 'lfg.signup', 'replay-a', 'joined', NULL, '2026-09-30T00:01:00Z')")
+        .bind(GUILD)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let fresh = db.independent_pool().await.unwrap();
+    let before = select_snapshot(&fresh).await;
+    assert_eq!(before["audits"].as_array().unwrap().len(), 1);
+    assert!(before["audits"][0]["reason"].is_null());
+    assert_eq!(before["signups"], json!([]));
+    let mock = MockRest::start(vec![], ScriptedResponse::status(200)).await;
+    let executor =
+        ActionExecutor::with_proxy("lfg-test-token".into(), Some(mock.origin())).unwrap();
+    let service = LfgInteractions::new(fresh.clone());
+    let result = service
+        .execute(
+            &executor,
+            LfgRequest::Select(signup_action("replay-a", "tank")),
+            GUILD,
+            "3333",
+            8701,
+            BOT,
+        )
+        .await;
+    let after = select_snapshot(&fresh).await;
+    let requests = mock.requests();
+    mock.shutdown().await;
+    drop(service);
+    fresh.close().await;
+    db.close().await.unwrap();
+    assert!(
+        result.is_err(),
+        "legacy audit does not prove identical delivery: {result:?}"
+    );
+    assert_eq!(after, before);
+    assert!(
+        requests.is_empty(),
+        "legacy uncertainty must not refresh or post"
+    );
+}
+
+async fn wait_for_select_lock(pool: &sqlx::PgPool, lock_type: &str) -> bool {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+                 WHERE a.datname = current_database() AND NOT l.granted AND l.locktype = $1
+                 AND cardinality(pg_blocking_pids(l.pid)) > 0
+                 AND ($1 = 'advisory' OR (l.relation = 'announcements_audit_log'::regclass AND l.mode = 'RowExclusiveLock')))",
+            )
+            .bind(lock_type)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+#[ignore = "needs TWO_TEST_DATABASE_URL disposable database"]
+async fn durable_select_concurrent_different_posts_serialize_before_the_first_audit_exists() {
+    let db = durable_select_db().await;
+    replay_post(db.pool(), "replay-a", GUILD).await;
+    replay_post(db.pool(), "replay-b", GUILD).await;
+    let observer = db.independent_pool().await.unwrap();
+    let second_pool = db.independent_pool().await.unwrap();
+    // SHARE allows the replay's audit SELECT but blocks INSERT. The first
+    // mutation commits while its audit is absent: without an interaction lock,
+    // a differently-targeted request can mutate too, then queue for this table.
+    let mut audit_gate = observer.begin().await.unwrap();
+    sqlx::query("LOCK TABLE announcements_audit_log IN SHARE MODE")
+        .execute(&mut *audit_gate)
+        .await
+        .unwrap();
+    let mock = MockRest::start(vec![], ScriptedResponse::status(200)).await;
+    let first_service = LfgInteractions::new(db.pool().clone());
+    let first_executor =
+        ActionExecutor::with_proxy("lfg-test-token".into(), Some(mock.origin())).unwrap();
+    let first = tokio::spawn(async move {
+        first_service
+            .execute(
+                &first_executor,
+                LfgRequest::Select(signup_action("replay-a", "tank")),
+                GUILD,
+                "3333",
+                8801,
+                BOT,
+            )
+            .await
+    });
+    let first_waiting = wait_for_select_lock(&observer, "relation").await;
+    let before = select_snapshot(&observer).await;
+    let second_service = LfgInteractions::new(second_pool.clone());
+    let second_executor =
+        ActionExecutor::with_proxy("lfg-test-token".into(), Some(mock.origin())).unwrap();
+    let second = tokio::spawn(async move {
+        second_service
+            .execute(
+                &second_executor,
+                LfgRequest::Select(signup_action("replay-b", "tank")),
+                GUILD,
+                "3333",
+                8801,
+                BOT,
+            )
+            .await
+    });
+    // Observe a real PostgreSQL waiter, not a wall-clock guess or a local
+    // semaphore: services, pools and REST executors are independent.
+    let second_waiting = wait_for_select_lock(&observer, "advisory").await;
+    let while_waiting = select_snapshot(&observer).await;
+    let premature_requests = mock.requests();
+    // Always release the test-owned lock before assertions or joining workers.
+    audit_gate.commit().await.unwrap();
+    let first_result = first.await.unwrap();
+    let second_result = second.await.unwrap();
+    let after = select_snapshot(&observer).await;
+    let requests = mock.requests();
+    mock.shutdown().await;
+    second_pool.close().await;
+    observer.close().await;
+    db.close().await.unwrap();
+    assert!(
+        first_waiting,
+        "first service must reach the blocked audit INSERT"
+    );
+    assert_eq!(before["signups"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        before["audits"],
+        json!([]),
+        "race window has no replay receipt yet"
+    );
+    assert!(
+        second_waiting,
+        "same interaction on another post must wait on an advisory lock"
+    );
+    assert_eq!(
+        while_waiting, before,
+        "contender must not mutate before the first audit commits"
+    );
+    assert!(
+        premature_requests.is_empty(),
+        "no channel work before the audit"
+    );
+    assert_eq!(first_result.unwrap(), "LFG joined.");
+    assert!(
+        second_result.is_err(),
+        "contender must refuse the now-durable divergent receipt: {second_result:?}"
+    );
+    for key in ["posts", "roles", "signups"] {
+        assert_eq!(after[key], before[key], "contender changed {key}");
+    }
+    assert_eq!(after["audits"].as_array().unwrap().len(), 1);
+    assert_eq!(after["audits"][0]["target_key"], "replay-a");
+    assert_eq!(after["audits"][0]["outcome"], "joined");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "PATCH");
+    assert_eq!(requests[0].path, "/api/v10/channels/4444/messages/5000");
+    assert_eq!(body(&requests[0])["allowed_mentions"]["parse"], json!([]));
 }

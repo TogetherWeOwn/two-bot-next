@@ -17,6 +17,9 @@
 
 #![cfg(test)]
 
+#[path = "member_dispatch_authority_acceptance.rs"]
+mod member_dispatch_authority_acceptance;
+
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,7 +61,7 @@ use crate::command_runtime::{
 };
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::MemberRuntime;
-use crate::privacy_command::{privacy_action, PrivacyAction};
+use crate::privacy_command::{deletion_request_id, privacy_action, PrivacyAction};
 use crate::schedule_runtime::{schedule_options, schedule_remove_option};
 
 const GUILD: u64 = 2222;
@@ -1407,21 +1410,28 @@ fn member_slash(name: &str) -> Interaction {
     interaction
 }
 
+async fn member_refusal_database() -> two_bot_testsupport::TestDatabase {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap");
+    two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("disposable member refusal fixture")
+}
+
 #[tokio::test]
-async fn member_verbs_reach_executor_facts_then_fail_closed_without_db() {
-    // Every member verb routes through the shared router into the member
-    // consumer, which reads live guild facts over REST before touching the
-    // ledger. The mock fails that first read, so each verb must fail closed
-    // with exactly three wire calls (defer, guild read, reply edit) and never
-    // reach the connectionless lazy pool.
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn member_verbs_reach_executor_facts_then_fail_closed_with_audit() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    // Identity resolution fails before any authority/mutation. The failure
+    // must still persist an attributable denial, so this now needs a ledger.
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
-        let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+        let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
         runtime.on_interaction(&member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(requests.len(), 3, "{name}: defer, guild read, reply edit");
         assert_eq!(requests[1].method, "GET");
-        assert_eq!(requests[1].path, format!("/api/v10/guilds/{GUILD_S}"));
+        assert_eq!(requests[1].path, "/api/v10/users/@me");
         let reply = mock.deferred_reply();
         assert!(
             reply
@@ -1431,16 +1441,21 @@ async fn member_verbs_reach_executor_facts_then_fail_closed_without_db() {
         );
         mock.shutdown().await;
     }
+    let denied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM moderation_audit WHERE outcome = 'denied'")
+            .fetch_one(db.pool())
+            .await
+            .expect("refusal audit");
+    assert_eq!(denied, 5);
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
 async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
-    // Serialize with the website exact-delta `refused` tests in
-    // `internal_action_http::tests` (TOG-28482): this test records
-    // `kick/refused` (and the other member verbs) on the process-global
-    // registry via `preflight_refused`, and `cargo test --workspace --lib
-    // --bins` runs both modules as threads of one process.
+    // Keep process-global outcome assertions isolated from website tests.
     let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let json_response = |body: serde_json::Value| RestResponse {
             status: 200,
@@ -1449,27 +1464,31 @@ async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
         };
         let (mock, origin) = MockRest::start_script(vec![
             RestResponse::status(200),
-            json_response(serde_json::json!({
-                "owner_id": "5555",
-                "roles": [{"id": GUILD_S, "position": 0}],
-            })),
-            json_response(serde_json::json!({"user": {"id": "3333", "bot": false}, "roles": []})),
             json_response(serde_json::to_value(user(4444, true)).unwrap()),
-            json_response(serde_json::json!({"user": {"id": "4444"}, "roles": ["missing-role"]})),
+            json_response(serde_json::json!({
+                "id": GUILD_S, "owner_id": "5555",
+                "roles": [
+                    {"id": GUILD_S, "position": 0, "permissions": "0"},
+                    {"id": "101", "position": 50, "permissions": Permissions::all().bits().to_string()},
+                ],
+            })),
+            json_response(serde_json::json!({"user": {"id": "88", "bot": false}, "roles": ["101"]})),
+            json_response(serde_json::json!({"user": {"id": "3333", "bot": false}, "roles": []})),
+            json_response(serde_json::json!({"user": {"id": "4444", "bot": true}, "roles": ["9999"]})),
             RestResponse::status(200),
         ])
         .await;
-        let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+        let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
         runtime.on_interaction(&member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(
             requests.len(),
-            6,
-            "{name}: facts only, no mutation or DB claim"
+            7,
+            "{name}: facts and refusal audit only, no mutation or DB claim"
         );
-        assert!(requests[1..5].iter().all(|request| request.method == "GET"));
+        assert!(requests[1..6].iter().all(|request| request.method == "GET"));
         assert_eq!(
-            requests[4].path,
+            requests[5].path,
             format!("/api/v10/guilds/{GUILD_S}/members/4444")
         );
         assert!(mock.deferred_reply()["content"]
@@ -1478,12 +1497,22 @@ async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
             .contains("Moderation command failed"));
         mock.shutdown().await;
     }
+    let denied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM moderation_audit WHERE outcome = 'denied'")
+            .fetch_one(db.pool())
+            .await
+            .expect("refusal audit");
+    assert_eq!(denied, 5);
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
 async fn member_verbs_share_actor_cooldown_before_role_reads() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
     let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
-    let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+    let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
     runtime.on_interaction(&member_slash("ban")).await;
     for (index, name) in ["tempban", "kick", "timeout", "warn"]
         .into_iter()
@@ -1508,6 +1537,181 @@ async fn member_verbs_share_actor_cooldown_before_role_reads() {
         );
     }
     mock.shutdown().await;
+    db.close().await.expect("dispose fixture");
+}
+
+fn scripted_json(body: serde_json::Value) -> RestResponse {
+    RestResponse {
+        status: 200,
+        body: Some(body.to_string()),
+        delay: Duration::ZERO,
+    }
+}
+
+/// The reads one member verb makes before it can act, in issue order: the bot
+/// identity (cached after the first command), the guild, then the actor. The
+/// actor holds every permission at position 50; the bot sits at 100.
+fn authority_reads(first_command: bool) -> Vec<RestResponse> {
+    let mut reads = Vec::new();
+    if first_command {
+        reads.push(scripted_json(
+            serde_json::to_value(user(4444, true)).unwrap(),
+        ));
+    }
+    reads.push(scripted_json(serde_json::json!({
+        "id": GUILD_S, "owner_id": "5555",
+        "roles": [
+            {"id": GUILD_S, "position": 0, "permissions": "0"},
+            {"id": "101", "position": 50, "permissions": Permissions::all().bits().to_string()},
+            {"id": "103", "position": 100, "permissions": "0"},
+        ],
+    })));
+    reads.push(scripted_json(
+        serde_json::json!({"user": {"id": "88", "bot": false}, "roles": ["101"]}),
+    ));
+    reads
+}
+
+fn timed_member_slash(name: &str) -> Interaction {
+    let mut interaction = member_slash(name);
+    if name == "timeout" {
+        let Some(InteractionData::ApplicationCommand(data)) = &mut interaction.data else {
+            panic!("command fixture")
+        };
+        data.options
+            .push(option("duration_seconds", CommandOptionValue::Integer(60)));
+    }
+    interaction
+}
+
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn member_verbs_that_need_a_present_target_refuse_a_departed_one_without_effects() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    for name in ["kick", "timeout", "warn"] {
+        let mut script = vec![RestResponse::status(200)];
+        script.extend(authority_reads(true));
+        // A strict target-member 404 is a confirmed departure.
+        script.push(RestResponse::status(404));
+        script.push(RestResponse::status(200));
+        let (mock, origin) = MockRest::start_script(script).await;
+        let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
+        runtime.on_interaction(&timed_member_slash(name)).await;
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            6,
+            "{name}: defer, bot, guild, actor, target, reply; no bot-member read or effect"
+        );
+        assert!(requests[1..5].iter().all(|request| request.method == "GET"));
+        assert_eq!(
+            requests[4].path,
+            format!("/api/v10/guilds/{GUILD_S}/members/3333")
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.method != "GET" && r.path.starts_with("/api/v10/guilds/")),
+            "{name}: a departed target is never dispatched against"
+        );
+        assert_eq!(
+            mock.deferred_reply()["content"],
+            "That member is not in this server."
+        );
+        mock.shutdown().await;
+    }
+    let denied: Vec<(String, String)> =
+        sqlx::query_as("SELECT action, outcome FROM moderation_audit ORDER BY action")
+            .fetch_all(db.pool())
+            .await
+            .expect("refusal audit");
+    assert_eq!(
+        denied,
+        ["moderation.kick", "moderation.timeout", "moderation.warn"]
+            .map(|action| (action.to_owned(), "denied".to_owned())),
+        "exactly one denial per verb and no accepted audit"
+    );
+    let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_idempotency")
+        .fetch_one(db.pool())
+        .await
+        .expect("claim rows");
+    let warnings: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_warnings")
+        .fetch_one(db.pool())
+        .await
+        .expect("warning rows");
+    assert_eq!(
+        (claims, warnings),
+        (0, 0),
+        "refusal leaves no claim or warning"
+    );
+    db.close().await.expect("dispose fixture");
+}
+
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn a_completed_kick_replays_after_its_target_left_without_a_denial() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    let mut script = vec![RestResponse::status(200)];
+    script.extend(authority_reads(true));
+    script.push(scripted_json(serde_json::json!(
+        {"user": {"id": "3333", "bot": false}, "roles": []}
+    )));
+    script.push(scripted_json(
+        serde_json::json!({"user": {"id": "4444", "bot": true}, "roles": ["103"]}),
+    ));
+    script.push(RestResponse::status(204));
+    script.push(RestResponse::status(200));
+    // Redelivery of the same interaction: the kick removed the target, so its
+    // member read is now a strict 404.
+    script.push(RestResponse::status(200));
+    script.extend(authority_reads(false));
+    script.push(RestResponse::status(404));
+    script.push(RestResponse::status(200));
+    let (mock, origin) = MockRest::start_script(script).await;
+    let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
+    let interaction = member_slash("kick");
+    runtime.on_interaction(&interaction).await;
+    runtime.on_interaction(&interaction).await;
+    let requests = mock.requests();
+    let replies: Vec<String> = requests
+        .iter()
+        .filter(|r| r.method == "PATCH")
+        .map(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(replies, ["Kicked.", "Kicked. Already applied."]);
+    let kicks: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "DELETE" && r.path.starts_with("/api/v10/guilds/"))
+        .collect();
+    assert_eq!(kicks.len(), 1, "the replay dispatches nothing");
+    let audits: Vec<(String, String)> =
+        sqlx::query_as("SELECT action, outcome FROM moderation_audit")
+            .fetch_all(db.pool())
+            .await
+            .expect("audit rows");
+    assert_eq!(
+        audits,
+        [("moderation.kick".to_owned(), "kicked".to_owned())],
+        "one acceptance and no replay denial"
+    );
+    let state: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT state, outcome FROM moderation_idempotency WHERE guild_id = $1 AND idempotency_key = $2",
+    )
+    .bind(GUILD_S)
+    .bind(interaction.id.get().to_string())
+    .fetch_optional(db.pool())
+    .await
+    .expect("replay ledger");
+    assert_eq!(state, Some(("done".to_owned(), Some("kicked".to_owned()))));
+    mock.shutdown().await;
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]
@@ -8886,8 +9090,35 @@ fn privacy_interaction_in(guild: u64, member: u64, subcommand: Option<&str>) -> 
     interaction
 }
 
+fn privacy_request_interaction_in(
+    guild: u64,
+    member: u64,
+    subcommand: &str,
+    request_id: Option<&str>,
+) -> Interaction {
+    let nested = request_id
+        .map(|request_id| {
+            vec![option(
+                "request-id",
+                CommandOptionValue::String(request_id.to_owned()),
+            )]
+        })
+        .unwrap_or_default();
+    let mut interaction = from_member(
+        slash(
+            "privacy",
+            Some(CHANNEL),
+            vec![option(subcommand, CommandOptionValue::SubCommand(nested))],
+        ),
+        member,
+        Permissions::empty(),
+    );
+    interaction.guild_id = Some(Id::new(guild));
+    interaction
+}
+
 #[test]
-fn privacy_action_decodes_only_the_three_known_subcommands() {
+fn privacy_action_decodes_known_analytics_and_deletion_subcommands() {
     assert_eq!(
         privacy_action(&privacy_interaction(88, Some("opt-out"))),
         PrivacyAction::OptOut
@@ -8899,6 +9130,18 @@ fn privacy_action_decodes_only_the_three_known_subcommands() {
     assert_eq!(
         privacy_action(&privacy_interaction(88, Some("status"))),
         PrivacyAction::Status
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("delete"))),
+        PrivacyAction::DeletionRequest
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("deletion-status"))),
+        PrivacyAction::DeletionStatus
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("deletion-receipt"))),
+        PrivacyAction::DeletionReceipt
     );
     // Missing options, a non-subcommand value and an unknown name all
     // refuse before any database access.
@@ -8924,6 +9167,48 @@ fn privacy_action_decodes_only_the_three_known_subcommands() {
     let mut component = privacy_interaction(88, Some("opt-out"));
     component.data = None;
     assert_eq!(privacy_action(&component), PrivacyAction::Invalid);
+}
+
+#[test]
+fn deletion_status_and_receipt_accept_only_a_nested_request_id_string() {
+    let request_id = "del-0123456789abcdef";
+    let nested = vec![option(
+        "deletion-status",
+        CommandOptionValue::SubCommand(vec![option(
+            "request-id",
+            CommandOptionValue::String(request_id.to_owned()),
+        )]),
+    )];
+    let interaction = from_member(
+        slash("privacy", Some(CHANNEL), nested),
+        88,
+        Permissions::empty(),
+    );
+    assert_eq!(deletion_request_id(&interaction), Some(request_id));
+    let unrelated = privacy_request_interaction_in(
+        100000000000000431,
+        100000000000000432,
+        "delete",
+        Some(request_id),
+    );
+    assert_eq!(deletion_request_id(&unrelated), None);
+
+    let malformed = from_member(
+        slash(
+            "privacy",
+            Some(CHANNEL),
+            vec![option(
+                "deletion-receipt",
+                CommandOptionValue::SubCommand(vec![option(
+                    "request-id",
+                    CommandOptionValue::Integer(123),
+                )]),
+            )],
+        ),
+        88,
+        Permissions::empty(),
+    );
+    assert_eq!(deletion_request_id(&malformed), None);
 }
 
 /// `/privacy` end to end through gateway dispatch: `opt-out` purges the
@@ -9156,6 +9441,174 @@ async fn privacy_command_purges_suppresses_receipts_and_reenables_through_dispat
         assert!(!content.contains("token-"), "no interaction token echoes");
         assert!(!content.contains("@everyone"), "no mass mentions");
     }
+    mock.shutdown().await;
+    db.close().await.expect("drop own disposable database");
+}
+
+/// `/privacy` deletion commands cross the real gateway dispatcher with the
+/// interaction-derived guild/member pair; another member cannot read status or
+/// the completed receipt. Completion is synthesized only inside this disposable
+/// database so the test does not enable retention execution or run the scheduler.
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb and mock REST only"]
+async fn privacy_deletion_dispatch_binds_request_status_and_receipt_to_invoker() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test bootstrap URL");
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .expect("migrated test database; no credential fallback");
+    const PRIVACY_GUILD: u64 = 100000000000000431;
+    const MEMBER_A: u64 = 100000000000000432;
+    const MEMBER_B: u64 = 100000000000000433;
+    const DELETE_INTERACTION: u64 = 100000000000000434;
+    const NEXT_DELETE_INTERACTION: u64 = 100000000000000435;
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
+    let mut privacy_gates = gates(false, false);
+    privacy_gates.configured_guild = Some(PRIVACY_GUILD);
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor,
+        router_with_commands(privacy_gates),
+        PRIVACY_GUILD,
+        false,
+    );
+
+    let mut delete = privacy_request_interaction_in(PRIVACY_GUILD, MEMBER_A, "delete", None);
+    delete.id = Id::new(DELETE_INTERACTION);
+    runtime.on_interaction(&delete).await;
+    let request: (String, String, String, String) = sqlx::query_as(
+        "SELECT request_id, guild_id, user_id, status FROM retention_deletion_requests \
+         WHERE guild_id = $1 AND user_id = $2",
+    )
+    .bind(PRIVACY_GUILD.to_string())
+    .bind(MEMBER_A.to_string())
+    .fetch_one(db.pool())
+    .await
+    .expect("live dispatch queued a requester-bound deletion");
+    assert_eq!(request.1, PRIVACY_GUILD.to_string());
+    assert_eq!(request.2, MEMBER_A.to_string());
+    assert_eq!(request.3, "pending");
+
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            "deletion-status",
+            Some(&request.0),
+        ))
+        .await;
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_B,
+            "deletion-status",
+            Some(&request.0),
+        ))
+        .await;
+
+    // Simulate only the settled ledger state needed to exercise receipt reads;
+    // no erasure, purge, scheduler, or production database is involved.
+    sqlx::query(
+        "UPDATE retention_deletion_requests \
+         SET status = 'completed', completed_at = clock_timestamp(), receipt_id = 'test-receipt' \
+         WHERE request_id = $1",
+    )
+    .bind(&request.0)
+    .execute(db.pool())
+    .await
+    .expect("fixture marks this disposable-ledger row completed");
+    runtime.on_interaction(&delete).await;
+    let retried_requests: Vec<(String, String)> = sqlx::query_as(
+        "SELECT request_id, status FROM retention_deletion_requests \
+         WHERE guild_id = $1 AND user_id = $2",
+    )
+    .bind(PRIVACY_GUILD.to_string())
+    .bind(MEMBER_A.to_string())
+    .fetch_all(db.pool())
+    .await
+    .expect("read ledger after retrying the same interaction");
+    assert_eq!(
+        retried_requests,
+        vec![(request.0.clone(), "completed".to_owned())],
+        "same-interaction retry reuses the completed request without inserting a row"
+    );
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            "deletion-receipt",
+            Some(&request.0),
+        ))
+        .await;
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_B,
+            "deletion-receipt",
+            Some(&request.0),
+        ))
+        .await;
+
+    // Change only the interaction id: a new tap must not reuse the completed
+    // request even though the authenticated guild and member are unchanged.
+    let mut next_delete = delete.clone();
+    next_delete.id = Id::new(NEXT_DELETE_INTERACTION);
+    runtime.on_interaction(&next_delete).await;
+    let requests: Vec<(String, String)> = sqlx::query_as(
+        "SELECT request_id, status FROM retention_deletion_requests \
+         WHERE guild_id = $1 AND user_id = $2",
+    )
+    .bind(PRIVACY_GUILD.to_string())
+    .bind(MEMBER_A.to_string())
+    .fetch_all(db.pool())
+    .await
+    .expect("read ledger after a distinct deletion interaction");
+    assert_eq!(requests.len(), 2, "a distinct tap queues a second request");
+    assert!(
+        requests.contains(&(request.0.clone(), "completed".to_owned())),
+        "the original completed request remains settled"
+    );
+    let (next_request_id, next_status) = requests
+        .iter()
+        .find(|(request_id, _)| request_id != &request.0)
+        .expect("the new interaction has a different request id");
+    assert_eq!(next_status, "pending");
+
+    let edits: Vec<serde_json::Value> = mock
+        .requests()
+        .iter()
+        .filter(|request| request.method == "PATCH" && request.path.ends_with("/@original"))
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    assert_eq!(
+        edits.len(),
+        7,
+        "each dispatched command completes its defer"
+    );
+    assert!(edits[0]["content"].as_str().unwrap().contains("pending"));
+    assert!(edits[1]["content"].as_str().unwrap().contains("pending"));
+    assert_eq!(
+        edits[2]["content"], "Privacy command failed; try again.",
+        "another member cannot read the request status"
+    );
+    let retry_reply = edits[3]["content"].as_str().unwrap();
+    assert!(retry_reply.contains(&request.0));
+    assert!(retry_reply.contains("already accepted"));
+    assert!(retry_reply.contains("check its current status"));
+    assert!(!retry_reply.contains("queued"));
+    assert!(edits[4]["content"]
+        .as_str()
+        .unwrap()
+        .contains("erasable rows in the member erasure plan"));
+    assert_eq!(
+        edits[5]["content"], "Privacy command failed; try again.",
+        "another member cannot read the completion receipt"
+    );
+    let next_reply = edits[6]["content"].as_str().unwrap();
+    assert!(next_reply.contains("queued as pending"));
+    assert!(next_reply.contains(next_request_id));
+    assert!(!next_reply.contains(&request.0));
     mock.shutdown().await;
     db.close().await.expect("drop own disposable database");
 }

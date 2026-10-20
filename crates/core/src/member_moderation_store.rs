@@ -255,6 +255,32 @@ impl MemberModerationStore for PgMemberModerationStore {
         Ok(ClaimState::InFlight)
     }
 
+    async fn completed_outcome(
+        &self,
+        guild_id: &str,
+        key: &str,
+        hash: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.ensure_guild(guild_id)?;
+        let row = sqlx::query(
+            "SELECT outcome FROM moderation_idempotency
+             WHERE guild_id = $1 AND idempotency_key = $2
+               AND request_hash = $3 AND state = 'done'",
+        )
+        .bind(&self.guild_id)
+        .bind(key)
+        .bind(hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_error)?;
+        row.map(|row| {
+            row.try_get::<Option<String>, _>("outcome")
+                .map_err(db_error)?
+                .ok_or_else(|| StoreError::new("completed claim has no outcome"))
+        })
+        .transpose()
+    }
+
     async fn complete(
         &self,
         guild_id: &str,

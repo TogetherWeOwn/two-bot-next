@@ -3129,6 +3129,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
+    def test_lfg_runtime_regressions_receive_disposable_database_url(self):
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-stores"]
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "LFG actual-router and mock-Discord regressions"
+        )
+        # The fixture guard rejects any URL whose database is not two_bot_test_*.
+        self.assertEqual(
+            step["env"]["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        # Main may add more targets to this shared step; pin its LFG target and
+        # serial ignored-test tail without freezing the entire command line.
+        self.assertRegex(
+            step["run"],
+            r"--test lfg_interactions(?: --test \S+)* -- --ignored --test-threads=1",
+        )
+
     def test_runtime_postgres_wal_budget_is_bounded(self):
         # Keep the broader runtime-lane budget from main; the smaller target is
         # specific to the longer rust-tests coverage replay.
@@ -3455,6 +3473,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn(
             "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only",
             main_sweep,
+        )
+        ignored_sweep = [run for run in sweeps if "-- --ignored" in run][0]
+        self.assertIn(
+            "--skip list_is_guild_scoped_selector_shaped_and_read_only",
+            ignored_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
         self.assertEqual(len(guarded), 14)

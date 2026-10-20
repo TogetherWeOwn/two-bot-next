@@ -10257,6 +10257,15 @@ fn applied(trace: &Trace) -> bool {
         .any(|entry| entry == "config_apply")
 }
 
+fn applied_count(trace: &Trace) -> usize {
+    trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.as_str() == "config_apply")
+        .count()
+}
+
 #[test]
 fn parse_export_and_import_attachment_option() {
     let export = with_user(
@@ -10567,6 +10576,58 @@ async fn import_confirm_applies() {
     assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
     assert_eq!(*shared.lock().unwrap(), full_config());
     assert!(applied(&trace));
+}
+
+/// `/setup` then `/import` confirm round-trip through constructed interactions.
+///
+/// An admin reads the status panel, uploads a configuration file, previews
+/// the diff, and confirms: the stored configuration equals the upload and
+/// the apply lands exactly once, with the panel still answering after.
+/// Drives the real `handle_voice_interaction_with` arms with constructed
+/// slash and component inputs; no guild, network, or database.
+#[tokio::test]
+async fn setup_then_import_confirm_round_trip_through_interactions() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    // Baseline: /setup answers the admin panel before the import.
+    let setup = with_user(
+        voice_interaction(Some(command_data("setup", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let (owned, panel) = handle_import_capture(&runtime, &setup, Some(&inventory)).await;
+    assert!(owned, "voice owns the /setup callback");
+    assert!(!response_text(&panel.expect("setup panel")).is_empty());
+
+    // Upload: /import previews the diff with confirm/cancel buttons.
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (owned, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    assert!(owned, "voice owns the /import callback");
+    let preview = preview.expect("preview");
+    assert!(!applied(&trace), "preview writes nothing");
+    let (confirm_id, _) = preview_buttons(&preview);
+
+    // Confirm: the component press applies the upload exactly once.
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned, "voice owns the confirm callback");
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert_eq!(*shared.lock().unwrap(), full_config());
+    assert_eq!(applied_count(&trace), 1, "one apply per confirm");
+
+    // Replay: pressing Confirm again expires instead of applying twice.
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned, "voice owns the replayed confirm callback");
+    let replayed = response_text(&response.expect("expired replay"));
+    assert!(replayed.contains("expired"), "{replayed}");
+    assert_eq!(applied_count(&trace), 1, "no second apply");
+    assert_eq!(*shared.lock().unwrap(), full_config());
+
+    // The panel still answers with content after the import lands.
+    let (owned, panel) = handle_import_capture(&runtime, &setup, Some(&inventory)).await;
+    assert!(owned, "voice still owns /setup after the import");
+    assert!(!response_text(&panel.expect("post-import panel")).is_empty());
 }
 
 #[tokio::test]
@@ -11666,6 +11727,132 @@ async fn sink_never_answers_kick_without_the_router() {
         "no callback, got {calls:?}"
     );
     assert!(replies.completed.lock().unwrap().is_empty());
+}
+
+/// Every ballot button's custom ID plus its disabled state, in render order.
+fn ballot_button_states(response: &InteractionResponse) -> Vec<(String, bool)> {
+    let mut states = Vec::new();
+    let Some(data) = response.data.as_ref() else {
+        return states;
+    };
+    let Some(components) = data.components.as_ref() else {
+        return states;
+    };
+    for component in components {
+        let Component::ActionRow(row) = component else {
+            continue;
+        };
+        for inner in &row.components {
+            let Component::Button(button) = inner else {
+                continue;
+            };
+            states.push((
+                button.custom_id.clone().unwrap_or_default(),
+                button.disabled,
+            ));
+        }
+    }
+    states
+}
+
+/// Vote-kick open/vote/close round-trip through constructed interactions.
+///
+/// Drives the real `handle_voice_interaction` arms with a `/kick` slash
+/// command followed by Yes-ballot component presses: the open renders the
+/// public ballot, the second Yes reaches strict majority (2/3) and closes
+/// the vote Passed with disabled buttons, and a further ballot replays the
+/// terminal Passed instead of reopening. The queued room-scoped
+/// deny/disconnect enforcement is pinned at worker level by
+/// `strict_majority_passes_and_enforces_on_that_room_only`; no guild,
+/// network, or database here.
+#[tokio::test]
+async fn vote_kick_open_vote_close_round_trip_through_interactions() {
+    const VOTER_B: u64 = 302;
+    const VOTER_C: u64 = 304;
+    let trace = Trace::default();
+    let runtime = kick_room_runtime(
+        &trace,
+        true,
+        vec![
+            voice_member_in(KICK_VOTER, KICK_ROOM),
+            voice_member_in(VOTER_B, KICK_ROOM),
+            voice_member_in(KICK_TARGET, KICK_ROOM),
+            voice_member_in(VOTER_C, KICK_ROOM),
+        ],
+    );
+
+    // Open: /kick from an occupant renders the public ballot.
+    let open = kick_sink_interaction(KICK_TARGET, KICK_VOTER);
+    let vote_id = open.id.get();
+    let (owned, ballot) = handle_capture(&runtime, &open).await;
+    assert!(owned, "voice owns the /kick callback");
+    let ballot = ballot.expect("ballot reply");
+    assert_eq!(
+        ballot.kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    let content = response_text(&ballot);
+    assert!(content.contains("<@303>"), "{content}");
+    assert!(content.contains("too loud"), "{content}");
+    assert!(content.contains("2/3 needed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&ballot),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), false),
+            (vote_button_id(vote_id, VoteBallot::No), false),
+        ]
+    );
+
+    // First Yes: still active, buttons live.
+    let first = component_interaction(&vote_button_id(vote_id, VoteBallot::Yes), None, KICK_VOTER);
+    let (owned, response) = handle_capture(&runtime, &first).await;
+    assert!(owned, "voice owns the ballot callback");
+    let response = response.expect("first ballot update");
+    assert_eq!(response.kind, InteractionResponseType::UpdateMessage);
+    let content = response_text(&response);
+    assert!(content.contains("2/3 needed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&response),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), false),
+            (vote_button_id(vote_id, VoteBallot::No), false),
+        ],
+        "active ballot keeps both live buttons"
+    );
+
+    // Second Yes: strict majority closes the vote Passed, buttons disabled.
+    let second = component_interaction(&vote_button_id(vote_id, VoteBallot::Yes), None, VOTER_B);
+    let (owned, response) = handle_capture(&runtime, &second).await;
+    assert!(owned, "voice owns the closing ballot callback");
+    let response = response.expect("closing ballot update");
+    assert_eq!(response.kind, InteractionResponseType::UpdateMessage);
+    let content = response_text(&response);
+    assert!(content.contains("Vote passed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&response),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), true),
+            (vote_button_id(vote_id, VoteBallot::No), true),
+        ],
+        "closed ballot keeps both buttons, disabled"
+    );
+
+    // Replay: a further ballot stays terminal instead of reopening.
+    let replay = component_interaction(&vote_button_id(vote_id, VoteBallot::Yes), None, VOTER_C);
+    let (owned, response) = handle_capture(&runtime, &replay).await;
+    assert!(owned, "voice owns the replay ballot callback");
+    let response = response.expect("replay update");
+    assert_eq!(response.kind, InteractionResponseType::UpdateMessage);
+    let content = response_text(&response);
+    assert!(content.contains("Vote passed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&response),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), true),
+            (vote_button_id(vote_id, VoteBallot::No), true),
+        ],
+        "replay keeps the closed Passed shell"
+    );
 }
 
 // ---- lifecycle-outcome signals (offline cutover verification) ----

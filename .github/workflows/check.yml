@@ -284,6 +284,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rollback_readiness_probe.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rollback_readiness_input_limits_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill_observation_acceptance.py' -v
 
       - name: staging E2E run-record template (offline)
         run: |
@@ -844,10 +845,10 @@ jobs:
           # share tables and locks, so parallel runs race and
           # --ignore-run-fail would then drop their coverage silently.
           # The reference-docs regen never runs in CI: it rewrites committed docs.
-          # The publication regression and the game-report acceptance have
-          # their own guarded DBs (dedicated step below / agent_test re-run);
-          # never feed them the round-trip/bootstrap URL here, mirroring the
-          # integration step's skips so their guards don't fail the sweep.
+          # These guarded acceptance tests need their own DB URLs: the
+          # publication regression and game report run in dedicated steps;
+          # reengagement runs below against agent_test. Keep them out of the
+          # bootstrap sweep so their database guards are exercised correctly.
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail --no-report -- \
             --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump \
@@ -858,9 +859,9 @@ jobs:
           # misattributes as real flakes. The dedicated re-run below stays the
           # fail-closed gate.
           export MEMBER_TESTDB=agent-testdb
-          # stream_live_store's disposable-DB tests accept only the exact agent_test
-          # URL and refuse the bootstrap database by design, so the sweep skips them;
-          # the agent_test re-run below and the feeds-db job run them.
+          # stream_live_store now accepts the bootstrap URL too. Run its ignored
+          # DB cases once in the fail-closed agent_test replay below instead of
+          # duplicating them in this failure-tolerant sweep.
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail \
             --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs \
@@ -872,7 +873,8 @@ jobs:
             --skip stale_unposted_claim_is_taken_over_atomically \
             --skip started_claim_is_never_reclaimed_even_when_stale \
             --skip started_send_that_provably_failed_releases_for_the_retry \
-            --skip reclaiming_a_missing_key_claims_it_fresh
+            --skip reclaiming_a_missing_key_claims_it_fresh \
+            --skip list_is_guild_scoped_selector_shaped_and_read_only
           # Guarded channel suites accept the exact agent_test URL and the
           # workspace bootstrap URL (they always connect to agent_test with
           # an isolated schema). The sweep above already runs them green, and
@@ -1269,6 +1271,8 @@ jobs:
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
       - name: LFG actual-router and mock-Discord regressions
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: >-
           cargo test -p two-bot-discord --features db --locked --test lfg_interactions --test lfg_nonce_malformed_history_acceptance -- --ignored --test-threads=1
 

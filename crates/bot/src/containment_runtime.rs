@@ -41,7 +41,7 @@ use two_bot_core::containment::{
     plan_quarantine, quarantine_outcome, ContainmentAlert, ContainmentDisposition,
     ContainmentIncident, ContainmentIncidentState, ContainmentPolicy, ContainmentReason,
     ContainmentRole, DestructiveAction, DestructiveAuditEvent, QuarantineFailure, QuarantinePlan,
-    DEFAULT_CONTAINMENT_HEAT_THRESHOLD, DEFAULT_CONTAINMENT_MAX_AGE_MS,
+    QuarantineRefusal, DEFAULT_CONTAINMENT_HEAT_THRESHOLD, DEFAULT_CONTAINMENT_MAX_AGE_MS,
     DEFAULT_CONTAINMENT_WINDOW_MS,
 };
 use two_bot_core::containment_store::{ContainmentStore, EventClaim, IncidentClaim};
@@ -260,9 +260,10 @@ fn processing_now_ms(fallback_ms: i64) -> i64 {
         .unwrap_or(fallback_ms)
 }
 
-/// Fail closed: any malformed role (or a non-array body) refuses the whole
-/// snapshot, so a dropped managed or higher-than-bot role can never let the
-/// plan remove the others against the whole-plan preflight rule.
+/// Fail closed on malformed fields rather than dropping individual roles.
+/// The core planner additionally validates identities, hierarchy positions,
+/// baseline presence and coverage of both fetched held-role sets before it
+/// can produce any removals or an empty-plan success.
 fn role_snapshot(body: &serde_json::Value) -> Option<Vec<ContainmentRole>> {
     let roles = body.as_array()?;
     roles
@@ -539,7 +540,17 @@ impl<S: SettingsSource> ContainmentWorker<S> {
         };
         match plan_quarantine(guild_id, &executor_roles, &bot_roles, &snapshot, dry_run) {
             QuarantinePlan::DryRun => PlanOutcome::DryRun,
-            QuarantinePlan::Refused { .. } => {
+            QuarantinePlan::Refused {
+                reason: QuarantineRefusal::InvalidEvidence,
+                ..
+            } => {
+                error!("containment_refused: role evidence incomplete or contradictory");
+                PlanOutcome::Refused
+            }
+            QuarantinePlan::Refused {
+                reason: QuarantineRefusal::ManagedRole | QuarantineRefusal::Hierarchy,
+                ..
+            } => {
                 error!("containment_refused: hierarchy or managed role blocks removal");
                 PlanOutcome::Refused
             }

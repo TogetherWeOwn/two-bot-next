@@ -348,7 +348,7 @@ Set where new rooms appear and the first room number
 
 ## `/privacy`
 
-Manage your analytics privacy for this server.
+Manage your analytics privacy and deletion requests for this server.
 
 - Default permissions: Everyone (no default permission gate)
 - Available in DMs: false
@@ -358,6 +358,11 @@ Manage your analytics privacy for this server.
 | `opt-out` | subcommand | false | — | — | — | — | Delete your stored activity for this server and stop future analytics persistence. |
 | `opt-in` | subcommand | false | — | — | — | — | Resume analytics persistence for this server (already-deleted rows are not restored). |
 | `status` | subcommand | false | — | — | — | — | Show whether you are opted out and this server's analytics switches. |
+| `delete` | subcommand | false | — | — | — | — | Request deletion of your stored data for this server. |
+| `deletion-status` | subcommand | false | — | — | — | — | Show the status of your deletion request. |
+| `deletion-status request-id` | string | true | — | — | 128 | — | The request id returned when you requested deletion. |
+| `deletion-receipt` | subcommand | false | — | — | — | — | Show the completed receipt for your deletion request. |
+| `deletion-receipt request-id` | string | true | — | — | 128 | — | The request id returned when you requested deletion. |
 
 ## `/private`
 
