@@ -703,8 +703,11 @@ jobs:
           # coverage lane replays the database suites. max_wal_size is a soft
           # checkpoint target, not a hard ceiling: heavy WAL can exceed it, so
           # keep recycling bounded with headroom for relation files and segment
-          # creation. The pre/post suite reports bracket the run for tuning.
-          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
+          # creation. Run 39379404168 filled the tmpfs with 496 MiB of WAL
+          # plus 27 databases during coverage. Start checkpoints sooner without
+          # increasing memory or changing durability. This remains a soft target;
+          # the pre/post suite reports bracket the run for tuning.
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '256MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
           createdb -h agent-testdb -U agent_test two_bot_test_ci
@@ -727,7 +730,7 @@ jobs:
               'fsync': 'on',
               'full_page_writes': 'on',
               'synchronous_commit': 'on',
-              'max_wal_size': '512MB',
+              'max_wal_size': '256MB',
               'min_wal_size': '64MB',
           }
           fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)

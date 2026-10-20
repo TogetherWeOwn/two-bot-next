@@ -2732,14 +2732,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
-    def assert_wal_reload_ordering_is_pinned(self, run):
+    def assert_wal_reload_ordering_is_pinned(self, run, max_wal_size="512MB"):
         # Order is load-bearing both ways: the ALTERs must precede the
         # reload (ALTER SYSTEM only writes postgresql.auto.conf, which the
         # reload reads), and the reload must precede the first createdb,
         # since the bootstrap databases are created later in this same step.
         reload = run.index("pg_reload_conf()")
         self.assertLess(
-            run.index("ALTER SYSTEM SET max_wal_size = '512MB'"),
+            run.index(f"ALTER SYSTEM SET max_wal_size = '{max_wal_size}'"),
             reload,
             "max_wal_size ALTER must precede pg_reload_conf()",
         )
@@ -2754,6 +2754,29 @@ class WorkflowTests(unittest.TestCase):
             "pg_reload_conf() must precede the first createdb",
         )
 
+    def test_coverage_wal_leaves_room_for_fixture_databases_without_more_memory(self):
+        # Run 39379404168 exhausted the 1 GiB tmpfs with 496 MiB of WAL
+        # and 27 databases. Coverage needs a smaller checkpoint target, not
+        # more service memory or weaker durability settings.
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        options = job["services"]["agent-testdb"]["options"]
+        self.assertIn("--tmpfs /var/lib/postgresql:rw,size=1073741824", options)
+        self.assertIn("--memory 2147483648", options)
+        self.assertIn("--memory-swap 2147483648", options)
+        prepare = next(
+            step for step in job["steps"]
+            if step.get("name") == "Prepare isolated test databases"
+        )
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '256MB'", prepare["run"])
+        verify = next(
+            step for step in job["steps"]
+            if step.get("name") == "Verify disposable Postgres defaults"
+        )
+        for key, value in (("fsync", "on"), ("full_page_writes", "on"),
+                           ("synchronous_commit", "on"), ("max_wal_size", "256MB")):
+            self.assertIn(f"'{key}': '{value}'", verify["run"])
+        self.assertIn("if settings != expected:", verify["run"])
+
     def test_rust_test_postgres_wal_budget_is_bounded(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
         prepare = next(
@@ -2764,11 +2787,11 @@ class WorkflowTests(unittest.TestCase):
             step for step in job["steps"]
             if step.get("name") == "Verify disposable Postgres defaults"
         )
-        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '256MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
-        self.assert_wal_reload_ordering_is_pinned(prepare["run"])
-        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assert_wal_reload_ordering_is_pinned(prepare["run"], max_wal_size="256MB")
+        self.assertIn("'max_wal_size': '256MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_tmpfs_postgres_wal_budget_is_bounded_in_every_lane(self):
@@ -2787,7 +2810,8 @@ class WorkflowTests(unittest.TestCase):
                     step for step in job["steps"]
                     if step.get("name") == "Verify disposable Postgres defaults"
                 )
-                self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+                max_wal_size = "256MB" if job_id == "rust-tests" else "512MB"
+                self.assertIn(f"ALTER SYSTEM SET max_wal_size = '{max_wal_size}'", prepare["run"])
                 self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
                 self.assertIn("pg_reload_conf()", prepare["run"])
                 # Reload-before-ALTER writes auto.conf but never applies it;
@@ -2801,7 +2825,7 @@ class WorkflowTests(unittest.TestCase):
                     run.index("ALTER SYSTEM SET min_wal_size"),
                     run.index("pg_reload_conf()"),
                 )
-                self.assertIn("'max_wal_size': '512MB'", verify["run"])
+                self.assertIn(f"'max_wal_size': '{max_wal_size}'", verify["run"])
                 self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_nextest_lane_bounds_tmpfs_wal_and_reports_headroom(self):
