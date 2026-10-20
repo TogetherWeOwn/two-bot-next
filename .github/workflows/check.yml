@@ -270,16 +270,18 @@ jobs:
 
       - name: soak evidence parser (offline, fixtures only)
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_evidence.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p '*soak*evidence*.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_gate5_outage.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_watch_checkpoint_doc_conformance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_voice_config_apply_doc_conformance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_sanitize_evidence_rows.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_stdout_read.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_stdout_read_acceptance.py' -v
 
       - name: cutover rollback-readiness probe and freeze drill (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rollback_readiness_probe.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rollback_readiness_input_limits_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill.py' -v
 
       - name: staging E2E run-record template (offline)
@@ -287,6 +289,7 @@ jobs:
           python3 scripts/check_run_record.py --record scripts/fixtures/staging_e2e_run_record_mock.json --allow-mock
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_no_echo_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_condition_shapes.py' -v
 
       - name: Validate voice template fixtures (hermetic, no renderer)
         run: |
@@ -699,14 +702,14 @@ jobs:
         id: prepare_test_databases
         run: |
           # The database service stores data and WAL on a 1 GiB tmpfs. The HARD
-          # coverage lane replays the database suites. max_wal_size is a soft
-          # checkpoint target, not a hard ceiling: heavy WAL can exceed it, so
-          # keep recycling bounded with headroom for relation files and segment
-          # creation. Run 39355954244 retained 496MB of WAL plus fixture data
-          # and exhausted this tmpfs at a 512MB target. Use 128MB in all bounded
-          # lanes; retain durability, service limits and pre/post evidence.
+          # coverage replay exhausted the previous 512 MB soft WAL target
+          # (run 39360867142). max_wal_size is a soft checkpoint target, not a
+          # hard ceiling: heavy WAL can still exceed it, so checkpoint earlier
+          # and leave room for relation files and transient segments. Do not
+          # raise the memory ceiling or relax fsync, full_page_writes or
+          # synchronous_commit. The pre/post suite reports bracket the run.
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '128MB'"
-          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '32MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
           createdb -h agent-testdb -U agent_test two_bot_test_ci
           createdb -h agent-testdb -U agent_test two_next_backup_ci
@@ -729,7 +732,7 @@ jobs:
               'full_page_writes': 'on',
               'synchronous_commit': 'on',
               'max_wal_size': '128MB',
-              'min_wal_size': '64MB',
+              'min_wal_size': '32MB',
           }
           fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
           settings = json.loads(subprocess.check_output([
@@ -1169,7 +1172,7 @@ jobs:
           # with headroom for relation files and segment creation, mirroring
           # the rust-tests lane. The pre/post suite reports bracket the run
           # for future budget tuning.
-          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '128MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
           createdb -h agent-testdb -U agent_test two_bot_test_ci
@@ -1191,7 +1194,7 @@ jobs:
               'fsync': 'on',
               'full_page_writes': 'on',
               'synchronous_commit': 'on',
-              'max_wal_size': '128MB',
+              'max_wal_size': '512MB',
               'min_wal_size': '64MB',
           }
           fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
@@ -1254,7 +1257,7 @@ jobs:
 
       - name: LFG actual-router and mock-Discord regressions
         run: >-
-          cargo test -p two-bot-discord --features db --locked --test lfg_interactions -- --ignored --test-threads=1
+          cargo test -p two-bot-discord --features db --locked --test lfg_interactions --test lfg_nonce_malformed_history_acceptance -- --ignored --test-threads=1
 
       - name: leveling gateway and interaction integration (CI service only)
         env:
@@ -1631,7 +1634,7 @@ jobs:
           # it, so keep recycling bounded with headroom for relation files and
           # segment creation (same bound as the rust-tests and stores lanes).
           # The pre/post suite reports bracket the run for future budget tuning.
-          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '128MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
           createdb -h agent-testdb -U agent_test two_bot_test_ci
@@ -1653,7 +1656,7 @@ jobs:
               'fsync': 'on',
               'full_page_writes': 'on',
               'synchronous_commit': 'on',
-              'max_wal_size': '128MB',
+              'max_wal_size': '512MB',
               'min_wal_size': '64MB',
           }
           fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
@@ -1693,7 +1696,10 @@ jobs:
         run: cargo test -p two-bot --locked join_risk_runtime_ -- --include-ignored
 
       - name: containment runtime acceptance (mock Discord and CI service only)
-        run: cargo test -p two-bot --locked containment_runtime_ -- --include-ignored
+        run: cargo test -p two-bot --locked --lib --bins containment_worker_ -- --include-ignored
+
+      - name: containment worker-path soak (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked --test containment_worker_soak -- --include-ignored
 
       - name: Raid cohort query (CI service container only)
         env:
@@ -2434,8 +2440,8 @@ jobs:
         run: cargo +nightly-2026-10-01 fetch --locked
       # Builds all twenty-five libFuzzer targets. No campaign or generated corpus
       # output; the existing weekly run replays the bounded eventsub_delivery,
-      # helix_token, and custom_command_template seeds below. Bounded vote_kick
-      # and helix_token smokes are manual (README).
+      # helix_token, custom_command_template, and fb_page_events seeds below.
+      # Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -2443,16 +2449,17 @@ jobs:
       - name: Compile-only fuzz build (no execution)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz build
-      # Bounded seed replay, eventsub_delivery, helix_token and
-      # custom_command_template: `-runs=0`
+      # Bounded seed replay, eventsub_delivery, helix_token,
+      # custom_command_template, and fb_page_events: `-runs=0`
       # executes each committed corpus seed exactly once (plus the target's
       # fixed matrix) and exits without fuzzing. A signing-key drift between
       # the harness and production, a token-contract drift between the
       # helix_token oracle and the parser, a template-contract drift between
-      # the custom_command_template oracle and the renderer, or seed
-      # misrouting panics an assertion here instead of passing a
-      # compile-only gate. Compile stays the only gate for the other
-      # twenty-two targets.
+      # the custom_command_template oracle and the renderer, a
+      # challenge/envelope-contract drift between the fb_page_events oracles
+      # and the front door, or seed misrouting panics an assertion here
+      # instead of passing a compile-only gate. Compile stays the only gate
+      # for the other twenty-one targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
@@ -2462,6 +2469,9 @@ jobs:
       - name: Seed replay for custom_command_template (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run custom_command_template -- -runs=0 -timeout=10 -rss_limit_mb=2048
+      - name: Seed replay for fb_page_events (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run fb_page_events -- -runs=0 -timeout=10 -rss_limit_mb=2048
 
   worker:
     name: worker check
@@ -2544,7 +2554,7 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_ownership_status.py -v
       - name: Verify staging redirect smoke (offline fixtures)
         if: needs.job-inputs.outputs.worker != 'false'
-        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_redirect_smoke.py -v
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s ../scripts -p 'test_staging_redirect_smoke*.py' -v
       - name: Verify staging automation read smoke (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
       - name: Verify staging voice smoke (offline fixtures)
@@ -2576,6 +2586,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_smoke_run.py -v
       - name: Verify staging events read (offline fixtures, no database)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_events_read.py -v
+      - name: Verify staging event evidence semantics (offline fixtures, no database)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_events_read_acceptance.py -v
       - name: Verify cutover acceptance probes (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_qa_cutover_probes.py -v
       - name: Verify cutover freeze drill (offline fixtures)

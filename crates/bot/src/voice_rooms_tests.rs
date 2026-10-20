@@ -7,8 +7,12 @@ use std::sync::Mutex;
 mod admission_config_acceptance;
 #[path = "voice_admission_spawn_tests.rs"]
 mod admission_spawn;
+#[path = "voice_boot_settings_acceptance_tests.rs"]
+mod boot_settings_acceptance;
 #[path = "voice_cold_authority_tests.rs"]
 mod cold_authority;
+#[path = "voice_creation_receipt_acceptance_tests.rs"]
+mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_empty_grace_override_tests.rs"]
@@ -19,6 +23,8 @@ mod invite_override;
 mod invite_responder_wiring;
 #[path = "voice_join_requests_tests.rs"]
 mod join;
+#[path = "voice_join_grant_witness_acceptance_tests.rs"]
+mod join_grant_witness_acceptance;
 #[path = "voice_kick_tests.rs"]
 mod kick;
 #[path = "voice_rooms_limit_tests.rs"]
@@ -704,7 +710,12 @@ impl RoomPersistence for Store {
     async fn join_grants(&self, _: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
         Ok(self.join_grants.lock().unwrap().clone())
     }
-    async fn save_join_grant(&self, _: u64, room: u64, member: u64) -> Result<bool, StoreError> {
+    async fn save_join_grant(
+        &self,
+        _: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<JoinGrantIntent, StoreError> {
         self.trace
             .lock()
             .unwrap()
@@ -713,15 +724,20 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         if !self.rooms.lock().unwrap().contains_key(&room) {
-            return Ok(false);
+            return Ok(JoinGrantIntent::RoomMissing);
         }
-        self.join_grants
+        let inserted = self
+            .join_grants
             .lock()
             .unwrap()
             .entry(room)
             .or_default()
             .insert(member);
-        Ok(true)
+        Ok(if inserted {
+            JoinGrantIntent::Fresh
+        } else {
+            JoinGrantIntent::Retained
+        })
     }
     async fn remove_join_grant(&self, _: u64, room: u64, member: u64) -> Result<(), StoreError> {
         self.trace
@@ -785,6 +801,8 @@ struct Http {
     written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
     refused_notices: Mutex<Vec<NoticeTarget>>,
+    /// Notice targets answering a per-route 429 instead of a refusal.
+    rate_limited_notices: Mutex<Vec<NoticeTarget>>,
     /// V3 join-request prompts posted in a room's chat, and the scripted
     /// errors (one per attempt) the next sends fail with.
     prompts: Mutex<Vec<SentPrompt>>,
@@ -849,6 +867,7 @@ impl Http {
             written_overwrites: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             refused_notices: Mutex::new(Vec::new()),
+            rate_limited_notices: Mutex::new(Vec::new()),
             prompts: Mutex::new(Vec::new()),
             prompt_errors: Mutex::new(VecDeque::new()),
             next_message: Mutex::new(9_000),
@@ -1311,6 +1330,12 @@ impl RoomWrites for Http {
         content: &str,
         mention_role: Option<u64>,
     ) -> Result<(), RoomHttpError> {
+        if self.rate_limited_notices.lock().unwrap().contains(&target) {
+            return Err(RoomHttpError::RateLimited {
+                retry_after_ms: 1_000,
+                global: false,
+            });
+        }
         if self.refused_notices.lock().unwrap().contains(&target) {
             return Err(RoomHttpError::AccessDenied);
         }
@@ -11170,6 +11195,77 @@ async fn notices_fall_back_from_system_channel_to_owner_dm_to_creator_chat() {
         .push(NoticeTarget::DirectMessage(OWNER));
     assert!(worker.send_notices(NOTICE_REPEAT_INTERVAL_MS).await);
     assert_eq!(sent(&worker)[1].0, NoticeTarget::Channel(CREATOR));
+}
+
+#[tokio::test]
+async fn configured_channel_failure_warns_then_falls_back() {
+    let settings = LoggingSettings {
+        channel_id: Some(650),
+        mention_role_id: Some(NOTICE_ROLE),
+        ..LoggingSettings::default()
+    };
+    let mut worker = failed_worker(settings, Some(SYSTEM_CHANNEL)).await;
+
+    // A working configured channel stays silent: no fallback warn.
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    assert!(worker.send_notices(0).await);
+    assert_eq!(sent(&worker)[0].0, NoticeTarget::Channel(650));
+    let quiet = global.text()[before..].to_owned();
+    assert!(
+        !quiet.contains("voice notice configured channel failed; trying fallback"),
+        "success stays silent: {quiet}"
+    );
+
+    // A rate limit is a retry, not a misconfiguration: the fallback still
+    // delivers and no warn fires. Kept in this test because the capture is
+    // process-wide and only this test emits the warn, so a sibling's line
+    // cannot land in these silent windows.
+    worker
+        .http
+        .rate_limited_notices
+        .lock()
+        .unwrap()
+        .push(NoticeTarget::Channel(650));
+    let before = global.text().len();
+    assert!(worker.send_notices(NOTICE_REPEAT_INTERVAL_MS).await);
+    let notices = sent(&worker);
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices[1].0, NoticeTarget::Channel(SYSTEM_CHANNEL));
+    let throttled = global.text()[before..].to_owned();
+    assert!(
+        !throttled.contains("voice notice configured channel failed; trying fallback"),
+        "a rate limit stays silent: {throttled}"
+    );
+
+    // A failing configured channel warns once, then the fallback delivers
+    // with the mention intact.
+    worker.http.rate_limited_notices.lock().unwrap().clear();
+    worker
+        .http
+        .refused_notices
+        .lock()
+        .unwrap()
+        .push(NoticeTarget::Channel(650));
+    let before = global.text().len();
+    assert!(worker.send_notices(2 * NOTICE_REPEAT_INTERVAL_MS).await);
+    let notices = sent(&worker);
+    assert_eq!(notices.len(), 3);
+    assert_eq!(notices[2].0, NoticeTarget::Channel(SYSTEM_CHANNEL));
+    assert_eq!(notices[2].2, Some(NOTICE_ROLE));
+    let logged = global.text()[before..].to_owned();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("voice notice configured channel failed; trying fallback"))
+        .expect("a configured-channel failure warns before falling back");
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains(&format!("guild=\"{GUILD}\"")), "{line}");
+    assert!(line.contains("op=\"send_notice\""), "{line}");
+    assert!(line.contains("outcome=\"discord\""), "{line}");
+    assert!(
+        !line.contains("/setup"),
+        "the warn carries no notice text: {line}"
+    );
 }
 
 #[tokio::test]

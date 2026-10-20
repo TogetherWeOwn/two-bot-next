@@ -1749,10 +1749,13 @@ def differences(before, after, path=""):
 
 
 class ShellStepTests(unittest.TestCase):
-    def bash(self, script, cwd=ROOT, **env):
+    def bash(self, script, cwd=ROOT, curl_script=None, **env):
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             bin_dir = Path(tmp) / "bin"
             bin_dir.mkdir()
+            if curl_script is not None:
+                (bin_dir / "curl").write_text(curl_script)
+                (bin_dir / "curl").chmod(0o755)
             (bin_dir / "sleep").write_text("#!/bin/sh\nexit 0\n")
             (bin_dir / "sleep").chmod(0o755)
             step, summary = Path(tmp) / "step.sh", Path(tmp) / "summary"
@@ -1803,6 +1806,29 @@ class ShellStepTests(unittest.TestCase):
         self.assertEqual(worker.count("/readyz"), 1 + 18)
         self.assertEqual(worker.count("/health"), 1 + 18)
         self.assertEqual({agent for _, agent in worker.hits}, {AGENT})
+
+    def test_curl_size_failure_with_200_and_valid_prefix_never_passes(self):
+        # curl can report HTTP 200 and leave a valid JSON prefix when its
+        # body cap aborts the transfer. The exit status must still fail closed.
+        curl_script = f"#!{sys.executable}\n" + textwrap.dedent('''\
+            import os, pathlib, sys
+            args = sys.argv[1:]
+            pathlib.Path(args[args.index("-o") + 1]).write_text(os.environ["PREFIX"])
+            print("200", end="")
+            sys.exit(63 if args[-1].endswith(os.environ["FAILED_PATH"]) else 0)
+            ''')
+        for endpoint in ("/health", "/readyz"):
+            for mode in ("deploy", "rollback"):
+                with self.subTest(endpoint=endpoint, mode=mode):
+                    code, summary, _ = self.bash(
+                        GATE, cwd=WRANGLER_DIR, curl_script=curl_script,
+                        PRODUCTION_URL="https://fixture.invalid", MODE=mode, SHA=SHA,
+                        GITHUB_RUN_ID="700", GITHUB_RUN_ATTEMPT="1",
+                        PREFIX=report(), FAILED_PATH=endpoint,
+                    )
+                    self.assertEqual(code, 1, summary)
+                    self.assertIn("Gate failed: no fully-passing answer", summary)
+                    self.assertNotIn("stable 18/18 polls", summary)
 
     def test_parked_gateway_never_passes(self):
         # The 10-15 incident: a crash-looping build answered 503 parked and
@@ -2121,9 +2147,9 @@ class ReadyzVerdictTests(unittest.TestCase):
             self.assertNotIn("payload", message)
 
     def test_decoder_overflow_is_refused_without_a_traceback(self):
-        # Deep enough to overflow the C JSON decoder itself, so json.loads
-        # raises RecursionError before the iterative depth check is reached.
-        body = "[" * 100000
+        # Deep enough to overflow the C JSON decoder itself, but below the
+        # body cap, so RecursionError precedes the iterative depth check.
+        body = "[" * 10_000
         for mode in ("deploy", "rollback"):
             code, message = self.judge("200", body, mode=mode)
             self.assertEqual(code, 1, message)

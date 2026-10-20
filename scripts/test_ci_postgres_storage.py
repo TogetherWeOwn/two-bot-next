@@ -33,12 +33,20 @@ SCRIPTS = [
     for tail in VERIFY_TAILS
 ]
 PREPARES = [tail.split("\n      - name: ", 1)[0] for tail in PREPARE_TAILS]
-SCRIPT = SCRIPTS[0]
 NEXTEST_VERIFY_TAILS = NEXTEST_WORKFLOW_TEXT.split("      - name: Verify disposable Postgres defaults\n")[1:]
 NEXTEST_SCRIPT = textwrap.dedent(
     NEXTEST_VERIFY_TAILS[0].split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
 )
 POSTGRES_LANES = ("rust-tests", "ignored-db-stores", "ignored-db-runtime")
+# Coverage replay needs earlier checkpoints on the same 1 GiB tmpfs. Only
+# its WAL targets differ; all four probes must enforce the same safety checks.
+WAL_BUDGETS = {
+    "rust-tests": ("128MB", "32MB"),
+    "ignored-db-stores": ("512MB", "64MB"),
+    "ignored-db-runtime": ("512MB", "64MB"),
+    "nextest": ("512MB", "64MB"),
+}
+PROBES = list(zip(POSTGRES_LANES, SCRIPTS)) + [("nextest", NEXTEST_SCRIPT)]
 
 
 def job_text(job_key):
@@ -59,9 +67,12 @@ EXPECTED = {
     "fsync": "on",
     "full_page_writes": "on",
     "synchronous_commit": "on",
-    "max_wal_size": "128MB",
-    "min_wal_size": "64MB",
 }
+
+
+def expected_settings(lane):
+    max_wal, min_wal = WAL_BUDGETS[lane]
+    return EXPECTED | {"max_wal_size": max_wal, "min_wal_size": min_wal}
 
 
 class PostgresStorageTests(unittest.TestCase):
@@ -125,8 +136,9 @@ class PostgresStorageTests(unittest.TestCase):
                 prepare = job.split(
                     "      - name: Prepare isolated test databases\n", 1,
                 )[1].split("\n      - name: ", 1)[0]
-                self.assertIn("ALTER SYSTEM SET max_wal_size = '128MB'", prepare)
-                self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare)
+                max_wal, min_wal = WAL_BUDGETS[lane]
+                self.assertIn(f"ALTER SYSTEM SET max_wal_size = '{max_wal}'", prepare)
+                self.assertIn(f"ALTER SYSTEM SET min_wal_size = '{min_wal}'", prepare)
                 self.assertIn("pg_reload_conf()", prepare)
                 self.assertLess(
                     prepare.index("ALTER SYSTEM SET max_wal_size"),
@@ -142,68 +154,86 @@ class PostgresStorageTests(unittest.TestCase):
                 script = textwrap.dedent(
                     verify_tail.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
                 )
-                self.assertIn("'max_wal_size': '128MB'", script)
-                self.assertIn("'min_wal_size': '64MB'", script)
-                scripts.append(script)
+                self.assertIn(f"'max_wal_size': '{max_wal}'", script)
+                self.assertIn(f"'min_wal_size': '{min_wal}'", script)
+                # Normalize only the separately pinned WAL literals. Any change
+                # to connection, durability or rejection logic must still fail.
+                scripts.append(
+                    script.replace(f"'max_wal_size': '{max_wal}'", "'max_wal_size': '512MB'")
+                    .replace(f"'min_wal_size': '{min_wal}'", "'min_wal_size': '64MB'")
+                )
         self.assertEqual(len(set(scripts)), 1, "the lanes' verify probes drifted apart")
-        # The nextest lane carries a fourth copy of this probe in the reusable
-        # workflow. It must stay identical to the executed reference, so the
-        # rejection tests below cover it too: without this, deleting the
-        # comparison in the nextest copy alone stays green everywhere.
+        # Nextest retains the larger budget. Compare its complete safety logic
+        # too, and execute every copy in the behavioral tests below.
         self.assertEqual(len(NEXTEST_VERIFY_TAILS), 1)
+        nextest_max, nextest_min = WAL_BUDGETS["nextest"]
+        normalized_nextest = (
+            NEXTEST_SCRIPT.replace(
+                f"'max_wal_size': '{nextest_max}'", "'max_wal_size': '512MB'"
+            ).replace(f"'min_wal_size': '{nextest_min}'", "'min_wal_size': '64MB'")
+        )
         self.assertEqual(
-            NEXTEST_SCRIPT, SCRIPT,
+            normalized_nextest, scripts[0],
             "the nextest verify probe drifted from the executed reference",
         )
 
     def test_probe_preserves_durability_and_uses_only_explicit_test_connection(self):
-        output = io.StringIO()
-        with (
-            mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch("subprocess.check_output", return_value=json.dumps(EXPECTED)) as probe,
-            contextlib.redirect_stdout(output),
-        ):
-            exec(compile(SCRIPT, str(WORKFLOW), "exec"), {})
-        args, kwargs = probe.call_args
-        self.assertEqual(args[0][:8], [
-            "psql", "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
-            "-X", "-w", "-At", "-v", "ON_ERROR_STOP=1", "-c",
-        ])
-        for key in EXPECTED:
-            self.assertIn(f"current_setting('{key}')", args[0][8])
-        self.assertEqual(kwargs["env"], {
-            "PGPASSFILE": "/dev/null", "PGSSLMODE": "disable",
-            "PGOPTIONS": "-c statement_timeout=5000",
-        })
-        self.assertIn("Disposable Postgres defaults:", output.getvalue())
+        for lane, script in PROBES:
+            expected = expected_settings(lane)
+            output = io.StringIO()
+            with (
+                self.subTest(lane=lane),
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch("subprocess.check_output", return_value=json.dumps(expected)) as probe,
+                contextlib.redirect_stdout(output),
+            ):
+                exec(compile(script, str(WORKFLOW), "exec"), {})
+                args, kwargs = probe.call_args
+                self.assertEqual(args[0][:8], [
+                    "psql", "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+                    "-X", "-w", "-At", "-v", "ON_ERROR_STOP=1", "-c",
+                ])
+                for key in expected:
+                    self.assertIn(f"current_setting('{key}')", args[0][8])
+                self.assertEqual(kwargs["env"], {
+                    "PGPASSFILE": "/dev/null", "PGSSLMODE": "disable",
+                    "PGOPTIONS": "-c statement_timeout=5000",
+                })
+                self.assertIn("Disposable Postgres defaults:", output.getvalue())
 
     def test_probe_rejects_changed_path_or_disabled_durability(self):
-        for key in EXPECTED:
-            changed = EXPECTED | {key: "changed"}
-            with (
-                self.subTest(key=key),
-                mock.patch.dict(os.environ, {}, clear=True),
-                mock.patch("subprocess.check_output", return_value=json.dumps(changed)),
-                self.assertRaisesRegex(SystemExit, "data path or durability defaults changed"),
-            ):
-                exec(compile(SCRIPT, str(WORKFLOW), "exec"), {})
+        for lane, script in PROBES:
+            expected = expected_settings(lane)
+            for key in expected:
+                changed = expected | {key: "changed"}
+                with (
+                    self.subTest(lane=lane, key=key),
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch("subprocess.check_output", return_value=json.dumps(changed)),
+                    self.assertRaisesRegex(SystemExit, "data path or durability defaults changed"),
+                ):
+                    exec(compile(script, str(WORKFLOW), "exec"), {})
 
     def test_probe_refuses_ambient_redirection_before_connecting(self):
-        with (
-            mock.patch.dict(os.environ, {"PGHOSTADDR": "fixture-redirection"}, clear=True),
-            mock.patch("subprocess.check_output") as probe,
-            self.assertRaisesRegex(SystemExit, "unset ambient libpq"),
-        ):
-            exec(compile(SCRIPT, str(WORKFLOW), "exec"), {})
-        probe.assert_not_called()
+        for lane, script in PROBES:
+            with (
+                self.subTest(lane=lane),
+                mock.patch.dict(os.environ, {"PGHOSTADDR": "fixture-redirection"}, clear=True),
+                mock.patch("subprocess.check_output") as probe,
+                self.assertRaisesRegex(SystemExit, "unset ambient libpq"),
+            ):
+                exec(compile(script, str(WORKFLOW), "exec"), {})
+            probe.assert_not_called()
 
     def test_failed_probe_cannot_claim_defaults_verified(self):
-        with (
-            mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch("subprocess.check_output", side_effect=subprocess.CalledProcessError(1, "psql")),
-            self.assertRaises(subprocess.CalledProcessError),
-        ):
-            exec(compile(SCRIPT, str(WORKFLOW), "exec"), {})
+        for lane, script in PROBES:
+            with (
+                self.subTest(lane=lane),
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch("subprocess.check_output", side_effect=subprocess.CalledProcessError(1, "psql")),
+                self.assertRaises(subprocess.CalledProcessError),
+            ):
+                exec(compile(script, str(WORKFLOW), "exec"), {})
 
 
 if __name__ == "__main__":
