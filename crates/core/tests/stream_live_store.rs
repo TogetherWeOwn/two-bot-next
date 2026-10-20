@@ -63,6 +63,7 @@ fn live_test_options_require_the_approved_container() {
         "postgres://agent_test:@localhost/agent_test",
         "postgres://agent_test:@127.0.0.1/agent_test",
         "postgres://agent_test:@agent-testdb/agent_test?host=/var/run/postgresql",
+        "postgres://agent_test:@agent-testdb/agent_test?port=5433",
         "postgres://other_user:@agent-testdb/agent_test",
         "postgres://agent_test:@agent-testdb/production",
         "postgres://agent_test:fixture-password@agent-testdb/agent_test",
