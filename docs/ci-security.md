@@ -192,8 +192,9 @@ the runner's system CA bundle, keeps the password out of the process list,
 runs every statement in a `READ ONLY` transaction with statement and lock
 timeouts, runs no DDL (no `CREATE EXTENSION`: a missing pgcrypto yields
 count/min/max without a digest), never echoes the client's error text, and
-never invokes retention or activates Execute. An empty cohort or empty
-family is a reported limitation, never a pass.
+never invokes retention or activates Execute. Both cohort captures reuse
+one server-anchored window, so the bounds cannot move between them. An
+empty cohort or empty family is a reported limitation, never a pass.
 
 ## Production route
 

@@ -24,8 +24,10 @@ Three pinned aggregate groups, counts/digests/timestamps only:
      bucket is called "would-delete";
   C. bounded stable-cohort digest (at most 1000 rows, sha256 of
      `id|event_time`) captured before AND after one in-job 900 s sleep that
-     observes a natural DryRun interval. An empty cohort, zero candidates,
-     or a missing pgcrypto digest is a reported limitation, never a PASS.
+     observes a natural DryRun interval. Both captures reuse one
+     server-anchored window, so the bounds cannot move between them. An
+     empty cohort, zero candidates, or a missing pgcrypto digest is a
+     reported limitation, never a PASS.
 
 Fences, all before the first connection (exit 2, nothing was sent):
   * the database login comes only from $TWO_BOT_STAGING_PLAN_DATABASE_URL
@@ -164,47 +166,67 @@ COUNTS_SQL = (
     + " GROUP BY event_type ORDER BY event_type;\n"
     + "COMMIT;\n"
 )
-# Bounded must-preserve cohort: strictly fresher than every cutoff, so no
-# row is expiry-eligible. Captured twice with this same predicate; the
-# digest comparison is the stability datum.
-COHORT_PREDICATE = (
-    "    FROM event_store\n"
-    "   WHERE event_type IN ('PRESENCE_UPDATE','VOICE_STATE_UPDATE',"
-    "'VOICE_SERVER_UPDATE','GUILD_AUDIT_LOG_ENTRY_CREATE')\n"
-    "     AND event_time > now() + make_interval(secs => 900) - make_interval(days => 30)\n"
-    "   ORDER BY event_time, id\n"
-    f"   LIMIT {COHORT_LIMIT}\n"
-)
-COHORT_SQL = (
-    READ_ONLY_15S
-    + "WITH cohort AS (\n"
-    + "  SELECT id, event_time\n"
-    + COHORT_PREDICATE
-    + ")\n"
-    + "SELECT count(*) AS cohort_count,\n"
-    # id::text: PostgreSQL has no bigint || text operator, so the bare
-    # concatenation errors (42883) on the BIGSERIAL schema. Same values in,
-    # same digest shape out; the digest is only compared before-vs-after.
-    + "       encode(digest(string_agg(id::text || '|' || event_time::text, ','"
-    + " ORDER BY event_time, id), 'sha256'), 'hex') AS cohort_digest,\n"
-    + "       min(event_time) AS cohort_min_event_time,\n"
-    + "       max(event_time) AS cohort_max_event_time\n"
-    + "  FROM cohort;\n"
-    + "COMMIT;\n"
-)
-# pgcrypto-absent fallback: same cohort, no digest. Reported as a limitation.
-COHORT_NODIGEST_SQL = (
-    READ_ONLY_15S
-    + "WITH cohort AS (\n"
-    + "  SELECT id, event_time\n"
-    + COHORT_PREDICATE
-    + ")\n"
-    + "SELECT count(*) AS cohort_count,\n"
-    + "       min(event_time) AS cohort_min_event_time,\n"
-    + "       max(event_time) AS cohort_max_event_time\n"
-    + "  FROM cohort;\n"
-    + "COMMIT;\n"
-)
+# One server epoch, read before the first capture, anchors both cohort
+# captures to a single frozen window. A now() bound would move ~900 s
+# between the captures and the oldest-1000 cohort would drift with it, so a
+# live predicate cannot be compared before-vs-after.
+ANCHOR_SQL = (READ_ONLY_5S + "SELECT extract(epoch FROM now())::bigint;\nCOMMIT;\n")
+# Frozen-window margin: the lower bound stays fresher than every retention
+# cutoff until the after-capture (lookahead 900 s + one sleep + margin);
+# the upper bound excludes rows inserted during the sleep.
+COHORT_MARGIN_SECONDS = 900 + SLEEP_SECONDS + 120
+
+
+def cohort_predicate(anchor_epoch):
+    """The shared frozen cohort window over one integer anchor literal."""
+    if isinstance(anchor_epoch, bool) or not isinstance(anchor_epoch, int):
+        raise ReadFailed("a row had an unexpected shape; nothing was reported")
+    return (
+        "    FROM event_store\n"
+        "   WHERE event_type IN ('PRESENCE_UPDATE','VOICE_STATE_UPDATE',"
+        "'VOICE_SERVER_UPDATE','GUILD_AUDIT_LOG_ENTRY_CREATE')\n"
+        f"     AND event_time > to_timestamp({anchor_epoch}) + make_interval(secs => "
+        f"{COHORT_MARGIN_SECONDS}) - make_interval(days => 30)\n"
+        f"     AND event_time <= to_timestamp({anchor_epoch})\n"
+        "   ORDER BY event_time, id\n"
+        f"   LIMIT {COHORT_LIMIT}\n"
+    )
+
+
+def cohort_sql(anchor_epoch):
+    return (
+        READ_ONLY_15S
+        + "WITH cohort AS (\n"
+        + "  SELECT id, event_time\n"
+        + cohort_predicate(anchor_epoch)
+        + ")\n"
+        + "SELECT count(*) AS cohort_count,\n"
+        # id::text: PostgreSQL has no bigint || text operator, so the bare
+        # concatenation errors (42883) on the BIGSERIAL schema. Same values in,
+        # same digest shape out; the digest is only compared before-vs-after.
+        + "       encode(digest(string_agg(id::text || '|' || event_time::text, ','"
+        + " ORDER BY event_time, id), 'sha256'), 'hex') AS cohort_digest,\n"
+        + "       min(event_time) AS cohort_min_event_time,\n"
+        + "       max(event_time) AS cohort_max_event_time\n"
+        + "  FROM cohort;\n"
+        + "COMMIT;\n"
+    )
+
+
+def cohort_nodigest_sql(anchor_epoch):
+    # pgcrypto-absent fallback: same cohort, no digest. Reported as a limitation.
+    return (
+        READ_ONLY_15S
+        + "WITH cohort AS (\n"
+        + "  SELECT id, event_time\n"
+        + cohort_predicate(anchor_epoch)
+        + ")\n"
+        + "SELECT count(*) AS cohort_count,\n"
+        + "       min(event_time) AS cohort_min_event_time,\n"
+        + "       max(event_time) AS cohort_max_event_time\n"
+        + "  FROM cohort;\n"
+        + "COMMIT;\n"
+    )
 
 
 class Refused(Exception):
@@ -460,6 +482,14 @@ def parse_cohort(output, with_digest):
     return count, None, minimum, maximum
 
 
+def parse_anchor(output):
+    """One server epoch; the frozen cohort-window anchor."""
+    rows = csv_rows(output)
+    if len(rows) != 1 or len(rows[0]) != 1:
+        raise ReadFailed("a row had an unexpected shape; nothing was reported")
+    return parse_count(rows[0][0])
+
+
 def format_report(observed_before, observed_after, migrations, indexes, counts,
                   before, after, pgcrypto):
     lines = ["## staging retention census",
@@ -510,14 +540,15 @@ def run_census(env, psql, clock, sleep_fn):
     migrations = parse_migrations(run_psql(psql, pg_env, MIGRATIONS_SQL))
     indexes = parse_indexes(run_psql(psql, pg_env, INDEXES_SQL))
     counts = parse_counts(run_psql(psql, pg_env, COUNTS_SQL))
-    cohort_sql = COHORT_SQL if pgcrypto else COHORT_NODIGEST_SQL
+    anchor = parse_anchor(run_psql(psql, pg_env, ANCHOR_SQL))
+    cohort_query = cohort_sql(anchor) if pgcrypto else cohort_nodigest_sql(anchor)
     observed_before = format_instant(clock())
-    before = parse_cohort(run_psql(psql, pg_env, cohort_sql), pgcrypto)
+    before = parse_cohort(run_psql(psql, pg_env, cohort_query), pgcrypto)
     print(f"sleeping {SLEEP_SECONDS}s to observe one natural DryRun interval",
           flush=True)
     sleep_fn(SLEEP_SECONDS)
     observed_after = format_instant(clock())
-    after = parse_cohort(run_psql(psql, pg_env, cohort_sql), pgcrypto)
+    after = parse_cohort(run_psql(psql, pg_env, cohort_query), pgcrypto)
     return format_report(observed_before, observed_after, migrations, indexes,
                          counts, before, after, pgcrypto)
 

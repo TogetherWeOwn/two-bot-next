@@ -50,6 +50,8 @@ COUNTS_OUT = ("GUILD_AUDIT_LOG_ENTRY_CREATE,12,400,412\n"
               "VOICE_SERVER_UPDATE,0,50,50\n"
               "VOICE_STATE_UPDATE,3,120,123\n")
 DIGEST = "9f" * 32
+ANCHOR = 1760990400
+ANCHOR_OUT = f"{ANCHOR}\n"
 COHORT_OUT = (f"3,{DIGEST},2026-10-20 20:00:00+00,2026-10-20 20:10:00+00\n")
 COHORT_NODIGEST_OUT = "3,2026-10-20 20:00:00+00,2026-10-20 20:10:00+00\n"
 EMPTY_COHORT_OUT = "0,,,\n"
@@ -85,13 +87,15 @@ def standard_outputs():
             ("_sqlx_migrations", MIGRATIONS_OUT),
             ("pg_indexes", INDEXES_OUT),
             ("eligible_old", COUNTS_OUT),
+            ("extract(epoch", ANCHOR_OUT),
             ("cohort_digest", COHORT_OUT)]
 
 
 class QueryPinTests(unittest.TestCase):
     SCRIPTS = (census.IDENTITY_SQL, census.MIGRATIONS_SQL, census.INDEXES_SQL,
-               census.COUNTS_SQL, census.COHORT_SQL, census.COHORT_NODIGEST_SQL,
-               census.PROBE_SQL)
+               census.COUNTS_SQL, census.cohort_sql(ANCHOR),
+               census.cohort_nodigest_sql(ANCHOR), census.PROBE_SQL,
+               census.ANCHOR_SQL)
 
     def test_every_statement_is_read_only_with_timeouts(self):
         for script in self.SCRIPTS:
@@ -115,24 +119,46 @@ class QueryPinTests(unittest.TestCase):
         self.assertNotIn("LIMIT 0", census.COUNTS_SQL)
 
     def test_cohort_predicate_is_shared_and_bounded(self):
-        self.assertIn(census.COHORT_PREDICATE, census.COHORT_SQL)
-        self.assertIn(census.COHORT_PREDICATE, census.COHORT_NODIGEST_SQL)
-        self.assertIn(f"LIMIT {census.COHORT_LIMIT}", census.COHORT_PREDICATE)
+        predicate = census.cohort_predicate(ANCHOR)
+        self.assertIn(predicate, census.cohort_sql(ANCHOR))
+        self.assertIn(predicate, census.cohort_nodigest_sql(ANCHOR))
+        self.assertIn(f"LIMIT {census.COHORT_LIMIT}", predicate)
         self.assertEqual(census.COHORT_LIMIT, 1000)
         for family in census.FAMILIES:
-            self.assertIn(family, census.COHORT_PREDICATE)
+            self.assertIn(family, predicate)
             self.assertIn(family, census.COUNTS_SQL)
 
     def test_cohort_digest_casts_the_bigint_id(self):
         # PostgreSQL has no bigint || text operator: the bare concatenation
         # errors (42883) on the BIGSERIAL schema and aborts the census.
-        self.assertIn("id::text || '|'", census.COHORT_SQL)
-        self.assertNotRegex(census.COHORT_SQL, r"(?<!:)id \|\|")
+        query = census.cohort_sql(ANCHOR)
+        self.assertIn("id::text || '|'", query)
+        self.assertNotRegex(query, r"(?<!:)id \|\|")
+
+    def test_cohort_window_is_frozen_on_one_anchor(self):
+        # A now() bound would move ~900 s between the captures and the
+        # oldest-1000 cohort would drift with it. Both captures reuse one
+        # server-anchored window: the same anchor literal in both bounds,
+        # a lower bound past the end of the observed interval, and no now().
+        for query in (census.cohort_sql(ANCHOR),
+                      census.cohort_nodigest_sql(ANCHOR)):
+            self.assertNotIn("now()", query)
+            self.assertEqual(query.count(f"to_timestamp({ANCHOR})"), 2)
+        predicate = census.cohort_predicate(ANCHOR)
+        self.assertIn(f"make_interval(secs => {census.COHORT_MARGIN_SECONDS})",
+                      predicate)
+        self.assertEqual(census.COHORT_MARGIN_SECONDS,
+                         900 + census.SLEEP_SECONDS + 120)
+        self.assertIn("extract(epoch FROM now())::bigint", census.ANCHOR_SQL)
+
+    def test_cohort_predicate_rejects_non_integer_anchors(self):
+        for bad in (True, "1760990400", "1; SELECT", 1.5, None):
+            with self.subTest(anchor=bad):
+                with self.assertRaises(census.ReadFailed):
+                    census.cohort_predicate(bad)
 
     def test_cutoffs_match_the_implementation(self):
-        for script in (census.COUNTS_SQL, census.COHORT_SQL,
-                       census.COHORT_NODIGEST_SQL):
-            self.assertIn("make_interval(secs => 900)", script)
+        self.assertIn("make_interval(secs => 900)", census.COUNTS_SQL)
         self.assertIn("make_interval(days => 30)", census.COUNTS_SQL)
         self.assertIn("make_interval(days => 45)", census.COUNTS_SQL)
         self.assertEqual(census.SLEEP_SECONDS, 900)
@@ -293,6 +319,13 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(census.parse_cohort(EMPTY_COHORT_OUT, True),
                          (0, None, None, None))
 
+    def test_anchor_parses_one_epoch(self):
+        self.assertEqual(census.parse_anchor(ANCHOR_OUT), ANCHOR)
+        for output in ("", "1\n2\n", "abc\n", f"{ANCHOR},extra\n"):
+            with self.subTest(output=output[:20]):
+                with self.assertRaises(census.ReadFailed):
+                    census.parse_anchor(output)
+
     def test_malformed_cohorts_fail(self):
         for output, with_digest in ((COHORT_OUT + COHORT_OUT, True),  # two rows
                                     ("", True),  # no row
@@ -354,12 +387,20 @@ class CensusRunTests(unittest.TestCase):
         self.assertNotIn(HOST, report)
         self.assertNotIn(GOOD_URL, report)
         self.assertNotIn("PASS", report)
-        # Both cohort captures run the same predicate.
+        # One anchor read feeds both captures, which run the identical
+        # frozen-window query with no now().
+        anchor_scripts = [script for script, _ in calls
+                          if "extract(epoch" in script]
+        self.assertEqual(anchor_scripts, [census.ANCHOR_SQL])
         cohort_scripts = [script for script, _ in calls
                           if "cohort_min_event_time" in script]
         self.assertEqual(len(cohort_scripts), 2)
         self.assertEqual(cohort_scripts[0], cohort_scripts[1])
-        self.assertEqual(cohort_scripts[0], census.COHORT_SQL)
+        self.assertEqual(cohort_scripts[0], census.cohort_sql(ANCHOR))
+        self.assertNotIn("now()", cohort_scripts[0])
+        scripts = [script for script, _ in calls]
+        self.assertLess(scripts.index(census.ANCHOR_SQL),
+                        scripts.index(cohort_scripts[0]))
 
     def test_digest_mismatch_is_data(self):
         other = COHORT_OUT.replace(DIGEST, "ab" * 32)
@@ -377,7 +418,8 @@ class CensusRunTests(unittest.TestCase):
         outputs = [("current_user", IDENTITY_OUT),
                    ("_sqlx_migrations", MIGRATIONS_OUT),
                    ("pg_indexes", INDEXES_OUT),
-                   ("eligible_old", COUNTS_OUT)]
+                   ("eligible_old", COUNTS_OUT),
+                   ("extract(epoch", ANCHOR_OUT)]
         report, _, _, calls = self.run_with(
             outputs, pgcrypto=False,
             cohorts=(COHORT_NODIGEST_OUT, COHORT_NODIGEST_OUT))
@@ -385,13 +427,15 @@ class CensusRunTests(unittest.TestCase):
         self.assertNotIn("digest_match", report)
         cohort_scripts = [script for script, _ in calls
                           if "cohort_min_event_time" in script]
-        self.assertEqual(cohort_scripts, [census.COHORT_NODIGEST_SQL] * 2)
+        self.assertEqual(cohort_scripts,
+                         [census.cohort_nodigest_sql(ANCHOR)] * 2)
 
     def test_empty_families_are_a_limitation(self):
         outputs = [("current_user", IDENTITY_OUT),
                    ("_sqlx_migrations", MIGRATIONS_OUT),
                    ("pg_indexes", INDEXES_OUT),
-                   ("eligible_old", "")]
+                   ("eligible_old", ""),
+                   ("extract(epoch", ANCHOR_OUT)]
         report, _, _, _ = self.run_with(outputs)
         self.assertIn("limitation: no rows in the retention families", report)
 
