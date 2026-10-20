@@ -3285,6 +3285,7 @@ class WorkflowTests(unittest.TestCase):
         )
         parity_reruns = [run for run in cov_runs if "--test legacy_verify_db" in run]
         self.assertEqual(len(parity_reruns), 1)
+        self.assertIn("-- --ignored --test-threads=1", parity_reruns[0])
         self.assertNotIn(
             "--skip parity_mismatch_cursor_and_read_only_acceptance",
             parity_reruns[0],
