@@ -3146,11 +3146,15 @@ class WorkflowTests(unittest.TestCase):
             step for step in job["steps"]
             if step.get("name") == "LFG actual-router and mock-Discord regressions"
         )
+        # The fixture guard rejects any URL whose database is not two_bot_test_*,
+        # so the bare agent_test name fails every durable case at setup.
         self.assertEqual(
             step["env"]["TWO_TEST_DATABASE_URL"],
-            "postgres://agent_test:@agent-testdb:5432/agent_test",
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
         )
-        self.assertIn("--test lfg_interactions -- --ignored --test-threads=1", step["run"])
+        # Other suites may join this step, so pin the LFG target and the serial
+        # ignored tail without freezing the whole command line.
+        self.assertRegex(step["run"], r"--test lfg_interactions(?: --test \S+)* -- --ignored --test-threads=1")
 
     def test_runtime_postgres_wal_budget_is_bounded(self):
         # Same budget as rust-tests and the stores lane: the runtime lane runs

@@ -1251,7 +1251,7 @@ jobs:
 
       - name: LFG actual-router and mock-Discord regressions
         env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: >-
           cargo test -p two-bot-discord --features db --locked --test lfg_interactions -- --ignored --test-threads=1
 
