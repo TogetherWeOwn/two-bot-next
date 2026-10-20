@@ -5,6 +5,8 @@
 
 use super::*;
 
+mod readiness_acceptance;
+
 const QUIET_WINDOW: Duration = Duration::from_millis(300);
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 

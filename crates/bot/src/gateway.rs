@@ -2150,6 +2150,79 @@ mod tests {
         assert_eq!(*state.read().await, GatewayState::Armed);
     }
 
+    mod readiness_acceptance {
+        use super::*;
+
+        #[tokio::test]
+        async fn checkpoint_io_stale_armed_snapshot_cannot_erase_committed_ready() {
+            let state = RwLock::new(GatewayState::Armed);
+            let generation = AtomicU64::new(0);
+            let (entered, entering) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let operation = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+                entered.send(()).unwrap();
+                released.await.unwrap();
+                Ok(())
+            });
+            let promote = async {
+                entering.await.unwrap();
+                assert_eq!(*state.read().await, GatewayState::Armed);
+                // The ordered writer has committed READY in this generation.
+                *state.write().await = GatewayState::Connected;
+                release.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+                tokio::join!(operation, promote)
+            })
+            .await
+            .expect("bounded checkpoint/promotion coordination");
+            result.expect("healthy IO completes");
+            assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(state.read().await.status(), ComponentStatus::Ready);
+        }
+
+        #[tokio::test]
+        async fn checkpoint_io_overlapping_successes_cannot_leave_readiness_armed() {
+            let state = RwLock::new(GatewayState::Connected);
+            let generation = AtomicU64::new(0);
+            let (first_entered, first_entering) = tokio::sync::oneshot::channel();
+            let (second_entered, second_entering) = tokio::sync::oneshot::channel();
+            let (release_first, first_released) = tokio::sync::oneshot::channel();
+            let (first_finished, first_finishing) = tokio::sync::oneshot::channel();
+            let first = async {
+                checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+                    first_entered.send(()).unwrap();
+                    first_released.await.unwrap();
+                    Ok(())
+                })
+                .await
+                .expect("first healthy IO");
+                first_finished.send(()).unwrap();
+            };
+            let second = async {
+                first_entering.await.unwrap();
+                checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+                    second_entered.send(()).unwrap();
+                    first_finishing.await.unwrap();
+                    Ok(())
+                })
+                .await
+                .expect("second healthy IO");
+            };
+            let release = async {
+                second_entering.await.unwrap();
+                release_first.send(()).unwrap();
+            };
+            tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+                tokio::join!(first, second, release)
+            })
+            .await
+            .expect("bounded overlapping checkpoint coordination");
+            assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(state.read().await.status(), ComponentStatus::Ready);
+        }
+    }
+
     #[tokio::test]
     async fn checkpoint_completion_cannot_overwrite_a_transport_disconnect() {
         let state = RwLock::new(GatewayState::Connected);
