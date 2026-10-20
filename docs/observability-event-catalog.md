@@ -124,6 +124,7 @@ Scalar gateway series pair with the labels above:
 
 | Series | Meaning |
 | --- | --- |
+| `two_bot_process_incarnation{part}` | Process-lifetime gauge: four fixed `part` labels (`0`, `1`, `2`, `3`) carry unsigned 32-bit numeric limbs of a nonzero random identity, stable across renders and new on process replacement. No PID, timestamp, build or identity-valued label. Optional for older containers; partial, duplicate, mislabeled or invalid parts invalidate the scrape. A validated same-scrape identity attributes gateway pairing windows, not health or recovery; full semantics live in `docs/metrics.md` |
 | `two_bot_gateway_reconnects_total` | New HELLOs after the first in the running loop |
 | `two_bot_gateway_resumes_total` | Received RESUMED dispatches |
 | `two_bot_gateway_disconnects_total` | Transport losses through the shard supervisor; each must pair with a later RESUME or fresh READY |
@@ -273,7 +274,7 @@ is the single shared spelling also pinned in `evidence.rs`
 | --- | --- | --- |
 | `rest_5xx_rate` | `two_bot_rest_requests_total{result="5xx"}` and all `two_bot_rest_requests_total` samples | Pages when at least 10 new REST requests arrive between samples and more than 10% are 5xx; a counter reset suppresses the window. |
 | `job_unknown_stale` | `two_bot_job_last_success_timestamp_seconds{job}` for labels outside `JOB_INTERVAL_SECONDS`, `TICKER_STALE_JOBS` and `UNKNOWN_STALE_EXCLUDED` | Ticket when a job without a cadence entry has a nonzero success timestamp older than 2 hours; never-succeeded stays silent; `session_checkpoint` is event-driven and excluded |
-| `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` against `two_bot_gateway_resumes_total` plus fresh `two_bot_gateway_events_total{event="READY"}` | Pages after 3 consecutive samples with disconnect growth and no RESUMED or fresh READY growth (pairing in `pairGatewayDisconnects`); any recovery growth clears at once; the disconnect counter increments in `gateway.rs` (`transport_disconnected`) |
+| `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` against `two_bot_gateway_resumes_total` plus fresh `two_bot_gateway_events_total{event="READY"}`, attributed by optional `two_bot_process_incarnation{part}` | Pages after 3 consecutive valid outstanding-loss samples: disconnect growth opens the loss and flat counters keep it outstanding until RESUMED or fresh READY growth clears it (pairing in `pairGatewayDisconnects`); readiness alone never clears it. When the validated process identity changes or a counter decreases, the evaluator re-baselines and holds an existing page for one sample; the next valid flat sample clears it. First identity adoption into legacy state is not recovery; missing identity after attribution or invalid inputs hold the previous state. The disconnect counter increments in `gateway.rs` (`transport_disconnected`) |
 | `gateway_not_ready` | `/readyz` `components` gateway entry (parsed by the keepalive probe, not a `/metrics` series) with the pairing counters as the restart signal | Pages after 3 consecutive valid samples with the gateway component `starting`/`down` and no disconnect edge required (stuck starting, parked, or draining); any ready sample clears at once; invalid probes and failed scrapes hold the previous state |
 | `voice_join_fast_burn` | `two_bot_voice_joins_received_total` minus benign `duplicate` refusals in `two_bot_voice_join_refused_total` against `two_bot_voice_join_to_move_seconds_bucket{le="5"}` | Pages when the creator-join budget (99.5% moved within 5 s) burns faster than 14.4x in both the 1 h and 5 min windows; every non-duplicate refusal, failed move and slow (>5 s) move is burn; each window needs at least 10 genuine joins and two bad moves, receive counts lag one scrape, and incomplete post-restart windows stay inactive; missing inputs hold the previous state |
 | `voice_join_slow_burn` | Same inputs as `voice_join_fast_burn` | Ticket, not page: same budget burning faster than 6x in both the 6 h and 30 min windows with the same per-window volume and bad-move floors; catches the sustained grind the fast rule never spikes on; do not close as "fast burn resolved" |
@@ -425,6 +426,31 @@ Empty-grace override warning (in `stored_empty_grace_with` in
 stored per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row is malformed or
 outside 0 to 600 whole seconds, so the sweep keeps the boot fallback. The
 line carries the setting key and the `out_of_range` reason.
+
+Fatal boot-setting warning (in `invalid_boot_setting`, called by
+`build_production_runtime` in `crates/bot/src/voice_rooms.rs`):
+`temp-voice boot setting invalid; refusing voice runtime` (warn). Fields:
+`key`: `&'static str` (one fixed key below); `reason`: `&'static str`
+(always `invalid_value`). No configured values, parser errors, tokens,
+channel/member lists or synthetic identity input are logged. This precedes
+the unchanged `RoomHttpError::InvalidRequest` setup failure and the gateway's
+`voice HTTP setup failed` line. It refuses the voice runtime, not necessarily
+the process. Exactly one warning names the first invalid setting in existing
+validation order:
+
+1. Protected infrastructure channels: `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`,
+   `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`, `TWO_TEMP_VOICE_CATEGORY_ID`, then
+   `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS`. The exact refused sub-key is named.
+2. Generator channel: `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID` (also checked by
+   protection above, so malformed input normally refuses there first).
+3. Empty-room grace: `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (whole seconds,
+   0 to 600).
+4. Synthetic humans: `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` (up to four distinct
+   nonzero IDs).
+
+Absent, blank and valid settings remain silent. Nonfatal admission knobs
+retain their separate default-fallback warning below. For safe triage, see
+[voice boot-setting refusal](runbook-observability.md#voice-boot-setting-refusal).
 
 Configured-channel notice fallback warning (in
 `GuildRoomWorker::deliver_notice` in `crates/bot/src/voice_rooms.rs`, guild

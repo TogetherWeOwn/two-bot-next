@@ -18,7 +18,7 @@ available in DMs (`docs/commands.md`):
 | --- | --- | --- |
 | `/feed-add` | `kind` (required choice: `"rss"`, `"youtube"`, `"twitch"`), `source` (required string, max 2048 chars) | Posts into the invoking channel. At most 2,048 input bytes total. |
 | `/feed-list` | none | Ephemeral text; each source capped at 128 UTF-16 units, shrinking adaptively at capacity (scheme-stripped head…tail so same-host relays stay distinguishable) so every relay id stays discoverable within the 2,000-unit message cap (`crates/core/src/feeds.rs`). |
-| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.` or `No feed relay with that id.` (`crates/core/src/feeds.rs:354-360`). Guild-scoped delete. |
+| `/feed-remove` | `id` (required string, max 128 chars) | Replies `Feed relay removed.`, `No feed relay with that id.` (`crates/core/src/feeds.rs:354-360`) or, while a delivery is still pending recovery, `Feed relay kept: unresolved deliveries are still pending recovery.` (`crates/core/src/feeds.rs:362-366`). Guild-scoped delete. |
 
 Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
 
@@ -30,9 +30,11 @@ Source rules (`crates/core/src/feeds.rs:168-184`, `docs/feeds-port.md`):
   Twitch is **not** a Helix API integration and needs no Twitch credential.
 - Adding a relay does not fetch the source. At most 25 feed relays per
   guild (disabled relays count; `docs/runbook.md:1312`).
-- Removal cascades delivery history (`feed_deliveries` rows go with the
-  relay). Do not remove and re-add a relay to "fix" it unless resetting its
-  delivery history is intended.
+- Removal cascades settled delivery history (`feed_deliveries` rows go with
+  the relay). While any delivery is still pending recovery, removal is
+  refused and keeps the relay and its ledger; let recovery settle it, then
+  remove again (`docs/feeds-port.md`). Do not remove and re-add a relay to
+  "fix" it unless resetting its delivery history is intended.
 
 Gates (both must hold or the poller parks):
 
