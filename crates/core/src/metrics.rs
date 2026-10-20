@@ -1465,6 +1465,28 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut out = String::with_capacity(16_384);
+        // Process-lifetime identity, independent of image, clock and PID reuse.
+        // Fixed numeric limbs avoid both unbounded labels and f64 precision loss.
+        static PROCESS_INCARNATION: OnceLock<[u32; 4]> = OnceLock::new();
+        let incarnation = PROCESS_INCARNATION.get_or_init(|| loop {
+            let parts = rand::random::<[u32; 4]>();
+            if parts != [0; 4] {
+                return parts;
+            }
+        });
+        header(
+            &mut out,
+            "two_bot_process_incarnation",
+            "gauge",
+            "Opaque process-lifetime identity in four exact unsigned 32-bit parts.",
+        );
+        for (part, value) in incarnation.iter().enumerate() {
+            writeln!(
+                out,
+                "two_bot_process_incarnation{{part=\"{part}\"}} {value}"
+            )
+            .unwrap();
+        }
         header(
             &mut out,
             "two_bot_gateway_events_total",
