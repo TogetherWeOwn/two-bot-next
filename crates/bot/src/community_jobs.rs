@@ -464,9 +464,9 @@ async fn scorecard_once(
     )
     .await
     .map_err(|error| match error {
-        CommunityStoreError::Build(_) | CommunityStoreError::UnknownFactType(_) => {
-            ErrorClass::Configuration
-        }
+        CommunityStoreError::Build(_)
+        | CommunityStoreError::UnknownFactType(_)
+        | CommunityStoreError::TooManyFacts { .. } => ErrorClass::Configuration,
         CommunityStoreError::Db(_) => ErrorClass::Database,
     })?;
     sqlx::query(
