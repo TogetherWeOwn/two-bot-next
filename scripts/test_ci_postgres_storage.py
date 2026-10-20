@@ -59,7 +59,7 @@ EXPECTED = {
     "fsync": "on",
     "full_page_writes": "on",
     "synchronous_commit": "on",
-    "max_wal_size": "512MB",
+    "max_wal_size": "128MB",
     "min_wal_size": "64MB",
 }
 
@@ -125,7 +125,7 @@ class PostgresStorageTests(unittest.TestCase):
                 prepare = job.split(
                     "      - name: Prepare isolated test databases\n", 1,
                 )[1].split("\n      - name: ", 1)[0]
-                self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare)
+                self.assertIn("ALTER SYSTEM SET max_wal_size = '128MB'", prepare)
                 self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare)
                 self.assertIn("pg_reload_conf()", prepare)
                 self.assertLess(
@@ -142,7 +142,7 @@ class PostgresStorageTests(unittest.TestCase):
                 script = textwrap.dedent(
                     verify_tail.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
                 )
-                self.assertIn("'max_wal_size': '512MB'", script)
+                self.assertIn("'max_wal_size': '128MB'", script)
                 self.assertIn("'min_wal_size': '64MB'", script)
                 scripts.append(script)
         self.assertEqual(len(set(scripts)), 1, "the lanes' verify probes drifted apart")

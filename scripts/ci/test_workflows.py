@@ -2739,7 +2739,7 @@ class WorkflowTests(unittest.TestCase):
         # since the bootstrap databases are created later in this same step.
         reload = run.index("pg_reload_conf()")
         self.assertLess(
-            run.index("ALTER SYSTEM SET max_wal_size = '512MB'"),
+            run.index("ALTER SYSTEM SET max_wal_size = '128MB'"),
             reload,
             "max_wal_size ALTER must precede pg_reload_conf()",
         )
@@ -2764,11 +2764,11 @@ class WorkflowTests(unittest.TestCase):
             step for step in job["steps"]
             if step.get("name") == "Verify disposable Postgres defaults"
         )
-        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '128MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
         self.assert_wal_reload_ordering_is_pinned(prepare["run"])
-        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assertIn("'max_wal_size': '128MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_tmpfs_postgres_wal_budget_is_bounded_in_every_lane(self):
@@ -2787,7 +2787,7 @@ class WorkflowTests(unittest.TestCase):
                     step for step in job["steps"]
                     if step.get("name") == "Verify disposable Postgres defaults"
                 )
-                self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+                self.assertIn("ALTER SYSTEM SET max_wal_size = '128MB'", prepare["run"])
                 self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
                 self.assertIn("pg_reload_conf()", prepare["run"])
                 # Reload-before-ALTER writes auto.conf but never applies it;
@@ -2801,7 +2801,7 @@ class WorkflowTests(unittest.TestCase):
                     run.index("ALTER SYSTEM SET min_wal_size"),
                     run.index("pg_reload_conf()"),
                 )
-                self.assertIn("'max_wal_size': '512MB'", verify["run"])
+                self.assertIn("'max_wal_size': '128MB'", verify["run"])
                 self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_nextest_lane_bounds_tmpfs_wal_and_reports_headroom(self):
@@ -2812,7 +2812,7 @@ class WorkflowTests(unittest.TestCase):
             step for step in steps
             if step.get("name") == "Prepare isolated test databases"
         )
-        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '128MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
         run = prepare["run"]
@@ -2843,7 +2843,7 @@ class WorkflowTests(unittest.TestCase):
             ("fsync", "on"),
             ("full_page_writes", "on"),
             ("synchronous_commit", "on"),
-            ("max_wal_size", "512MB"),
+            ("max_wal_size", "128MB"),
             ("min_wal_size", "64MB"),
         ):
             self.assertIn(f"'{key}': '{value}'", verify["run"])
@@ -3062,11 +3062,11 @@ class WorkflowTests(unittest.TestCase):
             step for step in job["steps"]
             if step.get("name") == "Verify disposable Postgres defaults"
         )
-        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '128MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
         self.assert_wal_reload_ordering_is_pinned(prepare["run"])
-        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assertIn("'max_wal_size': '128MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_runtime_container_pins_disposable_database_service_address(self):
@@ -3129,11 +3129,11 @@ class WorkflowTests(unittest.TestCase):
             step for step in job["steps"]
             if step.get("name") == "Verify disposable Postgres defaults"
         )
-        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '128MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
         self.assert_wal_reload_ordering_is_pinned(prepare["run"])
-        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assertIn("'max_wal_size': '128MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
@@ -3283,7 +3283,7 @@ class WorkflowTests(unittest.TestCase):
             main_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 12)
+        self.assertEqual(len(guarded), 14)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -3294,6 +3294,8 @@ class WorkflowTests(unittest.TestCase):
         # needle -> carries `--features db` (core/discord suites need the db
         # feature to build their guarded targets; cutover suites do not).
         guarded_needles = {
+            "--test stream_live_store": True,
+            "--test mutation_429_proves_no_effect_channel": True,
             "-- channel_moderation --include-ignored": True,
             "--test channel_moderation_runtime": True,
             "--test internal_channel_moderation": True,
@@ -3355,6 +3357,55 @@ class WorkflowTests(unittest.TestCase):
         )
         checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
         self.assertEqual(checkout["with"]["fetch-depth"], "0")
+
+    def test_coverage_replays_strict_agent_test_targets_and_fails_closed(self):
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+        )
+        run = step["run"]
+        wrapper = run[run.index("cov_run() {"):run.index("# Main sweep")]
+        start = run.index("export TWO_TEST_DATABASE_URL=postgres://agent_test@")
+        end = run.index("export TWO_TEST_DATABASE_URL=postgres://agent_test:@", start)
+        # Execute the real replay block and failure wrapper, but replace Cargo
+        # with a fixture that records its arguments and effective target URL.
+        targets = ("stream_live_store", "mutation_429_proves_no_effect_channel")
+        with tempfile.TemporaryDirectory() as directory:
+            stub = Path(directory) / "cargo-llvm-cov"
+            stub.write_text(
+                '#!/bin/bash\nprintf "%s %s\\n" "$TWO_TEST_DATABASE_URL" "$*"\n'
+                'if [ -n "$FAIL_TARGET" ] && [[ " $* " == *" --test $FAIL_TARGET "* ]]; '
+                'then exit 23; fi\n'
+            )
+            stub.chmod(0o755)
+            for failure in ("", *targets):
+                with self.subTest(failure=failure):
+                    result = subprocess.run(
+                        ["bash", "-c", "set -euo pipefail; " + wrapper + run[start:end]],
+                        env=dict(os.environ, COV=str(stub), FAIL_TARGET=failure),
+                        capture_output=True, text=True, check=False,
+                    )
+                    if failure:
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn("patch coverage measurement failed", result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        for target in targets:
+                            matches = [
+                                line for line in result.stdout.splitlines()
+                                if f"--test {target} " in line
+                            ]
+                            self.assertEqual(len(matches), 1, target)
+                            self.assertTrue(matches[0].startswith(
+                                "postgres://agent_test@agent-testdb:5432/agent_test "
+                            ))
+                            self.assertIn("--no-report", matches[0])
+                            self.assertIn("--features db", matches[0])
+                            self.assertIn("--locked", matches[0])
+                            self.assertIn("--test-threads=1", matches[0])
+                            self.assertRegex(matches[0], r"-- --(?:include-)?ignored(?: |$)")
+                            self.assertNotIn("--ignore-run-fail", matches[0])
 
     def test_voice_synthetic_shape_is_pinned_and_mutations_fail(self):
         import copy
@@ -5489,11 +5540,11 @@ class WorkflowTests(unittest.TestCase):
             if step.get("name") == "Verify disposable Postgres defaults"
         )
         self.assertEqual(verify.get("shell"), "bash")
-        self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare["run"])
+        self.assertIn("ALTER SYSTEM SET max_wal_size = '128MB'", prepare["run"])
         self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare["run"])
         self.assertIn("pg_reload_conf()", prepare["run"])
         self.assert_wal_reload_ordering_is_pinned(prepare["run"])
-        self.assertIn("'max_wal_size': '512MB'", verify["run"])
+        self.assertIn("'max_wal_size': '128MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
     def test_required_nextest_quarantine_ejects_without_revert(self):

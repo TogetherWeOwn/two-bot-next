@@ -702,8 +702,10 @@ jobs:
           # coverage lane replays the database suites. max_wal_size is a soft
           # checkpoint target, not a hard ceiling: heavy WAL can exceed it, so
           # keep recycling bounded with headroom for relation files and segment
-          # creation. The pre/post suite reports bracket the run for tuning.
-          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
+          # creation. Run 39355954244 retained 496MB of WAL plus fixture data
+          # and exhausted this tmpfs at a 512MB target. Use 128MB in all bounded
+          # lanes; retain durability, service limits and pre/post evidence.
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '128MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
           createdb -h agent-testdb -U agent_test two_bot_test_ci
@@ -726,7 +728,7 @@ jobs:
               'fsync': 'on',
               'full_page_writes': 'on',
               'synchronous_commit': 'on',
-              'max_wal_size': '512MB',
+              'max_wal_size': '128MB',
               'min_wal_size': '64MB',
           }
           fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
@@ -861,6 +863,11 @@ jobs:
           # the re-runs below merge their profiles; flags mirror the
           # corresponding ignored-db lane steps.
           export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test
+          # These guards require agent_test rather than the sweep's bootstrap;
+          # mutation-429 also requires this exact omitted-password spelling.
+          # Do not let --ignore-run-fail in the sweep hide their coverage.
+          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test stream_live_store -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test mutation_429_proves_no_effect_channel -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked -- channel_moderation --include-ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test channel_moderation_runtime -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
@@ -1162,7 +1169,7 @@ jobs:
           # with headroom for relation files and segment creation, mirroring
           # the rust-tests lane. The pre/post suite reports bracket the run
           # for future budget tuning.
-          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '128MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
           createdb -h agent-testdb -U agent_test two_bot_test_ci
@@ -1184,7 +1191,7 @@ jobs:
               'fsync': 'on',
               'full_page_writes': 'on',
               'synchronous_commit': 'on',
-              'max_wal_size': '512MB',
+              'max_wal_size': '128MB',
               'min_wal_size': '64MB',
           }
           fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
@@ -1624,7 +1631,7 @@ jobs:
           # it, so keep recycling bounded with headroom for relation files and
           # segment creation (same bound as the rust-tests and stores lanes).
           # The pre/post suite reports bracket the run for future budget tuning.
-          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '128MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
           createdb -h agent-testdb -U agent_test two_bot_test_ci
@@ -1646,7 +1653,7 @@ jobs:
               'fsync': 'on',
               'full_page_writes': 'on',
               'synchronous_commit': 'on',
-              'max_wal_size': '512MB',
+              'max_wal_size': '128MB',
               'min_wal_size': '64MB',
           }
           fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
