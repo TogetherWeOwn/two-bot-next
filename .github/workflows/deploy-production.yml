@@ -1217,8 +1217,9 @@ jobs:
     timeout-minutes: 90
     # The human gate: this job waits for the Environment's required
     # reviewers. The guard job refused to get here without them, unless
-    # vars.PRODUCTION_AUTO_APPROVE is true and the latest staging deploy of
-    # this exact SHA is green.
+    # vars.PRODUCTION_AUTO_APPROVE is true and either the latest staging
+    # deploy of this exact SHA is green or (rollback) the whole rollback
+    # target is a verified production rollback snapshot.
     environment: production
     permissions:
       contents: read
