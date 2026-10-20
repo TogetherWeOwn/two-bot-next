@@ -2768,15 +2768,32 @@ impl ActionExecutor {
             let rows: Vec<serde_json::Value> = serde_json::from_slice(&res.body)
                 .map_err(|_| DiscordError::Unavailable("unreadable message history".into()))?;
             for row in &rows {
-                if row["nonce"].as_str() == Some(nonce)
-                    && row["author"]["id"].as_str() == Some(&bot_user_id.to_string())
-                    && row["channel_id"].as_str() == Some(channel_id)
+                // A non-match proves absence only if its required evidence is readable.
+                // Map upstream ID failures to a fixed error, never a raw snowflake value.
+                let unreadable = || DiscordError::Unavailable("unreadable message history".into());
+                let id = row["id"].as_str().ok_or_else(unreadable)?;
+                let author = row["author"]["id"].as_str().ok_or_else(unreadable)?;
+                let message_id: Id<MessageMarker> = snowflake(id).map_err(|_| unreadable())?;
+                let author_id: Id<UserMarker> = snowflake(author).map_err(|_| unreadable())?;
+                if message_id.to_string() != id
+                    || author_id.to_string() != author
+                    || row["channel_id"].as_str() != Some(channel_id)
                 {
-                    let id = row["id"].as_str().ok_or_else(|| {
-                        DiscordError::Unavailable("accepted message missing id".into())
-                    })?;
-                    let _: Id<MessageMarker> = snowflake(id)?;
-                    return Ok(Some(id.to_owned()));
+                    return Err(unreadable());
+                }
+                if author_id.get() == bot_user_id {
+                    let row_nonce = &row["nonce"];
+                    // Only the bot's rows need readable nonce evidence to prove a non-match.
+                    if !row_nonce.is_null()
+                        && !row_nonce.is_string()
+                        && !row_nonce.is_i64()
+                        && !row_nonce.is_u64()
+                    {
+                        return Err(unreadable());
+                    }
+                    if row_nonce.as_str() == Some(nonce) {
+                        return Ok(Some(id.to_owned()));
+                    }
                 }
             }
             if rows.len() < 100 {
