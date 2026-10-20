@@ -297,9 +297,13 @@ fn gated_app(ledger: Arc<GateLedger>, sender: Arc<GateSender>) -> Router {
 }
 
 fn bind_config() -> EventsubReceiverConfig {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
+    let port = listener.local_addr().expect("reserved port").port();
+    drop(listener);
+
     let mut vars = std::collections::HashMap::new();
     vars.insert("TWO_EVENTSUB".to_owned(), "1".to_owned());
-    vars.insert("TWO_EVENTSUB_BIND".to_owned(), "127.0.0.1:0".to_owned());
+    vars.insert("TWO_EVENTSUB_BIND".to_owned(), format!("127.0.0.1:{port}"));
     vars.insert(
         "TWO_TWITCH_WEBHOOK_SECRET".to_owned(),
         test_secret().to_owned(),
