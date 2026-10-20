@@ -278,6 +278,13 @@ jobs:
     # TOG-11143: STAGING_OWNERSHIP_CONTROL_TOKEN is a `staging` environment
     # secret (TOG-12030); the job must declare the environment to read it.
     environment: staging
+    # Staging lifecycle exclusion: this job and the voice synthetic execution
+    # job share one fixed non-cancelling group, so a deploy cannot restart the
+    # container mid-lifecycle. Workflow-level serialization stays unchanged;
+    # the reusable caller must never hold this group (it waits on this job).
+    concurrency:
+      group: staging-lifecycle
+      cancel-in-progress: false
     # Sized for the worst case: the deploy, a failing verify and the
     # auto-rollback budget (600 s image + 900 s gate). A 30 min cap can
     # cancel the run mid-rollback and leave staging fenced.
