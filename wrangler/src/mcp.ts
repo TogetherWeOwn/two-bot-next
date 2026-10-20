@@ -227,8 +227,10 @@ async function containerGet(
         signal,
       }),
     );
-  return abortable(upstream.then((response) => {
-    if (signal.aborted) void response.body?.cancel().catch(() => {});
+  // A stub may return the Response itself; a missing `.then` must not turn a
+  // healthy reply into a generic failure. Late headers get the same cleanup.
+  return abortable(Promise.resolve(upstream).then((response) => {
+    if (signal.aborted) cancelBestEffort(response.body);
     return response;
   }), signal);
 }
