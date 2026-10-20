@@ -201,6 +201,12 @@ fn webhook_signature_malformed_deliveries_are_bounded_failures() {
     let empty_secret = String::new();
     let message = failed_message(verify_signature(&empty_secret, body, &good), "empty secret");
     assert_bounded(&message, "empty secret");
+    let empty_signed = sign(&empty_secret, body);
+    let message = failed_message(
+        verify_signature(&empty_secret, body, &empty_signed),
+        "empty secret signed",
+    );
+    assert_bounded(&message, "empty secret signed");
 }
 
 #[test]
@@ -368,6 +374,24 @@ fn webhook_envelope_floods_refuse_without_truncation() {
     .to_string();
     let message = failed_message(parse_envelope(flooded.as_bytes()), "change flood");
     assert_bounded(&message, "change flood");
+    // The change cap applies across entries, not to each entry separately.
+    let flooded = json!({"object": "page", "entry": [
+        {"id": "1", "changes": vec![json!({"field": "feed"}); 600]},
+        {"id": "2", "changes": vec![json!({"field": "feed"}); 401]},
+    ]})
+    .to_string();
+    let message = failed_message(
+        parse_envelope(flooded.as_bytes()),
+        "cross-entry change flood",
+    );
+    assert_bounded(&message, "cross-entry change flood");
+    let full = json!({"object": "page", "entry": [
+        {"id": "1", "changes": vec![json!({"field": "feed"}); 600]},
+        {"id": "2", "changes": vec![json!({"field": "feed"}); 400]},
+    ]})
+    .to_string();
+    let parsed = parse_envelope(full.as_bytes()).expect("1000-change cross-entry batch parses");
+    assert_eq!(parsed.changes.len(), FB_WEBHOOK_MAX_CHANGES);
     // A full in-contract batch parses whole: nothing is truncated.
     let full_changes: Vec<_> = (0..FB_WEBHOOK_MAX_CHANGES)
         .map(|_| json!({"field": "feed"}))
