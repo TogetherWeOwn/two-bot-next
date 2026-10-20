@@ -273,23 +273,30 @@ struct Hello {
 /// Client-side bound from pool acquisition through COMMIT, including stalled
 /// responses on an acquired connection. Never restore readiness during drain.
 /// A successful call restores only the snapshot it armed itself: a newer Ready
-/// publication in the same generation, or a disconnect that bumped it, stays.
-/// A failed call re-arms only its own generation: a stale failure from before
-/// a disconnect must not clobber the newer state.
+/// publication in the same generation, an overlapping failure, or a disconnect
+/// that bumped the generation, stays.
+/// A failed call re-arms only its own generation and records the failure so an
+/// overlapping success cannot restore readiness afterwards: a stale failure
+/// from before a disconnect must not clobber the newer state.
 /// Source: <https://docs.rs/tokio/1/tokio/time/fn.timeout.html>
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
     generation: &AtomicU64,
+    failures: &AtomicU64,
     deadline: std::time::Duration,
     operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
 ) -> Result<T, sqlx::Error> {
-    let (previous, observed_generation) = {
+    let (previous, observed_generation, observed_failures) = {
         let mut state = state.write().await;
         let previous = *state;
         if previous != GatewayState::Draining {
             *state = GatewayState::Armed;
         }
-        (previous, generation.load(Ordering::Acquire))
+        (
+            previous,
+            generation.load(Ordering::Acquire),
+            failures.load(Ordering::Acquire),
+        )
     };
     let result = match tokio::time::timeout(deadline, operation).await {
         Ok(result) => result,
@@ -300,19 +307,23 @@ async fn checkpoint_io<T>(
     let mut state = state.write().await;
     if result.is_err() {
         // An overlapping success may have restored readiness; a failure in the
-        // current generation clears it again, unless shutdown already owns the
-        // state. A stale failure from before a generation bump leaves the newer
-        // state alone, mirroring the success path below.
+        // current generation clears it again and records itself so a later
+        // overlapping success cannot restore it back — unless shutdown already
+        // owns the state. A stale failure from before a generation bump leaves
+        // the newer state alone, mirroring the success path below.
         if *state != GatewayState::Draining
             && generation.load(Ordering::Acquire) == observed_generation
         {
+            failures.fetch_add(1, Ordering::AcqRel);
             *state = GatewayState::Armed;
         }
     } else {
         // Armed is this call's own in-flight mark. Connected means a later
-        // publication already won; Draining and a bumped generation must win too.
+        // publication already won; an overlapping failure, Draining, and a
+        // bumped generation must win too.
         if *state == GatewayState::Armed
             && generation.load(Ordering::Acquire) == observed_generation
+            && failures.load(Ordering::Acquire) == observed_failures
         {
             *state = previous;
         }
@@ -819,6 +830,7 @@ fn apply_dispatch<I: InviteSource>(
     handle: &tokio::runtime::Handle,
     worker_state: &RwLock<GatewayState>,
     generation: &AtomicU64,
+    failures: &AtomicU64,
     pipeline: &GatewayPipeline<I>,
     store: &GatewaySessionStore,
     automod: Option<Arc<crate::automod_gateway::ProductionAutomod>>,
@@ -940,13 +952,18 @@ fn apply_dispatch<I: InviteSource>(
         // waiting for the server statement timeout with the checkpoint
         // uncommitted.
         if dispatch_error.is_none() {
-            let retention_result =
-                handle.block_on(checkpoint_io(worker_state, generation, deadline, async {
+            let retention_result = handle.block_on(checkpoint_io(
+                worker_state,
+                generation,
+                failures,
+                deadline,
+                async {
                     match retention_lifecycle(store, &dispatch.event).await {
                         Some(error) => Err(error),
                         None => Ok(()),
                     }
-                }));
+                },
+            ));
             if let Err(error) = retention_result {
                 dispatch_error = Some(error);
             }
@@ -961,8 +978,12 @@ fn apply_dispatch<I: InviteSource>(
             automod_enabled,
         );
         if !requests.is_empty() {
-            let drain_outcome =
-                handle.block_on(checkpoint_io(worker_state, generation, deadline, async {
+            let drain_outcome = handle.block_on(checkpoint_io(
+                worker_state,
+                generation,
+                failures,
+                deadline,
+                async {
                     pipeline.drain(requests).await.map(drop).map_err(|error| {
                         // Runtime Display is sanitized; never
                         // log its SQL/HTTP source.
@@ -972,7 +993,8 @@ fn apply_dispatch<I: InviteSource>(
                         );
                         leveling_dispatch_failure()
                     })
-                }));
+                },
+            ));
             if drain_outcome.is_err() {
                 // A failed drain or its checkpoint deadline
                 // holds the cursor via `dispatch_error`
@@ -1061,6 +1083,7 @@ fn apply_dispatch<I: InviteSource>(
             handle.block_on(checkpoint_io(
                 worker_state,
                 generation,
+                failures,
                 deadline,
                 store.commit_dispatch_with_job(
                     &checkpoint,
@@ -1178,7 +1201,17 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let _dispatch_guard = runtime.as_ref().map(|runtime| runtime.dispatch_guard());
     let _voice_connection = VoiceConnectionGuard(voice.clone());
     let generation = Arc::new(AtomicU64::new(0));
-    let saved = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, store.load()).await?;
+    // Counts current-generation checkpoint failures so an overlapping success
+    // cannot restore readiness after a failure (see `checkpoint_io`).
+    let checkpoint_failures = Arc::new(AtomicU64::new(0));
+    let saved = checkpoint_io(
+        &state,
+        &generation,
+        &checkpoint_failures,
+        CHECKPOINT_IO_MAX,
+        store.load(),
+    )
+    .await?;
     if let Some(voice) = &voice {
         let executor = runtime
             .as_ref()
@@ -1512,6 +1545,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             store.clone(),
             Arc::clone(&state),
             Arc::clone(&generation),
+            Arc::clone(&checkpoint_failures),
             Arc::clone(&live_interactions),
             OnboardingQueueSignals {
                 signal: Arc::clone(&queue_signal),
@@ -1548,6 +1582,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     let cleared = handle.block_on(checkpoint_io(
                         &worker_state,
                         &generation,
+                        &checkpoint_failures,
                         deadline,
                         store.clear(),
                     ));
@@ -1573,6 +1608,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     &handle,
                     &worker_state,
                     &generation,
+                    &checkpoint_failures,
                     &pipeline,
                     &store,
                     automod.clone(),
@@ -1695,6 +1731,7 @@ async fn onboarding_queue(
     store: GatewaySessionStore,
     state: Arc<RwLock<GatewayState>>,
     generation: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
     live_interactions: LiveInteractions,
     mut signals: OnboardingQueueSignals,
 ) -> Result<(), sqlx::Error> {
@@ -1746,6 +1783,7 @@ async fn onboarding_queue(
     checkpoint_io(
         &state,
         &generation,
+        &failures,
         deadline,
         store.recover_onboarding_jobs(),
     )
@@ -1760,8 +1798,14 @@ async fn onboarding_queue(
         }
         // Claim only available worker slots; reception keeps polling Twilight.
         if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT {
-            if let Some(saved) =
-                checkpoint_io(&state, &generation, deadline, store.claim_onboarding_job()).await?
+            if let Some(saved) = checkpoint_io(
+                &state,
+                &generation,
+                &failures,
+                deadline,
+                store.claim_onboarding_job(),
+            )
+            .await?
             {
                 let live = live_interactions
                     .lock()
@@ -1810,6 +1854,7 @@ async fn onboarding_queue(
                     checkpoint_io(
                         &state,
                         &generation,
+                        &failures,
                         deadline,
                         store.finish_onboarding_job(saved.id, true),
                     )
@@ -1835,7 +1880,14 @@ async fn onboarding_queue(
                     Some(Ok(Err(cause))) => return Err(onboarding_worker_failure(cause)),
                     _ => return Err(onboarding_worker_failure(OnboardingWorkerFailure::Join)),
                 };
-                checkpoint_io(&state, &generation, deadline, store.finish_onboarding_job(id, interrupted)).await?;
+                checkpoint_io(
+                    &state,
+                    &generation,
+                    &failures,
+                    deadline,
+                    store.finish_onboarding_job(id, interrupted),
+                )
+                .await?;
                 queue_dirty = true;
             }
         }
@@ -2189,6 +2241,7 @@ mod tests {
         let result = checkpoint_io(
             &state,
             &AtomicU64::new(0),
+            &AtomicU64::new(0),
             std::time::Duration::from_millis(10),
             std::future::pending::<Result<(), sqlx::Error>>(),
         )
@@ -2200,14 +2253,16 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_io_restores_readiness_only_after_success() {
         let state = RwLock::new(GatewayState::Connected);
-        checkpoint_io(&state, &AtomicU64::new(0), CHECKPOINT_IO_MAX, async {
+        let generation = AtomicU64::new(0);
+        let failures = AtomicU64::new(0);
+        checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
             assert_eq!(*state.read().await, GatewayState::Armed);
             Ok(())
         })
         .await
         .unwrap();
         assert_eq!(*state.read().await, GatewayState::Connected);
-        let result = checkpoint_io(&state, &AtomicU64::new(0), CHECKPOINT_IO_MAX, async {
+        let result = checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
             Err::<(), _>(sqlx::Error::InvalidArgument("test failure".into()))
         })
         .await;
@@ -2222,13 +2277,15 @@ mod tests {
         async fn checkpoint_io_stale_armed_snapshot_cannot_erase_committed_ready() {
             let state = RwLock::new(GatewayState::Armed);
             let generation = AtomicU64::new(0);
+            let failures = AtomicU64::new(0);
             let (entered, entering) = tokio::sync::oneshot::channel();
             let (release, released) = tokio::sync::oneshot::channel();
-            let operation = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
-                entered.send(()).unwrap();
-                released.await.unwrap();
-                Ok(())
-            });
+            let operation =
+                checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
+                    entered.send(()).unwrap();
+                    released.await.unwrap();
+                    Ok(())
+                });
             let promote = async {
                 entering.await.unwrap();
                 assert_eq!(*state.read().await, GatewayState::Armed);
@@ -2243,6 +2300,7 @@ mod tests {
             .expect("bounded checkpoint/promotion coordination");
             result.expect("healthy IO completes");
             assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(failures.load(Ordering::Acquire), 0);
             assert_eq!(state.read().await.status(), ComponentStatus::Ready);
         }
 
@@ -2250,13 +2308,14 @@ mod tests {
         async fn checkpoint_io_failure_after_overlapping_success_rearms_readiness() {
             let state = RwLock::new(GatewayState::Connected);
             let generation = AtomicU64::new(0);
+            let failures = AtomicU64::new(0);
             let (first_entered, first_entering) = tokio::sync::oneshot::channel();
             let (second_entered, second_entering) = tokio::sync::oneshot::channel();
             let (release_first, first_released) = tokio::sync::oneshot::channel();
             let (first_finished, first_finishing) = tokio::sync::oneshot::channel();
             let (fail_second, second_failed) = tokio::sync::oneshot::channel();
             let first = async {
-                checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+                checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
                     first_entered.send(()).unwrap();
                     first_released.await.unwrap();
                     Ok(())
@@ -2267,12 +2326,13 @@ mod tests {
             };
             let second = async {
                 first_entering.await.unwrap();
-                let result = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
-                    second_entered.send(()).unwrap();
-                    second_failed.await.unwrap();
-                    Err::<(), _>(sqlx::Error::InvalidArgument("test failure".into()))
-                })
-                .await;
+                let result =
+                    checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
+                        second_entered.send(()).unwrap();
+                        second_failed.await.unwrap();
+                        Err::<(), _>(sqlx::Error::InvalidArgument("test failure".into()))
+                    })
+                    .await;
                 assert!(result.is_err());
             };
             let release = async {
@@ -2287,6 +2347,107 @@ mod tests {
             .await
             .expect("bounded overlapping checkpoint failure coordination");
             assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(failures.load(Ordering::Acquire), 1);
+            assert_eq!(*state.read().await, GatewayState::Armed);
+        }
+
+        #[tokio::test]
+        async fn checkpoint_io_success_after_overlapping_failure_stays_unready() {
+            let state = RwLock::new(GatewayState::Connected);
+            let generation = AtomicU64::new(0);
+            let failures = AtomicU64::new(0);
+            let (first_entered, first_entering) = tokio::sync::oneshot::channel();
+            let (second_entered, second_entering) = tokio::sync::oneshot::channel();
+            let (fail_second, second_failed) = tokio::sync::oneshot::channel();
+            let (second_finished, second_finishing) = tokio::sync::oneshot::channel();
+            let (release_first, first_released) = tokio::sync::oneshot::channel();
+            let first = async {
+                checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
+                    first_entered.send(()).unwrap();
+                    first_released.await.unwrap();
+                    Ok(())
+                })
+                .await
+                .expect("first healthy IO");
+            };
+            let second = async {
+                first_entering.await.unwrap();
+                let result =
+                    checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
+                        second_entered.send(()).unwrap();
+                        second_failed.await.unwrap();
+                        Err::<(), _>(sqlx::Error::InvalidArgument("test failure".into()))
+                    })
+                    .await;
+                assert!(result.is_err());
+                second_finished.send(()).unwrap();
+            };
+            let release = async {
+                second_entering.await.unwrap();
+                // The failure lands while the success is still in flight: the
+                // recorded failure must stop the later success restoring Ready.
+                fail_second.send(()).unwrap();
+                second_finishing.await.unwrap();
+                release_first.send(()).unwrap();
+            };
+            tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+                tokio::join!(first, second, release)
+            })
+            .await
+            .expect("bounded overlapping failure-then-success coordination");
+            assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(failures.load(Ordering::Acquire), 1);
+            assert_eq!(*state.read().await, GatewayState::Armed);
+        }
+
+        #[tokio::test]
+        async fn checkpoint_io_timeout_after_overlapping_success_rearms_readiness() {
+            let state = RwLock::new(GatewayState::Connected);
+            let generation = AtomicU64::new(0);
+            let failures = AtomicU64::new(0);
+            let (first_entered, first_entering) = tokio::sync::oneshot::channel();
+            let (second_entered, second_entering) = tokio::sync::oneshot::channel();
+            let (release_first, first_released) = tokio::sync::oneshot::channel();
+            let (first_finished, first_finishing) = tokio::sync::oneshot::channel();
+            let first = async {
+                checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
+                    first_entered.send(()).unwrap();
+                    first_released.await.unwrap();
+                    Ok(())
+                })
+                .await
+                .expect("first healthy IO");
+                first_finished.send(()).unwrap();
+            };
+            let second = async {
+                first_entering.await.unwrap();
+                let result = checkpoint_io(
+                    &state,
+                    &generation,
+                    &failures,
+                    std::time::Duration::from_millis(100),
+                    async {
+                        second_entered.send(()).unwrap();
+                        std::future::pending::<Result<(), sqlx::Error>>().await
+                    },
+                )
+                .await;
+                assert!(result.is_err());
+            };
+            let release = async {
+                second_entering.await.unwrap();
+                // The first success restores Connected while the second call
+                // is still pending; its deadline must re-arm back to Armed.
+                release_first.send(()).unwrap();
+                first_finishing.await.unwrap();
+            };
+            tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+                tokio::join!(first, second, release)
+            })
+            .await
+            .expect("bounded overlapping checkpoint timeout coordination");
+            assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(failures.load(Ordering::Acquire), 1);
             assert_eq!(*state.read().await, GatewayState::Armed);
         }
 
@@ -2294,13 +2455,15 @@ mod tests {
         async fn checkpoint_io_stale_failure_cannot_clobber_newer_ready() {
             let state = RwLock::new(GatewayState::Connected);
             let generation = AtomicU64::new(0);
+            let failures = AtomicU64::new(0);
             let (entered, entering) = tokio::sync::oneshot::channel();
             let (fail, failed) = tokio::sync::oneshot::channel();
-            let operation = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
-                entered.send(()).unwrap();
-                failed.await.unwrap();
-                Err::<(), _>(sqlx::Error::InvalidArgument("test failure".into()))
-            });
+            let operation =
+                checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
+                    entered.send(()).unwrap();
+                    failed.await.unwrap();
+                    Err::<(), _>(sqlx::Error::InvalidArgument("test failure".into()))
+                });
             let reconnect = async {
                 entering.await.unwrap();
                 // A disconnect bumps the generation and a fresh READY publishes
@@ -2316,6 +2479,7 @@ mod tests {
             .expect("bounded stale checkpoint failure coordination");
             assert!(result.is_err());
             assert_eq!(generation.load(Ordering::Acquire), 1);
+            assert_eq!(failures.load(Ordering::Acquire), 0);
             assert_eq!(*state.read().await, GatewayState::Connected);
             assert_eq!(state.read().await.status(), ComponentStatus::Ready);
         }
@@ -2324,12 +2488,13 @@ mod tests {
         async fn checkpoint_io_overlapping_successes_cannot_leave_readiness_armed() {
             let state = RwLock::new(GatewayState::Connected);
             let generation = AtomicU64::new(0);
+            let failures = AtomicU64::new(0);
             let (first_entered, first_entering) = tokio::sync::oneshot::channel();
             let (second_entered, second_entering) = tokio::sync::oneshot::channel();
             let (release_first, first_released) = tokio::sync::oneshot::channel();
             let (first_finished, first_finishing) = tokio::sync::oneshot::channel();
             let first = async {
-                checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+                checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
                     first_entered.send(()).unwrap();
                     first_released.await.unwrap();
                     Ok(())
@@ -2340,7 +2505,7 @@ mod tests {
             };
             let second = async {
                 first_entering.await.unwrap();
-                checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+                checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
                     second_entered.send(()).unwrap();
                     first_finishing.await.unwrap();
                     Ok(())
@@ -2358,6 +2523,7 @@ mod tests {
             .await
             .expect("bounded overlapping checkpoint coordination");
             assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(failures.load(Ordering::Acquire), 0);
             assert_eq!(state.read().await.status(), ComponentStatus::Ready);
         }
     }
@@ -2366,7 +2532,8 @@ mod tests {
     async fn checkpoint_completion_cannot_overwrite_a_transport_disconnect() {
         let state = RwLock::new(GatewayState::Connected);
         let generation = AtomicU64::new(0);
-        checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+        let failures = AtomicU64::new(0);
+        checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
             assert_eq!(*state.read().await, GatewayState::Armed);
             transport_disconnected(&state, &generation).await;
             Ok(())
@@ -2374,6 +2541,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(generation.load(Ordering::Acquire), 1);
+        assert_eq!(failures.load(Ordering::Acquire), 0);
         assert_eq!(*state.read().await, GatewayState::Armed);
         assert_ne!(state.read().await.status(), ComponentStatus::Ready);
     }
@@ -2388,12 +2556,34 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_completion_cannot_restore_readiness_after_reception_stops() {
         let state = RwLock::new(GatewayState::Connected);
-        checkpoint_io(&state, &AtomicU64::new(0), CHECKPOINT_IO_MAX, async {
-            *state.write().await = GatewayState::Draining;
-            Ok(())
-        })
+        checkpoint_io(
+            &state,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+            CHECKPOINT_IO_MAX,
+            async {
+                *state.write().await = GatewayState::Draining;
+                Ok(())
+            },
+        )
         .await
         .unwrap();
+        assert_eq!(*state.read().await, GatewayState::Draining);
+        assert_eq!(state.read().await.status(), ComponentStatus::Down);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_failure_cannot_restore_readiness_after_reception_stops() {
+        let state = RwLock::new(GatewayState::Connected);
+        let generation = AtomicU64::new(0);
+        let failures = AtomicU64::new(0);
+        let result = checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
+            *state.write().await = GatewayState::Draining;
+            Err::<(), _>(sqlx::Error::InvalidArgument("test failure".into()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(failures.load(Ordering::Acquire), 0);
         assert_eq!(*state.read().await, GatewayState::Draining);
         assert_eq!(state.read().await.status(), ComponentStatus::Down);
     }
@@ -2411,6 +2601,7 @@ mod tests {
         let state = RwLock::new(GatewayState::Connected);
         let result = checkpoint_io(
             &state,
+            &AtomicU64::new(0),
             &AtomicU64::new(0),
             std::time::Duration::from_millis(10),
             async move {
@@ -2795,6 +2986,7 @@ mod tests {
         let pipeline = build_pipeline(vec![], None);
         let state = RwLock::new(GatewayState::Armed);
         let generation = AtomicU64::new(0);
+        let failures = AtomicU64::new(0);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
             .expect("lazy pool");
@@ -2816,6 +3008,7 @@ mod tests {
                 &tokio::runtime::Handle::current(),
                 &state,
                 &generation,
+                &failures,
                 &pipeline,
                 &store,
                 None,
@@ -2876,6 +3069,7 @@ mod tests {
         let pipeline = build_pipeline(vec![], None);
         let state = RwLock::new(GatewayState::Armed);
         let generation = AtomicU64::new(0);
+        let failures = AtomicU64::new(0);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
             .expect("lazy pool");
@@ -2903,6 +3097,7 @@ mod tests {
                 &tokio::runtime::Handle::current(),
                 &state,
                 &generation,
+                &failures,
                 &pipeline,
                 &store,
                 None,
@@ -2953,6 +3148,7 @@ mod tests {
         let pipeline = build_pipeline(vec![], None);
         let state = RwLock::new(GatewayState::Armed);
         let generation = AtomicU64::new(0);
+        let failures = AtomicU64::new(0);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
             .expect("lazy pool");
@@ -2976,6 +3172,7 @@ mod tests {
                     &tokio::runtime::Handle::current(),
                     &state,
                     &generation,
+                    &failures,
                     &pipeline,
                     &store,
                     None,
@@ -3076,6 +3273,7 @@ mod tests {
         );
         let state = RwLock::new(GatewayState::Armed);
         let generation = AtomicU64::new(0);
+        let failures = AtomicU64::new(0);
         let store = GatewaySessionStore::new(pool, "22".to_owned(), 1);
         let checkpoint = GatewaySession {
             session_id: "test-session".to_owned(),
@@ -3090,6 +3288,7 @@ mod tests {
                 &tokio::runtime::Handle::current(),
                 &state,
                 &generation,
+                &failures,
                 &pipeline,
                 &store,
                 None,
@@ -3610,6 +3809,7 @@ mod tests {
         let failures_before = community_facts_drain_failures("error");
         let state = RwLock::new(GatewayState::Armed);
         let generation = AtomicU64::new(0);
+        let failures = AtomicU64::new(0);
         let store = GatewaySessionStore::new(pool, "22".to_owned(), 1);
         let checkpoint = GatewaySession {
             session_id: "test-session".to_owned(),
@@ -3624,6 +3824,7 @@ mod tests {
                 &tokio::runtime::Handle::current(),
                 &state,
                 &generation,
+                &failures,
                 &pipeline,
                 &store,
                 None,
@@ -3742,6 +3943,7 @@ mod tests {
         );
         let state = RwLock::new(GatewayState::Armed);
         let generation = AtomicU64::new(0);
+        let failures = AtomicU64::new(0);
         let store = GatewaySessionStore::new(pool, "22".to_owned(), 1);
         let checkpoint = GatewaySession {
             session_id: "test-session".to_owned(),
@@ -3756,6 +3958,7 @@ mod tests {
                 &tokio::runtime::Handle::current(),
                 &state,
                 &generation,
+                &failures,
                 &pipeline,
                 &store,
                 None,
