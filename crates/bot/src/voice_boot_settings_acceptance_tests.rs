@@ -160,12 +160,12 @@ fn assert_refusal_names(pairs: &[(&str, &str)], key: &str) -> String {
         "the boot diagnostic is a warning, like the admission fallback: {line}"
     );
     assert!(
-        line.contains(key),
-        "the boot diagnostic names the exact setting key {key}: {line}"
+        line.contains(&format!(" key={key:?}")),
+        "the boot diagnostic binds the exact setting key to the key field: {line}"
     );
     assert!(
-        line.contains("invalid_value"),
-        "the boot diagnostic carries the fixed invalid_value class: {line}"
+        line.contains(r#" reason="invalid_value""#),
+        "the boot diagnostic binds the fixed invalid_value class to the reason field: {line}"
     );
     assert!(
         !logged.contains("invalid digit"),
@@ -266,6 +266,20 @@ fn multiple_invalid_settings_name_only_the_first_in_existing_order() {
         &[(EMPTY_GRACE_KEY, "bad-entry"), (SYNTHETIC_KEY, "bad-entry")],
         EMPTY_GRACE_KEY,
     );
+
+    // Each adjacent protected sub-key keeps its existing precedence,
+    // even when the later key is configured first in the input pairs.
+    for (earlier, later) in [
+        (LOBBY_KEY, GENERATOR_KEY),
+        (GENERATOR_KEY, CATEGORY_KEY),
+        (CATEGORY_KEY, PROTECTED_KEY),
+    ] {
+        let logged = assert_refusal_names(&[(later, "bad-entry"), (earlier, "bad-entry")], earlier);
+        assert!(
+            !logged.contains(later),
+            "only the earlier protected sub-key {earlier} is named, not {later}: {logged}"
+        );
+    }
 
     // Inside the protected validator its current sub-key order wins:
     // the lobby is consulted before the protected list.
