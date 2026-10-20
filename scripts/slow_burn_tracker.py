@@ -62,7 +62,7 @@ CADENCE_WARN_SECONDS = 600
 # once the slow windows have gone this long without coverage: genuine burns
 # go unfiled and open cards stay unclosed while coverage is gone.
 UNCOVERED_WARN_SECONDS = int(6.5 * 3600)
-MARKER_RE = re.compile(r"<!-- slow-burn-tracker:last-update=(\d+) -->")
+MARKER_RE = re.compile(r"<!-- slow-burn-tracker:last-update=([0-9]{1,19}) -->")
 TIMEOUT_SECONDS = 6
 MAX_BODY_BYTES = 64 * 1024
 # Plenty for a six-hour ring or 50 ordinary issue rows. Check UTF-8 bytes,
@@ -318,7 +318,8 @@ def open_tracking_issues(repo, token, label, prefix):
             or not isinstance(issue.get("title"), str)
             or type(issue.get("number")) is not int
             or issue["number"] <= 0
-            or (issue.get("body") is not None and not isinstance(issue["body"], str))
+            or "body" not in issue
+            or (issue["body"] is not None and not isinstance(issue["body"], str))
             for issue in issues):
         raise TrackError("issue reconcile failed: open issues are unreadable")
     return [issue for issue in issues if issue["title"].startswith(prefix)]
