@@ -375,6 +375,8 @@ export interface MetricsAlertState {
   gatewayUnpaired: number;
   /** Consecutive completed samples with an unpaired disconnect outstanding. */
   gatewayUnpairedStreak: number;
+  /** Same-scrape process identity for the gateway baseline; absent in legacy storage. */
+  gatewayProcessIncarnation?: string | undefined;
   /** False until the first valid gateway-readiness sample: the first sample never fires. */
   gatewayNotReadySeen: boolean;
   /** Consecutive valid samples with the /readyz gateway component non-ready. */
@@ -633,7 +635,7 @@ const REST_BREAKER_OPEN_RULE = "rest_admission_breaker_open";
 
 type GatewayPairingFields = Pick<
   MetricsAlertState,
-  "gatewayDisconnects" | "gatewayRecoveries" | "gatewayUnpairedSeen" | "gatewayUnpaired" | "gatewayUnpairedStreak"
+  "gatewayDisconnects" | "gatewayRecoveries" | "gatewayUnpairedSeen" | "gatewayUnpaired" | "gatewayUnpairedStreak" | "gatewayProcessIncarnation"
 >;
 
 /**
@@ -642,27 +644,50 @@ type GatewayPairingFields = Pick<
  * scrape-validation guard ("New consumed families cannot silently bypass
  * validation") covers these series: a Rust rename or malformed value fails
  * the scrape instead of silently holding the rule off. The
- * finite/nonnegative/single-row checks stay as a backstop for direct
+ * safe-integer/exact-label/single-row checks stay as a backstop for direct
  * `evaluateMetrics` callers.
  */
 function gatewayCounter(matches: Sample[], event?: string): number | undefined {
   const scoped = event === undefined ? matches : matches.filter((s) => s.labels["event"] === event);
   if (scoped.length !== 1) return undefined;
-  const value = scoped[0]!.value;
-  return Number.isFinite(value) && value >= 0 ? value : undefined;
+  const row = scoped[0]!;
+  if (Object.keys(row.labels).length !== (event === undefined ? 0 : 1)) return undefined;
+  return Number.isSafeInteger(row.value) && row.value >= 0 ? row.value : undefined;
+}
+
+/** Validates the complete optional family, shared with the strict scrape parser. */
+export function processIncarnation(rows: Sample[]): string | undefined {
+  if (rows.length !== 4) return undefined;
+  const parts = ["0", "1", "2", "3"].map((part) => exactSeries(rows, { part }));
+  if (parts.some((part) => part === undefined || part > 4294967295)
+    || parts.every((part) => part === 0)) return undefined;
+  return parts.map((part) => part!.toString(16).padStart(8, "0")).join("");
+}
+
+function validProcessIncarnation(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{32}$/.test(value) && value !== "0".repeat(32);
 }
 
 /** Pairs disconnects with RESUMED plus fresh READY; invalid samples hold, restarts re-baseline. */
 function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { firing: boolean; fields: GatewayPairingFields; restarted: boolean } {
+  const previousIncarnation = validProcessIncarnation(prev.gatewayProcessIncarnation) ? prev.gatewayProcessIncarnation : undefined;
   const carried: GatewayPairingFields = {
     gatewayDisconnects: prev.gatewayDisconnects ?? 0,
     gatewayRecoveries: prev.gatewayRecoveries ?? 0,
     gatewayUnpairedSeen: prev.gatewayUnpairedSeen ?? false,
     gatewayUnpaired: prev.gatewayUnpaired ?? 0,
     gatewayUnpairedStreak: prev.gatewayUnpairedStreak ?? 0,
+    gatewayProcessIncarnation: previousIncarnation,
   };
   const wasFiring = prev.firing.includes(GATEWAY_UNPAIRED_RULE);
   const gauge = (name: string) => samples.filter((s) => s.name === name);
+  const incarnationRows = gauge("two_bot_process_incarnation");
+  const incarnation = processIncarnation(incarnationRows);
+  // Missing identity remains compatible with old state + old containers. Once
+  // attributed, losing identity is not a valid counter window or a recovery.
+  if (incarnation === undefined && (incarnationRows.length > 0 || previousIncarnation !== undefined)) {
+    return { firing: wasFiring, fields: carried, restarted: false };
+  }
   const disconnects = gatewayCounter(gauge("two_bot_gateway_disconnects_total"));
   const resumes = gatewayCounter(gauge("two_bot_gateway_resumes_total"));
   const ready = gatewayCounter(gauge("two_bot_gateway_events_total"), "READY");
@@ -670,15 +695,20 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
     return { firing: wasFiring, fields: carried, restarted: false };
   }
   const recoveries = resumes + ready;
+  if (!Number.isSafeInteger(recoveries)) return { firing: wasFiring, fields: carried, restarted: false };
   const baseline: GatewayPairingFields = {
     gatewayDisconnects: disconnects,
     gatewayRecoveries: recoveries,
     gatewayUnpairedSeen: true,
     gatewayUnpaired: 0,
     gatewayUnpairedStreak: 0,
+    gatewayProcessIncarnation: incarnation,
   };
   if (!carried.gatewayUnpairedSeen) return { firing: false, fields: baseline, restarted: false };
-  if (disconnects < carried.gatewayDisconnects || recoveries < carried.gatewayRecoveries) {
+  // Only two validated, attributed samples prove a process change. Adopting
+  // identity into legacy state is not itself evidence of restart or recovery.
+  if ((previousIncarnation !== undefined && incarnation !== previousIncarnation)
+    || disconnects < carried.gatewayDisconnects || recoveries < carried.gatewayRecoveries) {
     return { firing: wasFiring, fields: baseline, restarted: true };
   }
   // Any recovery growth means the gateway came back: a RESUMED or fresh READY
@@ -693,13 +723,7 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
   if (recoveries > carried.gatewayRecoveries) {
     return {
       firing: false,
-      fields: {
-        gatewayDisconnects: disconnects,
-        gatewayRecoveries: recoveries,
-        gatewayUnpairedSeen: true,
-        gatewayUnpaired: 0,
-        gatewayUnpairedStreak: 0,
-      },
+      fields: baseline,
       restarted: false,
     };
   }
@@ -717,6 +741,7 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
       gatewayUnpairedSeen: true,
       gatewayUnpaired: outstanding ? 1 : 0,
       gatewayUnpairedStreak: streak,
+      gatewayProcessIncarnation: incarnation,
     },
     restarted: false,
   };
@@ -1223,8 +1248,8 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // holds the current state. `gateway_failure.failed_step` cannot serve here:
   // it is absent until a failure is recorded, so a shard stuck starting with
   // no recorded failure has no step to read. The first valid sample only
-  // stores the baseline and never fires; a process restart (gateway pairing
-  // counters went backwards, detected above) re-baselines the streak even
+  // stores the baseline and never fires; a process restart (gateway counter
+  // decrease or validated incarnation change above) re-baselines the streak even
   // when this sample's readiness is invalid, and holds a firing non-ready or
   // invalid alert rather than clearing it; any ready sample clears at once,
   // even across a restart. A failed /metrics scrape never reaches this

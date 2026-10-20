@@ -2,7 +2,9 @@ import { readFileSync } from "node:fs";
 
 const rust = readFileSync(new URL("../../../crates/core/src/metrics.rs", import.meta.url), "utf8");
 
-export function rustLabels(name: string): string[] {
+export function rustLabels(name: string | readonly string[]): string[] {
+  // Fixed wire dimensions can be specified literally, independent of a Rust constant name.
+  if (typeof name !== "string") return [...name];
   // Accept both `&[&str] = &[...]` and `[&str; N] = [...]` const shapes.
   const list = new RegExp(`pub const ${name}:[^=]*=\\s*(?:&)?\\[([\\s\\S]*?)\\];`).exec(rust);
   if (!list) throw new Error(`missing Rust metric dimension ${name}`);
@@ -17,7 +19,8 @@ export function rustLabels(name: string): string[] {
   throw new Error(`no parseable labels in Rust metric dimension ${name}`);
 }
 
-export const RUST_ALERT_AXES: Record<string, Record<string, string>> = {
+export const RUST_ALERT_AXES: Record<string, Record<string, string | readonly string[]>> = {
+  two_bot_process_incarnation: { part: ["0", "1", "2", "3"] },
   two_bot_job_last_success_timestamp_seconds: { job: "JOBS" },
   two_bot_job_consecutive_failures: { job: "JOBS" },
   two_bot_job_last_error_class: { job: "JOBS", class: "JOB_ERROR_CLASSES" },
@@ -63,7 +66,8 @@ export function metricsLines(rankFailures = 0): string[] {
     }
     for (const labels of rows) {
       const fields = Object.entries(labels).map(([k, v]) => `${k}="${v}"`).join(",");
-      const value = name === "two_bot_job_consecutive_failures" && labels.job === "rank" ? rankFailures : 0;
+      const value = name === "two_bot_process_incarnation" && labels.part === "3" ? 1
+        : name === "two_bot_job_consecutive_failures" && labels.job === "rank" ? rankFailures : 0;
       lines.push(`${name}${fields ? `{${fields}}` : ""} ${value}`);
     }
   }

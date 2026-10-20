@@ -124,6 +124,8 @@ mod ticket_runtime;
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
 mod website_jobs;
+#[cfg(test)]
+mod website_roster_cap_acceptance_tests;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

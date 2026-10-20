@@ -4916,6 +4916,175 @@ async fn feed_remove_deletes_present_and_reports_missing() {
     db.close().await;
 }
 
+// ── Acceptance: removal serialized with delivery (command path) ──────────
+// Protected acceptance tests. While a relay carries unresolved pending
+// delivery evidence, `/feed-remove` must refuse with a fixed
+// recovery-required reply, retain the relay and its exact ledger row, and
+// audit a recovery outcome — never claim removal, report the id missing,
+// or fall back to the generic store-failure "try again" reply.
+
+async fn seed_feed_delivery(db: &TestDb, feed_id: &str, state: &str) {
+    sqlx::query(
+        "INSERT INTO feed_deliveries
+           (feed_id, item_key, nonce, state, message_id, first_seen_at, delivered_at)
+         VALUES ($1, 'item-0', $2, $3,
+                 CASE WHEN $3 = 'delivered' THEN '9001' END,
+                 clock_timestamp(),
+                 CASE WHEN $3 = 'delivered' THEN clock_timestamp() END)",
+    )
+    .bind(feed_id)
+    .bind(format!("nonce-{feed_id}-item-0"))
+    .bind(state)
+    .execute(&db.pool)
+    .await
+    .expect("seed feed delivery");
+}
+
+/// (feed_id, item_key, nonce, state) across every guild in the fixture.
+async fn all_feed_delivery_rows(db: &TestDb) -> Vec<(String, String, String, String)> {
+    sqlx::query_as(
+        "SELECT feed_id, item_key, nonce, state FROM feed_deliveries
+          ORDER BY feed_id, item_key",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("feed delivery rows")
+}
+
+async fn feed_remove_reply(db: &TestDb, id: &str) -> (String, MockRest) {
+    let (runtime, mock) = db_runtime(db, Vec::new()).await;
+    runtime
+        .on_interaction(&slash(
+            "feed-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::String(id.to_owned()))],
+        ))
+        .await;
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), 1, "one completion per remove");
+    let body: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
+    (
+        body["content"].as_str().expect("reply content").to_owned(),
+        mock,
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_remove_with_pending_delivery_refuses_and_retains_evidence() {
+    let db = TestDb::new().await;
+    db.seed_feed(GUILD_S, "feed-pending", "rss").await;
+    seed_feed_delivery(&db, "feed-pending", "pending").await;
+    let before = all_feed_delivery_rows(&db).await;
+    assert_eq!(before.len(), 1);
+
+    let (reply, mock) = feed_remove_reply(&db, "feed-pending").await;
+
+    assert_ne!(reply, "Feed relay removed.", "must not claim removal");
+    assert_ne!(reply, "No feed relay with that id.", "the relay exists");
+    assert_ne!(
+        reply, "Feed command failed; try again.",
+        "a blind retry instruction cannot resolve unconfirmed send evidence"
+    );
+    assert!(
+        reply.to_lowercase().contains("recover"),
+        "fixed recovery-required reply, got: {reply}"
+    );
+    assert_eq!(
+        db.feed_rows()
+            .await
+            .iter()
+            .map(|row| row.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["feed-pending"],
+        "the relay is retained"
+    );
+    assert_eq!(
+        all_feed_delivery_rows(&db).await,
+        before,
+        "the exact pending ledger row is retained, not cascaded away"
+    );
+    let audits = db.feed_audits().await;
+    assert_eq!(audits.len(), 1, "exactly one remove audit row");
+    assert_eq!(audits[0].0, "feed.remove");
+    assert_eq!(audits[0].1, "feed-pending");
+    assert!(
+        audits[0].2.contains("recover"),
+        "fixed recovery-required audit outcome, got: {}",
+        audits[0].2
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_remove_with_only_delivered_delivery_still_removes() {
+    let db = TestDb::new().await;
+    db.seed_feed(GUILD_S, "feed-settled", "rss").await;
+    seed_feed_delivery(&db, "feed-settled", "delivered").await;
+
+    let (reply, mock) = feed_remove_reply(&db, "feed-settled").await;
+
+    assert_eq!(reply, "Feed relay removed.");
+    assert!(db.feed_rows().await.is_empty(), "settled relay is deleted");
+    assert!(
+        all_feed_delivery_rows(&db).await.is_empty(),
+        "settled ledger keeps its current cascade"
+    );
+    assert_eq!(
+        db.feed_audits().await,
+        vec![(
+            "feed.remove".to_owned(),
+            "feed-settled".to_owned(),
+            "removed".to_owned()
+        )]
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_remove_foreign_id_reports_missing_and_retains_foreign_pending() {
+    let db = TestDb::new().await;
+    db.seed_feed("9999", "feed-foreign", "rss").await;
+    seed_feed_delivery(&db, "feed-foreign", "pending").await;
+    let before = all_feed_delivery_rows(&db).await;
+
+    let (reply, mock) = feed_remove_reply(&db, "feed-foreign").await;
+
+    assert_eq!(
+        reply, "No feed relay with that id.",
+        "a foreign id is indistinguishable from missing in this guild"
+    );
+    let foreign: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM feed_relays WHERE guild_id = '9999'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("foreign relay count");
+    assert_eq!(foreign, 1, "the foreign relay is untouched");
+    assert_eq!(
+        all_feed_delivery_rows(&db).await,
+        before,
+        "the foreign pending evidence is untouched"
+    );
+    assert_eq!(
+        db.feed_audits().await,
+        vec![(
+            "feed.remove".to_owned(),
+            "feed-foreign".to_owned(),
+            "missing".to_owned()
+        )]
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn feed_list_is_scoped_to_the_configured_guild() {
