@@ -1,6 +1,9 @@
 //! Containment runtime acceptance against the mock Discord double. The worker
 //! tests are ignored and run only on agent-testdb / the CI service container.
 
+#[path = "containment_tuning_refusal_acceptance_tests.rs"]
+mod tuning_refusal_acceptance;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -169,15 +172,17 @@ fn containment_seconds_refuse_values_that_are_not_whole_positive_milliseconds() 
 
 #[test]
 fn containment_id_lists_split_commas_and_drop_empties() {
-    assert!(id_list(&vars(&[]), "TWO_ANTI_NUKE_TRUSTED_USER_IDS").is_empty());
+    assert!(id_list(&vars(&[]), "TWO_ANTI_NUKE_TRUSTED_USER_IDS")
+        .expect("empty list")
+        .is_empty());
+    let ids = ["1".repeat(18), "2".repeat(18), "3".repeat(18)];
+    let raw = format!(" {},{},, {} ", ids[0], ids[1], ids[2]);
     let list = id_list(
-        &vars(&[("TWO_ANTI_NUKE_TRUSTED_USER_IDS", " 1,2,, 3 ")]),
+        &vars(&[("TWO_ANTI_NUKE_TRUSTED_USER_IDS", &raw)]),
         "TWO_ANTI_NUKE_TRUSTED_USER_IDS",
-    );
-    assert_eq!(
-        list,
-        ["1", "2", "3"].into_iter().map(str::to_owned).collect()
-    );
+    )
+    .expect("valid snowflakes");
+    assert_eq!(list, ids.into_iter().collect());
 }
 
 #[derive(Clone, Copy)]
