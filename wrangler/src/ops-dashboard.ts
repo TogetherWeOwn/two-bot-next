@@ -299,7 +299,7 @@ const DASHBOARD_CSP = [
   "base-uri 'none'",
   "form-action 'none'",
   "frame-ancestors 'none'",
-  "script-src 'sha256-ynLfohoB+UfJtsoWHXaLV/HUlqQMLKtTUeIaQJqBQ4o='",
+  "script-src 'sha256-KakYnwlm90kiQyjP89ukbbsx3nu5UjTBJAfieSdbDR8='",
   "style-src 'sha256-XfBF+coe4Stt3RC6YIku87CPj/YAhk41yequAyR3nkA='",
 ].join("; ");
 
