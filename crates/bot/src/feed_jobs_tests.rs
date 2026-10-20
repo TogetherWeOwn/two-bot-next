@@ -1899,3 +1899,414 @@ async fn unconfirmed_send_survives_removal_attempts_and_restart_without_repost()
     mock.shutdown().await;
     db.close().await.unwrap();
 }
+
+fn feed_delivery_lock_key(guild_id: &str, feed_id: &str) -> String {
+    format!("feed-delivery:{guild_id}:{feed_id}")
+}
+
+/// Observation ceiling for an ungranted lock row. Returns as soon as the row
+/// appears, so a success-path release still happens inside the 5s lock_timeout.
+const ADVISORY_WAITER_WINDOW: Duration = Duration::from_secs(3);
+/// Above the 5s `lock_timeout` and strictly below the 15s `statement_timeout`.
+const LOCK_TIMEOUT_BOUND: Duration = Duration::from_secs(8);
+
+fn postgres_sqlstate(error: &store::FeedStoreError) -> Option<String> {
+    match error {
+        store::FeedStoreError::Db(sqlx::Error::Database(db)) => {
+            db.code().map(|code| code.into_owned())
+        }
+        _ => None,
+    }
+}
+
+async fn hold_feed_delivery_advisory_lock<'a>(
+    pool: &'a PgPool,
+    guild_id: &str,
+    feed_id: &str,
+) -> sqlx::Transaction<'a, sqlx::Postgres> {
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(feed_delivery_lock_key(guild_id, feed_id))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction
+}
+
+async fn advisory_waiter_count(
+    pool: &PgPool,
+    guild_id: &str,
+    feed_id: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH key AS (SELECT hashtextextended($1, 0) AS h)
+         SELECT count(*)::bigint FROM pg_locks, key
+         WHERE locktype = 'advisory'
+           AND NOT granted
+           AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND objsubid = 1
+           AND classid = (('x' || substr(lpad(to_hex(key.h), 16, '0'), 1, 8))::bit(32)::int)
+           AND objid = (('x' || substr(lpad(to_hex(key.h), 16, '0'), 9, 8))::bit(32)::int)",
+    )
+    .bind(feed_delivery_lock_key(guild_id, feed_id))
+    .fetch_one(pool)
+    .await
+}
+
+async fn wait_for_advisory_waiters(
+    pool: &PgPool,
+    guild_id: &str,
+    feed_id: &str,
+    expected: i64,
+) -> Result<bool, sqlx::Error> {
+    let wait = tokio::time::timeout(ADVISORY_WAITER_WINDOW, async {
+        loop {
+            if advisory_waiter_count(pool, guild_id, feed_id).await? == expected {
+                return Ok(true);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    match wait {
+        Ok(result) => result,
+        Err(_) => Ok(false),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn fresh_claim_waits_before_pending_removal_is_refused() {
+    let db = fixture().await;
+    let relay = feed("contended-claim-first");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let post = plan_post(&relay, &item(0)).unwrap();
+
+    let holder_pool = db.independent_pool().await.unwrap();
+    let holder = hold_feed_delivery_advisory_lock(&holder_pool, GUILD, &relay.id).await;
+    let claim_pool = db.independent_pool().await.unwrap();
+    let claim_pool_for_task = claim_pool.clone();
+    let claim_post = post.clone();
+    let mut claim = tokio::spawn(async move {
+        store::claim_delivery(
+            &claim_pool_for_task,
+            GUILD,
+            &claim_post,
+            "contended-claim-first-token",
+            now_millis_for_test(),
+        )
+        .await
+    });
+    let first_waiter = wait_for_advisory_waiters(db.pool(), GUILD, &relay.id, 1).await;
+    let (claim_waited, claim_probe) =
+        match tokio::time::timeout(Duration::from_millis(100), &mut claim).await {
+            Ok(result) => (false, Some(result)),
+            Err(_) => (true, None),
+        };
+    let rows_before_release = delivery_rows(db.pool(), &relay.id).await;
+
+    let remover = db.independent_pool().await.unwrap();
+    let remover_for_task = remover.clone();
+    let relay_id = relay.id.clone();
+    let mut removal =
+        tokio::spawn(async move { store::remove_feed(&remover_for_task, GUILD, &relay_id).await });
+    let second_waiter = wait_for_advisory_waiters(db.pool(), GUILD, &relay.id, 2).await;
+    let (removal_waited, removal_probe) =
+        match tokio::time::timeout(Duration::from_millis(100), &mut removal).await {
+            Ok(result) => (false, Some(result)),
+            Err(_) => (true, None),
+        };
+    let relay_before_release = relay_count(db.pool(), &relay.id).await;
+
+    let holder_released = holder.commit().await.is_ok();
+    let claim_join = match claim_probe {
+        Some(result) => result,
+        None => claim.await,
+    };
+    let removal_join = match removal_probe {
+        Some(result) => result,
+        None => removal.await,
+    };
+    let claim_result = claim_join.expect("claim task must not panic");
+    let removal_result = removal_join.expect("removal task must not panic");
+    let claim_is_fresh = matches!(claim_result, Ok(Some(DeliveryClaim::Fresh)));
+    let removal_was_refused = matches!(removal_result, Ok(store::FeedRemoval::RecoveryRequired));
+    let relay_after_release = relay_count(&remover, &relay.id).await;
+    let rows_after_release = delivery_rows(&remover, &relay.id).await;
+    let expected_rows = vec![(
+        post.item_key.clone(),
+        post.nonce.clone(),
+        "pending".to_owned(),
+        None,
+    )];
+
+    claim_pool.close().await;
+    remover.close().await;
+    holder_pool.close().await;
+    db.close().await.unwrap();
+
+    assert!(
+        matches!(first_waiter, Ok(true)),
+        "claim must be the first lock waiter"
+    );
+    assert!(
+        claim_waited,
+        "fresh claim must remain blocked before release"
+    );
+    assert!(
+        rows_before_release.is_empty(),
+        "blocked claim must write no ledger row"
+    );
+    assert!(
+        matches!(second_waiter, Ok(true)),
+        "removal must queue behind claim"
+    );
+    assert!(removal_waited, "removal must remain blocked before release");
+    assert_eq!(
+        relay_before_release, 1,
+        "blocked removal must retain the relay"
+    );
+    assert!(holder_released, "external advisory-lock holder must commit");
+    assert!(claim_is_fresh, "claim must win after the holder releases");
+    assert!(removal_was_refused, "pending evidence must refuse removal");
+    assert_eq!(
+        relay_after_release, 1,
+        "refused removal must retain the relay"
+    );
+    assert_eq!(
+        rows_after_release, expected_rows,
+        "the exact pending claim must remain"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn removal_waits_before_stale_polled_relay_claim_is_rejected() {
+    let db = fixture().await;
+    let relay = feed("contended-removal-first");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let stale = store::list_feeds(db.pool(), GUILD, true).await.unwrap();
+    assert_eq!(stale.len(), 1);
+
+    let holder_pool = db.independent_pool().await.unwrap();
+    let holder = hold_feed_delivery_advisory_lock(&holder_pool, GUILD, &relay.id).await;
+    let remover = db.independent_pool().await.unwrap();
+    let remover_for_task = remover.clone();
+    let relay_id = relay.id.clone();
+    let mut removal =
+        tokio::spawn(async move { store::remove_feed(&remover_for_task, GUILD, &relay_id).await });
+    let first_waiter = wait_for_advisory_waiters(db.pool(), GUILD, &relay.id, 1).await;
+    let (removal_waited, removal_probe) =
+        match tokio::time::timeout(Duration::from_millis(100), &mut removal).await {
+            Ok(result) => (false, Some(result)),
+            Err(_) => (true, None),
+        };
+    let relay_before_release = relay_count(db.pool(), &relay.id).await;
+
+    let poll_pool = db.independent_pool().await.unwrap();
+    let poll_pool_for_task = poll_pool.clone();
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"9001"}))).await;
+    let rest = executor(&mock);
+    let stale_relay = stale[0].clone();
+    let mut poll = tokio::spawn(async move {
+        poll_relay(
+            &poll_pool_for_task,
+            &rest,
+            &stale_relay,
+            &FixtureHttp::items(1),
+        )
+        .await
+    });
+    let second_waiter = wait_for_advisory_waiters(db.pool(), GUILD, &relay.id, 2).await;
+    let (poll_waited, poll_probe) =
+        match tokio::time::timeout(Duration::from_millis(100), &mut poll).await {
+            Ok(result) => (false, Some(result)),
+            Err(_) => (true, None),
+        };
+    let posts_before_release = post_count(&mock);
+
+    let holder_released = holder.commit().await.is_ok();
+    let removal_join = match removal_probe {
+        Some(result) => result,
+        None => removal.await,
+    };
+    let poll_join = match poll_probe {
+        Some(result) => result,
+        None => poll.await,
+    };
+    let removal_result = removal_join.expect("removal task must not panic");
+    let poll_result = poll_join.expect("poll task must not panic");
+    let removal_confirmed = matches!(removal_result, Ok(store::FeedRemoval::Removed));
+    let stale_post = plan_post(&relay, &item(1)).unwrap();
+    let stale_claim = store::claim_delivery(
+        &poll_pool,
+        GUILD,
+        &stale_post,
+        "contended-removal-stale-token",
+        now_millis_for_test(),
+    )
+    .await;
+    let stale_claim_rejected = matches!(stale_claim, Ok(None));
+    let relay_after_release = relay_count(&poll_pool, &relay.id).await;
+    let final_states = states(&poll_pool).await;
+    let final_posts = post_count(&mock);
+
+    poll_pool.close().await;
+    remover.close().await;
+    holder_pool.close().await;
+    mock.shutdown().await;
+    db.close().await.unwrap();
+
+    assert!(
+        matches!(first_waiter, Ok(true)),
+        "removal must be the first lock waiter"
+    );
+    assert!(removal_waited, "removal must remain blocked before release");
+    assert_eq!(
+        relay_before_release, 1,
+        "blocked removal must retain the relay"
+    );
+    let poll_is_second_waiter = matches!(second_waiter, Ok(true));
+    assert!(
+        poll_is_second_waiter,
+        "poll backend must be the second ungranted waiter on this feed key"
+    );
+    assert!(
+        poll_is_second_waiter && poll_waited,
+        "stale delivery attempt must remain blocked once it is the second waiter"
+    );
+    assert_eq!(posts_before_release, 0, "blocked delivery must not POST");
+    assert!(holder_released, "external advisory-lock holder must commit");
+    assert!(
+        removal_confirmed,
+        "removal must confirm after the holder releases"
+    );
+    assert!(
+        poll_result.is_ok(),
+        "stale poll should finish without a delivery error"
+    );
+    assert!(
+        stale_claim_rejected,
+        "a new claim against the removed relay must return None"
+    );
+    assert_eq!(
+        relay_after_release, 0,
+        "confirmed removal must delete the relay"
+    );
+    assert_eq!(final_states, (0, 0), "stale delivery must write no state");
+    assert_eq!(final_posts, 0, "stale delivery must never POST");
+}
+
+#[tokio::test]
+#[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+async fn delivery_fence_lock_timeout_bounds_waiting_claim_and_removal() {
+    let db = fixture().await;
+    let relay = feed("contended-timeout");
+    store::add_feed(db.pool(), &relay).await.unwrap();
+    let post = plan_post(&relay, &item(0)).unwrap();
+
+    let holder_pool = db.independent_pool().await.unwrap();
+    let holder = hold_feed_delivery_advisory_lock(&holder_pool, GUILD, &relay.id).await;
+    let remover = db.independent_pool().await.unwrap();
+    let remover_for_task = remover.clone();
+    let relay_for_removal = relay.id.clone();
+    let mut removal = tokio::spawn(async move {
+        store::remove_feed(&remover_for_task, GUILD, &relay_for_removal).await
+    });
+    let first_waiter = wait_for_advisory_waiters(db.pool(), GUILD, &relay.id, 1).await;
+
+    let claim_pool = db.independent_pool().await.unwrap();
+    let claim_pool_for_task = claim_pool.clone();
+    let claim_post = post.clone();
+    let mut claim = tokio::spawn(async move {
+        store::claim_delivery(
+            &claim_pool_for_task,
+            GUILD,
+            &claim_post,
+            "contended-timeout-token",
+            now_millis_for_test(),
+        )
+        .await
+    });
+    let second_waiter = wait_for_advisory_waiters(db.pool(), GUILD, &relay.id, 2).await;
+    let both_waiting = matches!(first_waiter, Ok(true)) && matches!(second_waiter, Ok(true));
+    let started = tokio::time::Instant::now();
+    let (removal_completed_in_time, removal_probe) =
+        match tokio::time::timeout(LOCK_TIMEOUT_BOUND, &mut removal).await {
+            Ok(result) => (true, Some(result)),
+            Err(_) => (false, None),
+        };
+    let remaining = LOCK_TIMEOUT_BOUND.saturating_sub(started.elapsed());
+    let (claim_completed_in_time, claim_probe) =
+        match tokio::time::timeout(remaining, &mut claim).await {
+            Ok(result) => (true, Some(result)),
+            Err(_) => (false, None),
+        };
+    let relay_before_release = relay_count(db.pool(), &relay.id).await;
+    let rows_before_release = delivery_rows(db.pool(), &relay.id).await;
+
+    let holder_released = holder.commit().await.is_ok();
+    let removal_join = match removal_probe {
+        Some(result) => result,
+        None => removal.await,
+    };
+    let claim_join = match claim_probe {
+        Some(result) => result,
+        None => claim.await,
+    };
+    let removal_result = removal_join.expect("removal task must not panic");
+    let claim_result = claim_join.expect("claim task must not panic");
+    let removal_sqlstate = removal_result.as_ref().err().and_then(postgres_sqlstate);
+    let claim_sqlstate = claim_result.as_ref().err().and_then(postgres_sqlstate);
+    let relay_after_release = relay_count(&claim_pool, &relay.id).await;
+    let rows_after_release = delivery_rows(&claim_pool, &relay.id).await;
+
+    claim_pool.close().await;
+    remover.close().await;
+    holder_pool.close().await;
+    db.close().await.unwrap();
+
+    assert!(
+        matches!(first_waiter, Ok(true)),
+        "removal must wait on the held key"
+    );
+    assert!(
+        both_waiting,
+        "both operations must be waiting on this feed key before the timeout clock starts"
+    );
+    assert!(
+        removal_completed_in_time,
+        "removal must fail within 8s of both waiters, below the 15s statement_timeout"
+    );
+    assert!(
+        claim_completed_in_time,
+        "claim must fail within 8s of both waiters, below the 15s statement_timeout"
+    );
+    assert_eq!(
+        relay_before_release, 1,
+        "timed-out removal must retain the relay"
+    );
+    assert!(
+        rows_before_release.is_empty(),
+        "timed-out claim must write no ledger row"
+    );
+    assert!(holder_released, "external advisory-lock holder must commit");
+    assert_eq!(
+        removal_sqlstate.as_deref(),
+        Some("55P03"),
+        "removal must be lock_timeout (55P03), not statement_timeout (57014)"
+    );
+    assert_eq!(
+        claim_sqlstate.as_deref(),
+        Some("55P03"),
+        "claim must be lock_timeout (55P03), not statement_timeout (57014)"
+    );
+    assert_eq!(
+        relay_after_release, 1,
+        "timeout must leave the relay unchanged"
+    );
+    assert!(
+        rows_after_release.is_empty(),
+        "timeout must leave the ledger unchanged"
+    );
+}
