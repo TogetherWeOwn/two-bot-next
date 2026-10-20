@@ -14,6 +14,8 @@ use two_bot_testsupport::TestDatabase;
 
 mod adapter;
 mod automations;
+mod drain_shutdown;
+mod receipt_lifecycle;
 mod settings;
 
 /// Stored `internal_idempotency` receipt row: action, state, response code,

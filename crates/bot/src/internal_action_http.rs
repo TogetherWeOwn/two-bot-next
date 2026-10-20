@@ -21,7 +21,10 @@
 
 use std::{
     future::IntoFuture,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -35,7 +38,11 @@ use axum::{
 };
 use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
-use tokio::{net::TcpListener, sync::Semaphore};
+use tokio::{
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
+};
 use tracing::Instrument;
 use two_bot_core::{
     automation_transfer::{
@@ -89,6 +96,11 @@ const MAX_HEADERS: usize = 64;
 const MAX_REQUESTS: usize = 32;
 const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Headroom inside the supervisor's HTTP drain budget: the receiver's shared
+/// shutdown deadline sits this far inside it, so the receiver always runs its
+/// child-abort path and reports before the supervisor backstop — armed on the
+/// same latch — can drop it mid-drain.
+const SUPERVISOR_HEADROOM: Duration = Duration::from_millis(500);
 /// Queued event work waits at most this long, then is refused `in_progress`
 /// before any claim.
 const EVENT_GATE_WAIT: Duration = Duration::from_secs(8);
@@ -899,6 +911,16 @@ struct ReceiverState {
     capacity: Arc<Semaphore>,
     event_gate: tokio::sync::Mutex<()>,
     event_gate_wait: Duration,
+    /// Receiver-owned lifecycle set for receipt-finishing event-mutation
+    /// children. Every spawned child is tracked here so shutdown can join it;
+    /// the set holds no result, only the join, and each spawn reaps already
+    /// finished entries so steady state keeps only in-flight work.
+    children: tokio::sync::Mutex<JoinSet<()>>,
+    /// Latched when shutdown is requested (or the listener stops on its own).
+    /// Freshly claimed mutations refuse before their effect while set; replay,
+    /// in-flight and reconciliation answers are unaffected so reads of the
+    /// durable fence keep working through drain.
+    draining: AtomicBool,
 }
 
 impl ReceiverState {
@@ -928,6 +950,8 @@ impl ReceiverState {
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
             event_gate: tokio::sync::Mutex::new(()),
             event_gate_wait: EVENT_GATE_WAIT,
+            children: tokio::sync::Mutex::new(JoinSet::new()),
+            draining: AtomicBool::new(false),
         }
     }
 
@@ -1205,21 +1229,114 @@ pub async fn bind(
 }
 
 impl BoundReceiver {
+    /// Shutdown budget shared by the Axum drain and the child drain, armed
+    /// when shutdown latches. It sits inside the supervisor's HTTP drain
+    /// budget by [`SUPERVISOR_HEADROOM`], so the receiver reports (and runs
+    /// its child-abort path) before the supervisor backstop fires.
+    fn shutdown_budget() -> Duration {
+        crate::website_jobs::HTTP_DRAIN_TIMEOUT.saturating_sub(SUPERVISOR_HEADROOM)
+    }
+
     /// Supervised by website_jobs along with the other runtime services.
     pub async fn serve(self, shutdown: tokio::sync::watch::Receiver<bool>) -> std::io::Result<()> {
-        let server = axum::serve(self.listener, router(Arc::clone(&self.state)))
+        let Self { listener, state } = self;
+        let mut latch = shutdown.clone();
+        let server = axum::serve(listener, router(Arc::clone(&state)))
             .with_graceful_shutdown(crate::server::shutdown_requested(shutdown))
             .into_future();
         tokio::pin!(server);
         let mut tick = tokio::time::interval(Duration::from_secs(60));
+        let mut draining = false;
+        // One shutdown deadline shared by the Axum drain and the child drain,
+        // armed when shutdown latches: an admitted handler holding a
+        // connection must not starve the child drain past the supervisor's
+        // backstop.
+        let mut deadline: Option<tokio::time::Instant> = None;
         let result = loop {
+            // Copied per iteration so the latch arm can re-arm the deadline
+            // while the nap below is pinned.
+            let latched_at = deadline;
+            let nap = async move {
+                match latched_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(nap);
             tokio::select! {
                 result = &mut server => break result,
-                _ = tick.tick() => self.state.flush(false),
+                _ = tick.tick() => state.flush(false),
+                // Latch drain mode the moment shutdown is requested, while
+                // Axum still drains in-flight connections: handlers admitted
+                // before the latch stop starting new mutation effects.
+                _ = latch.wait_for(|latched| *latched), if !draining => {
+                    draining = true;
+                    state.draining.store(true, Ordering::SeqCst);
+                    deadline = Some(tokio::time::Instant::now() + Self::shutdown_budget());
+                }
+                // The Axum drain shares the shutdown deadline: the child-abort
+                // path below still runs on the deadline's remainder.
+                _ = &mut nap, if draining => {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "internal-action receiver drain timed out",
+                    ));
+                }
             }
         };
-        self.state.flush(true);
-        result
+        // A listener that stopped on its own drains the same way.
+        state.draining.store(true, Ordering::SeqCst);
+        let budget = deadline
+            .map(|at| at.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or_else(Self::shutdown_budget);
+        let drained = Self::drain_children(&state, budget).await;
+        state.flush(true);
+        match (result, drained) {
+            (Ok(()), true) => Ok(()),
+            (Err(error), _) => Err(error),
+            (Ok(()), false) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "internal-action receiver drain timed out",
+            )),
+        }
+    }
+
+    /// Join tracked receipt-finishing children within `budget`, the remaining
+    /// share of the shutdown deadline the Axum drain did not consume. Clean
+    /// completion needs every child reaped; a reaped failure is terminal work
+    /// (its claim fence keeps durable uncertainty), but work still in flight
+    /// at the deadline is aborted and reported unclean, never waited on past
+    /// the budget.
+    async fn drain_children(state: &ReceiverState, budget: Duration) -> bool {
+        let mut children = state.children.lock().await;
+        let outcome = tokio::time::timeout(budget, async {
+            while let Some(finished) = children.join_next().await {
+                if let Err(join_error) = finished {
+                    tracing::warn!(
+                        msg = "internal_action_child_failed",
+                        error = %join_error,
+                        "receipt-finishing event mutation child failed; \
+                         its claim fence retains durable uncertainty"
+                    );
+                }
+            }
+        })
+        .await;
+        match outcome {
+            Ok(()) => true,
+            Err(_) => {
+                let pending = children.len();
+                children.abort_all();
+                tracing::warn!(
+                    msg = "internal_action_drain_deadline",
+                    pending = pending,
+                    "receiver shutdown reached the drain deadline with tracked \
+                     mutation children still in flight; aborted, their claims \
+                     retain durable uncertainty"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -1258,7 +1375,7 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
     let id = crate::logging::incoming_request_id(request.headers());
     let span = crate::logging::request_span(&id);
     async move {
-        let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
+        let Ok(permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
             return state.reject(
                 Failure::http(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1271,10 +1388,11 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
                 &id,
             );
         };
-        match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id)).await {
+        match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id, permit)).await {
             Ok(response) => response,
             // Dropping the future retains an announcement claim (a fresh nonce sees
-            // InFlight or NeedsReconciliation); event mutations finish in their own task.
+            // InFlight or NeedsReconciliation); event mutations finish in their
+            // own receiver-tracked task, holding capacity to their receipt.
             Err(_) => state.reject(
                 Failure::code(ErrorCode::UpstreamTimeout),
                 KeyLabel::Invalid,
@@ -1287,7 +1405,12 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
     .await
 }
 
-async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Response {
+async fn receive(
+    state: &Arc<ReceiverState>,
+    request: Request,
+    id: &str,
+    permit: OwnedSemaphorePermit,
+) -> Response {
     let reject_boundary =
         |failure| state.reject(failure, KeyLabel::Invalid, ActionLabel::Unknown, id);
     if request.uri().path_and_query().map(|path| path.as_str()) != Some(ACTIONS_PATH) {
@@ -1389,33 +1512,50 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
     // announcements below, with their own validation and key mapping.
     if supports_event_mutation(&decision.action) {
         // Runs to its receipt even if the client has gone: a claimed create that
-        // was dropped mid-flight must still register its key mapping.
+        // was dropped mid-flight must still register its key mapping. The child
+        // is tracked under the receiver (never detached and ownerless) and
+        // carries the admission permit with it, so capacity stays held through
+        // receipt persistence and repeated timed-out clients cannot admit more
+        // than the work limit. The handler learns the outcome over a oneshot;
+        // dropping the handler drops only the receiver side.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let task_state = Arc::clone(state);
         let task_decision = decision.clone();
         let task_raw = raw.to_vec();
         let task_idempotency = headers.idempotency.map(str::to_owned);
         let task_id = id.to_owned();
         let task_key = key.clone();
-        // Queued work inherits the request span: `tokio::spawn` does not
+        // Queued work inherits the request span: task spawning does not
         // propagate tracing context, so without this the follow-up's log
         // lines could not join the Worker/DO/container request by id.
         let task_span = tracing::Span::current();
-        let task = tokio::spawn(
-            async move {
-                mutate_event(
-                    &task_state,
-                    &task_decision,
-                    &task_raw,
-                    task_idempotency.as_deref(),
-                    &task_id,
-                    task_key,
-                    action,
-                )
-                .await
-            }
-            .instrument(task_span),
-        );
-        return match task.await {
+        {
+            // Locked through `state`, not the child's clone: the guard borrows
+            // while the spawned future moves its own Arc.
+            let mut children = state.children.lock().await;
+            children.spawn(
+                async move {
+                    let _permit = permit;
+                    let response = mutate_event(
+                        &task_state,
+                        &task_decision,
+                        &task_raw,
+                        task_idempotency.as_deref(),
+                        &task_id,
+                        task_key,
+                        action,
+                    )
+                    .await;
+                    let _ = done_tx.send(response);
+                }
+                .instrument(task_span),
+            );
+            // Reap finished siblings so the set tracks in-flight work only. A
+            // reaped failure already answered its own handler (or outlived it);
+            // the runtime logs the panic itself.
+            while children.try_join_next().is_some() {}
+        }
+        return match done_rx.await {
             Ok(response) => response,
             Err(_) => state.reject(Failure::reconciliation(), key, action, id),
         };
@@ -2350,6 +2490,26 @@ async fn mutate_event(
         Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
+    // Shutdown stops new mutation effects here, after the claim: replay,
+    // in-flight and reconciliation answers above keep working through drain.
+    // No effect has run at this point, and none can be running (only the
+    // freshly claimed owner ever proceeds), so the claim is released exactly
+    // like a pre-effect admission refusal and the same key may retry after
+    // restart. A failed release keeps the fence occupied instead. Only this
+    // provably-never-sent refusal releases; cancelling work already underway
+    // never does.
+    if state.draining.load(Ordering::SeqCst) {
+        if let Err(release_error) = state.store.release_proven_not_sent(claim).await {
+            log_terminal_persist_failed(action, "release", release_error);
+            return reject(Failure::code(ErrorCode::Internal));
+        }
+        return reject(Failure::http(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            true,
+            ErrorCode::RateLimited,
+        ));
+    }
     // No `observed_at` here: the executor stamps the mirror write after
     // Discord returns, so a slow PATCH is never recorded under a pre-send
     // instant and never loses last-observed-wins to a newer poller snapshot.
