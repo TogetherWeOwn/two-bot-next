@@ -3222,6 +3222,7 @@ class WorkflowTests(unittest.TestCase):
             "raid_list_db",
             "reengagement_list_db",
             "member_moderation_db",
+            "stream_live_store",
         ):
             with self.subTest(target=target):
                 self.assertIn(target, step["run"])
@@ -3242,6 +3243,33 @@ class WorkflowTests(unittest.TestCase):
         if pending:
             logical_lines.append(pending)
         cov_runs = [line for line in logical_lines if line.startswith("cov_run ")]
+
+        def classify_cov_runs(runs):
+            groups = {"sweeps": [], "guarded": [], "reports": []}
+            unclassified = []
+            for run in runs:
+                matches = [
+                    group for group, predicate in (
+                        ("sweeps", "--workspace --lib --bins --tests" in run),
+                        ("guarded", "llvm-cov --no-report -p " in run),
+                        ("reports", "llvm-cov report" in run),
+                    ) if predicate
+                ]
+                if len(matches) == 1:
+                    groups[matches[0]].append(run)
+                else:
+                    unclassified.append(run)
+            return groups, unclassified
+
+        cov_groups, unclassified = classify_cov_runs(cov_runs)
+        self.assertEqual(unclassified, [])
+        self.assertEqual(len(cov_runs), sum(len(group) for group in cov_groups.values()))
+        self.assertEqual(len(cov_groups["sweeps"]), 2)
+        self.assertEqual(len(cov_groups["guarded"]), 14)
+        self.assertEqual(len(cov_groups["reports"]), 2)
+        extra_run = 'cov_run "$COV" llvm-cov --no-report --version'
+        _, unclassified = classify_cov_runs(cov_runs + [extra_run])
+        self.assertEqual(unclassified, [extra_run])
         # cov_run's failure annotation must go to stderr: the stdout report
         # retry redirects cov_run's stdout into the lcov file.
         self.assertIn(
@@ -3261,6 +3289,140 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        # These guards reject the sweep's bootstrap URL. Derive exact skip
+        # tokens from the Rust tests so a rename cannot leave a tolerated panic
+        # behind; a prefix/typo or a skip on another invocation is not enough.
+        def rust_attribute_end(source, start):
+            depth = 0
+            quote = None
+            escaped = False
+            for index in range(start, len(source)):
+                char = source[index]
+                if quote:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == quote:
+                        quote = None
+                elif char in ('"', "'"):
+                    quote = char
+                elif char == "[":
+                    depth += 1
+                elif char == "]":
+                    depth -= 1
+                    if depth == 0:
+                        return index + 1
+            raise AssertionError("unterminated Rust attribute")
+
+        def attribute_has_ignore(attribute):
+            inner = attribute[2:-1].strip()
+            if re.match(r"ignore\b", inner):
+                return True
+            if not re.match(r"cfg_attr\s*\(", inner):
+                return False
+            depth = 0
+            quote = None
+            escaped = False
+            for index, char in enumerate(inner[inner.index("(") + 1:], inner.index("(") + 1):
+                if quote:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == quote:
+                        quote = None
+                elif char in ('"', "'"):
+                    quote = char
+                elif char in "([{":
+                    depth += 1
+                elif char in ")]}":
+                    depth -= 1
+                elif char == "," and depth == 0:
+                    attributes = inner[index + 1:-1]
+                    return re.search(r"(?:^|,)\s*ignore\s*(?:=|,|$)", attributes) is not None
+            return False
+
+        def skip_rust_trivia(source, index):
+            while index < len(source):
+                if source[index].isspace():
+                    index += 1
+                elif source.startswith("//", index):
+                    newline = source.find("\n", index)
+                    index = len(source) if newline < 0 else newline + 1
+                elif source.startswith("/*", index):
+                    depth = 1
+                    index += 2
+                    while index < len(source) and depth:
+                        if source.startswith("/*", index):
+                            depth += 1
+                            index += 2
+                        elif source.startswith("*/", index):
+                            depth -= 1
+                            index += 2
+                        else:
+                            index += 1
+                    if depth:
+                        raise AssertionError("unterminated Rust comment")
+                else:
+                    break
+            return index
+
+        def ignored_test_functions(source):
+            ignored = []
+            for match in re.finditer(r"#\[", source):
+                end = rust_attribute_end(source, match.start())
+                attribute = source[match.start():end]
+                if not attribute_has_ignore(attribute):
+                    continue
+                index = skip_rust_trivia(source, end)
+                while source.startswith("#[", index):
+                    index = skip_rust_trivia(source, rust_attribute_end(source, index))
+                function = re.match(r"(?:(?:pub(?:\([^)]*\))?)\s+)?(?:async\s+)?fn\s+(\w+)\s*\(",
+                                    source[index:])
+                if function:
+                    ignored.append(function.group(1))
+            return ignored
+
+        stream_mutations = {
+            "indented nested test": (
+                "mod tests {\n    #[tokio::test]\n    #[ignore]\n"
+                "    async fn extra_nested() {}\n}"
+            ),
+            "doc comment between attribute and function": (
+                "#[tokio::test]\n#[ignore]\n/// extra docs\nasync fn extra_doc() {}"
+            ),
+            "cfg_attr ignore": (
+                '    #[tokio::test]\n    #[cfg_attr(feature = "db-tests", ignore)]\n'
+                "    async fn extra_cfg_attr() {}"
+            ),
+        }
+        for label, source in stream_mutations.items():
+            with self.subTest(stream_mutation=label):
+                self.assertEqual(ignored_test_functions(source), [
+                    {"indented nested test": "extra_nested",
+                     "doc comment between attribute and function": "extra_doc",
+                     "cfg_attr ignore": "extra_cfg_attr"}[label]
+                ])
+        stream_ignored = ignored_test_functions(
+            (ROOT / "crates/core/tests/stream_live_store.rs").read_text()
+        )
+        self.assertCountEqual(stream_ignored, (
+            "claim_is_owned_once_then_in_flight",
+            "failed_send_releases_the_claim_for_the_retry",
+            "fresh_claim_cannot_be_reclaimed",
+            "stale_unposted_claim_is_taken_over_atomically",
+            "started_claim_is_never_reclaimed_even_when_stale",
+            "delivered_rows_are_never_reclaimed",
+            "started_send_that_provably_failed_releases_for_the_retry",
+            "reclaiming_a_missing_key_claims_it_fresh",
+            "delivered_rows_expire_only_past_the_horizon_with_the_fence_intact",
+        ))
+        self.assertEqual(len(stream_ignored), 9)
+        ignored_skips = re.findall(r"(?:^|\s)--skip\s+(\S+)", ignored_sweeps[0])
+        for name in stream_ignored:
+            with self.subTest(stream_ignored=name):
+                self.assertIn(name, ignored_skips)
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
@@ -3296,6 +3458,7 @@ class WorkflowTests(unittest.TestCase):
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
         self.assertEqual(len(guarded), 14)
+        self.assertCountEqual(guarded, cov_groups["guarded"])
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -3330,11 +3493,41 @@ class WorkflowTests(unittest.TestCase):
                     self.assertIn("--features db", matches[0])
                 else:
                     self.assertNotIn("--features db", matches[0])
+        # Stream has one standalone fail-closed replay after the ignored sweep.
+        # The last URL export must select its strict omitted-password form;
+        # neither a second target nor a skip may mask the ignored stream cases.
+        stream_runs = [
+            run for run in guarded
+            if re.search(r"--test stream_live_store(?:\s|$)", run)
+        ]
+        self.assertEqual(
+            len(stream_runs), 1, "expected one guarded stream_live_store invocation",
+        )
+        stream_run = stream_runs[0]
+        self.assertEqual(
+            re.findall(r"(?:^|\s)--test\s+(\S+)", stream_run), ["stream_live_store"],
+        )
+        self.assertIn("-- --ignored --test-threads=1", stream_run)
+        stream_skips = re.findall(r"(?:^|\s)--skip\s+(\S+)", stream_run)
+        for name in stream_ignored:
+            with self.subTest(stream_rerun=name):
+                self.assertNotIn(f"--skip {name}", stream_run)
+                self.assertFalse(any(skip in name for skip in stream_skips))
+        stream_rerun_index = logical_lines.index(stream_run)
+        database_exports = [
+            line for line in logical_lines[:stream_rerun_index]
+            if line.startswith("export TWO_TEST_DATABASE_URL=")
+        ]
+        self.assertEqual(database_exports[-1:], [
+            "export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test",
+        ])
+        self.assertLess(ignored_sweep_index, stream_rerun_index)
         env_wrapped = [
             run for run in cov_runs
             if run.startswith('cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV"')
         ]
         self.assertEqual(len(env_wrapped), 1)
+        self.assertIn(env_wrapped[0], guarded)
         self.assertIn("--test channel_moderation_runtime", env_wrapped[0])
         reports = [run for run in cov_runs if "llvm-cov report" in run]
         self.assertEqual(len(reports), 2)
