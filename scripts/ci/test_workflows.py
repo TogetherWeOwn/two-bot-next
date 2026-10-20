@@ -3149,8 +3149,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("--features two-bot-core/db", step["run"])
         self.assertIn("--lib --bins --tests", step["run"])
         self.assertIn(
-            "--no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs",
-            step["run"],
+            "--no-report -- --ignored --test-threads=1", step["run"]
         )
         self.assertIn(
             "--locked -- channel_moderation --include-ignored --test-threads=1",
@@ -3249,6 +3248,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        for test_name in (
+            "real_sqlx_runner_cases",
+            "post_failure_unreadable_ledger_is_unknown_not_empty",
+            "post_failure_readable_ledger_keeps_array_output",
+            "post_apply_unreadable_ledger_is_unknown_not_empty",
+            "store_failure_keeps_committed_cutover_evidence",
+            "connection_count_sees_other_roles_from_plan_login",
+        ):
+            with self.subTest(test_name=test_name):
+                self.assertIn(f"--skip {test_name}", ignored_sweeps[0])
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
