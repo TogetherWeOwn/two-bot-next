@@ -13,8 +13,21 @@ CI; the live run is manual-dispatch only.
 | Check | Probe | Pass shape |
 | --- | --- | --- |
 | `health` | `GET /health` | Exact 200 with `{"status":"ok"}` and no redirect target. Process liveness only: a 200 never claims readiness. |
-| `readyz` | `GET /readyz` | 200 or 503 with the bot's component breakdown (`process`, `gateway`, `database`, `token_invalid`, each `ready`/`starting`/`down`), the informational `jobs` object, an optional `gateway_failure` in the fixed `durable_gateway` + 12-class vocabulary, and compiled `build_revision`/`build_id` as non-empty printable ASCII strings. The code must equal 200 iff every component is ready. A shape-correct 503 is still a probe FAIL: a truthful parked process is never E2E approval. |
-| `build` | readyz body | `build_revision`/`build_id` present as printable ASCII strings (anything else is refused without echo); when `--expected-sha` (or `$EXPECTED_SHA`) is given, the revision must equal the deployed commit SHA from the `deploy-staging` receipt. |
+| `readyz` | `GET /readyz` | 200 or 503 with the bot's component breakdown (`process`, `gateway`, `database`, `token_invalid`, each `ready`/`starting`/`down`), the informational `jobs` object, and an optional `gateway_failure` in the fixed `durable_gateway` + 12-class vocabulary. Build identity is checked separately below. The code must equal 200 iff every component is ready. A shape-correct 503 is still a probe FAIL: a truthful parked process is never E2E approval. |
+| `build` | readyz body | A canonical `build_revision` (40 lowercase hexadecimal characters) and `build_id` (`<run id>-<attempt>`, ASCII digits with each part 1–20 digits), or the exact unstamped pair `unknown`/`unknown`. With `--expected-sha` (or `$EXPECTED_SHA`), only a canonical stamped pair whose revision equals that SHA passes. |
+
+Identity shapes use the existing `scripts/build_identity.py` validators, as
+in the production passive probe. Both remote fields must form one valid pair
+before either is used in diagnostics or receipts. Missing, mixed
+stamped/unstamped, wrong-type, oversized, control-bearing and arbitrary
+printable values fail `build` with a fixed diagnostic; **both** identity fields
+in the receipt become `null`, never copies of the rejected input. A canonical
+mismatch may retain the safe observed identity. The exact `unknown` pair with
+no pin passes only as explicitly **unstamped**, not a matched deployment; with
+a pin it fails. Identity failures do not change readiness or checkpoint-read
+classification. The smoke-run caller also validates the pair before retaining
+identity for its run record: a rejected build ID cannot supply deployment run
+metadata. Explicit local deployment pins can still produce a safe failed record.
 
 `/healthz` at the staging origin is the Worker's redirect probe (`ok`),
 covered by the redirect smoke — not this probe.
@@ -59,14 +72,19 @@ EXPECTED_SHA=<deployed commit SHA from the deploy-staging receipt> \
 Origin fence: anything but an
 `https://two-bot-next-staging.<sub>.workers.dev` origin — including the
 production Worker, plain HTTP, credentialed URLs, or any path/query —
-refuses with exit 2 and sends no request. Record the run with the
-run-record template (sibling leaf owns the template; this probe consumes
+refuses with exit 2 and sends no request. A supplied expected SHA must also
+be exactly 40 lowercase hexadecimal characters, without whitespace; malformed
+CLI/environment pins (including empty strings and `unknown`) refuse before
+any request, with exit 2, a fixed diagnostic and no evidence written. Omit the
+pin entirely for no-pin mode. Neither refusal echoes rejected input. Record
+the run with the run-record template (sibling leaf owns the template; this probe consumes
 it, referencing it without blocking on it).
 
 ## Verification (offline, runs in CI)
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_staging_health_contract_probe.py -v
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_staging_health_contract_probe_build_identity_acceptance.py -v
 ```
 
 Fixtures cover: production/HTTP/credentialed/missing origins refusing

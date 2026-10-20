@@ -161,7 +161,7 @@ impl RoomPersistence for Arc<Store> {
         guild: u64,
         room: u64,
         member: u64,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<JoinGrantIntent, StoreError> {
         self.as_ref().save_join_grant(guild, room, member).await
     }
     async fn remove_join_grant(
