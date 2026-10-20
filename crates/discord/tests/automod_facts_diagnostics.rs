@@ -336,7 +336,7 @@ async fn successful_reads_are_silent() {
 }
 
 /// One warning per 60 seconds per instance, shared across steps and guilds:
-/// immediate repeats stay silent, the window still holds at 30 seconds and
+/// immediate repeats stay silent, the window still holds at 59 seconds and
 /// reopens past 60 with margin for loopback I/O time.
 #[tokio::test]
 async fn repeats_share_one_sixty_second_window() {
@@ -361,7 +361,7 @@ async fn repeats_share_one_sixty_second_window() {
         "repeats share the open window"
     );
 
-    advance_window(30).await;
+    advance_window(59).await;
     let mark = log_mark();
     facts.target_facts(&subject()).await;
     assert!(
@@ -370,7 +370,7 @@ async fn repeats_share_one_sixty_second_window() {
     );
 
     // 61 seconds total: past the window with margin for loopback I/O time.
-    advance_window(31).await;
+    advance_window(2).await;
     let mark = log_mark();
     facts.target_facts(&subject()).await;
     assert_single_diagnostic(diagnostics_since(mark), "guild", "rejected");
@@ -444,7 +444,7 @@ async fn quiet_reads_neither_emit_nor_consume_the_window() {
     mock.shutdown().await;
 }
 
-/// A suppressed failure never extends the window: a failure 30 seconds in
+/// A suppressed failure never extends the window: a failure 59 seconds in
 /// does not push reopening past 60 seconds from the first emission (61 with
 /// margin for loopback I/O time).
 #[tokio::test]
@@ -457,7 +457,7 @@ async fn suppressed_failures_do_not_extend_the_window() {
     facts.target_facts(&subject()).await;
     assert_single_diagnostic(diagnostics_since(mark), "guild", "rejected");
 
-    advance_window(30).await;
+    advance_window(59).await;
     let mark = log_mark();
     facts.target_facts(&subject()).await;
     assert!(
@@ -465,7 +465,7 @@ async fn suppressed_failures_do_not_extend_the_window() {
         "the mid-window failure is suppressed"
     );
 
-    advance_window(31).await;
+    advance_window(2).await;
     let mark = log_mark();
     facts.target_facts(&subject()).await;
     assert_single_diagnostic(diagnostics_since(mark), "guild", "rejected");
