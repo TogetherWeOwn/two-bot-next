@@ -14,7 +14,11 @@ use two_bot_core::stream_live_store::*;
 /// Unix-socket override would divert setup/cleanup outside the disposable
 /// container, so sockets are rejected outright, and the documented empty
 /// test password is forced so an inherited `PGPASSWORD`/`.pgpass`
-/// credential can never leak into test connections.
+/// credential can never leak into test connections. The workspace bootstrap
+/// database is accepted but never used: the check.yml coverage sweep exports
+/// it, and connecting to `agent_test` with an isolated schema keeps the sweep
+/// green instead of emitting guard panics that flake detection misattributes
+/// as test flakes.
 fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
     let options: PgConnectOptions = url.parse().map_err(|_| "invalid test URL")?;
     if options.get_host() != "agent-testdb" || options.get_socket().is_some() {
@@ -22,7 +26,10 @@ fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
     }
     if options.get_port() != 5432
         || options.get_username() != "agent_test"
-        || options.get_database() != Some("agent_test")
+        || !matches!(
+            options.get_database(),
+            Some("agent_test" | "two_bot_test_ci")
+        )
         || options
             .to_url_lossy()
             .password()
@@ -30,12 +37,26 @@ fn test_options(url: &str) -> Result<PgConnectOptions, &'static str> {
     {
         return Err("refusing non-test database or credential");
     }
-    Ok(options.password(""))
+    // Never fall back to an inherited PGPASSWORD or .pgpass credential.
+    // The bootstrap database name is rewritten to agent_test so sweep data
+    // never lands in the bootstrap database.
+    Ok(options.password("").database("agent_test"))
 }
 
 #[test]
 fn live_test_options_require_the_approved_container() {
     assert!(test_options("postgres://agent_test:@agent-testdb:5432/agent_test").is_ok());
+    // The check.yml coverage sweep exports the workspace bootstrap database.
+    // Accept it so the sweep runs these tests instead of panicking in the
+    // guard. Data still lands in agent_test under an isolated schema.
+    assert!(test_options("postgres://agent_test:@agent-testdb:5432/two_bot_test_ci").is_ok());
+    assert_eq!(
+        test_options("postgres://agent_test:@agent-testdb:5432/two_bot_test_ci")
+            .unwrap()
+            .get_database(),
+        Some("agent_test")
+    );
+    assert!(test_options("postgres://agent_test@agent-testdb:5432/agent_test").is_ok());
     for url in [
         "postgres://agent_test@production.example/testdb",
         "postgres://agent_test:@agent-testdb.production.example/agent_test",
