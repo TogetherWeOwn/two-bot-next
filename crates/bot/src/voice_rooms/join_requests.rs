@@ -712,10 +712,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         }
         let Some(snapshot) = self.live.overwrite_snapshot(room) else {
-            // Nothing was persisted or sent: forget the in-memory approval so
-            // the member can request access again when authoritative state returns.
-            self.unwind_grant(room, member);
-            self.queue.mark_succeeded(&action);
+            if action.attempts == 0 {
+                // Nothing was persisted or sent: forget the in-memory approval so
+                // the member can request access again when authoritative state returns.
+                self.unwind_grant(room, member);
+                self.queue.mark_succeeded(&action);
+            } else {
+                // A retry after an unknown-outcome PUT may already have landed:
+                // keep the claim and the witness, retry from fresh evidence.
+                self.mark_failed_observed(
+                    action,
+                    "join approval overwrite evidence unavailable".to_owned(),
+                    elapsed_ms(now_ms, started),
+                );
+            }
             return;
         };
         let existing = snapshot.overwrites.iter().copied().find(|overwrite| {

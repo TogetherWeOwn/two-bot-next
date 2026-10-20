@@ -1301,6 +1301,47 @@ async fn an_approval_without_overwrite_evidence_claims_nothing() {
 }
 
 #[tokio::test]
+async fn an_approval_retry_without_overwrite_evidence_keeps_its_claim() {
+    let (mut worker, _trace) = private_room().await;
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    let request = request_of(&worker, OUTSIDER);
+    worker
+        .http
+        .overwrite_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+    assert!(worker.dispatch_one(1_000_000).await);
+    // Attempt 0 persisted its witness and may have landed: the claim stays.
+    assert!(worker.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    assert!(outsider_writes(&worker).is_empty());
+    // The retry meets unknown evidence: it must not unwind the claim.
+    let known = hide_overwrites(&worker);
+    assert!(worker.dispatch_one(10_000_000).await);
+    assert!(
+        worker.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)),
+        "retry keeps its claim while its witness survives"
+    );
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    assert!(outsider_writes(&worker).is_empty());
+    // Once evidence returns, the same retry lands.
+    worker.live.upsert_channel(known);
+    assert!(worker.dispatch_one(20_000_000).await);
+    let writes = outsider_writes(&worker);
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0].allow.contains(Permissions::CONNECT));
+    assert!(worker.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    assert!(
+        cached_outsider(&worker).is_some_and(|entry| entry.allow.contains(Permissions::CONNECT))
+    );
+}
+
+#[tokio::test]
 async fn a_revoke_without_overwrite_evidence_retries_once_it_returns() {
     let (mut worker, trace, _) = approved_over(None).await;
     let reply = worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
