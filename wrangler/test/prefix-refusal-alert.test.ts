@@ -40,12 +40,16 @@ function headingAnchors(text: string): Set<string> {
     m[1]!.toLowerCase().replace(/[^a-z0-9 _-]/g, "").replace(/ /g, "-")));
 }
 
-test("catalog: rule id matches the Rust evidence list, appended last, ticket severity", () => {
+test("catalog: rule id matches the Rust evidence list, preserves append position, ticket severity", () => {
   const evidence = readFileSync(new URL("../../crates/core/src/evidence.rs", import.meta.url), "utf8");
   const rustIds = /pub const ALERT_RULE_IDS: \[&str; \d+\] = \[([\s\S]*?)\];/.exec(evidence);
   assert.ok(rustIds, "ALERT_RULE_IDS not found in crates/core/src/evidence.rs");
   assert.deepEqual(RULES.map((r) => r.id), [...rustIds[1]!.matchAll(/"([^"]+)"/g)].map((m) => m[1]!));
-  assert.equal(RULES.at(-1)?.id, RULE_ID, "new rule is appended last so existing ids never move");
+  // The 28-rule historical prefix is pinned by event-store-lag-alert.test.ts.
+  // Keep both append positions stable while allowing future rules after them.
+  assert.equal(RULES[27]?.id, "event_store_consumer_lag");
+  assert.equal(RULES[28]?.id, RULE_ID, "prefix refusals append after the existing 28 rules without displacing them");
+  assert.equal(RULES.filter((r) => r.id === RULE_ID).length, 1, "prefix refusals are catalogued exactly once");
   const rule = ruleFor(RULE_ID);
   assert.ok(rule, `ruleFor(${RULE_ID}) must resolve`);
   assert.equal(rule.severity, "ticket", "sustained verdict refusals ticket, never page");
