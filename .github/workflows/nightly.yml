@@ -248,6 +248,7 @@ jobs:
           --skip purge_counts_bulk_delete_and_replays_without_rest_or_duplicate_audit
           --skip purge_stopped_early_reports_the_reason_in_the_result_and_the_audit_row
           --skip full_purge_audit_metadata_and_stored_payload_are_byte_identical_to_before
+          --skip purge_corrupt_stop_reason_replay_fails_closed_without_discord_requests
           --skip slowmode_zero_and_signed_maximum_unicode_reason_survive_replay
           --skip lockdown_and_unlock_restore_full_masks_and_replay_independently
           --skip missing_overwrite_is_deleted_on_unlock_and_untracked_unlock_refuses
