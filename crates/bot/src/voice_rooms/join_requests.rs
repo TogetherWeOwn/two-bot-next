@@ -711,7 +711,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         }
         let Some(snapshot) = self.live.overwrite_snapshot(room) else {
-            // No authoritative ACL: neither write nor retire a durable witness.
+            // Nothing was persisted or sent: forget the in-memory approval so
+            // the member can request access again when authoritative state returns.
+            self.unwind_grant(room, member);
             self.queue.mark_succeeded(&action);
             return;
         };
@@ -941,8 +943,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         }
         let Some(snapshot) = self.live.overwrite_snapshot(room) else {
-            // No authoritative ACL: neither write nor retire a durable witness.
-            self.queue.mark_succeeded(&action);
+            // Keep the witness and retry from fresh authoritative evidence.
+            self.mark_failed_observed(
+                action,
+                "join revoke overwrite evidence unavailable".to_owned(),
+                elapsed_ms(now_ms, started),
+            );
             return;
         };
         let existing = snapshot.overwrites.iter().copied().find(|overwrite| {
@@ -1014,6 +1020,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 self.mark_failed_observed(
                     action,
                     "Discord join revoke outcome unknown".to_owned(),
+                    elapsed_ms(now_ms, started),
+                );
+            }
+            Err(RoomHttpError::Cancelled) => {
+                // The snapshot went stale; replan the revoke on the next attempt.
+                self.mark_failed_observed(
+                    action,
+                    "join revoke planned from stale overwrites".to_owned(),
                     elapsed_ms(now_ms, started),
                 );
             }

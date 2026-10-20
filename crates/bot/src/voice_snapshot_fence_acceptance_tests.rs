@@ -812,6 +812,7 @@ async fn fence_approve_with_unknown_overwrite_evidence_writes_nothing() {
     drain(&mut worker).await;
     assert!(written_for(&worker, PermissionOverwriteType::Member, OUTSIDER).is_empty());
     assert!(!calls(&trace).contains(&format!("move:{OUTSIDER}:{ROOM}")));
+    assert!(!worker.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
 }
 
 #[tokio::test]
@@ -897,10 +898,28 @@ async fn fence_revoke_with_unknown_evidence_keeps_the_witness() {
     assert!(worker.dispatch_one(1_000_000).await);
     gateway_set_overwrites(&worker.live.clone(), None);
     clear_observations(&worker, &trace);
-    drain(&mut worker).await;
+    // Dispatch exactly the stale-evidence attempt, then restore known state
+    // before the bounded retry budget can be consumed.
+    assert!(worker.dispatch_one(2_000_000).await);
     // Absent evidence is not proof the member entry is gone: nothing is
     // written and the durable witness survives for a later revoke.
     assert!(written_for(&worker, PermissionOverwriteType::Member, OUTSIDER).is_empty());
     assert!(!calls(&trace).contains(&format!("delete_overwrite:{ROOM}:{OUTSIDER}")));
     assert_eq!(stored_grants(&worker), [OUTSIDER]);
+
+    // Once authoritative state returns, the queued revoke retries using the
+    // fresh snapshot and retires its witness without requiring a restart.
+    gateway_set_overwrites(
+        &worker.live.clone(),
+        Some(vec![
+            role_overwrite(GUILD, Permissions::empty(), Permissions::CONNECT),
+            member_overwrite(OUTSIDER, Permissions::CONNECT, Permissions::empty()),
+        ]),
+    );
+    clear_observations(&worker, &trace);
+    // Retry backoff is measured from the failed dispatch timestamp.
+    assert!(worker.dispatch_one(10_000_000).await);
+    assert!(written_for(&worker, PermissionOverwriteType::Member, OUTSIDER).is_empty());
+    assert!(calls(&trace).contains(&format!("delete_overwrite:{ROOM}:{OUTSIDER}")));
+    assert!(stored_grants(&worker).is_empty());
 }
