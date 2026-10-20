@@ -5,7 +5,10 @@
  * Breaks caught: serial six-second allowances multiplying across a burst,
  * relying only on cooperative fetch abort, awaiting unbounded body cancellation,
  * dropping later transition logs/evaluation when forwarding runs out of time,
- * retrying ambiguous delivery, and handling late failures without a rejection sink.
+ * retrying ambiguous delivery, handling late failures without a rejection sink,
+ * letting optional transport start after the forwarding cutoff or run past it,
+ * posting before the successor schedule is inserted, and losing a received HTTP
+ * status when body cancellation stalls or rejects.
  * No transport implementation or exact notification-budget constant is prescribed.
  *
  * The in-memory SDK/storage fixture follows container.test.ts's alertHarness;
@@ -90,6 +93,10 @@ type Post = {
   content: string;
   stored: Map<string, unknown>;
   logs: string[];
+  startedAt: number;
+  scheduleCalls: number;
+  pendingKeepalives: number;
+  abortedAt?: number;
 };
 type Sender = "readiness" | "metrics" | "remediation";
 function sender(post: Post): Sender {
@@ -98,8 +105,19 @@ function sender(post: Post): Sender {
   return "readiness";
 }
 
+function rejectingBody(status: number) {
+  const state = { cancels: 0 };
+  const response = new Response(new ReadableStream<Uint8Array>({
+    cancel() {
+      state.cancels++;
+      return Promise.reject(new Error(`${SENTINEL} ${WEBHOOK}`));
+    },
+  }, { highWaterMark: 0 }), { status });
+  return { response, state };
+}
+
 async function alertHarness(t: TestContext, options: {
-  probeDelay?: number; env?: Partial<Env>;
+  probeDelay?: number; scheduleDelayMs?: number; env?: Partial<Env>;
 } = {}) {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
   // node's native AbortSignal.timeout does not use mock.timers' clock.
@@ -123,7 +141,10 @@ async function alertHarness(t: TestContext, options: {
   const releases: (() => void)[] = [];
   let stopping = false;
   let failKey: string | undefined;
+  let scheduleCalls = () => 0;
   let transport = async (_post: Post): Promise<Response> => new Response(null, { status: 204 });
+  const pendingKeepalives = () =>
+    database.prepare("SELECT * FROM container_schedules WHERE callback = 'keepalive'").all().length;
   const ctx = {
     exports: { ContainerProxy: () => ({ fetch() { throw new Error("unexpected outbound request"); } }) },
     id: { toString: () => "synthetic-do-id" },
@@ -170,12 +191,29 @@ async function alertHarness(t: TestContext, options: {
     const post: Post = {
       url: String(url), init, content: JSON.parse(String(init.body)).content,
       stored: structuredClone(values), logs: [...logs],
+      startedAt: Date.now(), scheduleCalls: scheduleCalls(), pendingKeepalives: pendingKeepalives(),
     };
+    if (init.signal) {
+      init.signal.addEventListener("abort", () => { post.abortedAt = Date.now(); }, { once: true });
+    }
     posts.push(post);
     return stopping ? new Response(null, { status: 204 }) : transport(post);
   });
   await bot.onStart();
-  const schedules = t.mock.method(bot, "schedule");
+  // Delay only the successor inserted by the owned turn under test. Startup
+  // arming already ran, and a later tick must stay fast so replay checks do
+  // not themselves consume the cutoff.
+  const scheduleDelayMs = options.scheduleDelayMs ?? 0;
+  let delaysLeft = scheduleDelayMs > 0 ? 1 : 0;
+  const originalSchedule = bot.schedule.bind(bot);
+  const schedules = t.mock.method(bot, "schedule", async (...args: unknown[]) => {
+    if (delaysLeft > 0) {
+      delaysLeft -= 1;
+      await new Promise((resolve) => setTimeout(resolve, scheduleDelayMs));
+    }
+    return await (originalSchedule as (...inner: unknown[]) => Promise<unknown>)(...args);
+  });
+  scheduleCalls = () => schedules.mock.callCount();
   const tick = async () => {
     const [pending] = await bot.listSchedules<{ startedAt: number }>("keepalive");
     assert.ok(pending, "a real SDK schedule supplies the callback identity");
@@ -212,7 +250,7 @@ async function alertHarness(t: TestContext, options: {
     bot, values, logs, posts, paths, gates, schedules, tick, events, deferred, bodyResponse,
     setTransport: (next: typeof transport) => { transport = next; },
     failWrite: (key: string) => { failKey = key; },
-    pending: () => database.prepare("SELECT * FROM container_schedules WHERE callback = 'keepalive'").all(),
+    pending: () => database.prepare("SELECT * FROM container_schedules WHERE callback = 'keepalive'").all() as unknown[],
   };
 }
 
@@ -253,9 +291,27 @@ function assertAttempts(h: Harness) {
       assert.equal((post.stored.get("two-bot:remediation") as RemediationState).scopes["voice-stall"].phase, "reload-recommended");
       assert.ok(post.logs.some((line) => line.includes('"event":"remediation_recommendation"')));
     }
+    assert.ok(post.scheduleCalls >= 1, "the successor schedule is invoked before this POST");
+    assert.equal(post.pendingKeepalives, 1, "the successor keepalive row exists before this POST");
   }
   for (const forbidden of [WEBHOOK, SENTINEL, ENV.OWNERSHIP_CONTROL_TOKEN]) {
     assert.ok(h.logs.every((line) => !line.includes(forbidden)), "fixed diagnostics never expose transport details or bindings");
+  }
+}
+
+function assertWebhookStatus(h: Harness, target: Sender, status: number) {
+  const readiness = h.events().filter((event) => event.event === "container_unready_webhook_failed");
+  const metrics = h.events().filter((event) => event.event === "metrics_alert_webhook_failed");
+  if (target === "readiness") {
+    assert.equal(readiness.length, 1, "readiness delivery failure keeps its own event");
+    assert.equal(metrics.length, 0, "a readiness failure is not reported as a metrics webhook failure");
+    assert.equal(readiness[0].status, status, "the received HTTP status survives body cancellation");
+    assert.equal(readiness[0].notification, "container_unready_alert");
+  } else {
+    assert.equal(metrics.length, 1, `${target} delivery failure is reported on the metrics webhook event`);
+    assert.equal(readiness.length, 0, "a metrics or remediation failure is not reported as readiness");
+    assert.equal(metrics[0].status, status, "the received HTTP status survives body cancellation");
+    assert.equal(Object.hasOwn(metrics[0], "notification"), false);
   }
 }
 
@@ -304,6 +360,70 @@ test("six 5.5-second replies do not serially multiply the whole-turn allowance",
   assert.equal(h.posts.length, attempts, "a consumed allowance is never an outbox replay on the next tick");
 });
 
+test("forwarding that starts 20s into the turn is clipped to the remaining 4s", async (t) => {
+  const h = await alertHarness(t, { scheduleDelayMs: 20_000 });
+  h.setTransport(() => new Promise((resolve) => setTimeout(() => resolve(new Response(null, { status: 204 })), 5_500)));
+  const baseline = Date.now();
+  const work = track(h.tick());
+  await advance(t, 20_000);
+  assert.ok(h.posts.length >= 1, "forwarding starts once essential scheduling finishes");
+  assert.ok(h.posts.every((post) => post.startedAt - baseline >= 18_000), "transport does not start before the delayed essential step");
+  assert.ok(h.posts.every((post) => post.startedAt - baseline === 20_000), "transport starts when the successor schedule returns");
+  assert.equal(work.settled, false, "the clipped allowance is still in flight when forwarding starts");
+  await advance(t, 4_000);
+  assert.equal(work.settled, true, "the clipped turn settles at the 24s cutoff, not the 30s gate");
+  assert.equal(work.error, undefined);
+  assert.equal(work.endedAt - baseline, 24_000, "settlement is the cutoff, not the slow transport");
+  assert.equal(h.posts.length, 1, "the remaining allowance admits one attempt, not the whole burst");
+  assert.ok(h.posts.every((post) => post.abortedAt !== undefined && post.abortedAt - baseline === 24_000), "the attempt is aborted at the cutoff");
+  assertCore(h);
+  assertAttempts(h);
+  const attempts = h.posts.length;
+  await advance(t, 60_000);
+  assert.equal(h.posts.length, attempts, "a late transport completion cannot start another attempt");
+  await h.tick();
+  assert.equal(h.posts.length, attempts, "a clipped turn is not replayed");
+});
+
+test("forwarding does not start once essential work reaches the 24s cutoff", async (t) => {
+  const h = await alertHarness(t, { scheduleDelayMs: 24_000 });
+  const hung = h.deferred(new Response(null, { status: 204 }));
+  h.setTransport(() => hung.promise);
+  const baseline = Date.now();
+  const work = track(h.tick());
+  await advance(t, 24_000);
+  assert.equal(work.settled, true, "an exhausted allowance returns without waiting on transport");
+  assert.equal(work.error, undefined);
+  assert.equal(work.endedAt - baseline, 24_000, "no optional wait is appended at the cutoff");
+  assert.equal(h.posts.length, 0, "no optional POST is added once the cutoff is reached");
+  assertCore(h);
+  await advance(t, 60_000);
+  assert.equal(h.posts.length, 0, "nothing is retried after the turn");
+  await h.tick();
+  assert.equal(h.posts.length, 0, "the next observation does not replay the skipped burst");
+});
+
+test("essential work past the 24s cutoff adds no optional wait or POST", async (t) => {
+  const h = await alertHarness(t, { scheduleDelayMs: 26_000 });
+  const hung = h.deferred(new Response(null, { status: 204 }));
+  h.setTransport(() => hung.promise);
+  const baseline = Date.now();
+  const work = track(h.tick());
+  await advance(t, 26_000);
+  assert.equal(work.settled, true, "essential scheduling may finish after the cutoff");
+  assert.equal(work.error, undefined);
+  assert.equal(work.endedAt - baseline, 26_000, "no optional six-second wait is appended");
+  assert.equal(h.posts.length, 0, "no optional POST is added after the cutoff");
+  assertCore(h);
+  await advance(t, 60_000);
+  assert.equal(h.posts.length, 0, "nothing is retried after the turn");
+  const next = track(h.tick());
+  await flush();
+  assert.equal(next.settled, true, "the next owned turn is not held by skipped forwarding");
+  assert.equal(next.error, undefined);
+  assert.equal(h.posts.length, 0, "unchanged observations do not replay a skipped burst");
+});
+
 for (const target of ["readiness", "metrics", "remediation"] as const) {
   for (const failure of ["fetch", "cleanup"] as const) {
     test(`${target}: immediate ${failure} rejection preserves essential work and fixed diagnostics`, async (t) => {
@@ -341,15 +461,39 @@ for (const target of ["readiness", "metrics", "remediation"] as const) {
       assert.equal(body.state.cancels, 1, "cleanup is attempted once, best effort");
       assertCore(h);
       assertAttempts(h);
+      assertWebhookStatus(h, target, status);
       const count = h.posts.length;
       body.cancel.reject();
       await advance(t, 60_000);
       assert.equal(h.posts.length, count, "late cleanup rejection cannot retry or resume forwarding");
       assertAttempts(h);
+      assertWebhookStatus(h, target, status);
       const next = track(h.bot.onStart());
       await flush();
       assert.equal(next.settled, true);
       assert.equal(next.error, undefined);
+    });
+  }
+
+  for (const status of [200, 500]) {
+    test(`${target}: response ${status} with rejecting cancellation keeps the received status`, async (t) => {
+      const h = await alertHarness(t);
+      const body = rejectingBody(status);
+      let used = false;
+      h.setTransport(async (post) => {
+        if (!used && sender(post) === target) { used = true; return body.response; }
+        return new Response(null, { status: 204 });
+      });
+      await boundedTick(t, h);
+      assert.equal(used, true, "the intended sender reaches the adverse response");
+      assert.equal(body.state.cancels, 1, "cleanup is attempted once");
+      assertCore(h);
+      assertAttempts(h);
+      assertWebhookStatus(h, target, status);
+      const count = h.posts.length;
+      await h.tick();
+      assert.equal(h.posts.length, count, "rejected cleanup is not a retry");
+      assertWebhookStatus(h, target, status);
     });
   }
 
