@@ -59,7 +59,7 @@ claim. Staging deploys from `main`; production deploys through the manual
   runtime reading that snapshot yet, so stored values reach the runtime only
   through per-runtime store refreshes (`raid_runtime.rs:136`,
   `containment_runtime.rs:186`, `join_risk_runtime.rs:198`) and onboarding's
-  per-event refresh (`onboarding.rs:167`), if at all (see the reference;
+  per-event refresh (`onboarding.rs:261`), if at all (see the reference;
   re-checked at `bce86a791`).
 - [Feed supervisor](docs/feed-supervisor.md): running feed delivery —
   source configuration, fetch cadence as-coded, failure signals and triage,
