@@ -871,6 +871,15 @@ jobs:
             --skip post_apply_unreadable_ledger_is_unknown_not_empty \
             --skip store_failure_keeps_committed_cutover_evidence \
             --skip connection_count_sees_other_roles_from_plan_login \
+            --skip bulk_delete_429_releases_attempt_for_same_key_retry \
+            --skip cancelled_lockdown_stays_fenced_with_seed_retained \
+            --skip channel_overwrite_429_releases_attempt_and_retires_only_its_seed \
+            --skip lockdown_429_preserves_prior_seed_while_releasing_the_lane \
+            --skip single_delete_429_releases_attempt_for_same_key_retry \
+            --skip slowmode_429_releases_attempt_for_same_and_distinct_keys \
+            --skip slowmode_5xx_and_unexpected_statuses_stay_fenced \
+            --skip slowmode_timeout_stays_fenced \
+            --skip unlock_429_releases_lane_but_preserves_recovery_seed \
             --skip list_is_guild_scoped_selector_shaped_and_read_only
           # Guarded channel suites accept the exact agent_test URL and the
           # workspace bootstrap URL (they always connect to agent_test with
