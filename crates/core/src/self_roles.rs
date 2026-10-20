@@ -2124,6 +2124,22 @@ mod tests {
             self_role_reply(SettledOutcome::AlreadyHeld, false),
             "No role changes were needed."
         );
+        assert_eq!(
+            self_role_reply(SettledOutcome::AlreadyAbsent, false),
+            "No role changes were needed."
+        );
+        assert_eq!(
+            self_role_reply(SettledOutcome::AlreadyAbsent, true),
+            "No role changes were needed."
+        );
+        assert_eq!(
+            self_role_reply(SettledOutcome::Rejected, false),
+            "I could not change that role. Staff have been notified in the logs."
+        );
+        assert_eq!(
+            self_role_reply(SettledOutcome::Rejected, true),
+            "I could not change that role. Staff have been notified in the logs."
+        );
         // Renew at a third of the lease; ownership needs a future expiry.
         assert_eq!(self_role_renew_after_ms(SELF_ROLE_CLAIM_LEASE_MS), 100_000);
         assert_eq!(self_role_renew_after_ms(2), 1);

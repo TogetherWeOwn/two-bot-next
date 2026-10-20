@@ -553,6 +553,13 @@ mod tests {
             .await
             .expect("a full queue refuses immediately");
         assert!(matches!(refused, Err(LfgError::Busy)));
+        let Err(error) = refused else {
+            unreachable!("a full queue refuses instead of waiting");
+        };
+        assert_eq!(
+            error.to_string(),
+            "LFG is busy right now; try again in a few seconds."
+        );
         assert_eq!(
             service.admitted.load(Ordering::Acquire),
             LFG_MAX_IN_FLIGHT + LFG_MAX_WAITING,
@@ -589,6 +596,30 @@ mod tests {
             service.admitted.load(Ordering::Acquire),
             0,
             "gateway shutdown cancels queued work without leaking places"
+        );
+    }
+
+    #[test]
+    fn busy_and_uncertain_displays_are_pinned() {
+        // Busy renders member-visible via `busy.to_string()` (interactions.rs),
+        // so this Display pin is the member copy; the admission refusal path
+        // pins the same string in
+        // `queue_is_bounded_and_refuses_instead_of_waiting`.
+        assert_eq!(
+            LfgError::Busy.to_string(),
+            "LFG is busy right now; try again in a few seconds."
+        );
+        assert_eq!(
+            LfgError::Uncertain.to_string(),
+            "LFG acceptance is uncertain; durable state retained for nonce recovery"
+        );
+        // The member-visible Uncertain reply is a different literal at its
+        // render site (interactions.rs), pinned exact by the
+        // `router_cleans_failed_posts_but_preserves_unreadable_acceptance`
+        // integration test — never this Display.
+        assert_ne!(
+            LfgError::Uncertain.to_string(),
+            "LFG post acceptance is uncertain; saved state retained for nonce recovery."
         );
     }
 }

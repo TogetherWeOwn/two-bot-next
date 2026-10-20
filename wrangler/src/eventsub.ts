@@ -31,7 +31,8 @@
 import { TokenBuckets } from "./redirect.ts";
 import { LOG_QUERY_URL } from "./alert-rules.ts";
 import { UNKNOWN_RELEASE, normalizeRelease } from "./error-events.ts";
-import { REQUEST_ID_HEADER, ensureRequestId, newRequestId } from "./request-id.ts";
+import { REQUEST_ID_HEADER, ensureRequestId, isRequestId, newRequestId } from "./request-id.ts";
+import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
 
 export const EVENTSUB_PATH = "/hooks/twitch";
 /**
@@ -51,8 +52,11 @@ export const EVENTSUB_RECEIVER_PORT = 8092;
 export const EVENTSUB_RECEIVER_BIND = `0.0.0.0:${EVENTSUB_RECEIVER_PORT}`;
 /** Mirrors the core (`twitch_eventsub::MAX_BODY_BYTES`): cap before hashing. */
 export const MAX_BODY_BYTES = 64 * 1024;
-/** A subscription challenge is one short token; anything larger is not one. */
-export const MAX_CHALLENGE_BYTES = 4 * 1024;
+/**
+ * Mirrors the core (`twitch_eventsub::CHALLENGE_MAX`): a subscription
+ * challenge is 1..=256 ASCII-graphic bytes; anything else is not one.
+ */
+export const MAX_CHALLENGE_BYTES = 256;
 export const BODY_TIMEOUT_MS = 5_000;
 export const REQUEST_TIMEOUT_MS = 20_000;
 /** Concurrent ingress requests per isolate; the receiver itself admits 32. */
@@ -105,7 +109,7 @@ export function resetEventsubIngressLimits(): void {
 }
 
 export function notFound(): Response {
-  return new Response("not found", { status: 404 });
+  return new Response("not found", { status: 404, headers: withSecurityHeaders() });
 }
 
 /**
@@ -120,13 +124,15 @@ export function envelope(
   headers: Record<string, string> = {},
   requestId: string = newRequestId(),
 ): Response {
+  const hardened = new Headers({ "cache-control": "no-store", ...headers });
+  applySecurityHeaders(hardened);
   return Response.json(
     {
       ok: false,
       request_id: requestId,
       error: { code, message: "request refused", retryable },
     },
-    { status, headers: { "cache-control": "no-store", ...headers } },
+    { status, headers: hardened },
   );
 }
 
@@ -394,12 +400,92 @@ function releaseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
 }
 
 /**
- * Only the receiver's own answers may leave. A `200 text/plain` challenge
- * echo relays byte for byte (bounded: the challenge is one short token).
- * JSON envelopes relay with their status. SDK 0.3.7 synthesizes text
- * 429/500/503 bodies from startup failures (raw `e.message`), and a wrong
- * listener could answer anything else; both become the fixed unavailable
- * envelope. Allowlisted headers only.
+ * The receiver's refusal vocabulary, mirrored from its constructors and call
+ * sites (`crates/bot/src/eventsub_http.rs`: `envelope`/`refuse`/`ack`): each
+ * code is emitted with exactly one status and one retry policy. Verification
+ * failures map to `401 unauthorized` there, so `bad_signature` and
+ * `stale_timestamp` are not wire codes; deterministic wrong-subscription
+ * deliveries are acknowledged, not refused. A `Map` (not a plain object)
+ * keeps inherited names like `toString` from matching as codes.
+ */
+const RECEIVER_REFUSALS: ReadonlyMap<string, { status: number; retryable: boolean }> = new Map([
+  ["malformed", { status: 400, retryable: false }],
+  ["unauthorized", { status: 401, retryable: false }],
+  ["not_found", { status: 404, retryable: false }],
+  ["method_not_allowed", { status: 405, retryable: false }],
+  ["request_timeout", { status: 408, retryable: true }],
+  ["payload_too_large", { status: 413, retryable: false }],
+  ["unsupported_media_type", { status: 415, retryable: false }],
+  ["busy", { status: 503, retryable: true }],
+  ["upstream_timeout", { status: 503, retryable: true }],
+  ["unavailable", { status: 503, retryable: true }],
+]);
+
+/** True for the receiver's challenge shape: 1..=256 ASCII-graphic bytes. */
+function isChallengeBytes(body: Uint8Array): boolean {
+  if (body.byteLength === 0 || body.byteLength > MAX_CHALLENGE_BYTES) return false;
+  return body.every((byte) => byte >= 0x21 && byte <= 0x7e);
+}
+
+/**
+ * Project one collected JSON body to the receiver's supported envelope, or
+ * `null` when it is not one. Acknowledgements keep only
+ * `{ok: true, request_id}` with status 200; refusals keep only
+ * `{ok: false, request_id, error: {code, retryable}}` with their table status
+ * and the fixed refusal message. Extra top-level or nested fields and the
+ * upstream message text never leave. The id must be the generated shape AND
+ * the id actually forwarded, so a foreign or mismatched id fails closed.
+ * This is schema/outflow enforcement, not proof of upstream authenticity.
+ */
+function projectReceiverJson(
+  status: number,
+  body: Uint8Array,
+  requestId: string,
+): { ok: true; request_id: string } | {
+  ok: false;
+  request_id: string;
+  error: { code: string; message: string; retryable: boolean };
+} | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(body));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const candidate = parsed as Record<string, unknown>;
+  if (typeof candidate["request_id"] !== "string") return null;
+  const upstreamId = candidate["request_id"] as string;
+  if (!isRequestId(upstreamId) || upstreamId !== requestId) return null;
+  if (candidate["ok"] === true) {
+    if (status !== 200 || "error" in candidate) return null;
+    return { ok: true, request_id: requestId };
+  }
+  if (candidate["ok"] !== false) return null;
+  const error = candidate["error"];
+  if (typeof error !== "object" || error === null || Array.isArray(error)) return null;
+  const { code, retryable } = error as Record<string, unknown>;
+  if (typeof code !== "string" || typeof retryable !== "boolean") return null;
+  const verdict = RECEIVER_REFUSALS.get(code);
+  if (verdict === undefined || verdict.status !== status || verdict.retryable !== retryable) return null;
+  return {
+    ok: false,
+    request_id: requestId,
+    error: { code, message: "request refused", retryable },
+  };
+}
+
+/**
+ * Only the receiver's own answers may leave, projected to the supported
+ * contract. A `200 text/plain` challenge echo relays byte for byte when it
+ * is 1..=256 ASCII-graphic bytes. JSON acknowledgements and refusals are
+ * validated against the receiver's constructors (fixed fields, fixed
+ * vocabulary, fixed message, forwarded correlation id) and re-emitted with
+ * their valid status; anything else becomes the fixed unavailable envelope.
+ * SDK 0.3.7 synthesizes text 429/500/503 bodies from startup failures (raw
+ * `e.message`), and a wrong listener could answer anything else; both become
+ * the fixed unavailable envelope. Allowlisted headers only, plus the decided
+ * security headers on every response this function builds.
  *
  * Caps are enforced incrementally while reading: the reader is cancelled the
  * moment the cap is crossed, so no tail past the cap is collected. Rejected
@@ -436,8 +522,10 @@ export async function relayEventsubResponse(
   const limit = isChallenge ? MAX_CHALLENGE_BYTES : MAX_RESPONSE_BYTES;
   const reader = upstream.body?.getReader();
   if (!reader) {
-    const headers = relayHeaders(upstream.headers, media!);
-    return new Response(new Uint8Array(), { status: upstream.status, headers });
+    // The receiver always answers with a body: bodiless JSON is not an
+    // acknowledgement and a bodiless challenge is empty, so both fail closed.
+    releaseUpstream(upstream);
+    return refuse(503, "unavailable", true, undefined, requestId, release);
   }
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -471,8 +559,17 @@ export async function relayEventsubResponse(
     body.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  const headers = relayHeaders(upstream.headers, media!);
-  return new Response(body, { status: upstream.status, headers });
+  if (isChallenge) {
+    if (!isChallengeBytes(body)) {
+      return refuse(503, "unavailable", true, undefined, requestId, release);
+    }
+    return new Response(body, { status: 200, headers: relayHeaders(upstream.headers, media!) });
+  }
+  const projected = projectReceiverJson(upstream.status, body, requestId);
+  if (projected === null) {
+    return refuse(503, "unavailable", true, undefined, requestId, release);
+  }
+  return Response.json(projected, { status: upstream.status, headers: relayHeaders(upstream.headers, media!) });
 }
 
 function relayHeaders(source: Headers, media: string): Headers {
@@ -480,5 +577,6 @@ function relayHeaders(source: Headers, media: string): Headers {
   const retry = source.get("retry-after");
   if (retry !== null && /^\d{1,6}$/.test(retry)) headers.set("retry-after", retry);
   headers.set("cache-control", "no-store");
+  applySecurityHeaders(headers);
   return headers;
 }

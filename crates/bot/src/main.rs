@@ -84,9 +84,13 @@ mod moderation_release_cli;
 mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
+mod onboarding_queue_cause_forwarding_tests;
+#[cfg(test)]
 mod onboarding_tests;
 #[cfg(test)]
 mod onboarding_unknown_only_acceptance_tests;
+#[cfg(test)]
+mod onboarding_worker_failure_acceptance_tests;
 mod ops_backfill;
 mod ops_http;
 mod preflight;
