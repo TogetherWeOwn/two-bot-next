@@ -167,18 +167,78 @@ def shell_logical_lines(script):
 
 
 # An `#[ignore ...]` line, further attributes or trivia, then the fn it marks.
-IGNORED_TEST_FN = re.compile(
-    r"^[ \t]*#\[ignore\b[^\n]*\n"
-    r"(?:\s|//[^\n]*\n|/\*[\s\S]*?\*/|#\[[^\n]*\n)*"
-    r"(?:async[ \t]+)?fn[ \t]+(\w+)",
-    re.MULTILINE,
-)
+# A single regex with a block-comment alternative inside `(?:...)*` backtracks
+# exponentially (CodeQL `py/polynomial-regular-expression-used-on-uncontrolled-data`);
+# scan forward with string ops instead so each byte is visited once.
+IGNORE_MARK = re.compile(r"^[ \t]*#\[ignore\b", re.MULTILINE)
+
+
+def _skip_trivia(text, pos):
+    """Skip whitespace, line/block comments and `#[...]` lines from `pos`."""
+    end = len(text)
+    while pos < end:
+        char = text[pos]
+        if char.isspace():
+            pos += 1
+            continue
+        if text.startswith("//", pos):
+            newline = text.find("\n", pos + 2)
+            if newline == -1:
+                return end
+            pos = newline + 1
+            continue
+        if text.startswith("/*", pos):
+            close = text.find("*/", pos + 2)
+            if close == -1:
+                return end
+            pos = close + 2
+            continue
+        if text.startswith("#[", pos):
+            newline = text.find("\n", pos)
+            if newline == -1:
+                return end
+            pos = newline + 1
+            continue
+        return pos
+    return pos
+
+
+def _match_fn_name(text, pos):
+    """The fn name at `pos`, allowing an `async` prefix on the same line."""
+    end = len(text)
+    if text.startswith("async", pos) and pos + 5 < end and text[pos + 5] in " \t":
+        pos += 5
+        while pos < end and text[pos] in " \t":
+            pos += 1
+    if not text.startswith("fn", pos):
+        return None
+    pos += 2
+    if pos >= end or text[pos] not in " \t":
+        return None
+    while pos < end and text[pos] in " \t":
+        pos += 1
+    if pos >= end or not (text[pos].isalpha() or text[pos] == "_"):
+        return None
+    start = pos
+    pos += 1
+    while pos < end and (text[pos].isalnum() or text[pos] == "_"):
+        pos += 1
+    return text[start:pos]
 
 
 def ignored_test_names(suite):
     """The #[ignore]d test fns of the integration test target `suite`."""
     [path] = ROOT.glob(f"crates/*/tests/{suite}.rs")
-    return IGNORED_TEST_FN.findall(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    names = []
+    for mark in IGNORE_MARK.finditer(text):
+        line_end = text.find("\n", mark.end())
+        if line_end == -1:
+            continue
+        name = _match_fn_name(text, _skip_trivia(text, line_end + 1))
+        if name is not None:
+            names.append(name)
+    return names
 
 
 # Staging deploy push filter. Each deploy restarts the bot container and drops the
