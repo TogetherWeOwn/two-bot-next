@@ -36,7 +36,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import staging_edge_cases as edge  # noqa: E402
+import staging_edge_cases as edge
 
 # A unique marker, readable on purpose so a leak is unmistakable and no
 # credential-shaped literal is stored anywhere in this file.
