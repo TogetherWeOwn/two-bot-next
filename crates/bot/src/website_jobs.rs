@@ -50,6 +50,10 @@ mod snapshot_tests;
 #[path = "website_event_identity_acceptance_tests.rs"]
 mod event_identity_acceptance_tests;
 
+#[cfg(test)]
+#[path = "website_jobgate_acceptance_tests.rs"]
+mod jobgate_acceptance_tests;
+
 #[derive(Clone, Copy)]
 pub enum Kind {
     Counter,
