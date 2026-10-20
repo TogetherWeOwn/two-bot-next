@@ -283,6 +283,24 @@ impl std::fmt::Debug for RawResponse {
     }
 }
 
+/// Release a read's permit outside the receipt path (a stalled header/body or
+/// a truncated body), logging a storage failure like the receipt path. `site`
+/// is a fixed label naming the early-release site (`header_timeout`,
+/// `body_timeout`, `body_error`) for log triage. A failed completion holds
+/// the lane by design; the warn is the only signal.
+async fn complete_early_release(
+    permit: two_bot_core::send_admission::AdmissionPermit,
+    site: &'static str,
+) {
+    if let Err(error) = permit.complete(None).await {
+        tracing::warn!(
+            %error,
+            site,
+            "Discord send admission completion failed; lane held"
+        );
+    }
+}
+
 impl RawResponse {
     /// Call only for a definite effect/no-effect, after validating any required
     /// mutation receipt. A storage fault must not authorize effect replay.
@@ -594,7 +612,7 @@ impl HyperTransport {
                 Err(_) => {
                     if request.method() == Method::Get {
                         if let Some(permit) = permit {
-                            let _ = permit.complete(None).await;
+                            complete_early_release(permit, "header_timeout").await;
                         }
                     }
                     return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
@@ -733,7 +751,7 @@ impl PendingHeaders<'_> {
                 // permit held (uncertain) by returning with it taken.
                 if self.complete_on_receipt {
                     if let Some(permit) = self.permit.take() {
-                        let _ = permit.complete(None).await;
+                        complete_early_release(permit, "body_timeout").await;
                     }
                 }
                 return Err(BODY_TIMEOUT_MESSAGE.to_owned());
@@ -743,7 +761,7 @@ impl PendingHeaders<'_> {
                 // a receipted read (every GET) must release the lane.
                 if self.complete_on_receipt {
                     if let Some(permit) = self.permit.take() {
-                        let _ = permit.complete(None).await;
+                        complete_early_release(permit, "body_error").await;
                     }
                 }
                 return Err("Discord response body unavailable".to_owned());
@@ -2750,15 +2768,32 @@ impl ActionExecutor {
             let rows: Vec<serde_json::Value> = serde_json::from_slice(&res.body)
                 .map_err(|_| DiscordError::Unavailable("unreadable message history".into()))?;
             for row in &rows {
-                if row["nonce"].as_str() == Some(nonce)
-                    && row["author"]["id"].as_str() == Some(&bot_user_id.to_string())
-                    && row["channel_id"].as_str() == Some(channel_id)
+                // A non-match proves absence only if its required evidence is readable.
+                // Map upstream ID failures to a fixed error, never a raw snowflake value.
+                let unreadable = || DiscordError::Unavailable("unreadable message history".into());
+                let id = row["id"].as_str().ok_or_else(unreadable)?;
+                let author = row["author"]["id"].as_str().ok_or_else(unreadable)?;
+                let message_id: Id<MessageMarker> = snowflake(id).map_err(|_| unreadable())?;
+                let author_id: Id<UserMarker> = snowflake(author).map_err(|_| unreadable())?;
+                if message_id.to_string() != id
+                    || author_id.to_string() != author
+                    || row["channel_id"].as_str() != Some(channel_id)
                 {
-                    let id = row["id"].as_str().ok_or_else(|| {
-                        DiscordError::Unavailable("accepted message missing id".into())
-                    })?;
-                    let _: Id<MessageMarker> = snowflake(id)?;
-                    return Ok(Some(id.to_owned()));
+                    return Err(unreadable());
+                }
+                if author_id.get() == bot_user_id {
+                    let row_nonce = &row["nonce"];
+                    // Only the bot's rows need readable nonce evidence to prove a non-match.
+                    if !row_nonce.is_null()
+                        && !row_nonce.is_string()
+                        && !row_nonce.is_i64()
+                        && !row_nonce.is_u64()
+                    {
+                        return Err(unreadable());
+                    }
+                    if row_nonce.as_str() == Some(nonce) {
+                        return Ok(Some(id.to_owned()));
+                    }
                 }
             }
             if rows.len() < 100 {

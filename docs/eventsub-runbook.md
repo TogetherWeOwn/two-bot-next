@@ -329,6 +329,21 @@ public URL):
 | 504 | `upstream_timeout` | true | The fenced DO did not answer within the Worker deadline. Source: `wrangler/src/eventsub.ts:264`. |
 | 503 | `unavailable` | true | DO construction / binding failure, cold container, ownership-fence refusal, or relay failure (see the 503 triage below). Source: `wrangler/src/eventsub.ts:268,299-308,328,338,343` (ingress and relay failures), `wrangler/src/index.ts:905-915` (cold container at `:905`, `containerFetch` failure at `:906-910`, fence refusal at `:912-915`). |
 
+The DO relays receiver answers through `relayEventsubResponse`, which
+projects them to the supported contract before they leave: JSON
+acknowledgements become exactly `{ok: true, request_id}` (status 200) and
+refusals become exactly
+`{ok: false, request_id, error: {code, message: "request refused", retryable}}`
+with their valid container-layer status, code and retry policy from the table
+below; extra fields and upstream message text are dropped. A `200 text/plain`
+body echoes byte for byte only when it is 1..=256 ASCII-graphic bytes. Empty,
+malformed, scalar or contradictory JSON, unknown codes, foreign or mismatched
+correlation ids, and invalid challenge bytes all become the fixed 503
+`unavailable` envelope carrying the forwarded request id. Relayed and refusal
+responses carry `no-store` plus the decided security headers; only a numeric
+`retry-after` passes through. This is schema/outflow enforcement, not proof of
+upstream authenticity.
+
 Container layer (`crates/bot/src/eventsub_http.rs`; the 400 / 404 / 405 rows
 are reachable via the public URL only when the Worker is bypassed by a
 direct `containerFetch`, because the Worker answers those shapes first):
@@ -347,7 +362,7 @@ direct `containerFetch`, because the Worker answers those shapes first):
 
 Verified deliveries that need no operator action answer `200`:
 
-- `notification` and `revocation`: acknowledged as `200 {"ok": true}`.
+- `notification` and `revocation`: acknowledged as `200 {"ok": true, "request_id"}`.
   While delivery stays dark the receiver only acks a notification; with
   delivery enabled a 200 also covers a posted or deduplicated go-live. The
   reconciler (above) re-creates a revoked subscription on its next
@@ -363,7 +378,7 @@ Verified deliveries that need no operator action answer `200`:
   This carve-out excludes `webhook_callback_verification`: `classify()`
   returns `WrongSubscription` / `InvalidBody` for a challenge with the wrong
   type or version, or an unparsable signed body, and the handler still acks
-  `200 {"ok": true}` with only an info `delivery ignored` line without
+  `200 {"ok": true, "request_id"}` with only an info `delivery ignored` line without
   echoing the challenge — so the subscription is never enabled. A `200
   delivery ignored` immediately after a subscription creation means the
   challenge was not echoed: delete and recreate the subscription.
@@ -409,6 +424,25 @@ staging first and keep the posted go-live as enablement evidence;
 production enablement is its own rollout decision. To stop posting
 without touching the receiver, unset the gate (or set it to `"0"`) and
 redeploy: verified deliveries return to ack-only.
+
+## Lost go-live announcements
+
+Outcome reason `send_failed_unreleased` means the Discord send provably
+never landed, but releasing the started claim row failed (database error
+or noop), so the row stays fenced: the Twitch retry is answered
+`Duplicate` (2xx) and the announcement never posts. There is no
+automatic re-post or release retry; the row is never reclaimed. It
+counts as attempted+failed in `eventsub_post_failed_share`, like every
+other sender-reaching failure, and it logs one fixed-class warn naming
+the reason with no delivery data, safe to alert on as-is.
+
+Operator action: confirm the stream is (or was) actually live on
+Twitch, post a manual announcement if the moment still matters, and
+investigate the release failure in the container logs and database
+health around the warn. Do not hand-delete the ledger row and do not
+redeploy to repair one lost announcement.
+Source: `crates/core/src/stream_live_store.rs:614-642`,
+`crates/bot/src/eventsub_delivery.rs:86-98`.
 
 ## Dark-unless-enabled behavior
 

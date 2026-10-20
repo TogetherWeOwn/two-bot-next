@@ -28,15 +28,45 @@ cap (same bound as the metrics scrape). Oversize surfaces a generic
 `-32000` JSON-RPC error without echoing upstream bytes; timeouts and
 non-bot upstreams surface a generic `-32000` without proxied error text.
 `/readyz` accepts 200 and its routine 503 JSON (any component not ready)
-only when the body is a readiness report (`components` is an array);
-ownership-fence and junk bodies (e.g. `{error:"ownership_fenced"}`),
-other statuses, and non-JSON stay failures. `get_gateway` reads the `[name, status]`
-pairs in `components` plus `gateway_failure`. `get_config.build_revision`
-is the Worker version (`CF_VERSION_METADATA.id`).
+only when the body is a readiness report: `components` must be an array and
+**every row** must be an exact two-element `[name, status]` pair with a string
+name and status exactly `ready`, `starting` or `down`. Both `get_gateway` and
+`get_backfill_progress` refuse the whole report with the same generic `-32000`
+error if any row is malformed, with no result or echoed upstream content.
+Arbitrary component names, extra report fields and empty component lists remain
+valid; no gateway component is required. Ownership-fence and junk bodies
+(e.g. `{error:"ownership_fenced"}`), other statuses, and non-JSON stay failures.
+`get_gateway` reads the `[name, status]` pairs in `components` plus `gateway_failure`.
+`get_config.build_revision` is the Worker version (`CF_VERSION_METADATA.id`).
 `initialize` echoes only a supported protocol version, else the default.
 Unknown tool names return `-32601`. `GET /mcp` returns `405` with
 `Allow: POST` and never executes tools. Client stream close aborts the
 in-flight container fetch via the request signal.
+
+## Request validation (before dispatch)
+
+Every parsed body is validated before any Durable Object resolution or
+container read. Malformed envelopes (non-object/array/batch roots, wrong
+`jsonrpc`, non-string `method`, object/array/boolean `id`) return the fixed
+`-32600 invalid request`; malformed `params` (anything but an omitted or
+plain-object value) and malformed `tools/call` fields return the fixed
+`-32602 invalid params`. Refusals echo only string/number correlation IDs
+(`0` and `""` included), otherwise `null`; they never echo untrusted input
+or credentials. All five tools take no arguments: `arguments` must be
+omitted or `{}`, and any scalar, array, null, or unexpected-key value
+(including falsy extras and an own `__proto__` key) is refused with
+`-32602`. A missing or non-string tool `name` is `-32602`; a well-formed
+but unknown name stays `-32601 unknown tool`. Harmless top-level padding
+and extra object keys in method `params` remain allowed.
+
+Notification policy is derived from the envelope as well as the method: a
+missing or `null` ID on an ordinary method (`initialize`, `tools/list`,
+`tools/call`, `ping`) is `-32600`, while a missing or `null` ID on a
+`notifications/*` method with well-formed params is an empty `202` with no
+dispatch (malformed params there are `-32602`, not a silent accept). Any
+string/number ID — including `0` and `""` — makes a `notifications/*`
+method a request, answered `-32601 method not found` with the ID
+preserved; it never silently returns `202`.
 
 ## Auth (phase 1: shared `mcp:read` bearer; staging target: OAuth resource server)
 

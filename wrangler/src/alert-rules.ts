@@ -112,12 +112,16 @@ export const EVENTSUB_POST_OUTCOMES: readonly string[] = ["attempted", "succeede
  * classes. See docs/runbook.md#alert-rest-5xx.
  */
 export const PROMOTION_ERROR_GATE_RULES: readonly string[] = ["rest_5xx_rate"];
+/** Engaged audit halt for three valid keepalive samples (~2 min from first to third). */
+export const AUDIT_HALT_SAMPLES = 3;
 /** Pool at max with zero idle for this many consecutive samples. */
 export const POOL_SATURATED_SAMPLES = 3;
 /** DB errors must reach this many between two samples... */
 export const DB_ERROR_MIN_ERRORS = 3;
 /** ...and send-admission refusals must appear in this many consecutive samples. */
 export const SEND_BLOCKED_SAMPLES = 3;
+/** REST admission breaker openings must appear in this many consecutive samples. */
+export const REST_BREAKER_OPEN_SAMPLES = 3;
 /** Website-action receiver refusals must appear in this many consecutive samples. */
 export const RECEIVER_REFUSAL_SAMPLES = 3;
 /** EventSub tampered-signature deliveries must rise in this many consecutive samples. */
@@ -263,6 +267,8 @@ export const RULES: readonly RuleDef[] = [
   { id: "eventsub_post_failed_share", summary: `EventSub announcement post failures exceed ${EVENTSUB_POST_FAILED_SHARE_RATIO * 100}% of attempted posts (min ${EVENTSUB_POST_FAILED_SHARE_MIN_ATTEMPTED} attempted)`, runbook: "runbook.md#alert-eventsub-post-failed-share", severity: "ticket" },
   { id: "error_budget_fast_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_FAST_BURN}x over ${ERROR_BUDGET_FAST_LONG_SECONDS / 60} min and ${ERROR_BUDGET_FAST_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-fast-burn" },
   { id: "error_budget_slow_burn", summary: `REST error budget burning faster than ${ERROR_BUDGET_SLOW_BURN}x over ${ERROR_BUDGET_SLOW_LONG_SECONDS / 3600} h and ${ERROR_BUDGET_SLOW_SHORT_SECONDS / 60} min (99.9% success over 48 h)`, runbook: "runbook.md#alert-error-budget-slow-burn", severity: "ticket" },
+  { id: "audit_delivery_halt", summary: `audit delivery halt engaged for ${AUDIT_HALT_SAMPLES} consecutive valid samples`, runbook: "runbook.md#alert-audit-delivery-halt", severity: "ticket" },
+  { id: "rest_admission_breaker_open", summary: `REST admission breaker open for ${REST_BREAKER_OPEN_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-rest-admission-breaker-open", severity: "ticket" },
   { id: "eventsub_tampered", summary: `EventSub tampered-signature deliveries rose in ${EVENTSUB_TAMPERED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-eventsub-tampered" },
   { id: "eventsub_reconcile_failed", summary: `EventSub reconcile failed passes increased between samples`, runbook: "runbook.md#alert-eventsub-reconcile-failed", severity: "ticket" },
   { id: "event_store_consumer_lag", summary: `event-store consumer lag above ${EVENT_STORE_LAG_THRESHOLD_SECONDS} s sustained for ${EVENT_STORE_LAG_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-event-store-consumer-lag", severity: "ticket" },
@@ -320,9 +326,17 @@ export interface MetricsAlertState {
   rest5xx?: number;
   restTotal: number;
   poolStreak: number;
+  /** Consecutive valid engaged halt samples; absent in older DO storage. */
+  auditHaltStreak?: number;
   dbErrors: number;
   sendBlocked: number;
   sendBlockedStreak: number;
+  /**
+   * Consecutive valid samples with the REST admission breaker open, capped
+   * at REST_BREAKER_OPEN_SAMPLES. Absent on state stored by older Worker
+   * versions; legacy storage reads as no streak, never as sustained evidence.
+   */
+  breakerOpenStreak?: number;
   voiceOps: number;
   voiceFailures: number;
   voiceDeadLetters: number;
@@ -582,11 +596,16 @@ function errorBudgetBurnEvaluation(
   };
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, breakerOpenStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, voiceVoteKickFailures: 0, voiceVoteKickFailuresSeen: false, voiceVoteKickFiring: false, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, gatewayNotReadySeen: false, gatewayNotReadyStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {}, communityFactsDrainFailures: {}, communityFactsDrainStreak: 0, eventsubPosts: {}, eventsubPostsSeen: false, eventStoreLagStreak: 0, eventsubTampered: 0, eventsubTamperedSeen: false, eventsubTamperedStreak: 0, reconcileHealthy: 0, reconcilePending: 0, reconcileFailed: 0, reconcileSeen: false };
 
-/** An unsuccessful scrape breaks the dispatch and lag streaks, never an existing alert. */
+/** An unsuccessful scrape breaks the dispatch, breaker, and lag streaks, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
-  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, eventStoreLagStreak: 0 };
+  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, eventStoreLagStreak: 0 };
+}
+
+/** A failed scrape breaks the engaged run, but cannot prove a halt cleared. */
+export function interruptAuditHalt(state: MetricsAlertState): MetricsAlertState {
+  return { ...state, auditHaltStreak: 0 };
 }
 
 /** A failed scrape breaks drain-growth evidence, never an active drain ticket. */
@@ -610,6 +629,7 @@ export function parseExposition(text: string): Sample[] {
 }
 
 const GATEWAY_UNPAIRED_RULE = "gateway_unpaired_disconnect";
+const REST_BREAKER_OPEN_RULE = "rest_admission_breaker_open";
 
 type GatewayPairingFields = Pick<
   MetricsAlertState,
@@ -739,6 +759,8 @@ interface JoinBurnResult {
   slow: boolean;
   /** Inputs were missing or malformed: the caller retains the previous firing state. */
   held: boolean;
+  /** Both slow windows have a baseline snapshot: silence here is a confirmed clear. */
+  slowCovered: boolean;
   ring: JoinBurnSnapshot[];
 }
 
@@ -749,7 +771,10 @@ interface JoinBurnResult {
  * nothing. Otherwise the sample is appended, entries older than the slow
  * window plus margin are pruned, and each fully covered window burns as
  * bad / (genuine x budget) against its threshold. Each window also needs the
- * minimum join volume and at least two bad moves to fire.
+ * minimum join volume and at least two bad moves to fire. `slowCovered` is
+ * true only when both slow windows have baseline history; callers that
+ * resolve on silence must also require it, because an uncovered window
+ * reports no burn for lack of history rather than lack of errors.
  */
 function joinBurnEvaluation(samples: Sample[], ring: JoinBurnSnapshot[], nowSeconds: number): JoinBurnResult {
   const gauge = (name: string) => samples.filter((s) => s.name === name);
@@ -757,12 +782,12 @@ function joinBurnEvaluation(samples: Sample[], ring: JoinBurnSnapshot[], nowSeco
   const duplicate = exactSeries(gauge("two_bot_voice_join_refused_total"), { reason: "duplicate" });
   const fastMoves = exactSeries(gauge("two_bot_voice_join_to_move_seconds_bucket"), { le: "5" });
   if (received === undefined || duplicate === undefined || fastMoves === undefined) {
-    return { fast: false, slow: false, held: true, ring };
+    return { fast: false, slow: false, held: true, slowCovered: false, ring };
   }
   const snapshot: JoinBurnSnapshot = { t: nowSeconds, received, duplicate, fastMoves };
   const last = ring[ring.length - 1];
   if (last !== undefined && (received < last.received || duplicate < last.duplicate || fastMoves < last.fastMoves)) {
-    return { fast: false, slow: false, held: false, ring: [snapshot] };
+    return { fast: false, slow: false, held: false, slowCovered: false, ring: [snapshot] };
   }
   const cutoff = nowSeconds - JOIN_SLOW_LONG_SECONDS - JOIN_BURN_HISTORY_MARGIN_SECONDS;
   const next = [...ring.filter((s) => s.t > cutoff && s.t <= nowSeconds), snapshot];
@@ -800,10 +825,16 @@ function joinBurnEvaluation(samples: Sample[], ring: JoinBurnSnapshot[], nowSeco
   const fastShort = burn(JOIN_FAST_SHORT_SECONDS);
   const slowLong = burn(JOIN_SLOW_LONG_SECONDS);
   const slowShort = burn(JOIN_SLOW_SHORT_SECONDS);
+  // Coverage is about history, not burn: a quiet-but-covered window still
+  // counts, while a window without baselines must never read as a clear.
+  const covers = (windowSeconds: number): boolean =>
+    baselineAtOrBefore(end.t - windowSeconds, end.t) !== undefined
+    && baselineAtOrBefore(nowSeconds - windowSeconds, nowSeconds) !== undefined;
   return {
     fast: fastLong !== undefined && fastShort !== undefined && fastLong > JOIN_FAST_BURN && fastShort > JOIN_FAST_BURN,
     slow: slowLong !== undefined && slowShort !== undefined && slowLong > JOIN_SLOW_BURN && slowShort > JOIN_SLOW_BURN,
     held: false,
+    slowCovered: covers(JOIN_SLOW_LONG_SECONDS) && covers(JOIN_SLOW_SHORT_SECONDS),
     ring: next,
   };
 }
@@ -812,6 +843,10 @@ export interface Evaluation {
   /** Firing keys `ruleId` or `ruleId:subject`. */
   firing: string[];
   state: MetricsAlertState;
+  /** The creator-join burn inputs were unusable, so the previous firing state holds. */
+  joinHeld: boolean;
+  /** Both slow burn windows have baseline history; silence without it is unknown, not clear. */
+  joinSlowCovered: boolean;
 }
 
 export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowSeconds: number, gatewayReady?: boolean): Evaluation {
@@ -870,6 +905,30 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
       && s.value > 0 && nowSeconds - s.value > UNKNOWN_JOB_STALE_SECONDS) {
       firing.push(`job_unknown_stale:${job}`);
     }
+  }
+
+  // An unreadable sweep retains the old gauge, not an absent sample. Its
+  // supervisor failure count is therefore a veto on both firing and recovery.
+  // Conservatively hold on other failed audit sweeps too, until one succeeds.
+  // Standalone evaluator callers may supply just the halt; real scrapes require
+  // the complete job-failure family in parseAlertScrape.
+  const haltRows = gauge("two_bot_audit_delivery_halt");
+  const halt = haltRows.length === 1 ? exactSeries(haltRows, {}) : undefined;
+  const jobFailures = gauge("two_bot_job_consecutive_failures");
+  const auditHealthy = jobFailures.length === 0
+    || exactSeries(jobFailures, { job: "audit_retry" }) === 0;
+  // The gauge defaults to 0 at process boot. Unlike an observed 1, a zero
+  // cannot prove a read happened: require a successful sweep before recovery.
+  const auditSuccessRows = gauge("two_bot_job_last_success_timestamp_seconds").filter((s) => s.labels["job"] === "audit_retry");
+  const auditSuccess = exactSeries(auditSuccessRows, { job: "audit_retry" });
+  const recoveryConfirmed = auditSuccessRows.length === 0 || (auditSuccess !== undefined && auditSuccess > 0);
+  const validHalt = auditHealthy && (halt === 1 || (halt === 0 && recoveryConfirmed));
+  const auditHaltStreak = validHalt && halt === 1
+    ? Math.min((prev.auditHaltStreak ?? 0) + 1, AUDIT_HALT_SAMPLES) : 0;
+  const haltWasFiring = prev.firing.includes("audit_delivery_halt");
+  if ((!validHalt && haltWasFiring) || (validHalt && halt === 1
+    && (haltWasFiring || auditHaltStreak >= AUDIT_HALT_SAMPLES))) {
+    firing.push("audit_delivery_halt");
   }
 
   let rest429 = 0;
@@ -995,6 +1054,31 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // extend the streak, so idle or self-clearing contention never pages.
   const sendBlockedStreak = sendReset || sendBlocked === prevSendBlocked ? 0 : (prev.sendBlockedStreak ?? 0) + 1;
   if (sendBlockedStreak >= SEND_BLOCKED_SAMPLES) firing.push("send_admission_blocked");
+
+  // REST admission breaker (local refusals before any REST wire attempt, so
+  // the request counter and its 429/5xx rules never see them): three
+  // consecutive valid open samples of the label-free 0/1 gauge file one
+  // ticket, and one valid closed sample recovers it. Missing or malformed
+  // samples break the streak but hold a firing ticket: they manufacture
+  // neither sustained evidence nor recovery. `?? 0` covers DO storage
+  // written before this field existed, and the cap keeps persisted state
+  // bounded no matter how long the breaker stays open.
+  const breakerRows = gauge("two_bot_rest_guard_breaker_open");
+  const breakerOpen = breakerRows.length === 1 && Object.keys(breakerRows[0]!.labels).length === 0
+    && (breakerRows[0]!.value === 0 || breakerRows[0]!.value === 1)
+    ? breakerRows[0]!.value
+    : undefined;
+  const wasBreakerFiring = prev.firing.includes(REST_BREAKER_OPEN_RULE);
+  let breakerOpenStreak: number;
+  if (breakerOpen === 1) {
+    breakerOpenStreak = Math.min((prev.breakerOpenStreak ?? 0) + 1, REST_BREAKER_OPEN_SAMPLES);
+    if (breakerOpenStreak >= REST_BREAKER_OPEN_SAMPLES || wasBreakerFiring) firing.push(REST_BREAKER_OPEN_RULE);
+  } else if (breakerOpen === 0) {
+    breakerOpenStreak = 0;
+  } else {
+    breakerOpenStreak = 0;
+    if (wasBreakerFiring) firing.push(REST_BREAKER_OPEN_RULE);
+  }
 
   // Voice lifecycle failures (T3 room create/move/delete budget in
   // docs/voice-cutover-rollback-triggers.md): any outcome other than
@@ -1467,7 +1551,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     else if (!healthyGrew && wasReconcileFiring) firing.push(RECONCILE_FAILED_RULE);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak } };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, breakerOpenStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, voiceVoteKickFailures: voiceVoteKickFailures ?? prevVoiceVoteKickFailures, voiceVoteKickFailuresSeen: voiceVoteKickFailures !== undefined ? true : prevVoteKickSeen, voiceVoteKickFiring, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, gatewayNotReadySeen, gatewayNotReadyStreak, dispatchDrops, dispatchDropStreaks, communityFactsDrainFailures, communityFactsDrainStreak, auditHaltStreak, eventStoreLagStreak, reconcileHealthy, reconcilePending, reconcileFailed, reconcileSeen, joinBurn: joinBurn.ring, eventsubPosts, eventsubPostsSeen, errorBudgetBurn: errorBudgetBurn.ring, eventsubTampered, eventsubTamperedSeen, eventsubTamperedStreak }, joinHeld: joinBurn.held, joinSlowCovered: joinBurn.slowCovered };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
