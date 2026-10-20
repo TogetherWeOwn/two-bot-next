@@ -312,6 +312,14 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_no_echo_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_run_record_condition_shapes.py' -v
 
+      # The bench suite below is also matched by pipeline-benchmark.yml's
+      # wildcard, but that job is evidence-only (not required) and path-gated;
+      # this line gates the PR.
+      - name: CI tooling input-refusal acceptance (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_release_sbom_target_shape_refusal_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_argparse_refusal_acceptance.py' -v
+
       - name: Validate voice template fixtures (hermetic, no renderer)
         run: |
           python3 tests/voice_templates/validate.py
@@ -2167,6 +2175,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke.py' -v
       - name: Offline smoke cleanup-failure acceptance
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_cleanup_acceptance.py' -v
+      - name: Offline smoke inspect-shape acceptance
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_smoke_inspect_refusal_acceptance.py' -v
       - name: Offline JSON-log smoke parser regressions
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-logging-container.py --self-test
       # A skipped build still reports success: the offline tests above ran,

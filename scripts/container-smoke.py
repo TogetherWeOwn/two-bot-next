@@ -87,6 +87,29 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+INSPECT_SHAPE_REASON = "container inspect output has invalid shape"
+
+
+def inspect_state(name, *fields):
+    """Parse one `docker inspect` reply; refuse malformed output with fixed vocabulary.
+
+    Every container-inspect call site reads fields from `[0]["State"]`. A
+    reply that is not JSON, not a non-empty list, lacks a dict entry, lacks
+    a dict `State`, or lacks a required field is refused before any health
+    or exit verdict. Never echoes the reply.
+    """
+    try:
+        entries = json.loads(docker("inspect", name).stdout)
+    except ValueError:
+        raise RuntimeError(INSPECT_SHAPE_REASON) from None
+    require(isinstance(entries, list) and entries and isinstance(entries[0], dict),
+            INSPECT_SHAPE_REASON)
+    state = entries[0].get("State")
+    require(isinstance(state, dict) and all(field in state for field in fields),
+            INSPECT_SHAPE_REASON)
+    return state
+
+
 def docker(*args, timeout=30, check=True, text=True):
     return subprocess.run(
         ["docker", *args], capture_output=True, text=text, timeout=timeout, check=check
@@ -104,7 +127,7 @@ def image_file(container, path):
 
 def pid1_uids(name):
     """Real, effective, saved and filesystem uid of the container's PID 1."""
-    pid = json.loads(docker("inspect", name).stdout)[0]["State"]["Pid"]
+    pid = inspect_state(name, "Pid")["Pid"]
     require(isinstance(pid, int) and pid > 0, "container PID 1 has no host process")
     # `docker top` runs ps beside the daemon and keeps only this container's
     # processes; select PID 1 by its host PID rather than by row order.
@@ -257,7 +280,7 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                     require(body == {"status": "ok"}, "/health body must report status ok")
                     break
                 require(time.monotonic() < deadline, "/health did not return 200 within 30s")
-                state = json.loads(docker("inspect", name).stdout)[0]["State"]
+                state = inspect_state(name, "Running")
                 require(state["Running"], "container exited before becoming healthy")
                 time.sleep(0.25)
             code, body = http_response(url + "/readyz")
@@ -290,9 +313,11 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             require(docker("exec", name, BINARY, "--healthcheck", timeout=5, check=False).returncode == 0,
                     "--healthcheck must exit 0 against the live process")
             while True:
-                state = json.loads(docker("inspect", name).stdout)[0]["State"]
+                state = inspect_state(name, "Running", "Health")
                 require(state["Running"], "container exited during healthcheck")
-                if state["Health"]["Status"] == "healthy":
+                health = state["Health"]
+                require(isinstance(health, dict) and "Status" in health, INSPECT_SHAPE_REASON)
+                if health["Status"] == "healthy":
                     break
                 require(time.monotonic() < deadline, "Docker HEALTHCHECK did not become healthy within 30s")
                 time.sleep(0.25)
@@ -319,7 +344,7 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
             elapsed = time.monotonic() - started
             require(elapsed <= 10, f"SIGTERM took {elapsed:.3f}s (maximum 10s)")
             require(result.stdout.strip() == "0", f"SIGTERM exit code was {result.stdout.strip()}, expected 0")
-            state = json.loads(docker("inspect", name).stdout)[0]["State"]
+            state = inspect_state(name, "Running", "OOMKilled")
             require(not state["Running"] and not state["OOMKilled"], "container failed to shut down cleanly")
             report(f"PASS SIGTERM exits 0 in {elapsed:.3f}s (maximum 10s); no OOM")
         except CleanupFailure:
