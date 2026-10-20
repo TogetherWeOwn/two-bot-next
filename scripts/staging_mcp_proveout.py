@@ -25,7 +25,9 @@ Probes against $STAGING_MCP_URL (default the staging Worker /mcp) with
 Output: redacted commands plus full response bodies on stdout (responses
 carry no credential), plus a sanitized JSON artifact with the same bodies
 and no bearer. Bodies over 64 KiB are refused before parsing and recorded
-as probe failures with the fixed cap verdict. Exit 0 proves the
+as probe failures with the fixed cap verdict. JSON deeper than 32 containers
+falls back to bounded text; compact output avoids indentation amplification.
+Exit 0 proves the
 Worker-side slice; exit 1 is a probe failure; exit 2 is a pre-flight
 refusal (nothing was sent).
 
@@ -56,6 +58,7 @@ STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
 # reach parsing, logs or the artifact. Refusals never echo the body or the
 # bearer.
 MAX_BODY_BYTES = 64 * 1024
+MAX_JSON_DEPTH = 32
 REQUEST_TIMEOUT_SECONDS = 25
 SCHEMA_VERSION = 1
 
@@ -168,9 +171,20 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
 
 def parse_json_or_text(body):
     try:
-        return json.loads(body)
+        parsed = json.loads(body)
     except Exception:
         return {"_text": body[:MAX_BODY_BYTES]}
+    # Decoder and encoder recursion limits differ. Check iteratively before
+    # handing parsed containers to either the stdout or artifact encoder.
+    pending = [(parsed, 0)]
+    while pending:
+        value, depth = pending.pop()
+        if isinstance(value, (dict, list)):
+            if depth >= MAX_JSON_DEPTH:
+                return {"_text": body[:MAX_BODY_BYTES]}
+            children = value.values() if isinstance(value, dict) else value
+            pending.extend((child, depth + 1) for child in children)
+    return parsed
 
 
 def main():
@@ -210,7 +224,8 @@ def main():
         print(f"HTTP {http_status}", flush=True)
         for key, value in safe_headers.items():
             print(f"{key}: {value}", flush=True)
-        print(json.dumps(body_json, indent=2, sort_keys=True), flush=True)
+        # No pretty indentation: even shallow, wide JSON can amplify it.
+        print(json.dumps(body_json, separators=(",", ":"), sort_keys=True), flush=True)
         print(flush=True)
 
     def fetch(name, redacted_cmd, payload, token_or_none):
@@ -255,8 +270,12 @@ def main():
     status, headers, body = fetch("tools/list", redacted_request_line("tools/list", rpc_id), payload, token)
     if body is not None:
         parsed = parse_json_or_text(body)
-        tools = (parsed.get("result", {}) or {}).get("tools") if isinstance(parsed, dict) else None
-        names = sorted(t.get("name") for t in tools) if isinstance(tools, list) else None
+        result = parsed.get("result") if isinstance(parsed, dict) else None
+        tools = result.get("tools") if isinstance(result, dict) else None
+        names = None
+        if isinstance(tools, list) and all(
+                isinstance(t, dict) and isinstance(t.get("name"), str) for t in tools):
+            names = sorted(t["name"] for t in tools)
         if status != 200 or names != sorted(EXPECTED_TOOLS):
             failures.append(f"tools/list: expected exactly {','.join(sorted(EXPECTED_TOOLS))}, got {names}")
     rpc_id += 1
@@ -282,7 +301,7 @@ def main():
         if status != 200 or not isinstance(parsed, dict):
             failures.append(f"tools/call {tool}: expected HTTP 200 JSON-RPC envelope")
         elif "error" in parsed and parsed["error"] is not None:
-            err = parsed["error"] or {}
+            err = parsed["error"] if isinstance(parsed["error"], dict) else {}
             code = err.get("code")
             if tool in CONTAINER_BACKED and code == -32000:
                 print(f"NOTE: tools/call {tool} returned -32000 (fenced container); expected while staging is fenced.", flush=True)
@@ -297,8 +316,8 @@ def main():
             if not isinstance(result, dict) or "content" not in result:
                 failures.append(f"tools/call {tool}: expected result.content envelope")
             elif tool == "get_audit":
-                structured = result.get("structuredContent") or {}
-                if structured.get("implemented") is not False:
+                structured = result.get("structuredContent")
+                if not isinstance(structured, dict) or structured.get("implemented") is not False:
                     failures.append("tools/call get_audit: expected structuredContent.implemented=false stub")
         rpc_id += 1
 
@@ -317,7 +336,8 @@ def main():
     )
     if body is not None:
         parsed = parse_json_or_text(body)
-        err = (parsed.get("error") or {}) if isinstance(parsed, dict) else {}
+        err = parsed.get("error") if isinstance(parsed, dict) else None
+        err = err if isinstance(err, dict) else {}
         if status != 200 or err.get("code") != -32601:
             failures.append(f"tools/call unknown: expected JSON-RPC -32601, got HTTP {status} {err}")
     rpc_id += 1
@@ -359,7 +379,7 @@ def main():
         "failures": failures,
     }
     with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(artifact, f, indent=2, sort_keys=True)
+        json.dump(artifact, f, separators=(",", ":"), sort_keys=True)
         f.write("\n")
 
     if failures:

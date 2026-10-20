@@ -8,12 +8,14 @@ BodyTooLarge before decoding).
 """
 
 import io
+import json
 import os
 import sys
 import tempfile
 import threading
 import unittest
 import urllib.error
+from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -230,6 +232,127 @@ class BodyCapTests(unittest.TestCase):
         self.assertNotIn(sentinel, message)
         self.assertNotIn(self.TOKEN, message)
         self.assertEqual(seen, [proveout.MAX_BODY_BYTES + 1])
+
+
+class HostileBodyTests(unittest.TestCase):
+    TOKEN = "test-bearer-000000000000000000000000"
+    PROBES = (["initialize", "tools/list"]
+              + [f"tools/call {tool}" for tool in proveout.EXPECTED_TOOLS]
+              + ["tools/call unknown", "wrong bearer", "no bearer"])
+
+    def run_main(self, overrides=None):
+        responses = [
+            (200, {}, json.dumps({"result": {"protocolVersion": "2025-06-18"}})),
+            (200, {}, json.dumps({"result": {"tools": [
+                {"name": tool} for tool in proveout.EXPECTED_TOOLS]}})),
+        ] + [(200, {}, json.dumps({"result": {
+            "content": [], "structuredContent": {"implemented": False}}}))
+             for _ in proveout.EXPECTED_TOOLS] + [
+            (200, {}, '{"error":{"code":-32601}}'),
+            (401, {"www-authenticate": "Bearer"}, "{}"),
+            (401, {"www-authenticate": "Bearer"}, "{}"),
+        ]
+        for index, response in (overrides or {}).items():
+            responses[index] = response
+        with tempfile.TemporaryDirectory(
+                dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            output = Path(tmp) / "receipt.json"
+            argv = ["staging_mcp_proveout.py", "--output", str(output)]
+            env = {proveout.TOKEN_ENV: self.TOKEN,
+                   proveout.URL_ENV: proveout.DEFAULT_URL}
+            stdout = io.StringIO()
+            with mock.patch.object(proveout, "do_post", side_effect=responses) as post, \
+                    mock.patch.object(sys, "argv", argv), \
+                    mock.patch.dict(os.environ, env), redirect_stdout(stdout):
+                code = proveout.main()
+            raw = output.read_bytes()
+            artifact = json.loads(raw)
+        self.assertEqual(post.call_count, 10)
+        self.assertEqual([p["name"] for p in artifact["probes"]], self.PROBES)
+        self.assertEqual(artifact["schema_version"], proveout.SCHEMA_VERSION)
+        text = stdout.getvalue()
+        self.assertNotIn(self.TOKEN, text)
+        self.assertNotIn(self.TOKEN.encode(), raw)
+        return code, text, artifact, raw
+
+    def assert_shape_failure(self, index, body):
+        code, stdout, artifact, raw = self.run_main({index: (200, {}, body)})
+        self.assertEqual(code, 1)
+        self.assertEqual(len(artifact["failures"]), 1)
+        self.assertTrue(artifact["failures"][0].startswith(self.PROBES[index] + ":"))
+        self.assertNotIn("body cap", artifact["failures"][0])
+        self.assertLess(len(stdout.encode()), proveout.MAX_BODY_BYTES)
+        self.assertLess(len(raw), proveout.MAX_BODY_BYTES)
+        return artifact
+
+    def test_valid_script_and_fenced_container_errors(self):
+        for overrides in ({}, {i: (200, {}, '{"error":{"code":-32000}}')
+                               for i in (2, 3, 4)}):
+            with self.subTest(overrides=overrides):
+                code, _, artifact, _ = self.run_main(overrides)
+                self.assertEqual(code, 0)
+                self.assertEqual(artifact["failures"], [])
+
+    def test_mid_depth_json_falls_back_before_serialization(self):
+        for depth in (900, 2000):
+            with self.subTest(depth=depth):
+                body = "[" * depth + "]" * depth
+                artifact = self.assert_shape_failure(0, body)
+                self.assertEqual(artifact["probes"][0]["body"], {"_text": body})
+
+    def test_json_depth_limit_handles_arrays_and_objects(self):
+        for opener, closer in (("[", "]"), ('{"a":', "}")):
+            for depth in (32, 33):
+                with self.subTest(opener=opener, depth=depth):
+                    body = opener * depth + "0" + closer * depth
+                    expected = json.loads(body) if depth == 32 else {"_text": body}
+                    self.assertEqual(proveout.parse_json_or_text(body), expected)
+
+    def test_wide_nested_body_does_not_expand_with_indentation(self):
+        body = "[" * 30 + ",".join("0" for _ in range(10000)) + "]" * 30
+        artifact = self.assert_shape_failure(0, body)
+        self.assertEqual(artifact["probes"][0]["body"], json.loads(body))
+
+    def test_wrong_typed_result_and_tool_entries_are_shape_failures(self):
+        bodies = [
+            {"result": ["x"]}, {"result": "x"}, {"result": True},
+            {"result": {"tools": ["x"]}},
+            {"result": {"tools": [{"name": "get_status"}, {"name": 1}]}},
+            {"result": {"tools": [{"name": None}]}},
+            {"result": {"tools": [{}]}},
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                self.assert_shape_failure(1, json.dumps(body))
+
+    def test_wrong_typed_errors_are_shape_failures(self):
+        for index in range(2, 8):
+            for error in ("x", ["x"], True, 1):
+                with self.subTest(index=index, error=error):
+                    self.assert_shape_failure(index, json.dumps({"error": error}))
+
+    def test_wrong_typed_audit_structured_content_is_shape_failure(self):
+        for structured in (["x"], "x", True, 1):
+            with self.subTest(structured=structured):
+                self.assert_shape_failure(6, json.dumps({"result": {
+                    "content": [], "structuredContent": structured}}))
+
+    def test_top_level_json_values_fail_envelope_probes_without_crashing(self):
+        for index in range(8):
+            for body in ("null", "true", "1", '"x"', "[]"):
+                with self.subTest(index=index, body=body):
+                    self.assert_shape_failure(index, body)
+
+    def test_cap_refusal_is_mapped_for_every_probe(self):
+        for index, name in enumerate(self.PROBES):
+            with self.subTest(probe=name):
+                code, stdout, artifact, raw = self.run_main({
+                    index: proveout.BodyTooLarge("response body over the size cap")})
+                self.assertEqual(code, 1)
+                self.assertEqual(artifact["failures"], [f"{name}: answered over the body cap"])
+                self.assertEqual(artifact["probes"][index]["body"], {"_text": ""})
+                self.assertLess(len(stdout.encode()), proveout.MAX_BODY_BYTES)
+                self.assertLess(len(raw), proveout.MAX_BODY_BYTES)
 
 
 if __name__ == "__main__":
