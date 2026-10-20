@@ -904,7 +904,14 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                 // every dump version including frozen v3, whose untyped
                 // rows still declare columns; the message names neither
                 // the missing column nor any cell value.
-                if info.columns.iter().any(|col| !data.contains_key(col)) {
+                // Outside keys have already refused, so equality with the
+                // deduplicated set's size proves completeness in O(1), even
+                // when the manifest repeats a column many times.
+                let is_missing_column = match column_sets.get(&table) {
+                    Some(known) => data.len() != known.len(),
+                    None => info.columns.iter().any(|col| !data.contains_key(col)),
+                };
+                if is_missing_column {
                     return Err(refuse(format!(
                         "{table} row on line {line_no} is missing a manifest column"
                     )));
@@ -2593,6 +2600,49 @@ mod tests {
                 row
             }]
         );
+    }
+
+    #[test]
+    fn duplicate_heavy_columns_preserve_row_completeness_verdicts() {
+        // Duplicate declarations must not multiply the work for each row.
+        // Keep this shape large enough to exercise the amplification without
+        // a wall-clock assertion that would flake on a loaded CI runner.
+        let row_count = 2_000;
+        let mut over = BTreeMap::new();
+        over.insert("events", (vec!["id"; 200_000], row_count));
+        let mut objs = vec![manifest(complete_tables(&over))];
+        let row = serde_json::json!({"kind":"row","table":"events","data":{"id":"1"}});
+        objs.extend(std::iter::repeat_n(row, row_count as usize));
+        objs.push(serde_json::json!({"kind":"end","rows":row_count}));
+        let bytes = gzip_lines(&objs);
+        let contents = inspect_bytes(&bytes).unwrap();
+        assert_eq!(contents.rows, row_count);
+        assert_eq!(contents.buffers["events"].len(), row_count as usize);
+        assert_eq!(
+            contents.buffers["events"][0],
+            serde_json::json!({"id":"1"}).as_object().unwrap().clone()
+        );
+
+        // The same distinct-column contract applies to typed and legacy rows.
+        for strip_types in [false, true] {
+            if strip_types {
+                objs[0]["version"] = serde_json::json!(3);
+                for table in objs[0]["tables"].as_array_mut().unwrap() {
+                    table.as_object_mut().unwrap().shift_remove("column_types");
+                }
+            }
+            objs[1]["data"] = serde_json::json!({});
+            let err = acceptance_refusal(&objs);
+            assert!(err.contains("is missing a manifest column"), "{err}");
+            // Equal key counts alone do not prove completeness: an outside
+            // key replacing a required key must retain the earlier refusal.
+            objs[1]["data"] = serde_json::json!({ECHO_SENTINEL:ECHO_SENTINEL});
+            let err = acceptance_refusal(&objs);
+            assert!(err.contains("has a column outside the manifest"), "{err}");
+            assert!(!err.contains(ECHO_SENTINEL), "{err}");
+            objs[1]["data"] = serde_json::json!({"id":"1"});
+            assert_eq!(inspect_bytes(&gzip_lines(&objs)).unwrap().rows, row_count);
+        }
     }
 
     #[test]
