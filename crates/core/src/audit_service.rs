@@ -34,8 +34,8 @@ use crate::audit::{
 };
 use crate::audit_mirror::{
     find_mirror_in_page, mirror_channel_policy, next_snowflake, page_floor_id,
-    snowflake_at_or_after, AuditMirror, MirrorError, MirrorGate, DEDUP_PAGE_LIMIT,
-    HISTORY_PAGE_LIMIT,
+    snowflake_at_or_after, validate_history_page, AuditMirror, MirrorError, MirrorGate,
+    DEDUP_PAGE_LIMIT, HISTORY_PAGE_LIMIT,
 };
 use crate::audit_store::{
     AuditClaim, AuditStore, AuditStoreError, DeliveryFailure, DeliveryIntent, PrepareSend,
@@ -325,7 +325,12 @@ impl<M: AuditMirror> AuditMirrorService<M> {
                 .mirror
                 .channel_history(&destination, before.as_deref(), HISTORY_PAGE_LIMIT)
                 .await
-            {
+                .and_then(|page| {
+                    // Enforce the contract even for alternate mirror adapters:
+                    // no marker, boundary or floor may use an invalid page.
+                    validate_history_page(&page, before.as_deref(), HISTORY_PAGE_LIMIT)?;
+                    Ok(page)
+                }) {
                 Ok(page) => page,
                 Err(MirrorError::Rejected(_)) => {
                     return self
@@ -517,7 +522,12 @@ impl<M: AuditMirror> AuditMirrorService<M> {
                 .mirror
                 .channel_history(&destination, before.as_deref(), HISTORY_PAGE_LIMIT)
                 .await
-            {
+                .and_then(|page| {
+                    // Enforce the contract even for alternate mirror adapters:
+                    // no marker, boundary or floor may use an invalid page.
+                    validate_history_page(&page, before.as_deref(), HISTORY_PAGE_LIMIT)?;
+                    Ok(page)
+                }) {
                 Ok(page) => page,
                 Err(MirrorError::Rejected(_)) => {
                     // Permission vanished between post and reconcile: terminal.
