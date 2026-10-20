@@ -107,7 +107,8 @@ async function harness(t: TestContext, env: Record<string, unknown>, options: { 
   const seen: Seen[] = [];
   const values = new Map<string, unknown>([[OWNER_KEY, "owner" in options ? options.owner : OWNER]]);
   const listening = new Set<number>();
-  let receiver: (request: Seen) => Response | Promise<Response> = () => Response.json({ ok: true });
+  let receiver: (request: Seen) => Response | Promise<Response> = (request) =>
+    Response.json({ ok: true, request_id: request.headers["x-request-id"] });
   const runtime = {
     running: false,
     async destroy() { this.running = false; },
@@ -467,7 +468,10 @@ test("per-IP bucket returns 429 before the container; the in-flight cap bounds c
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const stalled = {
-    TWO_BOT: { getByName: () => ({ fetch: async () => { await gate; return Response.json({ ok: true }); } }) },
+    TWO_BOT: { getByName: () => ({ fetch: async (request: Request) => {
+      await gate;
+      return Response.json({ ok: true, request_id: request.headers.get("x-request-id") });
+    } }) },
   };
   const env = { ...ENABLED_ENV, ...stalled } as unknown as Env;
   const held = Array.from({ length: MAX_IN_FLIGHT }, () =>
@@ -535,12 +539,15 @@ test("a challenge answer relays as text/plain byte for byte; receiver 4xx verdic
   assert.equal(await challenge.text(), CHALLENGE);
   assert.equal(challenge.headers.get("cache-control"), "no-store");
 
-  // The receiver's own 4xx verdict (bad signature, stale timestamp, wrong
-  // subscription) relays with its status; the Worker adds nothing.
-  h.setReceiver(() => Response.json({ ok: false, error: { code: "bad_signature" } }, { status: 401 }));
+  // The receiver maps bad signatures and stale timestamps to the same
+  // unauthorized refusal; deterministic wrong-subscription deliveries ack.
+  h.setReceiver((request) => Response.json({
+    ok: false, request_id: request.headers["x-request-id"],
+    error: { code: "unauthorized", message: "request refused", retryable: false },
+  }, { status: 401 }));
   const refused = await h.call(post());
   assert.equal(refused.status, 401);
-  assert.deepEqual((await refused.json() as { error: { code: string } }).error.code, "bad_signature");
+  assert.deepEqual((await refused.json() as { error: { code: string } }).error.code, "unauthorized");
   // The drained happy paths settle the SDK proxy pipe.
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(h.bot["inflightRequests"], 0, "drained relays must release the proxy slot");
@@ -594,16 +601,125 @@ test("relay unit: oversize, wrong-media and bodyless answers never leave; envelo
   const bodyless = await relayEventsubResponse(new Response(null, { status: 204 }));
   assert.equal(bodyless.status, 503);
   await bodyless.arrayBuffer();
-  // JSON envelopes relay with status; only a numeric retry-after survives.
-  const denied = await relayEventsubResponse(Response.json({ ok: false, error: { code: "stale_timestamp" } }, { status: 403, headers: { "retry-after": "7" } }));
-  assert.equal(denied.status, 403);
+  // Complete receiver envelopes retain status; only numeric retry-after survives.
+  const sent = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const denied = await relayEventsubResponse(Response.json({
+    ok: false, request_id: sent,
+    error: { code: "unauthorized", message: "request refused", retryable: false },
+  }, { status: 401, headers: { "retry-after": "7" } }), sent);
+  assert.equal(denied.status, 401);
   assert.equal(denied.headers.get("retry-after"), "7");
-  assert.deepEqual((await denied.json() as { error: { code: string } }).error.code, "stale_timestamp");
-  const odd = await relayEventsubResponse(Response.json({ ok: true }, { status: 200, headers: { "retry-after": "7.5", "x-secret": "leak" } }));
+  assert.deepEqual((await denied.json() as { error: { code: string } }).error.code, "unauthorized");
+  const odd = await relayEventsubResponse(Response.json({ ok: true, request_id: sent }, { status: 200, headers: { "retry-after": "7.5", "x-secret": "leak" } }), sent);
   assert.equal(odd.status, 200);
   assert.equal(odd.headers.get("retry-after"), null);
   assert.equal(odd.headers.get("x-secret"), null);
   assert.equal(odd.headers.get("cache-control"), "no-store");
+});
+
+test("relay unit: shutting_down refusals remain retryable and unknown codes fail closed", async () => {
+  const requestId = "00000000000000000000000000";
+  const shuttingDown = await relayEventsubResponse(Response.json({
+    ok: false,
+    request_id: requestId,
+    error: { code: "shutting_down", message: "untrusted detail", retryable: true },
+  }, { status: 503 }), requestId);
+  assert.deepEqual(await shuttingDown.json(), {
+    ok: false,
+    request_id: requestId,
+    error: { code: "shutting_down", message: "request refused", retryable: true },
+  });
+
+  const unknown = await relayEventsubResponse(Response.json({
+    ok: false,
+    request_id: requestId,
+    error: { code: "unknown_receiver_code", message: "untrusted detail", retryable: true },
+  }, { status: 503 }), requestId);
+  assert.equal(unknown.status, 503);
+  assert.deepEqual(await unknown.json(), {
+    ok: false,
+    request_id: requestId,
+    error: { code: "unavailable", message: "request refused", retryable: true },
+  });
+});
+
+test("relay unit: invalid challenge bytes fail closed", async () => {
+  const requestId = "00000000000000000000000000";
+  for (const bytes of [new Uint8Array([0x7f]), new Uint8Array(257).fill(0x61)]) {
+    const response = await relayEventsubResponse(new Response(
+      bytes,
+      { status: 200, headers: { "content-type": "text/plain" } },
+    ), requestId);
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      ok: false,
+      request_id: requestId,
+      error: { code: "unavailable", message: "request refused", retryable: true },
+    });
+  }
+});
+
+test("relay unit: valid acknowledgements project to the correlation envelope", async () => {
+  const requestId = "00000000000000000000000000";
+  const response = await relayEventsubResponse(Response.json({
+    ok: true,
+    request_id: requestId,
+    private: "synthetic-private-receiver-outflow",
+  }), requestId);
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, request_id: requestId });
+});
+
+test("relay unit: mismatched receiver request IDs fail closed", async () => {
+  const requestId = "00000000000000000000000000";
+  const response = await relayEventsubResponse(Response.json({
+    ok: true,
+    request_id: "00000000000000000000000001",
+  }), requestId);
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), {
+    ok: false,
+    request_id: requestId,
+    error: { code: "unavailable", message: "request refused", retryable: true },
+  });
+});
+
+test("relay unit: malformed JSON fails closed without relaying receiver bytes", async () => {
+  const requestId = "00000000000000000000000000";
+  const response = await relayEventsubResponse(new Response(
+    `{"ok":true,"request_id":"${requestId}","private":"synthetic-private-receiver-outflow"}!`,
+    { status: 200, headers: { "content-type": "application/json" } },
+  ), requestId);
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), {
+    ok: false,
+    request_id: requestId,
+    error: { code: "unavailable", message: "request refused", retryable: true },
+  });
+});
+
+test("relay unit: malformed UTF-8 fails closed before JSON projection", async () => {
+  const requestId = "00000000000000000000000000";
+  const prefix = new TextEncoder().encode(`{"ok":true,"request_id":"${requestId}","private":"`);
+  const suffix = new TextEncoder().encode('"}');
+  const bytes = new Uint8Array(prefix.length + 1 + suffix.length);
+  bytes.set(prefix);
+  bytes[prefix.length] = 0xff;
+  bytes.set(suffix, prefix.length + 1);
+  const response = await relayEventsubResponse(new Response(bytes, {
+    status: 200, headers: { "content-type": "application/json" },
+  }), requestId);
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), {
+    ok: false,
+    request_id: requestId,
+    error: { code: "unavailable", message: "request refused", retryable: true },
+  });
 });
 
 test("public ingress never starts the container: a cold instance answers 503 without a receiver call", async (t) => {

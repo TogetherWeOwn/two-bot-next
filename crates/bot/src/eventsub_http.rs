@@ -17,7 +17,7 @@
 use std::{
     future::IntoFuture,
     sync::{Arc, Mutex, RwLock},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -57,7 +57,7 @@ struct ReceiverState {
 
 struct DeliveryTasks {
     accepting: bool,
-    shutdown_started: Option<Instant>,
+    shutdown_started: Option<tokio::time::Instant>,
     failed: bool,
     tasks: tokio::task::JoinSet<()>,
 }
@@ -139,7 +139,7 @@ impl BoundEventsubReceiver {
                 .lock()
                 .expect("EventSub delivery task lock poisoned");
             deliveries.accepting = false;
-            deliveries.shutdown_started = Some(Instant::now());
+            deliveries.shutdown_started = Some(tokio::time::Instant::now());
         };
         let server = axum::serve(self.listener, router(state))
             .with_graceful_shutdown(close_admission)
@@ -154,7 +154,7 @@ impl BoundEventsubReceiver {
                 .expect("EventSub delivery task lock poisoned");
             if state_deliveries.accepting {
                 state_deliveries.accepting = false;
-                state_deliveries.shutdown_started = Some(Instant::now());
+                state_deliveries.shutdown_started = Some(tokio::time::Instant::now());
             }
             DeliveryTasks {
                 accepting: false,
@@ -166,7 +166,7 @@ impl BoundEventsubReceiver {
         let started = deliveries
             .shutdown_started
             .expect("shutdown start recorded");
-        let budget = crate::shutdown::deadline().saturating_sub(started.elapsed());
+        let budget = remaining_shutdown_budget(started, crate::shutdown::deadline());
         match tokio::time::timeout(budget, async {
             let mut failed = deliveries.failed;
             while let Some(result) = deliveries.tasks.join_next().await {
@@ -192,6 +192,10 @@ impl BoundEventsubReceiver {
             }
         }
     }
+}
+
+fn remaining_shutdown_budget(started: tokio::time::Instant, total: Duration) -> Duration {
+    total.saturating_sub(started.elapsed())
 }
 
 fn shutdown_failure(server_result: std::io::Result<()>, reason: &str) -> std::io::Error {
@@ -746,6 +750,133 @@ mod tests {
 
     fn app() -> Router {
         router(Arc::new(ReceiverState::new(&config())))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_join_budget_uses_tokio_elapsed_time() {
+        let started = tokio::time::Instant::now();
+        let total = Duration::from_secs(35);
+        tokio::time::advance(Duration::from_secs(10)).await;
+
+        assert_eq!(
+            remaining_shutdown_budget(started, total),
+            Duration::from_secs(25)
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_admission_refuses_notification_before_claim_or_send() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let ledger = Arc::new(FakeLedger::default());
+        let sender = FakeSender::scripted(vec![]);
+        let state = Arc::new(ReceiverState::with_delivery(
+            &config(),
+            Some(DeliveryDeps {
+                ledger: ledger.clone(),
+                sender: sender.clone(),
+                config: LiveDeliveryConfig {
+                    broadcasters: vec!["123456".to_owned()],
+                    invite_url: "https://discord.gg/example".to_owned(),
+                    channel_id: "777".to_owned(),
+                },
+            }),
+        ));
+        state.deliveries.lock().unwrap().accepting = false;
+
+        let response = router(state)
+            .oneshot(post_notification_request(
+                "synthetic-delivery-shutdown-closed",
+            ))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(value["error"]["code"], "shutting_down");
+        assert!(ledger.rows.lock().unwrap().is_empty());
+        assert!(sender.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delivery_child_panic_is_reported_by_receiver_shutdown() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        struct PanickingLedger;
+        impl LiveLedger for PanickingLedger {
+            fn claim<'a>(&'a self, _claim: &'a LiveClaim) -> LedgerFuture<'a, ClaimOutcome> {
+                Box::pin(async { panic!("synthetic ledger panic") })
+            }
+
+            fn mark_started<'a>(
+                &'a self,
+                _dedup_key: &'a str,
+                _claim_token: &'a str,
+            ) -> LedgerFuture<'a, bool> {
+                Box::pin(async { Ok(false) })
+            }
+
+            fn mark_delivered<'a>(
+                &'a self,
+                _dedup_key: &'a str,
+                _claim_token: &'a str,
+                _message_id: &'a str,
+            ) -> LedgerFuture<'a, bool> {
+                Box::pin(async { Ok(false) })
+            }
+
+            fn release_started<'a>(
+                &'a self,
+                _dedup_key: &'a str,
+                _claim_token: &'a str,
+            ) -> LedgerFuture<'a, bool> {
+                Box::pin(async { Ok(false) })
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = Arc::new(ReceiverState::with_delivery(
+            &config(),
+            Some(DeliveryDeps {
+                ledger: Arc::new(PanickingLedger),
+                sender: FakeSender::scripted(vec![]),
+                config: LiveDeliveryConfig {
+                    broadcasters: vec!["123456".to_owned()],
+                    invite_url: "https://discord.gg/example".to_owned(),
+                    channel_id: "777".to_owned(),
+                },
+            }),
+        ));
+        let response = router(Arc::clone(&state))
+            .oneshot(post_notification_request("synthetic-delivery-panic"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let serving = tokio::spawn(BoundEventsubReceiver { listener, state }.serve(receiver));
+        shutdown.send_replace(true);
+        let error = tokio::time::timeout(Duration::from_secs(2), serving)
+            .await
+            .expect("receiver shutdown must join the panicked child")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.to_string(), "EventSub delivery task failed");
+    }
+
+    fn post_notification_request(message_id: &'static str) -> Request<Body> {
+        let body = notification_body();
+        let timestamp = fresh_timestamp();
+        let signature = sign(message_id, &timestamp, body.as_bytes());
+        request(
+            "POST",
+            EVENTSUB_PATH,
+            Some(message_id),
+            Some(&timestamp),
+            Some(&signature),
+            Some("notification"),
+            body,
+        )
     }
 
     #[test]
