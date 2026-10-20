@@ -1414,7 +1414,10 @@ async fn full_purge_reply_and_audit_metadata_are_byte_identical_to_before() {
         vec![
             ScriptedResponse::json(
                 200,
-                json!([{"id": fresh_message_id(1)}, {"id": fresh_message_id(2)}]),
+                json!([
+                    {"id": fresh_message_id(1), "author": {"bot": false}},
+                    {"id": fresh_message_id(2), "author": {"bot": false}}
+                ]),
             ),
             ScriptedResponse::status(204),
         ],
