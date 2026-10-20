@@ -1,0 +1,371 @@
+# Complete required companion series for the offline slow-burn proof mode.
+# Regenerate from wrangler/test/fixtures/metrics.ts when required inputs change.
+# The three burn counters are supplied by fixture_inputs, not this file.
+two_bot_job_last_success_timestamp_seconds{job="invite_snapshot"} 0
+two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} 0
+two_bot_job_last_success_timestamp_seconds{job="counter"} 0
+two_bot_job_last_success_timestamp_seconds{job="rank"} 0
+two_bot_job_last_success_timestamp_seconds{job="scheduled_events"} 0
+two_bot_job_last_success_timestamp_seconds{job="settings"} 0
+two_bot_job_last_success_timestamp_seconds{job="presence_probe"} 0
+two_bot_job_last_success_timestamp_seconds{job="community_scorecard"} 0
+two_bot_job_last_success_timestamp_seconds{job="inactivity"} 0
+two_bot_job_last_success_timestamp_seconds{job="audit_retry"} 0
+two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} 0
+two_bot_job_last_success_timestamp_seconds{job="feeds"} 0
+two_bot_job_last_success_timestamp_seconds{job="self_role_recovery"} 0
+two_bot_job_last_success_timestamp_seconds{job="member_unban_sweep"} 0
+two_bot_job_last_success_timestamp_seconds{job="automod_expiry"} 0
+two_bot_job_last_success_timestamp_seconds{job="other"} 0
+two_bot_job_consecutive_failures{job="invite_snapshot"} 0
+two_bot_job_consecutive_failures{job="session_checkpoint"} 0
+two_bot_job_consecutive_failures{job="counter"} 0
+two_bot_job_consecutive_failures{job="rank"} 0
+two_bot_job_consecutive_failures{job="scheduled_events"} 0
+two_bot_job_consecutive_failures{job="settings"} 0
+two_bot_job_consecutive_failures{job="presence_probe"} 0
+two_bot_job_consecutive_failures{job="community_scorecard"} 0
+two_bot_job_consecutive_failures{job="inactivity"} 0
+two_bot_job_consecutive_failures{job="audit_retry"} 0
+two_bot_job_consecutive_failures{job="scheduled_messages"} 0
+two_bot_job_consecutive_failures{job="feeds"} 0
+two_bot_job_consecutive_failures{job="self_role_recovery"} 0
+two_bot_job_consecutive_failures{job="member_unban_sweep"} 0
+two_bot_job_consecutive_failures{job="automod_expiry"} 0
+two_bot_job_consecutive_failures{job="other"} 0
+two_bot_rest_requests_total{route="GET /channels/:channel",result="2xx"} 0
+two_bot_rest_requests_total{route="GET /channels/:channel",result="3xx"} 0
+two_bot_rest_requests_total{route="GET /channels/:channel",result="4xx"} 0
+two_bot_rest_requests_total{route="GET /channels/:channel",result="429"} 0
+two_bot_rest_requests_total{route="GET /channels/:channel",result="5xx"} 0
+two_bot_rest_requests_total{route="GET /channels/:channel",result="transport"} 0
+two_bot_rest_requests_total{route="GET /channels/:channel/messages",result="2xx"} 0
+two_bot_rest_requests_total{route="GET /channels/:channel/messages",result="3xx"} 0
+two_bot_rest_requests_total{route="GET /channels/:channel/messages",result="4xx"} 0
+two_bot_rest_requests_total{route="GET /channels/:channel/messages",result="429"} 0
+two_bot_rest_requests_total{route="GET /channels/:channel/messages",result="5xx"} 0
+two_bot_rest_requests_total{route="GET /channels/:channel/messages",result="transport"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild",result="2xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild",result="3xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild",result="4xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild",result="429"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild",result="5xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild",result="transport"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/members",result="2xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/members",result="3xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/members",result="4xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/members",result="429"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/members",result="5xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/members",result="transport"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/scheduled-events",result="2xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/scheduled-events",result="3xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/scheduled-events",result="4xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/scheduled-events",result="429"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/scheduled-events",result="5xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/scheduled-events",result="transport"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/bans/:member",result="2xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/bans/:member",result="3xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/bans/:member",result="4xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/bans/:member",result="429"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/bans/:member",result="5xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/bans/:member",result="transport"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel/permissions/:overwrite",result="2xx"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel/permissions/:overwrite",result="3xx"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel/permissions/:overwrite",result="4xx"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel/permissions/:overwrite",result="429"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel/permissions/:overwrite",result="5xx"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel/permissions/:overwrite",result="transport"} 0
+two_bot_rest_requests_total{route="PUT /applications/:application/commands",result="2xx"} 0
+two_bot_rest_requests_total{route="PUT /applications/:application/commands",result="3xx"} 0
+two_bot_rest_requests_total{route="PUT /applications/:application/commands",result="4xx"} 0
+two_bot_rest_requests_total{route="PUT /applications/:application/commands",result="429"} 0
+two_bot_rest_requests_total{route="PUT /applications/:application/commands",result="5xx"} 0
+two_bot_rest_requests_total{route="PUT /applications/:application/commands",result="transport"} 0
+two_bot_rest_requests_total{route="PUT /applications/:application/guilds/:guild/commands",result="2xx"} 0
+two_bot_rest_requests_total{route="PUT /applications/:application/guilds/:guild/commands",result="3xx"} 0
+two_bot_rest_requests_total{route="PUT /applications/:application/guilds/:guild/commands",result="4xx"} 0
+two_bot_rest_requests_total{route="PUT /applications/:application/guilds/:guild/commands",result="429"} 0
+two_bot_rest_requests_total{route="PUT /applications/:application/guilds/:guild/commands",result="5xx"} 0
+two_bot_rest_requests_total{route="PUT /applications/:application/guilds/:guild/commands",result="transport"} 0
+two_bot_rest_requests_total{route="POST /interactions/:interaction/:token/callback",result="2xx"} 0
+two_bot_rest_requests_total{route="POST /interactions/:interaction/:token/callback",result="3xx"} 0
+two_bot_rest_requests_total{route="POST /interactions/:interaction/:token/callback",result="4xx"} 0
+two_bot_rest_requests_total{route="POST /interactions/:interaction/:token/callback",result="429"} 0
+two_bot_rest_requests_total{route="POST /interactions/:interaction/:token/callback",result="5xx"} 0
+two_bot_rest_requests_total{route="POST /interactions/:interaction/:token/callback",result="transport"} 0
+two_bot_rest_requests_total{route="POST /channels/:channel/messages",result="2xx"} 0
+two_bot_rest_requests_total{route="POST /channels/:channel/messages",result="3xx"} 0
+two_bot_rest_requests_total{route="POST /channels/:channel/messages",result="4xx"} 0
+two_bot_rest_requests_total{route="POST /channels/:channel/messages",result="429"} 0
+two_bot_rest_requests_total{route="POST /channels/:channel/messages",result="5xx"} 0
+two_bot_rest_requests_total{route="POST /channels/:channel/messages",result="transport"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel/messages/:message",result="2xx"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel/messages/:message",result="3xx"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel/messages/:message",result="4xx"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel/messages/:message",result="429"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel/messages/:message",result="5xx"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel/messages/:message",result="transport"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/members/:member",result="2xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/members/:member",result="3xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/members/:member",result="4xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/members/:member",result="429"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/members/:member",result="5xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/members/:member",result="transport"} 0
+two_bot_rest_requests_total{route="PUT /guilds/:guild/bans/:member",result="2xx"} 0
+two_bot_rest_requests_total{route="PUT /guilds/:guild/bans/:member",result="3xx"} 0
+two_bot_rest_requests_total{route="PUT /guilds/:guild/bans/:member",result="4xx"} 0
+two_bot_rest_requests_total{route="PUT /guilds/:guild/bans/:member",result="429"} 0
+two_bot_rest_requests_total{route="PUT /guilds/:guild/bans/:member",result="5xx"} 0
+two_bot_rest_requests_total{route="PUT /guilds/:guild/bans/:member",result="transport"} 0
+two_bot_rest_requests_total{route="PATCH /guilds/:guild/members/:member",result="2xx"} 0
+two_bot_rest_requests_total{route="PATCH /guilds/:guild/members/:member",result="3xx"} 0
+two_bot_rest_requests_total{route="PATCH /guilds/:guild/members/:member",result="4xx"} 0
+two_bot_rest_requests_total{route="PATCH /guilds/:guild/members/:member",result="429"} 0
+two_bot_rest_requests_total{route="PATCH /guilds/:guild/members/:member",result="5xx"} 0
+two_bot_rest_requests_total{route="PATCH /guilds/:guild/members/:member",result="transport"} 0
+two_bot_rest_requests_total{route="PATCH /channels/:channel",result="2xx"} 0
+two_bot_rest_requests_total{route="PATCH /channels/:channel",result="3xx"} 0
+two_bot_rest_requests_total{route="PATCH /channels/:channel",result="4xx"} 0
+two_bot_rest_requests_total{route="PATCH /channels/:channel",result="429"} 0
+two_bot_rest_requests_total{route="PATCH /channels/:channel",result="5xx"} 0
+two_bot_rest_requests_total{route="PATCH /channels/:channel",result="transport"} 0
+two_bot_rest_requests_total{route="PUT /channels/:channel/voice-status",result="2xx"} 0
+two_bot_rest_requests_total{route="PUT /channels/:channel/voice-status",result="3xx"} 0
+two_bot_rest_requests_total{route="PUT /channels/:channel/voice-status",result="4xx"} 0
+two_bot_rest_requests_total{route="PUT /channels/:channel/voice-status",result="429"} 0
+two_bot_rest_requests_total{route="PUT /channels/:channel/voice-status",result="5xx"} 0
+two_bot_rest_requests_total{route="PUT /channels/:channel/voice-status",result="transport"} 0
+two_bot_rest_requests_total{route="PUT /channels/:channel/permissions/:overwrite",result="2xx"} 0
+two_bot_rest_requests_total{route="PUT /channels/:channel/permissions/:overwrite",result="3xx"} 0
+two_bot_rest_requests_total{route="PUT /channels/:channel/permissions/:overwrite",result="4xx"} 0
+two_bot_rest_requests_total{route="PUT /channels/:channel/permissions/:overwrite",result="429"} 0
+two_bot_rest_requests_total{route="PUT /channels/:channel/permissions/:overwrite",result="5xx"} 0
+two_bot_rest_requests_total{route="PUT /channels/:channel/permissions/:overwrite",result="transport"} 0
+two_bot_rest_requests_total{route="POST /channels/:channel/messages/bulk-delete",result="2xx"} 0
+two_bot_rest_requests_total{route="POST /channels/:channel/messages/bulk-delete",result="3xx"} 0
+two_bot_rest_requests_total{route="POST /channels/:channel/messages/bulk-delete",result="4xx"} 0
+two_bot_rest_requests_total{route="POST /channels/:channel/messages/bulk-delete",result="429"} 0
+two_bot_rest_requests_total{route="POST /channels/:channel/messages/bulk-delete",result="5xx"} 0
+two_bot_rest_requests_total{route="POST /channels/:channel/messages/bulk-delete",result="transport"} 0
+two_bot_rest_requests_total{route="PUT /guilds/:guild/members/:member/roles/:role",result="2xx"} 0
+two_bot_rest_requests_total{route="PUT /guilds/:guild/members/:member/roles/:role",result="3xx"} 0
+two_bot_rest_requests_total{route="PUT /guilds/:guild/members/:member/roles/:role",result="4xx"} 0
+two_bot_rest_requests_total{route="PUT /guilds/:guild/members/:member/roles/:role",result="429"} 0
+two_bot_rest_requests_total{route="PUT /guilds/:guild/members/:member/roles/:role",result="5xx"} 0
+two_bot_rest_requests_total{route="PUT /guilds/:guild/members/:member/roles/:role",result="transport"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/members/:member/roles/:role",result="2xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/members/:member/roles/:role",result="3xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/members/:member/roles/:role",result="4xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/members/:member/roles/:role",result="429"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/members/:member/roles/:role",result="5xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/members/:member/roles/:role",result="transport"} 0
+two_bot_rest_requests_total{route="POST /guilds/:guild/scheduled-events",result="2xx"} 0
+two_bot_rest_requests_total{route="POST /guilds/:guild/scheduled-events",result="3xx"} 0
+two_bot_rest_requests_total{route="POST /guilds/:guild/scheduled-events",result="4xx"} 0
+two_bot_rest_requests_total{route="POST /guilds/:guild/scheduled-events",result="429"} 0
+two_bot_rest_requests_total{route="POST /guilds/:guild/scheduled-events",result="5xx"} 0
+two_bot_rest_requests_total{route="POST /guilds/:guild/scheduled-events",result="transport"} 0
+two_bot_rest_requests_total{route="PATCH /guilds/:guild/scheduled-events/:event",result="2xx"} 0
+two_bot_rest_requests_total{route="PATCH /guilds/:guild/scheduled-events/:event",result="3xx"} 0
+two_bot_rest_requests_total{route="PATCH /guilds/:guild/scheduled-events/:event",result="4xx"} 0
+two_bot_rest_requests_total{route="PATCH /guilds/:guild/scheduled-events/:event",result="429"} 0
+two_bot_rest_requests_total{route="PATCH /guilds/:guild/scheduled-events/:event",result="5xx"} 0
+two_bot_rest_requests_total{route="PATCH /guilds/:guild/scheduled-events/:event",result="transport"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/scheduled-events/:event",result="2xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/scheduled-events/:event",result="3xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/scheduled-events/:event",result="4xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/scheduled-events/:event",result="429"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/scheduled-events/:event",result="5xx"} 0
+two_bot_rest_requests_total{route="DELETE /guilds/:guild/scheduled-events/:event",result="transport"} 0
+two_bot_rest_requests_total{route="POST /guilds/:guild/channels",result="2xx"} 0
+two_bot_rest_requests_total{route="POST /guilds/:guild/channels",result="3xx"} 0
+two_bot_rest_requests_total{route="POST /guilds/:guild/channels",result="4xx"} 0
+two_bot_rest_requests_total{route="POST /guilds/:guild/channels",result="429"} 0
+two_bot_rest_requests_total{route="POST /guilds/:guild/channels",result="5xx"} 0
+two_bot_rest_requests_total{route="POST /guilds/:guild/channels",result="transport"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel",result="2xx"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel",result="3xx"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel",result="4xx"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel",result="429"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel",result="5xx"} 0
+two_bot_rest_requests_total{route="DELETE /channels/:channel",result="transport"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/members/:member",result="2xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/members/:member",result="3xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/members/:member",result="4xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/members/:member",result="429"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/members/:member",result="5xx"} 0
+two_bot_rest_requests_total{route="GET /guilds/:guild/members/:member",result="transport"} 0
+two_bot_rest_requests_total{route="GET /users/@me",result="2xx"} 0
+two_bot_rest_requests_total{route="GET /users/@me",result="3xx"} 0
+two_bot_rest_requests_total{route="GET /users/@me",result="4xx"} 0
+two_bot_rest_requests_total{route="GET /users/@me",result="429"} 0
+two_bot_rest_requests_total{route="GET /users/@me",result="5xx"} 0
+two_bot_rest_requests_total{route="GET /users/@me",result="transport"} 0
+two_bot_rest_requests_total{route="PATCH /webhooks/:application/:token/messages/@original",result="2xx"} 0
+two_bot_rest_requests_total{route="PATCH /webhooks/:application/:token/messages/@original",result="3xx"} 0
+two_bot_rest_requests_total{route="PATCH /webhooks/:application/:token/messages/@original",result="4xx"} 0
+two_bot_rest_requests_total{route="PATCH /webhooks/:application/:token/messages/@original",result="429"} 0
+two_bot_rest_requests_total{route="PATCH /webhooks/:application/:token/messages/@original",result="5xx"} 0
+two_bot_rest_requests_total{route="PATCH /webhooks/:application/:token/messages/@original",result="transport"} 0
+two_bot_rest_requests_total{route="other",result="2xx"} 0
+two_bot_rest_requests_total{route="other",result="3xx"} 0
+two_bot_rest_requests_total{route="other",result="4xx"} 0
+two_bot_rest_requests_total{route="other",result="429"} 0
+two_bot_rest_requests_total{route="other",result="5xx"} 0
+two_bot_rest_requests_total{route="other",result="transport"} 0
+two_bot_db_pool_configured 0
+two_bot_db_pool_connections 0
+two_bot_db_pool_idle_connections 0
+two_bot_db_pool_max_connections 0
+two_bot_db_errors_total{op="admission"} 0
+two_bot_db_errors_total{op="other"} 0
+two_bot_send_admissions_total{outcome="admitted"} 0
+two_bot_send_admissions_total{outcome="blocked"} 0
+two_bot_send_admissions_total{outcome="storage_error"} 0
+two_bot_send_admissions_total{outcome="other"} 0
+two_bot_voice_operations_total{op="create",outcome="success"} 0
+two_bot_voice_operations_total{op="create",outcome="category_full"} 0
+two_bot_voice_operations_total{op="create",outcome="discord"} 0
+two_bot_voice_operations_total{op="create",outcome="persistence"} 0
+two_bot_voice_operations_total{op="create",outcome="refused"} 0
+two_bot_voice_operations_total{op="create",outcome="cancelled"} 0
+two_bot_voice_operations_total{op="move",outcome="success"} 0
+two_bot_voice_operations_total{op="move",outcome="category_full"} 0
+two_bot_voice_operations_total{op="move",outcome="discord"} 0
+two_bot_voice_operations_total{op="move",outcome="persistence"} 0
+two_bot_voice_operations_total{op="move",outcome="refused"} 0
+two_bot_voice_operations_total{op="move",outcome="cancelled"} 0
+two_bot_voice_operations_total{op="delete",outcome="success"} 0
+two_bot_voice_operations_total{op="delete",outcome="category_full"} 0
+two_bot_voice_operations_total{op="delete",outcome="discord"} 0
+two_bot_voice_operations_total{op="delete",outcome="persistence"} 0
+two_bot_voice_operations_total{op="delete",outcome="refused"} 0
+two_bot_voice_operations_total{op="delete",outcome="cancelled"} 0
+two_bot_voice_dead_letters_total{action="create"} 0
+two_bot_voice_dead_letters_total{action="move"} 0
+two_bot_voice_dead_letters_total{action="delete"} 0
+two_bot_voice_dead_letters_total{action="companion"} 0
+two_bot_voice_dead_letters_total{action="ownership"} 0
+two_bot_voice_dead_letters_total{action="kick"} 0
+two_bot_voice_dead_letters_total{action="rename"} 0
+two_bot_voice_dead_letters_total{action="limit"} 0
+two_bot_voice_dead_letters_total{action="other"} 0
+two_bot_voice_orphans_total 0
+two_bot_voice_join_refused_total{reason="halted"} 0
+two_bot_voice_join_refused_total{reason="access"} 0
+two_bot_voice_join_refused_total{reason="unknown_creator"} 0
+two_bot_voice_join_refused_total{reason="stale_ticket"} 0
+two_bot_voice_join_refused_total{reason="name_blocked"} 0
+two_bot_voice_join_refused_total{reason="other"} 0
+two_bot_voice_join_to_move_seconds_bucket{le="0.001"} 0
+two_bot_voice_join_to_move_seconds_bucket{le="0.005"} 0
+two_bot_voice_join_to_move_seconds_bucket{le="0.01"} 0
+two_bot_voice_join_to_move_seconds_bucket{le="0.05"} 0
+two_bot_voice_join_to_move_seconds_bucket{le="0.1"} 0
+two_bot_voice_join_to_move_seconds_bucket{le="0.5"} 0
+two_bot_voice_join_to_move_seconds_bucket{le="1"} 0
+two_bot_voice_join_to_move_seconds_bucket{le="+Inf"} 0
+two_bot_gateway_missed_events_total 0
+two_bot_gateway_disconnects_total 0
+two_bot_gateway_resumes_total 0
+two_bot_gateway_events_total{event="READY"} 0
+two_bot_gateway_events_total{event="RESUMED"} 0
+two_bot_gateway_events_total{event="GUILD_CREATE"} 0
+two_bot_gateway_events_total{event="GUILD_DELETE"} 0
+two_bot_gateway_events_total{event="GUILD_UPDATE"} 0
+two_bot_gateway_events_total{event="GUILD_MEMBER_ADD"} 0
+two_bot_gateway_events_total{event="GUILD_MEMBER_REMOVE"} 0
+two_bot_gateway_events_total{event="GUILD_MEMBER_UPDATE"} 0
+two_bot_gateway_events_total{event="MESSAGE_CREATE"} 0
+two_bot_gateway_events_total{event="MESSAGE_UPDATE"} 0
+two_bot_gateway_events_total{event="MESSAGE_DELETE"} 0
+two_bot_gateway_events_total{event="MESSAGE_REACTION_ADD"} 0
+two_bot_gateway_events_total{event="MESSAGE_REACTION_REMOVE"} 0
+two_bot_gateway_events_total{event="VOICE_STATE_UPDATE"} 0
+two_bot_gateway_events_total{event="PRESENCE_UPDATE"} 0
+two_bot_gateway_events_total{event="INVITE_CREATE"} 0
+two_bot_gateway_events_total{event="INVITE_DELETE"} 0
+two_bot_gateway_events_total{event="INTERACTION_CREATE"} 0
+two_bot_gateway_events_total{event="HEARTBEAT_ACK"} 0
+two_bot_gateway_events_total{event="GATEWAY_CLOSE"} 0
+two_bot_gateway_events_total{event="other"} 0
+two_bot_gateway_checkpoint_failures_total{stage="pre_commit"} 0
+two_bot_gateway_checkpoint_failures_total{stage="commit"} 0
+two_bot_dispatch_drops_total{lane="messages"} 0
+two_bot_dispatch_drops_total{lane="interactions"} 0
+two_bot_dispatch_drops_total{lane="registry"} 0
+two_bot_dispatch_drops_total{lane="privileged"} 0
+two_bot_dispatch_drops_total{lane="busy"} 0
+two_bot_dispatch_drops_total{lane="reactions"} 0
+two_bot_internal_actions_total{family="announcement",outcome="executed"} 0
+two_bot_internal_actions_total{family="announcement",outcome="auth_failure"} 0
+two_bot_internal_actions_total{family="announcement",outcome="unknown_key"} 0
+two_bot_internal_actions_total{family="announcement",outcome="clock_skew"} 0
+two_bot_internal_actions_total{family="announcement",outcome="nonce_replay"} 0
+two_bot_internal_actions_total{family="announcement",outcome="rate_limit"} 0
+two_bot_internal_actions_total{family="announcement",outcome="unknown_action"} 0
+two_bot_internal_actions_total{family="announcement",outcome="action_disabled"} 0
+two_bot_internal_actions_total{family="announcement",outcome="malformed_body"} 0
+two_bot_internal_actions_total{family="announcement",outcome="conflict"} 0
+two_bot_internal_actions_total{family="announcement",outcome="upstream"} 0
+two_bot_internal_actions_total{family="announcement",outcome="internal"} 0
+two_bot_internal_actions_total{family="event",outcome="executed"} 0
+two_bot_internal_actions_total{family="event",outcome="auth_failure"} 0
+two_bot_internal_actions_total{family="event",outcome="unknown_key"} 0
+two_bot_internal_actions_total{family="event",outcome="clock_skew"} 0
+two_bot_internal_actions_total{family="event",outcome="nonce_replay"} 0
+two_bot_internal_actions_total{family="event",outcome="rate_limit"} 0
+two_bot_internal_actions_total{family="event",outcome="unknown_action"} 0
+two_bot_internal_actions_total{family="event",outcome="action_disabled"} 0
+two_bot_internal_actions_total{family="event",outcome="malformed_body"} 0
+two_bot_internal_actions_total{family="event",outcome="conflict"} 0
+two_bot_internal_actions_total{family="event",outcome="upstream"} 0
+two_bot_internal_actions_total{family="event",outcome="internal"} 0
+two_bot_internal_actions_total{family="settings",outcome="executed"} 0
+two_bot_internal_actions_total{family="settings",outcome="auth_failure"} 0
+two_bot_internal_actions_total{family="settings",outcome="unknown_key"} 0
+two_bot_internal_actions_total{family="settings",outcome="clock_skew"} 0
+two_bot_internal_actions_total{family="settings",outcome="nonce_replay"} 0
+two_bot_internal_actions_total{family="settings",outcome="rate_limit"} 0
+two_bot_internal_actions_total{family="settings",outcome="unknown_action"} 0
+two_bot_internal_actions_total{family="settings",outcome="action_disabled"} 0
+two_bot_internal_actions_total{family="settings",outcome="malformed_body"} 0
+two_bot_internal_actions_total{family="settings",outcome="conflict"} 0
+two_bot_internal_actions_total{family="settings",outcome="upstream"} 0
+two_bot_internal_actions_total{family="settings",outcome="internal"} 0
+two_bot_internal_actions_total{family="moderation",outcome="executed"} 0
+two_bot_internal_actions_total{family="moderation",outcome="auth_failure"} 0
+two_bot_internal_actions_total{family="moderation",outcome="unknown_key"} 0
+two_bot_internal_actions_total{family="moderation",outcome="clock_skew"} 0
+two_bot_internal_actions_total{family="moderation",outcome="nonce_replay"} 0
+two_bot_internal_actions_total{family="moderation",outcome="rate_limit"} 0
+two_bot_internal_actions_total{family="moderation",outcome="unknown_action"} 0
+two_bot_internal_actions_total{family="moderation",outcome="action_disabled"} 0
+two_bot_internal_actions_total{family="moderation",outcome="malformed_body"} 0
+two_bot_internal_actions_total{family="moderation",outcome="conflict"} 0
+two_bot_internal_actions_total{family="moderation",outcome="upstream"} 0
+two_bot_internal_actions_total{family="moderation",outcome="internal"} 0
+two_bot_internal_actions_total{family="membership",outcome="executed"} 0
+two_bot_internal_actions_total{family="membership",outcome="auth_failure"} 0
+two_bot_internal_actions_total{family="membership",outcome="unknown_key"} 0
+two_bot_internal_actions_total{family="membership",outcome="clock_skew"} 0
+two_bot_internal_actions_total{family="membership",outcome="nonce_replay"} 0
+two_bot_internal_actions_total{family="membership",outcome="rate_limit"} 0
+two_bot_internal_actions_total{family="membership",outcome="unknown_action"} 0
+two_bot_internal_actions_total{family="membership",outcome="action_disabled"} 0
+two_bot_internal_actions_total{family="membership",outcome="malformed_body"} 0
+two_bot_internal_actions_total{family="membership",outcome="conflict"} 0
+two_bot_internal_actions_total{family="membership",outcome="upstream"} 0
+two_bot_internal_actions_total{family="membership",outcome="internal"} 0
+two_bot_internal_actions_total{family="other",outcome="executed"} 0
+two_bot_internal_actions_total{family="other",outcome="auth_failure"} 0
+two_bot_internal_actions_total{family="other",outcome="unknown_key"} 0
+two_bot_internal_actions_total{family="other",outcome="clock_skew"} 0
+two_bot_internal_actions_total{family="other",outcome="nonce_replay"} 0
+two_bot_internal_actions_total{family="other",outcome="rate_limit"} 0
+two_bot_internal_actions_total{family="other",outcome="unknown_action"} 0
+two_bot_internal_actions_total{family="other",outcome="action_disabled"} 0
+two_bot_internal_actions_total{family="other",outcome="malformed_body"} 0
+two_bot_internal_actions_total{family="other",outcome="conflict"} 0
+two_bot_internal_actions_total{family="other",outcome="upstream"} 0
+two_bot_internal_actions_total{family="other",outcome="internal"} 0
