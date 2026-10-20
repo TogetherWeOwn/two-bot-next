@@ -2033,6 +2033,13 @@ pub async fn build_voice_runtime(
     }
 }
 
+// Duplicate-key refusal acceptance (paired Test Author file; test-only,
+// production unchanged). Child module so the tests can reach the private
+// frame structs. The builder must preserve this wiring.
+#[cfg(test)]
+#[path = "gateway_duplicate_key_acceptance_tests.rs"]
+mod gateway_duplicate_key_acceptance_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

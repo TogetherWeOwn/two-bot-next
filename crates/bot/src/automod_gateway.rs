@@ -346,3 +346,9 @@ pub(crate) fn expiry_job(slot: Slot) -> Job {
 #[cfg(test)]
 #[path = "automod_gateway_tests.rs"]
 mod tests;
+
+// Duplicate-key refusal acceptance (paired Test Author file; test-only,
+// production unchanged). The builder must preserve this wiring.
+#[cfg(test)]
+#[path = "automod_gateway_duplicate_key_acceptance_tests.rs"]
+mod duplicate_key_acceptance_tests;
