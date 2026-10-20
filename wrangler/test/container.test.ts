@@ -362,7 +362,13 @@ test("lifecycle error replaces arbitrary exception without inspecting it", async
   const h = await harness(t);
   const unsafe = { toString() { throw new Error(WORKER_ENV.DISCORD_TOKEN); } };
   assert.throws(() => h.bot.onError(unsafe), { message: "container_lifecycle_failed" });
-  assert.ok(h.logs.includes(JSON.stringify({ event: "container_error", error_class: "container_lifecycle_failed" })));
+  assert.ok(h.logs.includes(JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })));
   assert.ok(h.logs.every((line) => !line.includes(WORKER_ENV.DISCORD_TOKEN)));
 });
 
@@ -535,6 +541,8 @@ async function keepaliveSeeing(t: TestContext, body: string) {
 
 const gatewayFailureLogs = (logs: string[]) =>
   logs.filter((line) => line.includes("container_gateway_failure"));
+const containerErrorLogs = (logs: string[]) =>
+  logs.filter((line) => line.includes('"container_error"'));
 
 test("keepalive logs the gateway failure phase and class once, as strict tokens", async (t) => {
   const failure = { phase: "durable_gateway", class: "checkpoint_load_failed" };
@@ -654,6 +662,65 @@ test("keepalive tags the gateway failure with the container release and worker v
     release: RELEASE_SHA,
     worker_version: ID,
     log_url: "https://developers.cloudflare.com/workers/observability/logs/workers-logs/",
+  })]);
+});
+
+test("container_error stamps the parsed release once a probe has seen it", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: RELEASE_SHA, build_id: "123-1" },
+  ));
+  assert.throws(() => h.bot.onError(new Error("synthetic lifecycle failure")),
+    { message: "container_lifecycle_failed" });
+  assert.deepEqual(containerErrorLogs(h.logs), [JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: RELEASE_SHA,
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })]);
+});
+
+test("container_error after a container stop stamps unknown, not the previous release", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: RELEASE_SHA, build_id: "123-1" },
+  ));
+  // The old image stops; the replacement is unprobed when its startup fails.
+  h.bot.onStop();
+  assert.throws(() => h.bot.onError(new Error("synthetic restart failure")),
+    { message: "container_lifecycle_failed" });
+  assert.deepEqual(containerErrorLogs(h.logs), [JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
+  })]);
+});
+
+test("container_error during a probe fetch stamps unknown, not the previous release", async (t) => {
+  const h = await keepaliveSeeing(t, readyzWith(
+    { phase: "durable_gateway", class: "checkpoint_load_failed" },
+    { build_revision: RELEASE_SHA, build_id: "123-1" },
+  ));
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") return new Response(metricsBody(0));
+    // The SDK awaits onError from startup/port checks inside containerFetch
+    // (SDK 0.3.7 waitForPort), before the fetch settles; handler errors are
+    // ignored and the original failure propagates.
+    try { h.bot.onError(new Error("synthetic startup failure")); }
+    catch { /* SDK ignores onError handler errors */ }
+    throw new Error("synthetic probe fetch failure");
+  });
+  await tickKeepalive(h.bot);
+  assert.deepEqual(containerErrorLogs(h.logs), [JSON.stringify({
+    event: "container_error",
+    error_class: "container_lifecycle_failed",
+    release: "unknown",
+    worker_version: ID,
+    log_url: LOG_QUERY_URL,
   })]);
 });
 
@@ -1752,6 +1819,132 @@ for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) 
   });
 }
 
+for (const failure of ["missing", "invalid", "fetch"] as const) {
+  for (const forwarding of ["on", "off"] as const) {
+    test(`DO breaker ticket interrupts ${failure} samples with forwarding ${forwarding}`, async (t) => {
+      const h = await alertHarness(t, { ...ALERT_ENV, OPS_ALERT_FORWARDING: forwarding });
+      const gauge = "two_bot_rest_guard_breaker_open";
+      const rule = "rest_admission_breaker_open";
+      let open = 1;
+      let failed = false;
+      t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+        const path = new URL(typeof input === "string" ? input : input.url).pathname;
+        if (path !== "/metrics") return new Response(null, { status: 200 });
+        if (failed && failure === "fetch") throw new Error("synthetic metrics transport failure");
+        const row = failed ? (failure === "missing" ? "" : `${gauge} 2`) : `${gauge} ${open}`;
+        return new Response(metricsBody().replace(`${gauge} 0`, row));
+      });
+      const state = () => h.values.get("two-bot:metrics-alerts") as MetricsAlertState;
+      const transitions = () => h.events().filter((event) => event.event === "metrics_alert");
+      await h.tick();
+      await h.tick();
+      assert.equal(state().breakerOpenStreak, 2);
+      assert.equal(transitions().length, 0);
+      failed = true;
+      await h.tick();
+      assert.equal(state().breakerOpenStreak, 0, "a gap invalidates the persisted two-open streak");
+      assert.deepEqual(state().firing, []);
+      failed = false;
+      for (const streak of [1, 2]) {
+        await h.tick();
+        assert.equal(state().breakerOpenStreak, streak);
+        assert.equal(transitions().length, 0, "a fresh streak needs three valid open samples");
+      }
+      await h.tick();
+      await h.tick();
+      assert.equal(state().breakerOpenStreak, 3);
+      assert.deepEqual(state().firing, [rule]);
+      assert.equal(transitions().length, 1, "sustained opening notifies once");
+      assert.match(transitions()[0].content, /ALERT rest_admission_breaker_open \(ticket\):/);
+      failed = true;
+      await h.tick();
+      assert.equal(state().breakerOpenStreak, 0);
+      assert.deepEqual(state().firing, [rule], "missing evidence cannot resolve an existing ticket");
+      failed = false;
+      await h.tick();
+      assert.equal(transitions().length, 1, "open after a gap neither resolves nor re-alerts");
+      open = 0;
+      await h.tick();
+      await h.tick();
+      assert.deepEqual(state().firing, []);
+      assert.equal(transitions().length, 2, "only a valid closed sample recovers once");
+      assert.match(transitions()[1].content, /RESOLVED rest_admission_breaker_open\./);
+      assert.equal(h.posts.length, forwarding === "on" ? 2 : 0);
+    });
+  }
+}
+
+for (const forwarding of ["on", "off"] as const) {
+  for (const gap of ["http", "fetch", "body", "missing", "invalid", "unreadable"] as const) {
+    test(`DO audit halt (${forwarding} forwarding) holds across ${gap} and reconstructs without duplicate tickets`, async (t) => {
+      const env = { ...ALERT_ENV, OPS_ALERT_FORWARDING: forwarding };
+      const first = await alertHarness(t, env);
+      let value = 1;
+      let failed = false;
+      const mockMetrics = (h: typeof first) => t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+        const path = new URL(typeof input === "string" ? input : input.url).pathname;
+        if (path !== "/metrics") return new Response(null, { status: 200 });
+        if (failed && gap === "fetch") throw new Error("synthetic scrape failure");
+        if (failed && gap === "http") return new Response(null, { status: 503 });
+        if (failed && gap === "body") return new Response(new ReadableStream({ start(controller) {
+          controller.error(new Error("synthetic body failure"));
+        } }));
+        let body = metricsBody().replace("two_bot_audit_delivery_halt 0", `two_bot_audit_delivery_halt ${value}`).replace(
+          'two_bot_job_last_success_timestamp_seconds{job="audit_retry"} 0',
+          `two_bot_job_last_success_timestamp_seconds{job="audit_retry"} ${Math.floor(Date.now() / 1000)}`,
+        );
+        if (failed && gap === "missing") body = body.split("\n").filter((line) => !line.startsWith("two_bot_audit_delivery_halt")).join("\n");
+        if (failed && gap === "invalid") body = body.replace(`two_bot_audit_delivery_halt ${value}`, "two_bot_audit_delivery_halt 2");
+        if (failed && gap === "unreadable") body = body.replace(
+          'two_bot_job_consecutive_failures{job="audit_retry"} 0',
+          'two_bot_job_consecutive_failures{job="audit_retry"} 1',
+        );
+        return new Response(body);
+      });
+      const stored = (h: typeof first) => h.values.get("two-bot:metrics-alerts");
+      const messages = (h: typeof first) => h.events().filter((e) => e.event === "metrics_alert").map((e) => e.content);
+      mockMetrics(first);
+      await first.tick();
+      await first.tick();
+      failed = true;
+      await first.tick();
+      assert.deepEqual(stored(first)?.firing, []);
+      assert.equal(stored(first)?.auditHaltStreak, 0, "gap interrupts pending engagement");
+      failed = false;
+      await first.tick();
+      await first.tick();
+      assert.deepEqual(messages(first), []);
+      // Simulated eviction: the third valid sample continues only persisted state.
+      const rebuilt = await alertHarness(t, env, first.values);
+      mockMetrics(rebuilt);
+      await rebuilt.tick();
+      assert.deepEqual(stored(rebuilt)?.firing, ["audit_delivery_halt"]);
+      assert.equal(messages(rebuilt).length, 1);
+      assert.match(messages(rebuilt)[0], /ALERT audit_delivery_halt \(ticket\):/);
+      assert.equal(rebuilt.posts.length, forwarding === "on" ? 1 : 0);
+      failed = true;
+      value = 0;
+      await rebuilt.tick();
+      assert.deepEqual(stored(rebuilt)?.firing, ["audit_delivery_halt"], "failure is not a recovery");
+      assert.equal(messages(rebuilt).length, 1);
+      // Reconstruct an active ticket too: steady engagement must not notify again.
+      const active = await alertHarness(t, env, rebuilt.values);
+      mockMetrics(active);
+      failed = false;
+      value = 1;
+      await active.tick();
+      assert.deepEqual(messages(active), []);
+      value = 0;
+      await active.tick();
+      await active.tick();
+      assert.deepEqual(stored(active)?.firing, []);
+      assert.equal(messages(active).length, 1);
+      assert.match(messages(active)[0], /RESOLVED audit_delivery_halt\./);
+      assert.equal(active.posts.length, forwarding === "on" ? 1 : 0);
+    });
+  }
+}
+
 test("DO failed EventSub reconcile passes ticket once, survive a failed scrape, and recover on a healthy pass", async (t) => {
   const h = await alertHarness(t, ALERT_ENV);
   let healthy = 10;
@@ -2342,11 +2535,12 @@ const SCRAPE_FAILURE = "two-bot metrics scrape failed";
 const PRIOR_METRICS: MetricsAlertState = {
   ...EMPTY_STATE, firing: ["job_consecutive_failures:rank"],
   rest429: 12, restTotal: 100, poolStreak: 2, dbErrors: 7,
-  sendBlocked: 8, sendBlockedStreak: 2, voiceOps: 40, voiceFailures: 2,
+  sendBlocked: 8, sendBlockedStreak: 2, breakerOpenStreak: 2, voiceOps: 40, voiceFailures: 2,
   voiceDeadLetters: 1, voiceOrphans: 1, gatewayMissed: 4, gatewayMissedSeen: true,
   receiverRefusals: { membership: 8 }, receiverRefusalsSeen: true,
   receiverRefusalStreaks: { membership: 2 },
   dispatchDrops: { reactions: 5 }, dispatchDropStreaks: { reactions: 2 },
+  auditHaltStreak: 2,
 };
 
 async function backgroundMetricsHarness(t: TestContext) {
@@ -2363,13 +2557,13 @@ async function backgroundMetricsHarness(t: TestContext) {
     ...h, previous, puts,
     setMetricsResponse: (next: typeof response) => { response = next; },
     assertInterrupted: () => {
-      // A failed scrape preserves firing keys and every baseline/streak except
-      // the dispatch-drop window, which resets without resolving anything.
+      // A failed scrape resets dispatch-drop, breaker and audit-halt evidence,
+      // preserving firing keys and unrelated baselines without a recovery.
       const writes = puts.mock.calls.filter((call) => call.arguments[0] === METRICS_KEY);
-      assert.equal(writes.length, 1, "one dispatch-interrupt write");
-      assert.deepEqual(writes[0]!.arguments[1], { ...previous, dispatchDrops: {}, dispatchDropStreaks: {} });
+      assert.equal(writes.length, 1, "one scrape-interrupt write");
+      assert.deepEqual(writes[0]!.arguments[1], { ...previous, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, auditHaltStreak: 0 });
       assert.deepEqual(previous, PRIOR_METRICS, "no in-place baseline/streak/firing mutation");
-      assert.deepEqual(h.values.get(METRICS_KEY), { ...PRIOR_METRICS, dispatchDrops: {}, dispatchDropStreaks: {} });
+      assert.deepEqual(h.values.get(METRICS_KEY), { ...PRIOR_METRICS, dispatchDrops: {}, dispatchDropStreaks: {}, breakerOpenStreak: 0, auditHaltStreak: 0 });
       assert.equal(h.posts.length, 0, "no false RESOLVED notification");
       assert.equal(h.events().length, 0, "no false transition logs");
       assert.deepEqual(h.logs.filter((line) => line !== "two-bot container started"), [SCRAPE_FAILURE]);
@@ -2442,6 +2636,11 @@ for (const [name, body] of Object.entries({
   nonfinite: metricsBody().replace("two_bot_gateway_missed_events_total 0", "two_bot_gateway_missed_events_total NaN"),
   negative: metricsBody().replace("two_bot_db_pool_connections 0", "two_bot_db_pool_connections -1"),
   duplicate: `${metricsBody()}two_bot_gateway_missed_events_total 0\n`,
+  ...Object.fromEntries(["NaN", "2", "-1", "0.5", "+Inf", "-Inf"].map((value) => [
+    `breaker_${value}`, metricsBody().replace("two_bot_rest_guard_breaker_open 0", `two_bot_rest_guard_breaker_open ${value}`),
+  ])),
+  breakerLabeled: metricsBody().replace("two_bot_rest_guard_breaker_open 0", 'two_bot_rest_guard_breaker_open{route="other"} 1'),
+  breakerDuplicate: `${metricsBody()}two_bot_rest_guard_breaker_open 1\n`,
 })) {
   test(`background metrics: invalid 200 preserves all previous alert state (${name})`, async (t) => {
     const h = await backgroundMetricsHarness(t);

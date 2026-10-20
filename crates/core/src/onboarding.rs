@@ -1877,7 +1877,10 @@ mod tests {
         let dark = plan_session(&["join-voice"], &see_nothing(), &picks);
         assert_eq!(dark.unavailable, vec!["join-voice".to_owned()]);
         assert!(dark.channel_ids.is_empty());
-        assert!(!session_ack_text(&dark).contains(STAGING_LOBBY_VOICE_CHANNEL_ID));
+        assert_eq!(
+            session_ack_text(&dark),
+            "Those rooms are not open to you right now.\nNothing was changed - try again in a moment, or say hello in the welcome channel and someone will grab you."
+        );
     }
 
     #[test]
@@ -1903,11 +1906,17 @@ mod tests {
         assert!(unknown.picks.is_empty() && unknown.channel_ids.is_empty());
         assert_eq!(unknown.unknown_keys, vec!["nonsense"]);
         let ack = session_ack_text(&unknown);
-        assert!(ack.contains("stale") && ack.contains("Nothing was changed"));
+        assert_eq!(
+            ack,
+            "That option is gone or stale - the panel was probably replaced by a newer one.\nNothing was changed. Open the picker again and choose afresh."
+        );
         let empty = adjudicate_session_select(&[], &see_everything(), &picks);
         assert!(empty.routed.picks.is_empty() && empty.routed.channel_ids.is_empty());
         assert!(!empty.record_routed);
-        assert!(!empty.reply.contains("<#"));
+        assert_eq!(
+            empty.reply,
+            "Those rooms are not open to you right now.\nNothing was changed - try again in a moment, or say hello in the welcome channel and someone will grab you."
+        );
     }
 
     #[test]
@@ -1960,7 +1969,10 @@ mod tests {
         assert_eq!(hit.routed.picks, vec!["join-voice".to_owned()]);
         let miss = adjudicate_session_select(&["gone-option"], &see_everything(), &picks);
         assert!(!miss.record_routed, "nothing routed, nothing recorded");
-        assert!(miss.reply.contains("stale"));
+        assert_eq!(
+            miss.reply,
+            "That option is gone or stale - the panel was probably replaced by a newer one.\nNothing was changed. Open the picker again and choose afresh."
+        );
     }
 
     #[test]

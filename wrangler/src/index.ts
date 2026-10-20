@@ -106,6 +106,7 @@ import {
   evaluateMetrics,
   interruptCommunityFactsDrain,
   interruptDispatchDrops,
+  interruptAuditHalt,
   sanitizeScrapeLossState,
   scrapeLossFiringMessage,
   scrapeLossResolvedMessage,
@@ -366,6 +367,17 @@ interface ReadinessState {
 }
 
 type ReadinessEvent = "container_unready_alert" | "container_unready_recovery";
+
+interface KeepaliveNotification {
+  content: string;
+  readinessEvent?: ReadinessEvent;
+}
+
+// Two sequential six-second probes plus at most six seconds for ALL forwarding
+// leave twelve seconds for ownership/storage/scheduling in the 30-second gate.
+// Clip forwarding further if essential work has already used that headroom.
+const NOTIFICATION_TIMEOUT_MS = 6000;
+const KEEPALIVE_FORWARDING_CUTOFF_MS = 24_000;
 
 const SINGLETON_NAME = "two-bot";
 const DEFAULT_KEEPALIVE_SECONDS = 60;
@@ -1366,6 +1378,8 @@ export class TwoBotContainer extends Container<Env> {
     this.keepaliveRunning = true;
     try {
       await this.owned(async () => {
+        const turnStartedAt = Date.now();
+        const notifications: KeepaliveNotification[] = [];
         const owner = await this.ownership.require(this.id());
         if (payload?.deploymentId !== this.id() || payload.epoch !== owner.epoch) {
           throw new OwnershipRefused("stale_keepalive");
@@ -1377,6 +1391,11 @@ export class TwoBotContainer extends Container<Env> {
           let status: number | null = null;
           let probe: ProbeDetail = { failure: null };
           try {
+            // Refresh the release tag before any error event below: a failed
+            // probe must not reuse a previous image's SHA. containerFetch can
+            // trigger startup and port checks, and the SDK awaits onError from
+            // those paths, so the clear must precede the fetch.
+            this.lastRelease = null;
             const probeSignal = AbortSignal.timeout(6000);
             const res = await deadlineFetch(
               this.containerFetch("http://c/readyz", { signal: probeSignal }), probeSignal);
@@ -1398,9 +1417,6 @@ export class TwoBotContainer extends Container<Env> {
             // is a failed probe, never a buffered parse. Small bodies still
             // drain fully, so the SDK 0.3.7 proxy pipe settles cleanly.
             const body = await readBoundedText(res, MAX_PROBE_BODY_BYTES, probeSignal);
-            // Refresh the release tag before any error event below: a failed
-            // probe must not reuse a previous image's SHA.
-            this.lastRelease = null;
             if (probeSignal.aborted) {
               // A probe that only completed past its deadline is no evidence
               // of readiness: record it as failed, never as recovery.
@@ -1457,8 +1473,8 @@ export class TwoBotContainer extends Container<Env> {
             failedStep: probe.failure?.failedStep,
             errorCode: probe.failure?.errorCode,
           };
-          await this.recordReadiness(status, context);
-          await this.evaluateMetricsAlerts(context, probe.gatewayReady);
+          await this.recordReadiness(status, notifications, context);
+          await this.evaluateMetricsAlerts(notifications, context, probe.gatewayReady);
         } finally {
           // Collapse duplicate chains, preserving unrelated SDK schedules.
           // No takeover can interleave with this owned callback's I/O.
@@ -1468,6 +1484,9 @@ export class TwoBotContainer extends Container<Env> {
             await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
           }
         }
+        // Persistence, primary logs, remediation and the successor are complete
+        // before optional transport starts. Stay inside the same ownership gate.
+        await this.forwardNotifications(notifications, turnStartedAt);
       });
     } catch (error) {
       if (error instanceof OwnershipRefused) refused(error);
@@ -1486,7 +1505,7 @@ export class TwoBotContainer extends Container<Env> {
     return Math.max(1, Math.ceil(DEFAULT_UNREADY_SECONDS / this.keepaliveSeconds()));
   }
 
-  private async recordReadiness(status: number | null, context?: AlertContext): Promise<void> {
+  private async recordReadiness(status: number | null, notifications: KeepaliveNotification[], context?: AlertContext): Promise<void> {
     const now = Date.now();
     const ready = status !== null && status >= 200 && status < 300;
     const threshold = this.unreadyAlertFailures();
@@ -1529,11 +1548,17 @@ export class TwoBotContainer extends Container<Env> {
       error_code: context?.errorCode ?? "none",
       log_url: LOG_QUERY_URL,
     }));
-    await this.postReadinessWebhook(event, context);
+    const suffix = alertContextSuffix(context);
+    notifications.push({
+      readinessEvent: event,
+      content: event === "container_unready_alert"
+        ? `two-bot-next: Container /readyz has repeatedly failed. Check the gateway connection and Worker logs.${suffix}`
+        : `two-bot-next: Container /readyz is ready again. The unready incident has recovered.${suffix}`,
+    });
   }
 
-  /** Pull /metrics, evaluate rules, notify on transitions. Never throws. */
-  private async evaluateMetricsAlerts(context?: AlertContext, gatewayReady?: boolean): Promise<void> {
+  /** Pull /metrics, evaluate rules, log and collect transitions. Never throws. */
+  private async evaluateMetricsAlerts(notifications: KeepaliveNotification[], context?: AlertContext, gatewayReady?: boolean): Promise<void> {
     try {
       const previous = (await this.ctx.storage.get<MetricsAlertState>(METRICS_ALERT_KEY)) ?? EMPTY_STATE;
       const scrapeLoss = sanitizeScrapeLossState(await this.ctx.storage.get<ScrapeLossState>(SCRAPE_LOSS_KEY));
@@ -1570,7 +1595,10 @@ export class TwoBotContainer extends Container<Env> {
         const justFired = firing && !scrapeLoss.firing;
         // Persist before notifying: at most one attempt per transition, even
         // if the webhook fails or an alarm is retried.
-        await this.ctx.storage.put(METRICS_ALERT_KEY, interruptCommunityFactsDrain(interruptDispatchDrops(previous)));
+        await this.ctx.storage.put(
+          METRICS_ALERT_KEY,
+          interruptAuditHalt(interruptCommunityFactsDrain(interruptDispatchDrops(previous))),
+        );
         await this.ctx.storage.put(SCRAPE_LOSS_KEY, { streak, firing });
         if (justFired) {
           const content = scrapeLossFiringMessage(context);
@@ -1583,7 +1611,7 @@ export class TwoBotContainer extends Container<Env> {
             worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
             log_url: LOG_QUERY_URL,
           }));
-          await this.postWebhookText(content);
+          notifications.push({ content });
         }
         return;
       }
@@ -1605,7 +1633,7 @@ export class TwoBotContainer extends Container<Env> {
           worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
           log_url: LOG_QUERY_URL,
         }));
-        await this.postWebhookText(content);
+        notifications.push({ content });
       }
       // A complete valid scrape clears only observer-loss state: silently
       // below the ticket threshold, or with exactly one recovery once firing.
@@ -1627,7 +1655,7 @@ export class TwoBotContainer extends Container<Env> {
           worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
           log_url: LOG_QUERY_URL,
         }));
-        await this.postWebhookText(content);
+        notifications.push({ content });
       }
       // Guarded remediation recommendations ride the same alert path: one
       // line per recommendation, only while its trigger key fires. A corrupt
@@ -1648,7 +1676,7 @@ export class TwoBotContainer extends Container<Env> {
             worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
             log_url: LOG_QUERY_URL,
           }));
-          await this.postWebhookText(content);
+          notifications.push({ content });
         }
         // Staging-only persisted guard receipt: read back the guard just
         // written and log the allowlisted counters/timestamps/phases with
@@ -1700,87 +1728,56 @@ export class TwoBotContainer extends Container<Env> {
           }
         }
       } catch {
-        console.warn("two-bot remediation guard failed; alerts already delivered");
+        console.warn("two-bot remediation guard failed; alerts already recorded");
       }
     } catch {
       console.warn("two-bot metrics scrape failed");
     }
   }
 
-  private async postWebhookText(content: string): Promise<void> {
-    if (this.env.OPS_ALERT_FORWARDING !== "on") return;
-    const binding = this.env.OPS_ALERT_WEBHOOK_URL;
-    if (!binding) return;
-    try {
-      const url = opsAlertWebhookUrl(binding);
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        redirect: "error",
-        signal: AbortSignal.timeout(6000),
-        body: JSON.stringify({ content, allowed_mentions: { parse: [], replied_user: false } }),
-      });
-      await response.body?.cancel();
-      if (!response.ok) console.warn(JSON.stringify({
-        event: "metrics_alert_webhook_failed",
-        status: response.status,
-        release: releaseTag(this.lastRelease),
-        worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
-        log_url: LOG_QUERY_URL,
-      }));
-    } catch {
-      console.warn(JSON.stringify({
-        event: "metrics_alert_webhook_failed",
-        status: null,
-        release: releaseTag(this.lastRelease),
-        worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
-        log_url: LOG_QUERY_URL,
-      }));
+  /** One turn-local allowance, not a durable queue or a per-POST timeout. */
+  private async forwardNotifications(notifications: KeepaliveNotification[], turnStartedAt: number): Promise<void> {
+    if (!notifications.length || this.env.OPS_ALERT_FORWARDING !== "on" || !this.env.OPS_ALERT_WEBHOOK_URL) return;
+    const allowance = Math.min(NOTIFICATION_TIMEOUT_MS, KEEPALIVE_FORWARDING_CUTOFF_MS - (Date.now() - turnStartedAt));
+    if (allowance <= 0) return;
+    const deadline = Date.now() + allowance;
+    const signal = AbortSignal.timeout(allowance);
+    for (const notification of notifications) {
+      // The wall-clock check also refuses a fresh attempt before a delayed
+      // abort event is dispatched. Never resume this drain from late I/O.
+      if (signal.aborted || Date.now() >= deadline) break;
+      await this.postWebhook(notification, signal);
     }
   }
 
-  private async postReadinessWebhook(event: ReadinessEvent, context?: AlertContext): Promise<void> {
-    if (this.env.OPS_ALERT_FORWARDING !== "on") return;
-    const binding = this.env.OPS_ALERT_WEBHOOK_URL;
-    if (!binding) return;
+  private async postWebhook(notification: KeepaliveNotification, signal: AbortSignal): Promise<void> {
+    let status: number | null = null;
     try {
-      const url = opsAlertWebhookUrl(binding);
-      const suffix = alertContextSuffix(context);
-      const response = await fetch(url, {
+      const url = opsAlertWebhookUrl(this.env.OPS_ALERT_WEBHOOK_URL!);
+      const response = await deadlineFetch(fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         redirect: "error",
-        signal: AbortSignal.timeout(6000),
-        body: JSON.stringify({
-          content: event === "container_unready_alert"
-            ? `two-bot-next: Container /readyz has repeatedly failed. Check the gateway connection and Worker logs.${suffix}`
-            : `two-bot-next: Container /readyz is ready again. The unready incident has recovered.${suffix}`,
-          // https://docs.discord.com/developers/resources/webhook#execute-webhook
-          allowed_mentions: { parse: [], replied_user: false },
-        }),
-      });
-      await response.body?.cancel();
-      if (!response.ok) {
-        console.warn(JSON.stringify({
-          event: "container_unready_webhook_failed",
-          notification: event,
-          status: response.status,
-          release: releaseTag(this.lastRelease),
-          worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
-          log_url: LOG_QUERY_URL,
-        }));
-      }
+        signal,
+        body: JSON.stringify({ content: notification.content, allowed_mentions: { parse: [], replied_user: false } }),
+      }), signal);
+      status = response.status;
+      // Cleanup shares the aggregate deadline, including rejection sinks for
+      // late failures. A late fetch response is released by deadlineFetch.
+      await abortable(response.body?.cancel() ?? Promise.resolve(), signal);
+      if (response.ok && !signal.aborted) return;
     } catch {
-      // Fetch errors can contain the secret URL. Never log the error or body.
-      console.warn(JSON.stringify({
-        event: "container_unready_webhook_failed",
-        notification: event,
-        status: null,
-        release: releaseTag(this.lastRelease),
-        worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
-        log_url: LOG_QUERY_URL,
-      }));
+      // Fetch/cancel errors can contain the secret URL. Never log their text.
+      // Keep an already-received HTTP status when cleanup fails or times out.
     }
+    console.warn(JSON.stringify({
+      event: notification.readinessEvent ? "container_unready_webhook_failed" : "metrics_alert_webhook_failed",
+      ...(notification.readinessEvent ? { notification: notification.readinessEvent } : {}),
+      status,
+      release: releaseTag(this.lastRelease),
+      worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+      log_url: LOG_QUERY_URL,
+    }));
   }
 
   override async onStart(): Promise<void> {
@@ -1799,11 +1796,20 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   override onStop(): void {
+    // A stop invalidates the parsed release: the replacement image is
+    // unprobed, so its startup failure must stamp "unknown", not the old SHA.
+    this.lastRelease = null;
     console.log("two-bot container stopped");
   }
 
   override onError(_error: unknown): void {
-    console.error(JSON.stringify({ event: "container_error", error_class: "container_lifecycle_failed" }));
+    console.error(JSON.stringify({
+      event: "container_error",
+      error_class: "container_lifecycle_failed",
+      release: releaseTag(this.lastRelease),
+      worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+      log_url: LOG_QUERY_URL,
+    }));
     // The SDK logs errors thrown by hooks too; replace rather than rethrow the
     // original exception, and do not retain a credential-bearing cause.
     throw new Error("container_lifecycle_failed");
