@@ -10,7 +10,10 @@
 //! * ready/resumed → drop open voice sessions (TOG-6123). READY means a fresh
 //!   session here: twilight parses RESUMED as its own variant, and the mock
 //!   gateway (like Discord) sends READY only after (re-)identify.
-//! * guild-create (available) → seed invite snapshot + vanity flag.
+//! * guild-create (available) → seed invite snapshot + vanity flag, never
+//!   manufacture measured voice starts from snapshot occupancy.
+//! * guild unavailable/removed, channel deleted → discard affected measured
+//!   starts and their chains without inventing voice boundaries.
 //! * join: snapshot invites → expected-join note wins → invite-diff attribute
 //!   → `on_join` → instant `on_gate_cleared` when `!pending`.
 //! * `MemberUpdate` pending true→false → `on_gate_cleared` (role/nickname
@@ -30,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use twilight_cache_inmemory::{DefaultInMemoryCache, InMemoryCache};
 use twilight_model::gateway::event::Event;
@@ -341,6 +344,10 @@ pub struct Pipeline<
     expected_joins: Mutex<ExpectedJoins>,
     classifier: C,
     voice_chains: VoiceChains,
+    /// Voice/member effects hold a read guard; lifecycle gaps take the write
+    /// guard through invalidation and cache update. A gap cannot overtake an
+    /// in-flight start/end, and retiring chains cannot fork a member's lock.
+    voice_continuity: RwLock<()>,
     /// Guild IDs whose invites carry a vanity URL (for `vanity` attribution).
     vanity_guilds: Mutex<HashSet<Snowflake>>,
     /// Set once at startup by the runtime that wants joins (raid watch).
@@ -414,6 +421,7 @@ impl<
             expected_joins: Mutex::new(ExpectedJoins::new()),
             classifier,
             voice_chains: VoiceChains::default(),
+            voice_continuity: RwLock::new(()),
             vanity_guilds: Mutex::new(HashSet::new()),
             join_observer: OnceLock::new(),
             audit_entry_observer: OnceLock::new(),
@@ -536,6 +544,22 @@ impl<
             .lock()
             .expect("voice lock")
             .clear();
+        self.voice_chains.inner.lock().expect("chains lock").clear();
+    }
+
+    /// Caller holds the lifecycle write guard, so no voice/member frame can
+    /// still use a retired chain or put a pre-gap start back afterwards.
+    fn drop_sessions_for_guild(&self, guild_id: Snowflake) {
+        self.handlers
+            .voice_sessions
+            .lock()
+            .expect("voice lock")
+            .invalidate_guild(guild_id);
+        self.voice_chains
+            .inner
+            .lock()
+            .expect("chains lock")
+            .retain(|(guild, _), _| *guild != guild_id);
     }
 
     /// Drive one gateway event through the funnel. Reads pre-update state
@@ -604,16 +628,45 @@ impl<
             // RESUMED and READY never double-drop (TOG-6123): twilight parses
             // RESUMED as its own variant, READY only follows re-identify.
             Event::Ready(_) | Event::Resumed => {
+                let _continuity = self.voice_continuity.write().expect("voice continuity");
                 self.drop_sessions_on_reconnect();
                 self.cache.update(event);
             }
             Event::GuildCreate(gc) => {
-                if let twilight_model::gateway::payload::incoming::GuildCreate::Available(guild) =
-                    gc.as_ref()
-                {
-                    let gid = guild.id.get();
-                    self.set_guild_vanity(gid, guild.vanity_url_code.is_some());
-                    self.snapshot_invites(gid, observed_at);
+                let _continuity = self.voice_continuity.write().expect("voice continuity");
+                match gc.as_ref() {
+                    twilight_model::gateway::payload::incoming::GuildCreate::Available(guild) => {
+                        let gid = guild.id.get();
+                        self.set_guild_vanity(gid, guild.vanity_url_code.is_some());
+                        self.snapshot_invites(gid, observed_at);
+                    }
+                    twilight_model::gateway::payload::incoming::GuildCreate::Unavailable(guild) => {
+                        self.drop_sessions_for_guild(guild.id.get());
+                    }
+                }
+                // Snapshot occupancy only updates cache; it never witnesses a
+                // measured start, including when an unavailable guild returns.
+                self.cache.update(event);
+            }
+            Event::GuildDelete(guild) => {
+                let _continuity = self.voice_continuity.write().expect("voice continuity");
+                // Both unavailable=true and permanent removal break continuity.
+                self.drop_sessions_for_guild(guild.id.get());
+                self.cache.update(event);
+            }
+            Event::ChannelDelete(channel) => {
+                let _continuity = self.voice_continuity.write().expect("voice continuity");
+                if let Some(guild) = channel.guild_id {
+                    let members = self
+                        .handlers
+                        .voice_sessions
+                        .lock()
+                        .expect("voice lock")
+                        .invalidate_channel(guild.get(), channel.id.get());
+                    let mut chains = self.voice_chains.inner.lock().expect("chains lock");
+                    for member in members {
+                        chains.remove(&(guild.get(), member));
+                    }
                 }
                 self.cache.update(event);
             }
@@ -736,16 +789,24 @@ impl<
                 }
             }
             Event::MemberRemove(remove) => {
+                let _continuity = self.voice_continuity.read().expect("voice continuity");
                 let guild_id = remove.guild_id.get();
                 let member_id = remove.user.id.get();
                 let is_bot = remove.user.bot;
-                self.cache.update(event);
-                self.handlers.on_leave(
-                    guild_id,
-                    member_id,
-                    Some(observed_at.to_owned()),
-                    Some(is_bot),
-                );
+                let now_ms = two_bot_core::parse_iso_millis(observed_at).unwrap_or(0);
+                let chain = self.voice_chains.lock_for(guild_id, member_id, now_ms);
+                {
+                    let _guard = chain.lock().expect("voice chain");
+                    self.cache.update(event);
+                    self.handlers.on_leave(
+                        guild_id,
+                        member_id,
+                        Some(observed_at.to_owned()),
+                        Some(is_bot),
+                    );
+                }
+                self.voice_chains
+                    .remove_after_leave(guild_id, member_id, &chain);
             }
             Event::MessageCreate(msg) => {
                 let Some(guild_id) = msg.guild_id.map(|g| g.get()) else {
@@ -784,17 +845,26 @@ impl<
                 }
             }
             Event::VoiceStateUpdate(update) => {
+                let _continuity = self.voice_continuity.read().expect("voice continuity");
                 let Some(guild_id) = update.guild_id.map(|g| g.get()) else {
                     return;
                 };
                 let member_id = update.user_id.get();
-                // Pre-update channel from the cache: mute/deafen/camera frames
-                // carry no channel change and are not session boundaries.
+                let new_channel = update.channel_id.map(|c| c.get());
+                // A roster replacement resets the guild index, but Twilight
+                // can retain an absent member's old state object. It cannot
+                // witness a move from that absent roster entry. A missing index
+                // or a real null frame keeps the legacy READY unknown-end path.
+                let absent_from_roster = self
+                    .cache
+                    .guild_voice_states(guild_id_key(guild_id))
+                    .is_some_and(|members| !members.contains(&user_id_key(member_id)));
                 let old_channel = self
                     .cache
                     .voice_state(user_id_key(member_id), guild_id_key(guild_id))
-                    .map(|v| v.channel_id().get());
-                let new_channel = update.channel_id.map(|c| c.get());
+                    .map(|v| v.channel_id().get())
+                    .filter(|_| new_channel.is_none() || !absent_from_roster);
+                // Mute/deafen/camera frames are not session boundaries.
                 if old_channel == new_channel {
                     self.cache.update(event);
                     return;
@@ -972,6 +1042,443 @@ mod tests {
         assert!(!Arc::ptr_eq(&old, &fresh));
         chains.remove_after_leave(GUILD, 3, &old);
         assert_eq!(chains.len(), 1, "stale leave keeps the fresh chain");
+    }
+
+    fn lifecycle_voice(guild: u64, member: u64, channel: u64) -> Event {
+        Event::VoiceStateUpdate(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "guild_id": guild.to_string(), "user_id": member.to_string(),
+                "channel_id": channel.to_string(), "session_id": "fixture",
+                "deaf": false, "mute": false, "self_deaf": false,
+                "self_mute": false, "self_video": false, "suppress": false
+            }))
+            .expect("voice fixture"),
+        ))
+    }
+
+    fn lifecycle_delete(guild: u64, channel: Option<u64>) -> Event {
+        if let Some(channel) = channel {
+            Event::ChannelDelete(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "id": channel.to_string(), "guild_id": guild.to_string(), "type": 2
+                }))
+                .expect("channel fixture"),
+            ))
+        } else {
+            Event::GuildDelete(
+                serde_json::from_value(serde_json::json!({"id": guild.to_string()}))
+                    .expect("guild fixture"),
+            )
+        }
+    }
+
+    #[test]
+    fn lifecycle_retires_scoped_chains_without_waiting_for_member_frames() {
+        for event in [
+            lifecycle_delete(GUILD, Some(10)),
+            lifecycle_delete(GUILD, None),
+            Event::GuildCreate(Box::new(
+                serde_json::from_value(
+                    serde_json::json!({"id": GUILD.to_string(), "unavailable": true}),
+                )
+                .expect("unavailable guild fixture"),
+            )),
+            lifecycle_ready(),
+            Event::Resumed,
+        ] {
+            let p = MemPipeline::for_replay();
+            for (guild, member, channel) in [(GUILD, 1, 10), (GUILD, 2, 11), (8, 1, 10)] {
+                p.handle_at(
+                    &lifecycle_voice(guild, member, channel),
+                    "2026-10-19T12:00:00.000Z",
+                );
+            }
+            let foreign = p.voice_chains.lock_for(8, 1, 0);
+            let other_channel = p.voice_chains.lock_for(GUILD, 2, 0);
+            let expected = match event {
+                Event::ChannelDelete(_) => 2,
+                Event::Ready(_) | Event::Resumed => 0,
+                _ => 1,
+            };
+            for _ in 0..2 {
+                p.handle_at(&event, "2026-10-19T12:00:10.000Z");
+                assert_eq!(
+                    p.voice_chains.len(),
+                    expected,
+                    "scoped chains retired: {event:?}"
+                );
+                assert_eq!(
+                    p.handlers
+                        .voice_sessions
+                        .lock()
+                        .expect("tracker")
+                        .open_count(),
+                    expected
+                );
+            }
+            if expected > 0 {
+                assert!(Arc::ptr_eq(&foreign, &p.voice_chains.lock_for(8, 1, 0)));
+            }
+            if expected == 2 {
+                assert!(Arc::ptr_eq(
+                    &other_channel,
+                    &p.voice_chains.lock_for(GUILD, 2, 0)
+                ));
+            }
+        }
+    }
+
+    struct PausedVoiceStart {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl FactsSink for PausedVoiceStart {
+        fn record_member_join(&self, _: two_bot_core::MemberJoinFact<'_>) {}
+        fn record_rules_accepted(&self, _: two_bot_core::RulesAcceptedFact<'_>) {}
+        fn record_message(&self, _: two_bot_core::MessageFact<'_>) {}
+        fn record_voice_ended(&self, _: two_bot_core::VoiceEndedFact<'_>) {}
+        fn record_voice_started(&self, _: two_bot_core::VoiceStartedFact<'_>) -> Option<String> {
+            self.entered.send(()).expect("entered");
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv()
+                .expect("release");
+            None
+        }
+    }
+
+    fn lifecycle_ready() -> Event {
+        Event::Ready(
+            serde_json::from_value(serde_json::json!({
+                "v": 10,
+                "user": {
+                    "id": "999", "username": "fixture-bot", "discriminator": "0",
+                    "bot": true, "mfa_enabled": false
+                },
+                "session_id": "fixture-ready",
+                "resume_gateway_url": "wss://gateway.discord.gg",
+                "guilds": [{"id": GUILD.to_string(), "unavailable": true}],
+                "application": {"id": "1111", "flags": 0}
+            }))
+            .expect("READY fixture"),
+        )
+    }
+
+    fn lifecycle_available_guild() -> Event {
+        let mut guild: serde_json::Value =
+            serde_json::from_str(include_str!("../../bot/tests/fixtures/voice_guild.json"))
+                .expect("available guild fixture");
+        guild["id"] = serde_json::json!(GUILD.to_string());
+        guild["roles"][0]["id"] = serde_json::json!(GUILD.to_string());
+        guild["members"] = serde_json::json!([]);
+        guild["voice_states"] = serde_json::json!([]);
+        Event::GuildCreate(Box::new(
+            twilight_model::gateway::payload::incoming::GuildCreate::Available(
+                serde_json::from_value(guild).expect("available guild"),
+            ),
+        ))
+    }
+
+    fn lifecycle_member_remove(member: u64) -> Event {
+        Event::MemberRemove(
+            serde_json::from_value(serde_json::json!({
+                "guild_id": GUILD.to_string(),
+                "user": {
+                    "id": member.to_string(), "username": "fixture-member",
+                    "discriminator": "0", "bot": false
+                }
+            }))
+            .expect("member remove fixture"),
+        )
+    }
+
+    #[test]
+    fn lifecycle_waits_for_inflight_join_before_invalidating_and_retiring_chain() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        for event in [
+            lifecycle_delete(GUILD, None),
+            lifecycle_delete(GUILD, Some(10)),
+            lifecycle_ready(),
+            Event::Resumed,
+            Event::GuildCreate(Box::new(
+                serde_json::from_value(
+                    serde_json::json!({"id": GUILD.to_string(), "unavailable": true}),
+                )
+                .expect("unavailable guild fixture"),
+            )),
+            lifecycle_available_guild(),
+        ] {
+            // Available snapshots serialize too, but do not invalidate an
+            // already observed session. Every gap event discards it.
+            let expected = usize::from(matches!(
+                &event,
+                Event::GuildCreate(guild)
+                    if matches!(guild.as_ref(), twilight_model::gateway::payload::incoming::GuildCreate::Available(_))
+            ));
+            let (entered, waiting) = sync_channel(1);
+            let (release, paused) = sync_channel(1);
+            let p = Arc::new(Pipeline::new(
+                two_bot_core::MemStore::new(),
+                Some(two_bot_core::NoopLeveling),
+                Some(PausedVoiceStart {
+                    entered,
+                    release: Mutex::new(paused),
+                }),
+                ScriptedInvites::new(),
+                NoClassification,
+            ));
+            let joining = p.clone();
+            let join = std::thread::spawn(move || {
+                joining.handle_at(&lifecycle_voice(GUILD, 1, 10), "2026-10-19T12:00:00.000Z");
+            });
+            waiting
+                .recv_timeout(Duration::from_secs(5))
+                .expect("join paused before tracker write");
+            let deleting = p.clone();
+            let (started, running) = sync_channel(1);
+            let (finished, done) = sync_channel(1);
+            let delete = std::thread::spawn(move || {
+                started.send(()).expect("lifecycle starting");
+                deleting.handle_at(&event, "2026-10-19T12:00:10.000Z");
+                finished.send(()).expect("delete finished");
+            });
+            running
+                .recv_timeout(Duration::from_secs(5))
+                .expect("lifecycle started");
+            let premature = done.recv_timeout(Duration::from_millis(100));
+            release.send(()).expect("unpause join");
+            join.join().expect("join thread");
+            delete.join().expect("delete thread");
+            assert!(
+                matches!(premature, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+                "lifecycle update cannot overtake an in-flight join"
+            );
+            assert_eq!(
+                p.handlers
+                    .voice_sessions
+                    .lock()
+                    .expect("tracker")
+                    .open_count(),
+                expected
+            );
+            assert_eq!(p.voice_chains.len(), expected);
+        }
+    }
+
+    #[test]
+    fn member_remove_retires_chain_after_closing_voice() {
+        let p = MemPipeline::for_replay();
+        p.handle_at(&lifecycle_voice(GUILD, 1, 10), "2026-10-19T12:00:00.000Z");
+        assert_eq!(p.voice_chains.len(), 1);
+        p.handle_at(&lifecycle_member_remove(1), "2026-10-19T12:00:10.000Z");
+        assert_eq!(p.voice_chains.len(), 0, "member leave retires its chain");
+        assert_eq!(
+            p.handlers
+                .voice_sessions
+                .lock()
+                .expect("tracker")
+                .open_count(),
+            0
+        );
+        let rows = p.handlers.store().rows();
+        let end = rows
+            .iter()
+            .find(|row| row.event_type == two_bot_core::EventType::VoiceSessionEnd)
+            .expect("member leave closes the measured session");
+        assert_eq!(
+            end.metadata.as_ref().expect("end metadata")["durationSeconds"],
+            10
+        );
+        assert_eq!(
+            rows.last().expect("member leave").event_type,
+            two_bot_core::EventType::MemberLeave
+        );
+    }
+
+    #[test]
+    fn member_remove_waits_for_inflight_join_on_the_same_chain() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        let (entered, waiting) = sync_channel(1);
+        let (release, paused) = sync_channel(1);
+        let p = Arc::new(Pipeline::new(
+            two_bot_core::MemStore::new(),
+            Some(two_bot_core::NoopLeveling),
+            Some(PausedVoiceStart {
+                entered,
+                release: Mutex::new(paused),
+            }),
+            ScriptedInvites::new(),
+            NoClassification,
+        ));
+        let joining = p.clone();
+        let join = std::thread::spawn(move || {
+            joining.handle_at(&lifecycle_voice(GUILD, 1, 10), "2026-10-19T12:00:00.000Z");
+        });
+        waiting
+            .recv_timeout(Duration::from_secs(5))
+            .expect("join paused before tracker write");
+        let leaving = p.clone();
+        let (started, running) = sync_channel(1);
+        let (finished, done) = sync_channel(1);
+        let leave = std::thread::spawn(move || {
+            started.send(()).expect("leave starting");
+            leaving.handle_at(&lifecycle_member_remove(1), "2026-10-19T12:00:10.000Z");
+            finished.send(()).expect("leave finished");
+        });
+        running
+            .recv_timeout(Duration::from_secs(5))
+            .expect("leave started");
+        let premature = done.recv_timeout(Duration::from_millis(100));
+        release.send(()).expect("unpause join");
+        join.join().expect("join thread");
+        leave.join().expect("leave thread");
+        assert!(
+            matches!(premature, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "member leave cannot overtake its in-flight join"
+        );
+        assert_eq!(
+            p.handlers
+                .voice_sessions
+                .lock()
+                .expect("tracker")
+                .open_count(),
+            0
+        );
+        assert_eq!(p.voice_chains.len(), 0);
+        let rows = p.handlers.store().rows();
+        let end = rows
+            .iter()
+            .find(|row| row.event_type == two_bot_core::EventType::VoiceSessionEnd)
+            .expect("serialized leave closes the join");
+        assert_eq!(
+            end.metadata.as_ref().expect("end metadata")["durationSeconds"],
+            10
+        );
+        assert_eq!(
+            rows.last().expect("member leave").event_type,
+            two_bot_core::EventType::MemberLeave
+        );
+    }
+
+    struct PausedVoiceEnd {
+        entered: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl FactsSink for PausedVoiceEnd {
+        fn record_member_join(&self, _: two_bot_core::MemberJoinFact<'_>) {}
+        fn record_rules_accepted(&self, _: two_bot_core::RulesAcceptedFact<'_>) {}
+        fn record_message(&self, _: two_bot_core::MessageFact<'_>) {}
+        fn record_voice_started(&self, _: two_bot_core::VoiceStartedFact<'_>) -> Option<String> {
+            None
+        }
+        fn record_voice_ended(&self, _: two_bot_core::VoiceEndedFact<'_>) {
+            if let Some(entered) = self.entered.lock().expect("entered lock").take() {
+                entered.send(()).expect("entered");
+                self.release
+                    .lock()
+                    .expect("release lock")
+                    .recv()
+                    .expect("release");
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_waits_for_inflight_member_remove_before_invalidating() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        for event in [
+            lifecycle_delete(GUILD, Some(10)),
+            lifecycle_delete(GUILD, None),
+            lifecycle_ready(),
+            Event::Resumed,
+            Event::GuildCreate(Box::new(
+                serde_json::from_value(
+                    serde_json::json!({"id": GUILD.to_string(), "unavailable": true}),
+                )
+                .expect("unavailable guild fixture"),
+            )),
+        ] {
+            let (entered, waiting) = sync_channel(1);
+            let (release, paused) = sync_channel(1);
+            let p = Arc::new(Pipeline::new(
+                two_bot_core::MemStore::new(),
+                Some(two_bot_core::NoopLeveling),
+                Some(PausedVoiceEnd {
+                    entered: Mutex::new(Some(entered)),
+                    release: Mutex::new(paused),
+                }),
+                ScriptedInvites::new(),
+                NoClassification,
+            ));
+            for member in [1, 2] {
+                p.handle_at(
+                    &lifecycle_voice(GUILD, member, 10),
+                    "2026-10-19T12:00:00.000Z",
+                );
+            }
+            let leaving = p.clone();
+            let leave = std::thread::spawn(move || {
+                leaving.handle_at(&lifecycle_member_remove(1), "2026-10-19T12:00:10.000Z");
+            });
+            waiting
+                .recv_timeout(Duration::from_secs(5))
+                .expect("member leave paused in voice end");
+            let deleting = p.clone();
+            let (started, running) = sync_channel(1);
+            let (finished, done) = sync_channel(1);
+            let delete = std::thread::spawn(move || {
+                started.send(()).expect("delete starting");
+                deleting.handle_at(&event, "2026-10-19T12:00:20.000Z");
+                finished.send(()).expect("delete finished");
+            });
+            running
+                .recv_timeout(Duration::from_secs(5))
+                .expect("delete started");
+            let premature = done.recv_timeout(Duration::from_millis(100));
+            release.send(()).expect("unpause member leave");
+            leave.join().expect("leave thread");
+            delete.join().expect("delete thread");
+            assert!(
+                matches!(premature, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+                "invalidation cannot overtake an in-flight member leave"
+            );
+            assert_eq!(
+                p.handlers
+                    .voice_sessions
+                    .lock()
+                    .expect("tracker")
+                    .open_count(),
+                0
+            );
+            assert_eq!(p.voice_chains.len(), 0);
+            // The first leave precedes the gap; the second member's measured
+            // start is discarded even when no voice frame arrives before removal.
+            p.handle_at(&lifecycle_member_remove(2), "2026-10-19T12:01:00.000Z");
+            let ends: Vec<_> = p
+                .handlers
+                .store()
+                .rows()
+                .into_iter()
+                .filter(|row| row.event_type == two_bot_core::EventType::VoiceSessionEnd)
+                .collect();
+            assert_eq!(ends.len(), 1, "no cross-gap end for the invalidated member");
+            assert_eq!(ends[0].member_id, Some(1));
+            assert_eq!(ends[0].occurred_at, "2026-10-19T12:00:10.000Z");
+            assert_eq!(
+                ends[0].metadata.as_ref().expect("end metadata")["durationSeconds"],
+                10
+            );
+            assert_eq!(p.voice_chains.len(), 0);
+        }
     }
 
     #[derive(Clone, Default)]

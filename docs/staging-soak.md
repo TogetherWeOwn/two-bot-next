@@ -50,6 +50,20 @@ technical-policy question remains pending with the CTO; the CEO-held fixture
 authorization remains an execution hold. Neither is treated as the missing
 method's owner or as resolved or widened by this document.
 
+### Bounded event-read evidence contract
+
+The existing [processed-event collector](evidence-route.md) strictly parses
+psql CSV and rejects malformed quoting, impossible UTC instants and rows outside
+its inclusive SQL `BETWEEN` window before writing any artifact or step summary.
+That check includes the 61st returned truncation witness; the artifact validator
+also checks real, ordered window bounds (at most 15 minutes) and every kept row.
+Rows retain SQL ID order, not chronological order. Zero rows are a valid read,
+not proof of zero loss; more than 60 rows retains `truncated: true` and UNKNOWN
+coverage. The offline acceptance matrix is
+`scripts/test_staging_events_read_acceptance.py`. Passing it proves this bounded
+contract only: it neither authorizes a new live read nor closes the four-family,
+ACTIVE-hour or one-minute-sample evidence gaps above.
+
 ## Deployment interruption and recovery gap
 
 The current staging deploy workflow documents a **95–139-second gateway drop

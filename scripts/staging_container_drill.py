@@ -89,7 +89,14 @@ READY_BUDGET_SECONDS = 60
 READY_TIMEOUT_SECONDS = 300
 POLL_SECONDS = 5
 CONFIRM_PROBES = 2
-STALE_IMAGE_POLLS = 3
+# Polls tolerated while an accepted rollout's target image is not yet
+# reflected by the application listing. Mirrors
+# `staging_rollout.APPLICATION_IMAGE_STALE_POLLS`: the listing is read
+# separately from the rollout record and can trail it right after a deploy
+# (run-8: backout accepted active_lag, listing trailed 3+ polls, drill failed
+# `application_image_drift` with probes=0 on a stale budget). Single-sourced
+# so the two gates cannot drift apart again.
+STALE_IMAGE_POLLS = rollout.APPLICATION_IMAGE_STALE_POLLS
 WRANGLER_TIMEOUT_SECONDS = 600
 
 
@@ -593,7 +600,17 @@ class Drill:
             self.control("fence", self.owner(state).get("epoch"))
         fenced = self.stamp(f"{name}: fenced")
         leg["fenced"] = iso(fenced)
-        if serving_image(self.client, rollout.application(self.client)) != pin["image"]:
+        try:
+            current = serving_image(self.client, rollout.application(self.client))
+        except GateError as error:
+            if name != "restore" or str(error) != "application_image_drift":
+                raise
+            # Run-8: the backout leg left the listing drifted (rollout
+            # accepted, listing trailed), so a fail-closed read would skip the
+            # restore deploy and leave staging on the backout image. Deploy
+            # the baseline then verify instead.
+            current = None
+        if current != pin["image"]:
             deployed, deploy_elapsed = self.deploy_image(pin["image"], name, pin["source_sha"])
             expect_rollout = True
         else:
