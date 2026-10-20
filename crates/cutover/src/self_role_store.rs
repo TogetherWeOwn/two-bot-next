@@ -321,6 +321,8 @@ pub enum StoreError {
     GenerationExhausted,
     #[error("invalid persisted self-role audit metadata")]
     InvalidAudit,
+    #[error("self-role acknowledgement refused: {0}")]
+    AcknowledgementRefused(String),
 }
 
 #[derive(Debug, Clone)]
@@ -329,6 +331,21 @@ pub struct SelfRoleStore {
     lease_ms: u64,
     test_clock_ms: Option<Arc<AtomicI64>>,
 }
+
+/// Acknowledgement caps from the bounded durable acknowledgement decision:
+/// at most 500 unresolved ticket rows per guild, 50 per member, 20 per event,
+/// and 512 bytes per row. [`SelfRoleStore::journal_role_exchange`] refuses
+/// the insert that would exceed a cap before writing anything.
+const ACK_MAX_UNRESOLVED_PER_GUILD: u32 = 500;
+const ACK_MAX_UNRESOLVED_PER_MEMBER: u32 = 50;
+const ACK_MAX_UNRESOLVED_PER_EVENT: u32 = 20;
+const ACK_MAX_ROW_BYTES: usize = 512;
+/// Fixed per-row storage above the variable event/role identifiers: tuple
+/// header, null bitmap, the two uuid-text identity columns, disposition,
+/// flags and timestamps sum to roughly 130-150 B, so 160 B of fixed cost
+/// plus the two identifiers estimates the inserted row conservatively while
+/// leaving headroom under the 512 B bound.
+const ACK_ROW_FIXED_BYTES: usize = 160;
 
 impl SelfRoleStore {
     #[must_use]
@@ -1247,6 +1264,42 @@ impl SelfRoleStore {
         self.checkpoint_execution(claim, effects, false).await
     }
 
+    /// Pure acknowledgement cap check (no database): allow the insert only when
+    /// every unresolved count is strictly under its cap and the estimated row
+    /// fits the 512 B bound. Over any cap, refuse with an operator-visible
+    /// error naming the tripped dimension, never a silent substitution.
+    pub fn check_acknowledgement_caps(
+        guild_unresolved: u32,
+        member_unresolved: u32,
+        event_unresolved: u32,
+        row_bytes: usize,
+    ) -> Result<(), StoreError> {
+        if guild_unresolved >= ACK_MAX_UNRESOLVED_PER_GUILD {
+            return Err(StoreError::AcknowledgementRefused(format!(
+                "guild cap reached: {guild_unresolved} unresolved rows \
+                 (cap {ACK_MAX_UNRESOLVED_PER_GUILD})"
+            )));
+        }
+        if member_unresolved >= ACK_MAX_UNRESOLVED_PER_MEMBER {
+            return Err(StoreError::AcknowledgementRefused(format!(
+                "member cap reached: {member_unresolved} unresolved rows \
+                 (cap {ACK_MAX_UNRESOLVED_PER_MEMBER})"
+            )));
+        }
+        if event_unresolved >= ACK_MAX_UNRESOLVED_PER_EVENT {
+            return Err(StoreError::AcknowledgementRefused(format!(
+                "event cap reached: {event_unresolved} unresolved rows \
+                 (cap {ACK_MAX_UNRESOLVED_PER_EVENT})"
+            )));
+        }
+        if row_bytes > ACK_MAX_ROW_BYTES {
+            return Err(StoreError::AcknowledgementRefused(format!(
+                "row size {row_bytes} B exceeds the {ACK_MAX_ROW_BYTES} B bound"
+            )));
+        }
+        Ok(())
+    }
+
     /// Journal a distinct send and its attempted/unresolved role evidence in one
     /// transaction. The clock is sampled after panel -> event lock waits. This is
     /// not send authorization: the executor must fence again after the DB wait.
@@ -1290,6 +1343,10 @@ impl SelfRoleStore {
                 return Ok(None);
             }
         }
+        // Fixed refusal before any insert: a capped guild/member/event or an
+        // oversized row refuses here, so a refused attempt never partially
+        // writes. The transaction rolls back on drop.
+        enforce_acknowledgement_caps(&mut tx, claim, intent).await?;
         let ticket = insert_role_exchange(&mut tx, claim, intent).await?;
         tx.commit().await?;
         Ok(Some(ticket))
@@ -1719,6 +1776,65 @@ fn validate_exchange_intent(intent: &ExchangeIntent) -> Result<(), StoreError> {
         return Err(StoreError::InvalidAudit);
     }
     Ok(())
+}
+
+/// Count unresolved ticket rows for the journal's guild/member/event and refuse
+/// the insert that would exceed a cap. Unresolved means `pending`: nothing
+/// writes the acknowledgement settlement columns yet, so the predicate stays
+/// valid on databases with and without migration 0449. Runs inside the
+/// journal transaction after the event lock, before the insert.
+async fn enforce_acknowledgement_caps(
+    conn: &mut PgConnection,
+    claim: &EventClaim,
+    intent: &ExchangeIntent,
+) -> Result<(), StoreError> {
+    let scope: Option<(String, String)> =
+        sqlx::query_as("SELECT guild_id,member_id FROM self_role_audit WHERE event_id=$1")
+            .bind(&claim.event_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((guild_id, member_id)) = scope else {
+        return Err(StoreError::StaleClaim);
+    };
+    let guild_unresolved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM self_role_exchanges e
+         JOIN self_role_audit a ON e.event_id=a.event_id
+         WHERE a.guild_id=$1 AND e.disposition='pending'",
+    )
+    .bind(&guild_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let member_unresolved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM self_role_exchanges e
+         JOIN self_role_audit a ON e.event_id=a.event_id
+         WHERE a.guild_id=$1 AND a.member_id=$2 AND e.disposition='pending'",
+    )
+    .bind(&guild_id)
+    .bind(&member_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let event_unresolved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM self_role_exchanges WHERE event_id=$1 AND disposition='pending'",
+    )
+    .bind(&claim.event_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    // Counts cannot be negative; an unrepresentable count fails closed.
+    SelfRoleStore::check_acknowledgement_caps(
+        u32::try_from(guild_unresolved).unwrap_or(u32::MAX),
+        u32::try_from(member_unresolved).unwrap_or(u32::MAX),
+        u32::try_from(event_unresolved).unwrap_or(u32::MAX),
+        estimated_ack_row_bytes(&claim.event_id, &intent.role_id),
+    )
+}
+
+/// Estimated stored size of the ticket row the journal is about to insert:
+/// fixed per-row storage plus the variable event/role identifiers. Settlement
+/// fields are NULL at insert time, so they contribute nothing here.
+fn estimated_ack_row_bytes(event_id: &str, role_id: &str) -> usize {
+    ACK_ROW_FIXED_BYTES
+        .saturating_add(event_id.len())
+        .saturating_add(role_id.len())
 }
 
 async fn check_exchange_scope(

@@ -440,6 +440,10 @@
     "crates/cutover/migrations/0447_assistant_monthly_builds.sql": {
       "sha256": "f5f5cdfc03f21d0a5329afc4924c92fc42a1aac97a25337dc48bf766542f4e39",
       "justification": "Per-guild template-assistant monthly-cap ledger (no member columns): one row per guild with month_key plus build_count and a nonnegativity check; cutover chain copy, IF NOT EXISTS. Numbered 0447 because the store chain owns 0446; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0449_self_role_ticket_acknowledgement.sql": {
+      "sha256": "0e39d7b88d4109475359640a38d066d8a2b31b168bc7f46a324bb4db3cb92c8c",
+      "justification": "Self-role ticket-row acknowledgement lifecycle: nullable settled_at/settled_as/superseded_by/outcome_class plus attempt_no defaulting to 1 on self_role_exchanges with closed-set checks, so ambiguous sends persist per send and pre-existing rows read back unsettled; additive IF NOT EXISTS, backout drops the five columns. Numbered 0449 because the cutover chain owns 0447/0448; global migration numbers remain unique across both chains."
     }
   }
 }
