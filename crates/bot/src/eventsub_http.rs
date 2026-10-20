@@ -16,7 +16,10 @@
 
 use std::{
     future::IntoFuture,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -29,7 +32,11 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use tokio::{net::TcpListener, sync::Semaphore};
+use tokio::{
+    net::TcpListener,
+    sync::{oneshot, Mutex, Semaphore},
+    task::JoinSet,
+};
 use tracing::Instrument;
 use two_bot_core::{
     eventsub_receiver_config::EventsubReceiverConfig,
@@ -49,9 +56,23 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 struct ReceiverState {
     secret: RwLock<two_bot_core::twitch_eventsub::WebhookSecret>,
     capacity: Arc<Semaphore>,
+    /// Receiver-owned delivery children. Completed joins are reaped on the
+    /// next admission; active children remain joinable through shutdown.
+    children: Mutex<JoinSet<()>>,
+    /// Set under the child lock at shutdown so no child can race admission.
+    draining: AtomicBool,
     /// Go-live delivery dependencies, injected at bind time. `None` keeps
     /// verified notifications side-effect free (acknowledge only).
     delivery: Option<Arc<DeliveryDeps>>,
+}
+
+impl Drop for ReceiverState {
+    fn drop(&mut self) {
+        // If the enclosing service future is cancelled at its own deadline,
+        // dropping JoinSet would abort uncertain sends. Keep children detached
+        // instead; their started ledger claims remain the durable fence.
+        self.children.get_mut().detach_all();
+    }
 }
 
 impl ReceiverState {
@@ -65,6 +86,8 @@ impl ReceiverState {
             // re-read the environment or observe partially replaced material.
             secret: RwLock::new(config.secret().clone()),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
+            children: Mutex::new(JoinSet::new()),
+            draining: AtomicBool::new(false),
             delivery: delivery.map(Arc::new),
         }
     }
@@ -102,9 +125,80 @@ impl BoundEventsubReceiver {
     /// receiver; first termination stops admission everywhere.
     pub async fn serve(self, shutdown: tokio::sync::watch::Receiver<bool>) -> std::io::Result<()> {
         let server = axum::serve(self.listener, router(Arc::clone(&self.state)))
-            .with_graceful_shutdown(crate::server::shutdown_requested(shutdown))
+            .with_graceful_shutdown(crate::server::shutdown_requested(shutdown.clone()))
             .into_future();
-        server.await
+        tokio::pin!(server);
+        let mut shutdown = shutdown;
+        let deadline = tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|latched| *latched) => {
+                let deadline = tokio::time::Instant::now() + crate::shutdown::deadline();
+                Self::close_admission(&self.state).await;
+                deadline
+            }
+            result = &mut server => {
+                Self::close_admission(&self.state).await;
+                let deadline = tokio::time::Instant::now() + crate::shutdown::deadline();
+                let joined = Self::join_children(&self.state, deadline).await;
+                return match (result, joined) {
+                    (Err(error), _) => Err(error),
+                    (Ok(()), true) => Ok(()),
+                    (Ok(()), false) => Err(std::io::Error::other("EventSub receiver shutdown deadline exceeded")),
+                };
+            }
+        };
+
+        let server_result = tokio::time::timeout_at(deadline, &mut server).await;
+        let joined = Self::join_children(&self.state, deadline).await;
+        match (server_result, joined) {
+            (Ok(Ok(())), true) => Ok(()),
+            (Ok(Err(error)), _) => Err(error),
+            _ => {
+                tracing::error!(
+                    msg = "eventsub_receiver_drain_deadline",
+                    "receiver shutdown deadline exhausted; unfinished delivery claims remain fenced"
+                );
+                Err(std::io::Error::other(
+                    "EventSub receiver shutdown deadline exceeded",
+                ))
+            }
+        }
+    }
+
+    async fn close_admission(state: &ReceiverState) {
+        let _children = state.children.lock().await;
+        state.draining.store(true, Ordering::SeqCst);
+    }
+
+    async fn join_children(state: &ReceiverState, deadline: tokio::time::Instant) -> bool {
+        let mut children = state.children.lock().await;
+        match tokio::time::timeout_at(deadline, async {
+            while let Some(result) = children.join_next().await {
+                if let Err(error) = result {
+                    tracing::warn!(
+                        msg = "eventsub_delivery_child_failed",
+                        error = %error,
+                        "delivery child failed; durable claim fences retain uncertainty"
+                    );
+                }
+            }
+        })
+        .await
+        {
+            Ok(()) => true,
+            Err(_) => {
+                let pending = children.len();
+                // Started sends have unknown external effects. Detach rather
+                // than abort them; their durable started claims remain fenced.
+                children.detach_all();
+                tracing::error!(
+                    msg = "eventsub_receiver_drain_deadline",
+                    pending = pending,
+                    "receiver shutdown deadline exhausted with delivery children unfinished"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -197,7 +291,7 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
     let id = crate::logging::incoming_request_id(request.headers());
     let span = crate::logging::request_span(&id);
     async move {
-        let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
+        let Ok(permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
             return refuse(
                 &state,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -207,7 +301,7 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
                 "unknown",
             );
         };
-        receive_with_timeout(&state, &id, receive(&state, request, &id)).await
+        receive_with_timeout(&state, &id, receive(&state, request, &id, permit)).await
     }
     .instrument(span)
     .await
@@ -247,6 +341,7 @@ async fn handle_notification(
     state: &Arc<ReceiverState>,
     stream: &two_bot_core::stream_funnel::StreamOnline,
     id: &str,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let Some(deps) = &state.delivery else {
         tracing::info!(
@@ -258,17 +353,56 @@ async fn handle_notification(
     };
     let task_deps = Arc::clone(deps);
     let task_stream = (*stream).clone();
-    let delivery = match tokio::spawn(async move {
-        deliver_go_live(
-            task_deps.ledger.as_ref(),
-            task_deps.sender.as_ref(),
-            &task_deps.config,
-            &task_stream,
-        )
-        .await
-    })
-    .await
+    let (complete_tx, complete_rx) = oneshot::channel();
     {
+        let mut children = state.children.lock().await;
+        if state.draining.load(Ordering::SeqCst) {
+            return refuse(
+                state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "busy",
+                true,
+                id,
+                bounded_message_type("notification"),
+            );
+        }
+        while let Some(result) = children.try_join_next() {
+            if let Err(error) = result {
+                tracing::warn!(
+                    msg = "eventsub_delivery_child_failed",
+                    error = %error,
+                    "delivery child failed; durable claim fences retain uncertainty"
+                );
+            }
+        }
+        let child_span = tracing::Span::current();
+        children.spawn(
+            async move {
+                let _permit = permit;
+                let delivery = deliver_go_live(
+                    task_deps.ledger.as_ref(),
+                    task_deps.sender.as_ref(),
+                    &task_deps.config,
+                    &task_stream,
+                )
+                .await;
+                let metrics = two_bot_core::metrics::global();
+                let (attempted, succeeded, failed) = post_metric_counts(&delivery.outcome);
+                if attempted {
+                    metrics.eventsub_post("attempted");
+                }
+                if succeeded {
+                    metrics.eventsub_post("succeeded");
+                }
+                if failed {
+                    metrics.eventsub_post("failed");
+                }
+                let _ = complete_tx.send(delivery);
+            }
+            .instrument(child_span),
+        );
+    }
+    let delivery = match complete_rx.await {
         Ok(delivery) => delivery,
         Err(_) => {
             return refuse(
@@ -281,17 +415,6 @@ async fn handle_notification(
             );
         }
     };
-    let metrics = two_bot_core::metrics::global();
-    let (attempted, succeeded, failed) = post_metric_counts(&delivery.outcome);
-    if attempted {
-        metrics.eventsub_post("attempted");
-    }
-    if succeeded {
-        metrics.eventsub_post("succeeded");
-    }
-    if failed {
-        metrics.eventsub_post("failed");
-    }
     if delivery.disposition.status == 200 {
         tracing::info!(
             event = "eventsub_receiver",
@@ -319,7 +442,12 @@ fn record_verification_failure(metrics: &two_bot_core::metrics::Metrics, error: 
     }
 }
 
-async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Response {
+async fn receive(
+    state: &Arc<ReceiverState>,
+    request: Request,
+    id: &str,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
     // Exact path, no query: the Worker forwards only the sanitized shape, but
     // a direct `containerFetch` must not reach verification with extras.
     let path = request.uri().path();
@@ -486,7 +614,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         }
         Ok(Delivery::Notification(stream)) => {
             two_bot_core::metrics::global().eventsub_classified("notification");
-            handle_notification(state, &stream, id).await
+            handle_notification(state, &stream, id, permit).await
         }
         Ok(Delivery::Revocation { reason, .. }) => {
             two_bot_core::metrics::global().eventsub_classified("revocation");
@@ -564,6 +692,11 @@ mod tests {
         Mutex, OnceLock,
     };
     use tower::ServiceExt as _;
+
+    /// Protected delivery-capacity/shutdown acceptance (separate file; the
+    /// Builder must not edit it). A descendant of this module, so it reuses
+    /// the signing/request helpers and serializes on `RECEIVER_LOG_SERIAL`.
+    mod delivery_shutdown_tests;
 
     impl ReceiverState {
         fn reload_secret(&self, config: &EventsubReceiverConfig) {
