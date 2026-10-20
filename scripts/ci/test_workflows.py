@@ -3282,6 +3282,10 @@ class WorkflowTests(unittest.TestCase):
             "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only",
             main_sweep,
         )
+        self.assertIn(
+            "--skip connection_count_sees_other_roles_from_plan_login",
+            ignored_sweeps[0],
+        )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
         self.assertEqual(len(guarded), 12)
         for run in guarded:
@@ -3316,6 +3320,11 @@ class WorkflowTests(unittest.TestCase):
                     self.assertIn("--features db", matches[0])
                 else:
                     self.assertNotIn("--features db", matches[0])
+                if needle == "--test staging_migrate_db":
+                    self.assertNotIn(
+                        "--skip connection_count_sees_other_roles_from_plan_login",
+                        matches[0],
+                    )
         env_wrapped = [
             run for run in cov_runs
             if run.startswith('cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV"')
