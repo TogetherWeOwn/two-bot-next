@@ -14,6 +14,12 @@ import { isDirectInvocation } from "./is-direct-invocation.mjs";
 
 class ControlError extends Error {}
 
+// A request that never produced a Worker verdict: timeout, transport, or an
+// unparseable answer. Fixed vocabulary only, with attempts and elapsed time;
+// provider and JSON text are untrusted and never printed. Status retries
+// these inside its propagation budget; takeover keeps its 5xx-only policy.
+class TransientFailure extends ControlError {}
+
 class HttpFailure extends ControlError {
   constructor(message, status, reason) {
     super(message);
@@ -131,14 +137,27 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
   let attempts = 0;
   const read = async (init) => {
     // Never follow redirects carrying the control secret to another origin.
-    const response = await send(endpoint, { ...init, headers, redirect: "error", signal: AbortSignal.timeout(15000) });
+    let response;
+    try {
+      response = await send(endpoint, { ...init, headers, redirect: "error", signal: AbortSignal.timeout(15000) });
+    } catch (error) {
+      // Timeout vs transport is the only provider detail admitted, as one
+      // fixed word: the thrown text itself is untrusted and never printed.
+      const kind = error?.name === "AbortError" ? "timeout" : "failed";
+      throw new TransientFailure(`Ownership control request ${kind} attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`);
+    }
     if (!response.ok) {
       const reason = await refusalReason(response);
       throw new HttpFailure(`Ownership control failed (HTTP ${response.status}) reason=${reason} attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`, response.status, reason);
     }
-    const state = await response.json();
-    if (!state.deploymentId || !("owner" in state) || typeof state.running !== "boolean") {
-      throw new ControlError("Invalid ownership control response");
+    let state;
+    try {
+      state = await response.json();
+    } catch {
+      throw new TransientFailure(`Ownership control invalid response attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`);
+    }
+    if (!state || typeof state !== "object" || !state.deploymentId || !("owner" in state) || typeof state.running !== "boolean") {
+      throw new TransientFailure(`Ownership control invalid response attempts=${attempts} elapsed=${elapsedSeconds()}s; stop, do not change credentials`);
     }
     return state;
   };
@@ -204,7 +223,9 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
     // answers 503 deployment_mismatch, or a 200 naming the old deployment.
     // Both are propagation, not a NO-GO, so the P2 read waits for the new
     // version (34 reads, 10 s apart, the takeover window) before refusing.
-    // Every other refusal stops at once.
+    // A transient request failure (timeout, transport, unparseable answer)
+    // waits the same budget: this read is side-effect-free, so a single
+    // blip must not fail the deploy. Every other refusal stops at once.
     for (let attempt = 1; ; attempt++) {
       attempts = attempt;
       try {
@@ -213,7 +234,7 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
         const propagating = expectedDeploymentId !== undefined && (
           (error instanceof HttpFailure && error.status === 503 && error.reason === "deployment_mismatch") ||
           (!(error instanceof HttpFailure) && /^Production deployment mismatch/.test(error.message)));
-        if (!propagating || attempt >= statusAttempts) throw error;
+        if ((!propagating && !(error instanceof TransientFailure)) || attempt >= statusAttempts) throw error;
         await wait(statusRetryDelayMs);
       }
     }

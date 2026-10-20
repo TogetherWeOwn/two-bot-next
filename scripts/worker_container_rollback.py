@@ -29,9 +29,10 @@ version to SHA; the snapshot records that SHA beside the serving version
 and image. Before any restore POST, the receipt is validated against live
 Cloudflare state: the version's annotated SHA must equal the receipt SHA,
 the version must appear in the 100%-serving deployment history, and the
-image must appear in a completed rollout for the application. A missing or
-mismatched member refuses the rollback: a merely CI-green SHA paired with
-some other version is never admitted.
+image must appear in a completed or replaced (served, then superseded)
+rollout for the application. A missing or mismatched member refuses the
+rollback: a merely CI-green SHA paired with some other version is never
+admitted.
 
 Fail-closed rules, each pinned by scripts/test_worker_container_rollback.py:
 - Only allowlisted IDs, integers, statuses and fixed-vocabulary tokens reach
@@ -84,6 +85,8 @@ AUTH_STATUSES = ("401", "403")
 ACTOR = re.compile(r"[a-zA-Z0-9_.:@/-]{1,128}")
 SAFE_CONTROL_LINE = re.compile(
     r"(Ownership control failed \(HTTP [0-9]{3}\)|"
+    r"Ownership control request (timeout|failed)|"
+    r"Ownership control invalid response|"
     r"Singleton is intentionally fenced or uninitialized|"
     r"Ownership transition not confirmed|"
     r"OWNERSHIP_CONTROL_TOKEN is missing or invalid|"
@@ -317,9 +320,12 @@ def validate_receipt_against_live(client, receipt):
     """Bind a receipt to live Cloudflare state with reads only, before any
     restore POST: the version must have been deployed from the receipt
     SHA and must have served 100% before, and the image must come from a
-    completed rollout of this application. Rollout images carry no
-    version link, so served-before membership is the strongest image
-    binding the API offers; version and SHA bind exactly."""
+    rollout of this application that completed (status completed, or
+    replaced after completing: Cloudflare flips every superseded rollout
+    to replaced, so after any deploy the previous image lives only
+    there). Rollout images carry no version link, so served-before
+    membership is the strongest image binding the API offers; version
+    and SHA bind exactly."""
     require(version_sha(client, receipt.worker, receipt.version) == receipt.sha,
             "provenance_mismatch", "member=sha")
     require(receipt.version in deployments(client, receipt.worker),
@@ -329,7 +335,7 @@ def validate_receipt_against_live(client, receipt):
     for row in app_rollouts(client, app["id"]):
         row = base.mapping(row)
         image = base.mapping(row.get("target_configuration")).get("image")
-        if (row.get("status") == "completed" and isinstance(image, str)
+        if (row.get("status") in ("completed", "replaced") and isinstance(image, str)
                 and re.fullmatch(image_pattern(receipt.application), image)):
             served.add(image)
     require(receipt.image in served, "provenance_image_never_served")

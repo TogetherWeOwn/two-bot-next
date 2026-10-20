@@ -657,11 +657,11 @@ class MainProvenanceTests(unittest.TestCase):
             argv, self.live_routes(served_image=bad_image()),
             "provenance_image_never_served")
 
-    def test_manual_rollback_refuses_an_image_from_a_non_completed_rollout(self):
+    def test_manual_rollback_refuses_an_image_from_a_rollout_that_never_served(self):
         # The only rollout carrying the image never completed: without the
-        # completed-only filter it would pass as "served" and traffic would
-        # move to an image from a failed or reverted rollout.
-        for status in ("failed", "reverted"):
+        # served-before filter it would pass as "served" and traffic would
+        # move to an image from a failed, reverted or still-running rollout.
+        for status in ("failed", "reverted", "pending", "progressing"):
             with self.subTest(status=status):
                 served = rollout_row("r-prev", good_image(), status=status)
                 routes = self.live_routes()
@@ -675,6 +675,22 @@ class MainProvenanceTests(unittest.TestCase):
         receipt = rollback.ProvenanceReceipt(WORKER, APPLICATION, GOOD_VERSION,
                                              SHA, good_image())
         rollback.validate_receipt_against_live(FakeClient(self.live_routes()), receipt)
+
+    def test_complete_receipt_validates_when_the_image_rollout_was_superseded(self):
+        # Cloudflare flips a superseded rollout from completed to replaced,
+        # so after any deploy the previous image lives only in a replaced
+        # rollout. Served-before membership must accept it: the 10-20
+        # production drill refused its snapshot image here and restored
+        # nothing (provenance_image_never_served).
+        receipt = rollback.ProvenanceReceipt(WORKER, APPLICATION, GOOD_VERSION,
+                                             SHA, good_image())
+        routes = self.live_routes()
+        routes[("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100")] = \
+            lambda: {"success": True, "result": [
+                rollout_row("r-newer", bad_image(),
+                            created="2026-10-15T01:00:00Z", status="completed"),
+                rollout_row("r-prev", good_image(), status="replaced")]}
+        rollback.validate_receipt_against_live(FakeClient(routes), receipt)
 
     def snapshot_argv(self, path, *extra):
         return ["rollback", "--variant", "staging", "--worker-url", self.URL,
@@ -768,10 +784,11 @@ class MainProvenanceTests(unittest.TestCase):
             ("PROBE", "health"): health,
         }
 
-    def run_snapshot_main(self, tmp, revision):
+    def run_snapshot_main(self, tmp, revision, route_overrides=None):
         """Run main() on a complete snapshot with a stubbed ownership
         client and a scripted clock; capture the gate's expected SHA."""
         routes = self.snapshot_run_routes(revision)
+        routes.update(route_overrides or {})
         client = FakeClient(routes)
         control, _ = control_stub()
         clock = Clock()
@@ -810,6 +827,32 @@ class MainProvenanceTests(unittest.TestCase):
             record = json.loads(Path(evidence).read_text())
         self.assertEqual(record["provenance"], "validated")
         self.assertEqual(record["provenance_sha"], SHA)
+        self.assertTrue([call for call in client.calls if call[0] == "POST"],
+                        client.calls)
+
+    def test_snapshot_rollback_restores_when_the_snapshot_rollout_was_superseded(self):
+        # Drill shape: the deploy completed a newer rollout, so the
+        # snapshot's rollout now reads replaced (same image) and the list
+        # carries the newer completed rollout beside it. The rollback must
+        # still validate the receipt and restore the snapshot image.
+        overrides = {
+            ("GET", f"/containers/applications/{APP_ID}/rollouts/r-prev"):
+                lambda: {"success": True, "result": rollout_row(
+                    "r-prev", good_image(), status="replaced")},
+            ("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100"):
+                lambda: {"success": True, "result": [
+                    rollout_row("r-newer", bad_image(),
+                                created="2026-10-15T01:00:00Z",
+                                status="completed", target_version=8),
+                    rollout_row("r-prev", good_image(), status="replaced")]},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, _, client, evidence = self.run_snapshot_main(
+                tmp, SHA, overrides)
+            self.assertEqual(code, 0, out)
+            record = json.loads(Path(evidence).read_text())
+        self.assertEqual(record["provenance"], "validated")
+        self.assertEqual(record["restored_image_digest"], "sha256:" + "a" * 64)
         self.assertTrue([call for call in client.calls if call[0] == "POST"],
                         client.calls)
 
@@ -892,6 +935,25 @@ class ControlFenceHintTests(unittest.TestCase):
     def test_other_refusals_carry_no_release_hint(self):
         error = self.refusal("Ownership transition not confirmed\n")
         self.assertEqual(error.detail, "Ownership transition not confirmed")
+
+    def test_transient_control_lines_reach_the_detail(self):
+        # The production client's classified request failures are fixed
+        # vocabulary with integers only, so the rollback log may carry the
+        # cause instead of dropping it: attempts/elapsed stay out.
+        cases = [
+            ("Ownership control request timeout attempts=3 elapsed=45s; stop, do not change credentials\n",
+             "Ownership control request timeout"),
+            ("Ownership control request failed attempts=1 elapsed=2s; stop, do not change credentials\n",
+             "Ownership control request failed"),
+            ("Ownership control invalid response attempts=2 elapsed=12s; stop, do not change credentials\n",
+             "Ownership control invalid response"),
+        ]
+        for stderr, prefix in cases:
+            with self.subTest(prefix=prefix):
+                error = self.refusal(stderr, variant="production", action="status")
+                self.assertEqual(str(error), "ownership_control_failed")
+                self.assertEqual(error.detail, prefix)
+                self.assertNotIn("secret-token", error.detail)
 
     def test_fence_env_contract_that_makes_the_hint_dead(self):
         # Pins the env contract behind the hint removal: takeover-style
