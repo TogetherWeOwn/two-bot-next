@@ -11,8 +11,10 @@ invokes retention, never activates Execute, never changes a mode, and has no
 production path.
 
 Three pinned aggregate groups, counts/digests/timestamps only:
-  A. migration ledger rows 444-447 from `_sqlx_migrations` plus presence of
-     the two expiry indexes on `event_store` (the class index is expected
+  A. migration ledger rows 444-445 from `_sqlx_migrations` (the two expiry
+     migrations; 446 lives only in the store chain's `_two_bot_migrations`
+     ledger and 447 is unrelated, so neither is queried here) plus presence
+     of the two expiry indexes on `event_store` (the class index is expected
      present and the time-only index absent: migration 0445 drops it);
   B. eligible-old vs fresh counts by retention family (`PRESENCE_UPDATE`,
      `VOICE_STATE_UPDATE`, `VOICE_SERVER_UPDATE` at 30 days,
@@ -31,8 +33,10 @@ Three pinned aggregate groups, counts/digests/timestamps only:
 
 Fences, all before the first connection (exit 2, nothing was sent):
   * the database login comes only from $TWO_BOT_STAGING_PLAN_DATABASE_URL
-    and must name role two_bot_migrator_ro on the pinned staging database
-    at the pinned staging host. The URL port is omitted or 5432, pooler
+    and must be a bare login on the pinned staging database at the pinned
+    staging host. The login is a separate identity holding only
+    two_bot_migrator_ro (that group is NOLOGIN, so the binding username is
+    never the group name itself). The URL port is omitted or 5432, pooler
     hosts and pooler-style usernames are refused, and a production-like host
     or database refuses. Only sslmode, channel_binding and connect_timeout
     may ride on the URL; psql always uses verify-full with the runner's
@@ -43,9 +47,13 @@ Fences, all before the first connection (exit 2, nothing was sent):
     non-secret workflow vars $TWO_BOT_STAGING_HOST,
     $TWO_BOT_STAGING_DATABASE and $TWO_BOT_STAGING_BRANCH_ID, never derived
     from the URL. A PlanetScale host requires a bare branch pin matching
-    the binding username's `{role}.{branch_id}` suffix.
-After connecting, the server must also report current_user and
-current_database() as that role and database before any census query runs.
+    the binding username's `{login}.{branch_id}` suffix.
+Every connection then runs SET ROLE two_bot_migrator_ro before its READ ONLY
+transaction (mirroring the plan binary's per-connection role); a denied SET
+ROLE refuses. After connecting, the server must also report current_user as
+that role and current_database() as the pinned database, and must report
+that the login holds no membership in two_bot_migrator, before any census
+query runs.
 
 Every statement runs in a READ ONLY transaction with a statement and lock
 timeout. No DDL runs anywhere, including no CREATE EXTENSION: when pgcrypto
@@ -84,13 +92,14 @@ HOST_ENV = "TWO_BOT_STAGING_HOST"
 DATABASE_ENV = "TWO_BOT_STAGING_DATABASE"
 BRANCH_ENV = "TWO_BOT_STAGING_BRANCH_ID"
 DB_ROLE = "two_bot_migrator_ro"
+MIGRATOR_ROLE = "two_bot_migrator"
 SYSTEM_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 PSQL_TIMEOUT_SECONDS = 60
 # One natural retention interval (RETENTION_CADENCE_SECONDS in retention.rs).
 SLEEP_SECONDS = 900
 # One expiry batch (MAX_RAW_EXPIRY_ROWS_PER_BATCH in retention.rs).
 COHORT_LIMIT = 1000
-MIGRATION_VERSIONS = (444, 445, 446, 447)
+MIGRATION_VERSIONS = (444, 445)
 CLASS_INDEX = "idx_event_store_expiry_class_time_id"
 TIME_INDEX = "idx_event_store_expiry_event_time_id"
 FAMILIES = ("PRESENCE_UPDATE", "VOICE_STATE_UPDATE", "VOICE_SERVER_UPDATE",
@@ -112,11 +121,20 @@ URL_PARAMS = {
 # The only environment psql inherits besides the PG* values built from the URL.
 INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 
-READ_ONLY_5S = ("BEGIN READ ONLY;\nSET LOCAL statement_timeout = '5s';\n"
+# Every psql invocation is its own session, so every script re-asserts the
+# read-only group before the transaction (mirroring the plan binary's
+# per-connection SET ROLE in staging_migrate.rs): a login that is not a
+# member of the group fails on this line, before anything is read.
+SET_ROLE = f"SET ROLE {DB_ROLE};\n"
+READ_ONLY_5S = (SET_ROLE + "BEGIN READ ONLY;\nSET LOCAL statement_timeout = '5s';\n"
                 "SET LOCAL lock_timeout = '5s';\n")
-READ_ONLY_15S = ("BEGIN READ ONLY;\nSET LOCAL statement_timeout = '15s';\n"
+READ_ONLY_15S = (SET_ROLE + "BEGIN READ ONLY;\nSET LOCAL statement_timeout = '15s';\n"
                  "SET LOCAL lock_timeout = '5s';\n")
-IDENTITY_SQL = READ_ONLY_5S + "SELECT current_user, current_database();\nCOMMIT;\n"
+# session_user is unaffected by SET ROLE, so the membership flag tests the
+# login itself (mirroring refuse_migrator_member_plan_login): a login that
+# could also SET ROLE to the migrator group is not a read-only credential.
+IDENTITY_SQL = (READ_ONLY_5S + "SELECT current_user, current_database(), "
+                f"pg_has_role(session_user, '{MIGRATOR_ROLE}', 'MEMBER');\nCOMMIT;\n")
 # Capability probe, not census evidence: pgcrypto's digest() decides whether
 # the cohort carries a digest or count/min/max only. Casts keep the probe
 # independent of argument-type inference.
@@ -126,7 +144,7 @@ MIGRATIONS_SQL = (
     READ_ONLY_5S
     + "SELECT version, installed_on, success\n"
     + "  FROM _sqlx_migrations\n"
-    + " WHERE version IN (444, 445, 446, 447)\n"
+    + " WHERE version IN (444, 445)\n"
     + " ORDER BY version;\n"
     + "COMMIT;\n"
 )
@@ -170,7 +188,10 @@ COUNTS_SQL = (
 # captures to a single frozen window. A now() bound would move ~900 s
 # between the captures and the oldest-1000 cohort would drift with it, so a
 # live predicate cannot be compared before-vs-after.
-ANCHOR_SQL = (READ_ONLY_5S + "SELECT extract(epoch FROM now())::bigint;\nCOMMIT;\n")
+# floor(), not a bare cast: PostgreSQL rounds a float/numeric epoch to the
+# nearest bigint, so without the floor the upper bound could land up to 0.5 s
+# after the anchor read and admit a sleep-time insert into the after capture.
+ANCHOR_SQL = (READ_ONLY_5S + "SELECT floor(extract(epoch FROM now()))::bigint;\nCOMMIT;\n")
 # Frozen-window margin: the lower bound stays fresher than every retention
 # cutoff until the after-capture (lookahead 900 s + one sleep + margin);
 # the upper bound excludes rows inserted during the sleep.
@@ -298,12 +319,15 @@ def database_target(env):
     database = unquote(parts.path.lstrip("/").split("?", 1)[0])
     if "|" in user:
         raise Refused("refusing: pooler-style usernames are refused; use the direct role login")
-    role = user.rsplit(".", 1)[0] if host.lower().endswith(".psdb.cloud") else user
-    if role != DB_ROLE:
-        raise Refused(f"refusing: the login must be role {DB_ROLE}")
+    if not user:
+        raise Refused("refusing: the database login names no user")
+    # The login name itself is not pinned (mirroring the plan binary): any
+    # bare login passes here, and the server-side guards prove it holds only
+    # the read-only group (SET ROLE must succeed, current_user must be the
+    # group, session_user must not hold the migrator group).
     if host.lower().endswith(".psdb.cloud"):
-        suffix = user.rsplit(".", 1)
-        if len(suffix) != 2 or not suffix[1] or suffix[1].lower() != branch_pin.lower():
+        login, dot, suffix = user.rpartition(".")
+        if not dot or not login or not suffix or suffix.lower() != branch_pin.lower():
             raise Refused("refusing: the database binding does not match the verified branch")
     elif branch_pin:
         raise Refused("refusing: a branch pin only applies to PlanetScale staging hosts")
@@ -416,9 +440,14 @@ def parse_timestamp(value):
 
 def check_identity(output, database_pin):
     rows = csv_rows(output)
-    if rows != [[DB_ROLE, database_pin]]:
+    if len(rows) != 1 or len(rows[0]) != 3 or rows[0][2] not in ("t", "f"):
+        raise ReadFailed("a row had an unexpected shape; nothing was reported")
+    if rows[0][:2] != [DB_ROLE, database_pin]:
         raise Refused(f"refusing: the server does not report role {DB_ROLE} "
                       "on the pinned staging database")
+    if rows[0][2] == "t":
+        raise Refused(f"refusing: the plan login holds the {MIGRATOR_ROLE} group; "
+                      f"the plan binding must be a login that holds only {DB_ROLE}")
 
 
 def parse_migrations(output):
@@ -535,7 +564,17 @@ def run_census(env, psql, clock, sleep_fn):
     pg_env = psql_environment(pg, env)
     if not psql:
         raise Refused("refusing: psql is not installed on this runner")
-    check_identity(run_psql(psql, pg_env, IDENTITY_SQL), database_pin)
+    try:
+        identity_output = run_psql(psql, pg_env, IDENTITY_SQL)
+    except ReadFailed as error:
+        # The identity script runs first and does nothing but SET ROLE plus
+        # one read, so a permission denial here is a non-member login, not a
+        # missing grant: refuse like the plan binary's set-role-denied cause.
+        if "permission denied" in str(error):
+            raise Refused(f"refusing: the plan login cannot activate role {DB_ROLE} "
+                          "(SET ROLE denied)") from None
+        raise
+    check_identity(identity_output, database_pin)
     pgcrypto = probe_pgcrypto(psql, pg_env)
     migrations = parse_migrations(run_psql(psql, pg_env, MIGRATIONS_SQL))
     indexes = parse_indexes(run_psql(psql, pg_env, INDEXES_SQL))

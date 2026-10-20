@@ -184,17 +184,23 @@ three non-secret staging pins via the environment only. There is no artifact
 upload: counts, digests and timestamps never leave the run log and summary.
 No `set -x`, no wrangler, no apply route, no production path.
 
-The script refuses before connecting unless the login names role
-`two_bot_migrator_ro` on the pinned staging database at the pinned staging
-host (pooler endpoints and production-like names refuse; a PlanetScale host
-requires a matching branch pin). It forces libpq `sslmode=verify-full` with
-the runner's system CA bundle, keeps the password out of the process list,
-runs every statement in a `READ ONLY` transaction with statement and lock
-timeouts, runs no DDL (no `CREATE EXTENSION`: a missing pgcrypto yields
-count/min/max without a digest), never echoes the client's error text, and
-never invokes retention or activates Execute. Both cohort captures reuse
-one server-anchored window, so the bounds cannot move between them. An
-empty cohort or empty family is a reported limitation, never a pass.
+The script refuses before connecting unless the login is a bare staging
+login on the pinned staging database at the pinned staging host (pooler
+endpoints and production-like names refuse; a PlanetScale host requires a
+matching branch pin). The login is a separate identity holding only
+`two_bot_migrator_ro` (that group is `NOLOGIN`), mirroring the plan binary:
+every connection runs `SET ROLE two_bot_migrator_ro` before its `READ ONLY`
+transaction, the server must then report that role and database, and a
+login holding `two_bot_migrator` refuses. It forces libpq
+`sslmode=verify-full` with the runner's system CA bundle, keeps the
+password out of the process list, runs every statement in a `READ ONLY`
+transaction with statement and lock timeouts, runs no DDL (no `CREATE
+EXTENSION`: a missing pgcrypto yields count/min/max without a digest),
+never echoes the client's error text, and never invokes retention or
+activates Execute. The ledger scope is exactly the two expiry migrations
+(444/445); both cohort captures reuse one server-anchored window, so the
+bounds cannot move between them. An empty cohort or empty family is a
+reported limitation, never a pass.
 
 ## Production route
 

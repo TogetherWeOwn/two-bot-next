@@ -27,7 +27,7 @@ import staging_retention_census as census
 HOST = "staging-direct.neon.example"
 DATABASE = "two_bot"
 PASSWORD = "s3cret-fixture-only"
-GOOD_URL = f"postgres://two_bot_migrator_ro:{PASSWORD}@{HOST}:5432/{DATABASE}"
+GOOD_URL = f"postgres://two_bot_migrator_ro_plan:{PASSWORD}@{HOST}:5432/{DATABASE}"
 
 
 def good_env(**overrides):
@@ -39,7 +39,7 @@ def good_env(**overrides):
     return env
 
 
-IDENTITY_OUT = "two_bot_migrator_ro,two_bot\n"
+IDENTITY_OUT = "two_bot_migrator_ro,two_bot,f\n"
 MIGRATIONS_OUT = ("444,2026-10-19 23:19:00+00,t\n"
                   "445,2026-10-19 23:19:01+00,t\n")
 INDEXES_OUT = ('idx_event_store_expiry_class_time_id,'
@@ -135,6 +135,23 @@ class QueryPinTests(unittest.TestCase):
         self.assertIn("id::text || '|'", query)
         self.assertNotRegex(query, r"(?<!:)id \|\|")
 
+    def test_every_script_asserts_the_read_only_role_first(self):
+        # Every psql invocation is its own session: each script must SET ROLE
+        # before its transaction, exactly once, or a later script could run
+        # as the login instead of the read-only group.
+        for script in self.SCRIPTS:
+            with self.subTest(script=script[:40]):
+                self.assertTrue(script.startswith(census.SET_ROLE))
+                self.assertEqual(script.count("SET ROLE"), 1)
+        self.assertEqual(census.SET_ROLE, "SET ROLE two_bot_migrator_ro;\n")
+
+    def test_identity_reports_current_user_and_migrator_membership(self):
+        # current_user proves SET ROLE took effect; the session_user flag
+        # proves the login itself holds no path into the migrator group.
+        self.assertIn("SELECT current_user, current_database(),", census.IDENTITY_SQL)
+        self.assertIn("pg_has_role(session_user, 'two_bot_migrator', 'MEMBER')",
+                      census.IDENTITY_SQL)
+
     def test_cohort_window_is_frozen_on_one_anchor(self):
         # A now() bound would move ~900 s between the captures and the
         # oldest-1000 cohort would drift with it. Both captures reuse one
@@ -149,7 +166,10 @@ class QueryPinTests(unittest.TestCase):
                       predicate)
         self.assertEqual(census.COHORT_MARGIN_SECONDS,
                          900 + census.SLEEP_SECONDS + 120)
-        self.assertIn("extract(epoch FROM now())::bigint", census.ANCHOR_SQL)
+        # floor(), not a bare cast: PostgreSQL rounds a float/numeric epoch,
+        # so without the floor the upper bound could postdate the anchor read.
+        self.assertIn("floor(extract(epoch FROM now()))::bigint", census.ANCHOR_SQL)
+        self.assertNotIn("extract(epoch FROM now())::bigint", census.ANCHOR_SQL)
 
     def test_cohort_predicate_rejects_non_integer_anchors(self):
         for bad in (True, "1760990400", "1; SELECT", 1.5, None):
@@ -164,9 +184,15 @@ class QueryPinTests(unittest.TestCase):
         self.assertEqual(census.SLEEP_SECONDS, 900)
 
     def test_migration_ledger_and_index_scope(self):
+        # Hardcoded, not derived from the constant: 444/445 are the two
+        # expiry migrations in the cutover ledger. 446 lives only in the
+        # store chain's _two_bot_migrations ledger (so it could never appear
+        # here) and 447 is unrelated; either one in this query is a scope bug.
+        self.assertEqual(census.MIGRATION_VERSIONS, (444, 445))
         self.assertIn("_sqlx_migrations", census.MIGRATIONS_SQL)
-        for version in census.MIGRATION_VERSIONS:
-            self.assertIn(str(version), census.MIGRATIONS_SQL)
+        self.assertIn("version IN (444, 445)", census.MIGRATIONS_SQL)
+        self.assertNotIn("446", census.MIGRATIONS_SQL)
+        self.assertNotIn("447", census.MIGRATIONS_SQL)
         for index in (census.CLASS_INDEX, census.TIME_INDEX):
             self.assertIn(index, census.INDEXES_SQL)
 
@@ -176,7 +202,7 @@ class FenceTests(unittest.TestCase):
         pg, host_pin, database_pin = census.database_target(good_env())
         self.assertEqual((host_pin, database_pin), (HOST, DATABASE))
         self.assertEqual(pg["PGHOST"], HOST)
-        self.assertEqual(pg["PGUSER"], "two_bot_migrator_ro")
+        self.assertEqual(pg["PGUSER"], "two_bot_migrator_ro_plan")
         self.assertEqual(pg["PGPASSWORD"], PASSWORD)
         self.assertEqual(pg["PGDATABASE"], DATABASE)
         self.assertEqual(pg["PGSSLMODE"], "verify-full")
@@ -190,6 +216,16 @@ class FenceTests(unittest.TestCase):
         self.assertEqual(pg["PGCHANNELBINDING"], "require")
         self.assertEqual(pg["PGCONNECT_TIMEOUT"], "5")
 
+    def test_login_name_is_not_pinned_only_its_shape(self):
+        # Mirroring the plan binary: any bare login passes the URL fence and
+        # the server-side guards (SET ROLE, current_user, migrator-membership)
+        # prove it holds only the read-only group. The group itself is
+        # NOLOGIN, so the binding username is never the group name.
+        for login in ("two_bot_migrator_ro_plan", "operator_plan_login"):
+            url = f"postgres://{login}:{PASSWORD}@{HOST}:5432/{DATABASE}"
+            pg, _, _ = census.database_target(good_env(**{census.URL_ENV: url}))
+            self.assertEqual(pg["PGUSER"], login)
+
     def test_refusals(self):
         ps_host = "ep-quiet-tree-12345678.us-east-2.aws.psdb.cloud"
         cases = {
@@ -199,23 +235,29 @@ class FenceTests(unittest.TestCase):
             "bad port": {census.URL_ENV: GOOD_URL.replace(":5432/", ":6432/")},
             "pooler host": {census.URL_ENV: GOOD_URL.replace(HOST, "x-pooler.example"),
                              census.HOST_ENV: "x-pooler.example"},
+            "pooler-style username": {
+                census.URL_ENV: f"postgres://two_bot_migrator_ro_plan|bouncer:{PASSWORD}"
+                                f"@{HOST}:5432/{DATABASE}"},
+            "empty username": {census.URL_ENV: f"postgres://:{PASSWORD}@{HOST}:5432/{DATABASE}"},
             "host mismatch": {census.HOST_ENV: "other.example"},
             "prod host": {census.HOST_ENV: "prod-db.example"},
             "prod database": {census.DATABASE_ENV: "two_bot_prod"},
             "empty host pin": {census.HOST_ENV: ""},
             "empty database pin": {census.DATABASE_ENV: "  "},
-            "wrong role": {census.URL_ENV: GOOD_URL.replace("two_bot_migrator_ro", "two_bot")},
-            "no password": {census.URL_ENV: f"postgres://two_bot_migrator_ro@{HOST}:5432/{DATABASE}"},
+            "no password": {census.URL_ENV: f"postgres://two_bot_migrator_ro_plan@{HOST}:5432/{DATABASE}"},
             "database mismatch": {census.URL_ENV: GOOD_URL.replace(f"/{DATABASE}", "/other_db")},
             "extra query param": {census.URL_ENV: GOOD_URL + "?options=-cstatement_timeout%3D0"},
             "bad sslmode": {census.URL_ENV: GOOD_URL + "?sslmode=disable"},
             "bad connect timeout": {census.URL_ENV: GOOD_URL + "?connect_timeout=soon"},
             "planetscale without branch": {
-                census.URL_ENV: f"postgres://two_bot_migrator_ro.pw1234:{PASSWORD}@{ps_host}/{DATABASE}",
+                census.URL_ENV: f"postgres://two_bot_migrator_ro_plan.pw1234:{PASSWORD}@{ps_host}/{DATABASE}",
                 census.HOST_ENV: ps_host},
+            "planetscale without login": {
+                census.URL_ENV: f"postgres://.pw1234:{PASSWORD}@{ps_host}/{DATABASE}",
+                census.HOST_ENV: ps_host, census.BRANCH_ENV: "pw1234"},
             "branch pin on neon": {census.BRANCH_ENV: "pw1234"},
             "malformed branch pin": {
-                census.URL_ENV: f"postgres://two_bot_migrator_ro.pw1234:{PASSWORD}@{ps_host}/{DATABASE}",
+                census.URL_ENV: f"postgres://two_bot_migrator_ro_plan.pw1234:{PASSWORD}@{ps_host}/{DATABASE}",
                 census.HOST_ENV: ps_host, census.BRANCH_ENV: "not a pin!"},
         }
         for label, overrides in cases.items():
@@ -225,12 +267,12 @@ class FenceTests(unittest.TestCase):
 
     def test_planetscale_branch_pin_match(self):
         ps_host = "ep-quiet-tree-12345678.us-east-2.aws.psdb.cloud"
-        url = f"postgres://two_bot_migrator_ro.pw1234:{PASSWORD}@{ps_host}/{DATABASE}"
+        url = f"postgres://two_bot_migrator_ro_plan.pw1234:{PASSWORD}@{ps_host}/{DATABASE}"
         pg, host_pin, _ = census.database_target(
             good_env(**{census.URL_ENV: url, census.HOST_ENV: ps_host,
                         census.BRANCH_ENV: "pw1234"}))
         self.assertEqual(host_pin, ps_host)
-        self.assertEqual(pg["PGUSER"], "two_bot_migrator_ro.pw1234")
+        self.assertEqual(pg["PGUSER"], "two_bot_migrator_ro_plan.pw1234")
         with self.assertRaises(census.Refused):
             census.database_target(
                 good_env(**{census.URL_ENV: url, census.HOST_ENV: ps_host,
@@ -247,20 +289,31 @@ class FenceTests(unittest.TestCase):
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", merged)
 
     def test_identity_mismatch_refuses(self):
-        with self.assertRaises(census.Refused):
-            census.check_identity("two_bot,two_bot\n", DATABASE)
-        with self.assertRaises(census.Refused):
-            census.check_identity(IDENTITY_OUT, "other_db")
+        for output, database in (("two_bot,two_bot,f\n", DATABASE),
+                                 (IDENTITY_OUT, "other_db"),
+                                 ("two_bot_migrator_ro,two_bot,t\n", DATABASE)):
+            with self.subTest(output=output[:30]):
+                with self.assertRaises(census.Refused):
+                    census.check_identity(output, database)
         census.check_identity(IDENTITY_OUT, DATABASE)  # must not raise
+
+    def test_malformed_identity_fails(self):
+        for output in ("two_bot_migrator_ro,two_bot\n",  # missing flag
+                       "two_bot_migrator_ro,two_bot,maybe\n",
+                       ""):
+            with self.subTest(output=output[:30]):
+                with self.assertRaises(census.ReadFailed):
+                    census.check_identity(output, DATABASE)
 
 
 class ParseTests(unittest.TestCase):
     def test_migrations_map_absent_versions_to_none(self):
         parsed = census.parse_migrations(MIGRATIONS_OUT)
+        self.assertEqual(set(parsed), {444, 445})
         self.assertEqual(parsed[444], ("2026-10-19 23:19:00+00", True))
         self.assertEqual(parsed[445], ("2026-10-19 23:19:01+00", True))
-        self.assertIsNone(parsed[446])
-        self.assertIsNone(parsed[447])
+        partial = census.parse_migrations("444,2026-10-19 23:19:00+00,t\n")
+        self.assertIsNone(partial[445])
 
     def test_migration_failures_are_data_not_refusals(self):
         parsed = census.parse_migrations("444,2026-10-19 23:19:00+00,f\n")
@@ -269,6 +322,8 @@ class ParseTests(unittest.TestCase):
     def test_malformed_migrations_fail(self):
         for output in ("444,2026-10-19 23:19:00+00\n",  # short row
                        "999,2026-10-19 23:19:00+00,t\n",  # out of scope
+                       "446,2026-10-19 23:19:00+00,t\n",  # store ledger, not this one
+                       "447,2026-10-19 23:19:00+00,t\n",  # unrelated migration
                        "444,not-a-time,t\n",
                        "444,2026-10-19 23:19:00+00,yes\n",
                        MIGRATIONS_OUT + MIGRATIONS_OUT):  # duplicate
@@ -373,8 +428,10 @@ class CensusRunTests(unittest.TestCase):
         self.assertIn("sleeping 900s", printed)
         self.assertIn("observed_before: 2026-10-20T21:00:00.000Z", report)
         self.assertIn("observed_after: 2026-10-20T21:15:05.000Z", report)
-        self.assertIn("444 applied success 2026-10-19 23:19:00+00", report)
-        self.assertIn("446 not applied", report)
+        self.assertIn("migrations: 444 applied success 2026-10-19 23:19:00+00; "
+                        "445 applied success 2026-10-19 23:19:01+00", report)
+        self.assertNotIn("446", report)
+        self.assertNotIn("447", report)
         self.assertIn(f"{census.CLASS_INDEX} present", report)
         self.assertIn(f"{census.TIME_INDEX} absent", report)
         self.assertIn("PRESENCE_UPDATE: eligible_old=7 fresh=900 total=907", report)
@@ -478,6 +535,45 @@ class CensusRunTests(unittest.TestCase):
                                   lambda: datetime.now(timezone.utc),
                                   lambda seconds: None)
         self.assertIn("permission denied", str(raised.exception))
+
+    def test_identity_gate_runs_inside_run_census(self):
+        # The server-identity check is the fence proving the connection
+        # landed on the pinned role and database with a read-only login.
+        # Deleting the check_identity call (or neutering it) must turn this
+        # red: a wrong identity refuses before the migrations query runs.
+        for output in ("two_bot,two_bot,f\n",  # SET ROLE did not take effect
+                       "two_bot_migrator_ro,other_db,f\n",  # wrong database
+                       "two_bot_migrator_ro,two_bot,t\n"):  # migrator member
+            with self.subTest(output=output[:30]):
+                fake = canned_run([("current_user", output)])
+                with mock.patch("subprocess.run", fake):
+                    with self.assertRaises(census.Refused):
+                        census.run_census(good_env(), "psql",
+                                          lambda: datetime.now(timezone.utc),
+                                          lambda seconds: None)
+                self.assertEqual([script for script, _ in fake.calls],
+                                 [census.IDENTITY_SQL])
+
+    def test_set_role_denial_refuses(self):
+        # A login that is not a member of the read-only group fails on the
+        # SET ROLE line of the identity script: that is a credential-shape
+        # refusal (like the plan binary's set-role-denied cause), not a
+        # read failure, and nothing further is issued.
+        calls = []
+
+        def set_role_denied(command, input=None, **kwargs):
+            calls.append(input)
+            return subprocess.CompletedProcess(
+                command, 3, "",
+                "ERROR: permission denied to set role \"two_bot_migrator_ro\"\n")
+
+        with mock.patch("subprocess.run", set_role_denied):
+            with self.assertRaises(census.Refused) as raised:
+                census.run_census(good_env(), "psql",
+                                  lambda: datetime.now(timezone.utc),
+                                  lambda seconds: None)
+        self.assertIn("SET ROLE denied", str(raised.exception))
+        self.assertEqual(calls, [census.IDENTITY_SQL])
 
 
 class MainTests(unittest.TestCase):
