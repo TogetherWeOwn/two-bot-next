@@ -38,7 +38,33 @@ const SEED_VERSIONS: [i64; 29] = [
 
 fn url_allowed(url: &str, github_actions: bool) -> bool {
     url == "postgres://agent_test@agent-testdb:5432/agent_test"
-        || (github_actions && url == "postgres://agent_test@127.0.0.1:5432/agent_test")
+        || (github_actions
+            && matches!(
+                url,
+                "postgres://agent_test@127.0.0.1:5432/agent_test"
+                    | "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci"
+            ))
+}
+
+#[cfg(test)]
+mod url_guard_tests {
+    use super::url_allowed;
+
+    #[test]
+    fn accepts_ci_coverage_database() {
+        assert!(url_allowed(
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+            true
+        ));
+        assert!(!url_allowed(
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+            false
+        ));
+        assert!(!url_allowed(
+            "postgres://agent_test@other-host:5432/two_bot_test_ci",
+            true
+        ));
+    }
 }
 
 fn admin_options(host: &str, database: &str) -> PgConnectOptions {
