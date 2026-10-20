@@ -1716,10 +1716,10 @@ def production_errors(workflow):
         errors.append(f"{name}: production must run on dispatch, staging completion or schedule only")
     else:
         run_trigger = (on.get("workflow_run") or {})
-        if (run_trigger.get("workflows") != ["deploy-staging"]
+        if (run_trigger.get("workflows") != ["deploy-staging", "check"]
                 or run_trigger.get("types") != ["completed"]
                 or run_trigger.get("branches") != ["main"]):
-            errors.append(f"{name}: workflow_run must be a completed deploy-staging run on main only")
+            errors.append(f"{name}: workflow_run must be a completed deploy-staging or check run on main only")
         if not isinstance(on.get("schedule"), list) or not on.get("schedule"):
             errors.append(f"{name}: schedule must carry the daily backstop")
     jobs = workflow.get("jobs", {})
@@ -3129,6 +3129,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
+    def test_lfg_runtime_regressions_receive_disposable_database_url(self):
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-stores"]
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "LFG actual-router and mock-Discord regressions"
+        )
+        # The fixture guard rejects any URL whose database is not two_bot_test_*.
+        self.assertEqual(
+            step["env"]["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        # Main may add more targets to this shared step; pin its LFG target and
+        # serial ignored-test tail without freezing the entire command line.
+        self.assertRegex(
+            step["run"],
+            r"--test lfg_interactions(?: --test \S+)* -- --ignored --test-threads=1",
+        )
+
     def test_runtime_postgres_wal_budget_is_bounded(self):
         # Keep the broader runtime-lane budget from main; the smaller target is
         # specific to the longer rust-tests coverage replay.
@@ -3161,7 +3179,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("--features two-bot-core/db", step["run"])
         self.assertIn("--lib --bins --tests", step["run"])
         self.assertIn(
-            "--no-report -- --ignored --test-threads=1",
+            "--no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs",
             step["run"],
         )
         self.assertIn(
@@ -3261,16 +3279,6 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
-        staging_source = (
-            ROOT / "crates/cutover/tests/staging_migrate_db.rs"
-        ).read_text()
-        staging_tests = re.findall(
-            r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', staging_source
-        )
-        self.assertTrue(staging_tests, "guarded staging fixtures must be discovered")
-        for test_name in staging_tests:
-            with self.subTest(test_name=test_name):
-                self.assertIn(f"--skip {test_name}", ignored_sweeps[0])
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
@@ -3304,6 +3312,18 @@ class WorkflowTests(unittest.TestCase):
             "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only",
             main_sweep,
         )
+        # Staging fixtures accept only the exact agent_test URL; they run in
+        # the dedicated staging_migrate_db re-run below, never in this
+        # two_bot_test_ci sweep. Enumerate from the Rust source so a future
+        # seventh fixture cannot silently rejoin.
+        staging_source = (ROOT / "crates/cutover/tests/staging_migrate_db.rs").read_text()
+        staging_names = set(re.findall(r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', staging_source))
+        self.assertTrue(staging_names, "guarded ignored fixtures must be discovered")
+        # Match complete tokens: a suffixed filter would not skip the fixture.
+        broad_skips = set(re.findall(r"--skip (\S+)", ignored_sweeps[0]))
+        for name in sorted(staging_names):
+            with self.subTest(staging_skip=name):
+                self.assertIn(name, broad_skips)
         ignored_sweep = [run for run in sweeps if "-- --ignored" in run][0]
         self.assertIn(
             "--skip list_is_guild_scoped_selector_shaped_and_read_only",
@@ -3345,6 +3365,10 @@ class WorkflowTests(unittest.TestCase):
                     self.assertIn("--features db", matches[0])
                 else:
                     self.assertNotIn("--features db", matches[0])
+                if needle == "--test staging_migrate_db":
+                    for name in sorted(staging_names):
+                        with self.subTest(dedicated_no_skip=name):
+                            self.assertNotIn(f"--skip {name}", matches[0])
         env_wrapped = [
             run for run in cov_runs
             if run.startswith('cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV"')

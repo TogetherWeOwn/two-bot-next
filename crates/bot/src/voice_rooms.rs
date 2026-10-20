@@ -1472,6 +1472,12 @@ pub struct GuildSnapshot {
     pub member_roles: HashMap<Snowflake, Vec<Snowflake>>,
 }
 
+/// Exact gateway evidence used to build a whole-entry overwrite write.
+struct OverwriteSnapshot {
+    generation: u64,
+    overwrites: Vec<PermissionOverwrite>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinTicket {
     member_id: Snowflake,
@@ -2333,10 +2339,27 @@ impl LiveGuild {
         live.empty_since.remove(&channel);
     }
 
-    /// Guard one step of an owner-overwrite sequence. The exact overwrite
+    /// Unknown overwrites are not an empty ACL. Capture ready, known evidence
+    /// for a member grant/revoke before any awaited persistence or transport.
+    fn overwrite_snapshot(&self, channel_id: Snowflake) -> Option<OverwriteSnapshot> {
+        let live = self.read_state();
+        if !live.ready {
+            return None;
+        }
+        Some(OverwriteSnapshot {
+            generation: live.generation,
+            overwrites: live
+                .channels
+                .get(&channel_id)?
+                .permission_overwrites
+                .clone()?,
+        })
+    }
+
+    /// Guard one step of an overwrite sequence. The exact overwrite
     /// snapshot fences unrelated gateway changes while allowing a successful
     /// step's own CHANNEL_UPDATE echo to advance the channel revision.
-    fn owner_overwrite_guard(
+    fn overwrite_guard(
         &self,
         channel_id: Snowflake,
         generation: u64,
@@ -2351,7 +2374,7 @@ impl LiveGuild {
                     channel
                         .permission_overwrites
                         .as_deref()
-                        .is_some_and(|current| same_owner_overwrite_snapshot(current, &expected))
+                        .is_some_and(|current| same_overwrite_snapshot(current, &expected))
                 })
                 && state
                     .permissions(live.guild_id, channel_id)
@@ -2364,7 +2387,7 @@ impl LiveGuild {
     /// Advance the cached snapshot after a successful target write. Discord
     /// may have echoed the write already; accept either the prior or resulting
     /// overwrite set, but never overwrite a different gateway observation.
-    fn advance_owner_overwrites(
+    fn advance_overwrites(
         &self,
         channel_id: Snowflake,
         generation: u64,
@@ -2372,7 +2395,10 @@ impl LiveGuild {
         after: &[PermissionOverwrite],
     ) -> bool {
         let mut live = self.write_state();
-        if !live.ready || live.generation != generation {
+        if !live.ready
+            || live.generation != generation
+            || !private_runtime::can_edit_overwrites(live.permissions(self.guild_id, channel_id))
+        {
             return false;
         }
         let Some(channel) = live.channels.get_mut(&channel_id) else {
@@ -2381,10 +2407,10 @@ impl LiveGuild {
         let Some(current) = channel.permission_overwrites.as_deref() else {
             return false;
         };
-        if same_owner_overwrite_snapshot(current, after) {
+        if same_overwrite_snapshot(current, after) {
             return true;
         }
-        if !same_owner_overwrite_snapshot(current, before) {
+        if !same_overwrite_snapshot(current, before) {
             return false;
         }
         channel.permission_overwrites = Some(after.to_vec());
@@ -2493,10 +2519,7 @@ fn health_overwrites(guild_id: Snowflake, channel: &Channel) -> Vec<HealthOverwr
         .collect()
 }
 
-fn same_owner_overwrite_snapshot(
-    left: &[PermissionOverwrite],
-    right: &[PermissionOverwrite],
-) -> bool {
+fn same_overwrite_snapshot(left: &[PermissionOverwrite], right: &[PermissionOverwrite]) -> bool {
     left.len() == right.len() && left.iter().all(|overwrite| right.contains(overwrite))
 }
 
@@ -2550,9 +2573,9 @@ async fn write_owner_overwrite_delta<H: RoomWrites>(
         next.retain(|overwrite| {
             !(overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == member)
         });
-        let guard = live.owner_overwrite_guard(channel, generation, current.clone());
+        let guard = live.overwrite_guard(channel, generation, current.clone());
         http.delete_overwrite(channel, member, guard).await?;
-        if !live.advance_owner_overwrites(channel, generation, &current, &next) {
+        if !live.advance_overwrites(channel, generation, &current, &next) {
             return Err(RoomHttpError::Cancelled);
         }
         current = next;
@@ -2567,14 +2590,14 @@ async fn write_owner_overwrite_delta<H: RoomWrites>(
         } else {
             next.push(overwrite);
         }
-        let guard = live.owner_overwrite_guard(channel, generation, current.clone());
+        let guard = live.overwrite_guard(channel, generation, current.clone());
         http.put_overwrite(channel, overwrite, guard).await?;
-        if !live.advance_owner_overwrites(channel, generation, &current, &next) {
+        if !live.advance_overwrites(channel, generation, &current, &next) {
             return Err(RoomHttpError::Cancelled);
         }
         current = next;
     }
-    if !same_owner_overwrite_snapshot(&current, after) {
+    if !same_overwrite_snapshot(&current, after) {
         return Err(RoomHttpError::Cancelled);
     }
     Ok(())

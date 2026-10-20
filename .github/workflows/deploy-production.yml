@@ -1,9 +1,12 @@
 name: deploy-production
 
 # Production deploy and rollback, plus automatic promotion of green staging.
-# Triggers: manual dispatch, a completed deploy-staging run on main
+# Triggers: manual dispatch, a completed deploy-staging or check run on main
 # (`workflow_run`), and a daily schedule backstop. Never runs on push or
-# pull_request. An automatic run promotes exactly what a manual dispatch with
+# pull_request. Staging and CI finish in either order on the same main SHA
+# (10-20: staging green 12:17Z, check.yml 12:40Z), so both completions
+# notify: whichever finishes last promotes, the earlier one skips green
+# (`ci-pending` / `staging-pending`). An automatic run promotes exactly what a manual dispatch with
 # an empty `sha` would: the commit of the latest successful deploy-staging
 # run on main (merges supersede pending staging deploys, so the newest main
 # SHA is rarely staged), after a 30-minute soak past the staging-green time.
@@ -40,7 +43,7 @@ name: deploy-production
 # docs/production-deploy.md.
 on:
   workflow_run: # zizmor: ignore[dangerous-triggers] promotion notifier only: the guard re-resolves the SHA from the API and refuses unless it is on origin/main with green ci-ok, worker check and a successful deploy-staging run, in the protected production Environment
-    workflows: [deploy-staging]
+    workflows: [deploy-staging, check]
     types: [completed]
     branches: [main]
   # Daily backstop: promotes a staged-then-soaked commit the workflow_run
@@ -136,6 +139,10 @@ jobs:
           WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           WORKFLOW_RUN_UPDATED_AT: ${{ github.event.workflow_run.updated_at }}
+          # Which workflow completed (deploy-staging or check) and the event
+          # that started it: a check run counts only when it ran on a push.
+          WORKFLOW_RUN_PATH: ${{ github.event.workflow_run.path }}
+          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
           # Promotion hold with expiry (repo/org variable, ISO-8601 UTC):
           # automatic runs skip green while now is before it. Empty means
           # no hold. Manual dispatch ignores it.
@@ -164,6 +171,10 @@ jobs:
           skip = ""
           soak_seconds = 0
           staging_conclusion = ""
+          # The completed workflow behind a workflow_run trigger: "check"
+          # (check.yml on main) or "staging" (deploy-staging, the default).
+          trigger = ""
+          ci_trigger_sha = ""
           sha = os.environ.get("SHA", "").strip().lower()
           version = os.environ.get("ROLLBACK", "").strip().lower()
           image = os.environ.get("IMAGE", "").strip()
@@ -181,10 +192,28 @@ jobs:
                       print("::error::Refusing production run: "
                             "the completed staging run carries no verifiable head SHA")
                       sys.exit(1)
-                  staging_conclusion = os.environ.get("WORKFLOW_RUN_CONCLUSION", "")
-                  if staging_conclusion != "success":
-                      skip = "staging-not-green"
+                  run_conclusion = os.environ.get("WORKFLOW_RUN_CONCLUSION", "")
+                  run_path = os.environ.get("WORKFLOW_RUN_PATH", "").strip()
+                  trigger = "check" if run_path.split("@")[0] == ".github/workflows/check.yml" else "staging"
+                  if trigger == "staging":
+                      staging_conclusion = run_conclusion
+                      if staging_conclusion != "success":
+                          skip = "staging-not-green"
+                          sha = run_sha
+                  elif run_conclusion != "success":
+                      # A red CI completion promotes nothing; its SHA can
+                      # never pass the ci-ok gate below anyway.
+                      skip = "ci-not-green"
                       sha = run_sha
+                  elif os.environ.get("WORKFLOW_RUN_EVENT", "") != "push":
+                      # Only main's push CI vouches for a commit; a PR run
+                      # from a branch that happens to be named main does not.
+                      skip = "ci-not-push"
+                      sha = run_sha
+                  else:
+                      # Green push CI: promote only when its SHA is the
+                      # latest successful staging deploy (resolved below).
+                      ci_trigger_sha = run_sha
                   # A green completion promotes the LATEST successful staging
                   # deploy (the empty-sha path below), never the triggering
                   # run's SHA: a re-run of an older staging run must not
@@ -247,6 +276,13 @@ jobs:
                   refuse("no successful deploy-staging run on main to promote")
               sha = staged[0]["head_sha"].strip().lower()
               print(f"Promoting the latest successful staging deploy: {sha}")
+              if ci_trigger_sha and sha != ci_trigger_sha:
+                  # CI finished before staging did (or for a commit staging
+                  # superseded): the staging completion, or that commit's own
+                  # CI completion, promotes instead. Never a failure.
+                  print(f"CI-triggered SHA {ci_trigger_sha} is not the latest staged {sha}")
+                  skip = "staging-pending"
+                  sha = ci_trigger_sha
           if not re.fullmatch(r"[0-9a-f]{40}", sha):
               # Accept an unambiguous 7-39 character hex prefix: resolve it to
               # the full commit via the commits API, then run every downstream
@@ -329,25 +365,37 @@ jobs:
                   refuse("live production build revision does not match requested SHA")
           if os.environ.get("GITHUB_REF") != "refs/heads/main":
               refuse("dispatch this workflow from main only")
-          if skip:
-              # A completed-but-unsuccessful staging run promotes nothing: the
-              # run stays green without touching any API beyond this point.
-              # The next green staging run (or the daily backstop) promotes
-              # its own SHA. Every refusal below still applies to green runs.
+          def skip_green(code, reason):
+              """Exit green with nothing promoted: no deploy job runs after this.
+
+              The next qualifying completion (or the daily backstop) promotes.
+              Every refusal still applies to runs that do not skip here.
+              """
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
                   out.write(f"sha={sha}\nmode={mode}\nversion=\nrestore_image=\n"
                             f"takeover={takeover}\nallow_unstaged={allow_unstaged}\n"
-                            f"skip={skip}\nsoak_seconds=0\n"
+                            f"skip={code}\nsoak_seconds=0\n"
                             f"auto={'true' if auto else 'false'}\ngreen_at=\n")
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
                   summary.write(
                       "### Automatic production promotion skipped\n\n"
                       f"- SHA: `{sha}`\n"
-                      f"- Reason: the triggering deploy-staging run concluded `{staging_conclusion}`, "
-                      "not success; nothing to promote\n"
+                      f"- Reason: {reason}; nothing to promote\n"
                   )
-              print(f"skipped: {skip} {sha}")
+              print(f"skipped: {code} {sha}")
               sys.exit(0)
+
+          if skip:
+              # A completed-but-unsuccessful trigger, or CI that finished
+              # before staging, promotes nothing: the run stays green without
+              # touching any API beyond this point.
+              skip_green(skip, {
+                  "staging-not-green": f"the triggering deploy-staging run concluded `{staging_conclusion}`, not success",
+                  "ci-not-green": "the triggering check.yml run did not succeed",
+                  "ci-not-push": "the triggering check.yml run was not a push to main",
+                  "staging-pending": "CI finished on a commit that is not the latest successful staging deploy; "
+                                     "the staging completion promotes it",
+              }.get(skip, skip))
 
           # compare/{sha}...main is `ahead` or `identical` exactly when main
           # contains the SHA, i.e. the SHA is an ancestor of origin/main.
@@ -371,7 +419,7 @@ jobs:
                       break
               refuse(f"could not enumerate {what}; failing closed")
 
-          def latest_ci():
+          def latest_ci(pending_skips=False):
               # ci-ok is created only after its needs finish. Name-only queries
               # can still return an old green aggregate during a newer run.
               # Run numbers stay fixed on rerun; run_attempt increments:
@@ -394,11 +442,17 @@ jobs:
                   for key in ("run_attempt", "check_suite_id")
               ):
                   refuse("could not verify the latest check.yml attempt; failing closed")
+              if pending_skips and current.get("status") != "completed":
+                  # Staging finished before CI: CI's own completion triggers
+                  # this workflow again and promotes. Never a failure.
+                  skip_green("ci-pending", "check.yml is still running on this SHA; its completion promotes it")
               if current.get("status") != "completed" or current.get("conclusion") != "success":
                   refuse(f"check.yml latest run/attempt has no successful completed verdict on {sha}")
               return current
 
-          ci = latest_ci()
+          # Automatic runs skip green while CI is still running (the 10-20
+          # race: 12 refusals); a completed red CI still refuses loudly.
+          ci = latest_ci(pending_skips=auto and mode == "deploy")
           # The attempt endpoint provides check_run_url for each job, so an old
           # aggregate or worker from another run/attempt cannot stand in for it.
           # https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-specific-workflow-run-attempt

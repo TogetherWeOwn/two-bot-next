@@ -29,6 +29,8 @@ mod commands_cli;
 mod community_jobs;
 mod containment_runtime;
 #[cfg(test)]
+mod containment_runtime_evidence_tests;
+#[cfg(test)]
 mod containment_runtime_tests;
 mod database_roles_cli;
 mod db_log;

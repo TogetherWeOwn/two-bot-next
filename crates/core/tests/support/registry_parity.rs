@@ -191,6 +191,39 @@ pub fn expected_registry() -> Value {
                 "Show whether you are opted out and this server's analytics switches.",
                 CommandOptionType::SubCommand,
             ),
+            CommandOption::new(
+                "delete",
+                "Request deletion of your stored data for this server.",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "deletion-status",
+                "Show the status of your deletion request.",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new(
+                    "request-id",
+                    "The request id returned when you requested deletion.",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(128),
+            ]),
+            CommandOption::new(
+                "deletion-receipt",
+                "Show the completed receipt for your deletion request.",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new(
+                    "request-id",
+                    "The request id returned when you requested deletion.",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(128),
+            ]),
         ]),
     )
     .expect("privacy serializes");

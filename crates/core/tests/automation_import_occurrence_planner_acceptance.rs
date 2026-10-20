@@ -8,7 +8,7 @@
 mod cases;
 
 use two_bot_core::automation_transfer::{diff_import, max_import_entries, parse_import_document};
-use two_bot_core::custom_commands::builtin_command_names;
+use two_bot_core::custom_commands::reserved_command_names;
 
 fn assert_case(name: &str) {
     let case = cases::cases()
@@ -37,7 +37,7 @@ fn assert_case(name: &str) {
     let diff = diff_import(
         &case.existing,
         &parsed,
-        &builtin_command_names(),
+        &reserved_command_names(),
         parsed.overwrite,
     )
     .expect("bounded acceptance vector plans");
@@ -89,10 +89,26 @@ fn capacity_counts_unique_accepted_names_not_duplicate_occurrences() {
     commands.push(cases::command("fresh-0", "T", None));
     let parsed =
         parse_import_document(&cases::document(commands, false), max).expect("parse at cap");
-    let diff = diff_import(&existing, &parsed, &builtin_command_names(), false)
+    let diff = diff_import(&existing, &parsed, &reserved_command_names(), false)
         .expect("duplicate occurrence must not consume capacity twice");
     assert_eq!(diff.to_create.len(), max - 1);
     assert_eq!(diff.unchanged, ["fresh-0"]);
     assert!(diff.to_update.is_empty());
     assert!(diff.rejected.is_empty());
+}
+
+#[test]
+fn capacity_refuses_one_more_unique_name_at_the_reserved_boundary() {
+    let existing = vec![cases::row("seed", "S", None, true)];
+    let max = max_import_entries();
+    let commands: Vec<_> = (0..max)
+        .map(|i| cases::command(&format!("fresh-{i}"), "T", None))
+        .collect();
+    let parsed = parse_import_document(&cases::document(commands, false), max)
+        .expect("one-over-cap planner fixture fits the import-entry limit");
+
+    assert!(
+        diff_import(&existing, &parsed, &reserved_command_names(), false).is_err(),
+        "one more unique command than the reserved capacity must be refused"
+    );
 }

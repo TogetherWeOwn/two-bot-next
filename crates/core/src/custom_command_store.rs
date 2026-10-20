@@ -36,6 +36,33 @@ pub async fn audit<'c>(
     Ok(())
 }
 
+/// Append an immutable audit fact once. Concurrent/replayed slash outcomes
+/// retain the first row, including its timestamp; other SQL failures propagate.
+/// This deduplicates facts, not Discord execution or delivery attempts.
+pub async fn audit_once<'c>(
+    executor: impl Executor<'c, Database = Postgres>,
+    record: &AuditRecord,
+    id: &str,
+    at_iso: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO automation_audit_log (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::timestamptz)
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(id)
+    .bind(&record.guild_id)
+    .bind(&record.actor_id)
+    .bind(&record.action)
+    .bind(&record.target_key)
+    .bind(&record.outcome)
+    .bind(&record.reason)
+    .bind(at_iso)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Read one audit fact's `(outcome, reason)` by id. Replay paths use this to
 /// return the first result verbatim; `Ok(None)` means no such row (a receipt
 /// predating the summary row, or a rolled-back apply that never committed).

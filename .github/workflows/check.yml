@@ -284,6 +284,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rollback_readiness_probe.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rollback_readiness_input_limits_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill_observation_acceptance.py' -v
 
       - name: staging E2E run-record template (offline)
         run: |
@@ -844,8 +845,6 @@ jobs:
           # share tables and locks, so parallel runs race and
           # --ignore-run-fail would then drop their coverage silently.
           # The reference-docs regen never runs in CI: it rewrites committed docs.
-          # Staging migration fixtures reject the workspace bootstrap URL, so
-          # measure them only in the dedicated re-run below with their guarded URL.
           # These guarded acceptance tests need their own DB URLs: the
           # publication regression and game report run in dedicated steps;
           # reengagement runs below against agent_test. Keep them out of the
@@ -860,10 +859,12 @@ jobs:
           # misattributes as real flakes. The dedicated re-run below stays the
           # fail-closed gate.
           export MEMBER_TESTDB=agent-testdb
+          # These fixtures accept only the exact agent_test URL, not the
+          # two_bot_test_ci URL on this step; they run in their dedicated sweep
+          # below after TWO_TEST_DATABASE_URL is pinned to agent_test.
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail \
-            --no-report -- --ignored --test-threads=1 \
-            --skip regenerate_reference_docs \
+            --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs \
             --skip real_sqlx_runner_cases \
             --skip post_failure_unreadable_ledger_is_unknown_not_empty \
             --skip post_failure_readable_ledger_keeps_array_output \
@@ -1267,6 +1268,8 @@ jobs:
           cargo test -p two-bot-core --features db --locked lfg_store:: -- --ignored --test-threads=1
 
       - name: LFG actual-router and mock-Discord regressions
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: >-
           cargo test -p two-bot-discord --features db --locked --test lfg_interactions --test lfg_nonce_malformed_history_acceptance -- --ignored --test-threads=1
 
