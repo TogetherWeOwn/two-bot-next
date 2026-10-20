@@ -1,4 +1,4 @@
-import type { Sample } from "./alert-rules.ts";
+import { processIncarnation, type Sample } from "./alert-rules.ts";
 
 /** Required inputs consumed by alert rules; pinned to metrics.rs in tests. */
 export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
@@ -60,6 +60,8 @@ export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly
   two_bot_voice_vote_kick_total: { outcome: ["started", "evidence_unavailable", "not_a_room", "initiator_not_occupant", "target_not_occupant", "self_target", "protected_target", "privileged_target", "authority_unavailable", "active_vote_exists", "cooldown", "initiator_limited", "reused_vote_id", "unknown_vote", "wrong_vote_boundary", "ineligible_voter", "repeated_vote", "invalid_time", "connect_denied_and_disconnected", "connect_denied_target_absent", "skipped_room_gone", "skipped_target_protected", "permission_missing", "discord_error", "gave_up", "other"] },
   two_bot_eventsub_classified_total: { kind: ["challenge", "notification", "revocation", "tampered", "ignored", "other"] },
   two_bot_event_store_consumer_lag_seconds: {},
+  // Same-scrape lifecycle evidence; old containers may omit the whole family.
+  two_bot_process_incarnation: { part: ["0", "1", "2", "3"] },
 };
 
 /** Every series the validator checks: required plus optional-when-present. */
@@ -128,5 +130,7 @@ export function parseAlertScrape(text: string): Sample[] | null {
     }
     samples.push({ name, labels, value });
   }
+  const incarnation = samples.filter((sample) => sample.name === "two_bot_process_incarnation");
+  if (incarnation.length > 0 && processIncarnation(incarnation) === undefined) return null;
   return [...REQUIRED_INPUTS].every((key) => seen.has(key)) ? samples : null;
 }

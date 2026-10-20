@@ -7,8 +7,12 @@ use std::sync::Mutex;
 mod admission_config_acceptance;
 #[path = "voice_admission_spawn_tests.rs"]
 mod admission_spawn;
+#[path = "voice_boot_settings_acceptance_tests.rs"]
+mod boot_settings_acceptance;
 #[path = "voice_cold_authority_tests.rs"]
 mod cold_authority;
+#[path = "voice_creation_receipt_acceptance_tests.rs"]
+mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_empty_grace_override_tests.rs"]
@@ -19,6 +23,8 @@ mod invite_override;
 mod invite_responder_wiring;
 #[path = "voice_join_requests_tests.rs"]
 mod join;
+#[path = "voice_join_grant_witness_acceptance_tests.rs"]
+mod join_grant_witness_acceptance;
 #[path = "voice_kick_tests.rs"]
 mod kick;
 #[path = "voice_rooms_limit_tests.rs"]
@@ -704,7 +710,12 @@ impl RoomPersistence for Store {
     async fn join_grants(&self, _: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
         Ok(self.join_grants.lock().unwrap().clone())
     }
-    async fn save_join_grant(&self, _: u64, room: u64, member: u64) -> Result<bool, StoreError> {
+    async fn save_join_grant(
+        &self,
+        _: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<JoinGrantIntent, StoreError> {
         self.trace
             .lock()
             .unwrap()
@@ -713,15 +724,20 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         if !self.rooms.lock().unwrap().contains_key(&room) {
-            return Ok(false);
+            return Ok(JoinGrantIntent::RoomMissing);
         }
-        self.join_grants
+        let inserted = self
+            .join_grants
             .lock()
             .unwrap()
             .entry(room)
             .or_default()
             .insert(member);
-        Ok(true)
+        Ok(if inserted {
+            JoinGrantIntent::Fresh
+        } else {
+            JoinGrantIntent::Retained
+        })
     }
     async fn remove_join_grant(&self, _: u64, room: u64, member: u64) -> Result<(), StoreError> {
         self.trace

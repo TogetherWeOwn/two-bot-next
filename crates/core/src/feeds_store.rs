@@ -1,5 +1,8 @@
 //! SQLx persistence for feeds. Claims are fenced and guild-scoped; uncertain
 //! sends stay pending for nonce reconciliation rather than being blindly retried.
+//! Relay removal and delivery admission share one bounded guild/feed-scoped
+//! database fence, so a held send can never outlive a confirmed removal and
+//! removal can never cascade away unresolved send evidence.
 
 use crate::automation_quota::{lock_quota, AutomationQuota};
 use crate::feeds::{
@@ -85,16 +88,88 @@ pub async fn remove_feed(
     pool: &Pool<Postgres>,
     guild_id: &str,
     id: &str,
-) -> Result<bool, FeedStoreError> {
-    Ok(
-        sqlx::query("DELETE FROM feed_relays WHERE guild_id = $1 AND id = $2")
-            .bind(guild_id)
-            .bind(id)
-            .execute(pool)
-            .await?
-            .rows_affected()
-            == 1,
+) -> Result<FeedRemoval, FeedStoreError> {
+    let mut tx = pool.begin().await?;
+    lock_feed_delivery(&mut tx, guild_id, id).await?;
+    // Under the fence: refuse while unresolved pending delivery evidence
+    // remains, so the `ON DELETE CASCADE` ledger can never delete
+    // uncertainty. Only settled or never-pending relays are deleted.
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM feed_deliveries d JOIN feed_relays f ON f.id = d.feed_id
+         WHERE d.feed_id = $1 AND f.guild_id = $2 AND d.state = 'pending'",
     )
+    .bind(id)
+    .bind(guild_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if pending > 0 {
+        tx.rollback().await?;
+        return Ok(FeedRemoval::RecoveryRequired);
+    }
+    let removed = sqlx::query("DELETE FROM feed_relays WHERE guild_id = $1 AND id = $2")
+        .bind(guild_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+        == 1;
+    tx.commit().await?;
+    Ok(if removed {
+        FeedRemoval::Removed
+    } else {
+        FeedRemoval::Missing
+    })
+}
+
+/// Outcome of an attempted relay removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedRemoval {
+    /// The relay existed, carried no unresolved pending delivery evidence,
+    /// and was deleted; its settled ledger cascades with it.
+    Removed,
+    /// No relay with that id exists in this guild; nothing was deleted.
+    Missing,
+    /// The relay exists but carries unresolved pending delivery evidence.
+    /// Relay and ledger are retained for nonce reconciliation; the member
+    /// waits for recovery instead of reposting or removing.
+    RecoveryRequired,
+}
+
+/// Serialize relay removal against delivery admission for one guild/feed.
+///
+/// Both sides hold this transaction-scoped advisory lock only across short
+/// database statements — never across network IO. Removal's pending check
+/// plus delete run atomically under it; a fresh claim's relay-existence
+/// revalidation runs under it too. The lock orders the two: either the
+/// claim lands first and removal sees its pending row (refusal), or removal
+/// deletes first and admission finds no relay (no claim, no POST). A held
+/// send can therefore never outlive a confirmed removal, and removal can
+/// never cascade away a pending claim's recovery evidence. Takeover of an
+/// existing pending row and token-fenced settlement need no lock: a pending
+/// row already forces refusal, and settlement only flips such a row.
+///
+/// `lock_timeout`/`statement_timeout` mirror the cutover retention `SET
+/// LOCAL` precedent: a stuck holder fails this attempt fast as an isolated
+/// retryable store error instead of pinning a pooled connection.
+async fn lock_feed_delivery(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    guild_id: &str,
+    feed_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '15s'")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("feed-delivery:{guild_id}:{feed_id}"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// Single-statement conflict arbitration. The arbiter is intentionally
@@ -144,6 +219,12 @@ pub async fn claim_fresh_delivery(
     if token.is_empty() {
         return Err(FeedStoreError::EmptyClaimToken);
     }
+    // Admission shares the removal fence: the relay-existence revalidation
+    // in the INSERT below runs mutually excluded with removal's pending
+    // check plus delete, so a stale polled row can never claim (and POST)
+    // after removal has confirmed.
+    let mut tx = pool.begin().await?;
+    lock_feed_delivery(&mut tx, guild_id, &post.feed_id).await?;
     let inserted = sqlx::query(
         "INSERT INTO feed_deliveries
          (feed_id, item_key, nonce, state, first_seen_at, claim_token, claimed_at)
@@ -159,9 +240,10 @@ pub async fn claim_fresh_delivery(
     .bind(now_ms)
     .bind(guild_id)
     .bind(&post.channel_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
+    tx.commit().await?;
     Ok((inserted == 1).then_some(DeliveryClaim::Fresh))
 }
 

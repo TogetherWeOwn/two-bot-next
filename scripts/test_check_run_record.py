@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_run_record as checker  # noqa: E402
@@ -297,7 +298,9 @@ class RunRecordValidatorTests(unittest.TestCase):
         errors = checker.validate(record, SCHEMA, allow_mock=True)
         self.assert_no_sentinel(sentinel, "\n".join(errors), out, err)
         self.assertEqual(code, 1)
-        self.assertEqual(errors, ["$.tester: unexpected field '[redacted-key]'"])
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(errors[0].startswith(
+            "$.tester.[redacted-key]: public-safety scan hit "))
         # Custom schemas may name such a key as a property or required field.
         schema = {"required": [sentinel], "properties": {sentinel: {"type": "object"}}}
         errors = checker.validate({}, schema)
@@ -305,7 +308,215 @@ class RunRecordValidatorTests(unittest.TestCase):
         self.assertEqual(errors, ["$: missing required field '[redacted-key]'"])
         errors = checker.validate({sentinel: "ok"}, schema)
         self.assert_no_sentinel(sentinel, "\n".join(errors))
-        self.assertEqual(errors, ["$.[redacted-key]: expected object, got str"])
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(errors[0].startswith(
+            "$.[redacted-key]: public-safety scan hit "))
+
+    def test_secret_keys_rejected_across_every_marker_family_and_depth(self):
+        # Keys, not their innocent values, must trigger the same public-safety
+        # refusal. Split synthetic markers so no credential literal is stored.
+        prefixes = (
+            ("tracker-one", "TO" + "G-12345 "),
+            ("tracker-two", "PA" + "P-12345 "),
+            ("github-classic", "gh" + "p_"),
+            ("github-oauth", "gh" + "o_"),
+            ("github-fine", "github" + "_pat_"),
+            *(("slack-" + kind, "xo" + "x" + kind + "-") for kind in "bpras"),
+            *(("private-" + kind.strip(), "BEGIN " + kind + "PRIVATE KEY ")
+              for kind in ("", "RSA ", "EC ", "OPENSSH ")),
+            ("discord", "Discord " + "token="),
+            ("discord-lower", "discord " + "Token:"),
+        )
+        for label, prefix in prefixes:
+            sentinel = prefix + "KeyPayloadNeverEcho42"
+            self.assertTrue(any(marker.search(sentinel) for marker in checker.SECRET_MARKERS),
+                            "every key fixture must match an existing marker")
+            for depth, document, path in (
+                ("root", {sentinel: "innocent"}, "$.[redacted-key]"),
+                ("object", {"outer": {sentinel: None}}, "$.outer.[redacted-key]"),
+                ("array", {"outer": [{sentinel: 7}]}, "$.outer[0].[redacted-key]"),
+            ):
+                with self.subTest(family=label, depth=depth):
+                    errors = checker.validate(document, {}, allow_mock=True)
+                    joined = "\n".join(errors)
+                    self.assertFalse(sentinel in joined, "secret key leaked")
+                    self.assertFalse("KeyPayloadNeverEcho42" in joined, "key payload leaked")
+                    self.assertEqual(len(errors), 1, "secret key must be refused once")
+                    self.assertTrue(errors[0].startswith(
+                        path + ": public-safety scan hit "), "refusal must name a redacted path")
+
+    def test_safe_keys_remain_valid_and_values_remain_scanned(self):
+        self.assertEqual(checker.validate({"outer": [{"safe_key": "innocent"}]}, {}), [])
+        sentinel = "gh" + "p_" + "KeyPayloadNeverEcho42"
+        errors = checker.validate({"outer": [{"safe_key": sentinel}]}, {})
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(errors[0].startswith("$.outer[0].safe_key: public-safety scan hit "))
+        self.assertFalse(sentinel in "\n".join(errors), "secret value leaked")
+
+    def document_byte_limit(self):
+        # Default handoff budget: 1 MiB, far above either checked-in fixture.
+        # A published MAX_DOCUMENT_BYTES lets the implementation choose its
+        # finite budget without changing protected boundary tests.
+        limit = getattr(checker, "MAX_DOCUMENT_BYTES", 1024 * 1024)
+        self.assertIsInstance(limit, int)
+        self.assertGreater(limit, max(len(json.dumps(MOCK)), len(json.dumps(SCHEMA))))
+        self.assertLessEqual(limit, 16 * 1024 * 1024, "offline fixture budget must stay bounded")
+        return limit
+
+    def assert_byte_limit_refusal(self, record, schema, kind):
+        code, out, err = self.cli(record, schema)
+        # Fixed, content-free diagnostic, not a parse error or traceback.
+        self.assertEqual(code, 1)
+        self.assertTrue(out.rstrip().endswith(
+            f"cannot load {kind}: document exceeds byte limit"),
+            "oversize input must have a fixed byte-limit refusal before parsing")
+        self.assertEqual(err, "")
+        self.assertFalse("ReadPayloadNeverEcho42" in out, "oversize content leaked")
+
+    def test_document_reader_never_requests_an_unbounded_read(self):
+        limit = self.document_byte_limit()
+        test = self
+
+        class BudgetedReader:
+            # Wrap real file IO, not the decoder. Even a file that was small
+            # at stat time can grow: a post-read length check is too late.
+            def __init__(self, stream):
+                self.stream = stream
+                self.consumed = 0
+
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+            def read(self, size=-1):
+                test.assertGreaterEqual(size, 0, "document reader requested an unbounded read")
+                test.assertLessEqual(size, limit + 1, "read request exceeds cap plus EOF witness")
+                data = self.stream.read(size)
+                self.consumed += len(data)
+                test.assertLessEqual(self.consumed, limit + 1, "document reader consumed beyond cap")
+                return data
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+        with tempfile.TemporaryDirectory(dir=os.getenv("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            path = Path(tmp) / "document.json"
+            path.write_bytes(b'{"safe": true}')
+            real_open = Path.open
+
+            def budgeted_open(open_path, *args, **kwargs):
+                return BudgetedReader(real_open(open_path, *args, **kwargs))
+
+            with patch.object(Path, "open", budgeted_open):
+                self.assertEqual(checker.load_document(path), {"safe": True})
+
+    def test_record_read_refuses_one_byte_over_cap_before_parsing(self):
+        limit = self.document_byte_limit()
+        # Invalid UTF-8 at the last byte must not win over the size refusal.
+        oversized = b" " * limit + b"\xff"
+        self.assert_byte_limit_refusal(oversized, None, "record")
+
+    def test_schema_read_refuses_one_byte_over_cap_before_parsing(self):
+        limit = self.document_byte_limit()
+        self.assert_byte_limit_refusal(json.dumps(MOCK), b" " * limit + b"\xff", "schema")
+
+    def test_oversized_valid_record_and_schema_are_not_accepted(self):
+        limit = self.document_byte_limit()
+        for kind in ("record", "schema"):
+            with self.subTest(kind=kind):
+                document = copy.deepcopy(MOCK if kind == "record" else SCHEMA)
+                padding = "ReadPayloadNeverEcho42" + "a" * limit
+                if kind == "record":
+                    document["verdict"]["summary"] = padding
+                else:
+                    document["description"] = padding
+                text = json.dumps(document)
+                record, schema = (text, None) if kind == "record" else (json.dumps(MOCK), text)
+                self.assert_byte_limit_refusal(record, schema, kind)
+
+    def test_exact_byte_cap_and_one_below_still_load(self):
+        limit = self.document_byte_limit()
+        record = json.dumps(MOCK).encode("utf-8")
+        schema = json.dumps(SCHEMA).encode("utf-8")
+        for size in (limit - 1, limit):
+            for kind in ("record", "schema"):
+                with self.subTest(size=size, kind=kind):
+                    record_bytes = record + b" " * (size - len(record)) if kind == "record" else record
+                    schema_bytes = schema + b" " * (size - len(schema)) if kind == "schema" else schema
+                    code, out, err = self.cli(record_bytes, schema_bytes)
+                    self.assertEqual(code, 0)
+                    self.assertIn("valid staging E2E run record", out)
+                    self.assertEqual(err, "")
+
+    def test_byte_cap_counts_encoded_bytes_not_unicode_characters(self):
+        limit = self.document_byte_limit()
+        for kind in ("record", "schema"):
+            with self.subTest(kind=kind):
+                document = copy.deepcopy(MOCK if kind == "record" else SCHEMA)
+                # Fewer characters than the cap but more UTF-8 bytes. Use a
+                # known string field so schema rejection cannot fake the cap.
+                if kind == "record":
+                    document["verdict"]["summary"] = "é" * (limit // 2)
+                else:
+                    document["description"] = "é" * (limit // 2)
+                text = json.dumps(document, ensure_ascii=False)
+                self.assertLess(len(text), limit)
+                self.assertGreater(len(text.encode("utf-8")), limit)
+                record, schema = (text, None) if kind == "record" else (json.dumps(MOCK), text)
+                self.assert_byte_limit_refusal(record, schema, kind)
+
+    def test_unsupported_property_condition_operators_are_loudly_refused(self):
+        constraints = (
+            ("enum", {"enum": [True]}),
+            ("pattern", {"pattern": "^pass$"}),
+            ("type", {"type": "boolean"}),
+            ("unknown", {"futureOperator": "ConditionPayloadNeverEcho42"}),
+            ("mixed", {"const": True, "enum": [True]}),
+            ("nonmatching-const", {"const": False, "enum": [True]}),
+        )
+        for label, constraint in constraints:
+            with self.subTest(operator=label):
+                schema = {"allOf": [{
+                    "if": {"properties": {"mock": constraint}}, "then": {},
+                }]}
+                errors = checker.validate(MOCK, schema, allow_mock=True)
+                self.assertTrue(errors, "unsupported condition must not silently satisfy or skip")
+                joined = "\n".join(errors)
+                self.assertIn("unsupported", joined.lower())
+                self.assertIn("condition", joined.lower())
+                self.assertFalse("ConditionPayloadNeverEcho42" in joined, "condition value leaked")
+
+    def test_unsupported_outer_condition_operator_is_refused(self):
+        schema = {"allOf": [{"if": {"required": ["mock"]}, "then": {}}]}
+        errors = checker.validate(MOCK, schema, allow_mock=True)
+        self.assertTrue(errors, "unsupported outer condition must not silently satisfy")
+        self.assertIn("unsupported", "\n".join(errors).lower())
+        self.assertIn("condition", "\n".join(errors).lower())
+
+    def test_cli_reports_unsupported_condition_without_traceback(self):
+        schema = {"allOf": [{
+            "if": {"properties": {"mock": {"enum": [True]}}}, "then": {},
+        }]}
+        code, out, err = self.cli(json.dumps(MOCK), json.dumps(schema))
+        self.assertEqual(code, 1)
+        self.assertIn("unsupported", out.lower())
+        self.assertIn("condition", out.lower())
+        self.assertEqual(err, "")
+
+    def test_supported_const_condition_keeps_true_and_false_branches(self):
+        for value, expected in (
+            (True, ["$: missing required field 'proof'"]), (False, []),
+        ):
+            with self.subTest(const=value):
+                schema = {"allOf": [{
+                    "if": {"properties": {"mock": {"const": value}}},
+                    "then": {"required": ["proof"]},
+                }]}
+                self.assertEqual(checker.validate(MOCK, schema, allow_mock=True), expected)
+        self.assertEqual(checker.validate(MOCK, SCHEMA, allow_mock=True), [])
 
     def test_production_target_rejected(self):
         record = fresh_record()
