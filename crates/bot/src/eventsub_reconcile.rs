@@ -21,6 +21,14 @@
 //! secret value, header, challenge or body byte: only scalar counts, statuses
 //! and error classes.
 //!
+//! Each pass signs creates with the receiver's live snapshot, shared per
+//! pass: the bound receiver owns one `RwLock<WebhookSecret>` (seeded at boot
+//! from the Operator-provisioned secret, swapped by armed refresh), and the
+//! pass clones whatever it holds right now, so creates always carry the
+//! secret the receiver is verifying against. The pass never re-reads boot
+//! env, and a dark receiver means no snapshot and no task rather than a
+//! second secret source.
+//!
 //! Shutdown policy: the latched watch flag is checked before the startup
 //! pass, before every interval pass, and between the Helix calls of a pass
 //! (before the listing, before each plan action, and before the follow-up
@@ -37,15 +45,20 @@
 //! `reconcile_shutdown_drain_exceeded` because an in-flight remote mutation
 //! outcome is then uncertain until the next startup pass.
 
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use two_bot_core::metrics::Metrics;
 use two_bot_core::twitch_eventsub::{
     CallbackUrl, ExistingSubscription, SubscriptionAction, WebhookSecret,
 };
 use two_bot_core::twitch_helix::{
-    plan_boot_actions, webhook_secret_from_env, ActionOutcome, HelixClient, HelixCredentials,
-    HelixError, HelixTransport, HyperHelixTransport, HELIX_TIMEOUT_MS,
+    plan_boot_actions, ActionOutcome, HelixClient, HelixCredentials, HelixError, HelixTransport,
+    HyperHelixTransport, HELIX_TIMEOUT_MS, TWITCH_WEBHOOK_SECRET_ENV,
 };
 
 /// Environment variable carrying the bot's own public callback. Reconcile only
@@ -479,12 +492,30 @@ pub async fn reconcile_all_with_metrics<T: HelixTransport>(
     Ok(summary)
 }
 
-/// One reconcile pass from the process environment: gate, Operator
-/// credentials, callback plus allowlist, then `reconcile_all`. Every refusal
+/// Clone the receiver's live signing snapshot for one pass. The snapshot is
+/// seeded at boot from the Operator-provisioned `TWO_TWITCH_WEBHOOK_SECRET`
+/// (via `EventsubReceiverConfig`) and swapped by armed refresh; the pass
+/// always signs with the secret the receiver is verifying against right now,
+/// never boot env directly. A poisoned lock refuses the pass (the next tick
+/// retries) rather than signing with a torn copy. The error names only the
+/// variable and the runtime cause, never secret material.
+fn snapshot_secret(current: &RwLock<WebhookSecret>) -> Result<WebhookSecret, HelixError> {
+    current
+        .read()
+        .map(|guard| guard.clone())
+        .map_err(|_| HelixError::InvalidCredential {
+            name: TWITCH_WEBHOOK_SECRET_ENV,
+            reason: "in-memory snapshot is unreadable",
+        })
+}
+
+/// One reconcile pass: gate, Operator credentials, callback plus allowlist,
+/// and the receiver's live snapshot, then `reconcile_all`. Every refusal
 /// and failure is logged with an `error_class`; callers need no extra log.
 /// `shutdown` is the process latch the pass checks between Helix calls.
 pub async fn startup_reconcile(
     shutdown: &tokio::sync::watch::Receiver<bool>,
+    secret: &RwLock<WebhookSecret>,
 ) -> Result<ReconcileSummary, HelixError> {
     let vars: HashMap<String, String> = std::env::vars().collect();
     if !gate_open(&vars) {
@@ -528,14 +559,14 @@ pub async fn startup_reconcile(
             return Err(error);
         }
     };
-    let secret = match webhook_secret_from_env() {
+    let secret = match snapshot_secret(secret) {
         Ok(secret) => secret,
         Err(error) => {
             tracing::error!(
                 event = "eventsub_reconcile",
                 error_class = "reconcile_config_invalid",
                 error = %error,
-                "eventsub reconcile refused: webhook secret is missing or invalid"
+                "eventsub reconcile refused: webhook secret snapshot is unreadable"
             );
             return Err(error);
         }
@@ -556,8 +587,8 @@ pub async fn startup_reconcile(
 }
 
 /// One pass; the outcome is already logged inside `startup_reconcile`.
-async fn run_once(shutdown: &tokio::sync::watch::Receiver<bool>) {
-    let _ = startup_reconcile(shutdown).await;
+async fn run_once(shutdown: &tokio::sync::watch::Receiver<bool>, secret: &RwLock<WebhookSecret>) {
+    let _ = startup_reconcile(shutdown, secret).await;
 }
 
 /// Shutdown latch for the interval loop.
@@ -601,11 +632,24 @@ async fn run_loop<P, Fut>(
 
 /// Spawn the reconcile task when `TWO_EVENTSUB` is exactly `1`, returning
 /// its handle so the owner can [`join`] it at shutdown instead of detaching
-/// it. Dark is a parked info log and no handle, never a silent downgrade of
-/// an enabled receiver.
+/// it. `secret` is the bound receiver's live snapshot: every pass clones
+/// whatever it holds right now, so creates always carry the secret the
+/// receiver is verifying against. `None` (dark receiver, no snapshot) parks
+/// with an info log and no handle instead of a second secret source, never
+/// a silent downgrade of an enabled receiver.
 pub fn spawn_if_enabled(
     shutdown: tokio::sync::watch::Receiver<bool>,
+    secret: Option<Arc<RwLock<WebhookSecret>>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(secret) = secret else {
+        tracing::info!(
+            event = "eventsub_reconcile",
+            status = "parked",
+            reason = "receiver_dark",
+            "eventsub reconcile parked: the EventSub receiver is dark, no shared secret snapshot"
+        );
+        return None;
+    };
     if !enabled() {
         tracing::info!(
             event = "eventsub_reconcile",
@@ -621,7 +665,8 @@ pub fn spawn_if_enabled(
         Duration::from_secs(RECONCILE_INTERVAL_SECS),
         move || {
             let shutdown = pass_shutdown.clone();
-            async move { run_once(&shutdown).await }
+            let secret = Arc::clone(&secret);
+            async move { run_once(&shutdown, &secret).await }
         },
     )))
 }
@@ -834,6 +879,49 @@ mod tests {
             load_from_map(&vars(&[(CALLBACK_ENV, "https://hooks.example.com/twitch")]))
                 .expect("missing allowlist parks with an empty list");
         assert!(desired.is_empty());
+    }
+
+    #[test]
+    fn snapshot_secret_returns_the_live_value_after_a_swap() {
+        // The pass clones whatever the receiver holds right now: a rotation
+        // that landed between passes signs the next creates.
+        let current = std::sync::RwLock::new(test_secret());
+        let rotated = WebhookSecret::new("synthetic-webhook-secret-02".to_owned())
+            .expect("fixture secret must parse");
+        *current.write().expect("snapshot lock must be writable") = rotated.clone();
+        assert_eq!(
+            snapshot_secret(&current).expect("live snapshot must read"),
+            rotated
+        );
+    }
+
+    #[test]
+    fn snapshot_secret_refuses_a_poisoned_lock_without_secret_material() {
+        let current = std::sync::RwLock::new(test_secret());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = current.write().expect("snapshot lock must be writable");
+            panic!("poison the snapshot lock");
+        }));
+        let error = snapshot_secret(&current).expect_err("poisoned snapshot must refuse");
+        assert!(
+            matches!(error, HelixError::InvalidCredential { .. }),
+            "poisoned snapshot must refuse as an unusable credential: {error:?}"
+        );
+        for rendered in [format!("{error}"), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("synthetic-webhook-secret-01"),
+                "refusal leaks the signing secret: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_without_a_snapshot_parks_without_a_task() {
+        // No receiver snapshot means the receiver is dark: park with no
+        // handle rather than a second secret source. Needs no process
+        // environment, so it stays parallel-safe.
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        assert!(spawn_if_enabled(rx, None).is_none());
     }
 
     #[test]

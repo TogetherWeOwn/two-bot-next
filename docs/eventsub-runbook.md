@@ -128,17 +128,27 @@ reconciler's recreated subscription verifies, not by printing either value.
 Never use a test fixture as a runtime credential.
 
 Armed-refresh variant (staging only, needs its own authorization like any
-rotation): with `TWO_EVENTSUB_RELOAD_KEY` provisioned and unchanged, the
-verification side needs no restart — the running container swaps to the new
-secret on the first delivery served by the new Worker version, so a controlled delivery
-signed with the new secret verifies with no restart. The subscription
-creation side still reads the boot secret per pass
-(`crates/bot/src/eventsub_reconcile.rs`, `webhook_secret_from_env`), so a
-full rotation that re-creates subscriptions with the new secret still
-restarts the container before the delete step, exactly as above, until the
-reconciler learns the refreshed snapshot. Do not arm the reload key in
-staging while live subscriptions exist without that follow-up: the swap
-moves the 401 window to the Worker cutover instead of the restart.
+rotation): with `TWO_EVENTSUB_RELOAD_KEY` provisioned and unchanged, neither
+side needs a restart — the running container swaps to the new secret on the
+first delivery served by the new Worker version, and the reconciler creates
+with the same live snapshot (`secret_snapshot` in
+`crates/bot/src/eventsub_http.rs`, cloned per pass in
+`crates/bot/src/eventsub_reconcile.rs`), so a re-created subscription
+carries whatever the receiver is verifying against. The snapshot only
+refreshes on a delivery, so order matters: transfer Worker ownership first
+(as above), then confirm the swap with a controlled delivery signed with the
+new secret — it verifies only once the snapshot holds the new value — and
+only then delete the subscriptions. Deleting before the swap is confirmed
+lets the next pass re-create with the stale snapshot. The delete step stays
+manual, the recreate does not: the next scheduled pass creates the missing
+subscriptions with the new secret (restart the container to run the startup
+pass promptly; safe once ownership transferred, since the new Worker version
+forwards the new secret to a fresh container). The swap still moves the 401
+window to the Worker cutover instead of the restart: live deliveries signed
+with the old subscription secret fail closed until the re-created
+subscriptions verify. Confirm agreement by watching for `notification
+acknowledged` or `challenge answered` lines after the reconciler's recreated
+subscription verifies, not by printing either value.
 Source: `crates/core/src/twitch_eventsub.rs:542-545` (deletes first; a
 duplicate create answers `409`), `:559-563` (healthy wanted subscriptions
 on our callback are kept without comparing secrets), `:481-488`
@@ -175,8 +185,11 @@ Each pass, from the process environment:
 
 1. Refuse without any Helix call when the configuration is incomplete:
    `TWO_TWITCH_CALLBACK_URL` must be present and a plain `https` callback
-   with no port, query, or fragment, and the Operator Twitch client id,
-   client secret, and webhook secret must load. Any refusal logs
+   with no port, query, or fragment, and the Operator Twitch client id and
+   client secret must load. The webhook secret comes from the receiver's
+   live snapshot (seeded at boot from `TWO_TWITCH_WEBHOOK_SECRET`, swapped
+   by armed refresh), never boot env directly; an unreadable snapshot
+   refuses the same way. Any refusal logs
    `error_class="reconcile_config_invalid"` and mutates nothing. The Worker
    forwards the callback, the broadcaster allowlist, and the Helix
    credentials to the container only on explicit lines while the receiver
@@ -229,8 +242,10 @@ Health signal is the container log, scalar fields only
 - `error_class="reconcile_config_invalid"` or
   `error_class="reconcile_no_broadcasters"`: refused or parked before any
   mutation, per steps 1-2.
-- `status="parked"`, `reason="flag_dark"` (info, once at spawn time):
-  `TWO_EVENTSUB` is not exactly `1`; no pass ran.
+- `status="parked"`, `reason="receiver_dark"` (info, once at spawn time):
+  the receiver is dark, so no shared snapshot exists and no task spawned;
+  no pass ran. (The per-pass gate in `startup_reconcile` still parks with
+  `reason="flag_dark"` when `TWO_EVENTSUB` is not exactly `1`.)
 
 Detail lines inside a pass: `reconcile_prior_failed` (pre-pass
 subscriptions on our callback already in `webhook_callback_verification_failed`,
