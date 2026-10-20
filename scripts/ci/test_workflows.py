@@ -3149,7 +3149,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("--features two-bot-core/db", step["run"])
         self.assertIn("--lib --bins --tests", step["run"])
         self.assertIn(
-            "--no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs",
+            "--no-report -- --ignored --test-threads=1",
             step["run"],
         )
         self.assertIn(
@@ -3249,6 +3249,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        staging_source = (
+            ROOT / "crates/cutover/tests/staging_migrate_db.rs"
+        ).read_text()
+        staging_tests = re.findall(
+            r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', staging_source
+        )
+        self.assertTrue(staging_tests, "guarded staging fixtures must be discovered")
+        for test_name in staging_tests:
+            with self.subTest(test_name=test_name):
+                self.assertIn(f"--skip {test_name}", ignored_sweeps[0])
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
