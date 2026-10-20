@@ -3290,6 +3290,17 @@ class WorkflowTests(unittest.TestCase):
             "--skip parity_mismatch_cursor_and_read_only_acceptance",
             parity_reruns[0],
         )
+        # The parity guard accepts only the omitted-password URL. Its export
+        # must occur once, before the rerun and before the later URL switch.
+        parity_export = "export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test"
+        later_export = "export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test"
+        self.assertEqual(logical_lines.count(parity_export), 1)
+        self.assertLess(
+            logical_lines.index(parity_export), logical_lines.index(parity_reruns[0])
+        )
+        self.assertLess(
+            logical_lines.index(parity_reruns[0]), logical_lines.index(later_export)
+        )
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
