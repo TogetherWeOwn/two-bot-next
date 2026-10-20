@@ -49,7 +49,13 @@ fn voice_channel(id: u64, name: &str) -> Channel {
 
 /// A private room with its Join channel up and an empty trace.
 async fn private_room() -> (Worker, Trace) {
-    let (live, store, http, trace) = parts();
+    private_room_from(parts()).await
+}
+
+/// [`private_room`] over prepared fixture parts, such as a hooked `Http`.
+async fn private_room_from(
+    (live, store, http, trace): (LiveGuild, Store, Http, Trace),
+) -> (Worker, Trace) {
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     // This scenario predates the empty-room grace and asserts immediate
     // deletion, so it shortens it; the grace itself is pinned by the
@@ -1170,4 +1176,183 @@ async fn a_grant_witness_older_than_a_block_hydrates_cleanly_after_a_restart() {
     drain(&mut after).await;
     assert!(!after.privacy[&ROOM].private);
     assert_eq!(stored_blocks(&after), [OUTSIDER]);
+}
+
+// --- stale or unknown overwrite evidence ---------------------------------------
+
+fn outsider_entry(allow: Permissions, deny: Permissions) -> PermissionOverwrite {
+    PermissionOverwrite {
+        allow,
+        deny,
+        id: Id::new(OUTSIDER),
+        kind: PermissionOverwriteType::Member,
+    }
+}
+
+/// Every member-entry PUT sent for `OUTSIDER`, oldest first.
+fn outsider_writes(worker: &Worker) -> Vec<PermissionOverwrite> {
+    worker
+        .http
+        .written_overwrites
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, overwrite)| *overwrite)
+        .filter(|overwrite| {
+            overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == OUTSIDER
+        })
+        .collect()
+}
+
+fn cached_outsider(worker: &Worker) -> Option<PermissionOverwrite> {
+    worker
+        .live_overwrites(ROOM)
+        .unwrap()
+        .into_iter()
+        .find(|overwrite| {
+            overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == OUTSIDER
+        })
+}
+
+/// Drop the room's overwrite evidence, as a channel object without
+/// `permission_overwrites` would; returns the channel that restores it.
+fn hide_overwrites(worker: &Worker) -> Channel {
+    let known = worker
+        .live
+        .read_state()
+        .channels
+        .get(&ROOM)
+        .cloned()
+        .expect("room channel is cached");
+    let mut unknown = known.clone();
+    unknown.permission_overwrites = None;
+    worker.live.upsert_channel(unknown);
+    known
+}
+
+/// One newer entry to land, once, while the next write for `OUTSIDER` is in
+/// flight: after Discord accepted it and before the worker can project it.
+type Overtake = Arc<Mutex<Option<PermissionOverwrite>>>;
+
+/// A private room where `OUTSIDER`'s approval landed over `before`, the entry
+/// they held until then. Recorded writes and the trace start empty; filling
+/// the returned slot overtakes the next `OUTSIDER` write.
+async fn approved_over(before: Option<PermissionOverwrite>) -> (Worker, Trace, Overtake) {
+    let (live, store, mut http, trace) = parts();
+    let overtake = Overtake::default();
+    let pending = Arc::clone(&overtake);
+    let gateway = live.clone();
+    http.after_overwrite = Some(Arc::new(move |channel_id, member_id, _| {
+        if channel_id != ROOM || member_id != OUTSIDER {
+            return;
+        }
+        let newer = pending.lock().unwrap().take();
+        if let Some(newer) = newer {
+            gateway_replace_entry(&gateway, newer);
+        }
+    }));
+    let (mut worker, trace) = private_room_from((live, store, http, trace)).await;
+    if let Some(entry) = before {
+        gateway_replace_entry(&worker.live, entry);
+    }
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    let request = request_of(&worker, OUTSIDER);
+    press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+    drain(&mut worker).await;
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    worker.http.written_overwrites.lock().unwrap().clear();
+    trace.lock().unwrap().clear();
+    (worker, trace, overtake)
+}
+
+#[tokio::test]
+async fn an_approval_without_overwrite_evidence_claims_nothing() {
+    let (mut worker, trace) = private_room().await;
+    enter(&worker, OUTSIDER, 2_000);
+    worker.reconcile();
+    drain(&mut worker).await;
+    let request = request_of(&worker, OUTSIDER);
+    press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+    let known = hide_overwrites(&worker);
+    trace.lock().unwrap().clear();
+    drain(&mut worker).await;
+    // Nothing is persisted or sent on unknown evidence, so the approval is not
+    // claimed either.
+    let log = calls(&trace);
+    assert!(
+        !log.contains(&format!("save_join_grant:{ROOM}:{OUTSIDER}")),
+        "{log:?}"
+    );
+    assert!(outsider_writes(&worker).is_empty());
+    assert!(!log.contains(&format!("move:{OUTSIDER}:{ROOM}")), "{log:?}");
+    assert!(!worker.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
+    assert!(stored_grants(&worker).is_empty());
+    // Once the evidence returns, the member can ask again.
+    worker.live.upsert_channel(known);
+    leave(&worker, OUTSIDER, 3_000);
+    worker.reconcile();
+    enter(&worker, OUTSIDER, 4_000);
+    worker.reconcile();
+    assert!(pending(&worker)
+        .iter()
+        .any(|request| request.member_id == MemberId(OUTSIDER)));
+}
+
+#[tokio::test]
+async fn a_revoke_without_overwrite_evidence_retries_once_it_returns() {
+    let (mut worker, trace, _) = approved_over(None).await;
+    let reply = worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
+    assert!(reply.contains("public again"), "{reply}");
+    // Land `/public`'s own write first; the revoke is queued behind it.
+    assert!(worker.dispatch_one(1_000_000).await);
+    let known = hide_overwrites(&worker);
+    assert!(worker.dispatch_one(2_000_000).await);
+    // Absent evidence is not proof the entry is gone: nothing is sent and the
+    // witness stays.
+    assert!(!calls(&trace).contains(&format!("delete_overwrite:{ROOM}:{OUTSIDER}")));
+    assert!(outsider_writes(&worker).is_empty());
+    assert_eq!(stored_grants(&worker), [OUTSIDER]);
+    // The same queued revoke retries after its backoff, without a restart.
+    worker.live.upsert_channel(known);
+    assert!(worker.dispatch_one(10_000_000).await);
+    assert!(calls(&trace).contains(&format!("delete_overwrite:{ROOM}:{OUTSIDER}")));
+    assert!(cached_outsider(&worker).is_none());
+    assert!(stored_grants(&worker).is_empty());
+}
+
+#[tokio::test]
+async fn a_revoke_put_overtaken_by_a_newer_entry_replans_before_retiring() {
+    let before = outsider_entry(Permissions::SPEAK, Permissions::MUTE_MEMBERS);
+    let (mut worker, _trace, overtake) = approved_over(Some(before)).await;
+    let newer = outsider_entry(
+        Permissions::SPEAK | Permissions::EMBED_LINKS,
+        Permissions::MUTE_MEMBERS,
+    );
+    *overtake.lock().unwrap() = Some(newer);
+    worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
+    drain(&mut worker).await;
+    // The first revoke landed, but a newer entry beat its projection. The
+    // queued revoke replans from that entry, so a second write keeps every
+    // newer bit, and only then does the witness retire.
+    assert_eq!(outsider_writes(&worker), [before, newer]);
+    assert_eq!(cached_outsider(&worker), Some(newer));
+    assert!(stored_grants(&worker).is_empty());
+}
+
+#[tokio::test]
+async fn a_revoke_delete_overtaken_by_a_newer_entry_replans_before_retiring() {
+    let (mut worker, trace, overtake) = approved_over(None).await;
+    let newer = outsider_entry(Permissions::SPEAK, Permissions::empty());
+    *overtake.lock().unwrap() = Some(newer);
+    worker.apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public);
+    drain(&mut worker).await;
+    // A Connect-only grant is deleted, and the member's entry is re-created
+    // before the delete is projected. The revoke replans as a kept-entry PUT
+    // instead of trusting the delete, then retires the witness.
+    assert!(calls(&trace).contains(&format!("delete_overwrite:{ROOM}:{OUTSIDER}")));
+    assert_eq!(outsider_writes(&worker), [newer]);
+    assert_eq!(cached_outsider(&worker), Some(newer));
+    assert!(stored_grants(&worker).is_empty());
 }
