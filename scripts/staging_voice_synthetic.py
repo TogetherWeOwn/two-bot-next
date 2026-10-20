@@ -80,7 +80,7 @@ STAGING_GUILD_ID = "1545644954272137297"
 LIVE_GUILD_ID = "326474832151838730"
 # Staging "Create a Lobby" creator (the only creator; "Join to Create" is retired).
 STAGING_CREATOR_ID = "1546211378430345286"
-STAGING_ORIGIN = "https://two-bot-next-staging"
+STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
 API = "https://discord.com/api/v10"
 GATEWAY = "gateway.discord.gg"
 INTENTS = 1 | (1 << 7)  # GUILDS | GUILD_VOICE_STATES (no privileged intents)
@@ -441,8 +441,18 @@ def fence(guild_id, creator_id, staging_url):
     if creator_id != STAGING_CREATOR_ID:
         raise Refusal(f"creator {creator_id!r} is not the staging Create a Lobby creator")
     if staging_url:
-        parts = urlsplit(staging_url)
-        if parts.scheme != "https" or not f"{parts.scheme}://{parts.netloc}".startswith(STAGING_ORIGIN):
+        try:
+            parts = urlsplit(staging_url)
+        except ValueError:
+            raise Refusal("staging URL must be the two-bot-next-staging workers.dev origin")
+        try:
+            port = parts.port
+        except ValueError:
+            raise Refusal("staging URL must be the two-bot-next-staging workers.dev origin")
+        if (parts.scheme != "https" or port is not None
+                or parts.username is not None or parts.password is not None
+                or not STAGING_HOST.fullmatch(parts.hostname or "")
+                or parts.path not in ("", "/") or parts.query or parts.fragment):
             raise Refusal("staging URL must be the two-bot-next-staging workers.dev origin")
 
 

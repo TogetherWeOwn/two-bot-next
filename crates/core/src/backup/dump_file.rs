@@ -1,4 +1,4 @@
-//! The v8 backup envelope (also reads v3/v4/v5/v6/v7): manifest / rows / end marker, gzipped NDJSON.
+//! The v9 backup envelope (also reads v3/v4/v5/v6/v7/v8): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -83,6 +83,11 @@ pub const DUMP_TABLES: &[&str] = &[
     // no member column, archived like the other aggregate tables. No foreign
     // keys, so order is free.
     "game_activity_guild_aggregates",
+    // Assistant monthly-cap ledger (0446/0447): one guild-keyed counter row
+    // per guild with no member column, archived so caps survive a restore
+    // fail-closed (an excluded ledger would grant a fresh quota after every
+    // restore). No foreign keys, so order is free.
+    "assistant_monthly_builds",
     "member_levels",
     // Seasonal XP projection (0100): append-only mirror of lifetime XP per
     // quarter, guild-keyed with no foreign keys, so order beside
@@ -222,6 +227,13 @@ pub const V7_ADDED_TABLES: &[&str] = &[
 /// absent from an older version.
 pub const V8_ADDED_TABLES: &[&str] = &["stream_live_claims"];
 
+/// Tables first covered by v9: guild game-activity aggregates (0441/0442) and
+/// the assistant monthly-cap ledger (0446/0447). Older archives may omit them;
+/// restore clears the destination rows, as for every versioned addition.
+/// New archives must contain both counters so their state survives recovery.
+pub const V9_ADDED_TABLES: &[&str] =
+    &["game_activity_guild_aggregates", "assistant_monthly_builds"];
+
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
 /// legacy subsystems. A table created by migrations must leave this list
@@ -297,8 +309,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v8 coverage; the reader also accepts frozen v3/v4/v5/v6/v7 coverage.
-pub const DUMP_VERSION: u32 = 8;
+/// Write complete v9 coverage; the reader also accepts frozen v3/v4/v5/v6/v7/v8 coverage.
+pub const DUMP_VERSION: u32 = 9;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -830,10 +842,11 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     && version != 5
                     && version != 6
                     && version != 7
+                    && version != 8
                     && version != u64::from(DUMP_VERSION)
                 {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4, 5, 6, 7 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -877,13 +890,11 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     Some(Value::Object(data)) => data,
                     _ => return Err(refuse("dump row has no data object")),
                 };
-                // The manifest column list gates unknown keys here, before any
+                // The manifest column list gates row keys here, before any
                 // publish/restore or `--dry-run` success: a row key it never
-                // declared refuses. This check does not verify column
-                // completeness: a row carrying a subset stays valid at
-                // inspect, while restore refuses a row with a missing cell
-                // (`missing cell`, dump.rs). The message is fixed vocabulary:
-                // it never echoes the hostile key.
+                // declared refuses, and so does a row missing a column it
+                // did declare. Both messages are fixed vocabulary: they
+                // never echo row content.
                 // Membership is tested against the per-table set built with the
                 // manifest, so the per-row cost is O(row keys). The fallback
                 // linear scan is unreachable (the set is built from the same
@@ -896,6 +907,26 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                 if has_outside_key {
                     return Err(refuse(format!(
                         "{table} row on line {line_no} has a column outside the manifest"
+                    )));
+                }
+                // Completeness is the other half of the restore contract:
+                // restore binds one parameter per kept manifest column and
+                // refuses a row with a missing cell (`missing cell`,
+                // dump.rs), so a row carrying a subset of its table's
+                // declared columns refuses here too. The check runs for
+                // every dump version including frozen v3, whose untyped
+                // rows still declare columns; the message names neither
+                // the missing column nor any cell value.
+                // Outside keys have already refused, so equality with the
+                // deduplicated set's size proves completeness in O(1), even
+                // when the manifest repeats a column many times.
+                let is_missing_column = match column_sets.get(&table) {
+                    Some(known) => data.len() != known.len(),
+                    None => info.columns.iter().any(|col| !data.contains_key(col)),
+                };
+                if is_missing_column {
+                    return Err(refuse(format!(
+                        "{table} row on line {line_no} is missing a manifest column"
                     )));
                 }
                 // Frozen v3 has native driver-decoded cells and no type metadata.
@@ -1091,15 +1122,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // Historical inventories are pinned by fixtures. New v8 archives must cover
-    // reservations, the retention queues (0438, v7), the seasonal XP
-    // projection (0100, v7), the event store (0427 voice plus 0428
-    // presence plus 0429 thread lifecycle plus 0430 message/reaction plus
-    // 0431 stage/interaction/audit capture plus 0432 member capture, v6)
-    // and the stream go-live ledger (0440/0443, v8) too; v7 recovery points remain
-    // readable without the ledger, v6 ones without the ledger and the v7
-    // seasonal projection and retention queues, v5 ones without those and the
-    // v6 event store, and v4 ones without any of the v5/v6/v7/v8 additions.
+    // Historical inventories are pinned by fixtures. Each old version waives
+    // only tables first covered by a later version. New v9 archives require
+    // the full inventory, including both guild counters (0441/0442/0446/0447).
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -1112,20 +1137,28 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V6_ADDED_TABLES.contains(name)
                     && !V7_ADDED_TABLES.contains(name)
                     && !V8_ADDED_TABLES.contains(name)
+                    && !V9_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(5) => {
                 !V6_ADDED_TABLES.contains(name)
                     && !V7_ADDED_TABLES.contains(name)
                     && !V8_ADDED_TABLES.contains(name)
+                    && !V9_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
             Some(6) => {
                 !V7_ADDED_TABLES.contains(name)
                     && !V8_ADDED_TABLES.contains(name)
+                    && !V9_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
-            Some(7) => !V8_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
+            Some(7) => {
+                !V8_ADDED_TABLES.contains(name)
+                    && !V9_ADDED_TABLES.contains(name)
+                    && !OPTIONAL_LEGACY_TABLES.contains(name)
+            }
+            Some(8) => !V9_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
@@ -1883,6 +1916,7 @@ mod tests {
                     && !V6_ADDED_TABLES.contains(name)
                     && !V7_ADDED_TABLES.contains(name)
                     && !V8_ADDED_TABLES.contains(name)
+                    && !V9_ADDED_TABLES.contains(name)
             })
             .collect();
         assert_eq!(names, expected);
@@ -1893,6 +1927,8 @@ mod tests {
                 "privacy_opt_outs",
                 "guild_analytics_settings",
                 "privacy_opt_out_audit",
+                "game_activity_guild_aggregates",
+                "assistant_monthly_builds",
                 "member_season_xp",
                 "stream_live_claims",
                 "voice_create_reservations",
@@ -1941,7 +1977,7 @@ mod tests {
         assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
         // The same inventory at the current version refuses: new archives must
         // cover the event store.
-        assert_eq!(DUMP_VERSION, 8);
+        assert_eq!(DUMP_VERSION, 9);
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
         assert!(validate_manifest(&current)
@@ -2027,7 +2063,7 @@ mod tests {
             .contains("event_store"));
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
-        assert_eq!(DUMP_VERSION, 8, "frozen v5 test pins the v8 bump");
+        assert_eq!(DUMP_VERSION, 9, "frozen v5 test pins the v9 bump");
         assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
@@ -2045,7 +2081,7 @@ mod tests {
         // A v6 recovery point written before the seasonal XP projection (0100)
         // declares every covered table except member_season_xp and stays
         // readable; promoting it to v7 without the table is refused. This is
-        // the frozen-manifest guard for the v7 bump (now pinned at v8):
+        // the frozen-manifest guard for the v7 bump (now pinned at v9):
         // building the old manifest from today's inventory (as the v5 tests
         // do) would silently include the new table and miss the refusal.
         let mut v6 = manifest(without(
@@ -2078,7 +2114,7 @@ mod tests {
             "member_season_xp",
         ));
         assert_eq!(v7_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 8, "frozen v6 test pins the v8 bump");
+        assert_eq!(DUMP_VERSION, 9, "frozen v6 test pins the v9 bump");
         assert!(validate_manifest(&v7_gap)
             .unwrap_err()
             .to_string()
@@ -2145,8 +2181,8 @@ mod tests {
         let mut v7_gap = v6.clone();
         v7_gap["version"] = serde_json::json!(DUMP_VERSION);
         assert_eq!(
-            DUMP_VERSION, 8,
-            "frozen pre-retention test pins the v8 bump"
+            DUMP_VERSION, 9,
+            "frozen pre-retention test pins the v9 bump"
         );
         let err = validate_manifest(&v7_gap).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
@@ -2198,11 +2234,68 @@ mod tests {
             "stream_live_claims",
         ));
         assert_eq!(v8_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 8, "frozen v7 test pins the v8 bump");
+        assert_eq!(DUMP_VERSION, 9, "frozen v7 test pins the v9 bump");
         assert!(validate_manifest(&v8_gap)
             .unwrap_err()
             .to_string()
             .contains("stream_live_claims"));
+    }
+
+    #[test]
+    fn v8_archives_read_without_guild_counters_but_v9_requires_them() {
+        // Literal names, not V9_ADDED_TABLES: this reproduces the pre-change
+        // inventory even if the version waiver is accidentally removed.
+        let tables = complete_tables(&BTreeMap::new())
+            .into_iter()
+            .filter(|table| {
+                table["name"] != "assistant_monthly_builds"
+                    && table["name"] != "game_activity_guild_aggregates"
+            })
+            .collect();
+        let mut old = manifest(tables);
+        for version in 4..=8 {
+            old["version"] = serde_json::json!(version);
+            let contents = inspect_bytes(&gzip_lines(&[
+                old.clone(),
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .expect("old archives without the v9 guild counters stay readable");
+            assert_eq!(contents.manifest.version, version);
+            assert_eq!(
+                contents.manifest.missing_tables(),
+                ["game_activity_guild_aggregates", "assistant_monthly_builds"]
+            );
+            let mut gap = old.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != "events");
+            assert!(validate_manifest(&gap)
+                .unwrap_err()
+                .to_string()
+                .contains("missing tables: events"));
+        }
+        assert_eq!(DUMP_VERSION, 9, "new dumps require both guild counters");
+        let current = manifest(complete_tables(&BTreeMap::new()));
+        inspect_bytes(&gzip_lines(&[
+            current.clone(),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("complete v9 archive inspects");
+        for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
+            let mut gap = current.clone();
+            gap["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|table| table["name"] != name);
+            let error = inspect_bytes(&gzip_lines(&[
+                gap,
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(name), "{error}");
+        }
     }
 
     #[test]
@@ -2267,7 +2360,7 @@ mod tests {
         future[0]["version"] = serde_json::json!(DUMP_VERSION + 1);
         let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
         assert!(
-            message.contains(&format!("reads 3, 4, 5, 6, 7 and {DUMP_VERSION}")),
+            message.contains(&format!("reads 3, 4, 5, 6, 7, 8 and {DUMP_VERSION}")),
             "unknown versions are refused with the readable list: {message}"
         );
     }
@@ -2582,16 +2675,66 @@ mod tests {
                 row
             }]
         );
-        // A row carrying only a subset of the declared columns stays valid:
-        // only keys outside the manifest refuse, never missing ones.
+    }
+
+    #[test]
+    fn duplicate_heavy_columns_preserve_row_completeness_verdicts() {
+        // Duplicate declarations must not multiply the work for each row.
+        // Keep this shape large enough to exercise the amplification without
+        // a wall-clock assertion that would flake on a loaded CI runner.
+        let row_count = 2_000;
+        let mut over = BTreeMap::new();
+        over.insert("events", (vec!["id"; 200_000], row_count));
+        let mut objs = vec![manifest(complete_tables(&over))];
+        let row = serde_json::json!({"kind":"row","table":"events","data":{"id":"1"}});
+        objs.extend(std::iter::repeat_n(row, row_count as usize));
+        objs.push(serde_json::json!({"kind":"end","rows":row_count}));
+        let bytes = gzip_lines(&objs);
+        let contents = inspect_bytes(&bytes).unwrap();
+        assert_eq!(contents.rows, row_count);
+        assert_eq!(contents.buffers["events"].len(), row_count as usize);
+        assert_eq!(
+            contents.buffers["events"][0],
+            serde_json::json!({"id":"1"}).as_object().unwrap().clone()
+        );
+
+        // The same distinct-column contract applies to typed and legacy rows.
+        for strip_types in [false, true] {
+            if strip_types {
+                objs[0]["version"] = serde_json::json!(3);
+                for table in objs[0]["tables"].as_array_mut().unwrap() {
+                    table.as_object_mut().unwrap().shift_remove("column_types");
+                }
+            }
+            objs[1]["data"] = serde_json::json!({});
+            let err = acceptance_refusal(&objs);
+            assert!(err.contains("is missing a manifest column"), "{err}");
+            // Equal key counts alone do not prove completeness: an outside
+            // key replacing a required key must retain the earlier refusal.
+            objs[1]["data"] = serde_json::json!({ECHO_SENTINEL:ECHO_SENTINEL});
+            let err = acceptance_refusal(&objs);
+            assert!(err.contains("has a column outside the manifest"), "{err}");
+            assert!(!err.contains(ECHO_SENTINEL), "{err}");
+            objs[1]["data"] = serde_json::json!({"id":"1"});
+            assert_eq!(inspect_bytes(&gzip_lines(&objs)).unwrap().rows, row_count);
+        }
+    }
+
+    #[test]
+    fn acceptance_dump_inspect_refuses_row_missing_a_manifest_column() {
+        // Completeness is the restore contract: restore binds one parameter
+        // per kept manifest column and refuses a row with a missing cell, so
+        // a row carrying only a subset of the declared columns refuses at
+        // inspect with fixed vocabulary that never echoes row content.
         let mut subset = good_dump();
         subset[1]["data"]
             .as_object_mut()
             .unwrap()
             .shift_remove("guild_id");
-        let contents = inspect_bytes(&gzip_lines(&subset)).unwrap();
-        assert_eq!(contents.rows, 1);
-        assert_eq!(contents.buffers["events"][0].len(), 1);
+        subset[1]["data"]["id"] = serde_json::json!(ECHO_SENTINEL);
+        let err = acceptance_refusal(&subset);
+        assert!(err.contains("is missing a manifest column"), "{err}");
+        assert!(!err.contains(ECHO_SENTINEL), "{err}");
     }
 
     #[test]

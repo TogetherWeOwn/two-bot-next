@@ -133,6 +133,26 @@ Scalar gateway series pair with the labels above:
 | `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert) |
 | `two_bot_automod_decisions_total{outcome}` | Terminal automod inspection outcomes; `outcome` is `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out` or `sanction_refused`. Recorded once per committed `StoredOutcome` by the shared activation; replays and retained claims never count. Fixed eight series from process start; no message text, excerpts or user IDs become labels |
 
+## Automod facts read warnings
+
+Source: `RestAutomodFacts::get` in `crates/discord/src/automod_activation.rs`.
+
+| Event | Callsite (stable anchor) | Level | Fields | Meaning |
+| --- | --- | --- | --- | --- |
+| `automod_facts_read_failed` | `crates/discord/src/automod_activation.rs` (`RestAutomodFacts::get`) | WARN | `step`: `guild`, `bot_member`, `target_member` or `message`; `cause`: the fixed vocabulary from `DiscordError::cause()` in `crates/discord/src/executor.rs` | A strict Discord facts read failed; the caller still returns unavailable facts and preserves the existing fail-closed decision. Enrichment's author-member read uses `target_member`. |
+
+Only `Err` emits: successful reads and 404 (`Ok(None)`) stay silent and do not
+consume the warning window. The first failure emits immediately, then at most
+one warning per 60 seconds per facts resolver, shared across all steps and
+guilds. This constant-memory sampler also bounds each guild's warnings; a
+failure in one guild can suppress another guild's warning in the same window.
+Suppressed failures do not extend the window. The event carries no path,
+guild/member/message IDs, response body or formatted error. It adds no metric
+or retry and does not change `ActivationOutcome::Unavailable` or the eight
+terminal decision outcomes above. Missing or incomplete facts can still yield
+`Unavailable` without this warning; the warning is a sampled error signal,
+not a count of unavailable decisions.
+
 ## Voice stall gauge series
 
 Aggregated across all current guild actors. Before the aggregation change a
@@ -263,6 +283,8 @@ is the single shared spelling also pinned in `evidence.rs`
 | `event_store_consumer_lag` | `two_bot_event_store_consumer_lag_seconds` | Ticket, not page: lag above 60 s (one keepalive window, fractional counts) in 3 consecutive valid samples; a valid sample at or below 60 s resolves and rebaselines, missing/invalid samples and failed scrapes break the streak but preserve a firing ticket; the gauge is an optional scrape input, so older containers without it reset `eventStoreLagStreak` to `0` while retaining an existing firing ticket |
 | `error_budget_fast_burn` | All `two_bot_rest_requests_total` samples (eligible requests) against `result="5xx"` plus `result="transport"` (budget spend) | Pages when the REST error budget (99.9% success over 48 h) burns faster than 12x in both the 15 min and 2 min windows; each window needs at least 10 eligible requests and two budget errors; incomplete post-restart windows stay inactive; missing or malformed inputs hold the previous state |
 | `error_budget_slow_burn` | Same inputs as `error_budget_fast_burn` | Ticket, not page: same budget burning faster than 3x in both the 2 h and 15 min windows with the same per-window volume and error floors; needs full 2 h history, holds on missing inputs, scrape gaps, or counter resets, and resolves on a covered quiet or below-threshold 15 min window |
+| `rest_admission_breaker_open` | `two_bot_rest_guard_breaker_open` | Ticket, not page: the label-free 0/1 gauge reads 1 for 3 consecutive samples; one valid closed sample recovers, missing/invalid samples hold a firing ticket without manufacturing evidence; the gauge is an optional scrape input, so rollback containers hold the previous state |
+| `audit_delivery_halt` | `two_bot_audit_delivery_halt` with `two_bot_job_consecutive_failures{job="audit_retry"}` and `two_bot_job_last_success_timestamp_seconds{job="audit_retry"}` | Ticket when the label-free halt gauge reads `1` for 3 consecutive valid samples (about two minutes at the 60 s cadence); any nonzero `audit_retry` failure count vetoes both firing and recovery, and missing, duplicate, labeled or non-boolean readings break the streak while holding an active ticket; a valid `0` after a healthy sweep resolves once, and a boot-default zero cannot resolve until `audit_retry` has a nonzero success timestamp |
 | `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` | Pages when the `tampered` counter (only `BadSignature`) rises in 3 consecutive samples; the first sample only baselines, a flat window resolves, a reset rebaselines, and missing/invalid scrapes hold firing |
 | `eventsub_reconcile_failed` | `two_bot_eventsub_reconcile_passes_total{outcome}` with the fixed `healthy`/`pending`/`failed` outcomes | Ticket, not page: fires when the failed-pass counter grows between valid samples, even beside healthy growth; the first valid sample only stores a baseline, healthy-only or pending-only growth never fires, and a flat failed counter never recovers (only healthy growth with no failed growth resolves, once); any backwards counter re-baselines: the reset sample fires when the new process already counted a failed pass (failed startup pass) and otherwise holds a firing ticket instead of fabricating a transition; missing or invalid samples hold the previous state; the family is an optional scrape input, so older containers hold the previous state |
 
@@ -312,6 +334,7 @@ sink attaches to the gateway writer on the cutover path.
 | `voice_event="voice_dead_letter"` | `crates/bot/src/voice_rooms.rs` (`mark_failed_observed`: `voice action dead-lettered`) | Queue write exhausted retries with bounded `action` and attempts |
 | `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs` (`execute_create`: `voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
 | `voice_event="voice_join_received"` | `crates/bot/src/voice_rooms.rs` (`accept_join_received`: `voice creator join accepted` / `voice creator join refused before queueing`) | One creator-channel join delivered to the guild actor, accepted or refused. The refused line carries a bounded `reason` (`halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked`, `other`) plus the refusing `channel` id and creator-map state at join time (`creators_len`, `known`, `halted`, `ready`, `live_generation`, `ticket_generation`; no member/name/token content); every delivery bumps `two_bot_voice_joins_received_total`, so received-vs-handled drift is the stall signal |
+| `voice_event="voice_admin_store"` | `crates/bot/src/voice_rooms.rs` (`log_admin_store_failure`: `voice admin store failed`) | One failed admin store read/write behind `/access`, `/logging`, `/export` or `/import`; bounded `op` (`access_read`, `access_save`, `logging_read`, `logging_save`, `export_read`, `import_read`) plus bounded `reason` (`unavailable`, `credential_refused`, `conflict`: the `StoreError` variant, no driver text) and the `guild_id`; the member reply is unchanged |
 
 ### `voice_event` JSON field shapes (verified 2026-10-17, emitter code only, no live log paste)
 
@@ -335,6 +358,7 @@ always `"tracing_event"` and the text above sits under `message`. Match on
 | `voice_creator_orphan` | `outcome`: `&str` (always `manual_needed`) | `execute_create` | warn / `voice creator orphan needs manual deletion` |
 | `voice_join_received` accepted | `guild`: `String` | `accept_join_received` | info / `voice creator join accepted` |
 | `voice_join_received` refused | `guild`, `channel`: `String`; `reason`: `&str` (bounded: `halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked`, unknown folds to `other` in the counter); `creators_len`: `u64`; `known`, `halted`, `ready`: `bool`; `live_generation`, `ticket_generation`: `u64` | `accept_join_received` | warn when `reason` is `halted`, debug when `duplicate`, info otherwise (including `name_blocked`) / `voice creator join refused before queueing` |
+| `voice_admin_store` | `op`: `&'static str` (bounded: `access_read`, `access_save`, `logging_read`, `logging_save`, `export_read`, `import_read`); `reason`: `&'static str` (bounded: `unavailable`, `credential_refused`, `conflict`); `guild_id`: `String` | `log_admin_store_failure` | warn / `voice admin store failed` |
 
 Rename-decision lines without a `voice_event` field:
 `voice room rename decision` (`log_rename_decision` and
@@ -401,6 +425,49 @@ Empty-grace override warning (in `stored_empty_grace_with` in
 stored per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row is malformed or
 outside 0 to 600 whole seconds, so the sweep keeps the boot fallback. The
 line carries the setting key and the `out_of_range` reason.
+
+Fatal boot-setting warning (in `invalid_boot_setting`, called by
+`build_production_runtime` in `crates/bot/src/voice_rooms.rs`):
+`temp-voice boot setting invalid; refusing voice runtime` (warn). Fields:
+`key`: `&'static str` (one fixed key below); `reason`: `&'static str`
+(always `invalid_value`). No configured values, parser errors, tokens,
+channel/member lists or synthetic identity input are logged. This precedes
+the unchanged `RoomHttpError::InvalidRequest` setup failure and the gateway's
+`voice HTTP setup failed` line. It refuses the voice runtime, not necessarily
+the process. Exactly one warning names the first invalid setting in existing
+validation order:
+
+1. Protected infrastructure channels: `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`,
+   `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`, `TWO_TEMP_VOICE_CATEGORY_ID`, then
+   `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS`. The exact refused sub-key is named.
+2. Generator channel: `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID` (also checked by
+   protection above, so malformed input normally refuses there first).
+3. Empty-room grace: `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (whole seconds,
+   0 to 600).
+4. Synthetic humans: `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` (up to four distinct
+   nonzero IDs).
+
+Absent, blank and valid settings remain silent. Nonfatal admission knobs
+retain their separate default-fallback warning below. For safe triage, see
+[voice boot-setting refusal](runbook-observability.md#voice-boot-setting-refusal).
+
+Configured-channel notice fallback warning (in
+`GuildRoomWorker::deliver_notice` in `crates/bot/src/voice_rooms.rs`, guild
+field plus bounded `op` and `outcome`, no notice text or mention payload):
+`voice notice configured channel failed; trying fallback` (warn): the
+configured `/logging` channel refused the notice send, so delivery falls
+through to the system channel, owner DM and creator chat in order. One line
+per failed configured-channel attempt; a working channel logs nothing, and a
+rate-limited attempt falls through silently (a rate limit is a retry, not an
+outcome).
+
+Invite-code override warning (in `stored_invite_code_with` in
+`crates/bot/src/voice_rooms.rs`, guild-only fields, no IDs):
+`stored invite-code override invalid; using vanity fallback` (warn): the
+stored per-guild `TWO_GUILD_INVITE_CODE` row is not a JSON string of 2 to
+32 ASCII alphanumerics plus `-`/`_`, so the `/invite` reply keeps the
+gateway vanity fallback. The line carries the setting key and the
+`invalid_invite_code` reason, never the rejected value.
 
 Boot admission warning (in `configured_admission` in
 `crates/bot/src/voice_rooms.rs`, key-only fields, no IDs):

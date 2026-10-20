@@ -10,6 +10,7 @@
 // the singleton: a fenced/pristine record needs OWNERSHIP_RELEASE_FENCE=true,
 // which the production workflow sets only when its `takeover` dispatch input
 // is true (B4 cutover execution). Production activation (GO) stays separate.
+import { isDirectInvocation } from "./is-direct-invocation.mjs";
 import { parseOwnershipResponse } from "./ownership-control-response.mjs";
 
 class ControlError extends Error {}
@@ -233,7 +234,7 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
   }
 }
 
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+if (isDirectInvocation(process.argv[1], import.meta.url)) {
   const [action, epoch] = process.argv.slice(2);
   try {
     const result = await control({

@@ -129,6 +129,35 @@ jobs:
           # Keep the package lists off the job-container overlay.
           rm -rf /var/lib/apt/lists/*
 
+      # Disk guard (run 39209332791): the ignored-db-stores lane died mid-suite
+      # with Postgres `PANIC: could not write to file "pg_wal/xlogtemp.*": No
+      # space left on device` on a 1 GiB tmpfs, and two Oct 2 main heads died
+      # with 98 MB left on the job-container overlay at link time. A runner
+      # that starts exhausted cannot finish a Rust build, so fail fast here
+      # with a clear infra verdict instead of a mid-suite PANIC. Service
+      # containers start before any step runs and steps see only the job
+      # container, so host-side reclaims (docker prune, toolchain removal) are
+      # not possible from here; the tmpfs-side mitigation is the bounded WAL
+      # budget in the prepare steps plus the storage-headroom report.
+      - name: Guard runner disk headroom
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h / "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          du -sh "$GITHUB_WORKSPACE" 2>/dev/null || true
+          # 1 GiB free on both the job-container overlay (/) and the
+          # host-mounted workspace: below that the toolchain install and cache
+          # restore cannot fit, so stop now with an infra verdict (rerun).
+          floor=1073741824
+          for mount in / "$GITHUB_WORKSPACE"; do
+            free_bytes=$(df -B1 --output=avail "$mount" | tail -n 1 | tr -d '[:space:]')
+            echo "disk headroom on $mount: $free_bytes bytes free (floor $floor)"
+            if [ "$free_bytes" -lt "$floor" ]; then
+              echo "::error::runner disk exhausted: $mount has $free_bytes bytes free, below the $floor-byte floor. Infra flake: rerun the job."
+              exit 1
+            fi
+          done
+
       - name: Selection note (dependency-aware skip)
         env:
           SEL_RUST: ${{ needs.job-inputs.outputs.rust }}
@@ -241,12 +270,13 @@ jobs:
 
       - name: soak evidence parser (offline, fixtures only)
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_evidence.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p '*soak*evidence*.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_gate5_outage.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_watch_checkpoint_doc_conformance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_voice_config_apply_doc_conformance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_sanitize_evidence_rows.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_stdout_read.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_stdout_read_acceptance.py' -v
 
       - name: cutover rollback-readiness probe and freeze drill (offline)
         run: |
@@ -552,6 +582,35 @@ jobs:
           for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
 
+      # Disk guard (run 39209332791): the ignored-db-stores lane died mid-suite
+      # with Postgres `PANIC: could not write to file "pg_wal/xlogtemp.*": No
+      # space left on device` on a 1 GiB tmpfs, and two Oct 2 main heads died
+      # with 98 MB left on the job-container overlay at link time. A runner
+      # that starts exhausted cannot finish a Rust build, so fail fast here
+      # with a clear infra verdict instead of a mid-suite PANIC. Service
+      # containers start before any step runs and steps see only the job
+      # container, so host-side reclaims (docker prune, toolchain removal) are
+      # not possible from here; the tmpfs-side mitigation is the bounded WAL
+      # budget in the prepare steps plus the storage-headroom report.
+      - name: Guard runner disk headroom
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h / "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          du -sh "$GITHUB_WORKSPACE" 2>/dev/null || true
+          # 1 GiB free on both the job-container overlay (/) and the
+          # host-mounted workspace: below that the toolchain install and cache
+          # restore cannot fit, so stop now with an infra verdict (rerun).
+          floor=1073741824
+          for mount in / "$GITHUB_WORKSPACE"; do
+            free_bytes=$(df -B1 --output=avail "$mount" | tail -n 1 | tr -d '[:space:]')
+            echo "disk headroom on $mount: $free_bytes bytes free (floor $floor)"
+            if [ "$free_bytes" -lt "$floor" ]; then
+              echo "::error::runner disk exhausted: $mount has $free_bytes bytes free, below the $floor-byte floor. Infra flake: rerun the job."
+              exit 1
+            fi
+          done
+
       - name: Install Rust toolchain
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
@@ -641,8 +700,10 @@ jobs:
         id: prepare_test_databases
         run: |
           # The database service stores data and WAL on a 1 GiB tmpfs. The HARD
-          # coverage lane replays the database suites, so keep WAL recycling
-          # bounded with headroom for relation files and segment creation.
+          # coverage lane replays the database suites. max_wal_size is a soft
+          # checkpoint target, not a hard ceiling: heavy WAL can exceed it, so
+          # keep recycling bounded with headroom for relation files and segment
+          # creation. The pre/post suite reports bracket the run for tuning.
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
@@ -682,6 +743,19 @@ jobs:
               raise SystemExit('disposable Postgres data path or durability defaults changed')
           print('Disposable Postgres defaults:', json.dumps(settings, sort_keys=True))
           PY
+
+      # Storage-headroom evidence (run 39209332791): the tmpfs holding PGDATA
+      # is invisible from this container, so report what Postgres sees: per-DB
+      # sizes, WAL segment bytes, and the bounded WAL budget. Runs right after
+      # verify so the sizes give the next incident a prepare-time baseline.
+      # Fail-closed like the verify probe: a broken report must not read as
+      # headroom.
+      - name: Report Postgres storage headroom
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
 
       # Preserve cargo test's default unit/binary, integration and doc targets.
       # Migrated suites create/drop unique databases; this bootstrap is not reset.
@@ -826,6 +900,17 @@ jobs:
           fi
           python3 scripts/ci/check-patch-coverage.py --lcov "$report_path" \
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
+
+      # Post-suite storage evidence: max_wal_size is a soft target, so the
+      # pre-suite report cannot show peak WAL. This always-runs report brackets
+      # the run with post-suite sizes for the next ENOSPC triage.
+      - name: Report Postgres storage headroom (post-suite)
+        if: always()
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
   # Required nextest lane (SDLC 2.3 CI speed pilot, promoted): the workspace
   # lib/bins scope under cargo-nextest (one retry, JUnit, flake ledger) via
   # the shared reusable lane. Same rust-selector gate as the other Rust test
@@ -958,6 +1043,35 @@ jobs:
           for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
 
+      # Disk guard (run 39209332791): the ignored-db-stores lane died mid-suite
+      # with Postgres `PANIC: could not write to file "pg_wal/xlogtemp.*": No
+      # space left on device` on a 1 GiB tmpfs, and two Oct 2 main heads died
+      # with 98 MB left on the job-container overlay at link time. A runner
+      # that starts exhausted cannot finish a Rust build, so fail fast here
+      # with a clear infra verdict instead of a mid-suite PANIC. Service
+      # containers start before any step runs and steps see only the job
+      # container, so host-side reclaims (docker prune, toolchain removal) are
+      # not possible from here; the tmpfs-side mitigation is the bounded WAL
+      # budget in the prepare steps plus the storage-headroom report.
+      - name: Guard runner disk headroom
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h / "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          du -sh "$GITHUB_WORKSPACE" 2>/dev/null || true
+          # 1 GiB free on both the job-container overlay (/) and the
+          # host-mounted workspace: below that the toolchain install and cache
+          # restore cannot fit, so stop now with an infra verdict (rerun).
+          floor=1073741824
+          for mount in / "$GITHUB_WORKSPACE"; do
+            free_bytes=$(df -B1 --output=avail "$mount" | tail -n 1 | tr -d '[:space:]')
+            echo "disk headroom on $mount: $free_bytes bytes free (floor $floor)"
+            if [ "$free_bytes" -lt "$floor" ]; then
+              echo "::error::runner disk exhausted: $mount has $free_bytes bytes free, below the $floor-byte floor. Infra flake: rerun the job."
+              exit 1
+            fi
+          done
+
       - name: Install Rust toolchain
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
@@ -1039,9 +1153,16 @@ jobs:
         run: |
           # The database service stores data and WAL on a 1 GiB tmpfs. This
           # lane runs ~30 sequential suites that each create, migrate and drop
-          # disposable databases, so keep WAL recycling bounded with headroom
-          # for relation files and segment creation (two main runs PANIC'd on
-          # No space left on device mid-suite before this cap).
+          # disposable databases. Unbounded WAL (the PG18 default max_wal_size
+          # is 1GB) filled it: run 39209332791 died in the ignored-db-stores
+          # lane with `PANIC: could not write to file "pg_wal/xlogtemp.*": No
+          # space left on device`, and two earlier main runs PANIC'd the same
+          # way mid-suite; run 39197217315 tore the service down and failed the
+          # whole binary on DNS. max_wal_size is a soft checkpoint target, not
+          # a hard ceiling: heavy WAL can exceed it, so keep recycling bounded
+          # with headroom for relation files and segment creation, mirroring
+          # the rust-tests lane. The pre/post suite reports bracket the run
+          # for future budget tuning.
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
@@ -1081,6 +1202,19 @@ jobs:
           print('Disposable Postgres defaults:', json.dumps(settings, sort_keys=True))
           PY
 
+      # Storage-headroom evidence (run 39209332791): the tmpfs holding PGDATA
+      # is invisible from this container, so report what Postgres sees: per-DB
+      # sizes, WAL segment bytes, and the bounded WAL budget. Runs right after
+      # verify so the sizes give the next incident a prepare-time baseline.
+      # Fail-closed like the verify probe: a broken report must not read as
+      # headroom.
+      - name: Report Postgres storage headroom
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
+
       - name: Backup publication faults (actual CLI, dedicated CI service database)
         env:
           TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_publication_ci
@@ -1114,7 +1248,7 @@ jobs:
 
       - name: LFG actual-router and mock-Discord regressions
         run: >-
-          cargo test -p two-bot-discord --features db --locked --test lfg_interactions -- --ignored --test-threads=1
+          cargo test -p two-bot-discord --features db --locked --test lfg_interactions --test lfg_nonce_malformed_history_acceptance -- --ignored --test-threads=1
 
       - name: leveling gateway and interaction integration (CI service only)
         env:
@@ -1152,7 +1286,7 @@ jobs:
       - name: Store Postgres integration (isolated CI schemas)
         env:
           TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
-        run: cargo test -p two-bot-store --locked --test postgres --test journal --test journal_writer --test membership_pg --test backfill_cursors --test backfill_history --test backfill_audit_log --test backfill_event_users_reactions_pins --test backfill_bans_invites_onboarding --test explain_seqscan -- --ignored --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window --skip audit_log_requests_ride_rate_limit_client_never_direct_rest --skip audit_cursor_persists_per_window_and_resumes_mid_window --skip audit_rows_hold_ids_timestamps_enums_only --skip audit_429_retry_after_pauses_without_losing_place --skip event_users_paginate_through_rate_limit_client_with_max_100 --skip reaction_users_paginate_through_rate_limit_client --skip pins_list_through_rate_limit_client_persists_metadata_only --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting --skip persisted_rows_hold_ids_timestamps_enums_only --skip resume_continues_from_persisted_cursors_per_family --skip bans_fetch_applies_blocklist_and_counts_everyone --skip invite_rows_hold_metadata_only --skip onboarding_rows_hold_ids_enums_metadata_only --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
+        run: cargo test -p two-bot-store --locked --test postgres --test journal --test journal_writer --test membership_pg --test backfill_cursors --test backfill_history --test backfill_audit_log --test backfill_event_users_reactions_pins --test backfill_bans_invites_onboarding --test explain_seqscan --test assistant_cap_ledger_acceptance -- --ignored --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window --skip audit_log_requests_ride_rate_limit_client_never_direct_rest --skip audit_cursor_persists_per_window_and_resumes_mid_window --skip audit_rows_hold_ids_timestamps_enums_only --skip audit_429_retry_after_pauses_without_losing_place --skip event_users_paginate_through_rate_limit_client_with_max_100 --skip reaction_users_paginate_through_rate_limit_client --skip pins_list_through_rate_limit_client_persists_metadata_only --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting --skip persisted_rows_hold_ids_timestamps_enums_only --skip resume_continues_from_persisted_cursors_per_family --skip bans_fetch_applies_blocklist_and_counts_everyone --skip invite_rows_hold_metadata_only --skip onboarding_rows_hold_ids_enums_metadata_only --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
 
       - name: sticky live store regressions (CI service container only)
         run: cargo test -p two-bot-core --features db --locked --test sticky_store_live -- --ignored
@@ -1263,6 +1397,17 @@ jobs:
           cargo test -p two-bot-discord --features db-tests --lib --locked admission_ -- --ignored
           cargo test -p two-bot-cutover --test send_admission --locked -- --ignored
 
+      # Post-suite storage evidence: max_wal_size is a soft target, so the
+      # pre-suite report cannot show peak WAL. This always-runs report brackets
+      # the run with post-suite sizes for the next ENOSPC triage.
+      - name: Report Postgres storage headroom (post-suite)
+        if: always()
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
+
   ignored-db-runtime:
     name: ignored db (runtime)
     permissions:
@@ -1363,6 +1508,35 @@ jobs:
           for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
 
+      # Disk guard (run 39209332791): the ignored-db-stores lane died mid-suite
+      # with Postgres `PANIC: could not write to file "pg_wal/xlogtemp.*": No
+      # space left on device` on a 1 GiB tmpfs, and two Oct 2 main heads died
+      # with 98 MB left on the job-container overlay at link time. A runner
+      # that starts exhausted cannot finish a Rust build, so fail fast here
+      # with a clear infra verdict instead of a mid-suite PANIC. Service
+      # containers start before any step runs and steps see only the job
+      # container, so host-side reclaims (docker prune, toolchain removal) are
+      # not possible from here; the tmpfs-side mitigation is the bounded WAL
+      # budget in the prepare steps plus the storage-headroom report.
+      - name: Guard runner disk headroom
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h / "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          du -sh "$GITHUB_WORKSPACE" 2>/dev/null || true
+          # 1 GiB free on both the job-container overlay (/) and the
+          # host-mounted workspace: below that the toolchain install and cache
+          # restore cannot fit, so stop now with an infra verdict (rerun).
+          floor=1073741824
+          for mount in / "$GITHUB_WORKSPACE"; do
+            free_bytes=$(df -B1 --output=avail "$mount" | tail -n 1 | tr -d '[:space:]')
+            echo "disk headroom on $mount: $free_bytes bytes free (floor $floor)"
+            if [ "$free_bytes" -lt "$floor" ]; then
+              echo "::error::runner disk exhausted: $mount has $free_bytes bytes free, below the $floor-byte floor. Infra flake: rerun the job."
+              exit 1
+            fi
+          done
+
       - name: Install Rust toolchain
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
@@ -1443,9 +1617,14 @@ jobs:
       - name: Prepare isolated test databases
         run: |
           # The database service stores data and WAL on a 1 GiB tmpfs. This
-          # lane runs 26 sequential database suites against it, so keep WAL
-          # recycling bounded with headroom for relation files and segment
-          # creation (same bound as the rust-tests and stores lanes).
+          # lane runs 26 sequential database suites against it. Unbounded WAL
+          # (the PG18 default max_wal_size is 1GB) filled the stores lane's
+          # tmpfs in run 39209332791 with `PANIC: could not write to file
+          # "pg_wal/xlogtemp.*": No space left on device`. max_wal_size is a
+          # soft checkpoint target, not a hard ceiling: heavy WAL can exceed
+          # it, so keep recycling bounded with headroom for relation files and
+          # segment creation (same bound as the rust-tests and stores lanes).
+          # The pre/post suite reports bracket the run for future budget tuning.
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
           psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
@@ -1485,6 +1664,19 @@ jobs:
           print('Disposable Postgres defaults:', json.dumps(settings, sort_keys=True))
           PY
 
+      # Storage-headroom evidence (run 39209332791): the tmpfs holding PGDATA
+      # is invisible from this container, so report what Postgres sees: per-DB
+      # sizes, WAL segment bytes, and the bounded WAL budget. Runs right after
+      # verify so the sizes give the next incident a prepare-time baseline.
+      # Fail-closed like the verify probe: a broken report must not read as
+      # headroom.
+      - name: Report Postgres storage headroom
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
+
       - name: onboarding shared runtime acceptance (mock Discord and CI service only)
         run: cargo test -p two-bot --locked onboarding_ -- --include-ignored
 
@@ -1495,7 +1687,10 @@ jobs:
         run: cargo test -p two-bot --locked join_risk_runtime_ -- --include-ignored
 
       - name: containment runtime acceptance (mock Discord and CI service only)
-        run: cargo test -p two-bot --locked containment_runtime_ -- --include-ignored
+        run: cargo test -p two-bot --locked --lib --bins containment_worker_ -- --include-ignored
+
+      - name: containment worker-path soak (mock Discord and CI service only)
+        run: cargo test -p two-bot --locked --test containment_worker_soak -- --include-ignored
 
       - name: Raid cohort query (CI service container only)
         env:
@@ -1593,6 +1788,17 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test community_facts_capture -- --ignored --test-threads=1
+
+      # Post-suite storage evidence: max_wal_size is a soft target, so the
+      # pre-suite report cannot show peak WAL. This always-runs report brackets
+      # the run with post-suite sizes for the next ENOSPC triage.
+      - name: Report Postgres storage headroom (post-suite)
+        if: always()
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
 
   moderation-db:
     name: moderation db
@@ -2225,8 +2431,8 @@ jobs:
         run: cargo +nightly-2026-10-01 fetch --locked
       # Builds all twenty-five libFuzzer targets. No campaign or generated corpus
       # output; the existing weekly run replays the bounded eventsub_delivery,
-      # helix_token, and custom_command_template seeds below. Bounded vote_kick
-      # and helix_token smokes are manual (README).
+      # helix_token, custom_command_template, and fb_page_events seeds below.
+      # Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -2234,16 +2440,17 @@ jobs:
       - name: Compile-only fuzz build (no execution)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz build
-      # Bounded seed replay, eventsub_delivery, helix_token and
-      # custom_command_template: `-runs=0`
+      # Bounded seed replay, eventsub_delivery, helix_token,
+      # custom_command_template, and fb_page_events: `-runs=0`
       # executes each committed corpus seed exactly once (plus the target's
       # fixed matrix) and exits without fuzzing. A signing-key drift between
       # the harness and production, a token-contract drift between the
       # helix_token oracle and the parser, a template-contract drift between
-      # the custom_command_template oracle and the renderer, or seed
-      # misrouting panics an assertion here instead of passing a
-      # compile-only gate. Compile stays the only gate for the other
-      # twenty-two targets.
+      # the custom_command_template oracle and the renderer, a
+      # challenge/envelope-contract drift between the fb_page_events oracles
+      # and the front door, or seed misrouting panics an assertion here
+      # instead of passing a compile-only gate. Compile stays the only gate
+      # for the other twenty-one targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
@@ -2253,6 +2460,9 @@ jobs:
       - name: Seed replay for custom_command_template (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run custom_command_template -- -runs=0 -timeout=10 -rss_limit_mb=2048
+      - name: Seed replay for fb_page_events (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run fb_page_events -- -runs=0 -timeout=10 -rss_limit_mb=2048
 
   worker:
     name: worker check
@@ -2339,7 +2549,7 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_ownership_status.py -v
       - name: Verify staging redirect smoke (offline fixtures)
         if: needs.job-inputs.outputs.worker != 'false'
-        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_redirect_smoke.py -v
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s ../scripts -p 'test_staging_redirect_smoke*.py' -v
       - name: Verify staging automation read smoke (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
       - name: Verify staging voice smoke (offline fixtures)
@@ -2359,6 +2569,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
       - name: Verify synthetic alert history rollover (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert_history_rollover.py -v
+      - name: Verify slow-burn card filer (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_slow_burn_tracker.py -v
       - name: Verify voice denied-copy fixtures (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_voice_denied_copy.py -v
       - name: Verify staging-guild E2E prep skeleton (offline fixtures)
@@ -2369,6 +2581,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_smoke_run.py -v
       - name: Verify staging events read (offline fixtures, no database)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_events_read.py -v
+      - name: Verify staging event evidence semantics (offline fixtures, no database)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_events_read_acceptance.py -v
       - name: Verify cutover acceptance probes (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_qa_cutover_probes.py -v
       - name: Verify cutover freeze drill (offline fixtures)

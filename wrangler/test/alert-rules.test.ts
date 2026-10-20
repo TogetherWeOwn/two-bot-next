@@ -352,9 +352,47 @@ test("voice join slow burn tickets on a sustained 6 h grind that never trips fas
   const grinding = evAt(joinLines(361 * 100, 0, 361 * 96), state, 361 * 60);
   // 361 ticks: 36,100 genuine, 34,656 fast, 1,444 slow = 8x burn.
   assert.deepEqual(grinding.firing, ["voice_join_slow_burn"]);
+  assert.equal(grinding.joinSlowCovered, true);
   assert.equal(ruleFor("voice_join_slow_burn")?.severity, "ticket");
   // The same 8x never reaches the 14.4x fast line in any 1 h / 5 min window.
   assert.ok(!grinding.firing.includes("voice_join_fast_burn"));
+});
+
+test("voice join burn holds the previous firing state when the join series go missing", () => {
+  // A firing ticket survives an exposition without the join series: the
+  // tracker reads joinHeld to decide nothing instead of resolving the card.
+  let state = EMPTY_STATE;
+  for (let i = 0; i <= 360; i++) {
+    state = evAt(joinLines(i * 100, 0, i * 96), state, i * 60).state;
+  }
+  const firing = evAt(joinLines(361 * 100, 0, 361 * 96), state, 361 * 60);
+  assert.deepEqual(firing.firing, ["voice_join_slow_burn"]);
+  assert.equal(firing.joinHeld, false);
+  assert.equal(firing.joinSlowCovered, true);
+  const held = evAt([], firing.state, 362 * 60);
+  assert.deepEqual(held.firing, ["voice_join_slow_burn"]);
+  assert.equal(held.joinHeld, true);
+  assert.equal(held.joinSlowCovered, false);
+});
+
+test("voice join burn reports slow-window coverage separately from the firing verdict", () => {
+  // A fresh ring is silent but uncovered: the tracker must read coverage,
+  // not silence, before it may resolve the card.
+  const first = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0);
+  assert.deepEqual(first.firing, []);
+  assert.equal(first.joinSlowCovered, false);
+  const second = evAt(joinLines(12, 0, 10), first.state, 60);
+  assert.deepEqual(second.firing, []);
+  assert.equal(second.joinSlowCovered, false);
+  // Full quiet history is covered and stays silent: covered-but-quiet may
+  // still resolve, uncovered may not.
+  let state = EMPTY_STATE;
+  for (let now = -21600; now <= 0; now += 60) {
+    state = evAt(joinLines(0, 0, 0), state, now).state;
+  }
+  const quiet = evAt(joinLines(0, 0, 0), state, 60);
+  assert.deepEqual(quiet.firing, []);
+  assert.equal(quiet.joinSlowCovered, true);
 });
 
 test("voice join burn stays silent on healthy traffic, quiet windows and benign duplicates", () => {
@@ -397,7 +435,9 @@ test("voice join burn waits for full window history after a fresh ring", () => {
   state = evAt(joinLines(12, 0, 10), state, 60).state;
   // The next scrape sees the received counter, but no long-window boundary
   // has a snapshot before it yet. A partial ring must not act like full windows.
-  assert.deepEqual(evAt(joinLines(12, 0, 10), state, 120).firing, []);
+  const partial = evAt(joinLines(12, 0, 10), state, 120);
+  assert.deepEqual(partial.firing, []);
+  assert.equal(partial.joinSlowCovered, false);
 });
 
 test("voice join burn stays silent when healthy bursts land on window edges", () => {
@@ -412,6 +452,7 @@ test("voice join burn stays silent when healthy bursts land on window edges", ()
   }
   const settled = evAt(joinLines(state.joinBurn?.at(-1)?.received ?? 0, 0, state.joinBurn?.at(-1)?.fastMoves ?? 0), state, 360 * 60 + 60);
   assert.deepEqual(settled.firing, []);
+  assert.equal(settled.joinSlowCovered, true);
   assert.ok(!settled.firing.includes("voice_join_fast_burn"), "healthy bursts must not page");
   assert.ok(!settled.firing.includes("voice_join_slow_burn"), "healthy bursts must not ticket");
 });
@@ -926,6 +967,8 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "eventsub_post_failed_share",
     "error_budget_fast_burn",
     "error_budget_slow_burn",
+    "audit_delivery_halt",
+    "rest_admission_breaker_open",
     "eventsub_tampered",
     "eventsub_reconcile_failed",
     "event_store_consumer_lag",
@@ -954,6 +997,8 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("event_store_consumer_lag", window), `evidence-event_store_consumer_lag-${window}.json`);
   assert.equal(packetFilename("error_budget_fast_burn", window), `evidence-error_budget_fast_burn-${window}.json`);
   assert.equal(packetFilename("error_budget_slow_burn", window), `evidence-error_budget_slow_burn-${window}.json`);
+  assert.equal(packetFilename("rest_admission_breaker_open", window), `evidence-rest_admission_breaker_open-${window}.json`);
+  assert.equal(packetFilename("audit_delivery_halt", window), `evidence-audit_delivery_halt-${window}.json`);
   assert.equal(packetFilename("eventsub_tampered", window), `evidence-eventsub_tampered-${window}.json`);
   assert.equal(packetFilename("eventsub_reconcile_failed", window), `evidence-eventsub_reconcile_failed-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
@@ -1123,6 +1168,9 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   }
   firing.push(...budget.firing);
   firing.push(...ev(["two_bot_voice_creator_map_generation 3", "two_bot_voice_creator_map_age_seconds 601"]).firing);
+  let halted = EMPTY_STATE;
+  for (let i = 0; i < 3; i++) halted = ev(["two_bot_audit_delivery_halt 1"], halted).state;
+  firing.push(...halted.firing);
   const drainFamily = (error: number) => [
     `two_bot_community_facts_drain_failures_total{reason="error"} ${error}`,
     `two_bot_community_facts_drain_failures_total{reason="timeout"} 0`,
@@ -1149,6 +1197,9 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
       ]).state,
     ).firing,
   );
+  let breaker = EMPTY_STATE;
+  for (let i = 0; i < 3; i++) breaker = ev(["two_bot_rest_guard_breaker_open 1"], breaker).state;
+  firing.push(...breaker.firing);
   let tampered = ev([`two_bot_eventsub_classified_total{kind="tampered"} 0`]);
   for (const n of [1, 2, 3]) {
     tampered = ev([`two_bot_eventsub_classified_total{kind="tampered"} ${n}`], tampered.state);

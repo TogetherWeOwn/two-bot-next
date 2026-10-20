@@ -81,11 +81,13 @@ async fn main() {
     );
     println!("  guild {guild_id}   max {max_pages} pages/channel\n");
 
-    let channels = rest
-        .guild_channels(guild)
-        .await
-        .unwrap_or(None)
-        .unwrap_or_default();
+    let channels = match rest.guild_channels(guild).await {
+        Ok(Some(channels)) => channels,
+        Ok(None) | Err(_) => {
+            eprintln!("Guild-channel discovery unavailable; backfill stopped.");
+            std::process::exit(1);
+        }
+    };
     let cat_name: HashMap<String, String> = channels
         .iter()
         .filter(|c| c.kind == ChannelType::GuildCategory)
@@ -108,11 +110,16 @@ async fn main() {
 
     // Forum posts live in threads, and threads are separate channels.
     let mut thread_ids: Vec<String> = Vec::new();
-    if let Ok(Some(active)) = rest.active_threads(guild).await {
-        for t in &active.threads {
-            if THREAD_CHANNEL_TYPES.contains(&channel_type_code(&t.kind)) {
-                thread_ids.push(t.id.get().to_string());
-            }
+    let active = match rest.active_threads(guild).await {
+        Ok(Some(active)) => active,
+        Ok(None) | Err(_) => {
+            eprintln!("Active-thread discovery unavailable; backfill stopped.");
+            std::process::exit(1);
+        }
+    };
+    for t in &active.threads {
+        if THREAD_CHANNEL_TYPES.contains(&channel_type_code(&t.kind)) {
+            thread_ids.push(t.id.get().to_string());
         }
     }
     let mut archived_truncated: Vec<String> = Vec::new();
