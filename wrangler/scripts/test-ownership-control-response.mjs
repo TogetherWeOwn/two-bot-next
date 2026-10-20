@@ -22,6 +22,20 @@ for (const patch of [
   });
 }
 
+// Omit oldEpoch so its independent checks cannot mask an invalid epoch.
+for (const epoch of [0, -1, 80.5, Number.MAX_SAFE_INTEGER + 1]) {
+  test(`rejects supplied epoch ${epoch} on an abbreviated owner`, () => {
+    assert.equal(parseOwnershipResponse(state({ owner: { ...owner, epoch } })), null);
+  });
+}
+
+for (const epoch of [1, Number.MAX_SAFE_INTEGER]) {
+  test(`preserves valid boundary epoch ${epoch} on an abbreviated owner`, () => {
+    const response = state({ owner: { ...owner, epoch } });
+    assert.deepEqual(parseOwnershipResponse(response), response);
+  });
+}
+
 test('missing epoch is allowed only on an active legacy record', () => {
   assert.deepEqual(parseOwnershipResponse(state({ owner: { deploymentId: 'new', phase: 'active' } })),
     state({ owner: { deploymentId: 'new', phase: 'active' } }));
