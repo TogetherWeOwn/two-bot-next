@@ -187,6 +187,11 @@ def parse_json_or_text(body):
     return parsed
 
 
+def jsonrpc_code(err):
+    code = err.get("code")
+    return code if isinstance(code, int) and not isinstance(code, bool) else None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--output", required=True)
@@ -302,9 +307,7 @@ def main():
             failures.append(f"tools/call {tool}: expected HTTP 200 JSON-RPC envelope")
         elif "error" in parsed and parsed["error"] is not None:
             err = parsed["error"] if isinstance(parsed["error"], dict) else {}
-            code = err.get("code")
-            if not isinstance(code, int) or isinstance(code, bool):
-                code = None
+            code = jsonrpc_code(err)
             if tool in CONTAINER_BACKED and code == -32000:
                 print(f"NOTE: tools/call {tool} returned -32000 (fenced container); expected while staging is fenced.", flush=True)
             elif tool == "get_config":
@@ -340,7 +343,7 @@ def main():
         parsed = parse_json_or_text(body)
         err = parsed.get("error") if isinstance(parsed, dict) else None
         err = err if isinstance(err, dict) else {}
-        if status != 200 or err.get("code") != -32601:
+        if status != 200 or jsonrpc_code(err) != -32601:
             failures.append(f"tools/call unknown: expected JSON-RPC -32601, got HTTP {status} {err}")
     rpc_id += 1
 

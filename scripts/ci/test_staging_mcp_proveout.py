@@ -335,7 +335,7 @@ class HostileBodyTests(unittest.TestCase):
 
     def test_non_integer_error_codes_are_shape_failures(self):
         for index in range(2, 8):
-            for code in ("\ud800x", "-32000", -32000.0, True, ["x"]):
+            for code in ("\ud800x", "-32000", -32000.0, -32601.0, True, ["x"]):
                 with self.subTest(index=index, code=code):
                     self.assert_shape_failure(index, json.dumps({"error": {"code": code}}))
 
