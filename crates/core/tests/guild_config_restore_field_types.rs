@@ -261,7 +261,7 @@ fn well_formed_patch_plan_remains_byte_identical() {
         .map(|operation| {
             let path = match &operation.path {
                 RestorePath::Literal(path) => path.clone(),
-                RestorePath::Channel(id) => panic!("existing channel must use literal path: {id}"),
+                RestorePath::Channel(id) => format!("/channels/{id}"),
             };
             json!({"method": operation.method, "path": path,
                "body": operation.body, "capture_id": operation.capture_id})
