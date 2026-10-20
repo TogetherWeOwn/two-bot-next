@@ -83,10 +83,22 @@ this slice.
 8. Anchor posts record `onboarding_prompted`, then `channel_routed` with only
    the anchor channel and degraded=0 after successful delivery, like legacy.
 
-The prompt guard prevents normal concurrent/redelivered successful sends; it is
-**not exactly-once across a process crash between Discord acceptance and the
-Postgres commit**. That cross-system ambiguity is inherited from legacy's
-send-then-record ordering. Do not record a failed send as success to hide it.
+The prompt guard prevents normal concurrent/redelivered successful sends. The
+runtime also retains an accepted-send receipt (message ID, original channel,
+time and anchor mode) before awaiting the record transaction. A transient record
+rollback gets one immediate, bounded record-only retry before reporting worker
+failure. A later retry within that runtime only reconciles the record under a
+fresh prompt/suppression guard; it never posts the welcome again. Local welcome attempts serialize through this
+transition. At most 32 unsettled receipts are retained; a full set refuses new
+sends rather than evicting receipts and risking duplicates. Failed sends create
+neither a receipt nor a prompt marker. Anchor substitution matches only the
+complete `<#channel-id>` mention, never bare IDs or other mention kinds.
+
+This is **not exactly-once across a process restart or independent runtimes
+between Discord acceptance and the Postgres commit**. Receipts are memory-only;
+worker errors can stop the essential runner and lose them on restart. That
+cross-system ambiguity remains outside this slice. Do not record a failed send
+as success to hide it.
 
 ## Runtime wiring checkpoint
 
@@ -123,9 +135,14 @@ call the shared component router and executor without blocking shard polling.
 
 Each relevant event reads a consistent settings snapshot. Hot stored overrides
 win; deletion restores deployment defaults. Mode and guild identity remain
-immutable deployment fields. Effective channel access is resolved from fresh
-guild/member/role reads and channel overwrites, in Discord overwrite order.
-Foreign guilds, DMs, malformed evidence and unpostable destinations fail closed.
+immutable deployment fields. Welcome/goodbye bot identity evidence uses one
+singleflight snapshot per runtime with a 60-second monotonic TTL. Guild/role
+changes and the bot's member events invalidate its generation, including loads
+in flight. Missing/unavailable identity is never cached. Channel checks remain
+live on every attempt; denied/unavailable access or failed posts invalidate the
+snapshot. Member picker permission reads remain fresh and uncached. Effective
+access follows Discord overwrite order. Foreign guilds, DMs, malformed evidence
+and unpostable destinations fail closed.
 Game role changes are serialized per member and routing reads fresh roles after
 all changes; unavailable fallback hubs are never linked. View-only game routing
 accepts the hub's forum type, but a plain welcome cannot post to a forum. Existing
