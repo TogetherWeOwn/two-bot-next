@@ -111,6 +111,22 @@ remaining gateway/accepted-prefix work:
    in-flight refusal gate active during deregistration and surface incomplete
    REST deletes instead of declaring disable complete.
 
+## Slash-run audit replay
+
+A definitive pre-mutation defer refusal records a failed `command.run` fact
+with reason `delivery_failed`. An ambiguous defer (timeout, transport, 5xx or
+429) leaves no definitive run fact. Slash-run facts use
+`custom:run:<interaction_id>` and are first-write-wins: a duplicate preserves
+all original columns, including `created_at`, rather than turning the current
+delivery outcome into a storage error. Both refused-defer and completion writes
+use this rule; management and prefix audits are unchanged.
+
+This is audit deduplication, not an execution claim. Explicit re-entry still
+attempts the defer and returns that call's delivery outcome; it adds no automatic
+retry. If a later explicit call succeeds after a recorded refusal, the original
+failed fact remains unchanged. A first successful invocation records the same
+success fact as before.
+
 ## Explicit prefix acceptance and replay safety
 
 `AutomationMessageAcceptance` distinguishes deliberately disabled automod,
