@@ -2524,8 +2524,9 @@ def slow_burn_tracker_errors(workflow):
             continue
         checkout, setup_node, run_step, upload = steps[0], steps[1], steps[run_index], steps[-1]
         if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-                or (checkout.get("with") or {}).get("persist-credentials") != "false":
-            errors.append(f"{name}:{job_id}: checkout must be pinned and must not persist credentials")
+                or checkout.get("with") != {"persist-credentials": "false", "fetch-depth": "1"}:
+            errors.append(f"{name}:{job_id}: checkout must be pinned, must not persist credentials, "
+                          "and must not set ref or repository")
         if not str(setup_node.get("uses", "")).startswith("actions/setup-node@") \
                 or (setup_node.get("with") or {}).get("node-version") != "24":
             errors.append(f"{name}:{job_id}: setup-node must be pinned at node 24 for the verdict driver")
@@ -5083,6 +5084,10 @@ class WorkflowTests(unittest.TestCase):
                 {"permissions": {"contents": "write", "issues": "write"}}),
             "live persisted credentials": lambda w: live_job(w)["steps"][0]["with"].update(
                 {"persist-credentials": "true"}),
+            "live checkout ref swap": lambda w: live_job(w)["steps"][0]["with"].update(
+                {"ref": "evil-branch"}),
+            "live checkout repository swap": lambda w: live_job(w)["steps"][0]["with"].update(
+                {"repository": "evil/repo"}),
             "live save only on success": lambda w: live_job(w)["steps"][4].update({"if": "success()"}),
             # Fixture job: proof runs never reach the staging Environment.
             "fixture binds staging": lambda w: fixture_job(w).update({"environment": deepcopy(staging)}),
@@ -5120,6 +5125,10 @@ class WorkflowTests(unittest.TestCase):
                 {"permissions": {"contents": "write", "issues": "write"}}),
             "fixture persisted credentials": lambda w: fixture_job(w)["steps"][0]["with"].update(
                 {"persist-credentials": "true"}),
+            "fixture checkout ref swap": lambda w: fixture_job(w)["steps"][0]["with"].update(
+                {"ref": "evil-branch"}),
+            "fixture checkout repository swap": lambda w: fixture_job(w)["steps"][0]["with"].update(
+                {"repository": "evil/repo"}),
             "fixture unrouted runner": lambda w: fixture_job(w).update({"runs-on": "ubuntu-latest"}),
             "fixture on tracker routing": lambda w: fixture_job(w).update(
                 {"runs-on": ROUTED_RUNNER.format(job="tracker")}),
