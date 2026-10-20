@@ -304,7 +304,13 @@ def collect(image, directory):
         configured_user = config.get("User")
         entrypoint = config.get("Entrypoint")
         cmd = config.get("Cmd")
-    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        if not (isinstance(inspected_id, str) and isinstance(architecture, str)
+                and isinstance(os_name, str)
+                and isinstance(configured_user, (str, type(None)))
+                and isinstance(entrypoint, (list, type(None)))
+                and isinstance(cmd, (list, type(None)))):
+            raise TypeError("unexpected inspection field type")
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError, RecursionError):
         # Malformed inspection fails closed through the collection_error path
         # (the inspect_filesystem precedent below), never as a traceback. The
         # architecture and config fields are unknown, so they are omitted

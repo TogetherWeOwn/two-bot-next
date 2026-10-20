@@ -214,7 +214,14 @@ def http_response(url):
 
 
 def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BYTES):
-    metadata = json.loads(docker("image", "inspect", image).stdout)[0]
+    image_entries = json.loads(docker("image", "inspect", image).stdout)
+    require(isinstance(image_entries, list) and image_entries,
+            "docker image inspect returned no entries")
+    require(isinstance(image_entries[0], dict),
+            "docker image inspect entry must be a JSON object")
+    metadata = image_entries[0]
+    require("Id" in metadata, "docker image inspect entry has no Id")
+    require("Size" in metadata, "docker image inspect entry has no Size")
     # Resolve the tag once; measurement and every image probe use this ID.
     image = metadata["Id"]
     report(f"Docker storage-driver Size (diagnostic only): {metadata['Size']} bytes")
