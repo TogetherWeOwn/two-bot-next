@@ -280,7 +280,7 @@ class ProbeTests(unittest.TestCase):
         self.server.fallback = "twoInvite"
         results = self.run_probes(expect_fallback_code="twoInvite")
         self.assertVerdicts(results)
-        self.assertEqual(results["fallback"]["observed"]["fallback_location"], "https://discord.gg/twoInvite")
+        self.assertEqual(results["fallback"]["observed"]["fallback_location"], "discord_invite")
         # Lookup outage: an unknown slug may redirect, but only to the fallback.
         self.server.overrides[f"/{SLUG}"] = (302, {"location": "https://discord.gg/twoInvite"}, "")
         results = self.run_probes()
