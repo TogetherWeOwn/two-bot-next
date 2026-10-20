@@ -275,7 +275,12 @@ fn well_formed_patch_plan_remains_byte_identical() {
          "body": {"name": "general", "type": 0, "parent_id": null,
                   "topic": "Welcome", "nsfw": false, "rate_limit_per_user": 5}},
         {"method": "PATCH", "path": "/guilds/1545644954272137297", "capture_id": null,
-         "body": {"afk_timeout": 300}}
+         "body": {"name": "Guild", "description": "A community", "verification_level": 2,
+                  "default_message_notifications": 0, "explicit_content_filter": 2,
+                  "afk_timeout": 300, "preferred_locale": "en-US",
+                  "premium_progress_bar_enabled": false, "system_channel_flags": 0,
+                  "system_channel_id": null, "rules_channel_id": null,
+                  "public_updates_channel_id": null, "afk_channel_id": null}}
     ]);
     assert_eq!(
         serde_json::to_vec(&actual).expect("operation bytes"),
