@@ -272,30 +272,27 @@ pub struct ImportDiff {
     pub to_create: Vec<String>,
     pub to_update: Vec<String>,
     pub unchanged: Vec<String>,
+    /// Indices into `ParsedImport::entries`, in document order, including
+    /// same-content convergence. Names alone cannot authorize an occurrence.
+    pub accepted_entry_indices: Vec<usize>,
     pub rejected: Vec<ImportRejection>,
     pub invalid_entries: usize,
 }
 
-fn same_content(existing: &StoredCommand, desired: &PutCommandInput) -> bool {
-    existing.description == desired.description
-        && existing.template == desired.template
-        && existing.text_trigger == desired.text_trigger
-}
-
-/// Plan the import without touching storage. Trigger ownership is simulated in
-/// document order (first claimant wins), mirroring the sequential legacy loop
-/// where earlier rows of the same import already hold their triggers.
+/// Plan the import without touching storage. Content and trigger ownership are
+/// simulated in document order (first claimant wins). Only accepted occurrences
+/// change that state; an accepted update releases its previous trigger.
 pub fn diff_import(
     existing: &[StoredCommand],
     parsed: &ParsedImport,
     builtins: &HashSet<String>,
     overwrite: bool,
 ) -> Result<ImportDiff, CommandError> {
-    let mut valid: Vec<&PutCommandInput> = Vec::with_capacity(parsed.entries.len());
+    let mut valid = Vec::with_capacity(parsed.entries.len());
     let mut rejected: Vec<ImportRejection> = Vec::new();
-    for entry in &parsed.entries {
+    for (index, entry) in parsed.entries.iter().enumerate() {
         match validate_put_input(entry, builtins) {
-            Ok(()) => valid.push(entry),
+            Ok(()) => valid.push((index, entry)),
             Err(err) => rejected.push(ImportRejection {
                 name: entry.name.clone(),
                 code: error_code(&err).to_owned(),
@@ -304,15 +301,25 @@ pub fn diff_import(
     }
     let max = max_custom_commands(builtins.len());
     let mut union: HashSet<&str> = existing.iter().map(|row| row.name.as_str()).collect();
-    for entry in &valid {
+    for (_, entry) in &valid {
         union.insert(entry.name.as_str());
     }
     if union.len() > max {
         return Err(CommandError::OverCapacity(max));
     }
-    let by_name: HashMap<&str, &StoredCommand> = existing
+    let mut by_name: HashMap<&str, PutCommandInput> = existing
         .iter()
-        .map(|row| (row.name.as_str(), row))
+        .map(|row| {
+            (
+                row.name.as_str(),
+                PutCommandInput {
+                    name: row.name.clone(),
+                    description: row.description.clone(),
+                    template: row.template.clone(),
+                    text_trigger: row.text_trigger.clone(),
+                },
+            )
+        })
         .collect();
     let mut trigger_owner: HashMap<String, String> = HashMap::new();
     for row in existing {
@@ -324,6 +331,7 @@ pub fn diff_import(
         to_create: Vec::new(),
         to_update: Vec::new(),
         unchanged: Vec::new(),
+        accepted_entry_indices: Vec::new(),
         rejected,
         invalid_entries: parsed.invalid_entries,
     };
@@ -333,42 +341,41 @@ pub fn diff_import(
             code: code.to_owned(),
         });
     };
-    for entry in valid {
+    for (index, entry) in valid {
+        let stored = by_name.get(entry.name.as_str());
+        if let Some(stored) = stored {
+            if stored == entry {
+                diff.unchanged.push(entry.name.clone());
+                diff.accepted_entry_indices.push(index);
+                continue;
+            }
+            if !overwrite {
+                reject(&mut diff, &entry.name, "would_overwrite");
+                continue;
+            }
+        }
         let trigger_taken = entry
             .text_trigger
             .as_deref()
             .and_then(|trigger| trigger_owner.get(&trigger.to_lowercase()))
             .is_some_and(|owner| owner != &entry.name);
-        match by_name.get(entry.name.as_str()) {
-            None => {
-                if trigger_taken {
-                    reject(&mut diff, &entry.name, "trigger_in_use");
-                    continue;
-                }
-                if let Some(trigger) = entry.text_trigger.as_deref() {
-                    trigger_owner.insert(trigger.to_lowercase(), entry.name.clone());
-                }
-                diff.to_create.push(entry.name.clone());
-            }
-            Some(stored) => {
-                if same_content(stored, entry) {
-                    diff.unchanged.push(entry.name.clone());
-                    continue;
-                }
-                if !overwrite {
-                    reject(&mut diff, &entry.name, "would_overwrite");
-                    continue;
-                }
-                if trigger_taken {
-                    reject(&mut diff, &entry.name, "trigger_in_use");
-                    continue;
-                }
-                if let Some(trigger) = entry.text_trigger.as_deref() {
-                    trigger_owner.insert(trigger.to_lowercase(), entry.name.clone());
-                }
-                diff.to_update.push(entry.name.clone());
-            }
+        if trigger_taken {
+            reject(&mut diff, &entry.name, "trigger_in_use");
+            continue;
         }
+        if let Some(stored) = stored {
+            if let Some(trigger) = stored.text_trigger.as_deref() {
+                trigger_owner.remove(&trigger.to_lowercase());
+            }
+            diff.to_update.push(entry.name.clone());
+        } else {
+            diff.to_create.push(entry.name.clone());
+        }
+        if let Some(trigger) = entry.text_trigger.as_deref() {
+            trigger_owner.insert(trigger.to_lowercase(), entry.name.clone());
+        }
+        by_name.insert(entry.name.as_str(), entry.clone());
+        diff.accepted_entry_indices.push(index);
     }
     Ok(diff)
 }
@@ -535,6 +542,60 @@ mod tests {
         );
         let forced = diff_import(&existing, &parsed, &builtins(), true).expect("diff plans");
         assert_eq!(forced.to_update, ["faq"]);
+    }
+
+    #[test]
+    fn accepted_indices_refer_to_parsed_entries_not_names_or_valid_only_entries() {
+        let parsed = parse(&json!({
+            "version": 1,
+            "commands": [
+                null,
+                {"name": "faq", "template": "A"},
+                {"name": "faq", "template": "{usre}"},
+                {"name": "faq", "template": "B"},
+                {"name": "faq", "template": "A"},
+            ],
+        }));
+        assert_eq!(parsed.invalid_entries, 1);
+        let diff = diff_import(&[], &parsed, &builtins(), false).expect("diff plans");
+        assert_eq!(diff.accepted_entry_indices, [0, 3]);
+        assert_eq!(diff.to_create, ["faq"]);
+        assert_eq!(diff.unchanged, ["faq"]);
+        assert_eq!(
+            diff.rejected
+                .iter()
+                .map(|rejection| rejection.code.as_str())
+                .collect::<Vec<_>>(),
+            ["invalid_template", "would_overwrite"]
+        );
+        assert_eq!(diff.invalid_entries, 1);
+    }
+
+    #[test]
+    fn accepted_slash_only_update_releases_trigger_for_next_claimant() {
+        let existing = vec![stored("faq", "A", Some("!old"))];
+        let parsed = parse(&json!({
+            "version": 1,
+            "overwrite": true,
+            "commands": [
+                {"name": "faq", "template": "B", "text_trigger": null},
+                {"name": "other", "template": "C", "text_trigger": "!old"},
+                {"name": "faq", "template": "D", "text_trigger": "!old"},
+                {"name": "faq", "template": "B", "text_trigger": null},
+            ],
+        }));
+        let diff = diff_import(&existing, &parsed, &builtins(), true).expect("diff plans");
+        assert_eq!(diff.accepted_entry_indices, [0, 1, 3]);
+        assert_eq!(diff.to_update, ["faq"]);
+        assert_eq!(diff.to_create, ["other"]);
+        assert_eq!(diff.unchanged, ["faq"]);
+        assert_eq!(
+            diff.rejected,
+            [ImportRejection {
+                name: "faq".to_owned(),
+                code: "trigger_in_use".to_owned(),
+            }]
+        );
     }
 
     #[test]
