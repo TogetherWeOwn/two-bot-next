@@ -203,8 +203,27 @@ jobs:
       # `cargo fmt` fails with "detected conflict: 'bin/cargo-fmt'" in roughly
       # half the runs. With the components in place the probe returns at once.
       - name: Install pinned Rust toolchain components
+        id: pinned_components
         if: needs.job-inputs.outputs.rust != 'false'
         run: rustup toolchain install --no-self-update
+        # Pip can invoke rustc immediately afterward; retry this first install
+        # too, or a transient rustup network failure aborts before the later retry.
+        continue-on-error: true
+
+      - name: Retry pinned Rust toolchain components on transient network failure
+        if: steps.pinned_components.outcome == 'failure'
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install --no-self-update; then
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
 
       - name: Install pinned static audit tools
         run: |

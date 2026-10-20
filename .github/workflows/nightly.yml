@@ -213,6 +213,8 @@ jobs:
           --skip shared_router_gates_bounds_and_required_reason_refuse_without_http
           --skip purge_and_slowmode_success_audit_and_replay_without_repeating_effects
           --skip purge_of_messages_older_than_fourteen_days_deletes_them_singly
+          --skip purge_stopped_early_reports_the_reason_in_the_reply_and_the_audit_row
+          --skip full_purge_reply_and_audit_metadata_are_byte_identical_to_before
           --skip repeated_lockdown_keeps_first_seed_and_unlock_restores_exact_masks
           --skip initially_absent_overwrite_is_deleted_only_after_recorded_lockdown
           --skip unlock_preserves_access_restrictions_added_after_lockdown
@@ -244,6 +246,9 @@ jobs:
           --skip purge_history_failures_are_retryable_without_any_deletion
           --skip uncertain_purge_deletions_keep_same_key_and_distinct_key_fenced
           --skip purge_counts_bulk_delete_and_replays_without_rest_or_duplicate_audit
+          --skip purge_stopped_early_reports_the_reason_in_the_result_and_the_audit_row
+          --skip full_purge_audit_metadata_and_stored_payload_are_byte_identical_to_before
+          --skip purge_corrupt_stop_reason_replay_fails_closed_without_discord_requests
           --skip slowmode_zero_and_signed_maximum_unicode_reason_survive_replay
           --skip lockdown_and_unlock_restore_full_masks_and_replay_independently
           --skip missing_overwrite_is_deleted_on_unlock_and_untracked_unlock_refuses
