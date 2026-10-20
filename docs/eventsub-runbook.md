@@ -128,9 +128,9 @@ reconciler's recreated subscription verifies, not by printing either value.
 Never use a test fixture as a runtime credential.
 
 Armed-refresh variant (staging only, needs its own authorization like any
-rotation): with `TWO_EVENTSUB_RELOAD_KEY` provisioned, the verification side
-needs no restart — the running container swaps to the new secret on the
-first delivery served by the new Worker version, so a controlled delivery
+rotation): with `TWO_EVENTSUB_RELOAD_KEY` provisioned and unchanged, the
+verification side needs no restart — the running container swaps to the new
+secret on the first delivery served by the new Worker version, so a controlled delivery
 signed with the new secret verifies with no restart. The subscription
 creation side still reads the boot secret per pass
 (`crates/bot/src/eventsub_reconcile.rs`, `webhook_secret_from_env`), so a
@@ -146,6 +146,17 @@ on our callback are kept without comparing secrets), `:481-488`
 `crates/core/src/twitch_helix.rs:591-593` (a `409` create counts as
 `AlreadyExists` only after a follow-up listing confirms a healthy
 subscription on our callback).
+
+The reload key itself is startup-only: arming, rotating, or removing
+`TWO_EVENTSUB_RELOAD_KEY` requires an authorized container restart after the
+corresponding Worker version takes ownership. Until the running container
+loads the matching configuration, deliveries may return retryable 503
+`unavailable`: a changed key fails refresh authentication, while removing
+the key leaves an armed receiver without refresh headers. Adding the key
+does not arm a receiver that was started without it. This restart requirement
+does not relax the staging and subscription-rotation restrictions above.
+Source: `crates/core/src/eventsub_receiver_config.rs` (`from_lookup`),
+`crates/bot/src/eventsub_http.rs` (`ReceiverState::with_delivery`, `receive`).
 
 ## Subscription reconciler
 

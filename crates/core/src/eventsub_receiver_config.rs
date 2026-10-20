@@ -243,12 +243,12 @@ mod tests {
         let config = load(&vars()).unwrap().expect("enabled");
         assert!(config.reload_key().is_none());
         // Present and long enough: armed, bytes intact.
-        let mut vars = vars();
-        vars.insert(
+        let mut configured_vars = vars();
+        configured_vars.insert(
             "TWO_EVENTSUB_RELOAD_KEY".to_owned(),
             "synthetic-reload-key-00000000000001".to_owned(),
         );
-        let config = load(&vars).unwrap().expect("enabled");
+        let config = load(&configured_vars).unwrap().expect("enabled");
         assert_eq!(
             config.reload_key().expect("armed").expose(),
             b"synthetic-reload-key-00000000000001"

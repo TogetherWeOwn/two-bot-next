@@ -164,10 +164,10 @@ impl RefreshVerifier {
 /// fresh, unreplayed, valid candidate swaps; anything else leaves `current`
 /// untouched for the caller to refuse generically. The swap holds one write
 /// lock, so concurrent requests each verify against one complete snapshot.
-pub fn refresh_before_verify(
+pub fn refresh_before_verify<'headers>(
     verifier: &RefreshVerifier,
     current: &RwLock<WebhookSecret>,
-    header: impl Fn(&str) -> Option<&str>,
+    header: impl Fn(&str) -> Option<&'headers str>,
     request_id: &str,
     now_ms: u64,
 ) -> Result<(), RefreshRejection> {
@@ -285,8 +285,10 @@ mod tests {
         ])
     }
 
-    fn lookup(headers: &HashMap<String, String>) -> impl Fn(&str) -> Option<&str> {
-        |name| headers.get(name).map(String::as_str)
+    fn lookup<'headers>(
+        headers: &'headers HashMap<String, String>,
+    ) -> impl Fn(&str) -> Option<&'headers str> {
+        move |name| headers.get(name).map(String::as_str)
     }
 
     fn now_secs() -> u64 {
@@ -428,6 +430,7 @@ mod tests {
 
     #[test]
     fn tampering_any_signed_field_breaks_the_hmac() {
+        let (other_verifier, _) = verifier();
         let (verifier, key) = verifier();
         let old = fresh_material("old-secret");
         let new = fresh_material("new-secret");
@@ -479,8 +482,7 @@ mod tests {
             ),
             Err(RefreshRejection::BadSignature)
         );
-        // A signature under another key does not verify either.
-        let (other_verifier, _) = verifier();
+        // The original request id and correct key still verify.
         let current = lock_for(&old);
         assert_eq!(
             refresh_before_verify(
@@ -492,13 +494,14 @@ mod tests {
             ),
             Ok(())
         );
-        let replayed = signed_headers(&key, &new, now_secs(), &nonce_for(8));
+        // A fresh signature does not verify under another key.
+        let signed_with_original_key = signed_headers(&key, &new, now_secs(), &nonce_for(8));
         let current = lock_for(&old);
         assert_eq!(
             refresh_before_verify(
                 &other_verifier,
                 &current,
-                lookup(&replayed),
+                lookup(&signed_with_original_key),
                 REQUEST_ID,
                 NOW_MS
             ),
@@ -600,10 +603,11 @@ mod tests {
     fn debug_and_rejection_carry_no_secret_material() {
         let (verifier, key) = verifier();
         let secret = fresh_material("debug-secret");
-        let rendered = format!("{verifier:?}");
-        assert!(!rendered.contains(&String::from_utf8_lossy(&key)));
-        assert!(!rendered.contains(secret.as_str()));
-        assert!(rendered.contains("key_len"));
+        let key_text = String::from_utf8_lossy(&key);
+        for rendered in [format!("{verifier:?}"), format!("{verifier:#?}")] {
+            assert!(!rendered.contains(key_text.as_ref()));
+            assert!(rendered.contains("key_len"));
+        }
         for rejection in [
             RefreshRejection::MissingHeader,
             RefreshRejection::MalformedHeader,
@@ -614,10 +618,7 @@ mod tests {
             RefreshRejection::Unavailable,
         ] {
             let text = format!("{rejection:?}");
-            assert!(
-                !text.contains(&String::from_utf8_lossy(&key)),
-                "{rejection:?}"
-            );
+            assert!(!text.contains(key_text.as_ref()), "{rejection:?}");
             assert!(!text.contains(secret.as_str()), "{rejection:?}");
         }
         // The digest helper is stable and hex-shaped; digests never format
