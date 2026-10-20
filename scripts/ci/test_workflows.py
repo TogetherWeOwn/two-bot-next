@@ -1716,10 +1716,10 @@ def production_errors(workflow):
         errors.append(f"{name}: production must run on dispatch, staging completion or schedule only")
     else:
         run_trigger = (on.get("workflow_run") or {})
-        if (run_trigger.get("workflows") != ["deploy-staging"]
+        if (run_trigger.get("workflows") != ["deploy-staging", "check"]
                 or run_trigger.get("types") != ["completed"]
                 or run_trigger.get("branches") != ["main"]):
-            errors.append(f"{name}: workflow_run must be a completed deploy-staging run on main only")
+            errors.append(f"{name}: workflow_run must be a completed deploy-staging or check run on main only")
         if not isinstance(on.get("schedule"), list) or not on.get("schedule"):
             errors.append(f"{name}: schedule must carry the daily backstop")
     jobs = workflow.get("jobs", {})
@@ -3474,6 +3474,18 @@ class WorkflowTests(unittest.TestCase):
             "--skip seeded_aggregates_render_exactly_guild_scoped_and_read_only",
             main_sweep,
         )
+        # Staging fixtures accept only the exact agent_test URL; they run in
+        # the dedicated staging_migrate_db re-run below, never in this
+        # two_bot_test_ci sweep. Enumerate from the Rust source so a future
+        # seventh fixture cannot silently rejoin.
+        staging_source = (ROOT / "crates/cutover/tests/staging_migrate_db.rs").read_text()
+        staging_names = set(re.findall(r'#\[ignore[^\]]*\]\s*async fn (\w+)\(', staging_source))
+        self.assertTrue(staging_names, "guarded ignored fixtures must be discovered")
+        # Match complete tokens: a suffixed filter would not skip the fixture.
+        broad_skips = set(re.findall(r"--skip (\S+)", ignored_sweeps[0]))
+        for name in sorted(staging_names):
+            with self.subTest(staging_skip=name):
+                self.assertIn(name, broad_skips)
         ignored_sweep = [run for run in sweeps if "-- --ignored" in run][0]
         self.assertIn(
             "--skip list_is_guild_scoped_selector_shaped_and_read_only",
@@ -3516,6 +3528,10 @@ class WorkflowTests(unittest.TestCase):
                     self.assertIn("--features db", matches[0])
                 else:
                     self.assertNotIn("--features db", matches[0])
+                if needle == "--test staging_migrate_db":
+                    for name in sorted(staging_names):
+                        with self.subTest(dedicated_no_skip=name):
+                            self.assertNotIn(f"--skip {name}", matches[0])
         # Stream has one standalone fail-closed replay after the ignored sweep.
         # The last URL export must select its strict omitted-password form;
         # neither a second target nor a skip may mask the ignored stream cases.

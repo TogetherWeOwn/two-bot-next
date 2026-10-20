@@ -862,6 +862,9 @@ jobs:
           # stream_live_store now accepts the bootstrap URL too. Run its ignored
           # DB cases once in the fail-closed agent_test replay below instead of
           # duplicating them in this failure-tolerant sweep.
+          # These fixtures accept only the exact agent_test URL, not the
+          # two_bot_test_ci URL on this step; they run in their dedicated sweep
+          # below after TWO_TEST_DATABASE_URL is pinned to agent_test.
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail \
             --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs \
@@ -874,6 +877,12 @@ jobs:
             --skip started_claim_is_never_reclaimed_even_when_stale \
             --skip started_send_that_provably_failed_releases_for_the_retry \
             --skip reclaiming_a_missing_key_claims_it_fresh \
+            --skip real_sqlx_runner_cases \
+            --skip post_failure_unreadable_ledger_is_unknown_not_empty \
+            --skip post_failure_readable_ledger_keeps_array_output \
+            --skip post_apply_unreadable_ledger_is_unknown_not_empty \
+            --skip store_failure_keeps_committed_cutover_evidence \
+            --skip connection_count_sees_other_roles_from_plan_login \
             --skip list_is_guild_scoped_selector_shaped_and_read_only
           # Guarded channel suites accept the exact agent_test URL and the
           # workspace bootstrap URL (they always connect to agent_test with
