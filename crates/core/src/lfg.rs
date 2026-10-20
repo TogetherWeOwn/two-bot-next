@@ -504,6 +504,13 @@ pub fn lfg_select_options(
     options
 }
 
+/// Resource IDs use the same nonempty, 128-UTF-16-unit bound at every LFG edge.
+#[must_use]
+pub fn valid_post_id(post_id: &str) -> bool {
+    let limit = crate::commands::MAX_RESOURCE_ID_CHARS;
+    !post_id.is_empty() && post_id.encode_utf16().take(limit + 1).count() <= limit
+}
+
 /// Select `custom_id` for a post (legacy `` `two:lfg:${post.id}` ``).
 #[must_use]
 pub fn lfg_custom_id(post_id: &str) -> String {
@@ -518,12 +525,16 @@ pub enum LfgSelectAction {
 }
 
 /// Parse a select interaction (`custom_id` + chosen value). `None` for
-/// foreign prefixes. An empty/unknown role value parses as a signup and the
-/// store answers `missing`, exactly like legacy (`role ?? ''` → `signupLfg`
+/// foreign prefixes or empty/overlong post IDs. An empty/unknown role value
+/// parses as a signup and the store answers `missing`, exactly like legacy
+/// (`role ?? ''` → `signupLfg`
 /// → unknown role → `'missing'`).
 #[must_use]
 pub fn parse_lfg_select(custom_id: &str, value: &str) -> Option<LfgSelectAction> {
     let post_id = custom_id.strip_prefix(LFG_SELECT_PREFIX)?;
+    if !valid_post_id(post_id) {
+        return None;
+    }
     if value == LFG_LEAVE_VALUE {
         Some(LfgSelectAction::Leave {
             post_id: post_id.to_owned(),
