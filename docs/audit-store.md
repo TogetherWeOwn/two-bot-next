@@ -143,7 +143,27 @@ password, or the disposable CI Postgres service. They never read application
 uses separate pools for worker races/restart. Connection/setup failures fail tests.
 CI explicitly executes the ignored DB lane; ignored tests alone are not evidence.
 
+On the persistent controller, use the
+[bounded build-cache wrapper](build-cache.md#local-builds) from the isolated
+worktree, with a 600000 ms Bash timeout or in the background. Refused or missing
+admission is not permission for direct compiling Cargo or another target/cache;
+follow the [Operator path](build-cache.md#operator-handoff-and-rollback-one-host-step).
+These recipes make no current pool-health claim. Format and diff checks do not
+compile and may run directly.
+
 ```sh
+# Persistent controller only (fmt and diff checks may run anywhere).
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --lib audit_store --locked -j 1
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test audit_store --locked -j 1 -- --ignored
+python3 scripts/cargo_cache.py run -- clippy -p two-bot-core --features db --all-targets --locked -j 1 -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+```
+
+Ephemeral hosted CI retains its direct Cargo variants and disposable DB boundary:
+
+```sh
+# Ephemeral hosted CI only, not a controller fallback.
 cargo test -p two-bot-core --features db --lib audit_store --locked -j 1
 cargo test -p two-bot-core --features db --test audit_store --locked -j 1 -- --ignored
 cargo clippy -p two-bot-core --features db --all-targets --locked -j 1 -- -D warnings

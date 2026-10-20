@@ -431,6 +431,16 @@ Absent, blank and valid settings remain silent. Nonfatal admission knobs
 retain their separate default-fallback warning below. For safe triage, see
 [voice boot-setting refusal](runbook-observability.md#voice-boot-setting-refusal).
 
+Configured-channel notice fallback warning (in
+`GuildRoomWorker::deliver_notice` in `crates/bot/src/voice_rooms.rs`, guild
+field plus bounded `op` and `outcome`, no notice text or mention payload):
+`voice notice configured channel failed; trying fallback` (warn): the
+configured `/logging` channel refused the notice send, so delivery falls
+through to the system channel, owner DM and creator chat in order. One line
+per failed configured-channel attempt; a working channel logs nothing, and a
+rate-limited attempt falls through silently (a rate limit is a retry, not an
+outcome).
+
 Invite-code override warning (in `stored_invite_code_with` in
 `crates/bot/src/voice_rooms.rs`, guild-only fields, no IDs):
 `stored invite-code override invalid; using vanity fallback` (warn): the

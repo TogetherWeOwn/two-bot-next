@@ -67,6 +67,27 @@ function isToolName(value: unknown): value is McpToolName {
   );
 }
 
+/** Echo only JSON-RPC scalar correlation IDs; anything else becomes null so
+ * refusals never reflect untrusted values. Falsy-but-valid IDs (`0`, `""`)
+ * are preserved. */
+function safeId(value: unknown): string | number | null {
+  return typeof value === "string" || typeof value === "number" ? value : null;
+}
+
+/** Every advertised tool takes no arguments: omitted or an empty object. Any
+ * scalar, array, null, or unexpected own key (including falsy values and an
+ * own `__proto__` key) is refused before dispatch. */
+function hasValidArguments(params: Record<string, unknown>): boolean {
+  if (!("arguments" in params)) return true;
+  const args = params["arguments"];
+  return (
+    typeof args === "object" &&
+    args !== null &&
+    !Array.isArray(args) &&
+    Object.keys(args).length === 0
+  );
+}
+
 const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
   get_status: "Bot status (container /health, read-only)",
   get_gateway: "Gateway connection state excerpt from /readyz (read-only)",
@@ -493,28 +514,44 @@ export async function handleMcp(
   } catch {
     return jsonError(null, -32700, "parse error");
   }
-  if (typeof body !== "object" || body === null) {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
     return jsonError(null, -32600, "invalid request");
   }
   const msg = body as Record<string, unknown>;
   if (msg["jsonrpc"] !== "2.0" || typeof msg["method"] !== "string") {
-    return jsonError(
-      (msg as { id?: unknown })["id"] ?? null,
-      -32600,
-      "invalid request",
-    );
+    return jsonError(safeId(msg["id"]), -32600, "invalid request");
   }
   const method = msg["method"] as string;
-  const id = ("id" in msg ? msg["id"] : undefined) as unknown;
-  const params = (msg["params"] ?? {}) as Record<string, unknown>;
-
-  // JSON-RPC notifications (no id) get a bare 202, never a result body.
-  if (id === undefined || id === null) {
-    if (method.startsWith("notifications/")) {
-      return new Response(null, { status: 202, headers: withSecurityHeaders() });
-    }
+  const rawId: unknown = "id" in msg ? msg["id"] : undefined;
+  if (
+    rawId !== undefined &&
+    rawId !== null &&
+    typeof rawId !== "string" &&
+    typeof rawId !== "number"
+  ) {
     return jsonError(null, -32600, "invalid request");
   }
+  const rawParams: unknown = "params" in msg ? msg["params"] : undefined;
+  const paramsShapeOk =
+    rawParams === undefined ||
+    (typeof rawParams === "object" && rawParams !== null && !Array.isArray(rawParams));
+
+  // JSON-RPC notifications (no id) get a bare 202, never a result body —
+  // but only for notification-named methods with well-formed params.
+  if (rawId === undefined || rawId === null) {
+    if (!method.startsWith("notifications/")) {
+      return jsonError(null, -32600, "invalid request");
+    }
+    if (!paramsShapeOk) {
+      return jsonError(null, -32602, "invalid params");
+    }
+    return new Response(null, { status: 202, headers: withSecurityHeaders() });
+  }
+  const id = rawId as string | number;
+  if (!paramsShapeOk) {
+    return jsonError(id, -32602, "invalid params");
+  }
+  const params = (rawParams ?? {}) as Record<string, unknown>;
 
   switch (method) {
     case "initialize": {
@@ -539,8 +576,14 @@ export async function handleMcp(
     }
     case "tools/call": {
       const name = params["name"];
+      if (typeof name !== "string") {
+        return jsonError(id, -32602, "invalid params");
+      }
       if (!isToolName(name)) {
         return jsonError(id, -32601, "unknown tool");
+      }
+      if (!hasValidArguments(params)) {
+        return jsonError(id, -32602, "invalid params");
       }
       const snapshot: Record<string, string | undefined> = {};
       if (fullEnv) {
@@ -552,9 +595,9 @@ export async function handleMcp(
       return jsonResult(id, {});
     }
     default: {
-      if (method.startsWith("notifications/")) {
-        return new Response(null, { status: 202, headers: withSecurityHeaders() });
-      }
+      // Only requests reach this branch (id-less notifications returned
+      // above), so a notification-named method with an ID is a request for
+      // an unknown method: a method response, never a silent 202.
       return jsonError(id, -32601, "method not found");
     }
   }

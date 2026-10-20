@@ -197,12 +197,13 @@ const MAIN_RS_ADJACENT: [&str; 14] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 21] = [
+const VOICE_RS_ADJACENT: [&str; 22] = [
     "voice succession refused",
     "voice actor load failed; retrying with capped backoff",
     "voice actor load failed; credential refused, not retrying",
     "voice notice settings unreadable",
     "voice notice had no working destination",
+    "voice notice configured channel failed; trying fallback",
     "voice create reservation settle failed",
     "import preview planned an apply; refusing without writing",
     "voice vote response failed; not retried",

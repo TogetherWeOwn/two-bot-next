@@ -149,11 +149,13 @@ async fn main() {
     let humans = listed.len();
 
     // --- 2. log channels ----------------------------------------------------
-    let channels = rest
-        .guild_channels(guild)
-        .await
-        .unwrap_or(None)
-        .unwrap_or_default();
+    let channels = match rest.guild_channels(guild).await {
+        Ok(Some(channels)) => channels,
+        Ok(None) | Err(_) => {
+            eprintln!("Guild-channel discovery unavailable; backfill stopped.");
+            std::process::exit(1);
+        }
+    };
     let candidates: Vec<_> = channels
         .iter()
         .filter(|c| {
