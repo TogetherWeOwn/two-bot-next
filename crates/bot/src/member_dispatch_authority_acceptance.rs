@@ -549,6 +549,14 @@ async fn valid_current_facts_and_nonmember_bans_still_work_and_completed_replay_
         let interaction = stale_interaction(verb, key);
         runtime.on_interaction(&interaction).await;
         let first = mutations(&rest.requests()).len();
+        let first_evidence = format!(
+            "{:?}; requests: {:?}",
+            evidence(db.pool(), &rest, key).await,
+            rest.requests()
+                .iter()
+                .map(|r| (&r.method, &r.path))
+                .collect::<Vec<_>>()
+        );
         runtime.on_interaction(&interaction).await;
         let replay = mutations(&rest.requests()).len();
         let done: Option<String> = sqlx::query_scalar(
@@ -570,7 +578,16 @@ async fn valid_current_facts_and_nonmember_bans_still_work_and_completed_replay_
         rest.change(|facts| facts.fault = Some(("/members/88", 403)));
         runtime.on_interaction(&interaction).await;
         let after_failed_read = mutations(&rest.requests()).len();
-        outcomes.push((verb, first, replay, done, audits, effect, after_failed_read));
+        outcomes.push((
+            verb,
+            first,
+            replay,
+            done,
+            audits,
+            effect,
+            after_failed_read,
+            first_evidence,
+        ));
     }
     let mut controls = Vec::new();
     for (index, case) in [
@@ -609,11 +626,11 @@ async fn valid_current_facts_and_nonmember_bans_still_work_and_completed_replay_
         controls.push((case, mutations(&rest.requests()).len()));
     }
     db.close().await.expect("dispose fixture");
-    for (verb, first, replay, done, audits, effect, after_failed_read) in outcomes {
+    for (verb, first, replay, done, audits, effect, after_failed_read, first_evidence) in outcomes {
         assert_eq!(
             first,
             usize::from(verb != "warn"),
-            "{verb}: positive control reaches the real effect"
+            "{verb}: positive control reaches the real effect; {first_evidence}"
         );
         assert_eq!(replay, first, "{verb}: replay does not dispatch twice");
         assert_eq!(done.as_deref(), Some("done"));

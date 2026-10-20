@@ -163,7 +163,7 @@ async fn denied_new_request_preserves_the_older_accepted_expiry_and_its_dispatch
     assert!(store
         .audits()
         .iter()
-        .any(|row| row.request_id == "revoked" && row.outcome == "denied"));
+        .any(|row| row.request_id == "revoked:denied" && row.outcome == "denied"));
 }
 
 #[tokio::test]
