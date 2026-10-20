@@ -838,8 +838,11 @@ jobs:
           # full parallelism, then ignored tests serially. The ignored stores
           # share tables and locks, so parallel runs race and
           # --ignore-run-fail would then drop their coverage silently. The raid
-          # and reengagement list suites require the exact agent_test URL, so
-          # exclude them here and measure them in their dedicated runs below.
+          # and reengagement list suites, the stream go-live ledger suite, the
+          # internal-events DB test, the legacy-verify/TLS-fence/migrate
+          # suites and the mutation-429 suite require the exact agent_test
+          # URL, so exclude them here and measure them in their dedicated
+          # runs below.
           # The reference-docs regen never runs in CI: it rewrites committed docs.
           # The publication regression and the game-report acceptance have
           # their own guarded DBs (dedicated step below / agent_test re-run);
@@ -859,7 +862,34 @@ jobs:
             --features two-bot-core/db --locked --ignore-run-fail \
             --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs \
             --skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected \
-            --skip list_is_guild_scoped_selector_shaped_and_read_only
+            --skip list_is_guild_scoped_selector_shaped_and_read_only \
+            --skip claim_is_owned_once_then_in_flight \
+            --skip failed_send_releases_the_claim_for_the_retry \
+            --skip delivered_rows_are_never_reclaimed \
+            --skip delivered_rows_expire_only_past_the_horizon_with_the_fence_intact \
+            --skip fresh_claim_cannot_be_reclaimed \
+            --skip stale_unposted_claim_is_taken_over_atomically \
+            --skip started_claim_is_never_reclaimed_even_when_stale \
+            --skip started_send_that_provably_failed_releases_for_the_retry \
+            --skip reclaiming_a_missing_key_claims_it_fresh \
+            --skip database::actions_persist_rows_and_preserve_other_events_and_guilds \
+            --skip parity_mismatch_cursor_and_read_only_acceptance \
+            --skip legacy_verify_policy_gates_the_real_test_endpoints \
+            --skip real_sqlx_runner_cases \
+            --skip post_failure_unreadable_ledger_is_unknown_not_empty \
+            --skip post_failure_readable_ledger_keeps_array_output \
+            --skip post_apply_unreadable_ledger_is_unknown_not_empty \
+            --skip store_failure_keeps_committed_cutover_evidence \
+            --skip connection_count_sees_other_roles_from_plan_login \
+            --skip single_delete_429_releases_attempt_for_same_key_retry \
+            --skip bulk_delete_429_releases_attempt_for_same_key_retry \
+            --skip channel_overwrite_429_releases_attempt_and_retires_only_its_seed \
+            --skip slowmode_429_releases_attempt_for_same_and_distinct_keys \
+            --skip unlock_429_releases_lane_but_preserves_recovery_seed \
+            --skip lockdown_429_preserves_prior_seed_while_releasing_the_lane \
+            --skip slowmode_5xx_and_unexpected_statuses_stay_fenced \
+            --skip slowmode_timeout_stays_fenced \
+            --skip cancelled_lockdown_stays_fenced_with_seed_retained
           # Guarded channel suites accept the exact agent_test URL and the
           # workspace bootstrap URL (they always connect to agent_test with
           # an isolated schema). The sweep above already runs them green, and
@@ -873,6 +903,7 @@ jobs:
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test legacy_verify_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test legacy_tls_fence --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test staging_migrate_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test mutation_429_proves_no_effect_channel -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
           # Suites pinned to the agent_test database under the empty-password
           # URL form. (MEMBER_TESTDB is exported before the ignored sweep
           # above so the member-moderation suite runs green there too.)
@@ -882,6 +913,7 @@ jobs:
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test reengagement_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test game_activity_report_db --locked -- --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test member_moderation_db -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test stream_live_store -- --ignored --test-threads=1 --skip regenerate_reference_docs
           # Merge every collected profile into the mounted workspace report the gate reads.
           # `report` must carry --workspace: without it the report scopes to
           # the current (root) package only and excludes every crates/*

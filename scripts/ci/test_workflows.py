@@ -3210,6 +3210,8 @@ class WorkflowTests(unittest.TestCase):
             "raid_list_db",
             "reengagement_list_db",
             "member_moderation_db",
+            "stream_live_store",
+            "mutation_429_proves_no_effect_channel",
         ):
             with self.subTest(target=target):
                 self.assertIn(target, step["run"])
@@ -3257,6 +3259,41 @@ class WorkflowTests(unittest.TestCase):
             "--skip list_is_guild_scoped_selector_shaped_and_read_only",
             ignored_sweeps[0],
         )
+        # The stream go-live ledger suite, the internal-events DB test, the
+        # legacy-verify/TLS-fence/migrate suites and the mutation-429 suite
+        # share the same strict agent_test guard: they run only in their
+        # dedicated agent_test runs below, never in the bootstrap sweep.
+        for skipped in (
+            "claim_is_owned_once_then_in_flight",
+            "failed_send_releases_the_claim_for_the_retry",
+            "delivered_rows_are_never_reclaimed",
+            "delivered_rows_expire_only_past_the_horizon_with_the_fence_intact",
+            "fresh_claim_cannot_be_reclaimed",
+            "stale_unposted_claim_is_taken_over_atomically",
+            "started_claim_is_never_reclaimed_even_when_stale",
+            "started_send_that_provably_failed_releases_for_the_retry",
+            "reclaiming_a_missing_key_claims_it_fresh",
+            "database::actions_persist_rows_and_preserve_other_events_and_guilds",
+            "parity_mismatch_cursor_and_read_only_acceptance",
+            "legacy_verify_policy_gates_the_real_test_endpoints",
+            "real_sqlx_runner_cases",
+            "post_failure_unreadable_ledger_is_unknown_not_empty",
+            "post_failure_readable_ledger_keeps_array_output",
+            "post_apply_unreadable_ledger_is_unknown_not_empty",
+            "store_failure_keeps_committed_cutover_evidence",
+            "connection_count_sees_other_roles_from_plan_login",
+            "single_delete_429_releases_attempt_for_same_key_retry",
+            "bulk_delete_429_releases_attempt_for_same_key_retry",
+            "channel_overwrite_429_releases_attempt_and_retires_only_its_seed",
+            "slowmode_429_releases_attempt_for_same_and_distinct_keys",
+            "unlock_429_releases_lane_but_preserves_recovery_seed",
+            "lockdown_429_preserves_prior_seed_while_releasing_the_lane",
+            "slowmode_5xx_and_unexpected_statuses_stay_fenced",
+            "slowmode_timeout_stays_fenced",
+            "cancelled_lockdown_stays_fenced_with_seed_retained",
+        ):
+            with self.subTest(skipped=skipped):
+                self.assertIn(f"--skip {skipped}", ignored_sweeps[0])
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
@@ -3291,7 +3328,7 @@ class WorkflowTests(unittest.TestCase):
             main_sweep,
         )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
-        self.assertEqual(len(guarded), 12)
+        self.assertEqual(len(guarded), 14)
         for run in guarded:
             with self.subTest(guarded=run):
                 self.assertIn("--test-threads=1", run)
@@ -3314,6 +3351,8 @@ class WorkflowTests(unittest.TestCase):
             "--test reengagement_list_db": False,
             "--test game_activity_report_db": False,
             "--test member_moderation_db": True,
+            "--test stream_live_store": True,
+            "--test mutation_429_proves_no_effect_channel": True,
         }
         for needle, wants_db_feature in guarded_needles.items():
             with self.subTest(needle=needle):
