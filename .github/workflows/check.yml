@@ -887,6 +887,7 @@ jobs:
           # These fixtures accept only the exact agent_test URL, not the
           # two_bot_test_ci URL on this step; they run in their dedicated sweep
           # below after TWO_TEST_DATABASE_URL is pinned to agent_test.
+          # The parity acceptance has an exact-URL guard; its dedicated re-run below uses the accepted endpoint.
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail \
             --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs \
