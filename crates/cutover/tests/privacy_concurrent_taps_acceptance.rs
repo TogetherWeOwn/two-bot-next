@@ -21,24 +21,27 @@
 //! What these tests pin, at the `two_bot_cutover::privacy` boundary that both
 //! member self-serve and assisted operator calls share:
 //! 1. Opt-out and opt-in for one (guild, member) are mutually exclusive: any
-//!    concurrent herd is linearizable to the order its taps complete in.
+//!    concurrent herd fits a serial order respecting non-overlapping calls.
 //! 2. N parallel opt-out taps: exactly one receipt, suppression present,
 //!    exactly one tap reports the purge and every tap completes without an
 //!    error (the service-level shape of one "opted out" reply and N-1
 //!    "already" replies; the command layer must not turn a raced tap into a
 //!    store-failure reply).
 //! 3. A mixed opt-out/opt-in herd always ends in the state matching the
-//!    last-completed tap, writes a receipt only on a transition into
+//!    last-serialized tap, writes a receipt only on a transition into
 //!    suppression, and every opt-in reports whether it actually removed a
 //!    suppression row.
 //!
 //! Coverage limits (stated, not silent): these tests drive the service
 //! functions directly with barrier-synchronized tasks; they do not dispatch
 //! Discord interactions, so the ephemeral reply text each outcome maps to
-//! stays covered by the command-runtime fixtures. "Last-completed" is the
-//! order in which the service calls return to the caller. No timing sleeps
+//! stays covered by the command-runtime fixtures. Last-serialized equals
+//! last-completed for non-overlapping taps. Overlapping taps may return in
+//! either order after committing, so the oracle searches legal serial orders
+//! using invocation/return stamps, not channel receive order. No timing sleeps
 //! coordinate the herds: a `Barrier` releases every tap together.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, Barrier};
@@ -126,23 +129,27 @@ enum Tap {
     OptIn,
 }
 
-/// One completed tap, in the order the service calls returned to their
-/// callers. For an opt-out, `purged` is the summed rows the call reports
-/// having deleted; a tap that found the pair already suppressed must report
-/// zero. For an opt-in, `removed` is the service's report of whether it
-/// deleted a suppression row.
+/// For an opt-out, `purged` is the summed rows the call reports having
+/// deleted; an already-suppressed tap must report zero. For an opt-in,
+/// `removed` reports whether it deleted a suppression row.
 #[derive(Debug)]
-enum Completed {
+enum Outcome {
     OptOut(Result<i64, String>),
     OptIn(Result<bool, String>),
 }
 
-/// Release `taps` against one (guild, member) pair from a single barrier and
-/// return their outcomes in completion order (the order the unbounded
-/// channel receives them, each sent immediately after its service call
-/// returns).
+#[derive(Debug)]
+struct Completed {
+    invoked: u64,
+    returned: u64,
+    outcome: Outcome,
+}
+
+/// Release `taps` against one pair from a single barrier. The shared clock
+/// bounds each service call; channel receive order has no semantic meaning.
 async fn herd(db: &CutoverDb, guild: &str, member: &str, taps: &[Tap]) -> Vec<Completed> {
     let barrier = Arc::new(Barrier::new(taps.len()));
+    let clock = Arc::new(AtomicU64::new(0));
     let (tx, mut rx) = mpsc::unbounded_channel::<Completed>();
     let mut handles = Vec::with_capacity(taps.len());
     for tap in taps {
@@ -152,22 +159,29 @@ async fn herd(db: &CutoverDb, guild: &str, member: &str, taps: &[Tap]) -> Vec<Co
         let member = member.to_owned();
         let barrier = Arc::clone(&barrier);
         let tx = tx.clone();
+        let clock = Arc::clone(&clock);
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
-            let done = match tap {
-                Tap::OptOut => Completed::OptOut(
+            let invoked = clock.fetch_add(1, Ordering::SeqCst);
+            let outcome = match tap {
+                Tap::OptOut => Outcome::OptOut(
                     opt_out_member(&db, &guild, &member, ACTOR)
                         .await
                         .map(|counts| counts.iter().map(|count| count.rows).sum())
                         .map_err(|err| err.to_string()),
                 ),
-                Tap::OptIn => Completed::OptIn(
+                Tap::OptIn => Outcome::OptIn(
                     opt_back_in(&db, &guild, &member)
                         .await
                         .map_err(|err| err.to_string()),
                 ),
             };
-            let _ = tx.send(done);
+            let returned = clock.fetch_add(1, Ordering::SeqCst);
+            let _ = tx.send(Completed {
+                invoked,
+                returned,
+                outcome,
+            });
         }));
     }
     drop(tx);
@@ -182,25 +196,156 @@ async fn herd(db: &CutoverDb, guild: &str, member: &str, taps: &[Tap]) -> Vec<Co
     completed
 }
 
-/// Assert every tap succeeded and return `(purge sums, opt-in removals)` in
-/// completion order. A raced tap must end as a clean no-op outcome, never as
-/// a store error the command layer could only render as a failure reply.
+/// Assert every tap succeeded and return `(purge sums, opt-in removals)`.
+/// A raced tap must end as a clean no-op outcome, never as a store error the
+/// command layer could only render as a failure reply.
 fn outcomes(completed: &[Completed]) -> (Vec<i64>, Vec<bool>) {
     let mut purges = Vec::new();
     let mut removals = Vec::new();
     for done in completed {
-        match done {
-            Completed::OptOut(Ok(purged)) => purges.push(*purged),
-            Completed::OptOut(Err(err)) => {
+        match &done.outcome {
+            Outcome::OptOut(Ok(purged)) => purges.push(*purged),
+            Outcome::OptOut(Err(err)) => {
                 panic!("every opt-out tap must complete cleanly, got error: {err}")
             }
-            Completed::OptIn(Ok(removed)) => removals.push(*removed),
-            Completed::OptIn(Err(err)) => {
+            Outcome::OptIn(Ok(removed)) => removals.push(*removed),
+            Outcome::OptIn(Err(err)) => {
                 panic!("every opt-in tap must complete cleanly, got error: {err}")
             }
         }
     }
     (purges, removals)
+}
+
+/// Wing & Gong search over legal serial histories, pruning prefixes that
+/// contradict real-time precedence or a reported outcome. The mixed herd
+/// has six taps, so even fully overlapping calls admit at most 6! orders.
+/// Initially the pair is unsuppressed with two seeded rows and no receipts.
+fn serial_ends(completed: &[Completed]) -> Vec<(i64, bool)> {
+    fn visit(
+        completed: &[Completed],
+        used: &mut [bool],
+        suppressed: bool,
+        rows: i64,
+        receipts: i64,
+        ends: &mut Vec<(i64, bool)>,
+    ) {
+        if used.iter().all(|used| *used) {
+            let end = (receipts, suppressed);
+            if !ends.contains(&end) {
+                ends.push(end);
+            }
+            return;
+        }
+        for (index, done) in completed.iter().enumerate() {
+            if used[index]
+                || completed
+                    .iter()
+                    .enumerate()
+                    .any(|(other, predecessor)| !used[other] && predecessor.returned < done.invoked)
+            {
+                continue;
+            }
+            let (next_suppressed, next_rows, next_receipts) = match &done.outcome {
+                Outcome::OptOut(Ok(purged)) => {
+                    let expected_purge = if suppressed { 0 } else { rows };
+                    if *purged != expected_purge {
+                        continue;
+                    }
+                    (true, 0, receipts + i64::from(!suppressed))
+                }
+                Outcome::OptIn(Ok(removed)) if *removed == suppressed => (false, rows, receipts),
+                _ => continue,
+            };
+            used[index] = true;
+            visit(
+                completed,
+                used,
+                next_suppressed,
+                next_rows,
+                next_receipts,
+                ends,
+            );
+            used[index] = false;
+        }
+    }
+
+    let mut ends = Vec::new();
+    visit(
+        completed,
+        &mut vec![false; completed.len()],
+        false,
+        2,
+        0,
+        &mut ends,
+    );
+    ends
+}
+
+#[test]
+fn serial_history_oracle_checks_overlap_precedence_and_outcomes() {
+    let opt_out = |invoked, returned, purged| Completed {
+        invoked,
+        returned,
+        outcome: Outcome::OptOut(Ok(purged)),
+    };
+    let opt_in = |invoked, returned, removed| Completed {
+        invoked,
+        returned,
+        outcome: Outcome::OptIn(Ok(removed)),
+    };
+    let cases = [
+        (
+            "overlapping calls may return in reverse serialization order",
+            vec![opt_in(1, 2, true), opt_out(0, 3, 2)],
+            vec![(1, false)],
+        ),
+        (
+            "non-overlapping calls cannot be reordered to explain a removal",
+            vec![opt_in(0, 1, true), opt_out(2, 3, 2)],
+            vec![],
+        ),
+        (
+            "a later suppression transition receipts without purging again",
+            vec![opt_out(0, 1, 2), opt_in(2, 3, true), opt_out(4, 5, 0)],
+            vec![(2, true)],
+        ),
+        (
+            "the first opt-out must purge both seeded rows",
+            vec![opt_out(0, 1, 0)],
+            vec![],
+        ),
+        (
+            "overlapping opt-outs cannot both purge the seeded rows",
+            vec![opt_out(0, 3, 2), opt_out(1, 2, 2)],
+            vec![],
+        ),
+        (
+            "opt-in must report an existing suppression",
+            vec![opt_out(0, 1, 2), opt_in(2, 3, false)],
+            vec![],
+        ),
+        (
+            "receipt counts and suppression stay paired across legal orders",
+            vec![opt_out(0, 5, 2), opt_out(1, 4, 0), opt_in(2, 3, true)],
+            vec![(1, false), (2, true)],
+        ),
+        (
+            "a later transition cannot purge the seeded rows again",
+            vec![opt_out(0, 1, 2), opt_in(2, 3, true), opt_out(4, 5, 2)],
+            vec![],
+        ),
+        (
+            "an already-suppressed opt-out is a no-op",
+            vec![opt_out(0, 1, 2), opt_out(2, 3, 0)],
+            vec![(1, true)],
+        ),
+    ];
+    for (case, completed, expected) in cases {
+        let mut actual = serial_ends(&completed);
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "{case}");
+    }
 }
 
 /// N parallel opt-out taps for one pair: exactly one purge, exactly one
@@ -243,16 +388,12 @@ async fn parallel_opt_out_taps_commit_exactly_one_purge_and_receipt() {
     test_db.close().await.unwrap();
 }
 
-/// A mixed opt-out/opt-in herd is linearizable to its completion order:
-/// replaying the taps in the order they completed must reproduce the
-/// receipt count (a receipt only on a transition into suppression), each
-/// opt-in's removed report, and the final suppression state — which is
-/// therefore always the state the last-completed tap reports. Three rounds
-/// on distinct members; with four opt-outs and two opt-ins a replay can
-/// demand at most three receipts, so an implementation that receipts every
-/// opt-out invocation fails every round.
+/// A mixed herd must fit one serial order respecting non-overlapping taps,
+/// including its per-tap outcomes, receipt count and final suppression.
+/// Three rounds on distinct members; four opt-outs and two opt-ins demand
+/// at most three receipts, so receipting every opt-out fails every round.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn parallel_mixed_taps_end_in_the_last_completed_state() {
+async fn parallel_mixed_taps_fit_a_real_time_serial_history() {
     let Some((test_db, db)) = database().await else {
         return;
     };
@@ -272,40 +413,24 @@ async fn parallel_mixed_taps_end_in_the_last_completed_state() {
         let completed = herd(&db, GUILD_A, &member, &TAPS).await;
         outcomes(&completed);
 
-        let mut suppressed = false;
-        let mut expected_receipts: i64 = 0;
-        for done in &completed {
-            match done {
-                Completed::OptOut(Ok(_)) => {
-                    if !suppressed {
-                        expected_receipts += 1;
-                    }
-                    suppressed = true;
-                }
-                Completed::OptIn(Ok(removed)) => {
-                    assert_eq!(
-                        *removed, suppressed,
-                        "round {round}: an opt-in reports removal exactly when the \
-                         pair was suppressed at its point in the completion order"
-                    );
-                    suppressed = false;
-                }
-                Completed::OptOut(Err(_)) | Completed::OptIn(Err(_)) => {
-                    unreachable!("outcomes above already rejected tap errors")
-                }
-            }
-        }
-
-        assert_eq!(
-            receipts(&db, GUILD_A, &member).await,
-            expected_receipts,
-            "round {round}: one receipt per transition into suppression, none for \
-             a tap that found the pair already suppressed"
+        let ends = serial_ends(&completed);
+        assert!(
+            !ends.is_empty(),
+            "round {round}: every purge/removal must fit a serial order respecting \
+             real-time precedence: {completed:?}"
         );
-        assert_eq!(
-            is_opted_out(&db, GUILD_A, &member).await.unwrap(),
-            suppressed,
-            "round {round}: final state matches the last-completed tap"
+        let actual_receipts = receipts(&db, GUILD_A, &member).await;
+        assert!(
+            ends.iter().any(|(count, _)| *count == actual_receipts),
+            "round {round}: {actual_receipts} receipt(s) must fit a serial order \
+             with one receipt per suppression transition; serial ends {ends:?}"
+        );
+        let suppressed = is_opted_out(&db, GUILD_A, &member).await.unwrap();
+        assert!(
+            ends.contains(&(actual_receipts, suppressed)),
+            "round {round}: receipt count and last-serialized suppression must \
+             fit the same order; observed ({actual_receipts}, {suppressed}), \
+             serial ends {ends:?}"
         );
         if suppressed {
             assert_eq!(
