@@ -33,8 +33,9 @@ service's 1 GiB tmpfs while creating a WAL segment (`pg_wal/xlogtemp.12570`),
 then failed the post-suite connection check during recovery. This was a second
 failure, not a coverage-percentage shortfall. The `rust-tests` fixture now
 checkpoints at a 128 MB soft WAL target with a 32 MB recycling floor, down from
-512/64 MB; the 1 GiB memory ceiling, durability defaults, suite selection and
-fail-closed coverage gate are unchanged. The offline workflow test pins the
+512/64 MB. The other disposable lanes keep their 512/64 MB budget. The 1 GiB
+memory ceiling, durability defaults, suite selection and fail-closed coverage
+gate are unchanged. The offline workflow test pins the
 new settings, reload ordering and exact settings readback. Hosted execution
 must still prove the complete coverage replay fits; `max_wal_size` is a soft
 target, not a quota.

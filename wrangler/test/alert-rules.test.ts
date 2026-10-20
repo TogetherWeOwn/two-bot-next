@@ -968,6 +968,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "error_budget_fast_burn",
     "error_budget_slow_burn",
     "audit_delivery_halt",
+    "rest_admission_breaker_open",
     "eventsub_tampered",
     "eventsub_reconcile_failed",
     "event_store_consumer_lag",
@@ -996,6 +997,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("event_store_consumer_lag", window), `evidence-event_store_consumer_lag-${window}.json`);
   assert.equal(packetFilename("error_budget_fast_burn", window), `evidence-error_budget_fast_burn-${window}.json`);
   assert.equal(packetFilename("error_budget_slow_burn", window), `evidence-error_budget_slow_burn-${window}.json`);
+  assert.equal(packetFilename("rest_admission_breaker_open", window), `evidence-rest_admission_breaker_open-${window}.json`);
   assert.equal(packetFilename("audit_delivery_halt", window), `evidence-audit_delivery_halt-${window}.json`);
   assert.equal(packetFilename("eventsub_tampered", window), `evidence-eventsub_tampered-${window}.json`);
   assert.equal(packetFilename("eventsub_reconcile_failed", window), `evidence-eventsub_reconcile_failed-${window}.json`);
@@ -1195,6 +1197,9 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
       ]).state,
     ).firing,
   );
+  let breaker = EMPTY_STATE;
+  for (let i = 0; i < 3; i++) breaker = ev(["two_bot_rest_guard_breaker_open 1"], breaker).state;
+  firing.push(...breaker.firing);
   let tampered = ev([`two_bot_eventsub_classified_total{kind="tampered"} 0`]);
   for (const n of [1, 2, 3]) {
     tampered = ev([`two_bot_eventsub_classified_total{kind="tampered"} ${n}`], tampered.state);

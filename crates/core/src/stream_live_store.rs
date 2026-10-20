@@ -614,16 +614,31 @@ where
         Err(LiveSendError::ProvenNoSend) => {
             // The one releasable failure: Discord provably never got the
             // post, so freeing the started row lets the Twitch retry claim
-            // again. A failed release just leaves the row fenced (the
-            // retry then answers Duplicate) — safe either way, never a
-            // second send from here.
-            let _ = ledger.release_started(&claim.dedup_key, &token).await;
-            return settled(
-                GoLiveOutcome::Failed {
-                    reason: "send_failed",
-                },
-                Stage::SendFailed,
-            );
+            // again. If the release itself fails (error or noop) the row
+            // stays fenced, the retry answers Duplicate, and the
+            // announcement is lost without ever being posted: report that
+            // distinctly so it cannot be mistaken for a retryable
+            // `send_failed`. Either way nothing here sends twice — the
+            // release path never posts.
+            let released = ledger.release_started(&claim.dedup_key, &token).await;
+            let reason = match released {
+                Ok(true) => "send_failed",
+                Ok(false) | Err(_) => {
+                    // Fixed class, safe to alert on as-is: the message and
+                    // fields are literals, never delivery data (no
+                    // broadcaster, channel, invite, claim token or dedup
+                    // key) and never the database error text.
+                    tracing::warn!(
+                        target: "two_bot_core::stream_live",
+                        reason = "send_failed_unreleased",
+                        "send_failed_unreleased: started claim could not be released \
+                         after a provably-unsent send; the retry dedupes and the \
+                         announcement is lost"
+                    );
+                    "send_failed_unreleased"
+                }
+            };
+            return settled(GoLiveOutcome::Failed { reason }, Stage::SendFailed);
         }
         Err(LiveSendError::Ambiguous) => {
             // Same settle posture as a stamp failure: the post may have
@@ -691,6 +706,11 @@ mod tests {
         Delivered,
     }
 
+    /// Distinctive database-error text for the fake release failure.
+    /// Shared by the fake and `assert_unreleased_warn` so the forbidden
+    /// match in the warn helper cannot go stale if the fake text changes.
+    const FAKE_RELEASE_ERROR_SENTINEL: &str = "fake-release-error-sentinel";
+
     /// In-memory ledger mirroring the store's classification at the trait
     /// boundary: fresh insert claims, a never-started row is `InFlight`, a
     /// started/delivered row is `Duplicate`, release only frees a started
@@ -702,6 +722,8 @@ mod tests {
         releases: Mutex<usize>,
         fail_claim: bool,
         fail_stamp: bool,
+        fail_release_err: bool,
+        fail_release_noop: bool,
     }
 
     impl FakeLedger {
@@ -775,6 +797,14 @@ mod tests {
             _claim_token: &'a str,
         ) -> LedgerFuture<'a, bool> {
             Box::pin(async move {
+                if self.fail_release_err {
+                    return Err(sqlx::Error::InvalidArgument(
+                        FAKE_RELEASE_ERROR_SENTINEL.into(),
+                    ));
+                }
+                if self.fail_release_noop {
+                    return Ok(false);
+                }
                 let mut rows = self.rows.lock().expect("rows");
                 if rows.get(dedup_key) == Some(&RowState::Started) {
                     rows.remove(dedup_key);
@@ -834,6 +864,81 @@ mod tests {
             broadcasters: vec!["123456".to_owned()],
             invite_url: "https://discord.gg/example".to_owned(),
             channel_id: "777".to_owned(),
+        }
+    }
+
+    /// Scoped warn capture for the lost-go-live tests. A thread-local
+    /// default (not `set_global_default`, which a sibling core test
+    /// module already owns) is enough here: `deliver_go_live` never
+    /// spawns, so every event is emitted on this test thread, and the
+    /// failed-release warn callsite is only ever reached under one of
+    /// these captures.
+    #[derive(Clone, Default)]
+    struct WarnCapture(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for WarnCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WarnCapture {
+        type Writer = WarnCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl WarnCapture {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(self.clone())
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("capture")).into_owned()
+        }
+    }
+
+    /// The failed-release warn is a fixed class: a WARN line naming the
+    /// `send_failed_unreleased` reason and carrying no delivery data
+    /// (no broadcaster, login, channel, invite, claim token or dedup
+    /// key) and no database error text, so it is safe to alert on as-is.
+    fn assert_unreleased_warn(capture: &WarnCapture) {
+        let text = capture.text();
+        assert!(
+            text.lines()
+                .any(|line| line.contains("WARN") && line.contains("send_failed_unreleased")),
+            "expected an unreleased warn, got: {text}"
+        );
+        let line = text
+            .lines()
+            .find(|line| line.contains("WARN") && line.contains("send_failed_unreleased"))
+            .expect("warn line present (asserted above)");
+        for forbidden in [
+            "123456",
+            "ourgamenight",
+            "777",
+            "discord.gg/example",
+            "fake-token",
+            FAKE_RELEASE_ERROR_SENTINEL,
+            &live_dedup_key(&stream()),
+        ] {
+            assert!(
+                !line.contains(forbidden),
+                "warn must not carry delivery data or database error text ({forbidden}): {line}"
+            );
         }
     }
 
@@ -924,6 +1029,73 @@ mod tests {
             }
         );
         assert_eq!(sender.calls().len(), 2);
+    }
+
+    // The control for the two lost-go-live tests below is
+    // `deliver_proven_no_send_releases_started_claim_for_the_retry`
+    // above: a successful release stays exactly `send_failed`, frees
+    // the row, and the retry may claim and post.
+
+    #[tokio::test]
+    async fn deliver_proven_no_send_with_release_error_reports_lost_and_retry_dedupes() {
+        let capture = WarnCapture::default();
+        let _guard = capture.install();
+        let ledger = FakeLedger {
+            fail_release_err: true,
+            ..FakeLedger::default()
+        };
+        let sender = FakeSender::scripted(vec![Err(LiveSendError::ProvenNoSend)]);
+        let config = delivery_config();
+        let first = deliver_go_live(&ledger, &sender, &config, &stream()).await;
+        assert_eq!(
+            first.outcome,
+            GoLiveOutcome::Failed {
+                reason: "send_failed_unreleased"
+            }
+        );
+        assert_eq!(first.disposition, disposition(Stage::SendFailed));
+        assert_eq!(ledger.releases(), 0);
+        assert_eq!(
+            ledger.row(&live_dedup_key(&stream())),
+            Some(RowState::Started)
+        );
+        assert_unreleased_warn(&capture);
+
+        let retry = deliver_go_live(&ledger, &sender, &config, &stream()).await;
+        assert_eq!(retry.outcome, GoLiveOutcome::Duplicate);
+        assert_eq!(retry.disposition.status, 200);
+        assert_eq!(sender.calls().len(), 1, "a lost go-live must not re-post");
+    }
+
+    #[tokio::test]
+    async fn deliver_proven_no_send_with_release_noop_reports_lost_and_retry_dedupes() {
+        let capture = WarnCapture::default();
+        let _guard = capture.install();
+        let ledger = FakeLedger {
+            fail_release_noop: true,
+            ..FakeLedger::default()
+        };
+        let sender = FakeSender::scripted(vec![Err(LiveSendError::ProvenNoSend)]);
+        let config = delivery_config();
+        let first = deliver_go_live(&ledger, &sender, &config, &stream()).await;
+        assert_eq!(
+            first.outcome,
+            GoLiveOutcome::Failed {
+                reason: "send_failed_unreleased"
+            }
+        );
+        assert_eq!(first.disposition, disposition(Stage::SendFailed));
+        assert_eq!(ledger.releases(), 0);
+        assert_eq!(
+            ledger.row(&live_dedup_key(&stream())),
+            Some(RowState::Started)
+        );
+        assert_unreleased_warn(&capture);
+
+        let retry = deliver_go_live(&ledger, &sender, &config, &stream()).await;
+        assert_eq!(retry.outcome, GoLiveOutcome::Duplicate);
+        assert_eq!(retry.disposition.status, 200);
+        assert_eq!(sender.calls().len(), 1, "a lost go-live must not re-post");
     }
 
     #[tokio::test]

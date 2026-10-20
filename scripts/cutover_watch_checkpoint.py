@@ -56,6 +56,30 @@ class CheckpointError(Exception):
     """A checkpoint's EXTEND reason."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
+def decode_strict(body):
+    """Decode JSON while refusing duplicate object keys at any depth."""
+    return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+
+
 def production_readyz_url(url):
     """Accept a bare https production origin; return its /readyz endpoint."""
     if not url:
@@ -92,7 +116,9 @@ def check_build_identity(body, expected_sha, expected_build_id):
     single checkpoint row nor leak into evidence.
     """
     try:
-        report = json.loads(body)
+        report = decode_strict(body)
+    except DuplicateKeyError:
+        raise CheckpointError("/readyz carries duplicate JSON object keys")
     except (ValueError, RecursionError):
         report = None
     if not isinstance(report, dict):

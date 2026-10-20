@@ -241,6 +241,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_REDIRECT_FALLBACK_CODE", SettingClass::Hot),
     ("TWO_FEED_POLL_SECONDS", SettingClass::Hot),
     ("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS", SettingClass::Hot),
+    ("TWO_GUILD_INVITE_CODE", SettingClass::Hot),
 ];
 
 /// The hot keys whose consumers read through the live config (legacy
@@ -274,6 +275,7 @@ pub const HOT_WIRED: &[&str] = &[
     "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
     "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
     "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
+    "TWO_GUILD_INVITE_CODE",
 ];
 
 /// The catalogue class for `key`, or `None` for a name this file has never
@@ -897,6 +899,7 @@ mod tests {
         "TWO_SELF_ROLE_DRY_RUN",
         "TWO_FEED_POLL_SECONDS",
         "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
+        "TWO_GUILD_INVITE_CODE",
     ];
 
     const EXPECTED_COLD: &[&str] = &[
@@ -1007,7 +1010,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 133, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 134, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,
@@ -1049,7 +1052,7 @@ mod tests {
 
     #[test]
     fn hot_wired_is_a_hot_subset() {
-        assert_eq!(HOT_WIRED.len(), 25);
+        assert_eq!(HOT_WIRED.len(), 26);
         for key in HOT_WIRED {
             assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
         }

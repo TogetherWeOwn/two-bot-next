@@ -10,9 +10,9 @@
 //! The supervisor never overlaps attempts of one job, which replaces the
 //! legacy re-entrancy guard.
 //!
-//! Every claimed occurrence ends in one `scheduled.run` audit row (ids and
-//! outcomes only, never the body). The one exception is legacy's too: when a
-//! re-queue finds the claim already gone, the new claim holder owns the row.
+//! Every claimed occurrence attempts one `scheduled.run` audit write (ids and
+//! outcomes only, never the body), including when recording or re-queuing the
+//! occurrence fails. An audit-write failure is logged and fails the tick.
 
 use std::{sync::Arc, time::Duration};
 
@@ -44,6 +44,10 @@ mod tests;
 #[cfg(test)]
 #[path = "scheduled_stale_audit_acceptance_tests.rs"]
 mod acceptance_tests;
+
+#[cfg(test)]
+#[path = "scheduled_store_failure_audit_acceptance_tests.rs"]
+mod store_failure_acceptance_tests;
 
 /// The supervised ticker for the configured guild, or `None` while
 /// `TWO_AUTOMATIONS` is off (legacy only started the scheduler when automations
@@ -285,7 +289,7 @@ impl Occurrence<'_> {
                 // vanish without an audit row. A lost claim keeps no nonce,
                 // so a surviving orphan has no idempotent retry: report it
                 // as stale, not retry-idempotent.
-                let retained = retry_scheduled(
+                let retained = match retry_scheduled(
                     self.pool,
                     &self.row.guild_id,
                     &self.row.id,
@@ -294,7 +298,18 @@ impl Occurrence<'_> {
                     !cleaned,
                 )
                 .await
-                .map_err(database)?;
+                {
+                    Ok(retained) => retained,
+                    Err(error) => {
+                        self.audit(
+                            &OccurrenceOutcome::PostedUnrecorded { cleaned },
+                            Some(reason),
+                            audit_failed,
+                        )
+                        .await;
+                        return Err(database(error));
+                    }
+                };
                 let outcome = if retained || cleaned {
                     OccurrenceOutcome::PostedUnrecorded { cleaned }
                 } else {
@@ -314,7 +329,7 @@ impl Occurrence<'_> {
         let reason = discord_error_name(error);
         if post_failure_retryable(failure_status(error)) {
             let retry_at_ms = self.now.saturating_add(clamp_retry_delay_ms(None));
-            let retained = retry_scheduled(
+            let retained = match retry_scheduled(
                 self.pool,
                 &self.row.guild_id,
                 &self.row.id,
@@ -323,7 +338,18 @@ impl Occurrence<'_> {
                 true,
             )
             .await
-            .map_err(database)?;
+            {
+                Ok(retained) => retained,
+                Err(error) => {
+                    self.audit(
+                        &OccurrenceOutcome::Retryable { retry_at_ms },
+                        Some(reason),
+                        audit_failed,
+                    )
+                    .await;
+                    return Err(database(error));
+                }
+            };
             if retained {
                 self.audit(
                     &OccurrenceOutcome::Retryable { retry_at_ms },
@@ -348,7 +374,7 @@ impl Occurrence<'_> {
         // A permanent refusal runs the occurrence without a message so a
         // dead row cannot wedge the queue: one-shots disable, recurring
         // rows advance.
-        let completed = complete_run(
+        let completed = match complete_run(
             self.pool,
             &self.row.guild_id,
             &self.row.id,
@@ -357,10 +383,19 @@ impl Occurrence<'_> {
             self.claim_token,
         )
         .await
-        .map_err(|error| {
-            tracing::warn!(guild = %self.row.guild_id, schedule = %self.row.id, reason = store_error_name(&error), "scheduled failure not recorded");
-            ErrorClass::Database
-        })?;
+        {
+            Ok(completed) => completed,
+            Err(error) => {
+                tracing::warn!(guild = %self.row.guild_id, schedule = %self.row.id, reason = store_error_name(&error), "scheduled failure not recorded");
+                self.audit(
+                    &OccurrenceOutcome::FailedPermanent,
+                    Some(reason),
+                    audit_failed,
+                )
+                .await;
+                return Err(ErrorClass::Database);
+            }
+        };
         if completed.is_some() {
             self.audit(
                 &OccurrenceOutcome::FailedPermanent,
