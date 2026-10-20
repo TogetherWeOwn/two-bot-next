@@ -16,16 +16,18 @@ use two_bot_testsupport::TestDatabase;
 const JOINED: &str = "2024-01-01T00:00:00.000000+00:00";
 static DIAGNOSTICS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn invalid_flags() -> Vec<(&'static str, Option<Value>)> {
+// Discord omits `bot` for humans (`bot?` is optional, never null), so an absent
+// key keeps the documented human default; only a present non-boolean value is
+// unverifiable.
+fn invalid_flags() -> Vec<(&'static str, Value)> {
     vec![
-        ("missing", None),
-        ("null", Some(Value::Null)),
-        ("string_false", Some(json!("false"))),
-        ("string_true", Some(json!("true"))),
-        ("zero", Some(json!(0))),
-        ("one", Some(json!(1))),
-        ("array", Some(json!([]))),
-        ("object", Some(json!({}))),
+        ("null", Value::Null),
+        ("string_false", json!("false")),
+        ("string_true", json!("true")),
+        ("zero", json!(0)),
+        ("one", json!(1)),
+        ("array", json!([])),
+        ("object", json!({})),
     ]
 }
 
@@ -93,7 +95,7 @@ async fn malformed_flags_skip_with_a_reason_without_changing_valid_row_bytes() {
     let mut observed = Vec::new();
     for (name, flag) in invalid_flags() {
         let mut rows = valid_members();
-        rows.insert(1, member("7777", flag, Value::Null));
+        rows.insert(1, member("7777", Some(flag), Value::Null));
         let offset = capture.text().len();
         let page = fetch(rows).await;
         let diagnostics = capture.text()[offset..].to_owned();
@@ -130,6 +132,17 @@ async fn explicit_boolean_flags_preserve_valid_member_rows_byte_for_byte() {
 }
 
 #[tokio::test]
+async fn absent_flag_keeps_discords_documented_human_default() {
+    let page = fetch(vec![member("4444", None, json!(false))]).await;
+    assert_eq!(
+        serde_json::to_vec(&page.members).expect("serialize rows"),
+        br#"[{"member_id":"4444","joined_at":"2024-01-01T00:00:00.000000+00:00","pending":false,"is_bot":false}]"#
+    );
+    assert_eq!(page.aggregate_count, 1);
+    assert_eq!(page.next_after.as_deref(), Some("4444"));
+}
+
+#[tokio::test]
 async fn mixed_page_persists_only_verified_members_and_preserves_valid_database_values() {
     let _serial = DIAGNOSTICS.lock().await;
     let url = match std::env::var("TWO_TEST_DATABASE_URL") {
@@ -140,7 +153,7 @@ async fn mixed_page_persists_only_verified_members_and_preserves_valid_database_
         }
         Err(_) => panic!("test database URL must be Unicode"),
     };
-    let db = TestDatabase::create(&url, &sqlx::migrate!("../migrations"))
+    let db = TestDatabase::create(&url, &sqlx::migrate!("./migrations"))
         .await
         .expect("guarded disposable database");
     let control = fetch(valid_members()).await;
@@ -149,7 +162,10 @@ async fn mixed_page_persists_only_verified_members_and_preserves_valid_database_
         .expect("persist valid control page");
     let mut mixed = valid_members();
     for (index, (_, flag)) in invalid_flags().into_iter().enumerate() {
-        mixed.insert(1, member(&(7000 + index).to_string(), flag, Value::Null));
+        mixed.insert(
+            1,
+            member(&(7000 + index).to_string(), Some(flag), Value::Null),
+        );
     }
     let page = fetch(mixed).await;
     let report = apply_member_page(db.pool(), "2222", &page, &HashSet::new())

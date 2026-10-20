@@ -13,21 +13,23 @@ use two_bot_discord::{rsvp::handle_rsvp_interaction, ActionExecutor};
 use two_bot_testsupport::TestDatabase;
 
 const GUILD: &str = "2222";
-const EVENT: &str = "5555";
+const EVENT: &str = "555555555555555555";
 const HOST: &str = "6666";
 const TARGET: &str = "7777";
 const REFUSAL: &str = "Unable to verify attendance member.";
 
-fn invalid_flags() -> Vec<(&'static str, Option<Value>)> {
+// Discord omits `bot` for humans (`bot?` is optional, never null), so an absent
+// key keeps the documented human default; only a present non-boolean value is
+// unverifiable.
+fn invalid_flags() -> Vec<(&'static str, Value)> {
     vec![
-        ("missing", None),
-        ("null", Some(Value::Null)),
-        ("string_false", Some(json!("false"))),
-        ("string_true", Some(json!("true"))),
-        ("zero", Some(json!(0))),
-        ("one", Some(json!(1))),
-        ("array", Some(json!([]))),
-        ("object", Some(json!({}))),
+        ("null", Value::Null),
+        ("string_false", json!("false")),
+        ("string_true", json!("true")),
+        ("zero", json!(0)),
+        ("one", json!(1)),
+        ("array", json!([])),
+        ("object", json!({})),
     ]
 }
 
@@ -134,7 +136,7 @@ async fn unknown_live_flags_refuse_before_the_store_even_when_the_store_is_unava
     let mut observed = Vec::new();
     for (name, flag) in invalid_flags() {
         for on_behalf in [false, true] {
-            let reply = checkin(&pool, flag.clone(), on_behalf, name).await;
+            let reply = checkin(&pool, Some(flag.clone()), on_behalf, name).await;
             observed.push((name, on_behalf, reply));
         }
     }
@@ -167,7 +169,7 @@ async fn unknown_live_flags_refuse_with_zero_checkin_insert_attempts() {
         for on_behalf in [false, true] {
             let reply = checkin(
                 db.pool(),
-                flag.clone(),
+                Some(flag.clone()),
                 on_behalf,
                 &format!("{name}-{on_behalf}"),
             )
@@ -216,23 +218,60 @@ async fn explicit_boolean_live_flags_preserve_host_proof_and_human_totals() {
     db.close().await.expect("drop owned disposable database");
     assert_eq!(
         human_reply,
-        "Recorded <@6666> for event occurrence `5555:human`."
+        "Recorded <@6666> for event occurrence `555555555555555555:human`."
     );
     assert_eq!(
         bot_reply,
-        "Recorded <@7777> for event occurrence `5555:bot`."
+        "Recorded <@7777> for event occurrence `555555555555555555:bot`."
     );
     assert_eq!(humans, 1);
     assert_eq!(rows.len(), 2);
     for (row, actor, classification, occurrence) in [
-        (&rows[0], HOST, "eligible_human", "5555:human"),
-        (&rows[1], TARGET, "bot", "5555:bot"),
+        (&rows[0], HOST, "eligible_human", "555555555555555555:human"),
+        (&rows[1], TARGET, "bot", "555555555555555555:bot"),
     ] {
         assert_eq!(row.0, actor);
         assert_eq!(row.1, classification);
         assert_eq!(row.2, "community-v1");
         assert_eq!(
             serde_json::from_str::<Value>(&row.4).expect("proof JSON"),
+            json!({"eventOccurrenceId": occurrence, "proof": "host_checkin"})
+        );
+    }
+}
+
+#[tokio::test]
+async fn absent_live_flag_keeps_discords_documented_human_default() {
+    let Some(db) = fixture().await else {
+        eprintln!("disposable DB acceptance not run: TWO_TEST_DATABASE_URL unset");
+        return;
+    };
+    let self_reply = checkin(db.pool(), None, false, "absent-self").await;
+    let member_reply = checkin(db.pool(), None, true, "absent-member").await;
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT actor_id, classification, metadata FROM community_facts ORDER BY actor_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("read actual checkins");
+    db.close().await.expect("drop owned disposable database");
+    assert_eq!(
+        self_reply,
+        "Recorded <@6666> for event occurrence `555555555555555555:absent-self`."
+    );
+    assert_eq!(
+        member_reply,
+        "Recorded <@7777> for event occurrence `555555555555555555:absent-member`."
+    );
+    assert_eq!(rows.len(), 2);
+    for (row, actor, occurrence) in [
+        (&rows[0], HOST, "555555555555555555:absent-self"),
+        (&rows[1], TARGET, "555555555555555555:absent-member"),
+    ] {
+        assert_eq!(row.0, actor);
+        assert_eq!(row.1, "eligible_human");
+        assert_eq!(
+            serde_json::from_str::<Value>(&row.2).expect("proof JSON"),
             json!({"eventOccurrenceId": occurrence, "proof": "host_checkin"})
         );
     }
