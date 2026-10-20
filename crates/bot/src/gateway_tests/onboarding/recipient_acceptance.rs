@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Protected acceptance: queued welcomes must use current recipient evidence.
 //!
 //! The Builder must keep this file and recipient_recovery_acceptance.rs intact;
@@ -94,6 +95,9 @@ async fn finish(case: Case, mock: MockRest, result: std::thread::Result<()>) {
 enum Evidence {
     Valid,
     ChangedRoles,
+    OmittedBot,
+    OmittedPending,
+    OmittedBoth,
     Absent,
     Pending,
     Bot,
@@ -125,6 +129,15 @@ fn recipient_response(evidence: Evidence) -> ScriptedResponse {
         Evidence::Valid => {}
         Evidence::ChangedRoles => {
             body["roles"] = json!([GAME_PICKS[1].role_id, PLATFORM_PICKS[0].role_id])
+        }
+        Evidence::OmittedBot | Evidence::OmittedPending | Evidence::OmittedBoth => {
+            body["roles"] = json!([GAME_PICKS[1].role_id, PLATFORM_PICKS[0].role_id]);
+            if matches!(evidence, Evidence::OmittedBot | Evidence::OmittedBoth) {
+                body["user"].as_object_mut().unwrap().remove("bot");
+            }
+            if matches!(evidence, Evidence::OmittedPending | Evidence::OmittedBoth) {
+                body.as_object_mut().unwrap().remove("pending");
+            }
         }
         Evidence::Absent => {
             return ScriptedResponse::json(404, json!({"code":10007,"message":"Unknown Member"}))

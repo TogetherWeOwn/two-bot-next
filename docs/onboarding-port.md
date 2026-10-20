@@ -70,8 +70,10 @@ this slice.
    or `bot`, a missing or non-array `roles` field, a non-snowflake role id,
    HTTP 403 or 5xx, and a timed-out read return before the prompt lock and
    leave the durable job retryable. The worker claims no job until the shard
-   has flushed the Resume or Identify that Hello queued, so that failure cannot
-   drop the socket before the frame is written. Games-menu defaults come from
+   receives an authenticated dispatch (READY, RESUMED or a replay with a valid
+   session), proving Discord accepted the Hello-queued Resume or Identify. A
+   cooperative shutdown before authentication leaves jobs unclaimed and waits
+   for the ordered writer to drain. Games-menu defaults come from
    that fresh role list, not the roles captured at dispatch. Omitted `pending`
    and `bot` mean false. The read is the shared strict GET (only 404 is
    absence) on its existing five-second moderation deadline, inside the

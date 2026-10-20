@@ -1,9 +1,12 @@
+#![cfg(test)]
 //! Protected acceptance: a cold shard must revalidate persisted recipients.
 //! Seed through the real transactional queue, leave a running claim as a dead
 //! worker would, then run the real shard against local WebSocket/REST fixtures.
 //! Neither a warm cache nor a pure deserialize/handle test can satisfy this.
 
 use super::*;
+
+mod opening_acceptance;
 
 async fn seed(case: &Case, url: &str, seq: u64) {
     let (action, id) = case
@@ -73,6 +76,15 @@ async fn interrupted(case: &Case) {
 }
 
 async fn spawn(case: &Case, mock: &MockRest, url: &str) -> Runner {
+    spawn_with_shutdown(case, mock, url, None).await
+}
+
+async fn spawn_with_shutdown(
+    case: &Case,
+    mock: &MockRest,
+    url: &str,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Runner {
     let store = case.store();
     let saved = load_boot_session(&store).await.unwrap();
     let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), saved.as_ref());
@@ -94,7 +106,12 @@ async fn spawn(case: &Case, mock: &MockRest, url: &str) -> Runner {
         None,
         None,
         None,
-        std::future::pending(),
+        async move {
+            match shutdown {
+                Some(receiver) => crate::server::shutdown_requested(receiver).await,
+                None => std::future::pending().await,
+            }
+        },
     ));
     Runner {
         task,
@@ -209,7 +226,9 @@ async fn recovered_retryable(evidence: Evidence) {
         let runner = spawn(&case, &mock, &first.mock.url).await;
         assert_cold(&runner);
         assert_eq!(first.mock.authentication().await["op"], 6);
-        // Do not advance the checkpoint: the next cold owner resumes seq 2.
+        // A validated replay proves authentication without advancing seq 2.
+        // Receiving Resume alone must not start retryable recipient work.
+        first.send(resumed(2)).await;
         wait_failure(&case, &runner).await;
         runner.failed().await;
         let saved = row(&case, 2).await;
@@ -324,6 +343,7 @@ async fn onboarding_recipient_recovery_concurrent_valid_jobs_and_sequence_redeli
         let auth = ws.mock.authentication().await;
         assert_eq!(auth["op"], 6);
         assert_eq!(auth["d"]["seq"], 3);
+        ws.send(resumed(3)).await;
         let first = completed(&case, 2, 2).await;
         completed(&case, 3, 1).await;
         assert_welcome(&mock, "legacy");
@@ -362,6 +382,7 @@ async fn onboarding_recipient_recovery_persistent_failure_preserves_three_claim_
         interrupted(&case).await;
         let runner = spawn(&case, &mock, &first.mock.url).await;
         assert_eq!(first.mock.authentication().await["op"], 6);
+        first.send(resumed(2)).await;
         wait_failure(&case, &runner).await;
         runner.failed().await;
         assert_eq!(row(&case, 2).await.1, 2);
@@ -371,6 +392,7 @@ async fn onboarding_recipient_recovery_persistent_failure_preserves_three_claim_
         repoint(&case, &second.mock.url).await;
         let runner = spawn(&case, &mock, &second.mock.url).await;
         assert_eq!(second.mock.authentication().await["op"], 6);
+        second.send(resumed(2)).await;
         wait_failure(&case, &runner).await;
         runner.failed().await;
         assert_eq!(row(&case, 2).await.1, 3);
