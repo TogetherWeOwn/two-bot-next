@@ -10,9 +10,16 @@
 //!
 //! Audit parity with legacy `AutomationService`: creates and replaces audit
 //! `scheduled.create` / `scheduled.update` (`ok`, `rejected` on validation
-//! failure), removes audit `scheduled.delete` (`ok` / `absent`), and lists
-//! write no row. The 15 s ticker is a sibling card's job — nothing here posts
-//! to channels.
+//! failure), removes audit `scheduled.delete` (`ok` / `absent`), and
+//! successful lists write no row. The seven store-failure refusals (create
+//! read and write, remove resolve and delete, list first read, and the two
+//! deep-pagination list reads: hidden-window and unknown-overflow) each
+//! audit one row in the same refusal shape (`scheduled.create` /
+//! `scheduled.delete` / `scheduled.list`, outcome `rejected`, the invoking
+//! member as actor, the log line's fixed error-class token as reason, the
+//! attempted id or prefix as target, none for lists); a dead pool degrades
+//! to warn-plus-safe-reply because the audit write itself fails. The 15 s
+//! ticker is a sibling card's job — nothing here posts to channels.
 
 use sqlx::{Pool, Postgres};
 use twilight_model::application::interaction::{
@@ -22,15 +29,18 @@ use two_bot_core::{
     automation_quota::QuotaWriteError,
     commands::MAX_RESOURCE_ID_CHARS,
     funnel::now_millis_for_test,
-    message_safety,
     scheduled::{
         format_iso_ms, next_run_at_ms, no_such_schedule_text, no_unique_match_text,
-        schedule_cancelled_text, schedule_confirm_text, schedule_list_line, schedule_list_text,
+        schedule_cancelled_text, schedule_confirm_text, schedule_list_first_pages,
+        schedule_list_line, schedule_list_overflow_for_count, schedule_list_overflow_line,
+        schedule_list_page, schedule_list_page_out_of_range_text,
+        schedule_list_page_underflow_text, schedule_list_pages, schedule_list_pages_global,
         validate_schedule, ScheduleInput,
     },
     scheduled_store::{
-        audit_scheduled, delete_scheduled, get_scheduled, list_scheduled, put_scheduled,
-        resolve_scheduled_id as resolve_scheduled_id_store, ScheduledAuditInput, ScheduledWrite,
+        audit_scheduled, count_scheduled, delete_scheduled, get_scheduled, list_scheduled,
+        list_scheduled_window, put_scheduled, resolve_scheduled_id as resolve_scheduled_id_store,
+        ScheduledAuditInput, ScheduledWrite, SCHEDULE_LIST_CAP,
     },
 };
 use two_bot_discord::ActionExecutor;
@@ -99,6 +109,17 @@ pub(crate) async fn schedule_create(
         Ok(existing) => existing,
         Err(err) => {
             tracing::warn!(reason = db_class(&err), "schedule read failed");
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.create",
+                &id,
+                "rejected",
+                Some(db_class(&err)),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
             return;
         }
@@ -172,10 +193,36 @@ pub(crate) async fn schedule_create(
             .await;
         }
         Err(QuotaWriteError::Capacity(quota)) => {
+            // Quota refusal audits exactly like a validation rejection: one
+            // `scheduled.create`/`rejected` row with reason `quota`, naming
+            // the fresh attempt id. Every refusal audits its own row
+            // (1 refusal = 1 audit); nothing here dedupes or suppresses.
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.create",
+                &id,
+                "rejected",
+                Some("quota"),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, quota.to_string()).await;
         }
         Err(err) => {
             tracing::warn!(reason = quota_write_class(&err), "schedule put failed");
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.create",
+                &id,
+                "rejected",
+                Some(quota_write_class(&err)),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
         }
     }
@@ -210,10 +257,25 @@ pub(crate) async fn schedule_remove(
         .await;
         return;
     }
+    // Actor and timestamp sit above resolution so the resolve-failure
+    // refusal audits with the same actor and clock as every other refusal.
+    let actor = actor_id(interaction);
+    let now_iso = format_iso_ms(now_millis());
     let resolved = match resolve_scheduled_id_store(pool, guild_id, &prefix).await {
         Ok(resolved) => resolved,
         Err(err) => {
             tracing::warn!(reason = db_class(&err), "schedule resolve failed");
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.delete",
+                &prefix,
+                "rejected",
+                Some(db_class(&err)),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
             return;
         }
@@ -222,8 +284,6 @@ pub(crate) async fn schedule_remove(
         finish(executor, interaction, no_unique_match_text(&prefix)).await;
         return;
     };
-    let actor = actor_id(interaction);
-    let now_iso = format_iso_ms(now_millis());
     match delete_scheduled(pool, guild_id, &id).await {
         Ok(true) => {
             audit(
@@ -256,22 +316,52 @@ pub(crate) async fn schedule_remove(
         }
         Err(err) => {
             tracing::warn!(reason = db_class(&err), "schedule delete failed");
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.delete",
+                &id,
+                "rejected",
+                Some(db_class(&err)),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
         }
     }
 }
 
-/// `/schedule-list`: guild-scoped list → ephemeral text. Legacy lists every
-/// row for the guild and writes no audit row.
+/// `/schedule-list`: guild-scoped list → ephemeral text. The first read is
+/// capped at the earliest [`SCHEDULE_LIST_CAP`] rows; a full read counts
+/// once and appends an explicit `(truncated, N more)` overflow line, or
+/// `(truncated)` when the overflow count itself fails, so a cut is never
+/// silent. Rows are ordered by (`next_run_at`, `id`). Over-cap guilds page
+/// past the first window: `page` past the first window's packed pages reads
+/// one bounded hidden window (`LIMIT/OFFSET`, still 25 rows) so ids through
+/// the first 50 rows stay discoverable without reopening an unbounded read
+/// (see `docs/schedule-queue-order.md`). A failed
+/// hidden-window or overflow-count read fails closed with
+/// `STORE_FAILURE_REPLY` instead of reporting a possibly-false out-of-range
+/// page. A failed first, hidden-window, or overflow-count read audits one
+/// `scheduled.list` / `rejected` row like the other store-failure refusals;
+/// a successful list writes no audit row, and no list path writes schedule
+/// rows.
 pub(crate) async fn schedule_list(
     pool: &Pool<Postgres>,
     executor: &ActionExecutor,
     guild_id: &str,
     interaction: &Interaction,
 ) {
+    let page = schedule_list_page_option(interaction).unwrap_or(1);
+    if page < 1 {
+        finish(executor, interaction, schedule_list_page_underflow_text()).await;
+        return;
+    }
     match list_scheduled(pool, guild_id).await {
-        Ok(rows) => {
-            let lines: Vec<String> = rows
+        Ok(mut rows) => {
+            rows.sort_by(|a, b| (&a.next_run_at, &a.id).cmp(&(&b.next_run_at, &b.id)));
+            let mut lines: Vec<String> = rows
                 .iter()
                 .map(|row| {
                     schedule_list_line(
@@ -283,15 +373,181 @@ pub(crate) async fn schedule_list(
                     )
                 })
                 .collect();
-            finish(
-                executor,
-                interaction,
-                message_safety::truncate(&schedule_list_text(&lines), 2000),
-            )
-            .await;
+            // The first read is capped at SCHEDULE_LIST_CAP earliest rows.
+            // A full read may hide more: count once and name the cut rows
+            // so no id is silently dropped; a failed count still marks the
+            // cut without a number. Under-cap guilds skip the second query
+            // and render exactly as before.
+            if rows.len() as i64 == SCHEDULE_LIST_CAP {
+                let mut count_failure_class: Option<&str> = None;
+                let total_opt = match count_scheduled(pool, guild_id).await {
+                    Ok(total) => Some(total),
+                    Err(err) => {
+                        let class = db_class(&err);
+                        tracing::warn!(reason = class, "schedule list count failed");
+                        count_failure_class = Some(class);
+                        None
+                    }
+                };
+                if let Some(overflow) =
+                    schedule_list_overflow_for_count(total_opt, SCHEDULE_LIST_CAP)
+                {
+                    lines.push(overflow);
+                }
+                // Known overflow: pages past the first window's packed pages
+                // read one bounded hidden window, so rows through the first
+                // 50 stay reachable. Page 1 never pays for the extra query.
+                // The first window's last page names the next page, and the
+                // hidden window carries continuing global page numbers, so
+                // no footer reads as the end of the list.
+                if matches!(total_opt, Some(total) if total > SCHEDULE_LIST_CAP) {
+                    let total = total_opt.expect("guarded by the known-overflow match above");
+                    let first_pages = schedule_list_first_pages(&lines, true);
+                    let first_total = first_pages.len() as i64;
+                    if page > first_total {
+                        match list_scheduled_window(
+                            pool,
+                            guild_id,
+                            SCHEDULE_LIST_CAP,
+                            SCHEDULE_LIST_CAP,
+                        )
+                        .await
+                        {
+                            Ok(mut hidden) => {
+                                hidden.sort_by(|a, b| {
+                                    (&a.next_run_at, &a.id).cmp(&(&b.next_run_at, &b.id))
+                                });
+                                let mut hidden_lines: Vec<String> = hidden
+                                    .iter()
+                                    .map(|row| {
+                                        schedule_list_line(
+                                            &row.id,
+                                            &row.channel_id,
+                                            &row.next_run_at,
+                                            row.interval_seconds,
+                                            row.enabled,
+                                        )
+                                    })
+                                    .collect();
+                                let remaining = total - SCHEDULE_LIST_CAP - hidden.len() as i64;
+                                if remaining > 0 {
+                                    hidden_lines.push(schedule_list_overflow_line(remaining));
+                                }
+                                if hidden_lines.is_empty() {
+                                    finish(executor, interaction, schedule_list_page(&lines, page))
+                                        .await;
+                                    return;
+                                }
+                                let hidden_pages =
+                                    schedule_list_pages_global(&hidden_lines, first_total);
+                                let hidden_total = hidden_pages.len() as i64;
+                                let hidden_page = page - first_total;
+                                if hidden_page <= hidden_total {
+                                    finish(
+                                        executor,
+                                        interaction,
+                                        hidden_pages[(hidden_page - 1) as usize].clone(),
+                                    )
+                                    .await;
+                                } else {
+                                    finish(
+                                        executor,
+                                        interaction,
+                                        schedule_list_page_out_of_range_text(
+                                            page,
+                                            first_total + hidden_total,
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                return;
+                            }
+                            Err(err) => {
+                                // Fail closed: the hidden rows may exist, so a
+                                // failed window read must not report them as
+                                // out of range. Mirrors the list-read failure
+                                // path below, including its audit row.
+                                tracing::warn!(
+                                    reason = db_class(&err),
+                                    "schedule list hidden window failed"
+                                );
+                                // A failed list names no schedule id, so the
+                                // audit carries an empty target.
+                                let actor = actor_id(interaction);
+                                let now_iso = format_iso_ms(now_millis());
+                                audit(
+                                    pool,
+                                    guild_id,
+                                    &actor,
+                                    "scheduled.list",
+                                    "",
+                                    "rejected",
+                                    Some(db_class(&err)),
+                                    &now_iso,
+                                )
+                                .await;
+                                finish(executor, interaction, STORE_FAILURE_REPLY).await;
+                                return;
+                            }
+                        }
+                    }
+                    finish(
+                        executor,
+                        interaction,
+                        first_pages[(page - 1) as usize].clone(),
+                    )
+                    .await;
+                    return;
+                }
+                if total_opt.is_none() {
+                    // The overflow count failed, so the true page total is
+                    // unknown: a page past the packed first window may or may
+                    // not exist. Fail closed instead of reporting a
+                    // possibly-false out-of-range. Mirrors the list-read
+                    // failure path below, including its audit row; the count
+                    // failure already warned above, so the audit reuses its
+                    // captured error-class token as reason.
+                    let first_total = schedule_list_pages(&lines).len() as i64;
+                    if page > first_total {
+                        // A failed list names no schedule id, so the audit
+                        // carries an empty target.
+                        let actor = actor_id(interaction);
+                        let now_iso = format_iso_ms(now_millis());
+                        audit(
+                            pool,
+                            guild_id,
+                            &actor,
+                            "scheduled.list",
+                            "",
+                            "rejected",
+                            count_failure_class,
+                            &now_iso,
+                        )
+                        .await;
+                        finish(executor, interaction, STORE_FAILURE_REPLY).await;
+                        return;
+                    }
+                }
+            }
+            finish(executor, interaction, schedule_list_page(&lines, page)).await;
         }
         Err(err) => {
             tracing::warn!(reason = db_class(&err), "schedule list failed");
+            // A failed list names no schedule id, so the audit carries an
+            // empty target; the success path still audits nothing.
+            let actor = actor_id(interaction);
+            let now_iso = format_iso_ms(now_millis());
+            audit(
+                pool,
+                guild_id,
+                &actor,
+                "scheduled.list",
+                "",
+                "rejected",
+                Some(db_class(&err)),
+                &now_iso,
+            )
+            .await;
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
         }
     }
@@ -396,6 +652,21 @@ pub(crate) fn schedule_remove_option(interaction: &Interaction) -> Option<String
         .iter()
         .find_map(|option| match (option.name.as_str(), &option.value) {
             ("id", CommandOptionValue::String(value)) => Some(value.clone()),
+            _ => None,
+        })
+}
+
+/// `/schedule-list`'s optional 1-based `page` option; absent means page 1.
+/// A mismatched wire type decodes to absent (page 1) rather than refusing,
+/// so existing invocations keep working.
+pub(crate) fn schedule_list_page_option(interaction: &Interaction) -> Option<i64> {
+    let Some(InteractionData::ApplicationCommand(data)) = &interaction.data else {
+        return None;
+    };
+    data.options
+        .iter()
+        .find_map(|option| match (option.name.as_str(), &option.value) {
+            ("page", CommandOptionValue::Integer(value)) => Some(*value),
             _ => None,
         })
 }

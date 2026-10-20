@@ -5,6 +5,9 @@
 use super::*;
 use two_bot_core::voice_private::{ChannelId, JoinChannel, MemberId};
 
+#[path = "voice_overwrite_snapshot_tests.rs"]
+mod overwrite_snapshot;
+
 const ROOM: u64 = 500;
 const JOIN: u64 = 700;
 const BOT: u64 = 999;
@@ -987,4 +990,110 @@ async fn handle_public_on_a_room_a_creator_made_private_opens_it() {
     assert!(!calls(&trace)
         .iter()
         .any(|c| c.starts_with("delete") || c.starts_with("create_join")));
+}
+
+// Exact-text pins for the seven `/private` and `/public` outcome replies
+// (already-private, making-private, recreating-join, restoring-deny,
+// already-public, opening-unmarked, public-again). Each is asserted with
+// exact equality through the real worker path (`apply_privacy`, the same
+// string the handler replies with). The permission (`NEEDS_MANAGE_ROLES`)
+// and corrupt-settings error strings are out of scope and stay on their
+// existing substring checks. A one-word swap in any pinned literal must
+// fail its test; scratch-mutant runs are recorded on the card.
+
+#[tokio::test]
+async fn private_copy_making_private_exact() {
+    let (mut worker, _) = worker().await;
+    let reply = private_cmd(&mut worker, OWNER);
+    assert_eq!(
+        reply,
+        "Making this room private: new members can't join it directly, and a \
+         ⇩ Join channel will appear next to it."
+    );
+}
+
+#[tokio::test]
+async fn private_copy_already_private_exact() {
+    let (mut worker, _) = worker().await;
+    private_cmd(&mut worker, OWNER);
+    drain(&mut worker).await;
+    let again = private_cmd(&mut worker, OWNER);
+    assert_eq!(again, "This room is already private.");
+}
+
+#[tokio::test]
+async fn private_copy_recreating_join_channel_exact() {
+    let (mut worker, _) = worker().await;
+    worker
+        .http
+        .join_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::Rejected {
+            status: 400,
+            code: 50035,
+        });
+    private_cmd(&mut worker, OWNER);
+    drain(&mut worker).await;
+    // Private (Discord accepted the deny), but no Join channel yet.
+    assert!(worker.privacy[&ROOM].private);
+    assert_eq!(join_of(&worker), None);
+    let reply = private_cmd(&mut worker, OWNER);
+    assert_eq!(
+        reply,
+        "This room is already private. Recreating its ⇩ Join channel."
+    );
+}
+
+#[tokio::test]
+async fn private_copy_restoring_missing_deny_exact() {
+    let (mut worker, _) = worker().await;
+    private_cmd(&mut worker, OWNER);
+    drain(&mut worker).await;
+    assert!(worker.privacy[&ROOM].private);
+    assert!(join_of(&worker).is_some());
+    // A hand edit removed the Connect deny Discord held; the flag and the
+    // Join channel remain, so `/private` re-asserts the deny.
+    set_room_overwrites(&worker.live, bot_and_everyone_overwrites(false));
+    let reply = private_cmd(&mut worker, OWNER);
+    assert_eq!(
+        reply,
+        "This room is private, but its Connect deny was missing. Restoring it."
+    );
+}
+
+#[tokio::test]
+async fn private_copy_already_public_exact() {
+    let (live, store, http, _) = parts();
+    set_room_overwrites(&live, bot_and_everyone_overwrites(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let reply = public_cmd(&mut worker, OWNER);
+    assert_eq!(reply, "This room is already public.");
+}
+
+#[tokio::test]
+async fn private_copy_opening_unmarked_closed_room_exact() {
+    let (live, store, http, _) = parts();
+    // `/alwaysprivate` rooms are created with @everyone Connect already
+    // denied, while their stored flag still reads public.
+    set_room_overwrites(&live, bot_and_everyone_overwrites(true));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let reply = public_cmd(&mut worker, OWNER);
+    assert_eq!(
+        reply,
+        "This room wasn't marked private, but it was closed to new members. \
+         Opening it to everyone."
+    );
+}
+
+#[tokio::test]
+async fn private_copy_public_again_exact() {
+    let (mut worker, _) = worker().await;
+    private_cmd(&mut worker, OWNER);
+    drain(&mut worker).await;
+    let reply = public_cmd(&mut worker, OWNER);
+    assert_eq!(
+        reply,
+        "Making this room public again: anyone can join, and its ⇩ Join channel is going away."
+    );
 }

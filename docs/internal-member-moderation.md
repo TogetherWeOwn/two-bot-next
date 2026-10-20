@@ -32,8 +32,9 @@ UTF-16 units, and the entire marker survives.
 Intentional validation tightening: IDs must be canonical nonzero u64
 snowflakes; tempban needs 60–365-day `duration_seconds`, timeout 60–28-day,
 both required. Local guard refusals never reached the wire, so like confirmed
-4xx they release the claim for a real second attempt; timeouts, rate limits,
-5xx and transport failures stay fenced as `in_progress`, never auto-retried.
+4xx they release the claim for a real second attempt; a mutation 429 likewise
+proves no effect and releases only the failed attempt. Timeouts, 5xx and
+transport failures stay fenced as `in_progress`, never auto-retried.
 
 ## Shared ledger and recovery
 

@@ -14,6 +14,9 @@ Any 5xx on any probe must fail closed with a bounded shape: the
 `redirect service misconfigured` or `temporarily unavailable` 503 with
 `retry-after: 30`, or the `misconfigured campaign` 500 -- never a Location.
 
+A reply body longer than BODY_CAP (64 KiB) is refused before any shape
+comparison with a fixed cap diagnostic; exact-cap valid input still passes.
+
 The smoke never writes, never follows redirects (a 302 is observed, not
 followed), never touches a known campaign slug (no click side effects),
 never touches production, and sends no credentials. The only network calls
@@ -54,6 +57,10 @@ NOT_FOUND_BODY = b"not found\n"
 MISCONFIGURED_BODY = b"redirect service misconfigured\n"
 UNAVAILABLE_BODY = b"temporarily unavailable\n"
 BAD_CAMPAIGN_BODY = b"misconfigured campaign\n"
+
+# Fixed over-cap diagnostic, shared with scripts/staging_probe.py: names the
+# cap, echoes no body or header bytes, and is identical across probes.
+OVER_CAP_MESSAGE = "response body over the size cap"
 
 
 class SmokeError(Exception):
@@ -143,11 +150,21 @@ def header(headers, name):
     return None
 
 
+def refuse_over_cap(body):
+    """Refuse a body longer than BODY_CAP before any shape comparison.
+
+    Exact-cap bodies pass; only strictly longer bodies are refused.
+    """
+    if len(body) > BODY_CAP:
+        raise SmokeError(OVER_CAP_MESSAGE)
+
+
 def fail_closed_shape(status, headers, body):
     """Classify a 5xx as a bounded fail-closed shape, or refuse it.
 
     Returns the shape token on success; raises SmokeError otherwise.
     """
+    refuse_over_cap(body)
     location = header(headers, "location")
     if location is not None:
         raise SmokeError(f"unexpected status {status} with a redirect target")
@@ -166,6 +183,7 @@ def check_healthz(origin, fetch_fn):
         status, headers, body = fetch_fn(origin + "/healthz")
     except (OSError, http.client.HTTPException) as error:
         raise SmokeError(f"healthz probe did not respond ({error.__class__.__name__})")
+    refuse_over_cap(body)
     if status != 200:
         if 500 <= status <= 599:
             return fail_closed_shape(status, headers, body)
@@ -184,6 +202,7 @@ def check_reserved(origin, fetch_fn):
         status, headers, body = fetch_fn(origin + "/HEALTHZ")
     except (OSError, http.client.HTTPException) as error:
         raise SmokeError(f"reserved-alias probe did not respond ({error.__class__.__name__})")
+    refuse_over_cap(body)
     if status != 404:
         if 500 <= status <= 599:
             return fail_closed_shape(status, headers, body)
@@ -198,6 +217,7 @@ def check_unknown(origin, slug, fetch_fn):
         status, headers, body = fetch_fn(origin + "/" + slug)
     except (OSError, http.client.HTTPException) as error:
         raise SmokeError(f"unknown-slug probe did not respond ({error.__class__.__name__})")
+    refuse_over_cap(body)
     location = header(headers, "location")
     if status == 404:
         if body != NOT_FOUND_BODY or location is not None:

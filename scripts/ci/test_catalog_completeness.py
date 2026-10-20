@@ -57,8 +57,6 @@ _ALERT_INPUT_REASON = (
     "alert input documented in the docs/metrics.md rule table; "
     "no catalog row yet"
 )
-_EMITTED_REASON = "emitted series documented in docs/metrics.md; no catalog row yet"
-
 # Every emitted family absent from the catalog, with why it stays out.
 # A name here that gains a catalog row fails until its exemption is removed.
 EXEMPT_SERIES = {
@@ -68,7 +66,6 @@ EXEMPT_SERIES = {
     "two_bot_rest_guard_breaker_closes_total": _GUARD_REASON,
     "two_bot_rest_guard_global_pauses_total": _GUARD_REASON,
     "two_bot_rest_guard_invalid_requests_in_window": _GUARD_REASON,
-    "two_bot_rest_guard_breaker_open": _GUARD_REASON,
     "two_bot_rest_guard_token_invalid": _GUARD_REASON,
     "two_bot_rest_guard_pending_global_responses": _GUARD_REASON,
     "two_bot_rest_guard_global_paused": _GUARD_REASON,
@@ -94,14 +91,7 @@ EXEMPT_SERIES = {
         _ALERT_INPUT_REASON + " (gateway_checkpoint_failures)"
     ),
     "two_bot_internal_actions_total": _ALERT_INPUT_REASON + " (receiver_refusals)",
-    "two_bot_community_facts_drain_failures_total": _EMITTED_REASON,
     "two_bot_send_admissions_total": _ALERT_INPUT_REASON + " (send_admission_blocked)",
-    # Label-free halt gauge: a manual check, not an alert input. Its catalog
-    # row lands with the change that introduces the gauge.
-    "two_bot_audit_delivery_halt": (
-        "manual check documented in docs/metrics.md, consumed by no alert "
-        "rule; catalog row lands with the halt-gauge change"
-    ),
     # Voice stall-observability remainder (lobby-stall follow-up): backoff cap
     # and in-flight REST age. All rows live in docs/metrics.md; the catalog
     # covers voice_event log fields. (joins_received, dispatch_timeouts,
@@ -120,13 +110,6 @@ EXEMPT_SERIES = {
         "two_bot_voice_join_to_move_seconds family; alert input for "
         "voice_join_fast_burn and voice_join_slow_burn (cumulative le=\"5\" "
         "count); documented in docs/metrics.md and the catalog alert-rule rows"
-    ),
-    # Event-store S1 consumer-lag gauge: label-free manual check, not an
-    # alert input. Documented in docs/metrics.md; the catalog tracks event
-    # names, not this operational gauge.
-    "two_bot_event_store_consumer_lag_seconds": (
-        "manual check documented in docs/metrics.md, consumed by no alert "
-        "rule; label-free S1 consumer-lag gauge"
     ),
 }
 

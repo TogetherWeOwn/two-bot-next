@@ -248,7 +248,27 @@ impl CustomCommandRuntime {
             SlashOutcome::Handled {
                 handler: HandlerId::AutomationCustom,
             } => {
-                self.defer(interaction, false, received).await?;
+                if let Err(defer_error) = self.defer(interaction, false, received).await {
+                    // A refused defer proves no Discord-side effect, so audit
+                    // the failed run: operators must distinguish "attempted
+                    // and refused" from "never attempted". An ambiguous defer
+                    // (uncertain wire outcome) stays unaudited so a later
+                    // retry of the same interaction cannot double-record.
+                    if !matches!(defer_error, CustomCommandError::Delivery) {
+                        return Err(defer_error);
+                    }
+                    let row = row.ok_or(CustomCommandError::Context)?;
+                    let actor = interaction.author().ok_or(CustomCommandError::Context)?;
+                    let record = AuditRecord::run(
+                        &guild,
+                        &actor.id.to_string(),
+                        &row.name,
+                        false,
+                        Some("delivery_failed"),
+                    );
+                    self.audit_slash_run(&record, interaction.id.get()).await?;
+                    return Err(CustomCommandError::Delivery);
+                }
                 let row = row.ok_or(CustomCommandError::Context)?;
                 let actor = interaction.author().ok_or(CustomCommandError::Context)?;
                 let context =
@@ -286,8 +306,7 @@ impl CustomCommandRuntime {
                         None
                     }),
                 );
-                self.audit(&record, &format!("custom:run:{}", interaction.id))
-                    .await?;
+                self.audit_slash_run(&record, interaction.id.get()).await?;
                 result?;
                 Ok(true)
             }
@@ -452,6 +471,11 @@ impl CustomCommandRuntime {
         // Same receipt-relative bounded pre-wire retry as the refusal path:
         // a Blocked attempt never reached the wire, so retrying it cannot
         // double-acknowledge. Uncertain sends are never retried.
+        //
+        // Receipt-deadline expiry is ambiguous: the defer may have landed.
+        // Only provably pre-wire failures map to `Delivery`; everything
+        // else is `DeliveryUnknown` and must stay unaudited so a later
+        // retry cannot double-record.
         tokio::time::timeout_at(
             received + Duration::from_millis(crate::executor::RECEIPT_ADMISSION_BUDGET_MS),
             self.executor.answer_interaction_with_blocked_retry(
@@ -461,8 +485,14 @@ impl CustomCommandRuntime {
             ),
         )
         .await
-        .map_err(|_| CustomCommandError::Delivery)?
-        .map_err(|_| CustomCommandError::Delivery)
+        .map_err(|_| CustomCommandError::DeliveryUnknown)?
+        .map_err(|error| {
+            if error.is_safe_pre_mutation() {
+                CustomCommandError::Delivery
+            } else {
+                CustomCommandError::DeliveryUnknown
+            }
+        })
     }
 
     async fn complete(
@@ -482,6 +512,24 @@ impl CustomCommandRuntime {
             )
             .await
             .map_err(|_| CustomCommandError::Delivery)
+    }
+
+    // Explicit re-entry still attempts Discord delivery and returns that
+    // attempt's outcome. The immutable slash fact is first-write-wins across
+    // both refusal and completion, never an execution claim or a resend loop.
+    async fn audit_slash_run(
+        &self,
+        record: &AuditRecord,
+        interaction_id: u64,
+    ) -> Result<(), CustomCommandError> {
+        store::audit_once(
+            &self.pool,
+            record,
+            &format!("custom:run:{interaction_id}"),
+            &two_bot_core::now_iso(),
+        )
+        .await
+        .map_err(|_| CustomCommandError::Storage)
     }
 
     async fn audit(&self, record: &AuditRecord, id: &str) -> Result<(), CustomCommandError> {

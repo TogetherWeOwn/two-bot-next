@@ -58,8 +58,9 @@ use twilight_model::id::marker::{
 use twilight_model::id::Id;
 use two_bot_core::{
     backoff_ms, classify_kick_status, pace_wait_ms, parse_retry_after_secs, plan_purge,
-    retry_after_ms, utf16_len, ActionOutcome, KickOutcome, KickResult, KickStatus,
-    ModerationExecution, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
+    retry_after_ms, retry_after_ms_unclamped, utf16_len, ActionOutcome, KickOutcome, KickResult,
+    KickStatus, ModerationExecution, PurgeReport, PurgeStopReason, MAX_HTTP_TRIES,
+    MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
 };
 
 /// Minimum gap between paced requests, ms (legacy `rest.ts` default).
@@ -130,8 +131,8 @@ pub enum DiscordError {
     #[error("discord was unreachable: {0}")]
     Unavailable(String),
     /// Rate limited (legacy `rate_limited`): paced per §6. Discord did not
-    /// process the request ([`DiscordError::proves_no_effect`]), but the
-    /// member and website fences still classify it as uncertain.
+    /// process the request ([`DiscordError::proves_no_effect`]), so fences
+    /// release only the failed attempt; other failures stay uncertain.
     #[error("discord rate-limited this request")]
     RateLimited,
     /// Refused locally before any wire attempt; safe to release a claim.
@@ -283,6 +284,24 @@ impl std::fmt::Debug for RawResponse {
     }
 }
 
+/// Release a read's permit outside the receipt path (a stalled header/body or
+/// a truncated body), logging a storage failure like the receipt path. `site`
+/// is a fixed label naming the early-release site (`header_timeout`,
+/// `body_timeout`, `body_error`) for log triage. A failed completion holds
+/// the lane by design; the warn is the only signal.
+async fn complete_early_release(
+    permit: two_bot_core::send_admission::AdmissionPermit,
+    site: &'static str,
+) {
+    if let Err(error) = permit.complete(None).await {
+        tracing::warn!(
+            %error,
+            site,
+            "Discord send admission completion failed; lane held"
+        );
+    }
+}
+
 impl RawResponse {
     /// Call only for a definite effect/no-effect, after validating any required
     /// mutation receipt. A storage fault must not authorize effect replay.
@@ -315,6 +334,7 @@ impl RawResponse {
 
     /// Legacy 429 wait: body wins, then header, default 1 s; +250 ms pad;
     /// clamped so a bad header cannot park a run (legacy `retryAfterMs`).
+    /// Kick/publish lanes and registry reads keep this clamp.
     #[must_use]
     pub fn retry_after_wait_ms(&self) -> u64 {
         let header = self
@@ -322,6 +342,23 @@ impl RawResponse {
             .as_deref()
             .and_then(|s| parse_retry_after_secs(Some(s)));
         retry_after_ms(header, self.body_retry_after_secs())
+    }
+
+    /// Backfill-read 429 wait: same header/body/padding policy without the
+    /// 60 s clamp, so a long per-route `Retry-After` is waited out in one
+    /// sleep instead of retry-storming past it — but still bounded by the
+    /// 5 min backfill ceiling, so a malformed or hostile value cannot park a
+    /// caller. Only the paced backfill reads (`get_json_observed`,
+    /// `get_json_checked` via `read_json`) use this; every other lane
+    /// (including the general `get_json` read) keeps
+    /// [`Self::retry_after_wait_ms`].
+    #[must_use]
+    pub fn retry_after_wait_ms_unclamped(&self) -> u64 {
+        let header = self
+            .retry_after_header
+            .as_deref()
+            .and_then(|s| parse_retry_after_secs(Some(s)));
+        retry_after_ms_unclamped(header, self.body_retry_after_secs())
     }
 }
 
@@ -576,7 +613,7 @@ impl HyperTransport {
                 Err(_) => {
                     if request.method() == Method::Get {
                         if let Some(permit) = permit {
-                            let _ = permit.complete(None).await;
+                            complete_early_release(permit, "header_timeout").await;
                         }
                     }
                     return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
@@ -584,18 +621,35 @@ impl HyperTransport {
             },
         };
         let status = response.status().as_u16();
-        let accounting = crate::ratelimit_guard::ResponseAccounting::new(
+        let mut accounting = crate::ratelimit_guard::ResponseAccounting::new(
             &self.guard,
             status,
             response.headers(),
             !is_interaction_token_request(request),
         );
+        // Full bucket state is known at headers. Bare Retry-After waits for
+        // body classification so existing body timing/scope policy still wins.
+        let route_key = bucket_route_key(request);
+        self.guard
+            .observe_bucket_headers(&route_key, response.headers());
+        if status == 429 {
+            accounting.track_bare_bucket(&route_key, response.headers());
+        }
         attempt.finish(Some(status));
-        let retry_after_header = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
+        // The 429 wait honors `retry-after` first, then the bucket
+        // `reset-after` hint: on a 429 both name the same pause, and the reset
+        // hint is the only timing when `retry-after` is absent (official
+        // rate-limits page, verified 2026-10-12). Body `retry_after` still
+        // wins inside `retry_after_wait_ms`.
+        let retry_after_header = ["retry-after", "x-ratelimit-reset-after"]
+            .into_iter()
+            .find_map(|name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            });
         // Reads cannot mutate; a complete failure may be retried independently.
         // Mutation success needs its caller's validated receipt. 5xx, redirects
         // and request-timeout responses remain uncertain even with a full body.
@@ -702,7 +756,7 @@ impl PendingHeaders<'_> {
                 // permit held (uncertain) by returning with it taken.
                 if self.complete_on_receipt {
                     if let Some(permit) = self.permit.take() {
-                        let _ = permit.complete(None).await;
+                        complete_early_release(permit, "body_timeout").await;
                     }
                 }
                 return Err(BODY_TIMEOUT_MESSAGE.to_owned());
@@ -712,7 +766,7 @@ impl PendingHeaders<'_> {
                 // a receipted read (every GET) must release the lane.
                 if self.complete_on_receipt {
                     if let Some(permit) = self.permit.take() {
-                        let _ = permit.complete(None).await;
+                        complete_early_release(permit, "body_error").await;
                     }
                 }
                 return Err("Discord response body unavailable".to_owned());
@@ -774,6 +828,18 @@ impl Drop for PendingHeaders<'_> {
 
 fn is_interaction_callback(request: &Request) -> bool {
     request.path().starts_with("interactions/") && request.path().ends_with("/callback")
+}
+
+/// Bucket identity for one request: HTTP method plus path, without the
+/// query string. Paginated reads change `after`/`before`/`limit` on every
+/// page, so keying learned bucket state on the full path would orphan the
+/// deadline a response teaches before the next page admits; Discord can
+/// also bucket different methods on one path separately. Admission and
+/// `observe_bucket` share this key so a response's deadline gates the
+/// next page of the same route.
+fn bucket_route_key(request: &Request) -> String {
+    let path = request.path().split('?').next().unwrap_or(request.path());
+    format!("{} {path}", request.method().name())
 }
 
 fn is_interaction_token_request(request: &Request) -> bool {
@@ -1054,28 +1120,80 @@ impl ActionExecutor {
     }
 
     async fn admit(&self, request: &Request, lane: Option<bool>) -> Result<(), GuardError> {
+        self.admit_essential(request, lane, is_interaction_callback(request))
+            .await
+    }
+
+    /// 429 sleep-then-retry admission: essential, so a breaker this read's
+    /// own 429 tally just opened cannot refuse its retry — and only that.
+    /// The guard still enforces `token_invalid`, pending/global pauses, the
+    /// learned bucket deadline and shared pacing, so no retry leaves during
+    /// a pause another request installed while this one slept.
+    async fn admit_retry(&self, request: &Request, lane: Option<bool>) -> Result<(), GuardError> {
+        self.admit_essential(request, lane, true).await
+    }
+
+    async fn admit_essential(
+        &self,
+        request: &Request,
+        lane: Option<bool>,
+        essential: bool,
+    ) -> Result<(), GuardError> {
         let guard = &self.inner.transport.guard;
-        let essential = is_interaction_callback(request);
+        // Lane-less admission also honors learned route deadlines, but only
+        // paced lanes take a shared pacing turn.
+        let route_key = bucket_route_key(request);
         let Some(kick_lane) = lane else {
-            return guard.admit(essential).await;
+            return guard.admit_route_recheck(&route_key, essential).await;
         };
         let (lock, interval) = if kick_lane {
             (&self.inner.kick_last_at, self.inner.kick_interval)
         } else {
             (&self.inner.pace_last_at, self.inner.pace_interval)
         };
-        // Keep the lane reservation through cooldown and pacing. Timestamp only
-        // the actual dispatch, not each queued caller's pre-cooldown admission.
-        let mut last = lock.lock().await;
-        guard.admit(essential).await?;
-        let earliest = *last + interval;
-        if earliest > tokio::time::Instant::now() {
-            tokio::time::sleep_until(earliest).await;
+        // Wait out guard gates (global pause, this route's bucket deadline,
+        // shared pacing) before taking the lane lock: a route-local bucket
+        // reset can be seconds away, and sleeping it out under the lane
+        // lock would stall every unrelated route sharing the lane until
+        // their own admission budgets expire. The first pass also takes
+        // this admission's one pacing turn; later passes only re-wait
+        // gates that arrived while this caller queued for or slept in the
+        // lane, detected by the non-blocking re-check under the lock.
+        let mut paced = false;
+        loop {
+            if paced {
+                guard.admit_route_recheck(&route_key, essential).await?;
+            } else {
+                guard.admit_route(&route_key, essential).await?;
+                paced = true;
+            }
+            // Keep the lane reservation through the lane sleep. Timestamp
+            // only the actual dispatch, not each queued caller's
+            // pre-cooldown admission.
+            let mut last = lock.lock().await;
+            if let Err(error) = guard.check_route_now(&route_key, essential) {
+                drop(last);
+                match error {
+                    GuardError::GlobalPaused => continue,
+                    other => return Err(other),
+                }
+            }
+            let earliest = *last + interval;
+            if earliest > tokio::time::Instant::now() {
+                tokio::time::sleep_until(earliest).await;
+            }
+            // A global response/breaker/bucket reset may arrive during the
+            // lane sleep; re-wait it outside the lock, never under it.
+            if let Err(error) = guard.check_route_now(&route_key, essential) {
+                drop(last);
+                match error {
+                    GuardError::GlobalPaused => continue,
+                    other => return Err(other),
+                }
+            }
+            self.stamp_paced_lane(&mut last, kick_lane);
+            return Ok(());
         }
-        // A global response/breaker may arrive during the lane sleep.
-        guard.admit(essential).await?;
-        self.stamp_paced_lane(&mut last, kick_lane);
-        Ok(())
     }
 
     /// Keep pacing/global waits before the audit service's late DB fence, and
@@ -1499,7 +1617,8 @@ impl ActionExecutor {
         let reason = audit_reason(reason)?;
         let until = until_iso
             .map(|s| {
-                Timestamp::parse(s).map_err(|e| DiscordError::Rejected(format!("bad until: {e}")))
+                Timestamp::parse(&normalize_timeout_until(s))
+                    .map_err(|e| DiscordError::Rejected(format!("bad until: {e}")))
             })
             .transpose()?;
         let req = Self::request_of(
@@ -1752,41 +1871,76 @@ impl ActionExecutor {
         .map_err(|e| e.to_string())
     }
 
-    /// Paced GET: 110 ms lane, 403/404 → `None`, 429 waits (`retry-after +
-    /// 250 ms`; a global 429 rides the shared pause at next admission) and
-    /// retries within the same 5-try budget as 5xx/transport, other statuses
-    /// → `None` (legacy `DiscordRest::get`). Supported paths cover the
+    /// Paced GET: 110 ms lane, 403/404 → `None`, 429 sleeps-then-retries under
+    /// the same admission (`retry-after`/`reset-after` + 250 ms, clamped at
+    /// 60 s like kick/publish; a global 429 additionally rides out the shared
+    /// pause) within the same 5-try budget as 5xx/transport, other statuses →
+    /// `None` (legacy `DiscordRest::get`). This is the general interactive
+    /// read (containment snapshot, website jobs, onboarding probe): it keeps
+    /// the clamp so a long per-route wait cannot park a serialized worker.
+    /// Supported paths cover the
     /// parity §6 reads —
     /// guild, guild members (+`after`/`limit`), guild scheduled-events
     /// (+`with_user_count`), single channel and the channel-messages list
     /// (+`after`/`around`/`before`/`limit`). Anything else is a caller bug and
     /// is refused without I/O, never silently rewritten (finding 2).
     pub async fn get_json(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
-        Ok(self.get_json_observed(path).await?.map(|(data, _)| data))
+        Ok(self
+            .get_json_observed_inner(path, false)
+            .await?
+            .map(|(data, _)| data))
     }
 
     /// Permission evidence must distinguish denied/absent (403/404) from an
     /// unavailable or unreadable response. Keep the shared paced read policy,
     /// but never let a transient failure look like a proven delivery skip.
+    /// Shares the backfill evidence-read wait policy with
+    /// [`Self::get_json_observed`] (unclamped, 5 min ceiling).
     pub async fn get_json_checked(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
-        self.read_json(path, true).await
+        self.read_json(path, true, true).await
     }
 
     /// Membership evidence is bounded by the successful attempt's request
     /// start, after pacing, never by headers/body completion or an earlier
     /// failed attempt. Ordinary `get_json` keeps its data-only contract.
+    /// This is the backfill evidence read (driven by the store backfill): a
+    /// long per-route 429 is waited out unclamped (5 min ceiling per wait)
+    /// instead of retry-storming past it.
     pub async fn get_json_observed(
         &self,
         path: &str,
     ) -> Result<Option<(serde_json::Value, String)>, String> {
+        self.get_json_observed_inner(path, true).await
+    }
+
+    /// Shared observed-read loop: `backfill_wait` selects the unclamped
+    /// backfill 429 wait; the general read keeps the 60 s clamp.
+    async fn get_json_observed_inner(
+        &self,
+        path: &str,
+        backfill_wait: bool,
+    ) -> Result<Option<(serde_json::Value, String)>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
+        // A 429 proves the attempt reached Discord, so its sleep-then-retry
+        // re-admits as essential: a breaker the tally just opened must not
+        // refuse the in-flight read's own retry, while every other guard
+        // gate (token, pauses, bucket, pacing) still applies. New reads
+        // admit (and refuse) as usual.
+        let mut admitted_retry = false;
         loop {
             let request = Request::from_route(&route);
             // Guard refusals are terminal; pacing completes before the stamp.
-            self.admit(&request, Some(false))
-                .await
-                .map_err(|error| error.to_string())?;
+            if admitted_retry {
+                self.admit_retry(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            } else {
+                self.admit(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            admitted_retry = false;
             let observed_at = two_bot_core::now_iso();
             // Each attempt gets the moderation bound across headers and body,
             // so a response that never answers cannot park the caller (the
@@ -1816,15 +1970,30 @@ impl ActionExecutor {
                 429 => {
                     // Every 429 spends one read attempt, like 5xx/transport:
                     // a steady 429 stream exhausts the budget instead of
-                    // parking the read until a separate guard refuses it. A
-                    // global 429 installs the shared pause at next admission,
-                    // so only route-local 429s sleep here.
+                    // parking the read until a separate guard refuses it. The
+                    // retry re-admits as essential (see `admitted_retry`):
+                    // no request leaves during the wait or a shared pause.
+                    // Backfill evidence reads wait out a long per-route
+                    // Retry-After unclamped (5 min ceiling per wait): waking
+                    // early only earns another 429 and burns another try.
+                    // The general read and kick/publish keep the 60 s clamp.
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return Ok(None);
                     }
                     if !global {
-                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                        let wait_ms = if backfill_wait {
+                            res.retry_after_wait_ms_unclamped()
+                        } else {
+                            res.retry_after_wait_ms()
+                        };
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     }
+                    // A global 429 already installed the shared pause at
+                    // headers receipt, anchored to that instant: sleeping
+                    // the full wait again after the body would restart the
+                    // deadline. The essential re-admission waits out
+                    // whatever of the pause remains instead.
+                    admitted_retry = true;
                     attempt += 1;
                 }
                 403 | 404 => return Ok(None),
@@ -1877,19 +2046,33 @@ impl ActionExecutor {
         }
     }
 
+    /// `backfill_wait` selects the unclamped backfill 429 wait (5 min ceiling
+    /// per wait); callers outside the backfill evidence reads keep the clamp
+    /// by passing `false`.
     async fn read_json(
         &self,
         path: &str,
         checked: bool,
+        backfill_wait: bool,
     ) -> Result<Option<serde_json::Value>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
+        // Same essential re-admission as the observed read: a 429 retry
+        // bypasses only a just-opened breaker, never the other guard gates.
+        let mut admitted_retry = false;
         loop {
             let request = Request::from_route(&route);
             // Guard refusals are terminal; pacing completes before the send.
-            self.admit(&request, Some(false))
-                .await
-                .map_err(|error| error.to_string())?;
+            if admitted_retry {
+                self.admit_retry(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            } else {
+                self.admit(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            admitted_retry = false;
             let (res, global) = match self.send_admitted(&request).await {
                 Ok(r) => r,
                 Err(detail) => {
@@ -1917,8 +2100,10 @@ impl ActionExecutor {
                     // spends one attempt, so persistent rate limiting ends in
                     // the fixed transient-exhaustion error for checked reads
                     // (absence for unchecked ones), never an open-ended park.
-                    // Global pauses apply at next admission; only
-                    // route-local 429s sleep here.
+                    // The retry re-admits as essential after sleeping out
+                    // a route-local wait — unclamped (5 min ceiling) for the
+                    // backfill evidence reads, clamped otherwise, like the
+                    // observed read; a shared pause rides admission.
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return if checked {
                             Err("Discord evidence unavailable".to_owned())
@@ -1927,8 +2112,17 @@ impl ActionExecutor {
                         };
                     }
                     if !global {
-                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                        let wait_ms = if backfill_wait {
+                            res.retry_after_wait_ms_unclamped()
+                        } else {
+                            res.retry_after_wait_ms()
+                        };
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     }
+                    // Global: no local sleep — the shared pause is anchored
+                    // at headers receipt and the essential re-admission
+                    // waits out its remainder (see the observed read).
+                    admitted_retry = true;
                     attempt += 1;
                 }
                 403 | 404 => return Ok(None),
@@ -2301,14 +2495,14 @@ impl ActionExecutor {
     }
 
     /// Purge: list, then `POST .../bulk-delete` for recent messages and one
-    /// `DELETE` per older or lone message (legacy `ModerationDiscord::purge`
-    /// returns the affected count).
+    /// `DELETE` per older or lone message. Report the confirmed count and any
+    /// definitive refusal that stopped a later delete.
     pub async fn purge(
         &self,
         channel_id: &str,
         count: u64,
         reason: &str,
-    ) -> Result<u64, DiscordError> {
+    ) -> Result<PurgeReport, DiscordError> {
         // Keep reason validation before any I/O for the combined public call.
         audit_reason(reason)?;
         let ids = self.list_purge_messages(channel_id, count).await?;
@@ -2317,18 +2511,20 @@ impl ActionExecutor {
 
     /// Read-only purge phase. Even a timeout here proves no deletion was sent.
     /// Pinned messages and this bot's own posts (ticket, sticky and LFG panels)
-    /// are listed but never returned for deletion. The bot identity is read only
-    /// when a listed message was authored by some bot.
+    /// are listed but never returned for deletion. The bot identity is read unless
+    /// every listed message is explicitly marked as authored by a non-bot.
     pub(crate) async fn list_purge_messages(
         &self,
         channel_id: &str,
         count: u64,
     ) -> Result<Vec<Id<MessageMarker>>, DiscordError> {
+        if !(1..=100).contains(&count) {
+            return Err(DiscordError::Rejected(format!(
+                "purge out of range: {count}"
+            )));
+        }
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
-        let limit: u16 = count
-            .clamp(1, 100)
-            .try_into()
-            .map_err(|_| DiscordError::Rejected(format!("purge out of range: {count}")))?;
+        let limit = count as u16;
         let list_req = Self::request_of(self.inner.factory.channel_messages(channel).limit(limit))?;
         let res = self.call_once_raw(list_req, &[200]).await?;
         let unreadable =
@@ -2345,10 +2541,10 @@ impl ActionExecutor {
             }
             rows.push((id, row));
         }
-        let any_bot = rows
+        let needs_own_id = rows
             .iter()
-            .any(|(_, row)| row["author"]["bot"].as_bool() == Some(true));
-        let own_id = if any_bot {
+            .any(|(_, row)| row["author"]["bot"].as_bool() != Some(false));
+        let own_id = if needs_own_id {
             Some(self.current_bot_user_id().await?.to_string())
         } else {
             None
@@ -2364,14 +2560,14 @@ impl ActionExecutor {
     /// older ones, which make the whole bulk call fail with a 400, are deleted
     /// singly. Uncertain wire failures must retain caller fences. Once some
     /// message is gone, a failure that proves only the failing call had no
-    /// effect stops the purge and reports the count deleted so far; it must not
-    /// claim that no mutation was accepted.
+    /// effect stops the purge and reports the count deleted so far and why it
+    /// stopped; it must not claim that no mutation was accepted.
     pub(crate) async fn purge_messages(
         &self,
         channel_id: &str,
         ids: &[Id<MessageMarker>],
         reason: &str,
-    ) -> Result<u64, DiscordError> {
+    ) -> Result<PurgeReport, DiscordError> {
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
         let reason = audit_reason(reason)?;
         let raw: Vec<u64> = ids.iter().map(|id| id.get()).collect();
@@ -2401,10 +2597,21 @@ impl ActionExecutor {
                 Err(error @ (DiscordError::Timeout | DiscordError::Unavailable(_))) => {
                     return Err(error)
                 }
-                Err(_) => break,
+                Err(error) => {
+                    return Ok(PurgeReport {
+                        affected: deleted,
+                        stop_reason: Some(match error {
+                            DiscordError::RateLimited => PurgeStopReason::RateLimited,
+                            _ => PurgeStopReason::Refused,
+                        }),
+                    });
+                }
             }
         }
-        Ok(deleted)
+        Ok(PurgeReport {
+            affected: deleted,
+            stop_reason: None,
+        })
     }
 
     /// One purge delete. A 404 means the message vanished after the listing, so
@@ -2579,15 +2786,32 @@ impl ActionExecutor {
             let rows: Vec<serde_json::Value> = serde_json::from_slice(&res.body)
                 .map_err(|_| DiscordError::Unavailable("unreadable message history".into()))?;
             for row in &rows {
-                if row["nonce"].as_str() == Some(nonce)
-                    && row["author"]["id"].as_str() == Some(&bot_user_id.to_string())
-                    && row["channel_id"].as_str() == Some(channel_id)
+                // A non-match proves absence only if its required evidence is readable.
+                // Map upstream ID failures to a fixed error, never a raw snowflake value.
+                let unreadable = || DiscordError::Unavailable("unreadable message history".into());
+                let id = row["id"].as_str().ok_or_else(unreadable)?;
+                let author = row["author"]["id"].as_str().ok_or_else(unreadable)?;
+                let message_id: Id<MessageMarker> = snowflake(id).map_err(|_| unreadable())?;
+                let author_id: Id<UserMarker> = snowflake(author).map_err(|_| unreadable())?;
+                if message_id.to_string() != id
+                    || author_id.to_string() != author
+                    || row["channel_id"].as_str() != Some(channel_id)
                 {
-                    let id = row["id"].as_str().ok_or_else(|| {
-                        DiscordError::Unavailable("accepted message missing id".into())
-                    })?;
-                    let _: Id<MessageMarker> = snowflake(id)?;
-                    return Ok(Some(id.to_owned()));
+                    return Err(unreadable());
+                }
+                if author_id.get() == bot_user_id {
+                    let row_nonce = &row["nonce"];
+                    // Only the bot's rows need readable nonce evidence to prove a non-match.
+                    if !row_nonce.is_null()
+                        && !row_nonce.is_string()
+                        && !row_nonce.is_i64()
+                        && !row_nonce.is_u64()
+                    {
+                        return Err(unreadable());
+                    }
+                    if row_nonce.as_str() == Some(nonce) {
+                        return Ok(Some(id.to_owned()));
+                    }
                 }
             }
             if rows.len() < 100 {
@@ -2862,9 +3086,13 @@ impl ActionExecutor {
                 channel_id,
                 count,
                 reason,
-            } => Ok(ChannelCallOutcome::Purged {
-                affected: self.purge(channel_id, *count, reason).await?,
-            }),
+            } => {
+                let report = self.purge(channel_id, *count, reason).await?;
+                Ok(ChannelCallOutcome::Purged {
+                    affected: report.affected,
+                    stop_reason: report.stop_reason,
+                })
+            }
             ChannelCall::Slowmode {
                 channel_id,
                 seconds,
@@ -3504,12 +3732,14 @@ impl ActionExecutor {
                 self.unban(&exec.guild_id, user_id, &exec.reason).await?;
             }
             ActionOutcome::Purged { channel_id, .. } => {
-                let count = exec.count.unwrap_or(0);
-                let affected = self.purge(channel_id, count, &exec.reason).await?;
+                let count = exec
+                    .count
+                    .ok_or_else(|| DiscordError::Rejected("purge count required".into()))?;
+                let report = self.purge(channel_id, count, &exec.reason).await?;
                 return Ok(ActionOutcome::Purged {
                     channel_id: channel_id.clone(),
-                    // `purge` counts listed ids (≤100 by clamp); always fits.
-                    affected: affected as usize,
+                    // `purge` counts listed ids (≤100 by validated limit); always fits.
+                    affected: report.affected as usize,
                 });
             }
             ActionOutcome::SlowmodeUpdated {
@@ -3558,11 +3788,16 @@ impl ActionExecutor {
 /// Channel-verb outcome (affected counts for purge/post).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelCallOutcome {
-    Purged { affected: u64 },
+    Purged {
+        affected: u64,
+        stop_reason: Option<PurgeStopReason>,
+    },
     SlowmodeUpdated,
     OverwriteWritten,
     OverwriteDeleted,
-    Posted { message_id: String },
+    Posted {
+        message_id: String,
+    },
     MessageDeleted,
 }
 
@@ -3701,6 +3936,19 @@ fn audit_reason(reason: &str) -> Result<String, DiscordError> {
         )));
     }
     Ok(trimmed.to_owned())
+}
+
+/// Normalize service UTC expiries for pinned Twilight, which rejects short
+/// `Z` timestamps. Offset-bearing inputs keep their existing representation.
+pub(crate) fn normalize_timeout_until(until_iso: &str) -> String {
+    if let Some(core) = until_iso.strip_suffix(['Z', 'z']) {
+        let base = core
+            .split_once('.')
+            .map_or(core, |(date_time, _)| date_time);
+        format!("{base}+00:00")
+    } else {
+        until_iso.to_owned()
+    }
 }
 
 /// `timeout` until timestamp: now + duration, RFC 3339 (legacy
@@ -3938,6 +4186,7 @@ mod tests {
     use two_bot_core::send_admission::{
         AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, TokenKey,
     };
+    use two_bot_core::MAX_BACKFILL_RETRY_AFTER_MS;
 
     #[derive(Debug)]
     struct NeverSendAdmission(TokenKey);
@@ -4239,6 +4488,40 @@ mod tests {
             completion: None,
         };
         assert_eq!(clamped.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
+    }
+
+    #[test]
+    fn backfill_read_waits_out_long_header_unclamped() {
+        let long = RawResponse {
+            status: 429,
+            retry_after_header: Some("75".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        // Backfill reads honor the 75 s header in one wait; the kick/publish
+        // clamp stays pinned at 60 s for the same response.
+        assert_eq!(long.retry_after_wait_ms_unclamped(), 75_250);
+        assert_eq!(long.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
+        let short = RawResponse {
+            status: 429,
+            retry_after_header: Some("2".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        assert_eq!(short.retry_after_wait_ms_unclamped(), 2250);
+        // A huge header stops at the 5 min backfill ceiling instead of
+        // parking the caller, while the clamped wait is untouched.
+        let huge = RawResponse {
+            status: 429,
+            retry_after_header: Some("86400".to_owned()),
+            body: Vec::new(),
+            completion: None,
+        };
+        assert_eq!(
+            huge.retry_after_wait_ms_unclamped(),
+            MAX_BACKFILL_RETRY_AFTER_MS
+        );
+        assert_eq!(huge.retry_after_wait_ms(), MAX_RETRY_AFTER_MS);
     }
 
     #[test]

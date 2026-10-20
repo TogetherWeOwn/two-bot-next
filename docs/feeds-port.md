@@ -20,8 +20,11 @@ Read-only specification: TogetherWeOwn/two-bot `src/announcements/service.ts`,
   enabled, but fail validation whenever feed polling runs; disabled relays are not
   polled. This slice does not edit stored sources; do not remove and re-add a
   relay unless resetting its delivery history is intended (`feed_deliveries`
-  cascades on relay removal). Any in-place remediation needs a separate reviewed
-  path. Adding a relay does not fetch the source. Twitch is **not** a Helix API
+  cascades on relay removal). Removal refuses while the relay carries
+  unresolved pending delivery evidence, retaining relay and ledger for
+  recovery; only settled or never-pending relays delete. Any in-place
+  remediation needs a separate reviewed path. Adding a relay does not fetch
+  the source. Twitch is **not** a Helix API
   integration and does not require a Twitch credential. YouTube also
   accepts a 20–32-character channel ID and expands it into the videos Atom URL.
 - RSS item/guid and Atom entry/id parsing, alternate-link preference, title,
@@ -47,7 +50,7 @@ Read-only specification: TogetherWeOwn/two-bot `src/announcements/service.ts`,
   item URLs over their feed kind's message budget are filtered during XML parsing
   rather than retried as poll failures. The kind-agnostic XML parser uses the
   widest feed URL budget; the managed poller passes the feed kind explicitly.
-  `/feed-list` truncates each source to 128 units before its total message cap.
+  `/feed-list` caps each source at 128 units and shrinks sources adaptively at capacity (scheme-stripped head…tail) so every relay id stays discoverable and same-host sources stay distinguishable within the 2,000-unit message cap.
 - SHA-256 item-key fallback and 24-hex nonce are byte-compatible with legacy.
   Feed titles neutralize mass mentions before escaping punctuation and flattening
   CR/LF, so the shared REST sanitizer does not expand them past the message limit.
@@ -126,6 +129,18 @@ post-accepted/pre-DB crash test recovers one mock message without reposting;
 unknown acceptance remains pending rather than risking duplicates or claiming
 success. The shared executor must implement reconciliation and surface unresolved
 claims; missing in a bounded 100-message search is not authoritative absence.
+
+Relay removal and delivery admission share one bounded guild/feed-scoped
+database fence (`pg_advisory_xact_lock`, held only across short statements,
+never across network IO, with `lock_timeout = '5s'` / `statement_timeout =
+'15s'`). Removal atomically refuses with a fixed recovery-required reply and
+audit outcome while any pending delivery row for that guild/feed is unresolved,
+retaining relay and ledger; a stale polled relay revalidates existence under
+the same fence, so it can never POST after removal has confirmed. Ordinary
+settled/no-pending removal, not-found and foreign-guild behavior are unchanged.
+No blind resend, history-based absence claim or operator release authority is
+introduced: the member waits for the existing nonce reconciliation, then
+removes again.
 
 ## Verification
 

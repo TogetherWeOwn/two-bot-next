@@ -122,20 +122,6 @@ def dockerfile_parity_errors(root):
     return errors
 
 
-def dockerfile_builder_digest(root, name):
-    """Builder digest from the Dockerfile's first rust stage.
-
-    Read from the same single parse as the tag check above, so tag and digest
-    always describe the same FROM line.
-    """
-    try:
-        text = (root / name).read_text()
-    except Exception:
-        return None
-    stages = _rust_stages(text)
-    return (stages[0][1] or None) if stages else None
-
-
 def container_image_errors(root):
     """Selected job containers use the pinned Rust trixie image tag and digest.
 

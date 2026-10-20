@@ -120,24 +120,24 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertEqual(len(build), 1)
         self.assertEqual(build[0].get("working-directory"), "fuzz")
         self.assertEqual(build[0].get("run"), "cargo +nightly-2026-10-01 fuzz build")
-        replay = [step for step in job.get("steps", [])
-                  if "fuzz run eventsub_delivery" in str(step.get("run", ""))]
-        self.assertEqual(len(replay), 1)
-        self.assertEqual(replay[0].get("working-directory"), "fuzz")
+        targets = ("eventsub_delivery", "helix_token", "custom_command_template", "fb_page_events")
         fuzz_runs = [step for step in job.get("steps", [])
                      if "fuzz run" in step.get("run", "")]
-        self.assertEqual(fuzz_runs, replay)
-        self.assertIsNot(fuzz_runs[0], build[0])
-        self.assertEqual(
-            replay[0].get("run"),
-            "cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048",
-        )
+        self.assertEqual(len(fuzz_runs), len(targets))
+        for target, replay in zip(targets, fuzz_runs):
+            with self.subTest(target=target):
+                self.assertEqual(replay.get("working-directory"), "fuzz")
+                self.assertIsNot(replay, build[0])
+                self.assertEqual(
+                    replay.get("run"),
+                    f"cargo +nightly-2026-10-01 fuzz run {target} -- -runs=0 -timeout=10 -rss_limit_mb=2048",
+                )
 
-        # The committed target and seeds are what the bounded replay executes.
-        self.assertTrue((ROOT / "fuzz/fuzz_targets/eventsub_delivery.rs").is_file())
-        corpus = ROOT / "fuzz/corpus/eventsub_delivery"
-        self.assertTrue(corpus.is_dir())
-        self.assertTrue(any(seed.is_file() for seed in corpus.iterdir()))
+                # Each bounded replay executes its committed target and seeds.
+                self.assertTrue((ROOT / f"fuzz/fuzz_targets/{target}.rs").is_file())
+                corpus = ROOT / "fuzz/corpus" / target
+                self.assertTrue(corpus.is_dir())
+                self.assertTrue(any(seed.is_file() for seed in corpus.iterdir()))
 
         # Pinned dependencies: the committed fuzz/Cargo.lock is the gate's
         # version inventory. `--locked` fails the required job instead of

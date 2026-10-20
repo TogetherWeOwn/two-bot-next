@@ -10,11 +10,12 @@ use two_bot_core::metrics::{
     Metrics, AUTOMOD_DECISION_OUTCOMES, CHECKPOINT_FAILURE_STAGES, COMMUNITY_FACTS_DRAIN_REASONS,
     DB_ERROR_OPS, DISPATCH_LANES, EVENTS, EVENTSUB_DELIVERY_KINDS, EVENTSUB_POST_OUTCOMES,
     EVENTSUB_RECONCILE_ACTIONS, EVENTSUB_RECONCILE_ERROR_CLASSES, EVENTSUB_RECONCILE_OUTCOMES,
-    INTERNAL_ACTION_FAMILIES, INTERNAL_ACTION_OUTCOMES, JOBS, JOB_ERROR_CLASSES, JOB_OUTCOMES,
-    PREFIX_TRIGGER_REFUSED_REASONS, PRESENCE_CAPTURE_OUTCOMES, REST_ROUTES, RESULTS,
-    SEND_ADMISSION_OUTCOMES, VOICE_DEAD_ACTIONS, VOICE_JOIN_OCCUPANCY_BUCKETS,
-    VOICE_JOIN_REFUSAL_REASONS, VOICE_NAME_OUTCOMES, VOICE_OPERATIONS, VOICE_OUTCOMES,
-    VOICE_RECONCILE_ACTIONS, VOICE_VOTE_KICK_OUTCOMES,
+    FEED_FETCH_ERROR_CLASSES, FEED_FETCH_OUTCOMES, INTERNAL_ACTION_FAMILIES,
+    INTERNAL_ACTION_OUTCOMES, JOBS, JOB_ERROR_CLASSES, JOB_OUTCOMES,
+    MODERATION_ENFORCEMENT_OUTCOMES, MODERATION_VERBS, PREFIX_TRIGGER_REFUSED_REASONS,
+    PRESENCE_CAPTURE_OUTCOMES, REST_ROUTES, RESULTS, SEND_ADMISSION_OUTCOMES, VOICE_DEAD_ACTIONS,
+    VOICE_JOIN_OCCUPANCY_BUCKETS, VOICE_JOIN_REFUSAL_REASONS, VOICE_NAME_OUTCOMES,
+    VOICE_OPERATIONS, VOICE_OUTCOMES, VOICE_RECONCILE_ACTIONS, VOICE_VOTE_KICK_OUTCOMES,
 };
 
 fn repository_root() -> PathBuf {
@@ -132,6 +133,7 @@ fn allowlisted_labels(name: &str) -> Vec<&'static str> {
         "two_bot_voice_vote_kick_total" => vec!["outcome"],
         "two_bot_voice_names_total" => vec!["outcome"],
         "two_bot_internal_actions_total" => vec!["family", "outcome"],
+        "two_bot_moderation_enforcements_total" => vec!["verb", "outcome"],
         "two_bot_community_facts_drain_failures_total" => vec!["reason"],
         "two_bot_gateway_checkpoint_failures_total" => vec!["stage"],
         "two_bot_presence_capture_total" => vec!["outcome"],
@@ -141,6 +143,8 @@ fn allowlisted_labels(name: &str) -> Vec<&'static str> {
         "two_bot_eventsub_reconcile_passes_total" => vec!["outcome"],
         "two_bot_eventsub_reconcile_actions_total" => vec!["action"],
         "two_bot_eventsub_reconcile_errors_total" => vec!["error_class"],
+        "two_bot_feed_fetches_total" => vec!["outcome"],
+        "two_bot_feed_fetch_errors_total" => vec!["error_class"],
         _ => Vec::new(),
     }
 }
@@ -190,6 +194,10 @@ fn expected_values(name: &str) -> Vec<(&'static str, Vec<&'static str>)> {
             ("family", INTERNAL_ACTION_FAMILIES.to_vec()),
             ("outcome", INTERNAL_ACTION_OUTCOMES.to_vec()),
         ],
+        "two_bot_moderation_enforcements_total" => vec![
+            ("verb", MODERATION_VERBS.to_vec()),
+            ("outcome", MODERATION_ENFORCEMENT_OUTCOMES.to_vec()),
+        ],
         "two_bot_community_facts_drain_failures_total" => {
             vec![("reason", COMMUNITY_FACTS_DRAIN_REASONS.to_vec())]
         }
@@ -216,6 +224,12 @@ fn expected_values(name: &str) -> Vec<(&'static str, Vec<&'static str>)> {
         }
         "two_bot_eventsub_reconcile_errors_total" => {
             vec![("error_class", EVENTSUB_RECONCILE_ERROR_CLASSES.to_vec())]
+        }
+        "two_bot_feed_fetches_total" => {
+            vec![("outcome", FEED_FETCH_OUTCOMES.to_vec())]
+        }
+        "two_bot_feed_fetch_errors_total" => {
+            vec![("error_class", FEED_FETCH_ERROR_CLASSES.to_vec())]
         }
         _ => Vec::new(),
     }
@@ -250,11 +264,13 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_voice_dispatch_timeouts_total",
     "two_bot_voice_watchdog_stucks_total",
     "two_bot_voice_halt_recoveries_total",
+    "two_bot_voice_live_self_heal_total",
     "two_bot_db_errors_total",
     "two_bot_send_admissions_total",
     "two_bot_gateway_prefix_trigger_refused_total",
     "two_bot_dispatch_drops_total",
     "two_bot_internal_actions_total",
+    "two_bot_moderation_enforcements_total",
     "two_bot_community_facts_drain_failures_total",
     "two_bot_gateway_checkpoint_failures_total",
     "two_bot_presence_capture_total",
@@ -265,6 +281,9 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_eventsub_reconcile_passes_total",
     "two_bot_eventsub_reconcile_actions_total",
     "two_bot_eventsub_reconcile_errors_total",
+    "two_bot_feed_fetches_total",
+    "two_bot_feed_fetch_errors_total",
+    "two_bot_retention_replay_needed_total",
 ];
 
 fn check_docs_against_exposition(doc: &str, exposition: &str) -> Result<(), String> {

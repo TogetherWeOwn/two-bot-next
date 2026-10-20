@@ -19,7 +19,7 @@ Bounds below are registry bounds; a dash means no bound is declared there,
 not that handler validation is unlimited. Permissions are Discord default
 member-permission bitfields, not a replacement for runtime authorization.
 
-Built-in commands: 50.
+Built-in commands: 51.
 
 ## `/access`
 
@@ -346,6 +346,24 @@ Set where new rooms appear and the first room number
 | `position` | string | false | — | — | — | Above = `"above"`; Below = `"below"` | New rooms go above or below the creator channel |
 | `first-number` | integer | false | 1 | 4294967295 | — | — | First room number (numbering starts here) |
 
+## `/privacy`
+
+Manage your analytics privacy and deletion requests for this server.
+
+- Default permissions: Everyone (no default permission gate)
+- Available in DMs: false
+
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `opt-out` | subcommand | false | — | — | — | — | Delete your stored activity for this server and stop future analytics persistence. |
+| `opt-in` | subcommand | false | — | — | — | — | Resume analytics persistence for this server (already-deleted rows are not restored). |
+| `status` | subcommand | false | — | — | — | — | Show whether you are opted out and this server's analytics switches. |
+| `delete` | subcommand | false | — | — | — | — | Request deletion of your stored data for this server. |
+| `deletion-status` | subcommand | false | — | — | — | — | Show the status of your deletion request. |
+| `deletion-status request-id` | string | true | — | — | 128 | — | The request id returned when you requested deletion. |
+| `deletion-receipt` | subcommand | false | — | — | — | — | Show the completed receipt for your deletion request. |
+| `deletion-receipt request-id` | string | true | — | — | 128 | — | The request id returned when you requested deletion. |
+
 ## `/private`
 
 Deny new members from joining your voice room and open a Join channel
@@ -439,7 +457,9 @@ List scheduled messages for this server
 - Default permissions: ManageGuild (`32`)
 - Available in DMs: false
 
-No options.
+| Option | Type | Required | Min | Max | Max length | Choices | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `page` | integer | false | 1 | — | — | — | Page of the schedule list (1-based) |
 
 ## `/schedule-remove`
 

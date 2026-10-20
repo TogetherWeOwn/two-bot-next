@@ -349,6 +349,10 @@
       "sha256": "f5280fb02325d7f63a2f563f410f71bb7b79e228a4362537511ae687cab27980",
       "justification": "Audit resource witness for event intents: nullable resource_id/affected/outcome on internal_action_log copied from the completed receipt so a target-less event create still names its Discord event; additive, backout drops the columns."
     },
+    "crates/cutover/migrations/0448_internal_action_stop_reason.sql": {
+      "sha256": "de10c43d5c2935c8bb0056df56137a431f5c5730600ab7e05c1d1f4578c3a57c",
+      "justification": "Durable purge stop reason for website channel-moderation receipts: nullable refused/rate_limited on internal_idempotency and its terminal audit so an outer replay of an early-stopped purge keeps its reason; additive, backout drops both columns. Numbered 0448 because the store chain owns 0446 and the cutover chain 0447; global migration numbers remain unique across both chains."
+    },
     "crates/cutover/migrations/0426_community_facts_guild_source.sql": {
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
@@ -420,6 +424,22 @@
     "crates/store/migrations/0442_game_activity_guild_aggregates.sql": {
       "sha256": "1fccfea2ca41d6047c4ac2af17b955c3f76b2fa108bfe648f6e22dc8845a6f60",
       "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; store chain copy, IF NOT EXISTS. Renumbered 0441 to 0442 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0444_event_store_expiry_index.sql": {
+      "sha256": "44d0e0371d3536192ccf7e2ccec0c52e5066480392f18413f95b69a872b81750",
+      "justification": "Initial event_time/id index for bounded raw expiry, superseded by 0445's event-class index; built transactionally because concurrent index creation deadlocks parallel test migrators."
+    },
+    "crates/cutover/migrations/0445_event_store_expiry_class_index.sql": {
+      "sha256": "0d9633dc2763776ac633aff5f694d02ad6d5f0afb7b39d2b20d8ad8e0750c700",
+      "justification": "Replace the broad event-time index with a per-event-class index so capped expiry scans avoid non-expiring event-store families."
+    },
+    "crates/store/migrations/0446_assistant_monthly_builds.sql": {
+      "sha256": "947269d9cce4a695fb62743588da4a604cae90d330a706c629935425d8da5056",
+      "justification": "Per-guild template-assistant monthly-cap ledger (no member columns): one row per guild with month_key plus build_count and a nonnegativity check; store chain copy, IF NOT EXISTS. Renumbered 0444 to 0446 after main claimed 0444/0445 for event-store expiry indexes; never merged under 0444."
+    },
+    "crates/cutover/migrations/0447_assistant_monthly_builds.sql": {
+      "sha256": "f5f5cdfc03f21d0a5329afc4924c92fc42a1aac97a25337dc48bf766542f4e39",
+      "justification": "Per-guild template-assistant monthly-cap ledger (no member columns): one row per guild with month_key plus build_count and a nonnegativity check; cutover chain copy, IF NOT EXISTS. Numbered 0447 because the store chain owns 0446; global migration numbers remain unique across both chains."
     }
   }
 }

@@ -17,6 +17,9 @@
 
 #![cfg(test)]
 
+#[path = "member_dispatch_authority_acceptance.rs"]
+mod member_dispatch_authority_acceptance;
+
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,7 +48,7 @@ use twilight_model::oauth::{ApplicationFlags, ApplicationIntegrationMap, Partial
 use twilight_model::user::{CurrentUser, User};
 use twilight_model::util::Timestamp;
 use two_bot_core::funnel::now_millis_for_test;
-use two_bot_core::sticky::{store, ActivityOutcome};
+use two_bot_core::sticky::{store, ActivityOutcome, PutSticky};
 use two_bot_core::{
     RouterGates, RouterRefusal, ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY,
     MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY,
@@ -56,7 +59,9 @@ use crate::command_runtime::{
     actor_id, ephemeral, feed_add_options, feed_remove_option, new_id, router_with_commands,
     sticky_options, CommandRuntime, RegistrySyncError,
 };
+use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::MemberRuntime;
+use crate::privacy_command::{deletion_request_id, privacy_action, PrivacyAction};
 use crate::schedule_runtime::{schedule_options, schedule_remove_option};
 
 const GUILD: u64 = 2222;
@@ -715,7 +720,7 @@ async fn activation_boot_resumed_uses_current_clearance_and_checks_identity() {
                 .collect();
             assert_eq!(
                 names,
-                vec!["rank", "leaderboard", "help"],
+                vec!["rank", "leaderboard", "help", "privacy"],
                 "unrelated core commands remain; uncleared surfaces are replaced"
             );
         }
@@ -829,7 +834,7 @@ async fn activation_boot_from_env_fixture() {
     let defs = runtime.router().publish_set(&[]).unwrap();
     let names: Vec<_> = defs.iter().map(|def| def.name.as_str()).collect();
     if expected == "narrowed" {
-        assert_eq!(names, ["rank", "leaderboard", "help"]);
+        assert_eq!(names, ["rank", "leaderboard", "help", "privacy"]);
         assert!(!runtime.router().gates().moderation);
         assert!(!runtime.router().gates().automations);
         assert!(!runtime.router().gates().announcements);
@@ -842,6 +847,249 @@ async fn activation_boot_from_env_fixture() {
         assert!(names.contains(&"ban"));
         assert!(names.contains(&"sticky"));
     }
+}
+
+/// Process-isolated fixture evidence for the two `run()` call-site guards the
+/// port record flags as fixture-only: the `SelfRoles` match arm gating
+/// `SelfRoleService::from_env` on `(gateway_prerequisites, store, permitted)`
+/// and the `Automod`-permitted fence before `automod_gateway::resolve`. Each
+/// case runs in an isolated child process with a cleared environment,
+/// following `activation_boot_from_env_isolates_denied_moderation_validation`.
+/// The fixture calls the real `crate::gateway_prerequisites` plus the
+/// permission fence and constructors, and pins the exact
+/// `live activation refused` log line plus narrow-not-throw per call site. It
+/// does not execute `run()`, so a deleted or inverted guard in `run()` would
+/// not fail this test; it pins the composition behavior the guards implement.
+/// No boot/intent/gateway semantics change.
+#[test]
+fn activation_boot_call_sites_narrow_refused_guards() {
+    const VALID_PANELS: &str = r#"[{"id":"games","channelId":"10000000000000007","messageId":"10000000000000008","mode":"button","options":[{"key":"chess","label":"Chess","roleId":"10000000000000004","permissions":"0"}]}]"#;
+    for (guild, token, owen, protected_roles, panels, expected) in [
+        // Staging pair with a valid catalogue: both guards permit, both
+        // construct as today.
+        (
+            "1545644954272137297",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "123456789012345678",
+            "",
+            VALID_PANELS,
+            "permitted-constructs",
+        ),
+        // Live pair: the reviewed self_roles clearance stays while automod
+        // refuses and never resolves, even with vars that would fail
+        // validation once permitted.
+        (
+            "326474832151838730",
+            "MTUzOTcxMTY4Mzg5ODExODE1NA.mock.signature",
+            "",
+            "invalid",
+            VALID_PANELS,
+            "live-automod-refused",
+        ),
+        // Unknown guild: both refuse; invalid vars prove narrow-not-throw.
+        (
+            "1555555555555555555",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "",
+            "invalid",
+            "not-json",
+            "both-refused",
+        ),
+        // Control: the same invalid vars under a permitted identity fail
+        // loudly, so the refused narrow comes from the guard, not the vars.
+        (
+            "1545644954272137297",
+            "MTQ2OTEzNzYzNjY2Mzc1ODg4OA.mock.signature",
+            "",
+            "invalid",
+            "not-json",
+            "permitted-validates",
+        ),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "command_runtime_tests::activation_boot_call_site_fixture",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("ACTIVATION_CALL_SITE_EXPECTED", expected)
+            .env("GUILD_ID", guild)
+            .env("DISCORD_TOKEN", token)
+            .env(
+                "DATABASE_URL",
+                "postgres://agent_test@agent-testdb:5432/agent_test",
+            )
+            .env("DISCORD_API_BASE", "http://127.0.0.1:9")
+            .env("TWO_MODERATION", "1")
+            .env("TWO_OWEN_USER_ID", owen)
+            .env("TWO_MODERATION_PROTECTED_ROLE_IDS", protected_roles)
+            .env("TWO_AUTOMOD", "1")
+            .env("TWO_SELF_ROLE_PANELS", panels)
+            .env("TWO_SELF_ROLE_DRY_RUN", "0")
+            .output()
+            .expect("isolated call-site fixture");
+        assert!(
+            output.status.success(),
+            "fixture {expected}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("1 passed"));
+        // The marker goes to stderr (`print_stdout` is denied workspace-wide):
+        // its presence proves the child ran this case's arm instead of
+        // early-returning with the env var unset.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("CALL_SITE") && stderr.contains(expected),
+            "fixture {expected} must emit its summary line"
+        );
+    }
+}
+
+#[tokio::test]
+async fn activation_boot_call_site_fixture() {
+    let Ok(expected) = std::env::var("ACTIVATION_CALL_SITE_EXPECTED") else {
+        return;
+    };
+    // Capture the boot refusal lines: `log_refusals` is the only writer in
+    // this process, so the buffer holds exactly this identity's refusals.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let capture = Capture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let config = two_bot_core::Config::from_env().unwrap();
+    let guild = config.guild_id.unwrap();
+    let activation = crate::activation::BootActivation::from_config(&config);
+    activation.log_refusals();
+    let log = String::from_utf8(capture.0.lock().expect("capture lock").clone()).unwrap();
+
+    let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+    // Mirror the `SelfRoles` match arm in `run()`: the real
+    // `crate::gateway_prerequisites` plus a present store gate the permission
+    // check, and only the permitted path reaches catalogue parsing, the first
+    // fallible step of `SelfRoleService::from_env`. No pool is built here; the
+    // fixture stops at parsing, so the store is treated as present and the
+    // permission fence is the varying input.
+    let prerequisites_ok = crate::gateway_prerequisites(&config).is_ok();
+    let self_permitted = activation.permitted(two_bot_core::activation::LiveCapability::SelfRoles);
+    let automod_permitted = activation.permitted(two_bot_core::activation::LiveCapability::Automod);
+    let mut self_constructed = false;
+    let self_gates = if prerequisites_ok && self_permitted {
+        self_constructed = true;
+        Some(two_bot_core::self_roles::SelfRoleGates::from_map(&vars))
+    } else {
+        None
+    };
+    // Mirror the `Automod`-permitted fence in `run()`: a refused automod
+    // capability is never resolved or validated; the refusal was already
+    // logged once above.
+    let mut automod_resolved = false;
+    let automod_config = if automod_permitted {
+        automod_resolved = true;
+        Some(crate::automod_gateway::resolve(&vars, guild))
+    } else {
+        None
+    };
+
+    match expected.as_str() {
+        "permitted-constructs" => {
+            assert!(self_permitted && automod_permitted);
+            assert!(
+                !log.contains("live activation refused"),
+                "staging permits every capability, so nothing is refused"
+            );
+            let gates = self_gates.expect("permitted self-roles reaches parsing");
+            let gates = gates.expect("valid panels parse");
+            assert!(!gates.panels.is_empty());
+            let resolved = automod_config.expect("permitted automod reaches resolve");
+            assert!(
+                resolved.expect("valid automod resolves").is_some(),
+                "permitted automod constructs as today"
+            );
+        }
+        "live-automod-refused" => {
+            assert!(
+                self_permitted,
+                "live pair keeps the reviewed self_roles clearance"
+            );
+            assert!(!automod_permitted);
+            assert!(log.contains("live activation refused"));
+            assert!(log.contains("automod"));
+            assert!(
+                !log.contains("self_roles"),
+                "permitted self_roles logs no refusal"
+            );
+            let gates = self_gates.expect("permitted self-roles reaches parsing");
+            assert!(
+                !gates.expect("valid panels parse").panels.is_empty(),
+                "permitted self-roles constructs as today"
+            );
+            assert!(
+                !automod_resolved,
+                "refused automod never resolves or validates"
+            );
+            assert!(
+                automod_config.is_none(),
+                "refused automod narrows, not throws"
+            );
+        }
+        "both-refused" => {
+            assert!(!self_permitted && !automod_permitted);
+            assert!(log.contains("live activation refused"));
+            assert!(log.contains("self_roles"));
+            assert!(log.contains("automod"));
+            assert!(
+                !self_constructed,
+                "refused SelfRoles composes no SelfRoleService"
+            );
+            assert!(self_gates.is_none());
+            assert!(
+                !automod_resolved,
+                "refused Automod never resolves or validates"
+            );
+            assert!(
+                automod_config.is_none(),
+                "refused automod narrows, not throws"
+            );
+        }
+        "permitted-validates" => {
+            assert!(self_permitted && automod_permitted);
+            assert!(
+                self_gates
+                    .expect("permitted self-roles reaches parsing")
+                    .is_err(),
+                "invalid panels fail once permitted"
+            );
+            assert!(
+                automod_config
+                    .expect("permitted automod reaches resolve")
+                    .is_err(),
+                "invalid automod vars fail once permitted"
+            );
+        }
+        other => panic!("unknown call-site expectation {other}"),
+    }
+    // `eprintln!`: `clippy::print_stdout` is denied workspace-wide, and the
+    // parent reads this marker from the child's stderr.
+    eprintln!("CALL_SITE {expected} self_permitted={self_permitted} automod_permitted={automod_permitted}");
 }
 
 #[test]
@@ -1032,12 +1280,14 @@ async fn published_unwired_commands_reply_without_defer_or_store_work() {
                         | "rank"
                         | "leaderboard"
                         | "help"
+                        | "privacy"
                 )
             })
             .collect();
         assert!(!unwired.contains(&"rank"));
         assert!(!unwired.contains(&"leaderboard"));
         assert!(!unwired.contains(&"help"));
+        assert!(!unwired.contains(&"privacy"));
         if router_gates.announcements {
             assert!(unwired.contains(&"rsvp"), "enabled unwired announcement");
         }
@@ -1160,21 +1410,28 @@ fn member_slash(name: &str) -> Interaction {
     interaction
 }
 
+async fn member_refusal_database() -> two_bot_testsupport::TestDatabase {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap");
+    two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("disposable member refusal fixture")
+}
+
 #[tokio::test]
-async fn member_verbs_reach_executor_facts_then_fail_closed_without_db() {
-    // Every member verb routes through the shared router into the member
-    // consumer, which reads live guild facts over REST before touching the
-    // ledger. The mock fails that first read, so each verb must fail closed
-    // with exactly three wire calls (defer, guild read, reply edit) and never
-    // reach the connectionless lazy pool.
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn member_verbs_reach_executor_facts_then_fail_closed_with_audit() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    // Identity resolution fails before any authority/mutation. The failure
+    // must still persist an attributable denial, so this now needs a ledger.
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
-        let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+        let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
         runtime.on_interaction(&member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(requests.len(), 3, "{name}: defer, guild read, reply edit");
         assert_eq!(requests[1].method, "GET");
-        assert_eq!(requests[1].path, format!("/api/v10/guilds/{GUILD_S}"));
+        assert_eq!(requests[1].path, "/api/v10/users/@me");
         let reply = mock.deferred_reply();
         assert!(
             reply
@@ -1184,10 +1441,21 @@ async fn member_verbs_reach_executor_facts_then_fail_closed_without_db() {
         );
         mock.shutdown().await;
     }
+    let denied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM moderation_audit WHERE outcome = 'denied'")
+            .fetch_one(db.pool())
+            .await
+            .expect("refusal audit");
+    assert_eq!(denied, 5);
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
 async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
+    // Keep process-global outcome assertions isolated from website tests.
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
     for name in ["ban", "tempban", "kick", "timeout", "warn"] {
         let json_response = |body: serde_json::Value| RestResponse {
             status: 200,
@@ -1196,27 +1464,31 @@ async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
         };
         let (mock, origin) = MockRest::start_script(vec![
             RestResponse::status(200),
-            json_response(serde_json::json!({
-                "owner_id": "5555",
-                "roles": [{"id": GUILD_S, "position": 0}],
-            })),
-            json_response(serde_json::json!({"user": {"id": "3333", "bot": false}, "roles": []})),
             json_response(serde_json::to_value(user(4444, true)).unwrap()),
-            json_response(serde_json::json!({"user": {"id": "4444"}, "roles": ["missing-role"]})),
+            json_response(serde_json::json!({
+                "id": GUILD_S, "owner_id": "5555",
+                "roles": [
+                    {"id": GUILD_S, "position": 0, "permissions": "0"},
+                    {"id": "101", "position": 50, "permissions": Permissions::all().bits().to_string()},
+                ],
+            })),
+            json_response(serde_json::json!({"user": {"id": "88", "bot": false}, "roles": ["101"]})),
+            json_response(serde_json::json!({"user": {"id": "3333", "bot": false}, "roles": []})),
+            json_response(serde_json::json!({"user": {"id": "4444", "bot": true}, "roles": ["9999"]})),
             RestResponse::status(200),
         ])
         .await;
-        let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+        let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
         runtime.on_interaction(&member_slash(name)).await;
         let requests = mock.requests();
         assert_eq!(
             requests.len(),
-            6,
-            "{name}: facts only, no mutation or DB claim"
+            7,
+            "{name}: facts and refusal audit only, no mutation or DB claim"
         );
-        assert!(requests[1..5].iter().all(|request| request.method == "GET"));
+        assert!(requests[1..6].iter().all(|request| request.method == "GET"));
         assert_eq!(
-            requests[4].path,
+            requests[5].path,
             format!("/api/v10/guilds/{GUILD_S}/members/4444")
         );
         assert!(mock.deferred_reply()["content"]
@@ -1225,12 +1497,22 @@ async fn member_verbs_refuse_unknown_bot_hierarchy_before_claim_or_mutation() {
             .contains("Moderation command failed"));
         mock.shutdown().await;
     }
+    let denied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM moderation_audit WHERE outcome = 'denied'")
+            .fetch_one(db.pool())
+            .await
+            .expect("refusal audit");
+    assert_eq!(denied, 5);
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
 async fn member_verbs_share_actor_cooldown_before_role_reads() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
     let (mock, origin) = MockRest::start(vec![200, 500, 200]).await;
-    let runtime = runtime_with_member(member_gates(), origin, lazy_pool());
+    let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
     runtime.on_interaction(&member_slash("ban")).await;
     for (index, name) in ["tempban", "kick", "timeout", "warn"]
         .into_iter()
@@ -1255,6 +1537,181 @@ async fn member_verbs_share_actor_cooldown_before_role_reads() {
         );
     }
     mock.shutdown().await;
+    db.close().await.expect("dispose fixture");
+}
+
+fn scripted_json(body: serde_json::Value) -> RestResponse {
+    RestResponse {
+        status: 200,
+        body: Some(body.to_string()),
+        delay: Duration::ZERO,
+    }
+}
+
+/// The reads one member verb makes before it can act, in issue order: the bot
+/// identity (cached after the first command), the guild, then the actor. The
+/// actor holds every permission at position 50; the bot sits at 100.
+fn authority_reads(first_command: bool) -> Vec<RestResponse> {
+    let mut reads = Vec::new();
+    if first_command {
+        reads.push(scripted_json(
+            serde_json::to_value(user(4444, true)).unwrap(),
+        ));
+    }
+    reads.push(scripted_json(serde_json::json!({
+        "id": GUILD_S, "owner_id": "5555",
+        "roles": [
+            {"id": GUILD_S, "position": 0, "permissions": "0"},
+            {"id": "101", "position": 50, "permissions": Permissions::all().bits().to_string()},
+            {"id": "103", "position": 100, "permissions": "0"},
+        ],
+    })));
+    reads.push(scripted_json(
+        serde_json::json!({"user": {"id": "88", "bot": false}, "roles": ["101"]}),
+    ));
+    reads
+}
+
+fn timed_member_slash(name: &str) -> Interaction {
+    let mut interaction = member_slash(name);
+    if name == "timeout" {
+        let Some(InteractionData::ApplicationCommand(data)) = &mut interaction.data else {
+            panic!("command fixture")
+        };
+        data.options
+            .push(option("duration_seconds", CommandOptionValue::Integer(60)));
+    }
+    interaction
+}
+
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn member_verbs_that_need_a_present_target_refuse_a_departed_one_without_effects() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    for name in ["kick", "timeout", "warn"] {
+        let mut script = vec![RestResponse::status(200)];
+        script.extend(authority_reads(true));
+        // A strict target-member 404 is a confirmed departure.
+        script.push(RestResponse::status(404));
+        script.push(RestResponse::status(200));
+        let (mock, origin) = MockRest::start_script(script).await;
+        let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
+        runtime.on_interaction(&timed_member_slash(name)).await;
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            6,
+            "{name}: defer, bot, guild, actor, target, reply; no bot-member read or effect"
+        );
+        assert!(requests[1..5].iter().all(|request| request.method == "GET"));
+        assert_eq!(
+            requests[4].path,
+            format!("/api/v10/guilds/{GUILD_S}/members/3333")
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.method != "GET" && r.path.starts_with("/api/v10/guilds/")),
+            "{name}: a departed target is never dispatched against"
+        );
+        assert_eq!(
+            mock.deferred_reply()["content"],
+            "That member is not in this server."
+        );
+        mock.shutdown().await;
+    }
+    let denied: Vec<(String, String)> =
+        sqlx::query_as("SELECT action, outcome FROM moderation_audit ORDER BY action")
+            .fetch_all(db.pool())
+            .await
+            .expect("refusal audit");
+    assert_eq!(
+        denied,
+        ["moderation.kick", "moderation.timeout", "moderation.warn"]
+            .map(|action| (action.to_owned(), "denied".to_owned())),
+        "exactly one denial per verb and no accepted audit"
+    );
+    let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_idempotency")
+        .fetch_one(db.pool())
+        .await
+        .expect("claim rows");
+    let warnings: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_warnings")
+        .fetch_one(db.pool())
+        .await
+        .expect("warning rows");
+    assert_eq!(
+        (claims, warnings),
+        (0, 0),
+        "refusal leaves no claim or warning"
+    );
+    db.close().await.expect("dispose fixture");
+}
+
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb for refusal audits"]
+async fn a_completed_kick_replays_after_its_target_left_without_a_denial() {
+    let _metrics = MODERATION_METRICS_LOCK.lock().await;
+    let db = member_refusal_database().await;
+    let mut script = vec![RestResponse::status(200)];
+    script.extend(authority_reads(true));
+    script.push(scripted_json(serde_json::json!(
+        {"user": {"id": "3333", "bot": false}, "roles": []}
+    )));
+    script.push(scripted_json(
+        serde_json::json!({"user": {"id": "4444", "bot": true}, "roles": ["103"]}),
+    ));
+    script.push(RestResponse::status(204));
+    script.push(RestResponse::status(200));
+    // Redelivery of the same interaction: the kick removed the target, so its
+    // member read is now a strict 404.
+    script.push(RestResponse::status(200));
+    script.extend(authority_reads(false));
+    script.push(RestResponse::status(404));
+    script.push(RestResponse::status(200));
+    let (mock, origin) = MockRest::start_script(script).await;
+    let runtime = runtime_with_member(member_gates(), origin, db.pool().clone());
+    let interaction = member_slash("kick");
+    runtime.on_interaction(&interaction).await;
+    runtime.on_interaction(&interaction).await;
+    let requests = mock.requests();
+    let replies: Vec<String> = requests
+        .iter()
+        .filter(|r| r.method == "PATCH")
+        .map(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(replies, ["Kicked.", "Kicked. Already applied."]);
+    let kicks: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "DELETE" && r.path.starts_with("/api/v10/guilds/"))
+        .collect();
+    assert_eq!(kicks.len(), 1, "the replay dispatches nothing");
+    let audits: Vec<(String, String)> =
+        sqlx::query_as("SELECT action, outcome FROM moderation_audit")
+            .fetch_all(db.pool())
+            .await
+            .expect("audit rows");
+    assert_eq!(
+        audits,
+        [("moderation.kick".to_owned(), "kicked".to_owned())],
+        "one acceptance and no replay denial"
+    );
+    let state: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT state, outcome FROM moderation_idempotency WHERE guild_id = $1 AND idempotency_key = $2",
+    )
+    .bind(GUILD_S)
+    .bind(interaction.id.get().to_string())
+    .fetch_optional(db.pool())
+    .await
+    .expect("replay ledger");
+    assert_eq!(state, Some(("done".to_owned(), Some("kicked".to_owned()))));
+    mock.shutdown().await;
+    db.close().await.expect("dispose fixture");
 }
 
 #[tokio::test]
@@ -2911,9 +3368,12 @@ async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fe
         assert!(pipeline.handle(&event).await.unwrap().is_empty());
         runtime.on_interaction(interaction).await;
     }
+    // The routed board reads the current season only: lifetime stays empty,
+    // so every row below must come from `member_season_xp`.
+    let season = two_bot_core::leveling::season_id_for_ms(now_millis_for_test());
     for member in 77..89 {
-        sqlx::query("INSERT INTO member_levels (guild_id,member_id,xp,imported_xp,updated_at) VALUES ($1,$2,$3,$3,NOW())")
-            .bind(GUILD_S).bind(member.to_string()).bind(i64::from(member))
+        sqlx::query("INSERT INTO member_season_xp (guild_id,season_id,member_id,seasonal_xp,updated_at) VALUES ($1,$2,$3,$4,NOW())")
+            .bind(GUILD_S).bind(&season).bind(member.to_string()).bind(i64::from(member))
             .execute(db.pool()).await.unwrap();
     }
     runtime.on_interaction(&leaderboard).await;
@@ -2945,7 +3405,10 @@ async fn shared_runtime_routes_leveling_once_with_legacy_visibility_and_guild_fe
             two_bot_core::leveling::rank_text(name, 0, None, 0, 0)
         );
     }
-    assert_eq!(replies[2]["data"]["content"], "No XP has been earned yet.");
+    assert_eq!(
+        replies[2]["data"]["content"],
+        two_bot_core::leveling::leaderboard_reply_for_season(&[], &season).content
+    );
     for reply in &replies[2..] {
         assert!(reply["data"]["flags"].is_null(), "leaderboard stays public");
         assert_eq!(
@@ -3162,6 +3625,60 @@ impl TestDb {
         .execute(&self.pool)
         .await
         .expect("seed scheduled message");
+    }
+
+    /// Seed a scheduled message with an explicit run time, interval and
+    /// enabled flag (listing-render fixtures). Direct insert, so a fixture
+    /// can hold more rows than the quota-admission write path allows.
+    async fn seed_schedule_row(
+        &self,
+        guild_id: &str,
+        id: &str,
+        next_run_at: &str,
+        interval_seconds: Option<i64>,
+        enabled: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO scheduled_messages
+               (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                created_by, created_at, updated_by, updated_at)
+             VALUES ($1, $2, $3, 'remember this', $4, $5, $6,
+                     '77', '2026-09-30T12:00:00.000Z', '77', '2026-09-30T12:00:00.000Z')",
+        )
+        .bind(id)
+        .bind(guild_id)
+        .bind(CHANNEL_S)
+        .bind(next_run_at)
+        .bind(interval_seconds)
+        .bind(enabled)
+        .execute(&self.pool)
+        .await
+        .expect("seed scheduled message row");
+    }
+
+    /// Seed one scheduled message with caller-chosen channel, timing,
+    /// recurrence and enabled state (full-quota list fixtures need rows
+    /// whose rendered lines carry realistic lengths and state markers).
+    /// Renamed from `seed_schedule_row` when the bounded-listing acceptance
+    /// tests landed their own helper under that name; call sites below use
+    /// this fixture-row form.
+    async fn seed_schedule_fixture_row(&self, guild_id: &str, row: &ScheduleListFixtureRow) {
+        sqlx::query(
+            "INSERT INTO scheduled_messages
+               (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+                created_by, created_at, updated_by, updated_at)
+             VALUES ($1, $2, $3, 'remember this', $4, $5, $6,
+                     '77', '2026-09-30T12:00:00.000Z', '77', '2026-09-30T12:00:00.000Z')",
+        )
+        .bind(&row.id)
+        .bind(guild_id)
+        .bind(&row.channel_id)
+        .bind(&row.next_run_at)
+        .bind(row.interval_seconds)
+        .bind(row.enabled)
+        .execute(&self.pool)
+        .await
+        .expect("seed scheduled message row");
     }
 
     /// (id, channel_id) for this guild's scheduled messages, in list order.
@@ -3785,6 +4302,236 @@ async fn post_failure_releases_claim_and_audits_post_failed() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn obsolete_post_after_admin_update_preserves_admin_state() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000010"), 120_000, 5).await;
+    // Hold the accepted POST open so the administrator update lands between
+    // the wire post and the store record. The mock delay is the hold; the
+    // POST-arrival poll is the deterministic sync (no blind sleeps).
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 200,
+            body: None,
+            delay: Duration::from_millis(1000),
+        }],
+    )
+    .await;
+    let msg = message(30, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "replacement POST entered",
+        )
+        .await;
+        // Independent administrator path: the upsert clears the claim but
+        // preserves the live post columns.
+        let updated = store::put_sticky(
+            &db.pool,
+            &PutSticky {
+                guild_id: GUILD_S,
+                channel_id: CHANNEL_S,
+                body: "admin v2",
+                debounce_seconds: 5,
+                enabled: true,
+                actor_id: "admin-9",
+                now_ms: now_millis_for_test(),
+            },
+        )
+        .await
+        .expect("admin update");
+        assert!(!updated, "seed row already existed");
+    });
+    assert_eq!(outcome, ActivityOutcome::Held, "lost claim reports held");
+
+    // The orphan replacement is deleted exactly once; the previous sticky is
+    // never retired through the lost-claim branch.
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "one orphan cleanup: {deletes:?}");
+    assert_eq!(
+        deletes[0].path, "/api/v10/channels/3333/messages/9000000000000000000",
+        "orphan id from the held POST",
+    );
+    assert!(
+        !deletes[0].path.ends_with("8000000000000000010"),
+        "previous sticky untouched",
+    );
+
+    // Administrator state wins: new body, previous post columns, no claim,
+    // and no success audit from the obsolete completion.
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "admin v2");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000010"),
+        "obsolete record cannot overwrite the live post",
+    );
+    assert_eq!(
+        claim, None,
+        "admin update cleared the claim; record recreates none"
+    );
+    assert!(
+        db.audits().await.is_empty(),
+        "lost claim writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn obsolete_post_after_admin_remove_preserves_absence() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000011"), 120_000, 5).await;
+    let (runtime, mock) = db_runtime_script(
+        &db,
+        vec![RestResponse {
+            status: 200,
+            body: None,
+            delay: Duration::from_millis(1000),
+        }],
+    )
+    .await;
+    let msg = message(31, CHANNEL, false, Some(GUILD));
+    let (outcome, _) = tokio::join!(runtime.on_message(&msg), async {
+        wait_for(
+            || {
+                mock.requests()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.path.ends_with("/messages"))
+            },
+            "replacement POST entered",
+        )
+        .await;
+        let removed = store::delete_sticky(&db.pool, GUILD_S, CHANNEL_S)
+            .await
+            .expect("admin remove");
+        assert!(
+            matches!(removed, two_bot_core::sticky::RemoveOutcome::Removed { .. }),
+            "seed row removed",
+        );
+    });
+    assert_eq!(outcome, ActivityOutcome::Held, "lost claim reports held");
+
+    // Exactly the orphan goes; the removed previous id is never re-deleted
+    // through this branch, and the row stays absent.
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "one orphan cleanup: {deletes:?}");
+    assert_eq!(
+        deletes[0].path,
+        "/api/v10/channels/3333/messages/9000000000000000000",
+    );
+    assert!(
+        db.row().await.is_none(),
+        "obsolete record cannot recreate administrator-removed state",
+    );
+    assert!(
+        db.audits().await.is_empty(),
+        "lost claim writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn completion_db_failure_audits_post_failed_and_preserves_newer_claim() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000012"), 120_000, 5).await;
+    // Scoped completion-only fault: the trigger rejects only the record that
+    // carries this test's orphan id. The claim (no post columns) and the
+    // release (post columns untouched) pass through.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION sticky_test_fail_orphan() RETURNS trigger AS $$
+         BEGIN
+           IF NEW.last_message_id = '9000000000000000000' THEN
+             RAISE EXCEPTION 'scoped completion-only failure';
+           END IF;
+           RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install fault function");
+    sqlx::query("DROP TRIGGER IF EXISTS sticky_test_fail_orphan_trg ON sticky_messages")
+        .execute(&db.pool)
+        .await
+        .expect("drop stale fault trigger");
+    sqlx::query(
+        "CREATE TRIGGER sticky_test_fail_orphan_trg
+           BEFORE UPDATE ON sticky_messages FOR EACH ROW
+           EXECUTE FUNCTION sticky_test_fail_orphan()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install fault trigger");
+
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+    let outcome = runtime
+        .on_message(&message(32, CHANNEL, false, Some(GUILD)))
+        .await;
+    assert_eq!(outcome, ActivityOutcome::Held);
+    assert_eq!(
+        db.audits().await,
+        vec![("sticky.run".to_owned(), "post_failed".to_owned())],
+    );
+    let deletes = mock.deletes();
+    assert_eq!(deletes.len(), 1, "orphan cleaned up: {deletes:?}");
+    assert_eq!(
+        deletes[0].path,
+        "/api/v10/channels/3333/messages/9000000000000000000",
+    );
+    let (body, last_id, claim) = db.row().await.expect("row exists");
+    assert_eq!(body, "remember this");
+    assert_eq!(
+        last_id.as_deref(),
+        Some("8000000000000000012"),
+        "failed record leaves the live post",
+    );
+    assert_eq!(claim, None, "own claim released for the next activity");
+
+    sqlx::query("DROP TRIGGER IF EXISTS sticky_test_fail_orphan_trg ON sticky_messages")
+        .execute(&db.pool)
+        .await
+        .expect("remove fault trigger");
+    sqlx::query("DROP FUNCTION IF EXISTS sticky_test_fail_orphan()")
+        .execute(&db.pool)
+        .await
+        .expect("remove fault function");
+
+    // Claim ownership: releasing a stale unrelated token cannot clear a newer
+    // claim — the property the post_failed rollback relies on.
+    let grant = store::claim_sticky_post(
+        &db.pool,
+        GUILD_S,
+        CHANNEL_S,
+        "newer-claim",
+        now_millis_for_test(),
+    )
+    .await
+    .expect("newer claim")
+    .expect("window free after release");
+    assert_eq!(grant.body, "remember this");
+    store::release_sticky_post(&db.pool, GUILD_S, CHANNEL_S, "stale-unrelated")
+        .await
+        .expect("stale release");
+    let (_, _, claim) = db.row().await.expect("row exists");
+    assert_eq!(
+        claim.as_deref(),
+        Some("newer-claim"),
+        "stale release preserves the newer claim",
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn sticky_remove_clears_state_and_deletes_the_message() {
     let db = TestDb::new().await;
     db.seed(Some("8000000000000000005"), 120_000, 5).await;
@@ -3896,6 +4643,298 @@ async fn sticky_set_rejection_audits_rejected_and_still_replies() {
     db.close().await;
 }
 
+// --- acceptance: sticky store-failure refusals audit like rejections ------
+//
+// Locked contract: every sticky store-failure refusal (the `put_sticky`
+// failure in `/sticky` and the `delete_sticky` failure in `/sticky-remove`)
+// writes exactly one `automation_audit_log` row per refusal whenever the
+// pool accepts it, in the existing refusal shape: the attempted `sticky.*`
+// action (`sticky.create` when no row exists yet, `sticky.update` when one
+// does — the same existence read the validation rejection already uses to
+// name its action — and `sticky.delete` for a remove), outcome `rejected`,
+// the invoking channel as `target_key`, the invoking member as `actor_id`,
+// and a bounded single-token `reason` (a fixed error class such as the log
+// line's `db_class` token, or an equivalent fixed token — never the raw
+// sqlx / Postgres message, which can carry statement or fixture detail).
+// The user reply stays the existing fixed store-failure text. A dead pool
+// (audit write itself impossible) degrades to that same safe reply with no
+// panic and no leaked internals. Every other sticky path keeps its existing
+// audit behavior.
+
+const STICKY_STORE_FAILURE_REPLY: &str = "Sticky command failed; try again.";
+
+/// Fail only writes to `sticky_messages`: reads still succeed, so the
+/// refusal comes from the upsert itself while `automation_audit_log` stays
+/// writable and an audit attempt on the live pool can still land.
+async fn fail_sticky_writes(db: &TestDb) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_sticky_write() RETURNS trigger AS $$
+         BEGIN
+           RAISE EXCEPTION 'induced sticky write failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install write fault function");
+    sqlx::query(
+        "CREATE TRIGGER fail_sticky_write_trg
+           BEFORE INSERT OR UPDATE ON sticky_messages FOR EACH ROW
+           EXECUTE FUNCTION fail_sticky_write()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install write fault trigger");
+}
+
+/// Fail only DELETEs from `sticky_messages`: the row stays readable, so the
+/// refusal comes from the delete itself.
+async fn fail_sticky_deletes(db: &TestDb) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_sticky_delete() RETURNS trigger AS $$
+         BEGIN
+           RAISE EXCEPTION 'induced sticky delete failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install delete fault function");
+    sqlx::query(
+        "CREATE TRIGGER fail_sticky_delete_trg
+           BEFORE DELETE ON sticky_messages FOR EACH ROW
+           EXECUTE FUNCTION fail_sticky_delete()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install delete fault trigger");
+}
+
+/// The refusal shape every sticky store-failure audit row must share.
+fn assert_sticky_store_failure_audit(
+    action: &str,
+    target_key: Option<&str>,
+    outcome: &str,
+    reason: Option<&str>,
+    actor_id: Option<&str>,
+    expected_action: &str,
+) {
+    assert_eq!(action, expected_action);
+    assert_eq!(
+        target_key,
+        Some(CHANNEL_S),
+        "audit names the invoking channel, like every other sticky row"
+    );
+    assert_eq!(outcome, "rejected");
+    assert_eq!(
+        actor_id,
+        Some("88"),
+        "audit names the invoking member, like a validation rejection"
+    );
+    let reason = reason.expect("store-failure refusal audits a reason");
+    assert!(
+        !reason.is_empty() && reason.len() <= 64 && !reason.chars().any(char::is_whitespace),
+        "reason is one bounded token, not raw error text: {reason:?}"
+    );
+    let lowered = reason.to_ascii_lowercase();
+    for leaked in ["sqlx", "postgres", "sticky_messages", "induced"] {
+        assert!(
+            !lowered.contains(leaked),
+            "reason must not leak {leaked}: {reason:?}"
+        );
+    }
+}
+
+/// Every completion-edit `content`, in invocation order.
+fn sticky_store_failure_replies(mock: &MockRest, invocations: usize) -> Vec<String> {
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), invocations, "one completion per invocation");
+    edits
+        .iter()
+        .map(|edit| {
+            let json: serde_json::Value =
+                serde_json::from_slice(&edit.body).expect("completion json");
+            json["content"]
+                .as_str()
+                .expect("reply content is text")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn sticky_set_interaction() -> Interaction {
+    slash(
+        "sticky",
+        Some(CHANNEL),
+        vec![option(
+            "body",
+            CommandOptionValue::String("pin me".to_owned()),
+        )],
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn sticky_set_create_store_failure_audits_one_rejected_row_per_refusal() {
+    let db = TestDb::new().await;
+    fail_sticky_writes(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime.on_interaction(&sticky_set_interaction()).await;
+    runtime.on_interaction(&sticky_set_interaction()).await;
+
+    assert_eq!(
+        sticky_store_failure_replies(&mock, 2),
+        vec![
+            STICKY_STORE_FAILURE_REPLY.to_owned(),
+            STICKY_STORE_FAILURE_REPLY.to_owned()
+        ],
+        "write failures keep the existing safe reply text"
+    );
+    assert!(
+        db.row().await.is_none(),
+        "failed writes store no sticky row"
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        2,
+        "each create failure writes exactly one audit row: {audits:?}"
+    );
+    for (action, target_key, outcome, reason, actor_id) in &audits {
+        assert_sticky_store_failure_audit(
+            action,
+            target_key.as_deref(),
+            outcome,
+            reason.as_deref(),
+            actor_id.as_deref(),
+            "sticky.create",
+        );
+    }
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn sticky_set_update_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000005"), 120_000, 5).await;
+    fail_sticky_writes(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime.on_interaction(&sticky_set_interaction()).await;
+
+    assert_eq!(mock.deferred_reply()["content"], STICKY_STORE_FAILURE_REPLY);
+    let (body, _, _) = db.row().await.expect("seeded row survives the refusal");
+    assert_eq!(body, "remember this", "failed update changes no sticky row");
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one update failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_sticky_store_failure_audit(
+        action,
+        target_key.as_deref(),
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "sticky.update",
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn sticky_remove_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    db.seed(Some("8000000000000000005"), 120_000, 5).await;
+    fail_sticky_deletes(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("sticky-remove", Some(CHANNEL), Vec::new()))
+        .await;
+
+    assert_eq!(mock.deferred_reply()["content"], STICKY_STORE_FAILURE_REPLY);
+    assert!(
+        db.row().await.is_some(),
+        "failed delete keeps the sticky row"
+    );
+    assert!(
+        mock.deletes().is_empty(),
+        "no Discord message delete on a store refusal"
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one delete failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_sticky_store_failure_audit(
+        action,
+        target_key.as_deref(),
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "sticky.delete",
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Dead-pool control: with a closed pool, the audit write is impossible by
+/// construction, so every sticky command must still finish with the fixed
+/// safe reply — no panic, no hang, no sqlx internals, pool address or
+/// credentials in the user text. A closed pool fails every query
+/// immediately; an unreachable pool would hold each command for the full
+/// acquire timeout, so this control stays fast after the audit attempt
+/// adds a second store call per refusal.
+#[tokio::test]
+async fn sticky_store_failures_on_dead_pool_reply_safely() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let runtime = CommandRuntime::new(
+        pool,
+        executor_at(origin),
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+
+    runtime.on_interaction(&sticky_set_interaction()).await;
+    runtime
+        .on_interaction(&slash("sticky-remove", Some(CHANNEL), Vec::new()))
+        .await;
+
+    let replies = sticky_store_failure_replies(&mock, 2);
+    assert_eq!(
+        replies,
+        vec![STICKY_STORE_FAILURE_REPLY.to_owned(); 2],
+        "dead pool degrades every sticky command to the safe reply"
+    );
+    for reply in &replies {
+        for leaked in ["sqlx", "postgres", "127.0.0.1", "agent_test", "Pool"] {
+            assert!(
+                !reply.contains(leaked),
+                "dead-pool reply must not leak {leaked}: {reply}"
+            );
+        }
+    }
+    mock.shutdown().await;
+}
+
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn automation_quota_refusals_reply_with_a_remedy_and_write_no_rows_or_audits() {
@@ -3947,7 +4986,16 @@ async fn automation_quota_refusals_reply_with_a_remedy_and_write_no_rows_or_audi
     );
     assert_eq!(db.schedule_rows().await.len(), 25);
     assert_eq!(db.feed_rows().await.len(), 25);
-    assert!(db.schedule_audits().await.is_empty());
+    // Schedule capacity refusal audits one `scheduled.create`/`rejected` row
+    // (reason `quota`); feed capacity refusal still audits nothing.
+    let schedule_audits = db.schedule_audits().await;
+    assert_eq!(
+        schedule_audits.len(),
+        1,
+        "schedule capacity refusal audits one row: {schedule_audits:?}"
+    );
+    assert_eq!(schedule_audits[0].0, "scheduled.create");
+    assert_eq!(schedule_audits[0].2, "rejected");
     assert!(db.feed_audits().await.is_empty());
     assert!(!mock
         .requests()
@@ -4072,6 +5120,175 @@ async fn feed_remove_deletes_present_and_reports_missing() {
     db.close().await;
 }
 
+// ── Acceptance: removal serialized with delivery (command path) ──────────
+// Protected acceptance tests. While a relay carries unresolved pending
+// delivery evidence, `/feed-remove` must refuse with a fixed
+// recovery-required reply, retain the relay and its exact ledger row, and
+// audit a recovery outcome — never claim removal, report the id missing,
+// or fall back to the generic store-failure "try again" reply.
+
+async fn seed_feed_delivery(db: &TestDb, feed_id: &str, state: &str) {
+    sqlx::query(
+        "INSERT INTO feed_deliveries
+           (feed_id, item_key, nonce, state, message_id, first_seen_at, delivered_at)
+         VALUES ($1, 'item-0', $2, $3,
+                 CASE WHEN $3 = 'delivered' THEN '9001' END,
+                 clock_timestamp(),
+                 CASE WHEN $3 = 'delivered' THEN clock_timestamp() END)",
+    )
+    .bind(feed_id)
+    .bind(format!("nonce-{feed_id}-item-0"))
+    .bind(state)
+    .execute(&db.pool)
+    .await
+    .expect("seed feed delivery");
+}
+
+/// (feed_id, item_key, nonce, state) across every guild in the fixture.
+async fn all_feed_delivery_rows(db: &TestDb) -> Vec<(String, String, String, String)> {
+    sqlx::query_as(
+        "SELECT feed_id, item_key, nonce, state FROM feed_deliveries
+          ORDER BY feed_id, item_key",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("feed delivery rows")
+}
+
+async fn feed_remove_reply(db: &TestDb, id: &str) -> (String, MockRest) {
+    let (runtime, mock) = db_runtime(db, Vec::new()).await;
+    runtime
+        .on_interaction(&slash(
+            "feed-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::String(id.to_owned()))],
+        ))
+        .await;
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), 1, "one completion per remove");
+    let body: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
+    (
+        body["content"].as_str().expect("reply content").to_owned(),
+        mock,
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_remove_with_pending_delivery_refuses_and_retains_evidence() {
+    let db = TestDb::new().await;
+    db.seed_feed(GUILD_S, "feed-pending", "rss").await;
+    seed_feed_delivery(&db, "feed-pending", "pending").await;
+    let before = all_feed_delivery_rows(&db).await;
+    assert_eq!(before.len(), 1);
+
+    let (reply, mock) = feed_remove_reply(&db, "feed-pending").await;
+
+    assert_ne!(reply, "Feed relay removed.", "must not claim removal");
+    assert_ne!(reply, "No feed relay with that id.", "the relay exists");
+    assert_ne!(
+        reply, "Feed command failed; try again.",
+        "a blind retry instruction cannot resolve unconfirmed send evidence"
+    );
+    assert!(
+        reply.to_lowercase().contains("recover"),
+        "fixed recovery-required reply, got: {reply}"
+    );
+    assert_eq!(
+        db.feed_rows()
+            .await
+            .iter()
+            .map(|row| row.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["feed-pending"],
+        "the relay is retained"
+    );
+    assert_eq!(
+        all_feed_delivery_rows(&db).await,
+        before,
+        "the exact pending ledger row is retained, not cascaded away"
+    );
+    let audits = db.feed_audits().await;
+    assert_eq!(audits.len(), 1, "exactly one remove audit row");
+    assert_eq!(audits[0].0, "feed.remove");
+    assert_eq!(audits[0].1, "feed-pending");
+    assert!(
+        audits[0].2.contains("recover"),
+        "fixed recovery-required audit outcome, got: {}",
+        audits[0].2
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_remove_with_only_delivered_delivery_still_removes() {
+    let db = TestDb::new().await;
+    db.seed_feed(GUILD_S, "feed-settled", "rss").await;
+    seed_feed_delivery(&db, "feed-settled", "delivered").await;
+
+    let (reply, mock) = feed_remove_reply(&db, "feed-settled").await;
+
+    assert_eq!(reply, "Feed relay removed.");
+    assert!(db.feed_rows().await.is_empty(), "settled relay is deleted");
+    assert!(
+        all_feed_delivery_rows(&db).await.is_empty(),
+        "settled ledger keeps its current cascade"
+    );
+    assert_eq!(
+        db.feed_audits().await,
+        vec![(
+            "feed.remove".to_owned(),
+            "feed-settled".to_owned(),
+            "removed".to_owned()
+        )]
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_remove_foreign_id_reports_missing_and_retains_foreign_pending() {
+    let db = TestDb::new().await;
+    db.seed_feed("9999", "feed-foreign", "rss").await;
+    seed_feed_delivery(&db, "feed-foreign", "pending").await;
+    let before = all_feed_delivery_rows(&db).await;
+
+    let (reply, mock) = feed_remove_reply(&db, "feed-foreign").await;
+
+    assert_eq!(
+        reply, "No feed relay with that id.",
+        "a foreign id is indistinguishable from missing in this guild"
+    );
+    let foreign: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM feed_relays WHERE guild_id = '9999'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("foreign relay count");
+    assert_eq!(foreign, 1, "the foreign relay is untouched");
+    assert_eq!(
+        all_feed_delivery_rows(&db).await,
+        before,
+        "the foreign pending evidence is untouched"
+    );
+    assert_eq!(
+        db.feed_audits().await,
+        vec![(
+            "feed.remove".to_owned(),
+            "feed-foreign".to_owned(),
+            "missing".to_owned()
+        )]
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn feed_list_is_scoped_to_the_configured_guild() {
@@ -4090,6 +5307,59 @@ async fn feed_list_is_scoped_to_the_configured_guild() {
     assert!(
         !content.contains("feed-foreign"),
         "other guild's relay never listed: {content}"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_list_at_capacity_keeps_every_configured_guild_id_discoverable() {
+    let db = TestDb::new().await;
+    // Real relay ids are 32 hex characters; seed the full supported
+    // capacity of 25 for the configured guild plus one foreign relay.
+    let own_ids: Vec<String> = (1..=25).map(|index| format!("{index:032x}")).collect();
+    for (position, id) in own_ids.iter().enumerate() {
+        let kind = ["rss", "youtube", "twitch"][position % 3];
+        db.seed_feed(GUILD_S, id, kind).await;
+    }
+    let foreign_id = "f".repeat(32);
+    db.seed_feed("9999", &foreign_id, "rss").await;
+    let rows_before = db.feed_rows().await;
+    assert_eq!(rows_before.len(), 25, "seeded capacity");
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("feed-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    // deferred_reply pins the ephemeral defer (flags 64) and mention safety
+    // (allowed_mentions parse []) on the single completion.
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("list content");
+    assert!(
+        content.encode_utf16().count() <= 2000,
+        "response exceeds the 2,000 UTF-16 unit limit ({} units): {content}",
+        content.encode_utf16().count()
+    );
+    for id in &own_ids {
+        assert!(
+            content.contains(&format!("`{id}`")),
+            "configured-guild relay {id} discoverable at capacity: {content}"
+        );
+    }
+    assert!(
+        !content.contains(&foreign_id),
+        "other guild's relay never listed: {content}"
+    );
+    assert_eq!(
+        db.feed_rows().await,
+        rows_before,
+        "list leaves feed configuration unchanged"
     );
     assert!(
         db.feed_audits().await.is_empty(),
@@ -4171,6 +5441,429 @@ async fn feed_store_failure_replies_generic_and_audits_nothing() {
     );
     mock.shutdown().await;
     db.close().await;
+}
+
+// --- acceptance: feed store-failure refusals audit like other refusals ----
+//
+// Locked contract: every feed-add / feed-remove store-failure refusal
+// writes exactly one `announcements_audit_log` row per refusal whenever the
+// pool accepts it, in the existing refusal shape: the attempted command's
+// `feed.*` action (`feed.create` for add, `feed.remove` for remove),
+// outcome `rejected`, the invoking member as `actor_id`, and a bounded
+// single-token `reason` (a fixed error class — never the raw sqlx /
+// Postgres message, which can carry statement or fixture detail).
+// `target_key` names the attempted relay: the fresh attempt id for adds,
+// the user-supplied id for removes. The user reply stays the existing
+// fixed store-failure text. Feed-list stays unaudited even on failure
+// (legacy parity): a failed list replies with the same safe text and
+// writes no audit row. A dead pool (the audit write itself impossible)
+// degrades to a warn log plus that same safe reply with no panic and no
+// leaked internals.
+
+const FEED_STORE_FAILURE_REPLY: &str = "Feed command failed; try again.";
+
+/// (action, target_key, outcome, reason, actor_id) for this guild's rows in
+/// the shared announcements audit log.
+async fn feed_audit_rows(
+    db: &TestDb,
+) -> Vec<(
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+)> {
+    sqlx::query_as(
+        "SELECT action, target_key, outcome, reason, actor_id
+           FROM announcements_audit_log
+          WHERE guild_id = $1 ORDER BY created_at, id",
+    )
+    .bind(GUILD_S)
+    .fetch_all(&db.pool)
+    .await
+    .expect("announcement audit rows with reasons")
+}
+
+/// Drop the feed table inside this test's isolated schema: every store call
+/// against it fails while `announcements_audit_log` stays writable, so an
+/// audit attempt on the live pool can still land. CASCADE covers the
+/// feed_deliveries.feed_id foreign key (0180_feeds.sql).
+async fn drop_feed_relays(db: &TestDb) {
+    sqlx::query("DROP TABLE feed_relays CASCADE")
+        .execute(&db.pool)
+        .await
+        .expect("drop feed_relays");
+}
+
+/// Fail only INSERTs into `feed_relays`: any read on the add path still
+/// succeeds, so the refusal comes from the write itself.
+async fn fail_feed_inserts(db: &TestDb) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_feed_insert() RETURNS trigger AS $$
+         BEGIN
+           RAISE EXCEPTION 'induced feed insert failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install insert fault function");
+    sqlx::query(
+        "CREATE TRIGGER fail_feed_insert_trg
+           BEFORE INSERT ON feed_relays FOR EACH ROW
+           EXECUTE FUNCTION fail_feed_insert()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install insert fault trigger");
+}
+
+/// Fail only DELETEs from `feed_relays`, so the remove refusal comes from
+/// the delete itself.
+async fn fail_feed_deletes(db: &TestDb) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_feed_delete() RETURNS trigger AS $$
+         BEGIN
+           RAISE EXCEPTION 'induced feed delete failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install delete fault function");
+    sqlx::query(
+        "CREATE TRIGGER fail_feed_delete_trg
+           BEFORE DELETE ON feed_relays FOR EACH ROW
+           EXECUTE FUNCTION fail_feed_delete()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install delete fault trigger");
+}
+
+/// The refusal shape every feed store-failure audit row must share.
+fn assert_feed_store_failure_audit(
+    action: &str,
+    outcome: &str,
+    reason: Option<&str>,
+    actor_id: Option<&str>,
+    expected_action: &str,
+) {
+    assert_eq!(action, expected_action);
+    assert_eq!(outcome, "rejected");
+    assert_eq!(
+        actor_id,
+        Some("88"),
+        "audit names the invoking member, like a validation rejection"
+    );
+    let reason = reason.expect("store-failure refusal audits a reason");
+    assert!(
+        !reason.is_empty() && reason.len() <= 64 && !reason.chars().any(char::is_whitespace),
+        "reason is one bounded token, not raw error text: {reason:?}"
+    );
+    let lowered = reason.to_ascii_lowercase();
+    for leaked in ["sqlx", "postgres", "feed_relays", "induced"] {
+        assert!(
+            !lowered.contains(leaked),
+            "reason must not leak {leaked}: {reason:?}"
+        );
+    }
+}
+
+/// Every completion-edit `content`, in invocation order.
+fn feed_store_failure_replies(mock: &MockRest, invocations: usize) -> Vec<String> {
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), invocations, "one completion per invocation");
+    edits
+        .iter()
+        .map(|edit| {
+            let json: serde_json::Value =
+                serde_json::from_slice(&edit.body).expect("completion json");
+            json["content"]
+                .as_str()
+                .expect("reply content is text")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn feed_add_interaction() -> Interaction {
+    slash(
+        "feed-add",
+        Some(CHANNEL),
+        vec![
+            option("kind", CommandOptionValue::String("rss".to_owned())),
+            option(
+                "source",
+                CommandOptionValue::String("https://example.com/feed.xml".to_owned()),
+            ),
+        ],
+    )
+}
+
+fn feed_remove_interaction(id: &str) -> Interaction {
+    slash(
+        "feed-remove",
+        Some(CHANNEL),
+        vec![option("id", CommandOptionValue::String(id.to_owned()))],
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_add_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    drop_feed_relays(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime.on_interaction(&feed_add_interaction()).await;
+
+    assert_eq!(mock.deferred_reply()["content"], FEED_STORE_FAILURE_REPLY);
+    let audits = feed_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one add store failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_feed_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "feed.create",
+    );
+    let target = target_key
+        .as_deref()
+        .expect("audit names the attempted feed id");
+    assert!(!target.is_empty(), "target is the fresh attempt id");
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_add_insert_store_failure_audits_one_row_per_refusal() {
+    let db = TestDb::new().await;
+    fail_feed_inserts(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime.on_interaction(&feed_add_interaction()).await;
+    runtime.on_interaction(&feed_add_interaction()).await;
+
+    assert_eq!(
+        feed_store_failure_replies(&mock, 2),
+        vec![
+            FEED_STORE_FAILURE_REPLY.to_owned(),
+            FEED_STORE_FAILURE_REPLY.to_owned()
+        ],
+        "write failures keep the existing safe reply text"
+    );
+    assert!(
+        db.feed_rows().await.is_empty(),
+        "failed writes store no feed row"
+    );
+    let audits = feed_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        2,
+        "each write failure writes exactly one audit row: {audits:?}"
+    );
+    for (action, _, outcome, reason, actor_id) in &audits {
+        assert_feed_store_failure_audit(
+            action,
+            outcome,
+            reason.as_deref(),
+            actor_id.as_deref(),
+            "feed.create",
+        );
+    }
+    let targets: std::collections::BTreeSet<Option<String>> = audits
+        .iter()
+        .map(|(_, target_key, _, _, _)| target_key.clone())
+        .collect();
+    assert_eq!(
+        targets.len(),
+        2,
+        "each refusal audits its own fresh attempt id: {audits:?}"
+    );
+    assert!(
+        targets
+            .iter()
+            .all(|target| target.as_deref().is_some_and(|t| !t.is_empty())),
+        "every target names an attempted feed id: {audits:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_remove_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    drop_feed_relays(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&feed_remove_interaction("feed-xyz"))
+        .await;
+
+    assert_eq!(mock.deferred_reply()["content"], FEED_STORE_FAILURE_REPLY);
+    let audits = feed_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one remove store failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_feed_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "feed.remove",
+    );
+    assert_eq!(
+        target_key.as_deref(),
+        Some("feed-xyz"),
+        "remove refusal names the user-supplied feed id"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_remove_delete_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    db.seed_feed(GUILD_S, "feed-drop", "rss").await;
+    fail_feed_deletes(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&feed_remove_interaction("feed-drop"))
+        .await;
+
+    assert_eq!(mock.deferred_reply()["content"], FEED_STORE_FAILURE_REPLY);
+    assert_eq!(
+        db.feed_rows()
+            .await
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect::<Vec<_>>(),
+        vec!["feed-drop".to_owned()],
+        "failed delete leaves the feed row in place"
+    );
+    let audits = feed_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one delete failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_feed_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "feed.remove",
+    );
+    assert_eq!(
+        target_key.as_deref(),
+        Some("feed-drop"),
+        "delete refusal names the attempted feed id"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Legacy parity: feed-list is read-only and stays unaudited even when its
+/// read fails — the same safe reply, and still no audit row.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_list_store_failure_writes_no_audit_row() {
+    let db = TestDb::new().await;
+    drop_feed_relays(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("feed-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    assert_eq!(mock.deferred_reply()["content"], FEED_STORE_FAILURE_REPLY);
+    assert!(
+        feed_audit_rows(&db).await.is_empty(),
+        "a failed list writes no audit row (legacy parity)"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "a failed list writes no feed audit row (legacy parity)"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Dead-pool control: with a closed pool, the audit write is impossible by
+/// construction, so every feed command must still emit a warn for the
+/// operator and finish with the fixed safe reply — no panic, no hang, no
+/// sqlx internals, pool address or credentials in the user text. A closed
+/// pool fails every query immediately; an unreachable pool would hold each
+/// command for the full acquire timeout, so this control stays fast after
+/// the audit attempt adds a second store call per refusal.
+#[tokio::test]
+async fn feed_store_failures_on_dead_pool_warn_and_reply_safely() {
+    let capture = crate::tracing_capture::global();
+    let log_start = capture.text().len();
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let runtime = CommandRuntime::new(
+        pool,
+        executor_at(origin),
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+
+    runtime.on_interaction(&feed_add_interaction()).await;
+    runtime
+        .on_interaction(&feed_remove_interaction("feed-xyz"))
+        .await;
+    runtime
+        .on_interaction(&slash("feed-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    let replies = feed_store_failure_replies(&mock, 3);
+    assert_eq!(
+        replies,
+        vec![FEED_STORE_FAILURE_REPLY.to_owned(); 3],
+        "dead pool degrades every feed command to the safe reply"
+    );
+    for reply in &replies {
+        for leaked in ["sqlx", "postgres", "127.0.0.1", "agent_test", "Pool"] {
+            assert!(
+                !reply.contains(leaked),
+                "dead-pool reply must not leak {leaked}: {reply}"
+            );
+        }
+    }
+    // The failure stays operator-visible: at least one warn-or-above log
+    // line was emitted while these refusals degraded. Sibling tests share
+    // the process-wide capture, so this asserts presence, never absence.
+    let logged = capture.text().split_off(log_start);
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.starts_with("WARN") || line.starts_with("ERROR")),
+        "dead-pool refusals leave a warn for the operator: {logged}"
+    );
+    mock.shutdown().await;
 }
 
 #[tokio::test]
@@ -4355,6 +6048,278 @@ async fn schedule_create_rejects_invalid_input_and_audits_rejected() {
     db.close().await;
 }
 
+// --- acceptance: quota-capacity refusal audits like other refusals --------
+//
+// Locked contract: one capacity refusal writes exactly one audit row with
+// action `scheduled.create`, outcome `rejected` and reason `quota`, in the
+// same shape as a validation rejection (fresh attempt id as `target_key`,
+// invoking member as `actor_id`). A repeated refusal is a new refusal: it
+// writes its own single row and no extra row (`1 refusal = 1 audit` parity).
+
+/// (action, target_key, outcome, reason, actor_id) for this guild's rows in
+/// the shared automation audit log.
+async fn schedule_audit_rows(
+    db: &TestDb,
+) -> Vec<(
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+)> {
+    sqlx::query_as(
+        "SELECT action, target_key, outcome, reason, actor_id
+           FROM automation_audit_log
+          WHERE guild_id = $1 ORDER BY created_at, id",
+    )
+    .bind(GUILD_S)
+    .fetch_all(&db.pool)
+    .await
+    .expect("automation audit rows with reasons")
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_quota_capacity_refusal_audits_one_rejected_row() {
+    use two_bot_core::automation_quota::AutomationQuota;
+
+    let db = TestDb::new().await;
+    let limit = AutomationQuota::Schedules.limit();
+    for n in 0..limit {
+        db.seed_schedule(GUILD_S, &format!("schedule-{n}")).await;
+    }
+    let seeded: Vec<String> = db
+        .schedule_rows()
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(seeded.len() as i64, limit, "guild starts at capacity");
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(30)),
+            ],
+        ))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        AutomationQuota::Schedules.to_string(),
+        "capacity refusal keeps its existing reply text"
+    );
+    assert!(
+        !mock
+            .requests()
+            .iter()
+            .any(|request| request.path.starts_with("/api/v10/channels/")),
+        "refusal posts nothing to a channel"
+    );
+    assert_eq!(
+        db.schedule_rows()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        seeded,
+        "refusal writes no schedule row"
+    );
+
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one capacity refusal writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_eq!(action, "scheduled.create");
+    assert_eq!(outcome, "rejected");
+    assert_eq!(reason.as_deref(), Some("quota"));
+    assert_eq!(
+        actor_id.as_deref(),
+        Some("88"),
+        "audit names the invoking member, like a validation rejection"
+    );
+    let target = target_key
+        .as_deref()
+        .expect("audit names the attempted schedule id");
+    assert!(
+        !target.is_empty() && !seeded.iter().any(|id| id == target),
+        "target is the fresh attempt id, not a seeded row: {target}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_refusals_audit_one_row_each_across_kinds() {
+    use two_bot_core::automation_quota::AutomationQuota;
+
+    let db = TestDb::new().await;
+    for n in 0..AutomationQuota::Schedules.limit() {
+        db.seed_schedule(GUILD_S, &format!("schedule-{n}")).await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+    let valid = || {
+        slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(30)),
+            ],
+        )
+    };
+
+    // Validation refusal (no timing), capacity refusal, the identical
+    // capacity refusal again, then another validation refusal.
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![option(
+                "body",
+                CommandOptionValue::String("hello".to_owned()),
+            )],
+        ))
+        .await;
+    runtime.on_interaction(&valid()).await;
+    runtime.on_interaction(&valid()).await;
+    runtime
+        .on_interaction(&slash(
+            "schedule",
+            Some(CHANNEL),
+            vec![
+                option("body", CommandOptionValue::String("hello".to_owned())),
+                option("in-minutes", CommandOptionValue::Integer(0)),
+            ],
+        ))
+        .await;
+
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), 4, "every refusal still completes the defer");
+    let replies: Vec<String> = edits
+        .iter()
+        .map(|edit| {
+            let json: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+            json["content"].as_str().expect("reply text").to_owned()
+        })
+        .collect();
+    assert_eq!(
+        replies,
+        vec![
+            "Give either in-minutes (one-shot) or every-minutes (recurring).".to_owned(),
+            AutomationQuota::Schedules.to_string(),
+            AutomationQuota::Schedules.to_string(),
+            "in-minutes must be between 1 and 525600, got 0.".to_owned(),
+        ],
+        "refusal reply texts are unchanged"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len() as i64,
+        AutomationQuota::Schedules.limit(),
+        "no refusal writes a schedule row"
+    );
+
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        4,
+        "each refusal writes exactly one audit row, no refusal writes an \
+         extra row: {audits:?}"
+    );
+    assert!(
+        audits.iter().all(|(action, _, outcome, _, actor_id)| {
+            action == "scheduled.create"
+                && outcome == "rejected"
+                && actor_id.as_deref() == Some("88")
+        }),
+        "all four refusals share the rejected shape: {audits:?}"
+    );
+    let mut reasons: Vec<Option<String>> = audits
+        .iter()
+        .map(|(_, _, _, reason, _)| reason.clone())
+        .collect();
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        vec![
+            Some("Give either in-minutes (one-shot) or every-minutes (recurring).".to_owned()),
+            Some("in-minutes must be between 1 and 525600, got 0.".to_owned()),
+            Some("quota".to_owned()),
+            Some("quota".to_owned()),
+        ],
+        "validation reasons keep their error text; capacity reasons are quota"
+    );
+    let targets: std::collections::BTreeSet<Option<String>> = audits
+        .iter()
+        .map(|(_, target_key, _, _, _)| target_key.clone())
+        .collect();
+    assert_eq!(
+        targets.len(),
+        4,
+        "each refusal audits its own fresh attempt id: {audits:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn feed_quota_capacity_refusal_audit_behavior_is_unchanged() {
+    use two_bot_core::automation_quota::AutomationQuota;
+
+    let db = TestDb::new().await;
+    for n in 0..AutomationQuota::Feeds.limit() {
+        db.seed_feed(GUILD_S, &format!("feed-{n}"), "rss").await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "feed-add",
+            Some(CHANNEL),
+            vec![
+                option("kind", CommandOptionValue::String("rss".to_owned())),
+                option(
+                    "source",
+                    CommandOptionValue::String("https://example.com/new.xml".to_owned()),
+                ),
+            ],
+        ))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        AutomationQuota::Feeds.to_string()
+    );
+    assert_eq!(
+        db.feed_rows().await.len() as i64,
+        AutomationQuota::Feeds.limit(),
+        "refusal writes no feed row"
+    );
+    assert!(
+        db.feed_audits().await.is_empty(),
+        "feed capacity refusal audit behavior is unchanged"
+    );
+    assert!(
+        schedule_audit_rows(&db).await.is_empty(),
+        "feed capacity refusal writes no automation audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn schedule_list_is_scoped_to_the_configured_guild_and_audits_nothing() {
@@ -4373,6 +6338,592 @@ async fn schedule_list_is_scoped_to_the_configured_guild_and_audits_nothing() {
     assert!(
         !content.contains("sched-foreign"),
         "other guild's row never listed: {content}"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+// --- schedule-list pagination: every configured id stays discoverable -----
+//
+// Locked contract for the builder (test-author handoff; do not edit these
+// tests to fit an implementation):
+//
+// - `/schedule-list` gains ONE optional integer option, `page` (1-based,
+//   minimum 1 in the published registry). Omitting it means page 1.
+// - Each reply holds only whole rows in the existing row format
+//   (`schedule_list_line`), ordered by (`next_run_at`, `id`), and never
+//   exceeds 2,000 UTF-16 units. No id is ever split or silently dropped.
+// - Whenever the guild's rows need more than one page, every page's reply
+//   carries the indicator `Page <current> of <total>` (exact substring), so
+//   staff can walk the pages and enumerate every configured id exactly once.
+//   A single-page reply may or may not carry `Page 1 of 1`.
+// - Empty guild: page 1 (or no page) replies `Nothing scheduled.`; any
+//   higher page is out of range against a total of 1 page.
+// - `page < 1` replies exactly `Page must be at least 1.`
+// - `page > total` replies exactly
+//   `Page <page> is out of range: this server has <total> page(s) of schedules.`
+//   Refusals list no rows and must not overflow on extreme page values.
+// - Listing stays guild-scoped, ephemeral, audit-free and write-free, and
+//   keeps disabled/recurring markers visible on each row.
+
+/// One full-quota fixture row: a realistic 32-hex id, a 19-digit channel
+/// snowflake and a full ISO timestamp, so 25 rendered rows cannot fit in a
+/// single 2,000-unit message (each row is at least ~84 units before state
+/// markers).
+struct ScheduleListFixtureRow {
+    id: String,
+    channel_id: String,
+    next_run_at: String,
+    interval_seconds: Option<i64>,
+    enabled: bool,
+}
+
+/// The 25-row guild quota (`AutomationQuota::Schedules`), in the order the
+/// list must return them: ascending (`next_run_at`, `id`). Rows 10 and 11
+/// share a `next_run_at` so the `id` tie-break is load-bearing; every third
+/// row recurs every 90 minutes; every fifth row is disabled.
+fn schedule_list_fixture_rows() -> Vec<ScheduleListFixtureRow> {
+    (0..25)
+        .map(|n| {
+            let minute = if n == 11 { 10 } else { n };
+            ScheduleListFixtureRow {
+                id: format!("a1b2c3d4e5f60718293a4b5c{n:08x}"),
+                channel_id: format!("123456789012345{:04}", 6000 + n),
+                next_run_at: format!("2030-01-01T00:{minute:02}:00.000Z"),
+                interval_seconds: (n % 3 == 0).then_some(5400),
+                enabled: n % 5 != 4,
+            }
+        })
+        .collect()
+}
+
+/// Parse the `Page <current> of <total>` indicator out of a list reply.
+fn schedule_list_page_indicator(content: &str) -> Option<(i64, i64)> {
+    let rest = content.split("Page ").nth(1)?;
+    let (current, rest) = rest.split_once(" of ")?;
+    let total: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some((current.trim().parse().ok()?, total.parse().ok()?))
+}
+
+/// The schedule rows in a list reply: lines in the row format, which start
+/// with a backticked id. Page indicators and refusals are not rows.
+fn schedule_list_row_lines(content: &str) -> Vec<&str> {
+    content
+        .lines()
+        .filter(|line| line.starts_with('`'))
+        .collect()
+}
+
+/// The complete id a row line leads with (between the first backticks).
+fn schedule_list_row_id(line: &str) -> &str {
+    line.trim_start_matches('`')
+        .split('`')
+        .next()
+        .expect("row line leads with a backticked id")
+}
+
+/// Invoke `/schedule-list` through the shared runtime, optionally with the
+/// `page` option.
+async fn invoke_schedule_list(runtime: &Arc<CommandRuntime>, page: Option<i64>) {
+    let options = page
+        .map(|page| vec![option("page", CommandOptionValue::Integer(page))])
+        .unwrap_or_default();
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), options))
+        .await;
+}
+
+/// Every deferred-reply completion body (`content`), in invocation order.
+/// Also pins the transport shape shared by every page: one ephemeral defer
+/// (type 5, flags 64) and one completion edit per invocation, nothing else.
+fn schedule_list_reply_contents(mock: &MockRest, invocations: usize) -> Vec<String> {
+    let requests = mock.requests();
+    let callbacks: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/callback"))
+        .collect();
+    assert_eq!(
+        callbacks.len(),
+        invocations,
+        "one ephemeral defer per list invocation"
+    );
+    for callback in &callbacks {
+        let json: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("callback json");
+        assert_eq!(json["type"], 5, "deferred reply");
+        assert_eq!(json["data"]["flags"], 64, "ephemeral defer");
+    }
+    let edits: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(
+        edits.len(),
+        invocations,
+        "one completion edit per list invocation, no extra messages"
+    );
+    assert_eq!(
+        requests.len(),
+        invocations * 2,
+        "listing makes no REST calls beyond defer + completion"
+    );
+    edits
+        .iter()
+        .map(|edit| {
+            let json: serde_json::Value =
+                serde_json::from_slice(&edit.body).expect("completion json");
+            json["content"]
+                .as_str()
+                .expect("list content is text")
+                .to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_full_quota_enumerates_every_id_across_pages() {
+    let db = TestDb::new().await;
+    let fixture = schedule_list_fixture_rows();
+    assert_eq!(fixture.len(), 25, "the per-guild schedule quota");
+    // Seed in reverse order: neither insertion order nor a bare
+    // `next_run_at` sort may decide the tied pair's order.
+    for row in fixture.iter().rev() {
+        db.seed_schedule_fixture_row(GUILD_S, row).await;
+    }
+    db.seed_schedule("9999", "sched-foreign-full").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    // Page 1 by default, then explicitly: the two must agree byte for byte.
+    invoke_schedule_list(&runtime, None).await;
+    invoke_schedule_list(&runtime, Some(1)).await;
+    let first_two = schedule_list_reply_contents(&mock, 2);
+    assert_eq!(
+        first_two[0], first_two[1],
+        "omitting page means page 1 exactly"
+    );
+    let first = &first_two[0];
+    assert!(
+        first.encode_utf16().count() <= 2000,
+        "page 1 stays within Discord's 2,000 UTF-16 unit cap: {} units",
+        first.encode_utf16().count()
+    );
+    let (current, total_pages) = schedule_list_page_indicator(first)
+        .unwrap_or_else(|| panic!("a full-quota list must announce `Page 1 of <total>`: {first}"));
+    assert_eq!(current, 1, "the first reply is page 1");
+    assert!(
+        (2..=25).contains(&total_pages),
+        "25 whole rows cannot fit one capped message, so pages must continue: \
+         indicator claims {total_pages} page(s)"
+    );
+
+    for page in 2..=total_pages {
+        invoke_schedule_list(&runtime, Some(page)).await;
+    }
+    let contents = schedule_list_reply_contents(&mock, 1 + total_pages as usize);
+    // contents[1] repeats page 1 (checked above); walk 1, 2, ..= total.
+    let mut pages: Vec<&str> = vec![contents[0].as_str()];
+    pages.extend(contents.iter().skip(2).map(String::as_str));
+
+    let mut listed: Vec<&ScheduleListFixtureRow> = Vec::new();
+    for (index, content) in pages.iter().enumerate() {
+        let page = index as i64 + 1;
+        assert!(
+            content.encode_utf16().count() <= 2000,
+            "page {page} stays within the 2,000 UTF-16 unit cap: {} units",
+            content.encode_utf16().count()
+        );
+        assert_eq!(
+            schedule_list_page_indicator(content),
+            Some((page, total_pages)),
+            "every page announces its position: {content}"
+        );
+        assert!(
+            !content.contains("sched-foreign-full"),
+            "another guild's schedule never leaks into page {page}: {content}"
+        );
+        let lines = schedule_list_row_lines(content);
+        assert!(!lines.is_empty(), "page {page} carries at least one row");
+        for line in lines {
+            let id = schedule_list_row_id(line);
+            let row = fixture
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap_or_else(|| panic!("row leads with a complete configured id: {line}"));
+            assert!(
+                line.contains(&format!("<#{}>", row.channel_id)),
+                "row keeps its whole channel mention: {line}"
+            );
+            assert!(
+                line.contains(&row.next_run_at),
+                "row keeps its whole next-run timestamp: {line}"
+            );
+            if row.interval_seconds.is_some() {
+                assert!(
+                    line.contains(" every 90m"),
+                    "recurring row keeps its interval marker: {line}"
+                );
+            } else {
+                assert!(
+                    !line.contains(" every "),
+                    "one-shot row carries no interval marker: {line}"
+                );
+            }
+            if row.enabled {
+                assert!(
+                    !line.contains("(disabled)"),
+                    "enabled row carries no disabled marker: {line}"
+                );
+            } else {
+                assert!(
+                    line.contains(" (disabled)"),
+                    "disabled row keeps its disabled marker: {line}"
+                );
+            }
+            listed.push(row);
+        }
+    }
+
+    let listed_ids: Vec<&str> = listed.iter().map(|row| row.id.as_str()).collect();
+    let expected_ids: Vec<&str> = fixture.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(
+        listed_ids, expected_ids,
+        "walking every page enumerates each configured id exactly once, in \
+         (next_run_at, id) order, with no tail silently dropped"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "listing writes no audit rows on any page"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len(),
+        25,
+        "listing never writes schedule rows"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_empty_guild_pages_are_defined() {
+    let db = TestDb::new().await;
+    // Only another guild has schedules: this guild's list is empty on every
+    // page, and the foreign id must never surface.
+    db.seed_schedule("9999", "sched-foreign-only").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, None).await;
+    invoke_schedule_list(&runtime, Some(1)).await;
+    invoke_schedule_list(&runtime, Some(2)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 3);
+    assert_eq!(contents[0], "Nothing scheduled.");
+    assert_eq!(
+        contents[1], "Nothing scheduled.",
+        "explicit page 1 matches the default on an empty guild"
+    );
+    assert_eq!(
+        contents[2], "Page 2 is out of range: this server has 1 page(s) of schedules.",
+        "an empty guild has exactly one (empty) page"
+    );
+    for content in &contents {
+        assert!(
+            !content.contains("sched-foreign-only"),
+            "foreign rows never surface: {content}"
+        );
+        assert!(content.encode_utf16().count() <= 2000);
+    }
+    assert!(db.schedule_audits().await.is_empty());
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_invalid_and_out_of_range_pages_refuse_without_writes() {
+    let db = TestDb::new().await;
+    let fixture = schedule_list_fixture_rows();
+    for row in fixture.iter().take(3) {
+        db.seed_schedule_fixture_row(GUILD_S, row).await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(1)).await;
+    invoke_schedule_list(&runtime, Some(0)).await;
+    invoke_schedule_list(&runtime, Some(-1)).await;
+    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(i64::MAX)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 5);
+    let single_page = &contents[0];
+    assert!(single_page.encode_utf16().count() <= 2000);
+    assert!(
+        matches!(
+            schedule_list_page_indicator(single_page),
+            None | Some((1, 1))
+        ),
+        "a single-page list announces at most `Page 1 of 1`: {single_page}"
+    );
+    let single_ids: Vec<&str> = schedule_list_row_lines(single_page)
+        .iter()
+        .map(|line| schedule_list_row_id(line))
+        .collect();
+    assert_eq!(
+        single_ids,
+        fixture
+            .iter()
+            .take(3)
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        "page 1 lists the whole small guild in order"
+    );
+    assert_eq!(contents[1], "Page must be at least 1.");
+    assert_eq!(contents[2], "Page must be at least 1.");
+    assert_eq!(
+        contents[3],
+        "Page 2 is out of range: this server has 1 page(s) of schedules."
+    );
+    assert_eq!(
+        contents[4],
+        format!(
+            "Page {} is out of range: this server has 1 page(s) of schedules.",
+            i64::MAX
+        ),
+        "extreme page values refuse cleanly instead of overflowing page math"
+    );
+    for refusal in &contents[1..] {
+        for row in fixture.iter().take(3) {
+            assert!(
+                !refusal.contains(&row.id),
+                "a refused page lists no rows: {refusal}"
+            );
+        }
+    }
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "refused pages write no audit rows"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len(),
+        3,
+        "refused pages never write schedule rows"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_over_cap_shows_twenty_five_rows_and_an_overflow_line() {
+    let db = TestDb::new().await;
+    // 27 rows (direct seeds bypass quota admission), inserted newest-first.
+    // The listing cap is pinned at 25: raising it must break this test.
+    for n in (0..27u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("cap-{n:02}"),
+            &format!("2030-01-{:02}T00:00:00.000Z", n + 1),
+            None,
+            true,
+        )
+        .await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    // deferred_reply() already asserts the ephemeral defer (flags 64).
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("list content");
+    let mut expected_lines: Vec<String> = (0..25u32)
+        .map(|n| format!("`cap-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
+        .collect();
+    expected_lines.push("(truncated, 2 more)".to_owned());
+    assert_eq!(
+        content,
+        expected_lines.join("\n"),
+        "over-cap listing: 25 earliest rows, then the overflow line"
+    );
+    assert!(
+        !content.contains("cap-25") && !content.contains("cap-26"),
+        "rows past the cap are counted, not listed: {content}"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_at_cap_shows_every_row_without_an_overflow_line() {
+    let db = TestDb::new().await;
+    for n in (0..25u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("full-{n:02}"),
+            &format!("2030-01-{:02}T00:00:00.000Z", n + 1),
+            None,
+            true,
+        )
+        .await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    let json = mock.deferred_reply();
+    let content = json["content"].as_str().expect("list content");
+    let expected_lines: Vec<String> = (0..25u32)
+        .map(|n| format!("`full-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
+        .collect();
+    assert_eq!(
+        content,
+        expected_lines.join("\n"),
+        "exactly at the cap nothing is truncated"
+    );
+    assert!(
+        !content.contains("truncated"),
+        "no overflow line at the cap: {content}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_over_cap_second_page_lists_hidden_rows() {
+    let db = TestDb::new().await;
+    // Same 27-row over-cap guild as the page-1 acceptance test: page 2 must
+    // reach the bounded hidden window instead of re-paging the first 25.
+    for n in (0..27u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("cap-{n:02}"),
+            &format!("2030-01-{:02}T00:00:00.000Z", n + 1),
+            None,
+            true,
+        )
+        .await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(2)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 1);
+    assert_eq!(
+        contents[0],
+        "`cap-25` `<#3333>` 2030-01-26T00:00:00.000Z\n\
+         `cap-26` `<#3333>` 2030-01-27T00:00:00.000Z",
+        "page 2 lists exactly the rows past the capped first window"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_far_over_cap_second_page_names_remaining_overflow() {
+    let db = TestDb::new().await;
+    // 52 rows: the hidden window itself fills (25 rows) with 2 more behind
+    // it, so page 2 carries its own overflow line; minute-spaced stamps keep
+    // (next_run_at, id) order aligned with id order.
+    for n in (0..52u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("big-{n:02}"),
+            &format!("2030-03-01T{:02}:{:02}:00.000Z", n / 60, n % 60),
+            None,
+            true,
+        )
+        .await;
+    }
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(2)).await;
+    invoke_schedule_list(&runtime, Some(99)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 2);
+    let mut expected_lines: Vec<String> = (25..50u32)
+        .map(|n| {
+            format!(
+                "`big-{n:02}` `<#3333>` 2030-03-01T{:02}:{:02}:00.000Z",
+                n / 60,
+                n % 60
+            )
+        })
+        .collect();
+    expected_lines.push("(truncated, 2 more)".to_owned());
+    assert_eq!(
+        contents[0],
+        expected_lines.join("\n"),
+        "page 2 lists the full hidden window plus its own overflow line"
+    );
+    assert!(
+        !contents[0].contains("big-50") && !contents[0].contains("big-51"),
+        "rows past the hidden window are counted, not listed: {}",
+        contents[0]
+    );
+    assert_eq!(
+        contents[1], "Page 99 is out of range: this server has 2 page(s) of schedules.",
+        "pages past both windows refuse with the combined page total"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "list writes no audit row"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_under_cap_renders_byte_identical_to_before() {
+    let db = TestDb::new().await;
+    db.seed_schedule_row(
+        GUILD_S,
+        "weekly",
+        "2030-02-03T04:05:06.000Z",
+        Some(604_800),
+        true,
+    )
+    .await;
+    db.seed_schedule_row(GUILD_S, "once", "2030-01-01T00:00:00.000Z", None, true)
+        .await;
+    db.seed_schedule_row(
+        GUILD_S,
+        "paused",
+        "2030-01-15T12:30:00.000Z",
+        Some(3_600),
+        false,
+    )
+    .await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    // deferred_reply() already asserts the ephemeral defer (flags 64).
+    let json = mock.deferred_reply();
+    assert_eq!(
+        json["content"],
+        "`once` `<#3333>` 2030-01-01T00:00:00.000Z\n\
+         `paused` `<#3333>` 2030-01-15T12:30:00.000Z every 60m (disabled)\n\
+         `weekly` `<#3333>` 2030-02-03T04:05:06.000Z every 10080m",
+        "under-cap listing must not change a single byte"
     );
     assert!(
         db.schedule_audits().await.is_empty(),
@@ -4459,6 +7010,292 @@ async fn schedule_remove_deletes_by_unique_prefix_and_refuses_ambiguous() {
     db.close().await;
 }
 
+/// `/schedule-remove` invalid ids refuse before any store access (TOG-29645,
+/// IN-03 schedule-remove half): empty and over-128-UTF-16-unit ASCII and
+/// multibyte ids through the real router against a never-usable lazy pool.
+/// A store touch would fail the refused pool and reply with the generic store
+/// failure; the documented refusal instead proves the handler guard returned
+/// first. Only the permitted defer (POST /callback) + completion edit (PATCH)
+/// are recorded — no Discord mutation beyond the acknowledgement.
+#[tokio::test]
+async fn schedule_remove_invalid_ids_refuse_before_database_access() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(true, true), true, origin);
+
+    // Lengths are UTF-16 units (the guard's unit), not bytes: `é` is one
+    // unit, `😀` is two (a surrogate pair).
+    let ascii_over = "x".repeat(129);
+    let multibyte_over = "é".repeat(129);
+    let surrogate_over = "😀".repeat(65);
+    let hostile_over = format!("{}@everyone{}", "a".repeat(120), "b".repeat(20));
+    assert_eq!(ascii_over.encode_utf16().count(), 129);
+    assert_eq!(multibyte_over.encode_utf16().count(), 129);
+    assert_eq!(surrogate_over.encode_utf16().count(), 65 * 2);
+    assert!(hostile_over.encode_utf16().count() > 128);
+
+    let empty_reply =
+        "No unique scheduled message matches ``. Use the full id from /schedule-list.";
+    let overlong_reply =
+        "No unique scheduled message matches that id. Use the full id from /schedule-list.";
+    let store_failure = "Schedule command failed; try again.";
+
+    // Missing option and empty string both hit the empty guard.
+    let cases: Vec<(Vec<CommandDataOption>, &str)> = vec![
+        (Vec::new(), empty_reply),
+        (
+            vec![option("id", CommandOptionValue::String(String::new()))],
+            empty_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(ascii_over))],
+            overlong_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(multibyte_over))],
+            overlong_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(surrogate_over))],
+            overlong_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(hostile_over))],
+            overlong_reply,
+        ),
+    ];
+    let expected: Vec<String> = cases.iter().map(|(_, reply)| reply.to_string()).collect();
+    for (options, _) in &cases {
+        runtime
+            .on_interaction(&slash("schedule-remove", Some(CHANNEL), options.clone()))
+            .await;
+    }
+
+    let requests = mock.requests();
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 6, "one permitted defer per refusal");
+    let edits: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(edits.len(), 6, "one permitted completion edit per refusal");
+    assert_eq!(
+        requests.len(),
+        12,
+        "permitted defer+edit only, no other Discord call: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.method == "POST" || r.method == "PATCH"),
+        "no DELETE/PUT/message post on refusal: {requests:?}"
+    );
+    for (edit, want) in edits.iter().zip(expected.iter()) {
+        let reply: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+        assert_eq!(&reply["content"], want);
+        assert_ne!(
+            &reply["content"], store_failure,
+            "guard ran before any store access"
+        );
+        assert_eq!(reply["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+    // The overlong reply is a hard-coded literal: hostile input is never echoed.
+    for edit in &edits[2..] {
+        let reply: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+        let content = reply["content"].as_str().expect("string reply");
+        assert_eq!(content, overlong_reply);
+        assert!(
+            !content.contains("@everyone"),
+            "hostile tail must not echo: {content:?}"
+        );
+    }
+    mock.shutdown().await;
+}
+
+/// `/schedule-remove` invalid ids mutate nothing durable (TOG-29645, IN-03
+/// schedule-remove half): the same invalid matrix plus exact-128-unit boundary
+/// and whitespace-only missing-ID controls through the real router against a
+/// disposable database. Stored rows and audit rows are unchanged until the
+/// valid-prefix control deletes exactly one row.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_remove_invalid_ids_leave_store_untouched() {
+    let db = TestDb::new().await;
+    db.seed_schedule(GUILD_S, "keep111").await;
+    db.seed_schedule(GUILD_S, "keep222").await;
+    db.seed_schedule(GUILD_S, "xyz999").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    let ascii_over = "x".repeat(129);
+    let multibyte_over = "é".repeat(129);
+    let surrogate_over = "😀".repeat(65);
+    let hostile_over = format!("{}@everyone{}", "a".repeat(120), "b".repeat(20));
+    let ascii_exact = "x".repeat(128);
+    let multibyte_exact = "é".repeat(128);
+    assert_eq!(ascii_over.encode_utf16().count(), 129);
+    assert_eq!(multibyte_over.encode_utf16().count(), 129);
+    assert_eq!(surrogate_over.encode_utf16().count(), 65 * 2);
+    assert_eq!(ascii_exact.encode_utf16().count(), 128);
+    assert_eq!(multibyte_exact.encode_utf16().count(), 128);
+
+    let empty_reply =
+        "No unique scheduled message matches ``. Use the full id from /schedule-list.";
+    let overlong_reply =
+        "No unique scheduled message matches that id. Use the full id from /schedule-list.";
+    let whitespace_reply =
+        "No unique scheduled message matches `   `. Use the full id from /schedule-list.";
+    let ascii_exact_reply = format!(
+        "No unique scheduled message matches `{ascii_exact}`. Use the full id from /schedule-list."
+    );
+    let multibyte_exact_reply = format!(
+        "No unique scheduled message matches `{multibyte_exact}`. Use the full id from /schedule-list."
+    );
+
+    // Invalid: missing, empty, overlong ASCII / multibyte / surrogate /
+    // hostile. Boundary/missing controls: whitespace-only (a missing-ID
+    // control under current behavior, not a pre-lookup refusal) and the two
+    // exact-128-unit ids (they pass the guard, miss in the store, and echo).
+    let invalid_cases: Vec<(Vec<CommandDataOption>, String)> = vec![
+        (Vec::new(), empty_reply.to_owned()),
+        (
+            vec![option("id", CommandOptionValue::String(String::new()))],
+            empty_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(ascii_over))],
+            overlong_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(multibyte_over))],
+            overlong_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(surrogate_over))],
+            overlong_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(hostile_over))],
+            overlong_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String("   ".to_owned()))],
+            whitespace_reply.to_owned(),
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(ascii_exact))],
+            ascii_exact_reply,
+        ),
+        (
+            vec![option("id", CommandOptionValue::String(multibyte_exact))],
+            multibyte_exact_reply,
+        ),
+    ];
+    for (options, _) in &invalid_cases {
+        runtime
+            .on_interaction(&slash("schedule-remove", Some(CHANNEL), options.clone()))
+            .await;
+    }
+
+    // Forbidden effects: no row removed, no audit written.
+    let remaining: Vec<String> = db
+        .schedule_rows()
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        remaining,
+        vec![
+            "keep111".to_owned(),
+            "keep222".to_owned(),
+            "xyz999".to_owned()
+        ],
+        "invalid and boundary/missing ids delete nothing"
+    );
+    assert!(
+        db.schedule_audits().await.is_empty(),
+        "refusals write no scheduled.delete audit row"
+    );
+
+    // Permitted vs forbidden Discord effects: one defer + one completion edit
+    // per refusal; no channel post, delete, or registry publish.
+    let requests = mock.requests();
+    assert_eq!(
+        mock.posts_to("/callback").await.len(),
+        9,
+        "one permitted defer per refusal"
+    );
+    let edits: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(edits.len(), 9, "one permitted completion edit per refusal");
+    assert_eq!(
+        requests.len(),
+        18,
+        "permitted defer+edit only on refusal: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.method == "POST" || r.method == "PATCH"),
+        "no DELETE/PUT/message post on refusal: {requests:?}"
+    );
+    assert!(mock.deletes().is_empty(), "no Discord delete on refusal");
+    assert!(
+        mock.posts_to("/messages").await.is_empty(),
+        "no channel post on refusal"
+    );
+    for (edit, (_, want)) in edits.iter().zip(invalid_cases.iter()) {
+        let reply: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+        assert_eq!(&reply["content"], want);
+        assert_eq!(reply["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+    let hostile_edit: serde_json::Value =
+        serde_json::from_slice(&edits[5].body).expect("hostile edit json");
+    assert!(
+        !hostile_edit["content"]
+            .as_str()
+            .expect("string reply")
+            .contains("@everyone"),
+        "overlong reply never echoes hostile input"
+    );
+
+    // Valid control: the uniquely-resolving prefix still deletes exactly one
+    // row through the same router, proving the fixture was live and the
+    // invalid inputs left the store usable.
+    runtime
+        .on_interaction(&slash(
+            "schedule-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::String("xyz".to_owned()))],
+        ))
+        .await;
+    let remaining: Vec<String> = db
+        .schedule_rows()
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        remaining,
+        vec!["keep111".to_owned(), "keep222".to_owned()],
+        "valid prefix still deletes its row after the invalid matrix"
+    );
+    assert_eq!(
+        db.schedule_audits().await,
+        vec![(
+            "scheduled.delete".to_owned(),
+            "xyz999".to_owned(),
+            "ok".to_owned()
+        )],
+        "only the valid control audits"
+    );
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), 10, "one completion per interaction");
+    let valid: serde_json::Value = serde_json::from_slice(&edits[9].body).unwrap();
+    assert_eq!(valid["content"], "Cancelled.");
+    mock.shutdown().await;
+    db.close().await;
+}
+
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn schedule_store_failure_replies_generic() {
@@ -4488,6 +7325,655 @@ async fn schedule_store_failure_replies_generic() {
     );
     mock.shutdown().await;
     db.close().await;
+}
+
+// --- acceptance: store-failure refusals audit like other refusals ---------
+//
+// Locked contract: every schedule store-failure refusal (create read,
+// create write, remove resolve, remove delete, list read) writes exactly
+// one `automation_audit_log` row per refusal whenever the pool accepts it,
+// in the existing refusal shape: the command's `scheduled.*` action,
+// outcome `rejected`, the invoking member as `actor_id`, and a bounded
+// single-token `reason` (a fixed error class such as the log line's
+// `db_class` token, or an equivalent fixed token — never the raw sqlx /
+// Postgres message, which can carry statement or fixture detail).
+// `target_key` names the attempted row where one exists: the fresh attempt
+// id for creates, the user-supplied prefix when resolution itself fails,
+// the resolved id when the delete fails. A failed list has no schedule id,
+// so its `target_key` carries none (NULL or empty) rather than inventing
+// one. The user reply stays the existing fixed store-failure text. A dead
+// pool (audit write itself impossible) degrades to that same safe reply
+// with no panic and no leaked internals. Successful lists keep writing no
+// audit row; only the refusal audits.
+
+const SCHEDULE_STORE_FAILURE_REPLY: &str = "Schedule command failed; try again.";
+
+/// Drop the schedule table inside this test's isolated schema: every store
+/// call against it fails while `automation_audit_log` stays writable, so an
+/// audit attempt on the live pool can still land.
+async fn drop_scheduled_messages(db: &TestDb) {
+    sqlx::query("DROP TABLE scheduled_messages")
+        .execute(&db.pool)
+        .await
+        .expect("drop scheduled_messages");
+}
+
+/// Fail only INSERTs into `scheduled_messages`: the create path's read
+/// still succeeds, so the refusal comes from the write itself.
+async fn fail_scheduled_inserts(db: &TestDb) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_scheduled_insert() RETURNS trigger AS $$
+         BEGIN
+           RAISE EXCEPTION 'induced scheduled insert failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install insert fault function");
+    sqlx::query(
+        "CREATE TRIGGER fail_scheduled_insert_trg
+           BEFORE INSERT ON scheduled_messages FOR EACH ROW
+           EXECUTE FUNCTION fail_scheduled_insert()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install insert fault trigger");
+}
+
+/// Fail only DELETEs from `scheduled_messages`: prefix resolution still
+/// succeeds, so the refusal comes from the delete itself.
+async fn fail_scheduled_deletes(db: &TestDb) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_scheduled_delete() RETURNS trigger AS $$
+         BEGIN
+           RAISE EXCEPTION 'induced scheduled delete failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install delete fault function");
+    sqlx::query(
+        "CREATE TRIGGER fail_scheduled_delete_trg
+           BEFORE DELETE ON scheduled_messages FOR EACH ROW
+           EXECUTE FUNCTION fail_scheduled_delete()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install delete fault trigger");
+}
+
+/// The refusal shape every store-failure audit row must share.
+fn assert_schedule_store_failure_audit(
+    action: &str,
+    outcome: &str,
+    reason: Option<&str>,
+    actor_id: Option<&str>,
+    expected_action: &str,
+) {
+    assert_eq!(action, expected_action);
+    assert_eq!(outcome, "rejected");
+    assert_eq!(
+        actor_id,
+        Some("88"),
+        "audit names the invoking member, like a validation rejection"
+    );
+    let reason = reason.expect("store-failure refusal audits a reason");
+    assert!(
+        !reason.is_empty() && reason.len() <= 64 && !reason.chars().any(char::is_whitespace),
+        "reason is one bounded token, not raw error text: {reason:?}"
+    );
+    let lowered = reason.to_ascii_lowercase();
+    for leaked in ["sqlx", "postgres", "scheduled_messages", "induced"] {
+        assert!(
+            !lowered.contains(leaked),
+            "reason must not leak {leaked}: {reason:?}"
+        );
+    }
+}
+
+/// Every completion-edit `content`, in invocation order.
+fn schedule_store_failure_replies(mock: &MockRest, invocations: usize) -> Vec<String> {
+    let edits: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PATCH")
+        .collect();
+    assert_eq!(edits.len(), invocations, "one completion per invocation");
+    edits
+        .iter()
+        .map(|edit| {
+            let json: serde_json::Value =
+                serde_json::from_slice(&edit.body).expect("completion json");
+            json["content"]
+                .as_str()
+                .expect("reply content is text")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn schedule_create_interaction() -> Interaction {
+    slash(
+        "schedule",
+        Some(CHANNEL),
+        vec![
+            option("body", CommandOptionValue::String("hello".to_owned())),
+            option("in-minutes", CommandOptionValue::Integer(30)),
+        ],
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_read_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    drop_scheduled_messages(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime.on_interaction(&schedule_create_interaction()).await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        SCHEDULE_STORE_FAILURE_REPLY
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one create read failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_schedule_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "scheduled.create",
+    );
+    let target = target_key
+        .as_deref()
+        .expect("audit names the attempted schedule id");
+    assert!(!target.is_empty(), "target is the fresh attempt id");
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_create_put_store_failure_audits_one_rejected_row_per_refusal() {
+    let db = TestDb::new().await;
+    fail_scheduled_inserts(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime.on_interaction(&schedule_create_interaction()).await;
+    runtime.on_interaction(&schedule_create_interaction()).await;
+
+    assert_eq!(
+        schedule_store_failure_replies(&mock, 2),
+        vec![
+            SCHEDULE_STORE_FAILURE_REPLY.to_owned(),
+            SCHEDULE_STORE_FAILURE_REPLY.to_owned()
+        ],
+        "write failures keep the existing safe reply text"
+    );
+    assert!(
+        db.schedule_rows().await.is_empty(),
+        "failed writes store no schedule row"
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        2,
+        "each write failure writes exactly one audit row: {audits:?}"
+    );
+    for (action, _, outcome, reason, actor_id) in &audits {
+        assert_schedule_store_failure_audit(
+            action,
+            outcome,
+            reason.as_deref(),
+            actor_id.as_deref(),
+            "scheduled.create",
+        );
+    }
+    let targets: std::collections::BTreeSet<Option<String>> = audits
+        .iter()
+        .map(|(_, target_key, _, _, _)| target_key.clone())
+        .collect();
+    assert_eq!(
+        targets.len(),
+        2,
+        "each refusal audits its own fresh attempt id: {audits:?}"
+    );
+    assert!(
+        targets
+            .iter()
+            .all(|target| target.as_deref().is_some_and(|t| !t.is_empty())),
+        "every target names an attempted schedule id: {audits:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_remove_resolve_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    drop_scheduled_messages(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "schedule-remove",
+            Some(CHANNEL),
+            vec![option(
+                "id",
+                CommandOptionValue::String("sched-xyz".to_owned()),
+            )],
+        ))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        SCHEDULE_STORE_FAILURE_REPLY
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one resolve failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_schedule_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "scheduled.delete",
+    );
+    assert_eq!(
+        target_key.as_deref(),
+        Some("sched-xyz"),
+        "unresolved refusal names the user-supplied prefix"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_remove_delete_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    db.seed_schedule(GUILD_S, "xyz999").await;
+    fail_scheduled_deletes(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash(
+            "schedule-remove",
+            Some(CHANNEL),
+            vec![option("id", CommandOptionValue::String("xyz".to_owned()))],
+        ))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        SCHEDULE_STORE_FAILURE_REPLY
+    );
+    assert_eq!(
+        db.schedule_rows()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        vec!["xyz999".to_owned()],
+        "failed delete leaves the schedule row in place"
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one delete failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_schedule_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "scheduled.delete",
+    );
+    assert_eq!(
+        target_key.as_deref(),
+        Some("xyz999"),
+        "delete refusal names the resolved schedule id"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    drop_scheduled_messages(&db).await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    assert_eq!(
+        mock.deferred_reply()["content"],
+        SCHEDULE_STORE_FAILURE_REPLY
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one list failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_schedule_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "scheduled.list",
+    );
+    assert!(
+        target_key.as_deref().is_none_or(str::is_empty),
+        "a failed list names no schedule id: {target_key:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+// --- acceptance: deep-pagination list failures audit like other refusals --
+//
+// Locked contract: the two deep-pagination `/schedule-list` failure paths —
+// a failed hidden-window read on a page past the first window's packed
+// pages, and an unknown-overflow deep page whose count read failed — each
+// write exactly one `automation_audit_log` row in the refusal shape above
+// (`scheduled.list` / `rejected`, the invoking member as actor, no target,
+// the failing read's bounded error-class token as reason), keeping the
+// existing fixed store-failure reply. A successful deep page still writes
+// no audit row and the page-1 over-cap render does not change.
+
+/// Fail exactly the `scheduled_messages` SELECTs whose text matches
+/// `pattern` (`%OFFSET%` selects only the hidden-window read, `%count(*)%`
+/// only the overflow count; the capped first read matches neither). The
+/// table is renamed under a same-named view whose `WHERE` raises on a
+/// `current_query()` match, failing that one statement while the pool
+/// stays live, so an audit write can still land. An RLS policy cannot do
+/// this here: the test role is the database superuser, and superusers
+/// bypass row security even under `FORCE`. Install only after seeding;
+/// nothing writes `scheduled_messages` in these tests afterwards.
+async fn fail_scheduled_selects_matching(db: &TestDb, pattern: &str) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_query_matching(pat text) RETURNS boolean AS $$
+         BEGIN
+           IF current_query() LIKE pat THEN
+             RAISE EXCEPTION 'induced scheduled select failure';
+           END IF;
+           RETURN TRUE;
+         END;
+         $$ LANGUAGE plpgsql VOLATILE",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install select fault function");
+    assert!(
+        !pattern.contains('\''),
+        "fault pattern is a test-owned literal"
+    );
+    sqlx::query("ALTER TABLE scheduled_messages RENAME TO scheduled_messages_fault_base")
+        .execute(&db.pool)
+        .await
+        .expect("rename scheduled_messages under the fault view");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE VIEW scheduled_messages AS
+           SELECT * FROM scheduled_messages_fault_base
+            WHERE fail_query_matching('{pattern}')"
+    )))
+    .execute(&db.pool)
+    .await
+    .expect("install select fault view");
+}
+
+/// The 27-row over-cap guild shared by the deep-pagination tests; direct
+/// seeds bypass quota admission, and page 2 is the first deep page.
+async fn seed_over_cap_schedule_rows(db: &TestDb) {
+    for n in (0..27u32).rev() {
+        db.seed_schedule_row(
+            GUILD_S,
+            &format!("cap-{n:02}"),
+            &format!("2030-01-{:02}T00:00:00.000Z", n + 1),
+            None,
+            true,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_hidden_window_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    seed_over_cap_schedule_rows(&db).await;
+    fail_scheduled_selects_matching(&db, "%OFFSET%").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(2)).await;
+
+    assert_eq!(
+        schedule_list_reply_contents(&mock, 1),
+        vec![SCHEDULE_STORE_FAILURE_REPLY.to_owned()],
+        "a failed hidden-window read keeps the existing safe reply text"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len(),
+        27,
+        "a failed deep page writes no schedule rows"
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one hidden-window failure writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_schedule_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "scheduled.list",
+    );
+    assert!(
+        target_key.as_deref().is_none_or(str::is_empty),
+        "a failed list names no schedule id: {target_key:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_unknown_overflow_store_failure_audits_one_rejected_row() {
+    let db = TestDb::new().await;
+    seed_over_cap_schedule_rows(&db).await;
+    fail_scheduled_selects_matching(&db, "%count(*)%").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(2)).await;
+
+    assert_eq!(
+        schedule_list_reply_contents(&mock, 1),
+        vec![SCHEDULE_STORE_FAILURE_REPLY.to_owned()],
+        "an unknown-overflow deep page keeps the existing safe reply text"
+    );
+    assert_eq!(
+        db.schedule_rows().await.len(),
+        27,
+        "a failed deep page writes no schedule rows"
+    );
+    let audits = schedule_audit_rows(&db).await;
+    assert_eq!(
+        audits.len(),
+        1,
+        "one unknown-overflow refusal writes exactly one audit row: {audits:?}"
+    );
+    let (action, target_key, outcome, reason, actor_id) = &audits[0];
+    assert_schedule_store_failure_audit(
+        action,
+        outcome,
+        reason.as_deref(),
+        actor_id.as_deref(),
+        "scheduled.list",
+    );
+    assert!(
+        target_key.as_deref().is_none_or(str::is_empty),
+        "a failed list names no schedule id: {target_key:?}"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Control: with the fault view installed but matching no statement, the
+/// page-1 over-cap render and the successful deep page are byte-identical
+/// to the unfaulted listings and neither writes an audit row. This proves
+/// the fault harness itself, not just the failures it induces, is inert.
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn schedule_list_deep_pages_succeed_without_audit_when_no_query_fails() {
+    let db = TestDb::new().await;
+    seed_over_cap_schedule_rows(&db).await;
+    fail_scheduled_selects_matching(&db, "%ZZZ_NO_SUCH_FRAGMENT%").await;
+    let (runtime, mock) = db_runtime(&db, Vec::new()).await;
+
+    invoke_schedule_list(&runtime, Some(1)).await;
+    invoke_schedule_list(&runtime, Some(2)).await;
+
+    let contents = schedule_list_reply_contents(&mock, 2);
+    let mut expected_lines: Vec<String> = (0..25u32)
+        .map(|n| format!("`cap-{n:02}` `<#3333>` 2030-01-{:02}T00:00:00.000Z", n + 1))
+        .collect();
+    expected_lines.push("(truncated, 2 more)".to_owned());
+    assert_eq!(
+        contents[0],
+        expected_lines.join("\n"),
+        "page-1 over-cap render is unchanged"
+    );
+    assert_eq!(
+        contents[1],
+        "`cap-25` `<#3333>` 2030-01-26T00:00:00.000Z\n\
+         `cap-26` `<#3333>` 2030-01-27T00:00:00.000Z",
+        "a successful deep page still lists the hidden rows"
+    );
+    assert!(
+        schedule_audit_rows(&db).await.is_empty(),
+        "successful lists write no audit row on any page"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// Dead-pool control for a deep page: a closed pool fails the first read,
+/// so no audit write is possible either; asking for page 2 must still
+/// finish with the fixed safe reply — no panic, no leaked internals.
+#[tokio::test]
+async fn schedule_list_deep_page_on_dead_pool_replies_safely() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let runtime = CommandRuntime::new(
+        pool,
+        executor_at(origin),
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+
+    runtime
+        .on_interaction(&slash(
+            "schedule-list",
+            Some(CHANNEL),
+            vec![option("page", CommandOptionValue::Integer(2))],
+        ))
+        .await;
+
+    let replies = schedule_store_failure_replies(&mock, 1);
+    assert_eq!(
+        replies,
+        vec![SCHEDULE_STORE_FAILURE_REPLY.to_owned()],
+        "a deep page on a dead pool degrades to the safe reply"
+    );
+    for leaked in ["sqlx", "postgres", "127.0.0.1", "agent_test", "Pool"] {
+        assert!(
+            !replies[0].contains(leaked),
+            "dead-pool reply must not leak {leaked}: {}",
+            replies[0]
+        );
+    }
+    mock.shutdown().await;
+}
+
+/// Dead-pool control: with a closed pool, the audit write is impossible by
+/// construction, so every schedule command must still finish with the
+/// fixed safe reply — no panic, no hang, no sqlx internals, pool address
+/// or credentials in the user text. A closed pool fails every query
+/// immediately; an unreachable pool would hold each command for the full
+/// acquire timeout, so this control stays fast after the audit attempt
+/// adds a second store call per refusal.
+#[tokio::test]
+async fn schedule_store_failures_on_dead_pool_reply_safely() {
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    pool.close().await;
+    let runtime = CommandRuntime::new(
+        pool,
+        executor_at(origin),
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+
+    runtime.on_interaction(&schedule_create_interaction()).await;
+    runtime
+        .on_interaction(&slash(
+            "schedule-remove",
+            Some(CHANNEL),
+            vec![option(
+                "id",
+                CommandOptionValue::String("sched-xyz".to_owned()),
+            )],
+        ))
+        .await;
+    runtime
+        .on_interaction(&slash("schedule-list", Some(CHANNEL), Vec::new()))
+        .await;
+
+    let replies = schedule_store_failure_replies(&mock, 3);
+    assert_eq!(
+        replies,
+        vec![SCHEDULE_STORE_FAILURE_REPLY.to_owned(); 3],
+        "dead pool degrades every schedule command to the safe reply"
+    );
+    for reply in &replies {
+        for leaked in ["sqlx", "postgres", "127.0.0.1", "agent_test", "Pool"] {
+            assert!(
+                !reply.contains(leaked),
+                "dead-pool reply must not leak {leaked}: {reply}"
+            );
+        }
+    }
+    mock.shutdown().await;
 }
 
 #[tokio::test]
@@ -5511,7 +8997,8 @@ async fn worker_verdict_drives_prefix_trigger_from_call_site() {
     ]);
     runtime
         .initialize_custom_commands(
-            GatewayCommandConfig::from_map(GUILD, &vars).expect("dispatch command config"),
+            GatewayCommandConfig::from_map_for_activation(GUILD, &vars, true)
+                .expect("dispatch command config"),
         )
         .await
         .expect("custom-command bootstrap (loopback REST, isolated DB)");
@@ -5579,4 +9066,744 @@ async fn worker_verdict_drives_prefix_trigger_from_call_site() {
     );
     mock.shutdown().await;
     db.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// `/privacy` member self-serve (parity §1 row 32)
+// ---------------------------------------------------------------------------
+
+fn privacy_interaction(member: u64, subcommand: Option<&str>) -> Interaction {
+    let options = subcommand
+        .map(|name| vec![option(name, CommandOptionValue::SubCommand(Vec::new()))])
+        .unwrap_or_default();
+    let base = slash("privacy", Some(CHANNEL), options);
+    from_member(base, member, Permissions::empty())
+}
+
+/// Guild-scoped privacy interaction for store-backed tests: the privacy
+/// service validates guild and member as Discord snowflakes (17–20 digits),
+/// so the small `GUILD`/`88` fixtures used elsewhere would refuse before any
+/// purge. Callers pass real-shaped snowflake IDs for both.
+fn privacy_interaction_in(guild: u64, member: u64, subcommand: Option<&str>) -> Interaction {
+    let mut interaction = privacy_interaction(member, subcommand);
+    interaction.guild_id = Some(Id::new(guild));
+    interaction
+}
+
+fn privacy_request_interaction_in(
+    guild: u64,
+    member: u64,
+    subcommand: &str,
+    request_id: Option<&str>,
+) -> Interaction {
+    let nested = request_id
+        .map(|request_id| {
+            vec![option(
+                "request-id",
+                CommandOptionValue::String(request_id.to_owned()),
+            )]
+        })
+        .unwrap_or_default();
+    let mut interaction = from_member(
+        slash(
+            "privacy",
+            Some(CHANNEL),
+            vec![option(subcommand, CommandOptionValue::SubCommand(nested))],
+        ),
+        member,
+        Permissions::empty(),
+    );
+    interaction.guild_id = Some(Id::new(guild));
+    interaction
+}
+
+#[test]
+fn privacy_action_decodes_known_analytics_and_deletion_subcommands() {
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("opt-out"))),
+        PrivacyAction::OptOut
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("opt-in"))),
+        PrivacyAction::OptIn
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("status"))),
+        PrivacyAction::Status
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("delete"))),
+        PrivacyAction::DeletionRequest
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("deletion-status"))),
+        PrivacyAction::DeletionStatus
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("deletion-receipt"))),
+        PrivacyAction::DeletionReceipt
+    );
+    // Missing options, a non-subcommand value and an unknown name all
+    // refuse before any database access.
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, None)),
+        PrivacyAction::Invalid
+    );
+    let mut flat = slash(
+        "privacy",
+        Some(CHANNEL),
+        vec![option(
+            "opt-out",
+            CommandOptionValue::String("yes".to_owned()),
+        )],
+    );
+    flat = from_member(flat, 88, Permissions::empty());
+    assert_eq!(privacy_action(&flat), PrivacyAction::Invalid);
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("erase-everything"))),
+        PrivacyAction::Invalid
+    );
+    // A non-command interaction never dispatches.
+    let mut component = privacy_interaction(88, Some("opt-out"));
+    component.data = None;
+    assert_eq!(privacy_action(&component), PrivacyAction::Invalid);
+}
+
+#[test]
+fn deletion_status_and_receipt_accept_only_a_nested_request_id_string() {
+    let request_id = "del-0123456789abcdef";
+    let nested = vec![option(
+        "deletion-status",
+        CommandOptionValue::SubCommand(vec![option(
+            "request-id",
+            CommandOptionValue::String(request_id.to_owned()),
+        )]),
+    )];
+    let interaction = from_member(
+        slash("privacy", Some(CHANNEL), nested),
+        88,
+        Permissions::empty(),
+    );
+    assert_eq!(deletion_request_id(&interaction), Some(request_id));
+    let unrelated = privacy_request_interaction_in(
+        100000000000000431,
+        100000000000000432,
+        "delete",
+        Some(request_id),
+    );
+    assert_eq!(deletion_request_id(&unrelated), None);
+
+    let malformed = from_member(
+        slash(
+            "privacy",
+            Some(CHANNEL),
+            vec![option(
+                "deletion-receipt",
+                CommandOptionValue::SubCommand(vec![option(
+                    "request-id",
+                    CommandOptionValue::Integer(123),
+                )]),
+            )],
+        ),
+        88,
+        Permissions::empty(),
+    );
+    assert_eq!(deletion_request_id(&malformed), None);
+}
+
+/// `/privacy` end to end through gateway dispatch: `opt-out` purges the
+/// invoker's guild rows, installs suppression and writes exactly one
+/// `member:self-serve` receipt; `status` reports suppression plus the guild
+/// switches; `opt-in` clears suppression; the other member's rows survive
+/// throughout. Every step defers once and completes with one ephemeral edit.
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb and mock REST only"]
+async fn privacy_command_purges_suppresses_receipts_and_reenables_through_dispatch() {
+    use two_bot_cutover::db::{CutoverDb, FunnelWrite};
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test bootstrap URL");
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .expect("migrated test database; no credential fallback");
+    let cutover = CutoverDb::from_pool(db.pool().clone());
+    // Real-shaped snowflakes: `opt_out_member` validates both identities
+    // (17–20 digits), so the small `GUILD`/`88` fixtures would refuse.
+    const PRIVACY_GUILD: u64 = 100000000000000411;
+    const MEMBER_A: u64 = 100000000000000412;
+    const MEMBER_B: u64 = 100000000000000413;
+    let guild_s = PRIVACY_GUILD.to_string();
+    let member_a_s = MEMBER_A.to_string();
+    let member_b_s = MEMBER_B.to_string();
+    let seed = |member: &str| FunnelWrite {
+        member_id: Some(member.to_owned()),
+        guild_id: guild_s.clone(),
+        event_type: "first_message".to_owned(),
+        occurred_at: "2026-10-12T00:00:00Z".to_owned(),
+        source: "privacy-command-fixture".to_owned(),
+        metadata: Some("{}".to_owned()),
+    };
+    for member in [&member_a_s, &member_b_s] {
+        let (inserted, _) = two_bot_cutover::db::record_event(&cutover, &seed(member))
+            .await
+            .expect("seed persists before the opt-out");
+        assert!(inserted, "seed row for member {member}");
+    }
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
+    let mut privacy_gates = gates(false, false);
+    privacy_gates.configured_guild = Some(PRIVACY_GUILD);
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor.clone(),
+        router_with_commands(privacy_gates),
+        PRIVACY_GUILD,
+        false,
+    );
+
+    let events_for = |member: &str| {
+        let pool = db.pool().clone();
+        let guild = guild_s.clone();
+        let member = member.to_owned();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM events WHERE guild_id = $1 AND member_id = $2",
+            )
+            .bind(guild)
+            .bind(member)
+            .fetch_one(&pool)
+            .await
+            .expect("events count reads")
+        }
+    };
+    let suppressed = |member: &str| {
+        let pool = db.pool().clone();
+        let guild = guild_s.clone();
+        let member = member.to_owned();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
+            )
+            .bind(guild)
+            .bind(member)
+            .fetch_one(&pool)
+            .await
+            .expect("suppression reads")
+        }
+    };
+
+    // `opt-out`: purge + suppress + exactly one receipt, other member kept.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(
+        events_for(&member_a_s).await,
+        0,
+        "opt-out purges the invoker rows"
+    );
+    assert_eq!(
+        events_for(&member_b_s).await,
+        1,
+        "other member rows survive"
+    );
+    assert!(
+        suppressed(&member_a_s).await,
+        "opt-out installs suppression"
+    );
+    assert!(
+        !suppressed(&member_b_s).await,
+        "no suppression for anyone else"
+    );
+    let receipts: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT guild_id, member_id, actor FROM privacy_opt_out_audit")
+            .fetch_all(db.pool())
+            .await
+            .expect("receipt reads");
+    assert_eq!(receipts.len(), 1, "exactly one audit receipt");
+    assert_eq!(
+        receipts[0],
+        (
+            guild_s.clone(),
+            member_a_s.clone(),
+            "member:self-serve".to_owned()
+        ),
+        "receipt scopes the pair with a subject-free actor label"
+    );
+    // A write that passes after the purge still drops for the pair.
+    let (inserted, _) = two_bot_cutover::db::record_event(&cutover, &seed(&member_a_s))
+        .await
+        .expect("post-purge write attempts");
+    assert!(!inserted, "suppressed pair stays dropped");
+
+    // `status`: opted out, guild switches default on.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            Some("status"),
+        ))
+        .await;
+    // `opt-in`: suppression clears, purged rows stay gone.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            Some("opt-in"),
+        ))
+        .await;
+    assert!(!suppressed(&member_a_s).await, "opt-in clears suppression");
+    assert_eq!(events_for(&member_a_s).await, 0, "opt-in restores nothing");
+    // `status` again: persistence back on.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            Some("status"),
+        ))
+        .await;
+    // Unknown subcommand shape: usage reply, no writes.
+    runtime
+        .on_interaction(&privacy_interaction_in(PRIVACY_GUILD, MEMBER_A, None))
+        .await;
+    assert_eq!(
+        events_for(&member_b_s).await,
+        1,
+        "usage path writes nothing"
+    );
+
+    // Guild-less invocation refuses on a direct call (dispatch itself stays
+    // silent outside the configured guild via the router fence).
+    let mut dm = privacy_interaction_in(PRIVACY_GUILD, MEMBER_A, Some("status"));
+    dm.guild_id = None;
+    crate::privacy_command::privacy_command(db.pool(), &executor, &dm).await;
+
+    let callbacks = mock.posts_to("/callback").await;
+    assert_eq!(callbacks.len(), 5, "one defer per dispatched command");
+    for callback in &callbacks {
+        let body: serde_json::Value = serde_json::from_slice(&callback.body).unwrap();
+        assert_eq!(body["type"], 5, "defer before any store work");
+        assert_eq!(body["data"]["flags"], 64, "defer stays ephemeral");
+    }
+    let edits: Vec<serde_json::Value> = mock
+        .requests()
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.ends_with("/@original"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(
+        edits.len(),
+        6,
+        "one completion edit per command plus the direct call"
+    );
+    let text = |index: usize| {
+        edits[index]["content"]
+            .as_str()
+            .expect("edit carries text")
+            .to_owned()
+    };
+    assert!(
+        text(0).contains("opted out of analytics"),
+        "opt-out confirms, got: {}",
+        text(0)
+    );
+    assert!(
+        text(1).contains("opted out") && text(1).contains("presence on"),
+        "status reports suppression plus switches, got: {}",
+        text(1)
+    );
+    assert!(
+        text(2).contains("back on"),
+        "opt-in confirms, got: {}",
+        text(2)
+    );
+    assert!(
+        text(3).contains("Analytics for you in this server: on"),
+        "status reports restored persistence, got: {}",
+        text(3)
+    );
+    assert!(
+        text(4).contains("/privacy opt-out"),
+        "unknown shape teaches usage, got: {}",
+        text(4)
+    );
+    assert!(
+        text(5).contains("only works in a server"),
+        "guild-less call refuses, got: {}",
+        text(5)
+    );
+    for edit in &edits {
+        let content = edit["content"].as_str().unwrap_or_default();
+        assert!(!content.contains("token-"), "no interaction token echoes");
+        assert!(!content.contains("@everyone"), "no mass mentions");
+    }
+    mock.shutdown().await;
+    db.close().await.expect("drop own disposable database");
+}
+
+/// `/privacy` deletion commands cross the real gateway dispatcher with the
+/// interaction-derived guild/member pair; another member cannot read status or
+/// the completed receipt. Completion is synthesized only inside this disposable
+/// database so the test does not enable retention execution or run the scheduler.
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb and mock REST only"]
+async fn privacy_deletion_dispatch_binds_request_status_and_receipt_to_invoker() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test bootstrap URL");
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .expect("migrated test database; no credential fallback");
+    const PRIVACY_GUILD: u64 = 100000000000000431;
+    const MEMBER_A: u64 = 100000000000000432;
+    const MEMBER_B: u64 = 100000000000000433;
+    const DELETE_INTERACTION: u64 = 100000000000000434;
+    const NEXT_DELETE_INTERACTION: u64 = 100000000000000435;
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
+    let mut privacy_gates = gates(false, false);
+    privacy_gates.configured_guild = Some(PRIVACY_GUILD);
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor,
+        router_with_commands(privacy_gates),
+        PRIVACY_GUILD,
+        false,
+    );
+
+    let mut delete = privacy_request_interaction_in(PRIVACY_GUILD, MEMBER_A, "delete", None);
+    delete.id = Id::new(DELETE_INTERACTION);
+    runtime.on_interaction(&delete).await;
+    let request: (String, String, String, String) = sqlx::query_as(
+        "SELECT request_id, guild_id, user_id, status FROM retention_deletion_requests \
+         WHERE guild_id = $1 AND user_id = $2",
+    )
+    .bind(PRIVACY_GUILD.to_string())
+    .bind(MEMBER_A.to_string())
+    .fetch_one(db.pool())
+    .await
+    .expect("live dispatch queued a requester-bound deletion");
+    assert_eq!(request.1, PRIVACY_GUILD.to_string());
+    assert_eq!(request.2, MEMBER_A.to_string());
+    assert_eq!(request.3, "pending");
+
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            "deletion-status",
+            Some(&request.0),
+        ))
+        .await;
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_B,
+            "deletion-status",
+            Some(&request.0),
+        ))
+        .await;
+
+    // Simulate only the settled ledger state needed to exercise receipt reads;
+    // no erasure, purge, scheduler, or production database is involved.
+    sqlx::query(
+        "UPDATE retention_deletion_requests \
+         SET status = 'completed', completed_at = clock_timestamp(), receipt_id = 'test-receipt' \
+         WHERE request_id = $1",
+    )
+    .bind(&request.0)
+    .execute(db.pool())
+    .await
+    .expect("fixture marks this disposable-ledger row completed");
+    runtime.on_interaction(&delete).await;
+    let retried_requests: Vec<(String, String)> = sqlx::query_as(
+        "SELECT request_id, status FROM retention_deletion_requests \
+         WHERE guild_id = $1 AND user_id = $2",
+    )
+    .bind(PRIVACY_GUILD.to_string())
+    .bind(MEMBER_A.to_string())
+    .fetch_all(db.pool())
+    .await
+    .expect("read ledger after retrying the same interaction");
+    assert_eq!(
+        retried_requests,
+        vec![(request.0.clone(), "completed".to_owned())],
+        "same-interaction retry reuses the completed request without inserting a row"
+    );
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            "deletion-receipt",
+            Some(&request.0),
+        ))
+        .await;
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_B,
+            "deletion-receipt",
+            Some(&request.0),
+        ))
+        .await;
+
+    // Change only the interaction id: a new tap must not reuse the completed
+    // request even though the authenticated guild and member are unchanged.
+    let mut next_delete = delete.clone();
+    next_delete.id = Id::new(NEXT_DELETE_INTERACTION);
+    runtime.on_interaction(&next_delete).await;
+    let requests: Vec<(String, String)> = sqlx::query_as(
+        "SELECT request_id, status FROM retention_deletion_requests \
+         WHERE guild_id = $1 AND user_id = $2",
+    )
+    .bind(PRIVACY_GUILD.to_string())
+    .bind(MEMBER_A.to_string())
+    .fetch_all(db.pool())
+    .await
+    .expect("read ledger after a distinct deletion interaction");
+    assert_eq!(requests.len(), 2, "a distinct tap queues a second request");
+    assert!(
+        requests.contains(&(request.0.clone(), "completed".to_owned())),
+        "the original completed request remains settled"
+    );
+    let (next_request_id, next_status) = requests
+        .iter()
+        .find(|(request_id, _)| request_id != &request.0)
+        .expect("the new interaction has a different request id");
+    assert_eq!(next_status, "pending");
+
+    let edits: Vec<serde_json::Value> = mock
+        .requests()
+        .iter()
+        .filter(|request| request.method == "PATCH" && request.path.ends_with("/@original"))
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    assert_eq!(
+        edits.len(),
+        7,
+        "each dispatched command completes its defer"
+    );
+    assert!(edits[0]["content"].as_str().unwrap().contains("pending"));
+    assert!(edits[1]["content"].as_str().unwrap().contains("pending"));
+    assert_eq!(
+        edits[2]["content"], "Privacy command failed; try again.",
+        "another member cannot read the request status"
+    );
+    let retry_reply = edits[3]["content"].as_str().unwrap();
+    assert!(retry_reply.contains(&request.0));
+    assert!(retry_reply.contains("already accepted"));
+    assert!(retry_reply.contains("check its current status"));
+    assert!(!retry_reply.contains("queued"));
+    assert!(edits[4]["content"]
+        .as_str()
+        .unwrap()
+        .contains("erasable rows in the member erasure plan"));
+    assert_eq!(
+        edits[5]["content"], "Privacy command failed; try again.",
+        "another member cannot read the completion receipt"
+    );
+    let next_reply = edits[6]["content"].as_str().unwrap();
+    assert!(next_reply.contains("queued as pending"));
+    assert!(next_reply.contains(next_request_id));
+    assert!(!next_reply.contains(&request.0));
+    mock.shutdown().await;
+    db.close().await.expect("drop own disposable database");
+}
+
+/// `/privacy opt-out` abuse guards through gateway dispatch: a repeat tap
+/// while suppressed returns the already-opted-out reply, and a rapid re-opt
+/// right after opt-in returns the cooldown reply. Both early returns skip
+/// `opt_out_member` — the only `LOCK TABLE ... SHARE ROW EXCLUSIVE` on this
+/// path — so neither writes a new receipt. Backdating the receipt past the
+/// cooldown restores the full purge. Receipt count is the observable proxy:
+/// every purge writes exactly one receipt, every skipped purge writes none.
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb and mock REST only"]
+async fn privacy_command_repeat_opt_out_skips_purge_and_cooldown_blocks_rapid_reopt() {
+    use two_bot_cutover::db::{CutoverDb, FunnelWrite};
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test bootstrap URL");
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .expect("migrated test database; no credential fallback");
+    let cutover = CutoverDb::from_pool(db.pool().clone());
+    const GUARD_GUILD: u64 = 100000000000000421;
+    const GUARD_MEMBER: u64 = 100000000000000422;
+    let guild_s = GUARD_GUILD.to_string();
+    let member_s = GUARD_MEMBER.to_string();
+    let (inserted, _) = two_bot_cutover::db::record_event(
+        &cutover,
+        &FunnelWrite {
+            member_id: Some(member_s.clone()),
+            guild_id: guild_s.clone(),
+            event_type: "first_message".to_owned(),
+            occurred_at: "2026-10-12T00:00:00Z".to_owned(),
+            source: "privacy-guard-fixture".to_owned(),
+            metadata: Some("{}".to_owned()),
+        },
+    )
+    .await
+    .expect("seed persists before the opt-out");
+    assert!(inserted, "seed row for the guard member");
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
+    let mut privacy_gates = gates(false, false);
+    privacy_gates.configured_guild = Some(GUARD_GUILD);
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor.clone(),
+        router_with_commands(privacy_gates),
+        GUARD_GUILD,
+        false,
+    );
+
+    async fn receipts(pool: &sqlx::Pool<sqlx::Postgres>, guild: &str, member: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM privacy_opt_out_audit WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(guild)
+        .bind(member)
+        .fetch_one(pool)
+        .await
+        .expect("receipt reads")
+    }
+
+    async fn suppressed(pool: &sqlx::Pool<sqlx::Postgres>, guild: &str, member: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
+        )
+        .bind(guild)
+        .bind(member)
+        .fetch_one(pool)
+        .await
+        .expect("suppression reads")
+    }
+
+    // First purge: one receipt, suppression installed.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(receipts(db.pool(), &guild_s, &member_s).await, 1);
+    assert!(suppressed(db.pool(), &guild_s, &member_s).await);
+
+    // Repeat tap while suppressed: no new receipt, suppression stays.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(
+        receipts(db.pool(), &guild_s, &member_s).await,
+        1,
+        "repeat opt-out writes no new receipt, so no purge ran"
+    );
+    assert!(suppressed(db.pool(), &guild_s, &member_s).await);
+
+    // Opt back in clears suppression without a receipt.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-in"),
+        ))
+        .await;
+    assert!(!suppressed(db.pool(), &guild_s, &member_s).await);
+    assert_eq!(receipts(db.pool(), &guild_s, &member_s).await, 1);
+
+    // Rapid re-opt inside the cooldown: blocked, still no receipt and no
+    // suppression reinstall.
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(
+        receipts(db.pool(), &guild_s, &member_s).await,
+        1,
+        "cooldown re-opt writes no new receipt, so no purge ran"
+    );
+    assert!(
+        !suppressed(db.pool(), &guild_s, &member_s).await,
+        "cooldown path installs no suppression"
+    );
+
+    // Past the cooldown the purge runs again: backdate the receipt, then a
+    // fresh opt-out receipts and suppresses.
+    sqlx::query(
+        "UPDATE privacy_opt_out_audit
+         SET opted_out_at = clock_timestamp() - make_interval(mins => 11)
+         WHERE guild_id = $1 AND member_id = $2",
+    )
+    .bind(&guild_s)
+    .bind(&member_s)
+    .execute(db.pool())
+    .await
+    .expect("backdate writes");
+    runtime
+        .on_interaction(&privacy_interaction_in(
+            GUARD_GUILD,
+            GUARD_MEMBER,
+            Some("opt-out"),
+        ))
+        .await;
+    assert_eq!(
+        receipts(db.pool(), &guild_s, &member_s).await,
+        2,
+        "post-cooldown opt-out purges again"
+    );
+    assert!(suppressed(db.pool(), &guild_s, &member_s).await);
+
+    let edits: Vec<serde_json::Value> = mock
+        .requests()
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.ends_with("/@original"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(edits.len(), 5, "one completion edit per command");
+    let text = |index: usize| {
+        edits[index]["content"]
+            .as_str()
+            .expect("edit carries text")
+            .to_owned()
+    };
+    assert!(
+        text(0).contains("opted out of analytics"),
+        "first purge confirms, got: {}",
+        text(0)
+    );
+    assert!(
+        text(1).contains("already opted out"),
+        "repeat tap reports suppression, got: {}",
+        text(1)
+    );
+    assert!(
+        text(2).contains("back on"),
+        "opt-in confirms, got: {}",
+        text(2)
+    );
+    assert!(
+        text(3).contains("recently"),
+        "cooldown asks to retry later, got: {}",
+        text(3)
+    );
+    assert!(
+        text(4).contains("opted out of analytics"),
+        "post-cooldown purge confirms, got: {}",
+        text(4)
+    );
+    mock.shutdown().await;
+    db.close().await.expect("drop own disposable database");
 }

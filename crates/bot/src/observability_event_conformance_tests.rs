@@ -80,7 +80,7 @@ const SHUTDOWN_RS_EVENTS: [&str; 2] = [
 const JOBS_RS_EVENTS: [&str; 1] = ["periodic job failed"];
 
 /// `crates/bot/src/voice_rooms.rs`: the cataloged voice messages.
-const VOICE_RS_CATALOG_MESSAGES: [&str; 16] = [
+const VOICE_RS_CATALOG_MESSAGES: [&str; 18] = [
     "voice room rename decision",
     "voice join completed",
     "voice_operation succeeded",
@@ -97,11 +97,13 @@ const VOICE_RS_CATALOG_MESSAGES: [&str; 16] = [
     "voice creator revalidation failed; keeping the cached view",
     "voice creator refresh failed; keeping the cached view",
     "voice halt re-probe skipped: Discord credential latch set",
+    "voice admin store failed",
+    "temp-voice boot setting invalid; refusing voice runtime",
 ];
 
 /// `voice_event` field values (`crates/bot/src/voice_rooms.rs`), the bounded
 /// voice vocabulary that rides the gateway sink.
-const VOICE_EVENT_VALUES: [&str; 7] = [
+const VOICE_EVENT_VALUES: [&str; 8] = [
     "voice_join",
     "voice_join_received",
     "voice_operation",
@@ -109,6 +111,7 @@ const VOICE_EVENT_VALUES: [&str; 7] = [
     "voice_reconcile",
     "voice_dead_letter",
     "voice_creator_orphan",
+    "voice_admin_store",
 ];
 
 /// Metric event labels, in `two_bot_core::metrics::EVENTS` order. Unknown
@@ -194,23 +197,30 @@ const MAIN_RS_ADJACENT: [&str; 14] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 16] = [
+const VOICE_RS_ADJACENT: [&str; 23] = [
     "voice succession refused",
-    "voice actor load failed; actor respawns on the next guild snapshot",
+    "voice actor load failed; retrying with capped backoff",
+    "voice actor load failed; credential refused, not retrying",
     "voice notice settings unreadable",
     "voice notice had no working destination",
+    "voice notice configured channel failed; trying fallback",
     "voice create reservation settle failed",
     "import preview planned an apply; refusing without writing",
     "voice vote response failed; not retried",
     "voice ballot response failed; not retried",
     "voice name modal response failed; not retried",
     "voice acknowledgement failed; command not executed",
+    "voice responder saturated; interaction dropped without acknowledgement (sampled)",
     "voice response completion failed; not retried",
     "voice dispatch turn exceeded observe bound",
     "voice halt re-probe timed out",
     "voice halt re-probe: store still refusing",
     "voice worker halt cleared: store credentials healthy",
     "voice worker stuck: queued actions with no progress",
+    "stored empty-grace override out of range; using boot fallback",
+    "stored invite-code override invalid; using vanity fallback",
+    "temp-voice admission setting invalid; using default",
+    "voice live view was not ready on a connected gateway; republished from cache",
 ];
 
 // Test-only emissions inside the scanned files' `#[cfg(test)]` modules. They
@@ -718,7 +728,7 @@ fn eventsub_revocation_ack_carries_a_bounded_reason() {
 /// vocabulary. The file is permanent, so it is read at compile time; the
 /// message set, the bounded `event` field, the `error_class` tokens and the
 /// `status` tokens each fail closed when renamed or added without a catalog row.
-const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 11] = [
+const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 14] = [
     "eventsub reconcile parked: TWO_EVENTSUB is not exactly 1",
     "eventsub reconcile refused: callback configuration is invalid",
     "eventsub reconcile parked: broadcaster allowlist is empty, no subscriptions mutated",
@@ -730,8 +740,11 @@ const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 11] = [
     "eventsub subscriptions re-created but not all verified yet",
     "eventsub subscriptions reconciled",
     "eventsub reconcile failed",
+    "eventsub reconcile pass interrupted by shutdown; remaining actions skipped and subscription state unverified until the next startup pass",
+    "eventsub reconcile task ended abnormally",
+    "eventsub reconcile task did not finish within the shutdown drain; aborting it, so an in-flight remote mutation outcome is uncertain until the next startup pass re-checks",
 ];
-const EVENTSUB_RECONCILE_ERROR_CLASSES: [&str; 7] = [
+const EVENTSUB_RECONCILE_ERROR_CLASSES: [&str; 10] = [
     "reconcile_prior_failed",
     "reconcile_action_failed",
     "reconcile_unhealthy",
@@ -739,6 +752,9 @@ const EVENTSUB_RECONCILE_ERROR_CLASSES: [&str; 7] = [
     "reconcile_config_invalid",
     "reconcile_no_broadcasters",
     "reconcile_failed",
+    "reconcile_shutdown_interrupted",
+    "reconcile_task_failed",
+    "reconcile_shutdown_drain_exceeded",
 ];
 const EVENTSUB_RECONCILE_STATUSES: [&str; 3] = ["parked", "healthy", "pending"];
 const EVENTSUB_RECONCILE_EVENT_FIELD: &str = "eventsub_reconcile";

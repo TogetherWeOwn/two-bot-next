@@ -104,13 +104,71 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends python3 python3-pip postgresql-client socat >/dev/null
           rm -rf /var/lib/apt/lists/*
+          set -e
+          # /etc/hosts is mounted in the job container; sed -i cannot rename over it.
+          # Remove any runner/image mapping first so resolution uses the
+          # disposable service's current job-scoped address.
+          hosts_tmp="${RUNNER_TEMP:?RUNNER_TEMP must be set}/hosts"
+          sed -E 's/(^|[[:space:]])agent-testdb([[:space:]]|$)/ /g' /etc/hosts > "$hosts_tmp"
+          cat "$hosts_tmp" > /etc/hosts
+          rm -f "$hosts_tmp"
+          # Resolve the disposable service and pin its job-scoped address so
+          # long database runs do not depend on service-alias DNS staying up.
+          service_ip=""
+          for attempt in $(seq 1 30); do
+            service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk 'NR == 1 { print $1; exit }')" || service_ip=""
+            if [[ "$service_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+              break
+            fi
+            service_ip=""
+            sleep 1
+          done
+          if [ -z "$service_ip" ]; then
+            echo "agent-testdb did not resolve to an IPv4 address"
+            exit 1
+          fi
+          printf '%s agent-testdb\n' "$service_ip" >> /etc/hosts
+          pinned_ip="$(getent ahostsv4 agent-testdb | awk 'NR == 1 { print $1; exit }')"
+          if [ "$pinned_ip" != "$service_ip" ]; then
+            echo "agent-testdb hosts pin did not take effect"
+            exit 1
+          fi
           nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
           for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
           exit 1
 
+      # Disk guard (run 39209332791): the ignored-db-stores lane died mid-suite
+      # with Postgres `PANIC: could not write to file "pg_wal/xlogtemp.*": No
+      # space left on device` on a 1 GiB tmpfs, and two Oct 2 main heads died
+      # with 98 MB left on the job-container overlay at link time. A runner
+      # that starts exhausted cannot finish a Rust build, so fail fast here
+      # with a clear infra verdict instead of a mid-suite PANIC. Service
+      # containers start before any step runs and steps see only the job
+      # container, so host-side reclaims (docker prune, toolchain removal) are
+      # not possible from here; the tmpfs-side mitigation is the bounded WAL
+      # budget in the prepare step plus the storage-headroom report.
+      - name: Guard runner disk headroom
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h / "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          du -sh "$GITHUB_WORKSPACE" 2>/dev/null || true
+          # 1 GiB free on both the job-container overlay (/) and the
+          # host-mounted workspace: below that the toolchain install and cache
+          # restore cannot fit, so stop now with an infra verdict (rerun).
+          floor=1073741824
+          for mount in / "$GITHUB_WORKSPACE"; do
+            free_bytes=$(df -B1 --output=avail "$mount" | tail -n 1 | tr -d '[:space:]')
+            echo "disk headroom on $mount: $free_bytes bytes free (floor $floor)"
+            if [ "$free_bytes" -lt "$floor" ]; then
+              echo "::error::runner disk exhausted: $mount has $free_bytes bytes free, below the $floor-byte floor. Infra flake: rerun the job."
+              exit 1
+            fi
+          done
+
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
         # Continue so the retry below can reinstall the same pin; it fails closed.
@@ -175,7 +233,7 @@ jobs:
           fi
 
       - name: Start sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       # Restore-only: the warm `check` entry in check.yml owns the registry
       # write, so this step never saves. sccache is the only shared-cache
@@ -195,10 +253,67 @@ jobs:
       - name: Prepare isolated test databases
         shell: bash
         run: |
+          # The database service stores data and WAL on a 1 GiB tmpfs. This
+          # lane runs the workspace lib/bins suites against it. Unbounded WAL
+          # (the PG18 default max_wal_size is 1GB) filled the stores lane's
+          # tmpfs in run 39209332791 with `PANIC: could not write to file
+          # "pg_wal/xlogtemp.*": No space left on device`. max_wal_size is a
+          # soft checkpoint target, not a hard ceiling: heavy WAL can exceed
+          # it, so keep recycling bounded with headroom for relation files and
+          # segment creation (same bound as the check.yml lanes). The pre/post
+          # suite reports bracket the run for future budget tuning.
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_wal_size = '512MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET min_wal_size = '64MB'"
+          psql 'postgres://agent_test@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'
           createdb -h agent-testdb -U agent_test two_bot_test_ci
           createdb -h agent-testdb -U agent_test two_next_backup_ci
           createdb -h agent-testdb -U agent_test two_next_backup_publication_ci
           printf 'PAPERCLIP_RUN_SCRATCH_DIR=%s/two-bot-check-scratch\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Verify disposable Postgres defaults
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          if any(name.startswith('PG') for name in os.environ):
+              raise SystemExit('unset ambient libpq PG* configuration before probing the test service')
+          expected = {
+              'data_directory': '/var/lib/postgresql/18/docker',
+              'fsync': 'on',
+              'full_page_writes': 'on',
+              'synchronous_commit': 'on',
+              'max_wal_size': '512MB',
+              'min_wal_size': '64MB',
+          }
+          fields = ', '.join(f"'{key}', current_setting('{key}')" for key in expected)
+          settings = json.loads(subprocess.check_output([
+              'psql', 'postgres://agent_test:@agent-testdb:5432/two_bot_test_ci',
+              '-X', '-w', '-At', '-v', 'ON_ERROR_STOP=1',
+              '-c', f'SELECT json_build_object({fields})',
+          ], text=True, env=os.environ | {
+              'PGPASSFILE': '/dev/null', 'PGSSLMODE': 'disable',
+              'PGOPTIONS': '-c statement_timeout=5000',
+          }))
+          if settings != expected:
+              raise SystemExit('disposable Postgres data path or durability defaults changed')
+          print('Disposable Postgres defaults:', json.dumps(settings, sort_keys=True))
+          PY
+
+      # Storage-headroom evidence (run 39209332791): the tmpfs holding PGDATA
+      # is invisible from this container, so report what Postgres sees: per-DB
+      # sizes, WAL segment bytes, and the bounded WAL budget. Runs right after
+      # verify so the sizes give the next incident a prepare-time baseline.
+      # Fail-closed: a broken report must not read as headroom.
+      - name: Report Postgres storage headroom
+        shell: bash
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
 
       # Required scope: workspace lib/bins via nextest (retries=1 and
       # JUnit come from .config/nextest.toml profile `ci`). A fail-then-pass
@@ -246,6 +361,18 @@ jobs:
           fi
           test -f junit.xml
           exit $status
+
+      # Post-suite storage evidence: max_wal_size is a soft target, so the
+      # pre-suite report cannot show peak WAL. This always-runs report brackets
+      # the run with post-suite sizes for the next ENOSPC triage.
+      - name: Report Postgres storage headroom (post-suite)
+        if: always()
+        shell: bash
+        run: |
+          psql 'postgres://agent_test:@agent-testdb:5432/agent_test' -X -w -v ON_ERROR_STOP=1 \
+            -c "SELECT datname AS database, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database WHERE datistemplate = false ORDER BY 1" \
+            -c "SELECT pg_size_pretty(COALESCE(sum(size), 0)::bigint) AS wal_bytes, count(*) AS wal_segments FROM pg_ls_waldir()" \
+            -c "SELECT name, setting FROM pg_settings WHERE name IN ('data_directory', 'max_wal_size', 'min_wal_size') ORDER BY 1"
 
       - name: sccache stats (advisory speed evidence)
         shell: bash

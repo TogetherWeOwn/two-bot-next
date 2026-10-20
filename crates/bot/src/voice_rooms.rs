@@ -24,7 +24,7 @@ use std::{
 use crate::voice_room_plan::{
     category_room_ids, plan_room_diagnosed, RoomPlanError, RoomPlanInput, BOT_ROOM_ACCESS,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
@@ -47,7 +47,7 @@ use twilight_model::{
         interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
     },
     id::{
-        marker::{AttachmentMarker, RoleMarker, UserMarker},
+        marker::{AttachmentMarker, GuildMarker, RoleMarker, UserMarker},
         Id,
     },
 };
@@ -68,7 +68,10 @@ use two_bot_core::{
         diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
         DIFF_HASH_CHARS,
     },
-    voice_create_admission::{CreateAdmissionConfig, RefusalReason},
+    voice_create_admission::{
+        CreateAdmissionConfig, RefusalReason, MAX_CREATE_COOLDOWN_SECS, MAX_ROOMS_PER_GUILD,
+        MAX_ROOMS_PER_USER, MIN_CREATE_COOLDOWN_SECS, MIN_ROOMS_PER_GUILD, MIN_ROOMS_PER_USER,
+    },
     voice_custom_id::{
         import_cancel_custom_id, import_confirm_custom_id, parse_voice_custom_id, VoiceAction,
         IMPORT_HASH_CHARS,
@@ -103,7 +106,7 @@ use two_bot_core::{
         OverwriteTarget as TextOverwriteTarget, TextChannelPlan, VoiceRoomFacts,
         DEFAULT_TEXT_CHANNEL_NAME, MAX_TEXT_CHANNEL_NAME_CHARS,
     },
-    voice_utilities::{invite_render, ping_render},
+    voice_utilities::{invite_render, is_valid_invite_code, ping_render},
     voice_vote_kick::{
         VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError, VoteKickRef,
         VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts,
@@ -115,7 +118,7 @@ use two_bot_core::{
     AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
-use two_bot_cutover::voice_rooms::{CreateClaim, OwnerGrantIntent, PgRoomStore};
+use two_bot_cutover::voice_rooms::{CreateClaim, JoinGrantIntent, OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
     RoomHttp, RoomHttpError,
@@ -349,16 +352,16 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         guild: Snowflake,
     ) -> impl Future<Output = Result<BTreeMap<Snowflake, BTreeSet<Snowflake>>, StoreError>> + Send;
-    /// Record an approval's intent before granting Connect. Idempotent; a
-    /// retried intent is a no-op. `Ok(false)` when the room has no database
-    /// row, so a grant never outlives its room.
+    /// Record an approval's intent before granting Connect, distinguishing a
+    /// fresh insert from an existing obligation that may already hold access.
+    /// A missing room writes nothing, so a grant never outlives its room.
     fn save_join_grant(
         &self,
         guild: Snowflake,
         room: Snowflake,
         member: Snowflake,
-    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
-    /// Retire a grant after its revocation landed (or its grant was refused).
+    ) -> impl Future<Output = Result<JoinGrantIntent, StoreError>> + Send;
+    /// Retire a grant after a safe revoke (or a fresh intent's PUT was refused).
     /// Idempotent: retiring an absent grant is success.
     fn remove_join_grant(
         &self,
@@ -598,7 +601,7 @@ impl RoomPersistence for PgRoomStore {
         guild: Snowflake,
         room: Snowflake,
         member: Snowflake,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<JoinGrantIntent, StoreError> {
         self.save_join_grant(guild, room, member)
             .await
             .map_err(store_error)
@@ -624,6 +627,65 @@ impl RoomPersistence for PgRoomStore {
 /// the lobby.
 fn temp_voice_admission() -> CreateAdmissionConfig {
     CreateAdmissionConfig::new(1, 40, 0).expect("temp-voice admission limits are in range")
+}
+
+/// Boot-time temp-voice create-admission keys: cold-class settings resolved
+/// once at boot into every guild worker's durable create admission.
+const ADMISSION_MAX_PER_USER_KEY: &str = "TWO_TEMP_VOICE_MAX_PER_USER";
+const ADMISSION_MAX_PER_GUILD_KEY: &str = "TWO_TEMP_VOICE_MAX_PER_GUILD";
+const ADMISSION_COOLDOWN_KEY: &str = "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS";
+
+/// Resolve the boot temp-voice create admission from the process environment
+/// (shaped like `configured_protected_channels`). Each knob validates
+/// independently against the [`CreateAdmissionConfig`] ranges: a
+/// missing/blank value keeps today's effective default, while a
+/// present-but-unparsable or out-of-range value warns once with the setting
+/// key and reason `invalid_value` and fails closed to that knob's default
+/// only. Unset keeps today's (1, 40, 0) — deliberately not the legacy core
+/// default's 30 s cooldown, which silently kept members who rejoined the
+/// creator in the lobby.
+pub fn configured_admission(env: impl Fn(&str) -> Option<String>) -> CreateAdmissionConfig {
+    let user = admission_knob(
+        env(ADMISSION_MAX_PER_USER_KEY).as_deref(),
+        ADMISSION_MAX_PER_USER_KEY,
+        1,
+        MIN_ROOMS_PER_USER,
+        MAX_ROOMS_PER_USER,
+    );
+    let guild = admission_knob(
+        env(ADMISSION_MAX_PER_GUILD_KEY).as_deref(),
+        ADMISSION_MAX_PER_GUILD_KEY,
+        40,
+        MIN_ROOMS_PER_GUILD,
+        MAX_ROOMS_PER_GUILD,
+    );
+    let cooldown = admission_knob(
+        env(ADMISSION_COOLDOWN_KEY).as_deref(),
+        ADMISSION_COOLDOWN_KEY,
+        0,
+        MIN_CREATE_COOLDOWN_SECS,
+        MAX_CREATE_COOLDOWN_SECS,
+    );
+    CreateAdmissionConfig::new(user, guild, cooldown).expect("admission knobs validated per knob")
+}
+
+/// One admission knob: blank counts as unset (silent), anything else must
+/// parse as a whole number inside `min..=max` or it warns and fails closed.
+fn admission_knob(raw: Option<&str>, key: &str, default: u32, min: u32, max: u32) -> u32 {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return default;
+    };
+    match raw.parse::<u32>() {
+        Ok(value) if (min..=max).contains(&value) => value,
+        _ => {
+            warn!(
+                key = key,
+                reason = "invalid_value",
+                "temp-voice admission setting invalid; using default"
+            );
+            default
+        }
+    }
 }
 
 /// Wall clock in Unix seconds for the durable create admission; a clock
@@ -754,11 +816,84 @@ const VOICE_ACTOR_LOAD_WARN_INTERVAL_SECS: u64 = 300;
 /// Last wall-clock second a load-failure warn was emitted.
 static VOICE_ACTOR_LOAD_WARN_LAST_SECS: AtomicU64 = AtomicU64::new(0);
 
+/// Deadline for one actor initialization load attempt. The load is
+/// store reads only (no Discord writes), so abandoning a hung attempt and
+/// retrying replays nothing; a healthy load finishes far inside this.
+const VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// First retry delay after a failed initialization attempt; each further
+/// consecutive failure doubles it up to [`VOICE_ACTOR_LOAD_RETRY_MAX`].
+const VOICE_ACTOR_LOAD_RETRY_INITIAL: Duration = Duration::from_secs(1);
+/// Cap on the initialization retry delay: a guild whose store stays down
+/// retries at most once a minute, never a hot loop, and recovers on its
+/// own within a minute of the store healing.
+const VOICE_ACTOR_LOAD_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Delay before retrying actor initialization after `failed_attempts`
+/// consecutive failures (1-based): exponential from
+/// [`VOICE_ACTOR_LOAD_RETRY_INITIAL`], capped at
+/// [`VOICE_ACTOR_LOAD_RETRY_MAX`]. Pure so the bounds are unit-pinned.
+fn voice_actor_load_backoff(failed_attempts: u32) -> Duration {
+    let doublings = failed_attempts.saturating_sub(1).min(6);
+    VOICE_ACTOR_LOAD_RETRY_INITIAL
+        .saturating_mul(1 << doublings)
+        .min(VOICE_ACTOR_LOAD_RETRY_MAX)
+}
+
+#[cfg(test)]
+mod voice_actor_load_backoff_tests {
+    use super::{
+        voice_actor_load_backoff, Duration, VOICE_ACTOR_LOAD_RETRY_INITIAL,
+        VOICE_ACTOR_LOAD_RETRY_MAX,
+    };
+
+    #[test]
+    fn backoff_doubles_from_initial_and_caps() {
+        assert_eq!(voice_actor_load_backoff(1), VOICE_ACTOR_LOAD_RETRY_INITIAL);
+        assert_eq!(
+            voice_actor_load_backoff(2),
+            VOICE_ACTOR_LOAD_RETRY_INITIAL * 2
+        );
+        assert_eq!(
+            voice_actor_load_backoff(3),
+            VOICE_ACTOR_LOAD_RETRY_INITIAL * 4
+        );
+        assert_eq!(voice_actor_load_backoff(7), VOICE_ACTOR_LOAD_RETRY_MAX);
+        assert_eq!(voice_actor_load_backoff(1_000), VOICE_ACTOR_LOAD_RETRY_MAX);
+        assert!(voice_actor_load_backoff(u32::MAX) <= VOICE_ACTOR_LOAD_RETRY_MAX);
+        // Ten virtual minutes of failures stay far from a hot loop and
+        // the first retry lands promptly after a one-off blip.
+        let mut elapsed = Duration::ZERO;
+        let mut attempts = 1u32;
+        while elapsed < Duration::from_secs(600) {
+            elapsed += voice_actor_load_backoff(attempts);
+            attempts += 1;
+        }
+        assert!((2..=600).contains(&attempts), "attempts: {attempts}");
+    }
+}
+
 /// A failed `GuildRoomWorker::load` must not silently drop the guild actor:
-/// count it and warn (throttled). The actor respawns on the next guild
-/// snapshot (`publish_snapshot` on `GuildCreate`/resumed replay); meanwhile
-/// voice, channel and role events for the guild are dropped by `live_actor`.
+/// count it and warn (throttled). Transient failures retry in place with
+/// capped backoff (see [`voice_actor_load_backoff`]); a credential refusal
+/// is not transient, so it is reported once and never retried — the actor
+/// then respawns only on the next guild snapshot (`publish_snapshot` on
+/// `GuildCreate`/resumed replay), and meanwhile voice, channel and role
+/// events for the guild are dropped by `live_actor`.
 fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
+    observe_voice_actor_load_failure_kind(
+        guild,
+        &error.to_string(),
+        *error != StoreError::CredentialRefused,
+    );
+}
+
+/// A load attempt that hit [`VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT`] is a
+/// transient failure like any other: counted, warned (throttled), retried.
+fn observe_voice_actor_load_timeout(guild: Snowflake) {
+    observe_voice_actor_load_failure_kind(guild, "the store load timed out", true);
+}
+
+fn observe_voice_actor_load_failure_kind(guild: Snowflake, error: &str, retrying: bool) {
     metrics::global().db_error("other");
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -770,12 +905,48 @@ fn observe_voice_actor_load_failure(guild: Snowflake, error: &StoreError) {
             .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
-        warn!(
-            guild_id = guild.to_string(),
-            error = %error,
-            "voice actor load failed; actor respawns on the next guild snapshot"
-        );
+        if retrying {
+            warn!(
+                guild_id = guild.to_string(),
+                error = %error,
+                "voice actor load failed; retrying with capped backoff"
+            );
+        } else {
+            warn!(
+                guild_id = guild.to_string(),
+                error = %error,
+                "voice actor load failed; credential refused, not retrying"
+            );
+        }
     }
+}
+
+/// Fixed token naming a voice admin store failure without its internals.
+/// [`StoreError`] is already bounded to three variants with no driver detail,
+/// so the token is the variant in snake_case: rerun the failing admin command
+/// path for detail.
+fn admin_store_error_token(error: StoreError) -> &'static str {
+    match error {
+        StoreError::Unavailable => "unavailable",
+        StoreError::CredentialRefused => "credential_refused",
+        StoreError::Conflict => "conflict",
+    }
+}
+
+/// One operator signal per failed admin store read/write (`/access`,
+/// `/logging`, `/export`, `/import`): a fixed `op` per arm plus the bounded
+/// [`StoreError`] variant token. No settings, bytes or driver text: the reply
+/// already tells the member to retry, and the guild id plus op locate the outage.
+/// A single callsite, not one per arm: each `tracing` callsite costs
+/// release-binary bytes against the container size budget.
+fn log_admin_store_failure(op: &'static str, guild_id: Snowflake, error: StoreError) {
+    warn!(
+        voice_event = "voice_admin_store",
+        op,
+        reason = admin_store_error_token(error),
+        guild_id = guild_id.to_string(),
+        "voice admin store failed"
+    );
 }
 
 /// One structured line per executed rename decision, so a room that keeps
@@ -1301,6 +1472,12 @@ pub struct GuildSnapshot {
     pub member_roles: HashMap<Snowflake, Vec<Snowflake>>,
 }
 
+/// Exact gateway evidence used to build a whole-entry overwrite write.
+struct OverwriteSnapshot {
+    generation: u64,
+    overwrites: Vec<PermissionOverwrite>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinTicket {
     member_id: Snowflake,
@@ -1332,6 +1509,12 @@ fn wall_ms() -> u64 {
 #[derive(Debug, Default)]
 pub(crate) struct LiveState {
     ready: bool,
+    /// When the gateway last reported itself connected (READY or RESUMED
+    /// handled) while this live view was still not ready. `None` while the
+    /// view is ready or the transport is down. Joins are silently dropped
+    /// for as long as this is set, so its age is exported per actor tick as
+    /// `two_bot_voice_live_not_ready_seconds` for the host watchdog.
+    not_ready_since: Option<tokio::time::Instant>,
     generation: u64,
     next_transition: u64,
     next_channel_revision: u64,
@@ -1381,6 +1564,7 @@ const EMPTY_ROOM_GRACE: Duration = Duration::from_secs(60);
 
 /// Boot-only infrastructure protection. Stored settings remain unwired; these
 /// already-forwarded process keys must never be inferred from room rows.
+/// On refusal, return only the fixed setting key, never its value or parser error.
 fn configured_protected_channels(
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<HashSet<Snowflake>, &'static str> {
@@ -1396,11 +1580,9 @@ fn configured_protected_channels(
         };
         for value in raw.split(',') {
             let value = value.trim();
-            let id = value
-                .parse::<Snowflake>()
-                .map_err(|_| "invalid protected channel id")?;
+            let id = value.parse::<Snowflake>().map_err(|_| key)?;
             if id == 0 || value != id.to_string() || (!multiple && raw.contains(',')) {
-                return Err("invalid protected channel id");
+                return Err(key);
             }
             protected.insert(id);
         }
@@ -1738,6 +1920,7 @@ impl LiveGuild {
             live.refresh_empty_since(channel);
         }
         live.ready = true;
+        live.not_ready_since = None;
         true
     }
 
@@ -1746,6 +1929,34 @@ impl LiveGuild {
         live.ready = false;
         live.generation += 1;
         live.empty_since.clear();
+    }
+
+    /// Transport loss: the view is not ready, and that is expected until the
+    /// next READY/RESUMED, so the not-ready-while-connected clock stops too.
+    pub fn transport_lost(&self) {
+        self.disconnect();
+        self.write_state().not_ready_since = None;
+    }
+
+    /// The gateway is connected again (READY or RESUMED handled). A view
+    /// that is still not ready starts (or keeps) its not-ready clock; the
+    /// first stamp wins so repeated heal attempts cannot reset the age.
+    pub fn gateway_connected(&self, now: tokio::time::Instant) {
+        let mut live = self.write_state();
+        if !live.ready {
+            live.not_ready_since.get_or_insert(now);
+        }
+    }
+
+    /// Whole seconds this view has been not ready while the gateway was
+    /// connected; 0 while ready or while the transport is down.
+    #[must_use]
+    pub fn not_ready_secs(&self, now: tokio::time::Instant) -> u64 {
+        let live = self.read_state();
+        match live.not_ready_since {
+            Some(since) if !live.ready => now.saturating_duration_since(since).as_secs(),
+            _ => 0,
+        }
     }
 
     /// V10 health check: the bot's missing Manage Channels, Move Members,
@@ -2128,10 +2339,27 @@ impl LiveGuild {
         live.empty_since.remove(&channel);
     }
 
-    /// Guard one step of an owner-overwrite sequence. The exact overwrite
+    /// Unknown overwrites are not an empty ACL. Capture ready, known evidence
+    /// for a member grant/revoke before any awaited persistence or transport.
+    fn overwrite_snapshot(&self, channel_id: Snowflake) -> Option<OverwriteSnapshot> {
+        let live = self.read_state();
+        if !live.ready {
+            return None;
+        }
+        Some(OverwriteSnapshot {
+            generation: live.generation,
+            overwrites: live
+                .channels
+                .get(&channel_id)?
+                .permission_overwrites
+                .clone()?,
+        })
+    }
+
+    /// Guard one step of an overwrite sequence. The exact overwrite
     /// snapshot fences unrelated gateway changes while allowing a successful
     /// step's own CHANNEL_UPDATE echo to advance the channel revision.
-    fn owner_overwrite_guard(
+    fn overwrite_guard(
         &self,
         channel_id: Snowflake,
         generation: u64,
@@ -2146,7 +2374,7 @@ impl LiveGuild {
                     channel
                         .permission_overwrites
                         .as_deref()
-                        .is_some_and(|current| same_owner_overwrite_snapshot(current, &expected))
+                        .is_some_and(|current| same_overwrite_snapshot(current, &expected))
                 })
                 && state
                     .permissions(live.guild_id, channel_id)
@@ -2159,7 +2387,7 @@ impl LiveGuild {
     /// Advance the cached snapshot after a successful target write. Discord
     /// may have echoed the write already; accept either the prior or resulting
     /// overwrite set, but never overwrite a different gateway observation.
-    fn advance_owner_overwrites(
+    fn advance_overwrites(
         &self,
         channel_id: Snowflake,
         generation: u64,
@@ -2167,7 +2395,10 @@ impl LiveGuild {
         after: &[PermissionOverwrite],
     ) -> bool {
         let mut live = self.write_state();
-        if !live.ready || live.generation != generation {
+        if !live.ready
+            || live.generation != generation
+            || !private_runtime::can_edit_overwrites(live.permissions(self.guild_id, channel_id))
+        {
             return false;
         }
         let Some(channel) = live.channels.get_mut(&channel_id) else {
@@ -2176,10 +2407,10 @@ impl LiveGuild {
         let Some(current) = channel.permission_overwrites.as_deref() else {
             return false;
         };
-        if same_owner_overwrite_snapshot(current, after) {
+        if same_overwrite_snapshot(current, after) {
             return true;
         }
-        if !same_owner_overwrite_snapshot(current, before) {
+        if !same_overwrite_snapshot(current, before) {
             return false;
         }
         channel.permission_overwrites = Some(after.to_vec());
@@ -2288,10 +2519,7 @@ fn health_overwrites(guild_id: Snowflake, channel: &Channel) -> Vec<HealthOverwr
         .collect()
 }
 
-fn same_owner_overwrite_snapshot(
-    left: &[PermissionOverwrite],
-    right: &[PermissionOverwrite],
-) -> bool {
+fn same_overwrite_snapshot(left: &[PermissionOverwrite], right: &[PermissionOverwrite]) -> bool {
     left.len() == right.len() && left.iter().all(|overwrite| right.contains(overwrite))
 }
 
@@ -2345,9 +2573,9 @@ async fn write_owner_overwrite_delta<H: RoomWrites>(
         next.retain(|overwrite| {
             !(overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == member)
         });
-        let guard = live.owner_overwrite_guard(channel, generation, current.clone());
+        let guard = live.overwrite_guard(channel, generation, current.clone());
         http.delete_overwrite(channel, member, guard).await?;
-        if !live.advance_owner_overwrites(channel, generation, &current, &next) {
+        if !live.advance_overwrites(channel, generation, &current, &next) {
             return Err(RoomHttpError::Cancelled);
         }
         current = next;
@@ -2362,14 +2590,14 @@ async fn write_owner_overwrite_delta<H: RoomWrites>(
         } else {
             next.push(overwrite);
         }
-        let guard = live.owner_overwrite_guard(channel, generation, current.clone());
+        let guard = live.overwrite_guard(channel, generation, current.clone());
         http.put_overwrite(channel, overwrite, guard).await?;
-        if !live.advance_owner_overwrites(channel, generation, &current, &next) {
+        if !live.advance_overwrites(channel, generation, &current, &next) {
             return Err(RoomHttpError::Cancelled);
         }
         current = next;
     }
-    if !same_owner_overwrite_snapshot(&current, after) {
+    if !same_overwrite_snapshot(&current, after) {
         return Err(RoomHttpError::Cancelled);
     }
     Ok(())
@@ -2650,6 +2878,16 @@ pub struct GuildRoomWorker<S, H> {
     name_settings_loaded: bool,
     /// Actor clock of the last settings read (periodic reload).
     name_settings_read_ms: Option<u64>,
+    /// Boot fallback for the empty-room grace (`TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS`
+    /// at boot). A stored per-guild row overrides it live; unset and
+    /// out-of-range rows keep it.
+    empty_grace_fallback: Duration,
+    /// Revision of the live snapshot the empty grace was last resolved from.
+    /// Revision-gated so steady-state maintenance costs two mutex reads.
+    empty_grace_revision: Option<i64>,
+    /// Live-settings source for the stored empty-grace override (production
+    /// poller snapshot; tests resolve explicit snapshots instead).
+    live_source: Arc<dyn Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync>,
     /// Cheap fingerprint of every input automatic names depend on; an idle
     /// guild skips the per-room work entirely.
     name_inputs: Option<u64>,
@@ -2927,8 +3165,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         // Hydrate approved Connect grants: a private room remembers its
         // approvals so a later `/public` revokes them; a grant whose room is
         // public or gone still needs its revocation, which the queue lost on
-        // restart, so it is re-queued here. The witness is retired only by a
-        // successful revoke (or a refused grant), never by this hydration.
+        // restart, so it is re-queued here. Only a safe revoke or a fresh
+        // intent's definitively refused PUT retires it, never this hydration.
         let mut pending_revokes = Vec::new();
         for (room, members) in &join_grants {
             match privacy.get_mut(room) {
@@ -2967,6 +3205,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         let guild_id = live.guild_id;
         let creators_generation = live.read_state().generation;
+        let empty_grace_fallback = live.read_state().empty_grace.unwrap_or(EMPTY_ROOM_GRACE);
         let worker = Self {
             live,
             store,
@@ -2998,6 +3237,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             name_signatures: HashMap::new(),
             name_settings_loaded,
             name_settings_read_ms: None,
+            empty_grace_fallback,
+            empty_grace_revision: None,
+            live_source: Arc::new(|| None),
             name_inputs: None,
             room_status: HashMap::new(),
             pending_status: HashMap::new(),
@@ -3051,6 +3293,31 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             );
         }
         Ok(worker)
+    }
+
+    /// Re-resolve the empty-room grace from the live snapshot. Revision-gated,
+    /// so steady-state calls cost two mutex reads. A stored change applies
+    /// without a restart; unset and out-of-range rows keep the boot fallback.
+    /// Tests pass an explicit snapshot pair.
+    pub(crate) fn refresh_empty_grace_with(
+        &mut self,
+        live: Option<&two_bot_core::settings::LiveSettings>,
+    ) {
+        let revision = live.map(|live| live.revision());
+        if self.empty_grace_revision == revision {
+            return;
+        }
+        self.empty_grace_revision = revision;
+        let guild = self.live.guild_id.to_string();
+        let grace = stored_empty_grace_with(&guild, self.empty_grace_fallback, live);
+        self.live.set_empty_grace(grace);
+    }
+
+    /// Refresh from the runtime's live-settings source (production poller
+    /// snapshot; no reader in tests, so the boot fallback stands).
+    pub(crate) fn refresh_empty_grace(&mut self) {
+        let live = (self.live_source)();
+        self.refresh_empty_grace_with(live.as_ref());
     }
 
     /// Run the create-path name filter under `policy` from here on.
@@ -4732,7 +4999,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// First working destination: the configured channel, then the guild
     /// system channel, a DM to the guild owner, and finally a creator
     /// channel's chat. A destination that fails is dropped and the next is
-    /// tried.
+    /// tried. A failing configured channel warns once (op name plus the
+    /// bounded outcome, never the notice text or the mention) so a
+    /// misconfigured channel is distinguishable from a working one; a
+    /// successful send stays silent, and so does a rate limit, which is a
+    /// retry rather than an outcome (the channel may be healthy).
     async fn deliver_notice(&self, settings: &LoggingSettings, text: &str) -> bool {
         let mention = settings
             .mention_role_id
@@ -4741,13 +5012,25 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .channel_id
             .filter(|channel| self.live.text_notice_channel(*channel))
         {
-            if self
+            match self
                 .http
                 .send_notice(NoticeTarget::Channel(channel), text, mention)
                 .await
-                .is_ok()
             {
-                return true;
+                Ok(()) => return true,
+                // Rate limits are retries, never outcomes: skip the warn
+                // before the classifier, like its other callers.
+                Err(RoomHttpError::RateLimited { .. }) => {}
+                Err(error) => {
+                    let guild = self.live.guild_id.to_string();
+                    let outcome = voice_outcome_from_http(&error);
+                    warn!(
+                        guild,
+                        op = "send_notice",
+                        outcome,
+                        "voice notice configured channel failed; trying fallback"
+                    );
+                }
             }
         }
         let Some((system_channel_id, owner_id)) = self.live.notice_context() else {
@@ -6198,6 +6481,37 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     self.queue.mark_succeeded(&action);
                     return true;
                 }
+                // Member-requested renames pass the same automod name filter
+                // as every other naming path: a blocked name is refused
+                // here, before any Discord call, with the stable
+                // `name_blocked` outcome. Allowed names fall through
+                // unchanged.
+                {
+                    let owner_id = self
+                        .rooms
+                        .get(&channel_id)
+                        .map(|room| room.owner_id)
+                        .unwrap_or(channel_id);
+                    let context = NameFilterContext {
+                        guild_id: self.live.guild_id.to_string(),
+                        channel_id: channel_id.to_string(),
+                        user_id: owner_id.to_string(),
+                    };
+                    if filter_channel_name(&name, &self.name_policy, &context).is_err() {
+                        log_rename_decision(
+                            self.live.guild_id,
+                            channel_id,
+                            "name_blocked",
+                            "name_blocked",
+                            0,
+                            false,
+                        );
+                        metrics::global().voice_name("name_blocked");
+                        self.desired_names.remove(&channel_id);
+                        self.queue.mark_succeeded(&action);
+                        return true;
+                    }
+                }
                 // Flush-time uniqueness recheck (legacy 38041a1 drops a
                 // throttled rename that would now duplicate): a literal
                 // custom rename is dropped when the folded name is held by
@@ -6980,6 +7294,130 @@ enum ActorCommand {
     },
 }
 
+impl ActorCommand {
+    /// True for fire-and-forget state that can wait for the worker:
+    /// snapshots, voice frames and config swaps apply in arrival order
+    /// once it loads. Anything else carries a one-shot reply no worker
+    /// exists to answer yet (status, room commands, vote-kick, test
+    /// probes), so [`load_actor_worker`] drops it while initialization is
+    /// pending: the caller sees `None` and takes the existing "syncing,
+    /// try again shortly" path instead of hanging until recovery.
+    /// Fail-fast is the default, so a future reply-bearing variant can
+    /// never hang the init window by omission.
+    fn is_bufferable(&self) -> bool {
+        matches!(
+            self,
+            ActorCommand::Reconcile
+                | ActorCommand::Display { .. }
+                | ActorCommand::NameSettingsChanged(_)
+                | ActorCommand::RoomFactsChanged(_)
+                | ActorCommand::Join { .. }
+                | ActorCommand::CreatorAdded(_)
+                | ActorCommand::RefreshCreators
+                | ActorCommand::AccessChanged(_)
+        )
+    }
+}
+
+/// Cap on commands buffered while actor initialization is pending: voice
+/// state converges on the latest frame and `Reconcile` is idempotent, so
+/// a long outage sheds the oldest instead of growing without bound.
+const VOICE_ACTOR_INIT_BUFFER_CAP: usize = 512;
+
+/// Buffer one command that arrived during a load attempt. Everything waits
+/// (capped, oldest shed): when the attempt succeeds the worker answers the
+/// reply-bearing commands in arrival order, so a status or vote-kick sent
+/// right after the snapshot still resolves. Shedding the oldest at the cap
+/// drops its one-shot sender, so an overflowed caller fails fast with `None`.
+fn buffer_attempt_command(buffered: &mut VecDeque<ActorCommand>, command: ActorCommand) {
+    if buffered.len() >= VOICE_ACTOR_INIT_BUFFER_CAP {
+        let _ = buffered.pop_front();
+    }
+    buffered.push_back(command);
+}
+
+/// Buffer one command that arrived while backing off between attempts.
+/// Reply-bearing commands are dropped (see [`ActorCommand::is_bufferable`]);
+/// the rest apply in arrival order once the worker loads.
+fn buffer_init_command(buffered: &mut VecDeque<ActorCommand>, command: ActorCommand) {
+    if !command.is_bufferable() {
+        return;
+    }
+    buffer_attempt_command(buffered, command);
+}
+
+/// Drop buffered reply-bearing commands after a failed attempt. Their
+/// one-shot senders are dropped with them, so each waiting caller resolves
+/// to `None` (the existing "syncing" fallback) instead of hanging across
+/// an unbounded backoff window. Fire-and-forget state stays queued.
+fn purge_unanswerable_buffered(buffered: &mut VecDeque<ActorCommand>) {
+    buffered.retain(|command| command.is_bufferable());
+}
+
+#[cfg(test)]
+mod voice_actor_init_buffer_tests {
+    use super::{
+        buffer_attempt_command, buffer_init_command, purge_unanswerable_buffered, ActorCommand,
+        VecDeque, VOICE_ACTOR_INIT_BUFFER_CAP,
+    };
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn reply_bearing_commands_fail_fast_while_fire_and_forget_buffers() {
+        let mut buffered = VecDeque::new();
+        buffer_init_command(&mut buffered, ActorCommand::Reconcile);
+        buffer_init_command(&mut buffered, ActorCommand::RefreshCreators);
+        let (status_tx, mut status_rx) = oneshot::channel();
+        buffer_init_command(&mut buffered, ActorCommand::Status(status_tx));
+        let (kick_tx, _) = oneshot::channel();
+        buffer_init_command(
+            &mut buffered,
+            ActorCommand::KickRoomOf {
+                member: 7,
+                reply: kick_tx,
+            },
+        );
+        assert_eq!(
+            buffered.len(),
+            2,
+            "replies must not hang the backoff buffer"
+        );
+        assert!(matches!(buffered[0], ActorCommand::Reconcile));
+        assert!(matches!(buffered[1], ActorCommand::RefreshCreators));
+        // The dropped status sender resolves the waiter to `None` (syncing
+        // fallback) instead of hanging until recovery.
+        assert!(matches!(
+            status_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn attempt_buffers_replies_then_failure_purges_them() {
+        let mut buffered = VecDeque::new();
+        buffer_attempt_command(&mut buffered, ActorCommand::Reconcile);
+        let (status_tx, mut status_rx) = oneshot::channel();
+        buffer_attempt_command(&mut buffered, ActorCommand::Status(status_tx));
+        assert_eq!(buffered.len(), 2, "attempt must wait for replies");
+        purge_unanswerable_buffered(&mut buffered);
+        assert_eq!(buffered.len(), 1, "failure fails fast, keeps state");
+        assert!(matches!(buffered[0], ActorCommand::Reconcile));
+        assert!(matches!(
+            status_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn init_buffer_sheds_oldest_at_cap() {
+        let mut buffered = VecDeque::new();
+        for _ in 0..VOICE_ACTOR_INIT_BUFFER_CAP + 10 {
+            buffer_init_command(&mut buffered, ActorCommand::Reconcile);
+        }
+        assert_eq!(buffered.len(), VOICE_ACTOR_INIT_BUFFER_CAP);
+    }
+}
+
 /// A V2 ownership command from an interaction. `Reclaim` takes the caller's
 /// room back as its original creator (or claims one whose owner is gone);
 /// `Transfer` hands the caller's room to an occupant and makes them the
@@ -6994,7 +7432,9 @@ pub type KickReply = Result<VoteKickUpdate, KickRefusal>;
 
 /// Per-guild actor registry. Actors spawn lazily on the first complete
 /// snapshot and exit when their guild leaves (sender dropped) or their store
-/// load fails (respawned on the next guild snapshot via `UnboundedSender::is_closed`).
+/// load refuses the credential (respawned on the next guild snapshot via
+/// `UnboundedSender::is_closed`); transient load failures retry inside the
+/// spawned task instead (see `load_actor_worker`).
 /// How long an `/import` preview stays confirmable. Past that the Confirm
 /// button answers "expired" and writes nothing; the member uploads again.
 pub const PENDING_IMPORT_TTL: Duration = Duration::from_secs(15 * 60);
@@ -7053,14 +7493,26 @@ pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,
     enabled: bool,
+    /// Live-settings source for the per-guild empty-grace override. Production
+    /// reads the settings-poller snapshot; tests default to no reader (boot
+    /// fallback, byte-identical).
+    live_source: Arc<dyn Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync>,
     protected_channels: HashSet<Snowflake>,
     /// Boot creator set (the generator channel): copied into each new actor's
     /// `creator_channels` alongside the store creators loaded later.
     creator_channels: HashSet<Snowflake>,
     empty_grace: Option<Duration>,
+    /// Boot create-admission config (the three cold-class admission keys in
+    /// production): copied into each new actor's worker at spawn.
+    admission_config: Option<CreateAdmissionConfig>,
     synthetic_humans: HashSet<Snowflake>,
     seeds: AtomicU64,
     actors: Mutex<HashMap<Snowflake, GuildActor>>,
+    /// The gateway is connected as far as voice is concerned: set once READY
+    /// or RESUMED is handled, cleared by every transport `disconnect`. While
+    /// set, a live view that is not ready is a fault, not an outage, and
+    /// every dispatch retries the cached snapshot (see `heal_not_ready`).
+    gateway_connected: AtomicBool,
     /// Serializes `/access` read-modify-write cycles so two admins cannot
     /// overwrite each other's change (rare, admin-only, so one lock is enough).
     access_lock: tokio::sync::Mutex<()>,
@@ -7095,12 +7547,15 @@ where
             make: Arc::new(make),
             tick,
             enabled,
+            live_source: Arc::new(|| None),
             protected_channels: HashSet::new(),
             creator_channels: HashSet::new(),
             empty_grace: None,
+            admission_config: None,
             synthetic_humans: HashSet::new(),
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
+            gateway_connected: AtomicBool::new(false),
             access_lock: tokio::sync::Mutex::new(()),
             pending_imports: Mutex::new(HashMap::new()),
             name_policy: Arc::new(AutomodPolicy::default()),
@@ -7133,6 +7588,26 @@ where
     /// production; fixtures shorten it for unrelated lifecycle races).
     pub fn with_empty_grace(mut self, grace: Duration) -> Self {
         self.empty_grace = Some(grace);
+        self
+    }
+
+    /// Set the boot create-admission config (the three cold-class admission
+    /// keys resolved through [`configured_admission`] in production). Actor
+    /// spawn applies it via [`GuildRoomWorker::set_admission_config`];
+    /// without this, workers keep the `temp_voice_admission` default.
+    pub fn with_admission_config(mut self, config: CreateAdmissionConfig) -> Self {
+        self.admission_config = Some(config);
+        self
+    }
+
+    /// Live-settings source for the stored per-guild empty-grace override.
+    /// Production passes the settings-poller snapshot reader; tests keep the
+    /// default (no reader, boot fallback).
+    pub fn with_live_source(
+        mut self,
+        source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
+    ) -> Self {
+        self.live_source = Arc::new(source);
         self
     }
 
@@ -7270,9 +7745,21 @@ where
         actor
             .live
             .protect_creators(self.creator_channels.iter().copied());
-        if let Some(grace) = self.empty_grace {
+        // Boot fallback first, then the stored per-guild override: a stored
+        // change reaches new actors without a restart; unset and out-of-range
+        // rows keep the boot value.
+        let fallback = self.empty_grace.unwrap_or(EMPTY_ROOM_GRACE);
+        let guild_id = guild.to_string();
+        let snapshot = (self.live_source)();
+        let stored = snapshot
+            .as_ref()
+            .and_then(|live| live.get(&guild_id, EMPTY_GRACE_KEY));
+        let grace = stored_empty_grace_with(&guild_id, fallback, snapshot.as_ref());
+        if self.empty_grace.is_some() || stored.is_some() {
             actor.live.set_empty_grace(grace);
         }
+        // Else leave `empty_grace` unset: `empty_grace_elapsed` falls back to
+        // `EMPTY_ROOM_GRACE`, byte-identical to today.
         let synthetic = synthetic_humans_for(guild, &self.synthetic_humans);
         if !synthetic.is_empty() {
             actor.live.set_synthetic_humans(synthetic);
@@ -7281,18 +7768,30 @@ where
         let make = Arc::clone(&self.make);
         let tick = self.tick;
         let name_policy = Arc::clone(&self.name_policy);
+        let live_source = Arc::clone(&self.live_source);
+        let admission_config = self.admission_config;
         tokio::spawn(async move {
-            let (store, http) = make();
-            let guild_id = live.guild_id;
-            let worker = match GuildRoomWorker::load(live, store, http).await {
-                Ok(worker) => worker,
-                Err(error) => {
-                    observe_voice_actor_load_failure(guild_id, &error);
-                    return;
-                }
+            let mut rx = rx;
+            let Some((worker, buffered)) = load_actor_worker(make.as_ref(), live, &mut rx).await
+            else {
+                return;
             };
             let mut worker = worker.with_name_policy(name_policy);
-            run_actor(&mut worker, rx, tick).await;
+            worker.live_source = live_source;
+            // `load` captures the fallback from the shared live state, which
+            // already holds the stored override here; restore the true boot
+            // value so a later row removal or out-of-range edit falls back
+            // to boot, not to the stale stored grace.
+            worker.empty_grace_fallback = fallback;
+            // Apply the stored override at spawn; later stored changes arrive
+            // through the maintenance refresh without a restart.
+            worker.refresh_empty_grace();
+            // Apply the boot admission config at spawn; without one the
+            // worker keeps its `temp_voice_admission` default untouched.
+            if let Some(config) = admission_config {
+                worker.set_admission_config(config);
+            }
+            run_actor_with_initial(&mut worker, rx, tick, buffered).await;
         });
         actors.insert(guild, actor.clone());
         Some(actor)
@@ -7314,6 +7813,64 @@ where
             return false;
         };
         actor.live.publish(snapshot) && actor.tx.send(ActorCommand::Reconcile).is_ok()
+    }
+
+    /// READY or RESUMED was handled: the gateway is connected again. Any
+    /// known live view still not ready now starts its not-ready clock.
+    fn gateway_now_connected(&self) {
+        self.gateway_connected.store(true, Ordering::Release);
+        let now = tokio::time::Instant::now();
+        for actor in self.actors.lock().expect("voice runtime lock").values() {
+            actor.live.gateway_connected(now);
+        }
+    }
+
+    /// Self-correction for a live view left not ready while the gateway is
+    /// connected (no RESUMED/GUILD_CREATE publish will come for it). Every
+    /// dispatch retries the complete post-update cached snapshot; until one
+    /// publishes, joins in that guild are dropped and the actor tick exports
+    /// the age as `two_bot_voice_live_not_ready_seconds`.
+    ///
+    /// `joining` is the member of the VOICE_STATE_UPDATE being handled. The
+    /// cache already holds its new channel, so it is left out of the snapshot
+    /// and the frame that follows is still a transition that can ticket.
+    fn heal_not_ready(
+        &self,
+        cache: &DefaultInMemoryCache,
+        joining: Option<(Snowflake, Snowflake)>,
+    ) {
+        if !self.gateway_connected.load(Ordering::Acquire) {
+            return;
+        }
+        let stuck: Vec<Snowflake> = self
+            .actors
+            .lock()
+            .expect("voice runtime lock")
+            .iter()
+            .filter(|(_, actor)| !actor.live.read_state().ready)
+            .map(|(guild, _)| *guild)
+            .collect();
+        for guild_id in stuck {
+            let healed = snapshot_from_cache(cache, guild_id).is_some_and(|mut snapshot| {
+                if let Some((guild, member)) = joining {
+                    if guild == guild_id {
+                        snapshot
+                            .members
+                            .retain(|occupant| occupant.member_id != member);
+                    }
+                }
+                self.publish_snapshot(guild_id, snapshot)
+            });
+            if healed {
+                metrics::global().voice_live_self_heal();
+                warn!(
+                    guild = guild_id.to_string(),
+                    "voice live view was not ready on a connected gateway; republished from cache"
+                );
+            } else if let Some(actor) = self.live_actor(guild_id) {
+                actor.live.gateway_connected(tokio::time::Instant::now());
+            }
+        }
     }
 
     /// Feed one voice transition to an existing actor. Returns false when the
@@ -7712,8 +8269,11 @@ where
     }
 
     pub fn disconnect(&self) {
+        // Clear before invalidating the views so a concurrent dispatch
+        // cannot heal a view this transport loss is about to invalidate.
+        self.gateway_connected.store(false, Ordering::Release);
         for actor in self.actors.lock().expect("voice runtime lock").values() {
-            actor.live.disconnect();
+            actor.live.transport_lost();
         }
         // Game-activity wiring: transport loss invalidates live voice state,
         // so open spans close here instead of covering the offline gap.
@@ -7769,7 +8329,23 @@ where
         if !self.enabled {
             return;
         }
+        // READY, RESUMED and GUILD_CREATE publish (or wait for) snapshots
+        // themselves; every other dispatch on a connected gateway retries a
+        // live view that was left not ready.
         match event {
+            Event::Ready(_) | Event::Resumed | Event::GuildCreate(_) => {}
+            Event::VoiceStateUpdate(update) => self.heal_not_ready(
+                cache,
+                update
+                    .guild_id
+                    .map(|guild| (guild.get(), update.user_id.get())),
+            ),
+            _ => self.heal_not_ready(cache, None),
+        }
+        match event {
+            // Fresh session: GUILD_CREATE follows with complete state; until
+            // it publishes, known views count as not ready while connected.
+            Event::Ready(_) => self.gateway_now_connected(),
             Event::GuildCreate(gc) => {
                 if let twilight_model::gateway::payload::incoming::GuildCreate::Available(guild) =
                     gc.as_ref()
@@ -7936,8 +8512,27 @@ where
                 // Prefer the event's role list when the cache has not caught up.
                 let roles =
                     roles.or_else(|| Some(updated.roles.iter().map(|id| id.get()).collect()));
+                // A nickname change renders into `@@owner@@` rooms: forward it
+                // as a display update so the worker's directory (which the
+                // background re-render reads) never stays behind the fresh
+                // directory a `/name` submit just rendered from. Read the name
+                // from the event itself, not the cache, so a lagging cache
+                // cannot re-apply the old nickname.
+                let display = updated
+                    .nick
+                    .clone()
+                    .filter(|nick| !nick.is_empty())
+                    .or_else(|| {
+                        updated
+                            .user
+                            .global_name
+                            .clone()
+                            .filter(|name| !name.is_empty())
+                    })
+                    .unwrap_or_else(|| updated.user.name.clone());
                 if let Some(actor) = self.live_actor(guild_id) {
                     actor.live.set_member_roles(member_id, roles);
+                    let _ = actor.tx.send(ActorCommand::Display { member_id, display });
                 }
             }
             // A warm RESUME replays missed dispatches before RESUMED; only then
@@ -7964,6 +8559,7 @@ where
                         }
                     }
                 }
+                self.gateway_now_connected();
             }
             Event::GuildDelete(deleted) => {
                 self.remove_guild(deleted.id.get());
@@ -7981,12 +8577,123 @@ where
     }
 }
 
+/// Load one guild worker, retrying transient store failures in place so a
+/// brief database outage during `GuildCreate` no longer leaves the guild
+/// actorless until the next snapshot. Bounds: each attempt is abandoned
+/// after [`VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT`] (the load is reads only, so
+/// abandoning it replays nothing), consecutive failures wait
+/// [`voice_actor_load_backoff`] between attempts, and the same single
+/// spawned task owns every attempt — retries never spawn a second actor.
+///
+/// While a load attempt is in flight, every inbox command waits in order
+/// (capped, oldest shed) and is handed to `run_actor_with_initial` on
+/// success, so a status sent right after the snapshot still resolves once
+/// the worker exists. When the attempt fails or times out, buffered
+/// reply-bearing commands are purged (see [`ActorCommand::is_bufferable`])
+/// so their callers get the existing "syncing" fallback instead of hanging
+/// across the backoff window; commands arriving during the backoff itself
+/// are dropped unless fire-and-forget. Cancellation is the inbox closing
+/// (every sender dropped):
+/// `remove_guild` and runtime drop both end the retry loop, and a load
+/// that finishes after removal is discarded instead of resurrecting the
+/// guild. A [`StoreError::CredentialRefused`] attempt is never retried:
+/// no credential replacement or permission repair is attempted here.
+async fn load_actor_worker<S: RoomPersistence, H: RoomWrites>(
+    make: &(dyn Fn() -> (S, H) + Send + Sync),
+    live: LiveGuild,
+    inbox: &mut mpsc::UnboundedReceiver<ActorCommand>,
+) -> Option<(GuildRoomWorker<S, H>, VecDeque<ActorCommand>)> {
+    let guild_id = live.guild_id;
+    let mut buffered = VecDeque::new();
+    let mut failed_attempts = 0u32;
+    loop {
+        let (store, http) = make();
+        let attempt = GuildRoomWorker::load(live.clone(), store, http);
+        tokio::pin!(attempt);
+        let deadline = tokio::time::sleep(VOICE_ACTOR_LOAD_ATTEMPT_TIMEOUT);
+        tokio::pin!(deadline);
+        let mut finished = None;
+        let mut timed_out = false;
+        loop {
+            tokio::select! {
+                result = &mut attempt => {
+                    finished = Some(result);
+                    break;
+                }
+                () = &mut deadline => {
+                    timed_out = true;
+                    break;
+                }
+                command = inbox.recv() => match command {
+                    Some(command) => buffer_attempt_command(&mut buffered, command),
+                    None => return None,
+                },
+            }
+        }
+        // A timed-out attempt future is dropped here, abandoning its
+        // in-flight reads; the next attempt starts from a fresh pair.
+        match finished {
+            Some(Ok(worker)) => {
+                // Drain what is already queued and re-check the cancel
+                // signal: a load that finished after every sender dropped
+                // (guild removed) is discarded, never published.
+                loop {
+                    match inbox.try_recv() {
+                        Ok(command) => buffer_attempt_command(&mut buffered, command),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                    }
+                }
+                return Some((worker, buffered));
+            }
+            Some(Err(error)) => {
+                observe_voice_actor_load_failure(guild_id, &error);
+                if error == StoreError::CredentialRefused {
+                    return None;
+                }
+            }
+            None => {
+                debug_assert!(timed_out);
+                observe_voice_actor_load_timeout(guild_id);
+            }
+        }
+        // The attempt failed: waiting reply-bearing callers resolve now
+        // instead of hanging across the backoff window. State stays queued.
+        purge_unanswerable_buffered(&mut buffered);
+        failed_attempts = failed_attempts.saturating_add(1);
+        let wait = tokio::time::sleep(voice_actor_load_backoff(failed_attempts));
+        tokio::pin!(wait);
+        loop {
+            tokio::select! {
+                () = &mut wait => break,
+                command = inbox.recv() => match command {
+                    Some(command) => buffer_init_command(&mut buffered, command),
+                    None => return None,
+                },
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 async fn run_actor<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
     inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
 ) {
     run_actor_with_limits(worker, inbox, tick, ActorLimits::default()).await;
+}
+
+/// Run the actor loop after [`load_actor_worker`], applying the commands
+/// buffered during initialization (in arrival order) before any command
+/// that arrives afterwards.
+async fn run_actor_with_initial<S: RoomPersistence, H: RoomWrites + 'static>(
+    worker: &mut GuildRoomWorker<S, H>,
+    inbox: mpsc::UnboundedReceiver<ActorCommand>,
+    tick: Duration,
+    initial: VecDeque<ActorCommand>,
+) {
+    run_actor_inner(worker, inbox, tick, ActorLimits::default(), initial).await;
 }
 
 /// Bounds for the per-guild actor loop (TOG stall follow-up). All bounds are
@@ -8095,6 +8802,11 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(
         .map_or(0, |age| age.as_secs());
     let gauges = metrics::global();
     gauges.set_voice_actor_halted(guild, generation, worker.halted());
+    gauges.set_voice_actor_live_not_ready(
+        guild,
+        generation,
+        worker.live.not_ready_secs(tokio::time::Instant::now()),
+    );
     gauges.set_voice_creator_map(
         worker.creators_generation,
         creator_map_age_secs(worker.creators_merged_ms, now_ms),
@@ -8236,11 +8948,22 @@ impl<H: RoomWrites> StallShared<H> {
     }
 }
 
+#[cfg(test)]
 async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
+    worker: &mut GuildRoomWorker<S, H>,
+    inbox: mpsc::UnboundedReceiver<ActorCommand>,
+    tick: Duration,
+    limits: ActorLimits,
+) {
+    run_actor_inner(worker, inbox, tick, limits, VecDeque::new()).await;
+}
+
+async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
     mut inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
     limits: ActorLimits,
+    initial: VecDeque<ActorCommand>,
 ) {
     let generation = next_voice_actor_generation();
     let start = tokio::time::Instant::now();
@@ -8303,6 +9026,22 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
             }
         })
     };
+    // Commands buffered while the worker loaded (initialization retry)
+    // apply first, in arrival order, under the same read-through and
+    // apply path as inbox commands; stale joins are refused by the usual
+    // ticket guards inside `apply_command`.
+    for command in initial {
+        let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        if let ActorCommand::Join { ticket, .. } = &command {
+            worker.revalidate_creator(ticket.creator_id).await;
+        }
+        let accepted = apply_command(worker, command, now_ms);
+        if accepted {
+            last_progress = tokio::time::Instant::now();
+        }
+        dispatch_ready |= accepted;
+    }
+    stall.snapshot(worker, last_progress);
     loop {
         tokio::select! {
             biased;
@@ -8433,6 +9172,9 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 // the watchdog sibling would keep ageing the pre-merge stamp.
                 stall.snapshot(worker, last_progress);
                 worker.reload_name_settings(now_ms).await;
+                // A stored empty-grace change applies without a restart;
+                // revision-gated so steady-state ticks stay cheap.
+                worker.refresh_empty_grace();
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
                 dispatch_budget = 8;
@@ -8587,30 +9329,37 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
     accepted_join
 }
 
+/// Name a refused boot setting without exposing configured values or parser errors.
+fn invalid_boot_setting(key: &'static str) -> RoomHttpError {
+    warn!(
+        key,
+        reason = "invalid_value",
+        "temp-voice boot setting invalid; refusing voice runtime"
+    );
+    RoomHttpError::InvalidRequest
+}
+
 /// Build the production sink: lifecycle actors plus the S4 responder.
 pub fn build_production_runtime(
     token: &str,
     pool: sqlx::PgPool,
     name_policy: AutomodPolicy,
+    live_source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
-    // Malformed protection IDs refuse the whole runtime. The gateway reports it
-    // through its cataloged `voice HTTP setup failed` event.
+    // Fatal settings name only the first refused key, in existing validation
+    // order, before the gateway's generic `voice HTTP setup failed` event.
     let protected = configured_protected_channels(|key| std::env::var(key).ok())
-        .map_err(|_| RoomHttpError::InvalidRequest)?;
+        .map_err(invalid_boot_setting)?;
     let generator = configured_generator_channel(|key| std::env::var(key).ok())
-        .map_err(|_| RoomHttpError::InvalidRequest)?;
-    let empty_grace = configured_empty_grace(
-        std::env::var("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS")
-            .ok()
-            .as_deref(),
-    )
-    .map_err(|_| RoomHttpError::InvalidRequest)?;
+        .map_err(|_| invalid_boot_setting("TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID"))?;
+    let empty_grace = configured_empty_grace(std::env::var(EMPTY_GRACE_KEY).ok().as_deref())
+        .map_err(|_| invalid_boot_setting(EMPTY_GRACE_KEY))?;
     let synthetic_humans = configured_synthetic_humans(
         std::env::var("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS")
             .ok()
             .as_deref(),
     )
-    .map_err(|_| RoomHttpError::InvalidRequest)?;
+    .map_err(|_| invalid_boot_setting("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS"))?;
     let replies = RoomHttp::new(token.to_owned())?;
     let http = replies.clone();
     let store = PgRoomStore::new(pool);
@@ -8624,8 +9373,15 @@ pub fn build_production_runtime(
             .with_protected_channels(protected)
             .with_creator_channels(generator.into_iter().collect())
             .with_empty_grace(empty_grace)
+            // Resolve at the install site (not a `let` above): the
+            // acceptance wiring pin greps for this exact loader call, so
+            // extracting it would let a dropped temporary pass the pin.
+            // Unusable values fail closed per knob with an `invalid_value`
+            // warning; they never refuse the runtime.
+            .with_admission_config(configured_admission(|key| std::env::var(key).ok()))
             .with_synthetic_humans(synthetic_humans)
-            .with_name_policy(name_policy),
+            .with_name_policy(name_policy)
+            .with_live_source(live_source),
         ),
         Arc::new(replies),
     ))
@@ -8654,6 +9410,86 @@ pub fn configured_empty_grace(value: Option<&str>) -> Result<Duration, InvalidEm
 /// `0..=600`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidEmptyGrace;
+
+/// The stored per-guild empty-grace key served from the live settings snapshot.
+pub(crate) const EMPTY_GRACE_KEY: &str = "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS";
+
+/// Effective empty-room grace: the stored per-guild value wins over the boot
+/// fallback, an absent/malformed/out-of-range stored value falls back
+/// (store-first, like the feed interval). Pure for tests via `live`.
+pub(crate) fn stored_empty_grace_with(
+    guild: &str,
+    fallback: Duration,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> Duration {
+    let Some(live) = live else {
+        return fallback;
+    };
+    let Some(value) = live.get(guild, EMPTY_GRACE_KEY) else {
+        return fallback;
+    };
+    let seconds: Option<u64> = match &value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                trimmed.parse::<u64>().ok()
+            }
+        }
+        _ => None,
+    };
+    match seconds {
+        Some(seconds) if seconds <= MAX_EMPTY_ROOM_GRACE_SECONDS => Duration::from_secs(seconds),
+        _ => {
+            warn!(
+                guild = guild.to_string(),
+                key = EMPTY_GRACE_KEY,
+                reason = "out_of_range",
+                value = %value,
+                "stored empty-grace override out of range; using boot fallback"
+            );
+            fallback
+        }
+    }
+}
+
+/// The stored per-guild invite-code key served from the live settings snapshot.
+/// Store-only: no environment variable of this name is ever read.
+pub(crate) const INVITE_CODE_KEY: &str = "TWO_GUILD_INVITE_CODE";
+
+/// Effective guild invite code: the stored per-guild value wins over the
+/// gateway vanity fallback, an absent row or one for another guild keeps the
+/// fallback, and an invalid stored value fails closed to it (store-first, like
+/// the empty grace). Only a JSON string passing `is_valid_invite_code` can win;
+/// it passes through unchanged, never trimmed. The rejected value is never
+/// logged: a stale code may be a rotated secret. Pure for tests via `live`.
+pub(crate) fn stored_invite_code_with(
+    guild: &str,
+    fallback: Option<&str>,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> Option<String> {
+    let fallback = fallback.map(str::to_owned);
+    let Some(live) = live else {
+        return fallback;
+    };
+    let Some(value) = live.get(guild, INVITE_CODE_KEY) else {
+        return fallback;
+    };
+    match &value {
+        serde_json::Value::String(code) if is_valid_invite_code(code) => Some(code.clone()),
+        _ => {
+            warn!(
+                guild = guild.to_string(),
+                key = INVITE_CODE_KEY,
+                reason = "invalid_invite_code",
+                "stored invite-code override invalid; using vanity fallback"
+            );
+            fallback
+        }
+    }
+}
 
 /// The synthetic test identities a guild's actor may use: none for the live
 /// guild, whatever `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` says.
@@ -8711,8 +9547,7 @@ fn snapshot_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Opt
         .iter()
         .filter_map(|id| cache.channel(*id).map(|channel| channel.value().clone()))
         .collect();
-    let members: Vec<VoiceMember> = cache
-        .guild_voice_states(guild_key)?
+    let members: Vec<VoiceMember> = guild_voice_users(cache, guild_key)?
         .iter()
         .filter_map(|user_id| {
             let state = cache.voice_state(*user_id, guild_key)?;
@@ -8742,6 +9577,32 @@ fn snapshot_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Opt
         bot: bot_access_from_cache(cache, guild_id)?,
         member_roles,
     })
+}
+
+/// Members the cache holds in voice for a cached guild. GUILD_CREATE always
+/// installs the guild's voice-state set (empty when nobody is in voice), but
+/// Twilight removes that set again when the guild's last voice member leaves
+/// and only re-creates it on the next join. For a guild the cache holds, with
+/// voice states cached, a missing set therefore means "nobody in voice", not
+/// "not loaded yet": reading it as `None` left the live view unpublished
+/// after a warm RESUME into an empty guild, silently dropping every later
+/// creator join until a restart. `None` only when voice states are not
+/// cached at all, so the snapshot can never claim completeness it lacks.
+fn guild_voice_users(
+    cache: &DefaultInMemoryCache,
+    guild_key: Id<GuildMarker>,
+) -> Option<Vec<Id<UserMarker>>> {
+    match cache.guild_voice_states(guild_key) {
+        Some(users) => Some(users.iter().copied().collect()),
+        None if cache
+            .config()
+            .resource_types()
+            .contains(twilight_cache_inmemory::ResourceType::VOICE_STATE) =>
+        {
+            Some(Vec::new())
+        }
+        None => None,
+    }
 }
 
 fn bot_access_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Option<BotAccess> {
@@ -10911,9 +11772,13 @@ async fn execute_access<S: RoomPersistence>(
     action: AccessAction,
     on_saved: impl FnOnce(AccessControls),
 ) -> String {
-    let Ok(mut controls) = store.access_controls(guild_id).await else {
-        return "Could not read the voice-room settings. Nothing was changed; try again."
-            .to_owned();
+    let mut controls = match store.access_controls(guild_id).await {
+        Ok(controls) => controls,
+        Err(error) => {
+            log_admin_store_failure("access_read", guild_id, error);
+            return "Could not read the voice-room settings. Nothing was changed; try again."
+                .to_owned();
+        }
     };
     match action {
         AccessAction::Show => return access_summary(&controls),
@@ -10944,7 +11809,8 @@ async fn execute_access<S: RoomPersistence>(
             on_saved(controls);
             format!("Saved.\n{summary}")
         }
-        Err(_) => {
+        Err(error) => {
+            log_admin_store_failure("access_save", guild_id, error);
             "Could not save the voice-room settings. Nothing was changed; try again.".to_owned()
         }
     }
@@ -10975,8 +11841,13 @@ async fn execute_logging<S: RoomPersistence>(
     guild_id: Snowflake,
     action: LoggingAction,
 ) -> String {
-    let Ok(mut settings) = store.logging_settings(guild_id).await else {
-        return "Could not read the logging settings. Nothing was changed; try again.".to_owned();
+    let mut settings = match store.logging_settings(guild_id).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            log_admin_store_failure("logging_read", guild_id, error);
+            return "Could not read the logging settings. Nothing was changed; try again."
+                .to_owned();
+        }
     };
     match action {
         LoggingAction::Show => return logging_summary(&settings),
@@ -10992,7 +11863,10 @@ async fn execute_logging<S: RoomPersistence>(
     }
     match store.save_logging_settings(guild_id, &settings).await {
         Ok(()) => format!("Saved.\n{}", logging_summary(&settings)),
-        Err(_) => "Could not save the logging settings. Nothing was changed; try again.".to_owned(),
+        Err(error) => {
+            log_admin_store_failure("logging_save", guild_id, error);
+            "Could not save the logging settings. Nothing was changed; try again.".to_owned()
+        }
     }
 }
 
@@ -11660,7 +12534,8 @@ where
             let (store, _) = runtime.make_pair();
             let config = match store.config_snapshot(guild_id).await {
                 Ok(config) => config,
-                Err(_) => {
+                Err(error) => {
+                    log_admin_store_failure("export_read", guild_id, error);
                     reply(ephemeral_response(
                         "Could not read the voice configuration. Nothing was sent; try again.",
                     ))
@@ -11764,7 +12639,8 @@ where
     let (store, http) = runtime.make_pair();
     let current = match store.config_snapshot(guild_id).await {
         Ok(config) => config,
-        Err(_) => {
+        Err(error) => {
+            log_admin_store_failure("import_read", guild_id, error);
             reply(ephemeral_response(
                 "Could not read the current voice configuration. Nothing was changed; try again.",
             ))
@@ -12099,12 +12975,85 @@ impl InteractionReplies for RoomHttp {
     }
 }
 
+/// Maximum outstanding voice interaction responder tasks, including queued tasks.
+///
+/// Recognized voice interactions bypass the shared command router's admission
+/// (the router yields voice-owned interactions before its own lane check), so
+/// the responder reserves a permit synchronously after recognition, before
+/// cloning the interaction, building cache snapshots, or spawning any task.
+/// The owned permit moves into the task and covers the whole `respond_named`
+/// future. Excess interactions are dropped without acknowledgement (counted,
+/// log-sampled), never queued, so even an unpolled burst cannot accumulate
+/// unbounded responder tasks or snapshots.
+///
+/// The value matches the shared router's 16-slot interaction lane: a saturated
+/// voice responder sheds the same pressure the router would. Permits release
+/// on normal completion, on acknowledgement failure (a failed or ambiguous
+/// ack still means no mutation), and on task cancellation, so later
+/// interactions can always run once in-flight executions settle.
+const VOICE_RESPONDER_MAX_IN_FLIGHT: usize = 16;
+
+/// Seconds between saturation `warn!` lines per responder. The drop counter
+/// increments on every refused interaction; the log samples the first drop in
+/// each window so a burst is O(1) lines.
+const VOICE_RESPONDER_DROP_WARN_INTERVAL_SECS: u64 = 60;
+
+/// Non-waiting admission state shared by a responder's spawned tasks: one
+/// execution bound plus a counted, log-sampled saturation drop path.
+struct ResponderAdmission {
+    permits: Arc<Semaphore>,
+    drops: AtomicU64,
+    drop_warn_last_secs: AtomicU64,
+}
+
+impl Default for ResponderAdmission {
+    fn default() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(VOICE_RESPONDER_MAX_IN_FLIGHT)),
+            drops: AtomicU64::new(0),
+            drop_warn_last_secs: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ResponderAdmission {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a refused interaction: count every drop, warn at most once per
+    /// [`VOICE_RESPONDER_DROP_WARN_INTERVAL_SECS`]. The refused interaction
+    /// sends no callback at all: a busy acknowledgement per refusal would be
+    /// a second detached-task flood under the same burst.
+    fn record_drop(&self, interaction_id: u64) {
+        let dropped = self.drops.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let last = self.drop_warn_last_secs.load(Ordering::Relaxed);
+        if now_secs.wrapping_sub(last) >= VOICE_RESPONDER_DROP_WARN_INTERVAL_SECS
+            && self
+                .drop_warn_last_secs
+                .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            warn!(
+                interaction_id = interaction_id.to_string(),
+                dropped,
+                "voice responder saturated; interaction dropped without acknowledgement (sampled)"
+            );
+        }
+    }
+}
+
 /// Gateway wrapper: retain lifecycle publication, spawn command work off-loop.
 /// Discord accepts one initial callback per interaction, so a rejected or
 /// ambiguous acknowledgement must never execute a non-idempotent create.
 pub struct VoiceResponder<S, H, R> {
     runtime: Arc<VoiceRuntime<S, H>>,
     replies: Arc<R>,
+    admission: Arc<ResponderAdmission>,
 }
 
 impl<S, H, R> VoiceResponder<S, H, R>
@@ -12114,7 +13063,11 @@ where
     R: InteractionReplies + 'static,
 {
     pub fn new(runtime: Arc<VoiceRuntime<S, H>>, replies: Arc<R>) -> Self {
-        Self { runtime, replies }
+        Self {
+            runtime,
+            replies,
+            admission: Arc::new(ResponderAdmission::new()),
+        }
     }
 
     /// The wrapped lifecycle runtime, for boot-owned background work (the
@@ -12339,14 +13292,37 @@ where
             {
                 return;
             }
+            let Ok(permit) = Arc::clone(&self.admission.permits).try_acquire_owned() else {
+                self.admission.record_drop(created.0.id.get());
+                return;
+            };
             let interaction = created.0.clone();
-            let invite_code = vanity_code_from_cache(cache, &interaction);
+            let vanity_code = vanity_code_from_cache(cache, &interaction);
+            // The stored override resolves only for `/invite` (the sole
+            // renderer of `invite_code`): other interactions keep the plain
+            // vanity code, so an invalid row warns on invites, not on every
+            // voice interaction.
+            let invite_code = if matches!(command, Some(VoiceCommand::Invite)) {
+                let snapshot = (self.runtime.live_source)();
+                stored_invite_code_with(
+                    &interaction
+                        .guild_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    vanity_code.as_deref(),
+                    snapshot.as_ref(),
+                )
+            } else {
+                vanity_code
+            };
             let inventory = interaction_guild(&interaction)
                 .and_then(|guild_id| inventory_from_cache(cache, guild_id));
             let names = name_directory_from_cache(cache, &interaction);
             let runtime = Arc::clone(&self.runtime);
             let replies = Arc::clone(&self.replies);
             tokio::spawn(async move {
+                // Hold admission until the responder finishes or is cancelled.
+                let _permit = permit;
                 Self::respond_named(
                     &runtime,
                     &replies,

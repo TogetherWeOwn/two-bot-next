@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 28,
+  "count": 29,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -49,6 +49,103 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only discovery command with no legacy counterpart; answers from the live publish set with no store or network effect, so it is pinned offline by the router and help-renderer tests rather than the live smoke five."
+    },
+    {
+      "name": "privacy",
+      "description": "Manage your analytics privacy and deletion requests for this server.",
+      "family": "core",
+      "gate": "always",
+      "default_member_permissions": null,
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "opt-out",
+          "description": "Delete your stored activity for this server and stop future analytics persistence.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "opt-in",
+          "description": "Resume analytics persistence for this server (already-deleted rows are not restored).",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "status",
+          "description": "Show whether you are opted out and this server's analytics switches.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "delete",
+          "description": "Request deletion of your stored data for this server.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "deletion-status",
+          "description": "Show the status of your deletion request.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "request-id",
+              "description": "The request id returned when you requested deletion.",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 128,
+              "choices": []
+            }
+          ]
+        },
+        {
+          "name": "deletion-receipt",
+          "description": "Show the completed receipt for your deletion request.",
+          "type": "subcommand",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": null,
+          "choices": [],
+          "options": [
+            {
+              "name": "request-id",
+              "description": "The request id returned when you requested deletion.",
+              "type": "string",
+              "required": true,
+              "min_value": null,
+              "max_value": null,
+              "max_length": 128,
+              "choices": []
+            }
+          ]
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only member self-serve with no legacy counterpart; the purge-plus-suppression-plus-receipt path is pinned by the gateway dispatch tests on a disposable database rather than the live smoke five."
     },
     {
       "name": "attendance",
@@ -244,7 +341,18 @@
       "gate": "automations",
       "default_member_permissions": "32",
       "dm_permission": false,
-      "options": [],
+      "options": [
+        {
+          "name": "page",
+          "description": "Page of the schedule list (1-based)",
+          "type": "integer",
+          "required": false,
+          "min_value": 1,
+          "max_value": null,
+          "max_length": null,
+          "choices": []
+        }
+      ],
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Needs seeded scheduled rows (DB); the no-DB offline rule excludes it."

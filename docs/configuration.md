@@ -29,7 +29,7 @@ Keys in
 legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`
 partition in `settings.rs`); every other storable key reports cold.
 
-The thirty-four keys in `STORE_READ_KEYS`
+The thirty-five keys in `STORE_READ_KEYS`
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and
@@ -59,7 +59,7 @@ and purge (`crates/bot/src/ticket_runtime.rs`); the gateway funnel applies
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`
 from the snapshot on every guild message, refreshing the channel classifier
 and the community-facts sink together before the message's channel class is
-stamped (`crates/bot/src/gateway.rs`, `crates/discord/src/leveling_runtime.rs`). Two boot-only edges
+stamped (`crates/bot/src/gateway.rs`, `crates/discord/src/leveling_runtime.rs`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:3070-3093`, `:8741`). Two boot-only edges
 remain: the voice room-name policy is
 built once at boot from the process environment
 (`crates/bot/src/gateway.rs:1608`); and gateway intents plus ticket command
@@ -83,7 +83,7 @@ When voice is enabled, `build_production_runtime` also reads
 `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,
 `TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely
 for delete protection, not creator provisioning. Its empty grace is fixed at
-60 seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600) sets it.
+60 seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600) sets it at boot, and a stored per-guild row overrides that boot value live (out-of-range rows fail closed to the boot value).
 Onboarding, automod and scorecard typed loaders exist but are not
 called during boot; their defaults below come from empty-map calls. The
 classifier loader runs when the ordered pipeline is built and again when
@@ -129,7 +129,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 130.
+Catalog entries: 134.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -198,8 +198,12 @@ Catalog entries: 130.
 | `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token. |
 | `TWO_DB_POOL_MAX` | env_only | Not specified in Next | environment only | Legacy database pool maximum read before the settings store exists. |
 | `TWO_EVENTSUB` | env_only | Not specified in Next | environment only | Master gate for the private EventSub receiver; exactly 1 enables the container listener, any other state stays dark. |
+| `TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID` | env_only | Not specified in Next | environment only | Discord announcements channel snowflake the go-live post lands in; required while TWO_EVENTSUB_DELIVERY is exactly 1. |
 | `TWO_EVENTSUB_BIND` | env_only | Not specified in Next | environment only | Canonical combined IP and port for the private EventSub receiver; a wildcard bind requires the Worker-set container marker, otherwise a specific private IP. |
+| `TWO_EVENTSUB_DELIVERY` | env_only | Not specified in Next | environment only | Delivery gate for EventSub go-live posts; exactly 1 requires the announcements channel, invite URL and broadcaster allowlist, any other enabled state refuses startup. |
+| `TWO_EVENTSUB_INVITE_URL` | env_only | Not specified in Next | environment only | Discord invite URL rendered into the go-live post; validated with the renderer's rule while TWO_EVENTSUB_DELIVERY is exactly 1. |
 | `TWO_FEED_POLL_SECONDS` | hot | `300` | stored, applied live by runtime refresh (reload-report hot) | Feed polling interval (validated from 60 to 86400 seconds). |
+| `TWO_GUILD_INVITE_CODE` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Stored per-guild invite code; wins over the gateway vanity code on the /invite path, invalid rows fail closed to the fallback. |
 | `TWO_HEALTH_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy health listener interface; environment-only network bind. |
 | `TWO_HEALTH_PORT` | env_only | Not specified in Next | environment only | Legacy health listener port; Container uses LISTEN_ADDR instead. |
 | `TWO_INACTIVITY_DAYS` | cold | Not specified in Next | stored unwired | Inactivity horizon used for community nudges. |
@@ -222,7 +226,7 @@ Catalog entries: 130.
 | `TWO_JOIN_RISK_WINDOW_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh | Aggregation window for join-risk decisions. |
 | `TWO_MODERATION` | env_only | `false` | environment only | Enable moderation command publication/routing; enabled mode requires Owen ID. |
 | `TWO_MODERATION_AUDIT_SECRET` | env_only | Not rendered (secret) | environment only | Authentication secret for moderation audit handoff; never rendered. |
-| `TWO_MODERATION_PROTECTED_ROLE_IDS` | env_only | `[]` | environment only | Roles moderation may not target; environment-only reach boundary. |
+| `TWO_MODERATION_PROTECTED_ROLE_IDS` | env_only | `[]` | environment only | Roles moderation may not target; strict comma-separated 17-20 digit snowflakes with no spaces or empty segments (empty segments and leading/trailing commas refused, padding refused); missing or empty means no roles. |
 | `TWO_ONBOARDING_DRY_RUN` | hot | `false` | stored, applied live by runtime refresh | Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes. A stored non-0/1 rendering is ignored (deployment wins). |
 | `TWO_ONBOARDING_MODE` | env_only | `"legacy"` | environment only | Onboarding selector: legacy, session or anchor; session suppresses role writes. |
 | `TWO_ONBOARDING_ROTA_MEASUREMENT` | env_only | Not specified in Next | environment only | Dropped staging rota measurement gate; env-only refusal is retained. |
@@ -245,12 +249,12 @@ Catalog entries: 130.
 | `TWO_STAGING_RESTART_SYNTHETIC_ACTORS` | env_only | Not specified in Next | environment only | Synthetic-actor allowlist for staging restart containment; legacy input with no Next reader. |
 | `TWO_TEMP_VOICE` | cold | Not specified in Next | stored unwired | Temporary-voice capability flag; classification does not imply runtime wiring. |
 | `TWO_TEMP_VOICE_CATEGORY_ID` | cold | Not specified in Next | env at boot; stored unwired | Category for generated temporary voice rooms. |
-| `TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS` | cold | Not specified in Next | stored unwired | Cooldown between a member's temporary-room creations. |
+| `TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS` | cold | Not specified in Next | env at boot; stored unwired | Cooldown between a member's temporary-room creations. |
 | `TWO_TEMP_VOICE_DISABLED_CONTROLS` | cold | Not specified in Next | stored unwired | Temporary-room controls; classification does not imply runtime wiring. |
-| `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` | cold | Not specified in Next | env at boot; stored unwired | Grace period before an empty temporary room is removed. |
+| `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Grace period before an empty temporary room is removed. |
 | `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID` | cold | Not specified in Next | env at boot; stored unwired | Voice channel used to request a temporary room. |
-| `TWO_TEMP_VOICE_MAX_PER_GUILD` | cold | Not specified in Next | stored unwired | Maximum temporary rooms per guild. |
-| `TWO_TEMP_VOICE_MAX_PER_USER` | cold | Not specified in Next | stored unwired | Maximum temporary rooms owned by one member. |
+| `TWO_TEMP_VOICE_MAX_PER_GUILD` | cold | Not specified in Next | env at boot; stored unwired | Maximum temporary rooms per guild. |
+| `TWO_TEMP_VOICE_MAX_PER_USER` | cold | Not specified in Next | env at boot; stored unwired | Maximum temporary rooms owned by one member. |
 | `TWO_TEMP_VOICE_NAME_TEMPLATE` | cold | Not specified in Next | stored unwired | Temporary-room naming template; classification does not imply runtime wiring. |
 | `TWO_TEMP_VOICE_PANEL_CHANNEL_ID` | cold | Not specified in Next | stored unwired | Destination for temporary-room control panels. |
 | `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` | cold | Not specified in Next | env at boot; stored unwired | Channels temporary-room cleanup may not remove. |

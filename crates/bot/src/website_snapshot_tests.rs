@@ -16,7 +16,7 @@ fn executor(mock: &MockRest) -> ActionExecutor {
 }
 
 fn event(id: &str) -> Value {
-    json!({"id":id, "name":"Test night", "scheduled_start_time":"2026-10-01T19:00:00Z", "status":1})
+    json!({"id":id, "guild_id":"2222", "name":"Test night", "scheduled_start_time":"2026-10-01T19:00:00Z", "status":1})
 }
 
 fn malformed_snapshots() -> Vec<Value> {
@@ -117,14 +117,22 @@ async fn malformed_event_elements_and_optionals_never_reach_storage() {
 
 #[test]
 fn valid_optional_combinations_keep_their_representation() {
-    let values = [
+    // Channel strings must be canonical nonzero snowflakes; descriptions
+    // keep the empty/value string cases.
+    let channel_values = [
+        None,
+        Some(Value::Null),
+        Some(json!("4000")),
+        Some(json!("4001")),
+    ];
+    let description_values = [
         None,
         Some(Value::Null),
         Some(json!("")),
         Some(json!("value")),
     ];
-    for channel in &values {
-        for description in &values {
+    for channel in &channel_values {
+        for description in &description_values {
             let mut row = event("3000");
             if let Some(value) = channel {
                 row["channel_id"] = value.clone();
@@ -132,7 +140,7 @@ fn valid_optional_combinations_keep_their_representation() {
             if let Some(value) = description {
                 row["description"] = value.clone();
             }
-            let normalized = normalize_events(&[raw_event(&row).unwrap()]).unwrap();
+            let normalized = normalize_events(&[raw_event(&row, "2222").unwrap()]).unwrap();
             assert_eq!(
                 normalized[0].channel_id.as_deref(),
                 channel.as_ref().and_then(Value::as_str)
@@ -143,6 +151,19 @@ fn valid_optional_combinations_keep_their_representation() {
             );
             assert_eq!(normalized[0].starts_at, "2026-10-01T19:00:00.000Z");
         }
+    }
+}
+
+#[test]
+fn canonical_snowflake_extremes_are_accepted() {
+    // Minimum nonzero (1) and maximum u64 snowflakes stay valid identities.
+    let max = u64::MAX.to_string();
+    for (id, channel) in [("1", max.as_str()), (max.as_str(), "1")] {
+        let mut row = event(id);
+        row["channel_id"] = json!(channel);
+        let normalized = normalize_events(&[raw_event(&row, "2222").unwrap()]).unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].channel_id.as_deref(), Some(channel));
     }
 }
 
@@ -246,7 +267,7 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
     let pool = db.pool();
     let (_stop, shutdown) = watch::channel(false);
     let observation = Mutex::new(());
-    let seed = normalize_events(&[raw_event(&event("3000")).unwrap()]).unwrap();
+    let seed = normalize_events(&[raw_event(&event("3000"), "2222").unwrap()]).unwrap();
     replace_events(pool, "2222", "2026-09-30T12:00:00.123Z", &seed)
         .await
         .unwrap();
@@ -300,8 +321,8 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
     for (i, channel) in [
         None,
         Some(Value::Null),
-        Some(json!("")),
-        Some(json!("value")),
+        Some(json!("4000")),
+        Some(json!("4001")),
     ]
     .into_iter()
     .enumerate()
@@ -382,6 +403,165 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
             .await
             .unwrap();
     assert_eq!(pin, "2222");
+    run_once(
+        Kind::Events,
+        pool,
+        &rest,
+        "2222",
+        &observation,
+        &shutdown,
+        false,
+    )
+    .await
+    .unwrap();
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT guild_id FROM scheduled_events ORDER BY guild_id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining,
+        ["3333"],
+        "valid empty response clears only its own guild"
+    );
+    mock.shutdown().await;
+    db.close().await.unwrap();
+}
+
+fn named_event(id: &str, name: &str, start: &str, status: u64) -> Value {
+    json!({"id":id, "guild_id":"2222", "name":name, "scheduled_start_time":start, "status":status})
+}
+
+fn duplicate_id_snapshots() -> Vec<Value> {
+    let first = named_event("3000", "First name", "2026-10-01T19:00:00Z", 1);
+    let second = named_event("3000", "Second name", "2026-10-02T19:00:00Z", 2);
+    vec![
+        // Identical duplicates refuse under the same policy as conflicts.
+        json!([event("3000"), event("3000")]),
+        // Conflicting duplicates refuse in either order; no last-row winner.
+        json!([first.clone(), second.clone()]),
+        json!([second, first]),
+        // A duplicate anywhere refuses the whole snapshot.
+        json!([event("3001"), event("3000"), event("3000")]),
+        json!([event("3000"), event("3001"), event("3002"), event("3000")]),
+        json!([event("3000"), event("3000"), event("3000")]),
+    ]
+}
+
+#[tokio::test]
+async fn duplicate_event_ids_never_reach_storage() {
+    let snapshots = duplicate_id_snapshots();
+    let mock = MockRest::start(
+        snapshots
+            .iter()
+            .cloned()
+            .map(|v| ScriptedResponse::json(200, v))
+            .collect(),
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let pool = poison_pool();
+    let (_stop, shutdown) = watch::channel(false);
+    for snapshot in &snapshots {
+        assert_eq!(
+            run_once(
+                Kind::Events,
+                &pool,
+                &executor(&mock),
+                "2222",
+                &Mutex::new(()),
+                &shutdown,
+                false
+            )
+            .await,
+            Err(ErrorClass::Rest),
+            "{snapshot}"
+        );
+    }
+    assert_eq!(mock.requests().len(), snapshots.len());
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn duplicate_event_ids_preserve_full_mirror_and_valid_controls_still_replace() {
+    let Some(db) = fixture().await else {
+        return;
+    };
+    let pool = db.pool();
+    let (_stop, shutdown) = watch::channel(false);
+    let observation = Mutex::new(());
+    let seed = normalize_events(&[raw_event(&event("3000"), "2222").unwrap()]).unwrap();
+    replace_events(pool, "2222", "2026-09-30T12:00:00.123Z", &seed)
+        .await
+        .unwrap();
+    replace_events(pool, "3333", "2026-09-30T12:00:00.123Z", &seed)
+        .await
+        .unwrap();
+    let before = mirror(pool).await;
+    let snapshots = duplicate_id_snapshots();
+    let mock = MockRest::start(
+        snapshots
+            .iter()
+            .cloned()
+            .map(|v| ScriptedResponse::json(200, v))
+            .collect(),
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let rest = executor(&mock);
+    for snapshot in &snapshots {
+        assert_eq!(
+            run_once(
+                Kind::Events,
+                pool,
+                &rest,
+                "2222",
+                &observation,
+                &shutdown,
+                false
+            )
+            .await,
+            Err(ErrorClass::Rest),
+            "{snapshot}"
+        );
+        assert_eq!(
+            mirror(pool).await,
+            before,
+            "duplicate-id snapshot changed rows/timestamps/contract pin: {snapshot}"
+        );
+    }
+    mock.shutdown().await;
+
+    // Controls: a unique snapshot still replaces, and a valid empty snapshot
+    // still performs the intentional empty-set replacement for its guild.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!([event("3001"), event("3002")])),
+            ScriptedResponse::json(200, json!([])),
+        ],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let rest = executor(&mock);
+    run_once(
+        Kind::Events,
+        pool,
+        &rest,
+        "2222",
+        &observation,
+        &shutdown,
+        false,
+    )
+    .await
+    .unwrap();
+    let replaced: Vec<String> = sqlx::query_scalar(
+        "SELECT event_id FROM scheduled_events WHERE guild_id='2222' ORDER BY event_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(replaced, ["3001", "3002"]);
     run_once(
         Kind::Events,
         pool,

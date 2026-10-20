@@ -632,6 +632,27 @@ impl ActionError {
     pub fn status(&self) -> u16 {
         self.code.status()
     }
+
+    /// Bounded metrics outcome for `two_bot_moderation_enforcements_total`
+    /// (TOG-28482): `refused` for malformed/forbidden/definitive Discord
+    /// rejections, `discord_error` for uncertain Discord failures,
+    /// `storage_error` for persistence failures, `other` for anything else
+    /// (auth, stale, in-progress, version conflicts, replays). The caller
+    /// passes a `ModerationAction::command_name` verb; no user id, reason
+    /// text or free-form detail ever becomes a label.
+    #[must_use]
+    pub fn enforcement_outcome(&self) -> &'static str {
+        match self.code {
+            ErrorCode::Malformed | ErrorCode::ActionNotAllowed | ErrorCode::DiscordRejected => {
+                "refused"
+            }
+            ErrorCode::UpstreamTimeout | ErrorCode::RateLimited | ErrorCode::DiscordUnavailable => {
+                "discord_error"
+            }
+            ErrorCode::Internal => "storage_error",
+            _ => "other",
+        }
+    }
 }
 
 /// Every auth failure is this one error: same code, same message, detail only
@@ -2815,11 +2836,16 @@ mod tests {
         // TOG-23387 adds five env-only EventSub keys (TWO_EVENTSUB,
         // TWO_EVENTSUB_BIND, TWO_TWITCH_CLIENT_ID, TWO_TWITCH_CLIENT_SECRET,
         // TWO_TWITCH_WEBHOOK_SECRET). This change adds two env-only keys
-        // (TWO_TWITCH_BROADCASTERS, TWO_TWITCH_CALLBACK_URL).
+        // (TWO_TWITCH_BROADCASTERS, TWO_TWITCH_CALLBACK_URL). The delivery
+        // provisioning slice adds three env-only keys (TWO_EVENTSUB_DELIVERY,
+        // TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID, TWO_EVENTSUB_INVITE_URL).
+        // TOG-29862 moves TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS from cold to hot,
+        // shifting one entry between those classes. The stored invite-code
+        // slice adds one hot key (TWO_GUILD_INVITE_CODE).
         for (class, expected) in [
-            (SettingClass::Hot, 42),
-            (SettingClass::Cold, 27),
-            (SettingClass::EnvOnly, 61),
+            (SettingClass::Hot, 44),
+            (SettingClass::Cold, 26),
+            (SettingClass::EnvOnly, 64),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),

@@ -1,6 +1,13 @@
-"""Smoke-test a locally loaded runtime image, without Discord or a database."""
+"""Smoke-test a locally loaded runtime image, without Discord or a database.
+
+Cleanup failure exits nonzero even if all smoke checks passed. Removal is
+attempted only for this invocation's generated container names. If a smoke
+check already failed, preserve that primary failure and report cleanup
+failure separately with fixed stage/reason vocabulary, never Docker bodies.
+"""
 
 import argparse
+from contextlib import contextmanager
 import http.client
 import io
 import json
@@ -29,19 +36,29 @@ IMAGE_MAX_BYTES = 112 * MIB
 # hot-reload head measured 15,730,600 bytes (15.00 MiB), also below this
 # limit. This branch's automation-only head measured 15,769,872 bytes
 # (15.04 MiB) before the event-executor merge; the combined-head
-# measurement comes from hosted CI on the merged head. 16 MiB restores a
-# working tripwire with headroom; revisit if the binary approaches it.
-# 2026-10-17 recalibration: main tip 89503f71 measured 16,776,096 bytes
-# (16.00 MiB) in hosted CI, leaving 1,120 bytes of headroom — the tripwire
-# is exhausted even before new code lands. This branch's voice
-# rename-decision logs add 3,160 bytes (merged head 6a9c394e: 16,779,256
-# bytes, 2,040 over 16 MiB) with no new dependencies; the release profile
-# is already minimal (opt-level=z, lto, strip). The go-live receiver-ledger
-# branch independently measured 16801560 bytes (16.02 MiB) on CI run
-# 39056648109 job 117470241279, 24344 bytes over the 16 MiB tripwire, after
-# ~450 lines of shipping ledger/receiver code. 17 MiB restores ~1.00 MiB
-# of headroom while keeping a working tripwire; revisit if the binary
-# approaches it.
+# measurement comes from hosted CI on the merged head. 16 MiB trips on main
+# itself (main-red) with no new dependencies and the same minimal release
+# profile (opt-level=z, lto, strip). Main at d7774644 measured 16,768,848 bytes
+# (15.99 MiB), main tip 89503f71 measured 16,776,096 bytes (1,120 bytes of
+# headroom), and another calibration (main 89c859b1, run 39061354880,
+# byte-identical on main HEAD 89c859b) measured 16,777,376 bytes (160 over);
+# this head measured 16,778,152 bytes (936 over), including this branch's
+# feed-fetch outcome gauges (~2,240 bytes of bounded-vocabulary counters and
+# pure mapping functions; PR merge head 16,778,336 bytes, 1,120 over 16 MiB).
+# The stream retention-expiry slice (ac8fd66, fence-preserving expiry of
+# delivered go-live dedup rows) tipped the full 16 MiB budget with no new
+# dependencies and no release-profile change. The backfill rate-limit client
+# head measured 16,780,912 bytes (16.00 MiB) — the guard's bucket/pacing code.
+# The voice rename-decision logs add ~3,160 bytes (merged head 6a9c394e:
+# 16,779,256 bytes, 2,040 over 16 MiB). The game-activity aggregate-expiry
+# slice measured 16,782,608 bytes (16.01 MiB, 5,392 over) — store expiry plus
+# its per-guild stale listing and the retention-cadence driver. The go-live
+# receiver-ledger slice independently measured 16,801,560 bytes (16.02 MiB,
+# 24,344 over) on CI run 39056648109 job 117470241279 after ~450 lines of
+# ledger/receiver code. The landed slices since the 16 MiB bump consumed its
+# headroom, so 17 MiB restores a working tripwire with ~1 MiB of headroom;
+# revisit if the binary approaches it.
+# The voice actor-init retry measured 16,782,904 bytes (+6,808, no new dependencies).
 BINARY_MAX_BYTES = 17 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
@@ -105,6 +122,44 @@ def report(message):
             summary.write(message + "\n\n")
 
 
+def report_diagnostic(message):
+    """Diagnostic I/O must not replace the smoke or cleanup failure."""
+    try:
+        report(message)
+    except OSError:
+        pass
+
+
+class CleanupFailure(RuntimeError):
+    """An owned container could not be removed (fixed vocabulary only)."""
+
+
+@contextmanager
+def owned_container(name, stage):
+    """Attempt removal even when creation times out or a smoke check fails."""
+    primary_failed = False
+    try:
+        yield
+    except BaseException:
+        primary_failed = True
+        raise
+    finally:
+        reason = None
+        try:
+            result = docker("rm", "--force", name, timeout=30, check=False)
+            if result.returncode != 0:
+                reason = "nonzero removal exit"
+        except subprocess.TimeoutExpired:
+            reason = "removal timed out"
+        except (OSError, subprocess.SubprocessError):
+            reason = "removal process failed"
+        if reason is not None:
+            message = f"FAIL cleanup {stage}: {reason}"
+            report_diagnostic(message)
+            if not primary_failed:
+                raise CleanupFailure(message) from None
+
+
 def http_response(url):
     # A hand-rolled connection (not urlopen) so any 3xx is returned as-is;
     # following a redirect would let one healthy endpoint masquerade as
@@ -156,13 +211,11 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     # Created, never started, and named (not unnamed) so a timed-out Docker
     # client cannot leave an orphan behind; same memory cap as the main run.
     measure = "two-bot-measure-" + uuid.uuid4().hex
-    try:
+    with owned_container(measure, "measurement"):
         docker("create", "--name", measure, "--memory", "256m", "--network", "none", image)
         binary, _ = image_file(measure, BINARY)
         binary_bytes = binary.size
         bundle_header, bundle = image_file(measure, CA_BUNDLE)
-    finally:
-        docker("rm", "--force", measure, check=False)
     for label, size, limit in (
         ("image (summed uncompressed Docker history layer bytes)", measured_image_bytes, image_max_bytes),
         ("release binary", binary_bytes, binary_max_bytes),
@@ -187,95 +240,97 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
     # Docker does not inherit host environment without -e. No secrets or DB
     # are supplied, and no deployment/registry access is needed by this test.
     name = "two-bot-smoke-" + uuid.uuid4().hex
-    try:
-        docker(
-            "run", "--detach", "--name", name, "--memory", "256m",
-            "--publish", "127.0.0.1::8080", "--health-interval", "1s",
-            "--health-start-period", "0s", image,
-        )
-        port = docker("port", name, "8080/tcp").stdout.strip()
-        require(port.startswith("127.0.0.1:"), f"unexpected published port: {port}")
-        url = "http://" + port
-        deadline = time.monotonic() + 30
-        while True:
-            code, body = http_response(url + "/health")
-            if code == 200:
-                require(body == {"status": "ok"}, "/health body must report status ok")
-                break
-            require(time.monotonic() < deadline, "/health did not return 200 within 30s")
-            state = json.loads(docker("inspect", name).stdout)[0]["State"]
-            require(state["Running"], "container exited before becoming healthy")
-            time.sleep(0.25)
-        code, body = http_response(url + "/readyz")
-        require(code == 503, "/readyz must be 503 while the gateway is parked")
-        require(isinstance(body, dict), "/readyz body must be a JSON object")
-        require(body.get("components") == [
-            ["process", "ready"], ["gateway", "down"], ["database", "down"],
-            ["token_invalid", "ready"],
-        ], f"/readyz body must report a ready process, parked gateway, database down and valid token state; got status={code} body={json.dumps(body)[:2000]}")
-        # The runtime always reports informational job status alongside
-        # readiness; with no credentials all thirteen jobs must be parked,
-        # non-running and never started. Jobs never flip the 503 above. The
-        # audit-retry, scheduled-messages, self-role recovery, feeds,
-        # settings-poll, member-unban-sweep and retention entries are always
-        # listed (parked when their services are unregistered).
-        parked = {"parked": True, "running": False, "last_start": None,
-                  "last_success": None, "last_error_class": None,
-                  "consecutive_failures": 0}
-        require(body.get("jobs") == {
-            name: dict(parked) for name in (
-                "counter", "rank", "scheduled_events", "settings", "presence_probe",
-                "community_scorecard", "inactivity", "audit_retry",
-                "self_role_recovery", "scheduled_messages", "feeds",
-                "member_unban_sweep", "retention",
-            )
-        }, "/readyz body must report all thirteen jobs parked, non-running, never started")
-        # Check PID 1, not merely Docker's configured user or an exec helper.
-        uid = pid1_uids(name)
-        require(len(uid) == 4 and all(value != 0 for value in uid), "runtime PID 1 is root")
-        require(docker("exec", name, BINARY, "--healthcheck", timeout=5, check=False).returncode == 0,
-                "--healthcheck must exit 0 against the live process")
-        while True:
-            state = json.loads(docker("inspect", name).stdout)[0]["State"]
-            require(state["Running"], "container exited during healthcheck")
-            if state["Health"]["Status"] == "healthy":
-                break
-            require(time.monotonic() < deadline, "Docker HEALTHCHECK did not become healthy within 30s")
-            time.sleep(0.25)
-        report("PASS /health 200; /readyz 503 parked; non-root PID 1; --healthcheck 0; Docker HEALTHCHECK healthy")
-
-        # A fresh no-network process has no listening server: liveness must
-        # fail honestly rather than being an unconditional success command.
-        # Named (not --rm/unnamed) so a timed-out Docker client cannot leave
-        # an orphan behind; cleaned with the same memory cap as the main run.
-        probe = name + "-probe"
+    with owned_container(name, "main"):
         try:
-            result = docker(
-                "run", "--name", probe, "--memory", "256m",
-                "--network", "none", image, "--healthcheck",
-                timeout=30, check=False,
+            docker(
+                "run", "--detach", "--name", name, "--memory", "256m",
+                "--publish", "127.0.0.1::8080", "--health-interval", "1s",
+                "--health-start-period", "0s", image,
             )
-            require(result.returncode == 1, "--healthcheck without a server must exit 1")
-        finally:
-            docker("rm", "--force", probe, check=False)
-        report("PASS --healthcheck exits 1 without a listening server")
+            port = docker("port", name, "8080/tcp").stdout.strip()
+            require(port.startswith("127.0.0.1:"), f"unexpected published port: {port}")
+            url = "http://" + port
+            deadline = time.monotonic() + 30
+            while True:
+                code, body = http_response(url + "/health")
+                if code == 200:
+                    require(body == {"status": "ok"}, "/health body must report status ok")
+                    break
+                require(time.monotonic() < deadline, "/health did not return 200 within 30s")
+                state = json.loads(docker("inspect", name).stdout)[0]["State"]
+                require(state["Running"], "container exited before becoming healthy")
+                time.sleep(0.25)
+            code, body = http_response(url + "/readyz")
+            require(code == 503, "/readyz must be 503 while the gateway is parked")
+            require(isinstance(body, dict), "/readyz body must be a JSON object")
+            require(body.get("components") == [
+                ["process", "ready"], ["gateway", "down"], ["database", "down"],
+                ["token_invalid", "ready"],
+            ], f"/readyz body must report a ready process, parked gateway, database down and valid token state; got status={code} body={json.dumps(body)[:2000]}")
+            # The runtime always reports informational job status alongside
+            # readiness; with no credentials all thirteen jobs must be parked,
+            # non-running and never started. Jobs never flip the 503 above. The
+            # audit-retry, scheduled-messages, self-role recovery, feeds,
+            # settings-poll, member-unban-sweep and retention entries are always
+            # listed (parked when their services are unregistered).
+            parked = {"parked": True, "running": False, "last_start": None,
+                      "last_success": None, "last_error_class": None,
+                      "consecutive_failures": 0}
+            require(body.get("jobs") == {
+                name: dict(parked) for name in (
+                    "counter", "rank", "scheduled_events", "settings", "presence_probe",
+                    "community_scorecard", "inactivity", "audit_retry",
+                    "self_role_recovery", "scheduled_messages", "feeds",
+                    "member_unban_sweep", "retention",
+                )
+            }, "/readyz body must report all thirteen jobs parked, non-running, never started")
+            # Check PID 1, not merely Docker's configured user or an exec helper.
+            uid = pid1_uids(name)
+            require(len(uid) == 4 and all(value != 0 for value in uid), "runtime PID 1 is root")
+            require(docker("exec", name, BINARY, "--healthcheck", timeout=5, check=False).returncode == 0,
+                    "--healthcheck must exit 0 against the live process")
+            while True:
+                state = json.loads(docker("inspect", name).stdout)[0]["State"]
+                require(state["Running"], "container exited during healthcheck")
+                if state["Health"]["Status"] == "healthy":
+                    break
+                require(time.monotonic() < deadline, "Docker HEALTHCHECK did not become healthy within 30s")
+                time.sleep(0.25)
+            report("PASS /health 200; /readyz 503 parked; non-root PID 1; --healthcheck 0; Docker HEALTHCHECK healthy")
 
-        # Send SIGTERM directly; no docker stop fallback may hide SIGKILL.
-        started = time.monotonic()
-        docker("kill", "--signal", "TERM", name, timeout=2)
-        result = docker("wait", name, timeout=max(0.1, 10 - (time.monotonic() - started)))
-        elapsed = time.monotonic() - started
-        require(elapsed <= 10, f"SIGTERM took {elapsed:.3f}s (maximum 10s)")
-        require(result.stdout.strip() == "0", f"SIGTERM exit code was {result.stdout.strip()}, expected 0")
-        state = json.loads(docker("inspect", name).stdout)[0]["State"]
-        require(not state["Running"] and not state["OOMKilled"], "container failed to shut down cleanly")
-        report(f"PASS SIGTERM exits 0 in {elapsed:.3f}s (maximum 10s); no OOM")
-    except Exception:
-        logs = docker("logs", "--tail", "80", name, check=False)
-        print(logs.stdout + logs.stderr)
-        raise
-    finally:
-        docker("rm", "--force", name, check=False)
+            # A fresh no-network process has no listening server: liveness must
+            # fail honestly rather than being an unconditional success command.
+            # Named (not --rm/unnamed) so a timed-out Docker client cannot leave
+            # an orphan behind; cleaned with the same memory cap as the main run.
+            probe = name + "-probe"
+            with owned_container(probe, "health-probe"):
+                result = docker(
+                    "run", "--name", probe, "--memory", "256m",
+                    "--network", "none", image, "--healthcheck",
+                    timeout=30, check=False,
+                )
+                require(result.returncode == 1, "--healthcheck without a server must exit 1")
+            report("PASS --healthcheck exits 1 without a listening server")
+
+            # Send SIGTERM directly; no docker stop fallback may hide SIGKILL.
+            started = time.monotonic()
+            docker("kill", "--signal", "TERM", name, timeout=2)
+            result = docker("wait", name, timeout=max(0.1, 10 - (time.monotonic() - started)))
+            elapsed = time.monotonic() - started
+            require(elapsed <= 10, f"SIGTERM took {elapsed:.3f}s (maximum 10s)")
+            require(result.stdout.strip() == "0", f"SIGTERM exit code was {result.stdout.strip()}, expected 0")
+            state = json.loads(docker("inspect", name).stdout)[0]["State"]
+            require(not state["Running"] and not state["OOMKilled"], "container failed to shut down cleanly")
+            report(f"PASS SIGTERM exits 0 in {elapsed:.3f}s (maximum 10s); no OOM")
+        except CleanupFailure:
+            raise
+        except Exception:
+            try:
+                logs = docker("logs", "--tail", "80", name, check=False)
+                print(logs.stdout + logs.stderr)
+            except (OSError, subprocess.SubprocessError):
+                report_diagnostic("FAIL container smoke: diagnostic logs unavailable")
+            raise
 
 
 def main():

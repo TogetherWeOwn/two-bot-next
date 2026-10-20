@@ -66,9 +66,9 @@ use two_bot_core::{
     commands::PERM_MANAGE_GUILD,
     feeds::{
         feed_list_text, feed_removed_text, plan_command, FeedCommand, FeedCommandContext,
-        FeedCommandPlan, FeedError, FeedKind,
+        FeedCommandPlan, FeedError, FeedKind, FEED_REMOVAL_RECOVERY_REQUIRED_TEXT,
     },
-    feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit},
+    feeds_store::{add_feed, list_feeds, remove_feed, write_audit, FeedAudit, FeedRemoval},
     funnel::now_millis_for_test,
     moderation::ModerationAction,
     sticky::{
@@ -1372,6 +1372,7 @@ impl CommandRuntime {
         }
         let owner = match name.as_str() {
             "help" => Some(HandlerId::Help),
+            "privacy" => Some(HandlerId::Privacy),
             "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
                 Some(HandlerId::AutomationAdmin)
             }
@@ -1401,6 +1402,10 @@ impl CommandRuntime {
             return;
         }
         match name.as_str() {
+            "privacy" => {
+                crate::privacy_command::privacy_command(&self.pool, &self.executor, interaction)
+                    .await;
+            }
             "sticky" => self.sticky_set(interaction).await,
             "sticky-remove" => self.sticky_remove(interaction).await,
             "feed-add" => self.feed_add(interaction).await,
@@ -1672,7 +1677,8 @@ impl CommandRuntime {
 
     /// `/sticky`: validate → upsert → audit → ephemeral confirmation.
     /// Rejected input still audits (`rejected`, Create vs Update by whether a
-    /// row already exists — the read only names the audit action).
+    /// row already exists — the read only names the audit action). A store
+    /// failure audits that same refusal shape with the `db_class` token.
     async fn sticky_set(&self, interaction: &Interaction) {
         let guild_id = self.guild_id.to_string();
         let Some(channel_id) = interaction_channel(interaction) else {
@@ -1743,13 +1749,32 @@ impl CommandRuntime {
             }
             Err(err) => {
                 warn!(reason = db_class(&err), "sticky put failed");
+                let existed = store::get_sticky(&self.pool, &guild_id, &channel_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some();
+                self.audit(
+                    &guild_id,
+                    Some(&actor_id),
+                    if existed {
+                        StickyAuditAction::Update
+                    } else {
+                        StickyAuditAction::Create
+                    },
+                    Some(&channel_id),
+                    StickyAuditOutcome::Rejected,
+                    Some(db_class(&err)),
+                )
+                .await;
                 self.finish(interaction, STORE_FAILURE_REPLY).await;
             }
         }
     }
 
     /// `/sticky-remove`: delete the row → best-effort delete the previous
-    /// Discord message → audit → ephemeral confirmation.
+    /// Discord message → audit → ephemeral confirmation. A store failure
+    /// audits a `rejected` row with the `db_class` token instead.
     async fn sticky_remove(&self, interaction: &Interaction) {
         let guild_id = self.guild_id.to_string();
         let Some(channel_id) = interaction_channel(interaction) else {
@@ -1791,6 +1816,15 @@ impl CommandRuntime {
             }
             Err(err) => {
                 warn!(reason = db_class(&err), "sticky delete failed");
+                self.audit(
+                    &guild_id,
+                    Some(&actor_id),
+                    StickyAuditAction::Delete,
+                    Some(&channel_id),
+                    StickyAuditOutcome::Rejected,
+                    Some(db_class(&err)),
+                )
+                .await;
                 self.finish(interaction, STORE_FAILURE_REPLY).await;
             }
         }
@@ -1799,8 +1833,9 @@ impl CommandRuntime {
     /// `/feed-add`: decode options → plan → insert-only write → `feed.create`
     /// audit → ephemeral confirmation. The relay id is generated here (legacy
     /// `randomUUID()`); plan errors reply with the domain text and write
-    /// neither a row nor an audit (legacy parity). The relay binds to the
-    /// invoking channel.
+    /// neither a row nor an audit (legacy parity). A store failure audits one
+    /// `feed.create`/`rejected` refusal row, then replies safe. The relay
+    /// binds to the invoking channel.
     async fn feed_add(&self, interaction: &Interaction) {
         let Some(channel_id) = interaction_channel(interaction) else {
             self.finish(interaction, NO_CHANNEL_REPLY).await;
@@ -1830,12 +1865,15 @@ impl CommandRuntime {
                     if let two_bot_core::feeds_store::FeedStoreError::Capacity(quota) = err {
                         self.finish(interaction, quota.to_string()).await;
                     } else {
-                        warn!(reason = feed_store_class(&err), "feed insert failed");
+                        let class = feed_store_class(&err);
+                        warn!(reason = class, "feed insert failed");
+                        self.feed_audit(&inputs, "feed.create", &relay.id, "rejected", Some(class))
+                            .await;
                         self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
                     }
                     return;
                 }
-                self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str())
+                self.feed_audit(&inputs, "feed.create", &relay.id, relay.kind.as_str(), None)
                     .await;
                 self.finish(interaction, format!("Feed relay created: `{}`.", relay.id))
                     .await;
@@ -1850,7 +1888,11 @@ impl CommandRuntime {
     }
 
     /// `/feed-remove`: decode `id` → plan → guild-scoped delete → `feed.remove`
-    /// audit (`removed`/`missing` outcome) → ephemeral confirmation.
+    /// audit (`removed`/`missing`/`recovery_required` outcome) → ephemeral
+    /// confirmation. A relay carrying unresolved pending delivery evidence is
+    /// retained with a fixed recovery reply, never claimed removed. A store
+    /// failure audits one `feed.remove`/`rejected` refusal row, then replies
+    /// safe.
     async fn feed_remove(&self, interaction: &Interaction) {
         // Remove does not bind to the invoking channel; `channel_id` is only
         // context the planner ignores for this command.
@@ -1863,18 +1905,23 @@ impl CommandRuntime {
         match plan_command(&context, command) {
             Ok(FeedCommandPlan::Remove { guild_id, id }) => {
                 match remove_feed(&self.pool, &guild_id, &id).await {
-                    Ok(removed) => {
-                        self.feed_audit(
-                            &inputs,
-                            "feed.remove",
-                            &id,
-                            if removed { "removed" } else { "missing" },
-                        )
-                        .await;
-                        self.finish(interaction, feed_removed_text(removed)).await;
+                    Ok(outcome) => {
+                        let (audit_outcome, reply) = match outcome {
+                            FeedRemoval::Removed => ("removed", feed_removed_text(true)),
+                            FeedRemoval::Missing => ("missing", feed_removed_text(false)),
+                            FeedRemoval::RecoveryRequired => {
+                                ("recovery_required", FEED_REMOVAL_RECOVERY_REQUIRED_TEXT)
+                            }
+                        };
+                        self.feed_audit(&inputs, "feed.remove", &id, audit_outcome, None)
+                            .await;
+                        self.finish(interaction, reply).await;
                     }
                     Err(err) => {
-                        warn!(reason = feed_store_class(&err), "feed remove failed");
+                        let class = feed_store_class(&err);
+                        warn!(reason = class, "feed remove failed");
+                        self.feed_audit(&inputs, "feed.remove", &id, "rejected", Some(class))
+                            .await;
                         self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
                     }
                 }
@@ -1930,7 +1977,16 @@ impl CommandRuntime {
 
     /// Append one `feed.*` audit row; an audit write failure is logged but
     /// never fails the operation it records (same posture as [`Self::audit`]).
-    async fn feed_audit(&self, inputs: &FeedInputs, action: &str, target_key: &str, outcome: &str) {
+    /// Refusals carry the shared error-class token as `reason`; healthy
+    /// outcomes pass `None`.
+    async fn feed_audit(
+        &self,
+        inputs: &FeedInputs,
+        action: &str,
+        target_key: &str,
+        outcome: &str,
+        reason: Option<&str>,
+    ) {
         let audit_id = new_id();
         let row = FeedAudit {
             id: &audit_id,
@@ -1939,7 +1995,7 @@ impl CommandRuntime {
             action,
             target_key,
             outcome,
-            reason: None,
+            reason,
             now_ms: now_millis_for_test(),
         };
         if let Err(err) = write_audit(&self.pool, &row).await {
@@ -2192,6 +2248,9 @@ pub(crate) fn router_with_commands(gates: RouterGates) -> InteractionRouter {
     // `/help` discovery is never activation-fenced either: it renders from
     // the live publish set, so gated-off features simply do not appear.
     router.register(Box::new(SliceHandler(HandlerId::Help)));
+    // `/privacy` member self-serve is never activation-fenced either: every
+    // member may opt out of analytics in any guild.
+    router.register(Box::new(SliceHandler(HandlerId::Privacy)));
     router
 }
 

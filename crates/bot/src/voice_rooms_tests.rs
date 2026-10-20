@@ -3,22 +3,46 @@ use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
+#[path = "voice_admission_config_acceptance_tests.rs"]
+mod admission_config_acceptance;
+#[path = "voice_admission_spawn_tests.rs"]
+mod admission_spawn;
+#[path = "voice_boot_settings_acceptance_tests.rs"]
+mod boot_settings_acceptance;
 #[path = "voice_cold_authority_tests.rs"]
 mod cold_authority;
+#[path = "voice_creation_receipt_acceptance_tests.rs"]
+mod creation_receipt_acceptance;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
+#[path = "voice_empty_grace_override_tests.rs"]
+mod empty_grace_override;
+#[path = "voice_invite_override_tests.rs"]
+mod invite_override;
+#[path = "voice_invite_responder_wiring_tests.rs"]
+mod invite_responder_wiring;
 #[path = "voice_join_requests_tests.rs"]
 mod join;
+#[path = "voice_join_grant_witness_acceptance_tests.rs"]
+mod join_grant_witness_acceptance;
 #[path = "voice_kick_tests.rs"]
 mod kick;
 #[path = "voice_rooms_limit_tests.rs"]
 mod limit_command;
 #[path = "voice_name_tests.rs"]
 mod name;
+#[path = "voice_name_filter_acceptance_tests.rs"]
+mod name_filter_acceptance;
+#[path = "voice_name_rerender_tests.rs"]
+mod name_rerender;
 #[path = "voice_private_runtime_tests.rs"]
 mod private;
+#[path = "voice_responder_admission_acceptance_tests.rs"]
+mod responder_admission_acceptance;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
+#[path = "voice_snapshot_fence_acceptance_tests.rs"]
+mod snapshot_fence_acceptance;
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
 
@@ -131,6 +155,9 @@ struct Store {
     creators: Mutex<Vec<CreatorChannel>>,
     rooms: Mutex<HashMap<u64, VoiceRoom>>,
     rooms_errors: Mutex<VecDeque<StoreError>>,
+    /// One-shot hang for the next `rooms()` call, consumed when it
+    /// starts, so a test can prove a load attempt is deadline-bounded.
+    rooms_delay: Mutex<Option<Duration>>,
     after_rooms: Option<Hook>,
     owner_intents: Mutex<HashMap<u64, OwnerGrantIntent>>,
     owner_pending: Mutex<HashSet<u64>>,
@@ -151,6 +178,7 @@ struct Store {
     save_privacy_errors: Mutex<VecDeque<StoreError>>,
     /// Durable approved Connect grants, keyed by room then member.
     join_grants: Mutex<BTreeMap<u64, BTreeSet<u64>>>,
+    join_grants_errors: Mutex<VecDeque<StoreError>>,
     save_join_grant_errors: Mutex<VecDeque<StoreError>>,
     remove_join_grant_errors: Mutex<VecDeque<StoreError>>,
     add_creator_error: Mutex<Option<StoreError>>,
@@ -171,6 +199,9 @@ struct Store {
     claims: Mutex<Vec<(u64, i64)>>,
     /// The `leaving` list each claim carried.
     claim_leaving: Mutex<Vec<Vec<u64>>>,
+    /// The admission config each claim carried, in claim order. Shared out
+    /// so runtime-level tests can pin the config spawn installed.
+    claim_configs: Arc<Mutex<Vec<CreateAdmissionConfig>>>,
     settled: Mutex<Vec<(String, Option<u64>)>>,
     settle_errors: Mutex<VecDeque<StoreError>>,
     /// Claims bound to the channel Discord returned, as `(reservation, channel)`
@@ -205,6 +236,7 @@ impl Store {
             creators: Mutex::new(vec![CreatorChannel::new(GUILD, CREATOR)]),
             rooms: Mutex::new(HashMap::new()),
             rooms_errors: Mutex::new(VecDeque::new()),
+            rooms_delay: Mutex::new(None),
             after_rooms: None,
             owner_intents: Mutex::new(HashMap::new()),
             owner_pending: Mutex::new(HashSet::new()),
@@ -224,6 +256,7 @@ impl Store {
             privacy: Mutex::new(BTreeMap::new()),
             save_privacy_errors: Mutex::new(VecDeque::new()),
             join_grants: Mutex::new(BTreeMap::new()),
+            join_grants_errors: Mutex::new(VecDeque::new()),
             save_join_grant_errors: Mutex::new(VecDeque::new()),
             remove_join_grant_errors: Mutex::new(VecDeque::new()),
             add_creator_error: Mutex::new(None),
@@ -236,6 +269,7 @@ impl Store {
             claim_script: Mutex::new(VecDeque::new()),
             claims: Mutex::new(Vec::new()),
             claim_leaving: Mutex::new(Vec::new()),
+            claim_configs: Arc::new(Mutex::new(Vec::new())),
             settled: Mutex::new(Vec::new()),
             settle_errors: Mutex::new(VecDeque::new()),
             bound: Mutex::new(Vec::new()),
@@ -295,6 +329,10 @@ impl RoomPersistence for Store {
         Ok(())
     }
     async fn rooms(&self, _: u64) -> Result<Vec<VoiceRoom>, StoreError> {
+        let delay = self.rooms_delay.lock().unwrap().take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if let Some(error) = self.rooms_errors.lock().unwrap().pop_front() {
             return Err(error);
         }
@@ -464,10 +502,11 @@ impl RoomPersistence for Store {
         _: u64,
         user: u64,
         leaving: &[u64],
-        _: &CreateAdmissionConfig,
+        config: &CreateAdmissionConfig,
         now_secs: i64,
     ) -> Result<CreateClaim, StoreError> {
         self.claim_leaving.lock().unwrap().push(leaving.to_vec());
+        self.claim_configs.lock().unwrap().push(*config);
         if self.trace_claims {
             self.trace.lock().unwrap().push("claim".to_owned());
         }
@@ -675,9 +714,17 @@ impl RoomPersistence for Store {
         Ok(true)
     }
     async fn join_grants(&self, _: u64) -> Result<BTreeMap<u64, BTreeSet<u64>>, StoreError> {
+        if let Some(error) = self.join_grants_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         Ok(self.join_grants.lock().unwrap().clone())
     }
-    async fn save_join_grant(&self, _: u64, room: u64, member: u64) -> Result<bool, StoreError> {
+    async fn save_join_grant(
+        &self,
+        _: u64,
+        room: u64,
+        member: u64,
+    ) -> Result<JoinGrantIntent, StoreError> {
         self.trace
             .lock()
             .unwrap()
@@ -686,15 +733,20 @@ impl RoomPersistence for Store {
             return Err(error);
         }
         if !self.rooms.lock().unwrap().contains_key(&room) {
-            return Ok(false);
+            return Ok(JoinGrantIntent::RoomMissing);
         }
-        self.join_grants
+        let inserted = self
+            .join_grants
             .lock()
             .unwrap()
             .entry(room)
             .or_default()
             .insert(member);
-        Ok(true)
+        Ok(if inserted {
+            JoinGrantIntent::Fresh
+        } else {
+            JoinGrantIntent::Retained
+        })
     }
     async fn remove_join_grant(&self, _: u64, room: u64, member: u64) -> Result<(), StoreError> {
         self.trace
@@ -758,6 +810,8 @@ struct Http {
     written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
     refused_notices: Mutex<Vec<NoticeTarget>>,
+    /// Notice targets answering a per-route 429 instead of a refusal.
+    rate_limited_notices: Mutex<Vec<NoticeTarget>>,
     /// V3 join-request prompts posted in a room's chat, and the scripted
     /// errors (one per attempt) the next sends fail with.
     prompts: Mutex<Vec<SentPrompt>>,
@@ -822,6 +876,7 @@ impl Http {
             written_overwrites: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             refused_notices: Mutex::new(Vec::new()),
+            rate_limited_notices: Mutex::new(Vec::new()),
             prompts: Mutex::new(Vec::new()),
             prompt_errors: Mutex::new(VecDeque::new()),
             next_message: Mutex::new(9_000),
@@ -1284,6 +1339,12 @@ impl RoomWrites for Http {
         content: &str,
         mention_role: Option<u64>,
     ) -> Result<(), RoomHttpError> {
+        if self.rate_limited_notices.lock().unwrap().contains(&target) {
+            return Err(RoomHttpError::RateLimited {
+                retry_after_ms: 1_000,
+                global: false,
+            });
+        }
         if self.refused_notices.lock().unwrap().contains(&target) {
             return Err(RoomHttpError::AccessDenied);
         }
@@ -1889,15 +1950,14 @@ async fn failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it()
     assert!(!worker.deletes.contains(&500));
 }
 
-/// Cross-restart provenance for "retain provenance after a failed rollback" is
-/// proven by the disposable-database test
-/// `crates/cutover/tests/voice_create_admission_store.rs::bound_channel_witness_survives_restart_and_holds_the_slot_until_settled`,
-/// which binds the channel to its claim before any room row and rediscovers it
-/// on a fresh pool. This in-memory fixture stays ignored: only `rooms` crosses
-/// its simulated restart and a failed persist writes no room, so the `bound`
-/// witness cannot cross here and the test cannot pass unedited.
+/// In-memory restart proof for "retain provenance after a failed rollback":
+/// the failed persist writes no room row, but the `bound` witness is durable
+/// state (the SQL `bound_create_channels` rows), so it crosses the simulated
+/// restart like `rooms` does and `load` rediscovers the channel through
+/// `orphaned_create_channels`. The disposable-database test
+/// `crates/cutover/tests/voice_create_admission_store.rs::bound_channel_witness_survives_restart_and_holds_the_slot_until_settled`
+/// proves the same path against a real pool.
 #[tokio::test]
-#[ignore = "fixture gap: bound witness does not cross the simulated restart; durable proof is bound_channel_witness_survives_restart_and_holds_the_slot_until_settled"]
 async fn a_restarted_worker_rediscovers_a_channel_whose_rollback_failed() {
     let (live, mut store, http, _) = fixture();
     store.persist_error = Some(StoreError::Unavailable);
@@ -1916,6 +1976,7 @@ async fn a_restarted_worker_rediscovers_a_channel_whose_rollback_failed() {
     let (live, fresh_store, http, _) = fixture();
     live.publish(snapshot(&[500], vec![]));
     *fresh_store.rooms.lock().unwrap() = worker.store.rooms.lock().unwrap().clone();
+    *fresh_store.bound.lock().unwrap() = worker.store.bound.lock().unwrap().clone();
     drop(worker);
     let restarted = GuildRoomWorker::load(live, fresh_store, http)
         .await
@@ -4706,18 +4767,36 @@ fn setup_panel_lists_creators_failures_and_halt() {
 
 #[test]
 fn setup_panel_surfaces_store_errors() {
-    let panel = setup_panel(&SetupSummary {
-        guild_id: GUILD,
-        creators: vec![],
-        tracked_rooms: 0,
-        failures: vec![],
-        halted: false,
-        store_error: Some("Unavailable".to_owned()),
-    });
-    assert!(panel
-        .description
-        .contains("Could not load creator channels"));
-    assert!(!panel.description.contains("No creator channels yet"));
+    // The Setup arm stores `StoreError::to_string()`; pin each Display
+    // variant's exact line so a rewording fails here, not silently.
+    for (error, display) in [
+        (StoreError::Unavailable, "the store is unavailable"),
+        (
+            StoreError::CredentialRefused,
+            "the store refused the bot credential",
+        ),
+        (StoreError::Conflict, "the store reported a conflict"),
+    ] {
+        assert_eq!(error.to_string(), display);
+        let panel = setup_panel(&SetupSummary {
+            guild_id: GUILD,
+            creators: vec![],
+            tracked_rooms: 0,
+            failures: vec![],
+            halted: false,
+            store_error: Some(error.to_string()),
+        });
+        assert_eq!(
+            panel.description,
+            format!(
+                "Voice rooms are running.\n\
+                 Could not load creator channels ({display}); the worker state below is current.\n\
+                 Tracked rooms: 0.\n\
+                 No recent failures."
+            ),
+            "store-error line drifted for {display:?}"
+        );
+    }
 }
 
 #[test]
@@ -5834,6 +5913,298 @@ async fn handle_reclaim_outside_voice_asks_to_join() {
     assert!(text.contains("need to be in a voice room"), "{text}");
 }
 
+// Exact-text pins for reclaim/transfer outcome copy. Each `ownership_refusal`
+// arm plus the reclaim/transfer confirmation lines is asserted with exact
+// equality through the real reply path. Reachable cases go through
+// `handle_capture` (the full interaction reply); succession cases use
+// `worker.apply_ownership` (the exact string the handler replies with);
+// defensive arms that consistent live state cannot produce are pinned via the
+// refusal helper directly and noted as such. A one-word swap in any pinned
+// literal must fail its test; scratch-mutant runs are recorded on the card.
+
+#[tokio::test]
+async fn ownership_copy_reclaim_outside_voice_exact() {
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction = voice_interaction_as(Some(command_data("reclaim", Vec::new())), None, 302);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "You need to be in a voice room to use /reclaim."
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_transfer_outside_voice_exact() {
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 301)])),
+        None,
+        302,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "You need to be in a voice room to use /transfer."
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_transfer_missing_member_exact() {
+    // A transfer with no member option parses to target 0, which the handler
+    // refuses before touching the worker (not the InvalidMemberId arm).
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction =
+        voice_interaction_as(Some(command_data("transfer", Vec::new())), None, MEMBER);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "Choose a member in the room to transfer to."
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_reclaim_already_owner_exact() {
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction = voice_interaction_as(Some(command_data("reclaim", Vec::new())), None, MEMBER);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "You're already the owner of this room."
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_transfer_already_with_exact() {
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data(
+            "transfer",
+            vec![user_option("member", MEMBER)],
+        )),
+        None,
+        MEMBER,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        format!("Ownership is already with <@{MEMBER}>.")
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_transfer_success_exact() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 301)])),
+        None,
+        MEMBER,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "Transferred ownership of this room to <@301>."
+    );
+    wait_trace(&trace, "update_ownership:500:301").await;
+}
+
+#[tokio::test]
+async fn ownership_copy_reclaim_creator_return_exact() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    worker.reconcile();
+    assert_eq!(worker.tracked().get(&500).expect("room").owner_id, 301);
+    worker
+        .live
+        .voice_update_at(MEMBER, Some(500), Some(false), 2_000);
+    assert_eq!(
+        worker.apply_ownership(MEMBER, false, OwnershipCommand::Reclaim),
+        "You're the owner of this room again."
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_reclaim_owner_gone_exact() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    assert_eq!(
+        worker.apply_ownership(301, false, OwnershipCommand::Reclaim),
+        "The room's owner is gone, so it's yours now."
+    );
+}
+
+#[tokio::test]
+async fn ownership_copy_refusal_not_original_creator_exact() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(Some(command_data("reclaim", Vec::new())), None, 301);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "Only the original creator can reclaim this room while its owner is still here."
+    );
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn ownership_copy_refusal_not_owner_exact() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data(
+            "transfer",
+            vec![user_option("member", MEMBER)],
+        )),
+        None,
+        301,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "Only the room owner or an admin can transfer this room."
+    );
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn ownership_copy_refusal_target_not_in_room_exact() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 302)])),
+        None,
+        MEMBER,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "The transfer recipient must be in the room."
+    );
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn ownership_copy_refusal_bot_actor_exact() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    assert!(runtime.voice_frame(GUILD, 302, Some(500), Some(true), "bot".to_owned()));
+    let interaction = voice_interaction_as(Some(command_data("reclaim", Vec::new())), None, 302);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "Bots can't own temporary rooms."
+    );
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn ownership_copy_refusal_bot_target_exact() {
+    let trace = Trace::default();
+    let runtime = ownership_room_runtime(trace.clone()).await;
+    assert!(runtime.voice_frame(GUILD, 302, Some(500), Some(true), "bot".to_owned()));
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 302)])),
+        None,
+        MEMBER,
+    );
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(response.as_ref().expect("reply")),
+        "Bots can't own temporary rooms."
+    );
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership")));
+}
+
+#[tokio::test]
+async fn ownership_copy_corrupt_target_zero_exact() {
+    // `Transfer { target_id: 0 }` reaches the worker only via the direct call
+    // (the interaction handler refuses a missing member first). The worker
+    // maps the resulting `InvalidMemberId` through the shared corrupt-data arm.
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert_eq!(
+        worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 0 }),
+        "Something's off with this room's membership data — leave and rejoin, then try again."
+    );
+    assert!(!trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.starts_with("update_ownership")));
+}
+
+#[test]
+fn ownership_copy_refusal_actor_not_in_room_exact() {
+    // `ActorNotInRoom` is defensive: the worker resolves the room from the
+    // actor's own voice state under one lock, so consistent live state always
+    // yields the "voice room" or "temporary room" replies before `decide`
+    // could report it. Pin the literal so copy drift still fails.
+    assert_eq!(
+        super::ownership_refusal(OwnershipError::ActorNotInRoom),
+        "You need to be in the room to use this command."
+    );
+}
+
+#[test]
+fn ownership_copy_refusal_corrupt_variants_exact() {
+    // All four corrupt-snapshot variants share one arm and one literal.
+    const EXPECTED: &str =
+        "Something's off with this room's membership data — leave and rejoin, then try again.";
+    assert_eq!(
+        super::ownership_refusal(OwnershipError::InvalidMemberId),
+        EXPECTED
+    );
+    assert_eq!(
+        super::ownership_refusal(OwnershipError::DuplicateMember(2)),
+        EXPECTED
+    );
+    assert_eq!(
+        super::ownership_refusal(OwnershipError::BotOwnership),
+        EXPECTED
+    );
+    assert_eq!(
+        super::ownership_refusal(OwnershipError::EmptyRoom),
+        EXPECTED
+    );
+}
+
 fn gated_runtime(
     trace: Trace,
     controls: AccessControls,
@@ -6155,8 +6526,14 @@ async fn access_command_refuses_bad_input_without_changing_anything() {
     }
 }
 
+// These tests share the process-global log capture. Serialize every admin
+// store-failure emitter, including the two reply-only tests, so each capture
+// window contains only its own operation's warning. Hold the guard across await.
+static ADMIN_STORE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn access_command_reports_store_failures_and_changes_nothing() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
     let shared = Arc::new(Mutex::new(AccessControls::default()));
     let runtime = shared_runtime(
         Trace::default(),
@@ -6187,6 +6564,82 @@ async fn access_command_reports_store_failures_and_changes_nothing() {
     );
     let (_, response) = handle_capture(&unreadable, &disable()).await;
     assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
+}
+
+#[tokio::test]
+async fn access_read_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
+    let runtime = gated_runtime(
+        Trace::default(),
+        AccessControls::default(),
+        Some(StoreError::Unavailable),
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (_, response) = handle_capture(
+        &runtime,
+        &access_interaction(sub_option("show", vec![]), true),
+    )
+    .await;
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not read the voice-room settings. Nothing was changed; try again."
+    );
+    let log = global.text()[before..].to_owned();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("op=\"access_read\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one access_read warn in:\n{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"unavailable\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
+#[tokio::test]
+async fn access_save_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
+    let shared = Arc::new(Mutex::new(AccessControls::default()));
+    let runtime = shared_runtime(
+        Trace::default(),
+        shared.clone(),
+        Some(StoreError::CredentialRefused),
+    );
+    let disable = access_interaction(
+        sub_option(
+            "creation",
+            vec![CommandDataOption {
+                name: "enabled".to_owned(),
+                value: CommandOptionValue::Boolean(false),
+            }],
+        ),
+        true,
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (_, response) = handle_capture(&runtime, &disable).await;
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not save the voice-room settings. Nothing was changed; try again."
+    );
+    assert_eq!(*shared.lock().unwrap(), AccessControls::default());
+    let log = global.text()[before..].to_owned();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("op=\"access_save\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one access_save warn in:\n{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"credential_refused\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
 }
 
 fn channel_option(name: &str, id: u64) -> CommandDataOption {
@@ -6620,6 +7073,7 @@ async fn logging_rejects_foreign_channel_and_disconnected_or_unidentified_actor(
 
 #[tokio::test]
 async fn logging_command_reports_store_failures_and_changes_nothing() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
     let level = || {
         logging_interaction(
             sub_option("level", vec![command_option("level", "off")]),
@@ -6638,6 +7092,105 @@ async fn logging_command_reports_store_failures_and_changes_nothing() {
     let (_, response) = handle_capture(&unreadable, &level()).await;
     assert!(response_text(&response.expect("reply")).contains("Nothing was changed"));
     assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+}
+
+#[tokio::test]
+async fn logging_read_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let runtime = logging_runtime(shared.clone(), Some(StoreError::Conflict), None);
+    assert!(runtime.publish_snapshot(GUILD, logging_snapshot()));
+    let level = logging_interaction(
+        sub_option("level", vec![command_option("level", "off")]),
+        true,
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (_, response) = handle_capture(&runtime, &level).await;
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not read the logging settings. Nothing was changed; try again."
+    );
+    assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+    let log = global.text()[before..].to_owned();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("op=\"logging_read\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one logging_read warn in:\n{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"conflict\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
+#[tokio::test]
+async fn logging_save_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
+    let shared = Arc::new(Mutex::new(LoggingSettings::default()));
+    let runtime = logging_runtime(shared.clone(), None, Some(StoreError::Unavailable));
+    assert!(runtime.publish_snapshot(GUILD, logging_snapshot()));
+    let level = logging_interaction(
+        sub_option("level", vec![command_option("level", "off")]),
+        true,
+    );
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (_, response) = handle_capture(&runtime, &level).await;
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not save the logging settings. Nothing was changed; try again."
+    );
+    assert_eq!(*shared.lock().unwrap(), LoggingSettings::default());
+    let log = global.text()[before..].to_owned();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("op=\"logging_save\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one logging_save warn in:\n{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"unavailable\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
+#[test]
+fn admin_store_error_tokens_cover_all_variants() {
+    assert_eq!(
+        admin_store_error_token(StoreError::Unavailable),
+        "unavailable"
+    );
+    assert_eq!(
+        admin_store_error_token(StoreError::CredentialRefused),
+        "credential_refused"
+    );
+    assert_eq!(admin_store_error_token(StoreError::Conflict), "conflict");
+}
+
+#[test]
+fn admin_store_failure_logs_one_warn_with_op_and_reason() {
+    tracing_capture::global();
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        log_admin_store_failure("access_read", GUILD, StoreError::Unavailable);
+    });
+    let log = capture.text();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_event=\"voice_admin_store\""), "{line}");
+    assert!(line.contains("op=\"access_read\""), "{line}");
+    assert!(line.contains("reason=\"unavailable\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
 }
 
 #[tokio::test]
@@ -9713,6 +10266,15 @@ fn applied(trace: &Trace) -> bool {
         .any(|entry| entry == "config_apply")
 }
 
+fn applied_count(trace: &Trace) -> usize {
+    trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.as_str() == "config_apply")
+        .count()
+}
+
 #[test]
 fn parse_export_and_import_attachment_option() {
     let export = with_user(
@@ -9866,6 +10428,83 @@ async fn export_and_import_refuse_without_guild_inventory() {
     assert!(response_text(&response.expect("refusal")).contains("unavailable"));
 }
 
+fn config_failure_runtime(trace: Trace, error: StoreError) -> VoiceRuntime<Store, Http> {
+    VoiceRuntime::new(
+        move || {
+            let mut store = Store::new(trace.clone());
+            store.config_error = Some(error);
+            (store, Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+}
+
+#[tokio::test]
+async fn export_read_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
+    let trace = Trace::default();
+    let runtime = config_failure_runtime(trace.clone(), StoreError::CredentialRefused);
+    let interaction = with_user(
+        voice_interaction(Some(command_data("export", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let inventory = config_inventory();
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not read the voice configuration. Nothing was sent; try again."
+    );
+    assert!(trace.lock().unwrap().is_empty());
+    let log = global.text()[before..].to_owned();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("op=\"export_read\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one export_read warn in:\n{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"credential_refused\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
+#[tokio::test]
+async fn import_read_store_failure_warns_and_keeps_reply() {
+    let _guard = ADMIN_STORE_TEST_LOCK.lock().await;
+    let trace = Trace::default();
+    let runtime = config_failure_runtime(trace.clone(), StoreError::Conflict);
+    let interaction = import_interaction(10, manager(), UPLOADER);
+    let inventory = config_inventory();
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    let (owned, response) = handle_import_capture(&runtime, &interaction, Some(&inventory)).await;
+    assert!(owned);
+    assert_eq!(
+        response_text(&response.expect("reply")),
+        "Could not read the current voice configuration. Nothing was changed; try again."
+    );
+    assert!(trace.lock().unwrap().is_empty());
+    let log = global.text()[before..].to_owned();
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("op=\"import_read\""))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one import_read warn in:\n{log}");
+    let line = lines[0];
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains("voice_admin_store"), "{line}");
+    assert!(line.contains("reason=\"conflict\""), "{line}");
+    assert!(line.contains("guild_id=\"100\""), "{line}");
+    assert!(line.contains("voice admin store failed"), "{line}");
+    assert!(!line.contains("the store"), "{line}");
+}
+
 #[tokio::test]
 async fn import_denied_without_manage_server() {
     let trace = Trace::default();
@@ -9946,6 +10585,58 @@ async fn import_confirm_applies() {
     assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
     assert_eq!(*shared.lock().unwrap(), full_config());
     assert!(applied(&trace));
+}
+
+/// `/setup` then `/import` confirm round-trip through constructed interactions.
+///
+/// An admin reads the status panel, uploads a configuration file, previews
+/// the diff, and confirms: the stored configuration equals the upload and
+/// the apply lands exactly once, with the panel still answering after.
+/// Drives the real `handle_voice_interaction_with` arms with constructed
+/// slash and component inputs; no guild, network, or database.
+#[tokio::test]
+async fn setup_then_import_confirm_round_trip_through_interactions() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, shared) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    // Baseline: /setup answers the admin panel before the import.
+    let setup = with_user(
+        voice_interaction(Some(command_data("setup", Vec::new())), manager(), true),
+        UPLOADER,
+    );
+    let (owned, panel) = handle_import_capture(&runtime, &setup, Some(&inventory)).await;
+    assert!(owned, "voice owns the /setup callback");
+    assert!(!response_text(&panel.expect("setup panel")).is_empty());
+
+    // Upload: /import previews the diff with confirm/cancel buttons.
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (owned, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    assert!(owned, "voice owns the /import callback");
+    let preview = preview.expect("preview");
+    assert!(!applied(&trace), "preview writes nothing");
+    let (confirm_id, _) = preview_buttons(&preview);
+
+    // Confirm: the component press applies the upload exactly once.
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned, "voice owns the confirm callback");
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert_eq!(*shared.lock().unwrap(), full_config());
+    assert_eq!(applied_count(&trace), 1, "one apply per confirm");
+
+    // Replay: pressing Confirm again expires instead of applying twice.
+    let (owned, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(owned, "voice owns the replayed confirm callback");
+    let replayed = response_text(&response.expect("expired replay"));
+    assert!(replayed.contains("expired"), "{replayed}");
+    assert_eq!(applied_count(&trace), 1, "no second apply");
+    assert_eq!(*shared.lock().unwrap(), full_config());
+
+    // The panel still answers with content after the import lands.
+    let (owned, panel) = handle_import_capture(&runtime, &setup, Some(&inventory)).await;
+    assert!(owned, "voice still owns /setup after the import");
+    assert!(!response_text(&panel.expect("post-import panel")).is_empty());
 }
 
 #[tokio::test]
@@ -10577,6 +11268,77 @@ async fn notices_fall_back_from_system_channel_to_owner_dm_to_creator_chat() {
 }
 
 #[tokio::test]
+async fn configured_channel_failure_warns_then_falls_back() {
+    let settings = LoggingSettings {
+        channel_id: Some(650),
+        mention_role_id: Some(NOTICE_ROLE),
+        ..LoggingSettings::default()
+    };
+    let mut worker = failed_worker(settings, Some(SYSTEM_CHANNEL)).await;
+
+    // A working configured channel stays silent: no fallback warn.
+    let global = tracing_capture::global();
+    let before = global.text().len();
+    assert!(worker.send_notices(0).await);
+    assert_eq!(sent(&worker)[0].0, NoticeTarget::Channel(650));
+    let quiet = global.text()[before..].to_owned();
+    assert!(
+        !quiet.contains("voice notice configured channel failed; trying fallback"),
+        "success stays silent: {quiet}"
+    );
+
+    // A rate limit is a retry, not a misconfiguration: the fallback still
+    // delivers and no warn fires. Kept in this test because the capture is
+    // process-wide and only this test emits the warn, so a sibling's line
+    // cannot land in these silent windows.
+    worker
+        .http
+        .rate_limited_notices
+        .lock()
+        .unwrap()
+        .push(NoticeTarget::Channel(650));
+    let before = global.text().len();
+    assert!(worker.send_notices(NOTICE_REPEAT_INTERVAL_MS).await);
+    let notices = sent(&worker);
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices[1].0, NoticeTarget::Channel(SYSTEM_CHANNEL));
+    let throttled = global.text()[before..].to_owned();
+    assert!(
+        !throttled.contains("voice notice configured channel failed; trying fallback"),
+        "a rate limit stays silent: {throttled}"
+    );
+
+    // A failing configured channel warns once, then the fallback delivers
+    // with the mention intact.
+    worker.http.rate_limited_notices.lock().unwrap().clear();
+    worker
+        .http
+        .refused_notices
+        .lock()
+        .unwrap()
+        .push(NoticeTarget::Channel(650));
+    let before = global.text().len();
+    assert!(worker.send_notices(2 * NOTICE_REPEAT_INTERVAL_MS).await);
+    let notices = sent(&worker);
+    assert_eq!(notices.len(), 3);
+    assert_eq!(notices[2].0, NoticeTarget::Channel(SYSTEM_CHANNEL));
+    assert_eq!(notices[2].2, Some(NOTICE_ROLE));
+    let logged = global.text()[before..].to_owned();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("voice notice configured channel failed; trying fallback"))
+        .expect("a configured-channel failure warns before falling back");
+    assert!(line.starts_with("WARN "), "{line}");
+    assert!(line.contains(&format!("guild=\"{GUILD}\"")), "{line}");
+    assert!(line.contains("op=\"send_notice\""), "{line}");
+    assert!(line.contains("outcome=\"discord\""), "{line}");
+    assert!(
+        !line.contains("/setup"),
+        "the warn carries no notice text: {line}"
+    );
+}
+
+#[tokio::test]
 async fn no_system_channel_goes_straight_to_the_owner_dm() {
     let mut worker = failed_worker(LoggingSettings::default(), None).await;
     assert!(worker.send_notices(0).await);
@@ -10974,6 +11736,132 @@ async fn sink_never_answers_kick_without_the_router() {
         "no callback, got {calls:?}"
     );
     assert!(replies.completed.lock().unwrap().is_empty());
+}
+
+/// Every ballot button's custom ID plus its disabled state, in render order.
+fn ballot_button_states(response: &InteractionResponse) -> Vec<(String, bool)> {
+    let mut states = Vec::new();
+    let Some(data) = response.data.as_ref() else {
+        return states;
+    };
+    let Some(components) = data.components.as_ref() else {
+        return states;
+    };
+    for component in components {
+        let Component::ActionRow(row) = component else {
+            continue;
+        };
+        for inner in &row.components {
+            let Component::Button(button) = inner else {
+                continue;
+            };
+            states.push((
+                button.custom_id.clone().unwrap_or_default(),
+                button.disabled,
+            ));
+        }
+    }
+    states
+}
+
+/// Vote-kick open/vote/close round-trip through constructed interactions.
+///
+/// Drives the real `handle_voice_interaction` arms with a `/kick` slash
+/// command followed by Yes-ballot component presses: the open renders the
+/// public ballot, the second Yes reaches strict majority (2/3) and closes
+/// the vote Passed with disabled buttons, and a further ballot replays the
+/// terminal Passed instead of reopening. The queued room-scoped
+/// deny/disconnect enforcement is pinned at worker level by
+/// `strict_majority_passes_and_enforces_on_that_room_only`; no guild,
+/// network, or database here.
+#[tokio::test]
+async fn vote_kick_open_vote_close_round_trip_through_interactions() {
+    const VOTER_B: u64 = 302;
+    const VOTER_C: u64 = 304;
+    let trace = Trace::default();
+    let runtime = kick_room_runtime(
+        &trace,
+        true,
+        vec![
+            voice_member_in(KICK_VOTER, KICK_ROOM),
+            voice_member_in(VOTER_B, KICK_ROOM),
+            voice_member_in(KICK_TARGET, KICK_ROOM),
+            voice_member_in(VOTER_C, KICK_ROOM),
+        ],
+    );
+
+    // Open: /kick from an occupant renders the public ballot.
+    let open = kick_sink_interaction(KICK_TARGET, KICK_VOTER);
+    let vote_id = open.id.get();
+    let (owned, ballot) = handle_capture(&runtime, &open).await;
+    assert!(owned, "voice owns the /kick callback");
+    let ballot = ballot.expect("ballot reply");
+    assert_eq!(
+        ballot.kind,
+        InteractionResponseType::ChannelMessageWithSource
+    );
+    let content = response_text(&ballot);
+    assert!(content.contains("<@303>"), "{content}");
+    assert!(content.contains("too loud"), "{content}");
+    assert!(content.contains("2/3 needed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&ballot),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), false),
+            (vote_button_id(vote_id, VoteBallot::No), false),
+        ]
+    );
+
+    // First Yes: still active, buttons live.
+    let first = component_interaction(&vote_button_id(vote_id, VoteBallot::Yes), None, KICK_VOTER);
+    let (owned, response) = handle_capture(&runtime, &first).await;
+    assert!(owned, "voice owns the ballot callback");
+    let response = response.expect("first ballot update");
+    assert_eq!(response.kind, InteractionResponseType::UpdateMessage);
+    let content = response_text(&response);
+    assert!(content.contains("2/3 needed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&response),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), false),
+            (vote_button_id(vote_id, VoteBallot::No), false),
+        ],
+        "active ballot keeps both live buttons"
+    );
+
+    // Second Yes: strict majority closes the vote Passed, buttons disabled.
+    let second = component_interaction(&vote_button_id(vote_id, VoteBallot::Yes), None, VOTER_B);
+    let (owned, response) = handle_capture(&runtime, &second).await;
+    assert!(owned, "voice owns the closing ballot callback");
+    let response = response.expect("closing ballot update");
+    assert_eq!(response.kind, InteractionResponseType::UpdateMessage);
+    let content = response_text(&response);
+    assert!(content.contains("Vote passed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&response),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), true),
+            (vote_button_id(vote_id, VoteBallot::No), true),
+        ],
+        "closed ballot keeps both buttons, disabled"
+    );
+
+    // Replay: a further ballot stays terminal instead of reopening.
+    let replay = component_interaction(&vote_button_id(vote_id, VoteBallot::Yes), None, VOTER_C);
+    let (owned, response) = handle_capture(&runtime, &replay).await;
+    assert!(owned, "voice owns the replay ballot callback");
+    let response = response.expect("replay update");
+    assert_eq!(response.kind, InteractionResponseType::UpdateMessage);
+    let content = response_text(&response);
+    assert!(content.contains("Vote passed"), "{content}");
+    assert_eq!(
+        ballot_button_states(&response),
+        vec![
+            (vote_button_id(vote_id, VoteBallot::Yes), true),
+            (vote_button_id(vote_id, VoteBallot::No), true),
+        ],
+        "replay keeps the closed Passed shell"
+    );
 }
 
 // ---- lifecycle-outcome signals (offline cutover verification) ----
@@ -12770,6 +13658,130 @@ fn empty_grace_config_accepts_zero_to_ten_minutes_and_refuses_garbage() {
     assert_eq!(configured_empty_grace(Some("601")), Err(InvalidEmptyGrace));
     assert_eq!(configured_empty_grace(Some("-1")), Err(InvalidEmptyGrace));
     assert_eq!(configured_empty_grace(Some("1m")), Err(InvalidEmptyGrace));
+}
+
+/// Regression for the stored-grace fallback bug: a guild that spawns with a
+/// stored `0` must return to the true boot grace once the row is deleted
+/// (the documented undo path), not keep sweeping instantly. Driven through
+/// the real `ensure_actor` spawn path, so the boot-fallback restore line in
+/// `ensure_actor` is what makes this pass: with that line removed the final
+/// assert sees `Some(ZERO)` instead of `Some(EMPTY_ROOM_GRACE)`.
+#[tokio::test]
+async fn spawn_with_stored_zero_then_row_removal_restores_boot_grace() {
+    use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+
+    let trace = Trace::default();
+    let (mut writer, reader) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_string(),
+            key: EMPTY_GRACE_KEY.to_owned(),
+            value: json!(0),
+            version: 1,
+        }],
+    });
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || (Store::new(trace.clone()), Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+    .with_live_source(move || Some(reader.clone()));
+    let actor = runtime.ensure_actor(GUILD).expect("spawn the guild actor");
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(Duration::ZERO) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(Duration::ZERO),
+        "spawn with a stored 0 applies the stored override first"
+    );
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![],
+    });
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(EMPTY_ROOM_GRACE) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(EMPTY_ROOM_GRACE),
+        "deleting the stored row must restore the boot grace, never a stale zero"
+    );
+    runtime.remove_guild(GUILD);
+}
+
+/// Same fallback bug via the out-of-range path: a stored `0` at spawn
+/// followed by a `601` edit must fail closed to the boot grace. Driven
+/// through the real `ensure_actor` spawn path, like the row-removal test
+/// above: with the boot-fallback restore line removed the final assert
+/// sees `Some(ZERO)` instead of `Some(EMPTY_ROOM_GRACE)`.
+#[tokio::test]
+async fn spawn_with_stored_zero_then_out_of_range_restores_boot_grace() {
+    use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+
+    let trace = Trace::default();
+    let (mut writer, reader) = live_channel();
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_string(),
+            key: EMPTY_GRACE_KEY.to_owned(),
+            value: json!(0),
+            version: 1,
+        }],
+    });
+    let runtime = VoiceRuntime::new(
+        {
+            let trace = trace.clone();
+            move || (Store::new(trace.clone()), Http::new(trace.clone()))
+        },
+        Duration::from_millis(10),
+        true,
+    )
+    .with_live_source(move || Some(reader.clone()));
+    let actor = runtime.ensure_actor(GUILD).expect("spawn the guild actor");
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(Duration::ZERO) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(Duration::ZERO),
+        "spawn with a stored 0 applies the stored override first"
+    );
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_string(),
+            key: EMPTY_GRACE_KEY.to_owned(),
+            value: json!(601),
+            version: 2,
+        }],
+    });
+    for _ in 0..1000 {
+        if actor.live.read_state().empty_grace == Some(EMPTY_ROOM_GRACE) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        actor.live.read_state().empty_grace,
+        Some(EMPTY_ROOM_GRACE),
+        "an out-of-range edit after a stored zero must fail closed to boot"
+    );
+    runtime.remove_guild(GUILD);
 }
 
 #[test]

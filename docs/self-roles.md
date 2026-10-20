@@ -49,16 +49,27 @@ it does **not** enable live Discord dispatch.
    then the audit before checking expiry. Only deterministic fixtures use the
    explicitly named `with_test_clock` constructor.
 6. Use singular role mutations, removals before additions, retaining unrelated
-   roles. Check ownership before **and after** each REST call. Storage fencing
-   alone cannot cancel a remote request that outlives its lease.
+   roles. A nonexclusive button/reaction event converges **only its audited
+   option**, including explicit removals and already-held/absent no-ops. Another
+   offered option may change after admission; this event must not add, delete or
+   restore it. Select-menu submissions (including nonexclusive menus) and exclusive
+   panels retain full-set selection/replacement semantics. Check ownership before
+   **and after** each REST call. Storage fencing alone cannot cancel a remote
+   request that outlives its lease.
 7. Persist attempted/observed/compensated/unresolved effects truthfully.
    Attempted and compensated role IDs are cumulative historical evidence;
    checkpoint and settlement atomically union them with stored IDs. Observed
    added/removed and unresolved IDs are the latest snapshot and may be cleared
    after reconciliation. Recovery returns all eight arrays; it never infers
    historical effects from desired roles. On ambiguous REST failure, reconcile
-   to the persisted pre-mutation state; an exclusive stale worker repairs only
-   the last **committed** panel target.
+   to the persisted pre-mutation state in the same operation scope: for a
+   nonexclusive button/reaction, restore only the audited option, not other panel
+   options. Interrupted-exchange recovery and lease-expiry replay use that scope
+   too; the admitted before/desired snapshots stay immutable. Only attempted
+   roles contribute observed effects, so another option's independent changes
+   are not credited to this event. Pending exchanges remain unresolved even if
+   the scoped target is observed. An exclusive stale worker repairs only the last
+   **committed** panel target.
 8. Publish successful audit and panel target atomically using
    `finish_audit_and_set_panel_option`. A stale audit rolls back the target;
    a stale panel publishes nothing. Release retains chronology/commitment.
@@ -178,11 +189,15 @@ registered with the gateway:
 
 The settlement/repair checkpoint adds these runtime seams, still without handlers:
 
-- `settle` re-fetches authoritative policy/member state, requires convergence to
-  the immutable target, and commits a successful audit and exclusive target
+- `settle` re-fetches authoritative policy/member state and requires convergence
+  to the immutable target in the operation's scope: only the audited option for
+  nonexclusive buttons/reactions, the full panel set for selects/exclusive panels.
+  Unrelated option drift cannot prevent single-option settlement, but a reverted
+  audited option still does. It commits a successful audit and exclusive target
   atomically. A fully restored compensation is a rejected audit, not success.
-  Nonexclusive settlement requires the same live event fence. Release failure
-  cannot change an already committed outcome into a false rejection.
+  Nonexclusive settlement requires the same live event fence and no pending
+  exchange. Release failure cannot change an already committed outcome into a
+  false rejection.
 - `reconcile_stale` stops old keepers and acquires a **new** renewing maintenance
   lane without changing event chronology. It force-fetches and revalidates policy,
   removes before adding, and restores only the last committed option (including

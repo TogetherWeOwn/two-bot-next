@@ -58,7 +58,7 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   Keys in\n\
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\
-The thirty-four keys in `STORE_READ_KEYS`\n\
+The thirty-five keys in `STORE_READ_KEYS`\n\
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and\n\
@@ -88,7 +88,7 @@ and purge (`crates/bot/src/ticket_runtime.rs`); the gateway funnel applies\n\
 `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`\n\
 from the snapshot on every guild message, refreshing the channel classifier\n\
 and the community-facts sink together before the message's channel class is\n\
-stamped (`crates/bot/src/gateway.rs`, `crates/discord/src/leveling_runtime.rs`). Two boot-only edges\n\
+stamped (`crates/bot/src/gateway.rs`, `crates/discord/src/leveling_runtime.rs`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:3070-3093`, `:8741`). Two boot-only edges\n\
 remain: the voice room-name policy is\n\
 built once at boot from the process environment\n\
 (`crates/bot/src/gateway.rs:1608`); and gateway intents plus ticket command\n\
@@ -111,7 +111,7 @@ When voice is enabled, `build_production_runtime` also reads\n\
 `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,\n\
 `TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely\n\
 for delete protection, not creator provisioning. Its empty grace is fixed at\n\
-60 seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600) sets it.\n\
+60 seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600) sets it at boot, and a stored per-guild row overrides that boot value live (out-of-range rows fail closed to the boot value).\n\
 Onboarding, automod and scorecard typed loaders exist but are not\n\
 called during boot; their defaults below come from empty-map calls. The\n\
 classifier loader runs when the ordered pipeline is built and again when\n\
@@ -170,6 +170,9 @@ const BOOT_ENV: &[&str] = &[
     "TWO_TEMP_VOICE_CATEGORY_ID",
     "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
     "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
+    "TWO_TEMP_VOICE_MAX_PER_USER",
+    "TWO_TEMP_VOICE_MAX_PER_GUILD",
+    "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS",
 ];
 
 /// Catalog keys whose dashboard-stored values are applied at runtime through
@@ -178,10 +181,13 @@ const BOOT_ENV: &[&str] = &[
 /// (`join_risk_runtime.rs:66-70`, `:238`), raid (`raid_runtime.rs:45-46`,
 /// `:170`), onboarding's per-event `CONFIG_KEYS` merge
 /// (`onboarding.rs:21-30`, `:175-182`), message-path automod's per-delivery
-/// live refresh (`automod_gateway.rs:211-222`, `:292`) and the feed poller's
-/// per-tick schedule gate (`feed_jobs.rs:235-287`). These rows say “applied
-/// live by runtime refresh” in the table below; every other storable key
-/// keeps the legacy `HOT_WIRED`/boot-env labels.
+/// live refresh (`automod_gateway.rs:211-222`, `:292`), the feed poller's
+/// per-tick schedule gate (`feed_jobs.rs:235-287`), the voice sweep's
+/// per-guild empty-grace refresh (`voice_rooms.rs:3070-3093`, `:8741`) and
+/// the invite responder's per-interaction code resolution
+/// (`stored_invite_code_with`).
+/// These rows say “applied live by runtime refresh” in the table below;
+/// every other storable key keeps the legacy `HOT_WIRED`/boot-env labels.
 const STORE_READ_KEYS: &[&str] = &[
     "TWO_ANTI_NUKE_WINDOW_SECONDS",
     "TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS",
@@ -217,6 +223,8 @@ const STORE_READ_KEYS: &[&str] = &[
     "DISCORD_VOICE_LOG_CHANNEL_ID",
     "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
     "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
+    "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
+    "TWO_GUILD_INVITE_CODE",
 ];
 
 fn repository_root() -> PathBuf {

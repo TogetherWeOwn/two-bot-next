@@ -7,16 +7,18 @@
  * The bearer gate lives in `index.ts` (before this handler runs), so every
  * call here is already authenticated with the `mcp:read` bearer.
  *
- * Phase 1 tools (all read-only, all bounded: 6 s timeout + 64 KiB body cap,
- * same as the metrics scrape in `index.ts`):
+ * Phase 1 tools (all read-only). Two separate budgets share the 6 s / 64 KiB
+ * shape but never each other: inbound intake collects at most 64 KiB under a
+ * six-second deadline before JSON parsing (measured on bytes read, never on
+ * Content-Length), while every outbound container read keeps its own 6 s
+ * timeout + 64 KiB cap (same as the metrics scrape in `index.ts`):
  * - `get_status` → `GET http://c/health` (single container read)
  * - `get_gateway` → `GET http://c/readyz`, gateway excerpt only
  * - `get_backfill_progress` → `GET http://c/readyz` jobs excerpt, with an
  *   explicit `implemented: false` marker (no backfill JSON API exists yet)
  * - `get_config` → redacted non-secret Worker snapshot (no container read,
  *   never secrets)
- * - `get_audit` → explicit `implemented: false` stub (no audit JSON API
- *   exists yet; real audit read is follow-up work, never faked data)
+ * - `get_audit` → `GET http://c/ops/audit`, bounded redacted audit excerpt
  *
  * Control tools are out of scope (deferred behind step-up scope + control
  * token + audit write). Unknown tool names return JSON-RPC `-32601`.
@@ -39,7 +41,15 @@ export const MCP_SERVER_VERSION = "0.1.0";
 /** Container-fetch bound for every MCP tool call (mirrors the scrape bound). */
 export const MCP_FETCH_TIMEOUT_MS = 6000;
 export const MCP_MAX_BODY_BYTES = 64 * 1024;
+/** Inbound intake bound for authenticated request bodies (a separate budget
+ * from the outbound container bound above): at most 64 KiB collected under a
+ * six-second deadline before JSON parsing. */
+export const MCP_INBOUND_MAX_BODY_BYTES = 64 * 1024;
+export const MCP_INBOUND_BODY_TIMEOUT_MS = 6000;
 
+// Internal binding dispatch, not a credential. Public ingress strips this
+// header; only the authenticated MCP handler stamps it on its fixed GET.
+export const MCP_AUDIT_READ_HEADER = "x-two-bot-mcp-audit-read";
 const SINGLETON_NAME = "two-bot";
 
 export const MCP_TOOL_NAMES = [
@@ -59,13 +69,34 @@ function isToolName(value: unknown): value is McpToolName {
   );
 }
 
+/** Echo only JSON-RPC scalar correlation IDs; anything else becomes null so
+ * refusals never reflect untrusted values. Falsy-but-valid IDs (`0`, `""`)
+ * are preserved. */
+function safeId(value: unknown): string | number | null {
+  return typeof value === "string" || typeof value === "number" ? value : null;
+}
+
+/** Every advertised tool takes no arguments: omitted or an empty object. Any
+ * scalar, array, null, or unexpected own key (including falsy values and an
+ * own `__proto__` key) is refused before dispatch. */
+function hasValidArguments(params: Record<string, unknown>): boolean {
+  if (!("arguments" in params)) return true;
+  const args = params["arguments"];
+  return (
+    typeof args === "object" &&
+    args !== null &&
+    !Array.isArray(args) &&
+    Object.keys(args).length === 0
+  );
+}
+
 const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
   get_status: "Bot status (container /health, read-only)",
   get_gateway: "Gateway connection state excerpt from /readyz (read-only)",
   get_backfill_progress:
     "Backfill jobs excerpt from /readyz (phase 1: implemented=false; no backfill JSON API yet)",
   get_config: "Redacted non-secret Worker config snapshot (read-only, never secrets)",
-  get_audit: "Audit excerpt (phase 1: implemented=false; real audit read is follow-up)",
+  get_audit: "Bounded redacted audit excerpt from /ops/audit (read-only, newest 50 rows)",
 };
 
 function toolEntries(): unknown[] {
@@ -88,6 +119,23 @@ async function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
     return await Promise.race([work, aborted]);
   } finally {
     signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/** Cleanup never extends a deadline or replaces the intended refusal. */
+function cancelBestEffort(body: { cancel(): Promise<void> } | null): void {
+  try {
+    void body?.cancel().catch(() => {});
+  } catch {
+    // A synchronous cleanup failure is no more authoritative than a rejection.
+  }
+}
+
+function releaseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    reader.releaseLock();
+  } catch {
+    // Some runtimes cannot release a lock while a read is pending.
   }
 }
 
@@ -122,8 +170,8 @@ async function readBoundedText(
     }
     return new TextDecoder().decode(bytes);
   } finally {
-    if (!complete) void reader.cancel().catch(() => {});
-    reader.releaseLock();
+    if (!complete) cancelBestEffort(reader);
+    releaseReader(reader);
   }
 }
 
@@ -158,7 +206,7 @@ function toolResult(id: unknown, data: unknown): Response {
 /** One bounded container GET through the fenced singleton DO. */
 async function containerGet(
   env: McpEnv,
-  path: "/health" | "/readyz",
+  path: "/health" | "/readyz" | "/ops/audit",
   signal: AbortSignal,
 ): Promise<Response> {
   const deployment = deploymentId(
@@ -172,11 +220,19 @@ async function containerGet(
     .fetch(
       new Request(`http://c${path}`, {
         method: "GET",
-        headers: { [DEPLOYMENT_HEADER]: deployment },
+        headers: {
+          [DEPLOYMENT_HEADER]: deployment,
+          ...(path === "/ops/audit" ? { [MCP_AUDIT_READ_HEADER]: "1" } : {}),
+        },
         signal,
       }),
     );
-  return abortable(upstream, signal);
+  // A stub may return the Response itself; a missing `.then` must not turn a
+  // healthy reply into a generic failure. Late headers get the same cleanup.
+  return abortable(Promise.resolve(upstream).then((response) => {
+    if (signal.aborted) cancelBestEffort(response.body);
+    return response;
+  }), signal);
 }
 
 function combineSignals(request: Request, timeoutMs: number): AbortSignal {
@@ -206,21 +262,64 @@ function isReadyzBotResponse(status: number, contentType: string | null): boolea
 }
 
 /** A parsed /readyz body is only a readiness report when it carries the
- * HealthReport shape (components is an array of [name, status] pairs). The
+ * HealthReport shape: every component is an exact [string, status] pair,
+ * with status ready, starting or down (crates/core/src/health.rs). The
  * Worker's ownership/storage fence also answers 503 application/json with
  * `{error:"ownership_fenced"}` (see ownership.ts refused()); that body must
  * stay a generic failure, never an empty gateway/jobs success. */
 function isReadyzReport(data: unknown): boolean {
+  if (typeof data !== "object" || data === null) return false;
+  const components = (data as Record<string, unknown>)["components"];
   return (
-    typeof data === "object" &&
-    data !== null &&
-    Array.isArray((data as Record<string, unknown>)["components"])
+    Array.isArray(components) &&
+    components.every((entry: unknown) =>
+      Array.isArray(entry) &&
+      entry.length === 2 &&
+      typeof entry[0] === "string" &&
+      (entry[1] === "ready" || entry[1] === "starting" || entry[1] === "down")
+    )
   );
+}
+
+/** Reject schema drift rather than accidentally proxying private audit columns. */
+function isAuditExcerpt(data: unknown): boolean {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return false;
+  const excerpt = data as Record<string, unknown>;
+  if (Object.keys(excerpt).sort().join(",") !== "available,rows,truncated" ||
+      typeof excerpt.available !== "boolean" || typeof excerpt.truncated !== "boolean" ||
+      !Array.isArray(excerpt.rows) || excerpt.rows.length > 50) return false;
+  if (!excerpt.available && (excerpt.rows.length !== 0 || excerpt.truncated)) return false;
+  const keys = [
+    "action", "actor_id", "delivery_state", "destination_channel_id", "entry_id",
+    "guild_id", "kind", "message_id", "occurred_at", "source_channel_id", "target_id",
+  ].join(",");
+  return excerpt.rows.every((value: unknown) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+    const row = value as Record<string, unknown>;
+    if (Object.keys(row).sort().join(",") !== keys) return false;
+    const nullableIds = ["actor_id", "target_id", "source_channel_id", "destination_channel_id", "message_id"];
+    const snowflake = (field: unknown) => typeof field === "string" && /^[0-9]{1,20}$/.test(field);
+    return typeof row.entry_id === "string" && /^[A-Za-z0-9_:.-]{1,128}$/.test(row.entry_id)
+      && snowflake(row.guild_id)
+      && nullableIds.every((key) => row[key] === null || snowflake(row[key]))
+      && typeof row.occurred_at === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(row.occurred_at)
+      && typeof row.kind === "string" && ["message_edit", "message_delete", "member_update", "voice_join", "voice_leave", "voice_move", "moderation_action"].includes(row.kind)
+      && typeof row.delivery_state === "string" && ["none", "pending", "delivering", "delivered", "quarantined"].includes(row.delivery_state)
+      && (row.action === null || (typeof row.action === "string" && [
+        "member_kick", "member_prune", "member_ban", "member_unban", "member_update",
+        "member_role_update", "member_move", "member_disconnect", "message_delete",
+        "message_bulk_delete", "channel_update", "channel_overwrite_create",
+        "channel_overwrite_update", "channel_overwrite_delete", "moderation.ban",
+        "moderation.tempban", "moderation.kick", "moderation.timeout", "moderation.warn",
+        "moderation.purge", "moderation.slowmode", "moderation.lockdown", "moderation.unlock",
+        "moderation.unban_scheduled",
+      ].includes(row.action)));
+  });
 }
 
 async function readContainerJson(
   env: McpEnv,
-  path: "/health" | "/readyz",
+  path: "/health" | "/readyz" | "/ops/audit",
   signal: AbortSignal,
 ): Promise<{ ok: true; data: unknown } | { ok: false; oversize: boolean }> {
   let upstream: Response;
@@ -229,10 +328,12 @@ async function readContainerJson(
   } catch {
     return { ok: false, oversize: false };
   }
-  const botResponse =
-    path === "/health" ? upstream.ok : isReadyzBotResponse(upstream.status, upstream.headers.get("content-type"));
+  const contentType = upstream.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+  const botResponse = path === "/ops/audit"
+    ? upstream.status === 200 && contentType === "application/json"
+    : path === "/health" ? upstream.ok : isReadyzBotResponse(upstream.status, contentType ?? null);
   if (signal.aborted || !botResponse) {
-    await upstream.body?.cancel().catch(() => {});
+    cancelBestEffort(upstream.body);
     return { ok: false, oversize: false };
   }
   let body: string | null;
@@ -243,20 +344,20 @@ async function readContainerJson(
   }
   if (body === null || signal.aborted) {
     // Oversize (null) or a timeout that won the race during the read: never
-    // echo upstream bytes, just report the class.
-    await upstream.body?.cancel().catch(() => {});
+    // echo upstream bytes, just report the class. The reader already owns
+    // best-effort cleanup; do not cancel the same body a second time.
     return { ok: false, oversize: body === null };
   }
   try {
     const data = JSON.parse(body) as unknown;
-    if (path === "/readyz" && !isReadyzReport(data)) {
+    if ((path === "/readyz" && !isReadyzReport(data)) ||
+        (path === "/ops/audit" && !isAuditExcerpt(data))) {
       return { ok: false, oversize: false };
     }
     return { ok: true, data };
   } catch {
-    if (path === "/readyz") {
-      // Non-JSON 200/503 bodies (plain text, arrays-as-text, junk) are not
-      // readiness reports.
+    if (path !== "/health") {
+      // Non-JSON bodies are not readiness reports or audit excerpts.
       return { ok: false, oversize: false };
     }
     return { ok: true, data: { text: body } };
@@ -355,9 +456,89 @@ async function callTool(
       });
     }
     case "get_audit": {
-      // No audit JSON API exists yet: pin the stub, never fake entries.
-      return toolResult(id, { implemented: false });
+      const res = await readContainerJson(env, "/ops/audit", signal);
+      if (!res.ok) {
+        return jsonError(
+          id,
+          -32000,
+          res.oversize ? "container body exceeds limit" : "container request failed",
+        );
+      }
+      return toolResult(id, res.data);
     }
+  }
+}
+
+/**
+ * Collect at most `limit` inbound bytes under `timeoutMs` before parsing.
+ * The count is measured on the bytes actually read, never on Content-Length.
+ * Oversize, deadline, client-abort and stream errors all resolve `ok: false`;
+ * cancellation is attempted once without awaiting its result, and the reader
+ * is released where legal so cleanup cannot hold the refusal or drain the tail.
+ * Decoding happens once, after a complete read, so a multi-byte character
+ * split across chunks still parses.
+ */
+async function readInboundText(
+  request: Request,
+  limit: number,
+  timeoutMs: number,
+): Promise<{ ok: true; text: string } | { ok: false }> {
+  const stream = request.body;
+  if (!stream) return { ok: true, text: "" };
+  const clientSignal = request.signal;
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  // The deadline and the client abort share one mechanism: cancelling the
+  // reader settles the pending read as done, and the flags below tell that
+  // apart from a genuine end of body. Native stream cancellation closes pending
+  // reads before waiting for the underlying cancel hook; never await that hook.
+  // Keeping each read to one await also stops oversize intake before tail pulls.
+  let expired = false;
+  let complete = false;
+  let cancelled = false;
+  const cancelOnce = () => {
+    if (cancelled) return;
+    cancelled = true;
+    cancelBestEffort(reader);
+  };
+  const expire = () => {
+    expired = true;
+    cancelOnce();
+  };
+  const timer = setTimeout(expire, timeoutMs);
+  clientSignal?.addEventListener("abort", expire, { once: true });
+  try {
+    if (clientSignal?.aborted) return { ok: false };
+    for (;;) {
+      let next: ReadableStreamReadResult<Uint8Array>;
+      try {
+        next = await reader.read();
+      } catch {
+        // Stream error mid-body: same fixed refusal, never an echo.
+        return { ok: false };
+      }
+      if (expired || clientSignal?.aborted) return { ok: false };
+      if (next.done) {
+        complete = true;
+        break;
+      }
+      size += next.value.byteLength;
+      if (size > limit) return { ok: false };
+      chunks.push(next.value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { ok: true, text: new TextDecoder().decode(bytes) };
+  } finally {
+    clearTimeout(timer);
+    clientSignal?.removeEventListener("abort", expire);
+    if (!complete) cancelOnce();
+    releaseReader(reader);
   }
 }
 
@@ -370,34 +551,58 @@ export async function handleMcp(
   env: McpEnv,
   fullEnv?: Record<string, string | undefined>,
 ): Promise<Response> {
+  const intake = await readInboundText(
+    request,
+    MCP_INBOUND_MAX_BODY_BYTES,
+    MCP_INBOUND_BODY_TIMEOUT_MS,
+  );
+  if (!intake.ok) {
+    return jsonError(null, -32700, "parse error");
+  }
   let body: unknown;
   try {
-    body = await request.json();
+    body = JSON.parse(intake.text) as unknown;
   } catch {
     return jsonError(null, -32700, "parse error");
   }
-  if (typeof body !== "object" || body === null) {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
     return jsonError(null, -32600, "invalid request");
   }
   const msg = body as Record<string, unknown>;
   if (msg["jsonrpc"] !== "2.0" || typeof msg["method"] !== "string") {
-    return jsonError(
-      (msg as { id?: unknown })["id"] ?? null,
-      -32600,
-      "invalid request",
-    );
+    return jsonError(safeId(msg["id"]), -32600, "invalid request");
   }
   const method = msg["method"] as string;
-  const id = ("id" in msg ? msg["id"] : undefined) as unknown;
-  const params = (msg["params"] ?? {}) as Record<string, unknown>;
-
-  // JSON-RPC notifications (no id) get a bare 202, never a result body.
-  if (id === undefined || id === null) {
-    if (method.startsWith("notifications/")) {
-      return new Response(null, { status: 202, headers: withSecurityHeaders() });
-    }
+  const rawId: unknown = "id" in msg ? msg["id"] : undefined;
+  if (
+    rawId !== undefined &&
+    rawId !== null &&
+    typeof rawId !== "string" &&
+    typeof rawId !== "number"
+  ) {
     return jsonError(null, -32600, "invalid request");
   }
+  const rawParams: unknown = "params" in msg ? msg["params"] : undefined;
+  const paramsShapeOk =
+    rawParams === undefined ||
+    (typeof rawParams === "object" && rawParams !== null && !Array.isArray(rawParams));
+
+  // JSON-RPC notifications (no id) get a bare 202, never a result body —
+  // but only for notification-named methods with well-formed params.
+  if (rawId === undefined || rawId === null) {
+    if (!method.startsWith("notifications/")) {
+      return jsonError(null, -32600, "invalid request");
+    }
+    if (!paramsShapeOk) {
+      return jsonError(null, -32602, "invalid params");
+    }
+    return new Response(null, { status: 202, headers: withSecurityHeaders() });
+  }
+  const id = rawId as string | number;
+  if (!paramsShapeOk) {
+    return jsonError(id, -32602, "invalid params");
+  }
+  const params = (rawParams ?? {}) as Record<string, unknown>;
 
   switch (method) {
     case "initialize": {
@@ -422,8 +627,14 @@ export async function handleMcp(
     }
     case "tools/call": {
       const name = params["name"];
+      if (typeof name !== "string") {
+        return jsonError(id, -32602, "invalid params");
+      }
       if (!isToolName(name)) {
         return jsonError(id, -32601, "unknown tool");
+      }
+      if (!hasValidArguments(params)) {
+        return jsonError(id, -32602, "invalid params");
       }
       const snapshot: Record<string, string | undefined> = {};
       if (fullEnv) {
@@ -435,9 +646,9 @@ export async function handleMcp(
       return jsonResult(id, {});
     }
     default: {
-      if (method.startsWith("notifications/")) {
-        return new Response(null, { status: 202, headers: withSecurityHeaders() });
-      }
+      // Only requests reach this branch (id-less notifications returned
+      // above), so a notification-named method with an ID is a request for
+      // an unknown method: a method response, never a silent 202.
       return jsonError(id, -32601, "method not found");
     }
   }

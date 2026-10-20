@@ -7,11 +7,16 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use two_bot_core::internal_actions::{validate_event_input, EventInput, EventPlace};
+use two_bot_core::send_admission::{
+    AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, SendCompletion, SendCooldown,
+    TokenKey,
+};
 use two_bot_core::{EventStatus, ScheduledEvent, ScheduledEventMirror};
 use two_bot_discord::ratelimit_guard::GuardError;
 use two_bot_discord::{
@@ -101,6 +106,336 @@ impl MemoryMirror {
             .unwrap()
             .get(&(GUILD.to_owned(), EVENT.to_owned()))
             .cloned()
+    }
+
+    fn snapshot(&self) -> MirrorRows {
+        self.rows.lock().unwrap().clone()
+    }
+}
+
+/// Take-or-block lane. Dropping a permit leaves it held; only `complete`
+/// releases it, matching durable send admission.
+#[derive(Debug)]
+struct HeldLane {
+    key: TokenKey,
+    held: Arc<Mutex<bool>>,
+    released: Arc<AtomicU32>,
+}
+
+struct HeldRelease {
+    held: Arc<Mutex<bool>>,
+    released: Arc<AtomicU32>,
+}
+
+impl SendCompletion for HeldRelease {
+    fn complete(
+        self: Box<Self>,
+        _cooldown: Option<SendCooldown>,
+    ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+        *self.held.lock().unwrap() = false;
+        self.released.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl SendAdmission for HeldLane {
+    fn token_key(&self) -> &TokenKey {
+        &self.key
+    }
+
+    fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        if *self.held.lock().unwrap() {
+            Box::pin(async { Err(AdmissionError::Blocked) })
+        } else {
+            *self.held.lock().unwrap() = true;
+            let held = Arc::clone(&self.held);
+            let released = Arc::clone(&self.released);
+            Box::pin(async move {
+                Ok(AdmissionPermit::new(Box::new(HeldRelease {
+                    held,
+                    released,
+                })))
+            })
+        }
+    }
+}
+
+impl HeldLane {
+    fn new() -> Self {
+        Self {
+            key: TokenKey::for_bot_token("not-a-credential").unwrap(),
+            held: Arc::new(Mutex::new(false)),
+            released: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn released(&self) -> u32 {
+        self.released.load(Ordering::SeqCst)
+    }
+}
+
+fn governed(rest: &MockRest) -> (ActionExecutor, Arc<HeldLane>) {
+    let lane = Arc::new(HeldLane::new());
+    let executor = ActionExecutor::with_admission(
+        "not-a-credential".to_owned(),
+        Some(rest.origin()),
+        Arc::clone(&lane) as Arc<dyn SendAdmission>,
+    )
+    .unwrap();
+    (executor, lane)
+}
+
+#[derive(Clone, Copy)]
+enum CallKind {
+    Create,
+    Update,
+    Read,
+    Cancel,
+}
+
+impl CallKind {
+    const ALL: [Self; 4] = [Self::Create, Self::Update, Self::Read, Self::Cancel];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Read => "read",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    fn outcome(self) -> &'static str {
+        match self {
+            Self::Create => "created",
+            Self::Update => "updated",
+            Self::Read => "read",
+            Self::Cancel => "cancelled",
+        }
+    }
+
+    fn call(self) -> EventCall {
+        match self {
+            Self::Create => EventCall::Upsert {
+                event_id: None,
+                input: input(false),
+            },
+            Self::Update => EventCall::Upsert {
+                event_id: Some(EVENT.to_owned()),
+                input: input(false),
+            },
+            Self::Read => EventCall::Read {
+                event_id: EVENT.to_owned(),
+            },
+            Self::Cancel => EventCall::Cancel {
+                event_id: EVENT.to_owned(),
+            },
+        }
+    }
+
+    /// Cancel is only a successful publish when Discord says the event is
+    /// cancelled. Identity cases use that status so a status mismatch cannot
+    /// hide an accepted alias.
+    fn status(self) -> i64 {
+        if matches!(self, Self::Cancel) {
+            4
+        } else {
+            1
+        }
+    }
+
+    fn http_status(self) -> u16 {
+        if matches!(self, Self::Create) {
+            201
+        } else {
+            200
+        }
+    }
+
+    fn mutation(self) -> bool {
+        !matches!(self, Self::Read)
+    }
+}
+
+fn overflow_snowflake() -> String {
+    (u128::from(u64::MAX) + 1).to_string()
+}
+
+async fn seeded_mirror() -> (MemoryMirror, MirrorRows) {
+    let mirror = MemoryMirror::default();
+    mirror
+        .upsert(
+            GUILD,
+            OBSERVED,
+            &ScheduledEvent {
+                id: EVENT.to_owned(),
+                name: "Seeded".to_owned(),
+                starts_at: "2026-09-01T18:00:00.000Z".to_owned(),
+                channel_id: Some(CHANNEL.to_owned()),
+                description: None,
+                status: EventStatus::Scheduled,
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot = mirror.snapshot();
+    (mirror, snapshot)
+}
+
+fn identity_refusals() -> Vec<(CallKind, &'static str, Value)> {
+    let mut cases = Vec::new();
+    for kind in CallKind::ALL {
+        let voice = response(kind.status(), true);
+        let mut push = |label: &'static str, body: Value| cases.push((kind, label, body));
+
+        let mut alias_event = voice.clone();
+        alias_event["id"] = json!(format!("0{EVENT}"));
+        push("alias event id", alias_event);
+        let mut plus_event = voice.clone();
+        plus_event["id"] = json!(format!("+{EVENT}"));
+        push("plus event id", plus_event);
+        let mut zero_event = voice.clone();
+        zero_event["id"] = json!("0");
+        push("zero event id", zero_event);
+        let mut overflow_event = voice.clone();
+        overflow_event["id"] = json!(overflow_snowflake());
+        push("overflow event id", overflow_event);
+        let mut number_event = voice.clone();
+        number_event["id"] = json!(EVENT.parse::<u64>().unwrap());
+        push("nonstring event id", number_event);
+
+        let mut missing_guild = voice.clone();
+        missing_guild.as_object_mut().unwrap().remove("guild_id");
+        push("missing guild id", missing_guild);
+        let mut null_guild = voice.clone();
+        null_guild["guild_id"] = Value::Null;
+        push("null guild id", null_guild);
+        let mut number_guild = voice.clone();
+        number_guild["guild_id"] = json!(GUILD.parse::<u64>().unwrap());
+        push("nonstring guild id", number_guild);
+        let mut foreign_guild = voice.clone();
+        foreign_guild["guild_id"] = json!(format!("9{GUILD}"));
+        push("foreign guild id", foreign_guild);
+        let mut alias_guild = voice.clone();
+        alias_guild["guild_id"] = json!(format!("0{GUILD}"));
+        push("alias guild id", alias_guild);
+
+        let mut invalid_channel = voice.clone();
+        invalid_channel["channel_id"] = json!("bad");
+        push("invalid channel id", invalid_channel);
+        let mut zero_channel = voice.clone();
+        zero_channel["channel_id"] = json!("0");
+        push("zero channel id", zero_channel);
+        let mut alias_channel = voice.clone();
+        alias_channel["channel_id"] = json!(format!("0{CHANNEL}"));
+        push("alias channel id", alias_channel);
+        let mut number_channel = voice.clone();
+        number_channel["channel_id"] = json!(CHANNEL.parse::<u64>().unwrap());
+        push("nonstring channel id", number_channel);
+    }
+    cases
+}
+
+/// Production change that makes this pass: `execute_event` must reject a
+/// noncanonical event id, a missing or noncanonical guild id, and a present
+/// noncanonical channel id before `mirror.upsert` and, on a mutation, before
+/// `response.complete`. A read may already have completed admission in the
+/// transport; that is not a publish.
+#[tokio::test]
+async fn noncanonical_response_identities_never_publish_or_release_the_fence() {
+    let mut failures = Vec::new();
+    for (kind, label, body) in identity_refusals() {
+        let rest = MockRest::start(
+            vec![ScriptedResponse::json(kind.http_status(), body)],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let (executor, lane) = governed(&rest);
+        let (mirror, seeded) = seeded_mirror().await;
+        let result = executor
+            .execute_event(GUILD, &kind.call(), &mirror, stamp)
+            .await;
+        let name = format!("{} {label}", kind.label());
+        match &result {
+            Ok(value) => failures.push(format!("{name}: published {value}")),
+            Err(error) if *error != EventActionError::InvalidResponse => {
+                failures.push(format!("{name}: error {error:?}"));
+            }
+            Err(error) if error.is_safe_pre_mutation() => {
+                failures.push(format!("{name}: classified retry-safe"));
+            }
+            Err(_) => {}
+        }
+        if mirror.snapshot() != seeded {
+            failures.push(format!("{name}: mirror changed"));
+        }
+        let released = lane.released();
+        if kind.mutation() && released != 0 {
+            failures.push(format!("{name}: admission completed ({released})"));
+        }
+        if !kind.mutation() && released != 1 {
+            failures.push(format!("{name}: read admission settled {released} times"));
+        }
+        if rest.requests().len() != 1 {
+            failures.push(format!("{name}: sent {} requests", rest.requests().len()));
+        }
+        rest.shutdown().await;
+    }
+    assert!(
+        failures.is_empty(),
+        "noncanonical identities published:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Canonical same-guild bodies, a null external channel, and an absent
+/// channel stay publishable. Only a present noncanonical channel is a refusal.
+#[tokio::test]
+async fn canonical_same_guild_null_and_absent_channel_still_publish() {
+    for kind in CallKind::ALL {
+        for (label, mut body, channel) in [
+            (
+                "canonical voice",
+                response(kind.status(), true),
+                Some(CHANNEL),
+            ),
+            ("null channel", response(kind.status(), false), None),
+            ("absent channel", response(kind.status(), true), None),
+        ] {
+            if label == "absent channel" {
+                body.as_object_mut().unwrap().remove("channel_id");
+            }
+            let rest = MockRest::start(
+                vec![ScriptedResponse::json(kind.http_status(), body)],
+                ScriptedResponse::status(500),
+            )
+            .await;
+            let (executor, lane) = governed(&rest);
+            let (mirror, _) = seeded_mirror().await;
+            let value = executor
+                .execute_event(GUILD, &kind.call(), &mirror, stamp)
+                .await
+                .unwrap_or_else(|error| panic!("{label} {}: {error:?}", kind.label()));
+            assert_eq!(value["outcome"], kind.outcome(), "{label} {}", kind.label());
+            assert_eq!(value["event_id"], EVENT, "{label} {}", kind.label());
+            let rows = mirror.snapshot();
+            assert_eq!(rows.len(), 1, "{label} {}", kind.label());
+            let (event, observed) = rows
+                .get(&(GUILD.to_owned(), EVENT.to_owned()))
+                .unwrap_or_else(|| panic!("{label} {} stored an alias key", kind.label()));
+            assert_eq!(event.id, EVENT, "{label} {}", kind.label());
+            assert_eq!(event.name, "Launch Night", "{label} {}", kind.label());
+            assert_eq!(
+                event.channel_id.as_deref(),
+                channel,
+                "{label} {}",
+                kind.label()
+            );
+            assert_eq!(observed, OBSERVED, "{label} {}", kind.label());
+            assert_eq!(lane.released(), 1, "{label} {}", kind.label());
+            assert_eq!(rest.requests().len(), 1, "{label} {}", kind.label());
+            rest.shutdown().await;
+        }
     }
 }
 

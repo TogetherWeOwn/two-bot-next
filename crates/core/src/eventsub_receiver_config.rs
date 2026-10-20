@@ -10,13 +10,19 @@
 use std::{collections::HashMap, env, net::SocketAddr};
 
 use crate::{
-    config::ConfigError, internal_actions::assert_private_bind, twitch_eventsub::WebhookSecret,
+    config::ConfigError,
+    internal_actions::{assert_private_bind, MIN_KEY_SECRET_LEN},
+    secret::Secret,
+    twitch_eventsub::WebhookSecret,
 };
 
 /// Validated configuration; no public constructor or secret-bearing Debug.
 pub struct EventsubReceiverConfig {
     listen_addr: SocketAddr,
     secret: WebhookSecret,
+    /// Dedicated Worker-to-receiver refresh key, when the Operator arms
+    /// no-restart rotation. `None` keeps the legacy startup-secret behavior.
+    reload_key: Option<Secret<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for EventsubReceiverConfig {
@@ -86,9 +92,30 @@ impl EventsubReceiverConfig {
             )
         })?;
 
+        // Optional arming for no-restart rotation: absent keeps the legacy
+        // startup-secret behavior, but a present-but-short key refuses
+        // startup rather than silently running unrefreshable.
+        let reload_key = match lookup("TWO_EVENTSUB_RELOAD_KEY") {
+            Err(env::VarError::NotPresent) => None,
+            Ok(value) if value.len() >= MIN_KEY_SECRET_LEN => Some(Secret::new(value.into_bytes())),
+            Ok(_) => {
+                return Err(invalid(
+                    "TWO_EVENTSUB_RELOAD_KEY",
+                    "value must be at least 32 bytes",
+                ));
+            }
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(invalid(
+                    "TWO_EVENTSUB_RELOAD_KEY",
+                    "value is not valid unicode",
+                ));
+            }
+        };
+
         Ok(Some(Self {
             listen_addr,
             secret,
+            reload_key,
         }))
     }
 
@@ -100,6 +127,13 @@ impl EventsubReceiverConfig {
     #[must_use]
     pub fn secret(&self) -> &WebhookSecret {
         &self.secret
+    }
+
+    /// The refresh HMAC key, when rotation is armed. Expose only to the
+    /// refresh verifier, never to diagnostics.
+    #[must_use]
+    pub fn reload_key(&self) -> Option<&Secret<Vec<u8>>> {
+        self.reload_key.as_ref()
     }
 }
 
@@ -201,5 +235,43 @@ mod tests {
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("synthetic-webhook-secret-01"));
         assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn reload_key_is_optional_but_validated() {
+        // Absent: legacy startup-secret behavior, reload disarmed.
+        let config = load(&vars()).unwrap().expect("enabled");
+        assert!(config.reload_key().is_none());
+        // Present and long enough: armed, bytes intact.
+        let mut configured_vars = vars();
+        configured_vars.insert(
+            "TWO_EVENTSUB_RELOAD_KEY".to_owned(),
+            "synthetic-reload-key-00000000000001".to_owned(),
+        );
+        let config = load(&configured_vars).unwrap().expect("enabled");
+        assert_eq!(
+            config.reload_key().expect("armed").expose(),
+            b"synthetic-reload-key-00000000000001"
+        );
+        // Present but short or empty: refuse startup, never silently disarm.
+        let short_key = "x".repeat(MIN_KEY_SECRET_LEN - 1);
+        for short in ["", "short", short_key.as_str()] {
+            let mut vars = vars();
+            vars.insert("TWO_EVENTSUB_RELOAD_KEY".to_owned(), short.to_owned());
+            assert!(load(&vars).is_err(), "{short:?}");
+        }
+    }
+
+    #[test]
+    fn debug_never_carries_the_reload_key() {
+        let mut vars = vars();
+        vars.insert(
+            "TWO_EVENTSUB_RELOAD_KEY".to_owned(),
+            "synthetic-reload-key-00000000000001".to_owned(),
+        );
+        let config = load(&vars).unwrap().expect("enabled");
+        let rendered = format!("{config:?} {config:#?}");
+        assert!(!rendered.contains("synthetic-reload-key-00000000000001"));
+        assert!(!rendered.contains("synthetic-webhook-secret-01"));
     }
 }

@@ -57,8 +57,8 @@ claim. Staging deploys from `main`; production deploys through the manual
   `guild_settings` poll (`crates/bot/src/website_jobs.rs:152`) publishes through
   `settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`) with no feature
   runtime reading that snapshot yet, so stored values reach the runtime only
-  through per-runtime store refreshes (`raid_runtime.rs:136`,
-  `containment_runtime.rs:186`, `join_risk_runtime.rs:198`) and onboarding's
+  through per-runtime `StoreSettings::refresh` calls (`raid_runtime.rs`,
+  `containment_runtime.rs`, `join_risk_runtime.rs`) and onboarding's
   per-event refresh (`onboarding.rs:167`), if at all (see the reference;
   re-checked at `bce86a791`).
 - [Feed supervisor](docs/feed-supervisor.md): running feed delivery —
@@ -101,11 +101,12 @@ health-only fallback; see the [EventSub runbook](docs/eventsub-runbook.md).
 Every delivery body is capped at 64 KiB and verified
 (`twitch_eventsub::verify_delivery`,
 `crates/core/src/twitch_eventsub.rs:169`) before JSON parsing or classification
-(`classify`, `crates/core/src/twitch_eventsub.rs:245`). Only `stream.online`
-version 1 is accepted for classification. The runtime receiver currently only
-acknowledges verified notifications and revocations: it does not create a post
-plan, claim a durable ledger row, or publish an announcement. Core planning and
-claim logic is not yet wired to a send path. Planning rules live in the
+(`classify`, `crates/core/src/twitch_eventsub.rs:261`). Only `stream.online`
+version 1 is accepted for classification. With delivery dark the runtime
+receiver only acknowledges verified notifications and revocations; with
+delivery enabled a verified `stream.online` runs the durable claim → send →
+settle flow (`deliver_go_live`, `crates/bot/src/eventsub_http.rs:262`;
+production deps built at `crates/bot/src/main.rs:422`). Planning rules live in the
 [stream funnel](docs/stream-funnel.md); the operator runbook is the
 [EventSub runbook](docs/eventsub-runbook.md). The keys (`TWO_EVENTSUB`,
 `TWO_EVENTSUB_BIND`, `TWO_TWITCH_WEBHOOK_SECRET`) are catalogued in

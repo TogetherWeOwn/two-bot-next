@@ -97,6 +97,33 @@ definitions and their alert-response sections in
 [the operations runbook](runbook.md#metrics-alerts) and
 [metrics reference](metrics.md#off-container-scrape-and-alert-rules).
 
+## Voice boot-setting refusal
+
+If the gateway logs `voice HTTP setup failed`, look earlier in the same
+Container boot window for `temp-voice boot setting invalid; refusing voice
+runtime` at WARN. Match the JSON `message` field, not `msg`. Its `key` names
+the exact fixed environment key to inspect; `reason` is always
+`invalid_value`. The log intentionally contains no configured value, raw
+parser error, token, channel/member list or synthetic identity input.
+
+The first invalid setting wins: protected channels (lobby, generator,
+category, protected list), generator, empty-room grace, then synthetic humans.
+The generator key is already checked during protection. Later invalid keys
+are not reported until the earlier refusal is corrected. See the
+[event catalog](observability-event-catalog.md#voice-structured-fields-gateway-sink-adjacent)
+for the complete key list and field shape.
+
+Record the build revision, boot timestamp, fixed key and reason only. Have
+the authorized configuration executor inspect that one setting privately
+against its existing contract; use the normal configuration/restart gates
+for any correction. Do not dump environment values or paste lists into an
+incident. This runbook does not authorize a live setting change or restart.
+The runtime still refuses setup with `InvalidRequest`; process health alone
+is not evidence that voice initialized. Absent, blank and valid settings do
+not emit this diagnostic. Do not confuse it with `temp-voice admission
+setting invalid; using default`: admission knobs remain nonfatal and fall
+back per knob without refusing voice setup.
+
 ## Request-id correlation
 
 One `request_id` joins the Worker, Durable Object, container and queued-work
@@ -149,10 +176,13 @@ claim them as shipped acceptance:
 - Worker/DO alert log lines and Discord messages do not yet consistently carry
   the Container Git SHA and a direct log-query URL. Use the build/deploy
   correlation procedure above.
-- Worker/DO request-span and dispatch lines do not carry the container
-  `build_sha`/`release`: the Worker version ID is distinct from the Git SHA.
-  The release-tagged error events above are the exception. Correlate other
-  Worker/DO activity via the procedure above.
+- Worker/DO request-span and dispatch lines (`internal_actions_ingress`,
+  `eventsub_ingress`) carry `release` (the container Git SHA, deploy-stamped
+  on the Worker edge and probe-read on the DO relay, `"unknown"` when neither
+  has a SHA yet) and the stable `log_url` above; the Worker version ID is
+  still distinct from the Git SHA and is never used as one. Join an edge
+  refusal to the container's `build_sha`/`release` lines via `request_id`.
+  Correlate other Worker/DO activity via the procedure above.
 - Release-tagged error grouping is provided by Workers Logs, not an external
   error-tracking service. Every `container_gateway_failure` and `metrics_alert`
   line carries `release` (the container git SHA) and `worker_version` plus the
@@ -187,12 +217,24 @@ claim them as shipped acceptance:
   records `insufficient_data` (exit 0 with a warning), which proves nothing
   and must never be read as a healthy pass. Traffic between container boot
   and the first scrape lands in the baseline and is not judged; only requests
-  between the two scrapes count. Production has no error-rate gate yet.
+  between the two scrapes count. Production runs the same gate at the end of
+  the `production` job against live production `/ops/metrics` (evidence
+  `production-error-rate-gate.json`), failing the stage into the same
+  auto-rollback; live enforcement needs the `PRODUCTION_METRICS_SCRAPE_TOKEN`
+  secret, else a recorded skip, and the `inject_error_rate_spike` dispatch
+  input proves the chain with a rehearsal firing.
 - The shared central gradual-promotion action promotes 5-50-100% with
   per-stage health gates and automatic rollback to the recorded pre-promote
-  version. This repository has no caller wiring to it yet, so do not treat
-  the existing gated readiness check plus manual rollback as proof of a
-  gradual traffic rollout here.
+  version. The caller contract is implemented (`bin/smoke.mjs`, contract-tested
+  against a loopback stub with live staging probes without an override only;
+  override probes of a non-owner version return 503 `ownership_fenced` on this
+  singleton Worker and cannot pass as a canary; passive proof caller in
+  `.github/workflows/gradual-promote-proof.yml`
+  with every error-rate input explicit — see `docs/gradual-promote-caller.md`),
+  but no gradual traffic rollout has run here yet: the proof workflow refuses
+  before any Cloudflare call until its isolated synthetic fixture lands, and
+  production has no gradual caller. Do not treat the existing gated readiness
+  check plus manual rollback as proof of a gradual traffic rollout here.
 
 For the full health, metrics, and rollback procedures, see the
 [operations runbook](runbook.md), [metrics reference](metrics.md), and

@@ -10,18 +10,18 @@
 //! The supervisor never overlaps attempts of one job, which replaces the
 //! legacy re-entrancy guard.
 //!
-//! Every claimed occurrence ends in one `scheduled.run` audit row (ids and
-//! outcomes only, never the body). The one exception is legacy's too: when a
-//! re-queue finds the claim already gone, the new claim holder owns the row.
+//! Every claimed occurrence attempts one `scheduled.run` audit write (ids and
+//! outcomes only, never the body), including when recording or re-queuing the
+//! occurrence fails. An audit-write failure is logged and fails the tick.
 
 use std::{sync::Arc, time::Duration};
 
 use sqlx::PgPool;
 use two_bot_core::{
     activation::LiveCapability, audit_scheduled, claim_due, clamp_retry_delay_ms, complete_run,
-    format_iso_ms, lease_until_ms, post_failure_retryable, retry_scheduled, FeatureGates,
-    OccurrenceOutcome, ScheduledAuditInput, ScheduledMessageRow, ScheduledStoreError,
-    SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
+    format_iso_ms, lease_until_ms, neutralize_scheduled_body, post_failure_retryable,
+    retry_scheduled, FeatureGates, OccurrenceOutcome, ScheduledAuditInput, ScheduledMessageRow,
+    ScheduledStoreError, SCHEDULER_TICK_MS, TICKER_BATCH_LIMIT,
 };
 use two_bot_discord::executor::{ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordError};
 
@@ -40,6 +40,14 @@ const ORPHAN_REASON: &str = "Scheduled message run was not recorded";
 #[cfg(test)]
 #[path = "scheduled_jobs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "scheduled_stale_audit_acceptance_tests.rs"]
+mod acceptance_tests;
+
+#[cfg(test)]
+#[path = "scheduled_store_failure_audit_acceptance_tests.rs"]
+mod store_failure_acceptance_tests;
 
 /// The supervised ticker for the configured guild, or `None` while
 /// `TWO_AUTOMATIONS` is off (legacy only started the scheduler when automations
@@ -190,9 +198,18 @@ struct Occurrence<'a> {
 
 impl Occurrence<'_> {
     async fn run(&self, audit_failed: &mut bool) -> Result<Step, ErrorClass> {
+        // Defuse rows written before any validate-side screen on the way to
+        // the channel; benign bodies pass through byte-identical and the
+        // shared send path keeps the closed mention policy. The neutralized
+        // body is truncated to the message ceiling (surrogate-safe) so a
+        // legacy row at the old pre-neutralize limit still posts instead of
+        // failing permanent on the send-path length check.
         let call = ChannelCall::PostMessage {
             channel_id: self.row.channel_id.clone(),
-            content: self.row.body.clone(),
+            content: two_bot_core::message_safety::truncate(
+                &neutralize_scheduled_body(&self.row.body),
+                two_bot_core::message_safety::CONTENT_LIMIT,
+            ),
             nonce: self.row.occurrence_nonce.clone(),
         };
         let posted = match self.rest.execute_channel(&call).await {
@@ -266,8 +283,13 @@ impl Occurrence<'_> {
                     None => false,
                 };
                 // Keep the nonce when the message survives so the re-run
-                // dedupes against it instead of posting a second copy.
-                let retained = retry_scheduled(
+                // dedupes against it instead of posting a second copy. The
+                // unrecorded outcome is audited even when the claim was lost
+                // (the re-queue retains nothing): a posted message must never
+                // vanish without an audit row. A lost claim keeps no nonce,
+                // so a surviving orphan has no idempotent retry: report it
+                // as stale, not retry-idempotent.
+                let retained = match retry_scheduled(
                     self.pool,
                     &self.row.guild_id,
                     &self.row.id,
@@ -276,15 +298,24 @@ impl Occurrence<'_> {
                     !cleaned,
                 )
                 .await
-                .map_err(database)?;
-                if retained {
-                    self.audit(
-                        &OccurrenceOutcome::PostedUnrecorded { cleaned },
-                        Some(reason),
-                        audit_failed,
-                    )
-                    .await;
-                }
+                {
+                    Ok(retained) => retained,
+                    Err(error) => {
+                        self.audit(
+                            &OccurrenceOutcome::PostedUnrecorded { cleaned },
+                            Some(reason),
+                            audit_failed,
+                        )
+                        .await;
+                        return Err(database(error));
+                    }
+                };
+                let outcome = if retained || cleaned {
+                    OccurrenceOutcome::PostedUnrecorded { cleaned }
+                } else {
+                    OccurrenceOutcome::StaleCompletion
+                };
+                self.audit(&outcome, Some(reason), audit_failed).await;
                 Ok(Step::Stop)
             }
         }
@@ -298,7 +329,7 @@ impl Occurrence<'_> {
         let reason = discord_error_name(error);
         if post_failure_retryable(failure_status(error)) {
             let retry_at_ms = self.now.saturating_add(clamp_retry_delay_ms(None));
-            let retained = retry_scheduled(
+            let retained = match retry_scheduled(
                 self.pool,
                 &self.row.guild_id,
                 &self.row.id,
@@ -307,10 +338,32 @@ impl Occurrence<'_> {
                 true,
             )
             .await
-            .map_err(database)?;
+            {
+                Ok(retained) => retained,
+                Err(error) => {
+                    self.audit(
+                        &OccurrenceOutcome::Retryable { retry_at_ms },
+                        Some(reason),
+                        audit_failed,
+                    )
+                    .await;
+                    return Err(database(error));
+                }
+            };
             if retained {
                 self.audit(
                     &OccurrenceOutcome::Retryable { retry_at_ms },
+                    Some(reason),
+                    audit_failed,
+                )
+                .await;
+            } else {
+                // The claim went stale (the definition was replaced or
+                // cancelled while the retryable post was in flight): the
+                // re-queue lands nowhere, so audit the stale completion with
+                // the failure reason instead of vanishing silently.
+                self.audit(
+                    &OccurrenceOutcome::StaleCompletion,
                     Some(reason),
                     audit_failed,
                 )
@@ -321,7 +374,7 @@ impl Occurrence<'_> {
         // A permanent refusal runs the occurrence without a message so a
         // dead row cannot wedge the queue: one-shots disable, recurring
         // rows advance.
-        let completed = complete_run(
+        let completed = match complete_run(
             self.pool,
             &self.row.guild_id,
             &self.row.id,
@@ -330,13 +383,33 @@ impl Occurrence<'_> {
             self.claim_token,
         )
         .await
-        .map_err(|error| {
-            tracing::warn!(guild = %self.row.guild_id, schedule = %self.row.id, reason = store_error_name(&error), "scheduled failure not recorded");
-            ErrorClass::Database
-        })?;
+        {
+            Ok(completed) => completed,
+            Err(error) => {
+                tracing::warn!(guild = %self.row.guild_id, schedule = %self.row.id, reason = store_error_name(&error), "scheduled failure not recorded");
+                self.audit(
+                    &OccurrenceOutcome::FailedPermanent,
+                    Some(reason),
+                    audit_failed,
+                )
+                .await;
+                return Err(ErrorClass::Database);
+            }
+        };
         if completed.is_some() {
             self.audit(
                 &OccurrenceOutcome::FailedPermanent,
+                Some(reason),
+                audit_failed,
+            )
+            .await;
+        } else {
+            // The claim went stale (the definition was replaced or cancelled
+            // while Discord refused the post): the completion lands nowhere,
+            // so audit the stale completion with the refusal reason instead
+            // of vanishing silently.
+            self.audit(
+                &OccurrenceOutcome::StaleCompletion,
                 Some(reason),
                 audit_failed,
             )

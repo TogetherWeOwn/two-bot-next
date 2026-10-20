@@ -36,10 +36,21 @@ recovery evidence. An unreadable HTTP 200 does not prove permission loss.
 `guild_id` yields `""` and is fenced `WrongGuild`; a missing overwrite
 array yields `everyone: None` and is fenced `PublicChannel`. Malformed
 rows or non-object bodies are uncertain, not permission revocation.
-`channel_history` requires every entry to contain a numeric snowflake ID,
-author ID and content. Any malformed entry makes the entire page uncertain.
-Never shorten a page by filtering: its original size, newest ID and oldest
-ID establish exhaustion, the recovery boundary and the next cursor.
+`channel_history` requires every entry to contain a string message ID,
+author ID and content (empty content is valid). Both identities must be
+canonical nonzero decimal u64 values: no signs, whitespace, leading zeros or
+overflow. Message IDs must be unique and strictly descending **numerically**;
+the page may contain at most the requested limit (clamped to 1–100), and every
+message must be strictly below a supplied `before` cursor. The cursor itself
+must be a canonical nonzero u64 identity.
+
+The adapter and the service both apply the shared `validate_history_page`
+contract to the **complete** page before using any row. Any malformed row,
+oversized page, disorder, duplicate or cursor-equal/newer evidence makes the
+entire page uncertain, even if a valid-looking marker appears first. Never
+shorten a page by filtering or truncating: its original size, newest ID and
+oldest ID establish exhaustion, the recovery boundary and the next cursor.
+Diagnostics use fixed metadata-only reasons, not remote identities or content.
 
 ## Send protocol
 
@@ -55,6 +66,9 @@ ID establish exhaustion, the recovery boundary and the next cursor.
    `search_before` boundary; an empty channel seeds `"0"`. If a bot-authored
    exact marker is found, use **that matching ID** as the boundary instead.
    This admits the known mirror even if adoption's accepted-ID write fails.
+   Validate each complete page before choosing that boundary or adopting a
+   marker. Invalid evidence defers without preparing an attempt or POSTing;
+   a later healthy preflight can retry with the stored deterministic nonce.
 5. `prepare_send` persists the boundary and attempt before any POST.
    A halt releases the unattempted row; a lost fence stops the sender.
    Dedup adoption writes `note_accepted` + `complete`, without posting.
@@ -87,6 +101,15 @@ scan newest-first until a bot-authored exact marker at/above the boundary
 is found. Ambiguous reads preserve the boundary for a later healthy read;
 HTTP refusals quarantine `PermissionRevoked`; proven exhaustion or passing
 below the boundary quarantines `MarkerMissing`. Reconciliation never POSTs.
+
+Only a validated page can prove a marker, exhaustion or a crossed boundary.
+A repeated full page, or any page with IDs equal to/newer than the requested
+cursor, ends the pass as ambiguous immediately: it cannot renew an identical
+cursor indefinitely. Invalid evidence preserves the saved boundary, nonce,
+attempt and any accepted receipt; it never produces `MarkerMissing` or clears
+prior ambiguity. Existing claim/lease fences still exclude stale owners. A
+later healthy owner can reconcile without resending. Valid empty/short pages
+still prove exhaustion, and valid full pages continue strictly backwards.
 
 ## Kill switch
 
@@ -142,6 +165,14 @@ the raw value is never logged.
   accepted-post ack loss, adoption ack loss + restart, definite rejection,
   ambiguous history + healthy recovery, privacy/guild/refusal, expired
   prepared senders (including replacement quarantine), and halt/recovery.
+- `crates/discord/tests/support/audit_history_evidence.rs`: protected HTTP
+  fixtures for complete-page identity, order, size and cursor validation.
+- `crates/core/tests/audit_history_evidence.rs`: protected disposable-DB
+  acceptance for invalid preflight (zero POSTs), invalid recovery and strict
+  progress, exact evidence preservation, stale-owner fences and healthy
+  no-resend recovery, plus valid pagination/exhaustion/author/halt/refusal controls.
+  This non-ignored target runs in the existing DB-enabled integration lane;
+  without `TWO_TEST_DATABASE_URL` it reports a skip, not service evidence.
 - `crates/bot/src/audit_runtime_tests.rs`: env gating, once-only delivery,
   halt skip + held-claim release, ambiguous-post reconciliation, the 25-row
   cap, one loopback-REST pass through `ActionExecutor`, job metrics and log
@@ -150,7 +181,15 @@ the raw value is never logged.
 - `.github/workflows/check.yml` explicitly runs the ignored `audit_service`
   and `audit_store` tests against the ephemeral CI Postgres service.
 
+On the persistent controller, set only the authorized disposable bootstrap
+from [Contributing](../CONTRIBUTING.md#database-tests), then use the bounded
+cache wrapper (no direct compiling Cargo or fallback on admission refusal):
+
 ```sh
-cargo test -p two-bot-core --features db --test audit_store --test audit_service --locked -- --ignored
-cargo test -p two-bot-discord --test audit_mirror --locked
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test audit_history_evidence -- --test-threads=1
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test audit_store --test audit_service -- --ignored --test-threads=1
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test audit_mirror
 ```
+
+Ephemeral CI uses the equivalent locked Cargo commands with its disposable
+Postgres service. No live Discord or production/staging database is needed.

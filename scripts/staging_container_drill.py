@@ -89,7 +89,14 @@ READY_BUDGET_SECONDS = 60
 READY_TIMEOUT_SECONDS = 300
 POLL_SECONDS = 5
 CONFIRM_PROBES = 2
-STALE_IMAGE_POLLS = 3
+# Polls tolerated while an accepted rollout's target image is not yet
+# reflected by the application listing. Mirrors
+# `staging_rollout.APPLICATION_IMAGE_STALE_POLLS`: the listing is read
+# separately from the rollout record and can trail it right after a deploy
+# (run-8: backout accepted active_lag, listing trailed 3+ polls, drill failed
+# `application_image_drift` with probes=0 on a stale budget). Single-sourced
+# so the two gates cannot drift apart again.
+STALE_IMAGE_POLLS = rollout.APPLICATION_IMAGE_STALE_POLLS
 WRANGLER_TIMEOUT_SECONDS = 600
 
 
@@ -329,7 +336,7 @@ class Drill:
         self.log(f"{name} {iso(moment)}")
         return moment
 
-    def deploy_image(self, image, label):
+    def deploy_image(self, image, label, source_sha):
         """Full-container deploy of the pinned pre-built image, no rebuild.
 
         The deploy config is generated from the reviewed `wrangler.toml` on
@@ -337,12 +344,14 @@ class Drill:
         registry reference (Cloudflare docs: for a registry image
         `wrangler deploy` uses the configured reference without building).
         Old source is never checked out and no Dockerfile is rebuilt.
+        The version is stamped with the pinned source SHA (`--message`) so
+        the drill leg keeps its provenance receipt.
         Wrangler's own output may carry paths or gleamed config, so it is
         discarded: only the exit code and duration are recorded.
         """
         generate_deploy_config(self.deploy_path, image, self.wrangler_dir)
         started = self.now()
-        returncode = self.deploy(self.deploy_path)
+        returncode = self.deploy(self.deploy_path, source_sha)
         elapsed = round(self.now() - started, 1)
         require(returncode == 0, "deploy_failed",
                 f"elapsed={elapsed} code={returncode}")
@@ -591,8 +600,18 @@ class Drill:
             self.control("fence", self.owner(state).get("epoch"))
         fenced = self.stamp(f"{name}: fenced")
         leg["fenced"] = iso(fenced)
-        if serving_image(self.client, rollout.application(self.client)) != pin["image"]:
-            deployed, deploy_elapsed = self.deploy_image(pin["image"], name)
+        try:
+            current = serving_image(self.client, rollout.application(self.client))
+        except GateError as error:
+            if name != "restore" or str(error) != "application_image_drift":
+                raise
+            # Run-8: the backout leg left the listing drifted (rollout
+            # accepted, listing trailed), so a fail-closed read would skip the
+            # restore deploy and leave staging on the backout image. Deploy
+            # the baseline then verify instead.
+            current = None
+        if current != pin["image"]:
+            deployed, deploy_elapsed = self.deploy_image(pin["image"], name, pin["source_sha"])
             expect_rollout = True
         else:
             # Restore after a refused backout deploy: the baseline still serves.
@@ -750,13 +769,18 @@ WRANGLER_ENV_KEYS = ("PATH", "HOME", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT
 
 
 def wrangler_deploy(wrangler_bin, wrangler_dir, environ):
-    """Deploy closure: pinned wrangler binary, discarded output, exit code only."""
+    """Deploy closure: pinned wrangler binary, discarded output, exit code only.
+
+    The deployed version is stamped with the pinned source SHA (`--message`)
+    so the drill leg keeps its provenance receipt.
+    """
     child_env = {key: environ[key] for key in WRANGLER_ENV_KEYS if key in environ}
 
-    def deploy(config_path):
+    def deploy(config_path, message_sha):
         try:
             result = subprocess.run(
-                [wrangler_bin, "deploy", "--config", config_path, "--env", "staging"],
+                [wrangler_bin, "deploy", "--config", config_path, "--env", "staging",
+                 "--message", message_sha],
                 cwd=wrangler_dir, env=child_env, capture_output=True,
                 timeout=WRANGLER_TIMEOUT_SECONDS)
         except (OSError, subprocess.SubprocessError):

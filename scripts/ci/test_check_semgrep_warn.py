@@ -1,12 +1,13 @@
 """Offline tests for the Semgrep HARD gate.
 
 The gate must fail on new findings, stay silent when the diff adds none,
-and fail closed when it is blind. The vendored rule set is pinned: four
+and fail closed when it is blind. The vendored rule set is pinned: five
 rules, local config only, no registry access.
 """
 
 import io
 import json
+import re
 import stat
 import subprocess
 import tempfile
@@ -109,6 +110,40 @@ class ParseTests(unittest.TestCase):
         findings, error = self.run_report(report)
         self.assertEqual(error, "")
         self.assertEqual(findings, {("rust-empty-expect", "crates/bot/src/logging.rs", 12)})
+
+    def test_macro_empty_expect_keys_to_end_line(self):
+        report = {"results": [{
+            "check_id": "rust-warn.rust-empty-expect-in-macros",
+            "path": "crates/bot/src/logging.rs",
+            "start": {"line": 10}, "end": {"line": 12},
+        }]}
+        findings, error = self.run_report(report)
+        self.assertEqual(error, "")
+        self.assertEqual(
+            findings, {("rust-empty-expect-in-macros", "crates/bot/src/logging.rs", 12)})
+
+    def test_macro_empty_expect_end_line_before_start_is_blindness(self):
+        report = {"results": [{
+            "check_id": "rust-warn.rust-empty-expect-in-macros", "path": "a.rs",
+            "start": {"line": 2}, "end": {"line": 1},
+        }]}
+        findings, error = self.run_report(report)
+        self.assertIsNone(findings)
+        self.assertIn("invalid result location", error)
+
+    def test_macro_duplicate_of_base_collapses_to_base(self):
+        report = {"results": [
+            {"check_id": "rust-warn.rust-empty-expect",
+             "path": "crates/bot/src/logging.rs",
+             "start": {"line": 10}, "end": {"line": 12}},
+            {"check_id": "rust-warn.rust-empty-expect-in-macros",
+             "path": "crates/bot/src/logging.rs",
+             "start": {"line": 10}, "end": {"line": 12}},
+        ]}
+        findings, error = self.run_report(report)
+        self.assertEqual(error, "")
+        self.assertEqual(
+            findings, {("rust-empty-expect", "crates/bot/src/logging.rs", 12)})
 
     def test_findings_keep_rule_path_and_line(self):
         tmp, binary = fake_semgrep(json.dumps(REPORT))
@@ -448,6 +483,7 @@ class GateTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     EXPECTED_RULES = {"rust-todo-unimplemented", "rust-empty-expect",
+                      "rust-empty-expect-in-macros",
                       "rust-panic-in-prod", "rust-process-exit-in-lib"}
 
     def test_rule_set_is_pinned_and_local(self):
@@ -460,6 +496,33 @@ class ConfigTests(unittest.TestCase):
             text = json.dumps(rule)
             self.assertNotIn("registry", text)
             self.assertNotIn("p/rust", text)
+
+    def test_macro_rule_excludes_line_comments(self):
+        config = yaml.safe_load((ROOT / ".semgrep/rust-warn.yml").read_text())
+        rule = next(r for r in config["rules"]
+                    if r["id"] == "rust-empty-expect-in-macros")
+        patterns = rule.get("patterns", [])
+        regexes = [p["pattern-regex"] for p in patterns if "pattern-regex" in p]
+        self.assertTrue(regexes, "macro rule must keep its text regex")
+        self.assertTrue(any(re.search(rx, 'x.expect("")') for rx in regexes))
+        not_regexes = [p["pattern-not-regex"] for p in patterns
+                       if "pattern-not-regex" in p]
+        self.assertTrue(not_regexes, "macro rule must exclude // comments")
+        self.assertTrue(any(
+            re.search(rx, "/// Never write .expect(\"\")", re.M)
+            for rx in not_regexes))
+        self.assertTrue(any(
+            re.search(rx, '    // indented .expect("")', re.M)
+            for rx in not_regexes))
+        code_line = 'format!("https://{}/x", host.expect(""))'
+        expect_at = code_line.index('.expect("")')
+        self.assertTrue(any(re.search(rx, code_line) for rx in regexes))
+        for rx in not_regexes:
+            for m in re.finditer(rx, code_line, re.M):
+                self.assertFalse(
+                    m.start() <= expect_at < m.end(),
+                    f"exclusion {rx!r} must not swallow a real hit after //",
+                )
 
     def test_test_files_are_out_of_scope(self):
         config = yaml.safe_load((ROOT / ".semgrep/rust-warn.yml").read_text())

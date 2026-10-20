@@ -5,8 +5,9 @@ TOML with absolute paths and the two non-secret build arguments (`image_vars`)
 that /readyz reports as `build_revision` and `build_id`. `readyz` decides whether
 one /readyz answer proves the revision the workflow deployed or rolled back to.
 
-`readyz` refuses ambiguous or unsafe evidence before grading: duplicate JSON
-object keys, nesting past the depth bound, and remote revision/build-ID
+`readyz` refuses bodies over 64 KiB before decoding or parsing. It refuses
+ambiguous or unsafe evidence before grading: duplicate JSON object keys,
+nesting past the depth bound, and remote revision/build-ID
 shapes outside `unknown`/40-hex/bounded digits-digits yield a fixed
 single-line nonzero refusal that echoes no remote value.
 """
@@ -26,6 +27,7 @@ from build_identity import (
 )
 
 EXCERPT_BYTES = 2048
+MAX_READYZ_BYTES = 64 * 1024
 
 # Well below CPython's default recursion limit (1000): any report deeper
 # than this is refused up front with an explicit stack instead of recursing.
@@ -88,6 +90,13 @@ def render(args):
         container["image"] = str((source.parent / container["image"]).resolve())
         container["image_build_context"] = str(source.parent.parent)
     containers[0]["image_vars"] = {"BOT_BUILD_REVISION": args.sha, "BOT_BUILD_ID": f"{args.run_id}-{args.attempt}"}
+    # Worker-edge span lines log this SHA as `release` (same commit as the
+    # container image). Generated-only: a committed value would go stale, so
+    # the committed TOML must never carry it.
+    production_vars = config["env"]["production"].setdefault("vars", {})
+    if not isinstance(production_vars, dict):
+        sys.exit("render: production vars have the wrong shape")
+    production_vars["CONTAINER_RELEASE"] = args.sha
     Path(args.out).write_text(json.dumps(config, indent=2) + "\n")
     return 0
 
@@ -116,8 +125,14 @@ def readyz(args):
     if args.status not in ("200", "503"):
         return reject(f"/readyz answered {args.status}")
     try:
+        with open(args.body, "rb") as handle:
+            raw = handle.read(MAX_READYZ_BYTES + 1)
+        # The sentinel detects a hidden suffix; size wins over all parser
+        # verdicts, without decoding or echoing any oversized remote input.
+        if len(raw) > MAX_READYZ_BYTES:
+            return reject("/readyz answered over the body cap")
         report = json.loads(
-            Path(args.body).read_text(), object_pairs_hook=_reject_duplicate_keys
+            raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
         )
     except DuplicateKeyError:
         return reject("/readyz carries duplicate JSON object keys")

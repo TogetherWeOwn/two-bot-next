@@ -12,10 +12,10 @@ use two_bot_core::{
     attendance_totals_text, checkin_duplicate_text, checkin_idempotency_key,
     checkin_occurrence_full_text, checkin_recorded_text, classify, compensate_checkin_write,
     compensate_rsvp_write, list_rsvps, now_iso, parse_attendance_occurrence, partition_rsvps,
-    put_rsvp, record_checkin, require_manage_events, rsvp_event_full_text, rsvp_rate_limited_text,
-    rsvp_saved_text, validate_event_id, validate_occurrence_id, write_audit, AttendanceProof,
-    CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter, RsvpAudit,
-    RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
+    put_rsvp_with_audit, record_checkin, require_manage_events, rsvp_event_full_text,
+    rsvp_rate_limited_text, rsvp_saved_text, validate_event_id, validate_occurrence_id,
+    AttendanceProof, CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter,
+    RsvpAudit, RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
 };
 
 use crate::{
@@ -264,6 +264,16 @@ async fn execute(
     classifier: &ClassifierConfig,
     interaction: &Interaction,
 ) -> Result<String, String> {
+    // Fail closed: only the RSVP handlers execute here. A foreign handler id
+    // (an unregistered or sibling-slice id reaching this dispatcher) refuses
+    // with the existing invalid-payload string before any store or network
+    // work, never a panic.
+    if !matches!(
+        handler,
+        HandlerId::Rsvp | HandlerId::RsvpAttendance | HandlerId::ScorecardAttendance
+    ) {
+        return Err("Invalid command payload.".to_owned());
+    }
     let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref() else {
         return Err("Invalid command payload.".to_owned());
     };
@@ -320,22 +330,29 @@ async fn execute(
                 status,
                 responded_at: now_iso(),
             };
-            let transition = put_rsvp(pool, &record).await.map_err(|err| match err {
-                RsvpStoreError::EventAtCapacity => rsvp_event_full_text(),
-                RsvpStoreError::RsvpRateLimited => rsvp_rate_limited_text(),
-                // Occurrence capacity and retention floors cannot come
-                // out of an RSVP write; transport/parse failures stay
-                // generic. Every variant is mapped: a refused or failed
-                // write is never reported as saved.
-                RsvpStoreError::OccurrenceAtCapacity
-                | RsvpStoreError::CutoffTooRecent
-                | RsvpStoreError::Db(_)
-                | RsvpStoreError::UnknownStatus(_) => "Unable to save RSVP.".to_owned(),
-            })?;
+            // The response and its required audit row commit in one
+            // transaction: a failed audit insert rolls the response back,
+            // so no partial write can survive this path.
             let audit_id = format!("rsvp:{}", interaction.id);
-            write_audit(pool, &RsvpAudit::for_rsvp(&audit_id, &record))
-                .await
-                .map_err(|_| "Unable to audit RSVP.")?;
+            let transition =
+                put_rsvp_with_audit(pool, &record, &RsvpAudit::for_rsvp(&audit_id, &record))
+                    .await
+                    .map_err(|err| match err {
+                        RsvpStoreError::EventAtCapacity => rsvp_event_full_text(),
+                        RsvpStoreError::RsvpRateLimited => rsvp_rate_limited_text(),
+                        // A failed audit insert refuses with the pre-existing
+                        // audit text; response-step failures keep the
+                        // pre-existing save text.
+                        RsvpStoreError::AuditDb(_) => "Unable to audit RSVP.".to_owned(),
+                        // Occurrence capacity and retention floors cannot come
+                        // out of an RSVP write; transport/parse failures stay
+                        // generic. Every variant is mapped: a refused or failed
+                        // write is never reported as saved.
+                        RsvpStoreError::OccurrenceAtCapacity
+                        | RsvpStoreError::CutoffTooRecent
+                        | RsvpStoreError::Db(_)
+                        | RsvpStoreError::UnknownStatus(_) => "Unable to save RSVP.".to_owned(),
+                    })?;
             // RA-03 race fence: the event or membership may have vanished
             // between the pre-write lookups and the commit. Re-read the same
             // evidence; on loss or lookup failure compensate (a first
@@ -471,10 +488,14 @@ async fn execute(
             {
                 return Err("Unable to verify attendance member.".to_owned());
             }
-            let member_is_bot = live_user
-                .get("bot")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let member_is_bot = match live_user.get("bot") {
+                // Discord omits this optional field for humans, but a present
+                // non-boolean value cannot establish a classification.
+                None => false,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or("Unable to verify attendance member.")?,
+            };
             let verdict = classify(
                 classifier,
                 &ClassifyInput {
@@ -512,6 +533,9 @@ async fn execute(
                 | RsvpStoreError::RsvpRateLimited
                 | RsvpStoreError::CutoffTooRecent
                 | RsvpStoreError::Db(_)
+                // Unreachable on the check-in path (`record_checkin` writes
+                // no audit row); mapped only for exhaustiveness.
+                | RsvpStoreError::AuditDb(_)
                 | RsvpStoreError::UnknownStatus(_) => "Attendance was not recorded.".to_owned(),
             })?;
             if !inserted {
@@ -555,13 +579,50 @@ async fn execute(
                 &resolved.canonical_id,
             ))
         }
-        _ => unreachable!("only RSVP handlers execute here"),
+        _ => Err("Invalid command payload.".to_owned()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn foreign_handler_id_fails_closed_without_writes_or_panic() {
+        // Real dispatcher (`execute`) with a foreign handler id: must refuse
+        // with the existing invalid-payload string, never panic. The pool is
+        // closed and the executor points at an unroutable loopback, so any
+        // store or network touch would fail differently — the refusal proves
+        // neither was reached.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        pool.close().await;
+        let executor = ActionExecutor::with_proxy(
+            "rsvp-foreign-handler-fixture".into(),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .expect("loopback executor");
+        let classifier = ClassifierConfig::default();
+        let interaction: Interaction = serde_json::from_value(serde_json::json!({
+            "application_id": "1111", "authorizing_integration_owners": {"0": "2222"},
+            "id": "100", "token": "synthetic-secret-token", "type": 2,
+            "version": 1, "guild_id": "2222",
+            "member": {"permissions": "0", "roles": [], "deaf": false, "mute": false,
+                "flags": 0, "user": {"id": "77", "username": "human", "discriminator": "0"}},
+            "data": {"id": "4444", "name": "rsvp", "type": 1, "options": []}
+        }))
+        .expect("wire interaction");
+        for handler in [HandlerId::Rank, HandlerId::Lfg] {
+            let err = execute(handler, &pool, &executor, &classifier, &interaction)
+                .await
+                .expect_err("foreign handler must refuse");
+            assert_eq!(
+                err, "Invalid command payload.",
+                "{handler:?} must fail closed"
+            );
+        }
+    }
 
     #[test]
     fn prepared_debug_names_the_handler_never_the_callback_token() {

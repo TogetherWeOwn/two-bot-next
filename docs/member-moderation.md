@@ -8,10 +8,13 @@ executor merged.
 
 ## Integration contract
 
-- Feed current actor/target roles and permissions into `MemberExecution`.
-  `MemberModerationService::execute` reuses `assert_moderation_allowed`; it
-  validates before claiming or acting. Bot hierarchy is a required resolved
-  position; adapters must refuse unknown positions before constructing a request.
+- Network-facing adapters use `MemberModerationService::execute_with_authority`
+  with a resolver for current actor/target roles, permissions and bot hierarchy.
+  It acquires the ban/tempban member lane before invoking that resolver, then
+  reuses `assert_moderation_allowed` before claiming or preparing an effect.
+  Other verbs resolve immediately before validation/claim. The plain `execute`
+  seam remains available to trusted callers supplying their own authority facts;
+  it cannot make supplied snapshots fresh. Unknown positions must refuse.
   Protected-target refusals share one generic reply. Policy refusals persist the
   actor, target, action and `denied` outcome without claiming or acting; audit
   write failures fail closed. Reasons are trimmed and capped at 512
@@ -23,9 +26,10 @@ executor merged.
   `DiscordCall` describes the plain-data mutation. Each call must abort after
   **5 seconds**, without automatic retries. Preserve legacy success handling:
   ban 200/204, kick and unban 200/204/404, timeout 200.
-- Map definite Discord refusals to `Rejected`; timeouts, transport/5xx failures
-  and rate limits remain uncertain. Only a definite refusal permits releasing
-  a destructive claim or retrying an unban.
+- Map definite Discord refusals to `Rejected`; timeouts and transport/5xx
+  failures remain uncertain. A definite refusal or a rate limit (Discord did
+  not process the request, `DiscordError::proves_no_effect`) permits releasing
+  only the failed attempt's destructive claim or requeueing an unban.
 - Keep `TWO_MODERATION` off by default and restrict enabling it to staging.
   No production guild or token was used to verify this slice. The service is
   deliberately gate-independent: the shared router owns runtime gating.
@@ -79,20 +83,43 @@ serialize through one set of local queues.
 (`crates/discord/src/member_moderation.rs`): one attempt per verb, the legacy
 5 s abort, no automatic retry. Kick and unban treat 404 as complete; definite
 refusals (including local guard refusals, which never reach the wire) map to
-`Rejected`, while timeouts, transport/5xx failures and rate limits stay
-uncertain and keep the claim fenced. The audit-log reason stays within the
+`Rejected`, while timeouts and transport/5xx failures stay
+uncertain and keep the claim fenced; a rate limit proves no effect and
+releases only the failed attempt. The audit-log reason stays within the
 512-unit bound, enforced before any I/O.
 
-Interaction-to-`MemberExecution` mapping resolves live role facts (guild
-roles/owner, resolved-or-fetched target member, cached bot id); incomplete
-snapshots refuse fail-closed instead of guessing hierarchy. Actor and target
-membership are interaction-time snapshots; guild role positions and bot membership
-are fetched before execution, not atomically with the claim or Discord mutation.
-A role change during a queue wait can therefore race actor authorization. This
-residual TOCTOU risk is accepted only for the default-off, staging-only integration,
-not as production clearance; Discord's bot hierarchy check is not an actor-policy
-recheck. Production enablement requires an explicit security disposition or a fresh
-in-claim actor/target recheck.
+For slash commands, the interaction supplies identities and command content, never
+dispatch authority. This resolver is wired to the member-command runtime; the signed
+internal-action adapter retains its separately owned resolver/activation contract.
+After the ban/tempban member-lane wait, the runtime strictly reads the current guild
+(id, owner, complete role positions and permission bits), actor, target and bot
+memberships. The other verbs perform these same reads immediately before their
+validation/claim boundary. Actor permissions are the guild-wide union of current
+roles plus `@everyone`, not interaction permission bits or channel overwrites.
+Owner and administrator expansion grants every permission, but only the guild owner
+is exempt from the actor role hierarchy: an administrator keeps the real top-role
+position, as Discord and the website resolver do. Self, protected-target and
+bot-hierarchy checks remain. Unknown held roles, missing
+role facts, mismatched identities and failed reads refuse with a fixed, attributable
+`denied` audit before any prepared intent, warning, expiry or Discord mutation.
+Audit-write failures also fail closed. Only a strict target-member 404 permits a
+nonmember ban or tempban; kick/timeout/warn require present membership. No 403,
+timeout, malformed response or server error is absence. A completed,
+hash-matching request whose target has since left (a kick's expected end state)
+still replays, nonmutatingly and without a denial: that single read-only lookup
+runs only on a confirmed departure, and any other departed-target request refuses.
+
+This closes the avoidable interaction-snapshot and **local member-lane wait** stale
+window. The reads are sequential bounded GETs, not an atomic Discord snapshot:
+a remote role/membership change after its read (including REST pacing/dispatch
+waits) can still race the final effect. Discord's bot hierarchy check is not an
+actor-policy recheck. Completed replay remains nonmutating; a failed fresh read
+(other than the confirmed departed-target replay above) may refuse a redelivery but
+never releases its completed or unknown idempotency row, prepared intent or expiry
+fence. No distributed lock or new reconciliation
+rule is introduced. **This is not production activation/clearance**: moderation
+remains default-off and staging-only, and existing security/soak/release gates
+remain mandatory.
 
 All five member verbs share a process-local, per-guild actor cooldown: one new
 interaction per actor every 5 seconds, reserved before role REST reads. It applies
@@ -236,9 +263,10 @@ post-dispatch failures never do. If that release write itself fails, the caller
 still gets the original refusal and nothing is retried: the row stays
 `in_flight`, so a retry answers `in_progress` instead of repeating the
 mutation. The service logs one `moderation_idempotency_release_failed` error
-with only a fixed `action` and `cause` (`discord_rejected` or
-`store_rolled_back`), never the key, an id or the raw store error. Such a line
-means one caller-supplied key will keep answering `in_progress`; the signal does
+with only a fixed `action` and `cause` (`discord_rejected`,
+`discord_rate_limited`, or `store_rolled_back`), never a key, an id or the raw
+store error. Such a line means one caller-supplied key will keep answering
+`in_progress`; the signal does
 not name it, and no code expires or takes over the row.
 
 ## Verification

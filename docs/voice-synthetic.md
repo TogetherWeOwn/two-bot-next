@@ -54,7 +54,7 @@ WebSocket is not an HTTP body and is outside this cap.
   never echoes the body, headers, URL or a parse exception.
 - A refused read fails the run: the `run` check reports `FAIL` with that fixed
   message, the evidence JSON still uploads, and the script exits 1. The
-  workflow's single retry applies as for any other failure.
+  workflow's retries apply as for any other failure.
 - A metrics read that answers an in-cap error status stays optional (`metrics`
   reports SKIP). Only an over-cap body is a failure.
 
@@ -74,7 +74,9 @@ exact-cap pass, the cap-plus-one refusal on both paths and the fixed messages.
   PR's code is not deployed to staging before merge, so a live run would test
   main, not the PR.
 
-Each live run retries once after 30 s; two failures fail it. Evidence JSON is
+Each live run retries twice after 60 s; three failures fail it. The longer
+window covers the documented 95-139 s per-deploy gateway drop as well as a
+transient gateway/REST hiccup. Evidence JSON is
 uploaded as the `voice-synthetic-<run id>` artifact for 14 days.
 
 ## Identity
@@ -96,7 +98,7 @@ Bindings:
 |---|---|---|
 | GitHub environment `voice-synthetic` (main only, no reviewer) | secret `TWO_VOICE_SYNTHETIC_BOT_TOKEN` | the test bot token |
 | GitHub repository variable (optional) | `VOICE_SYNTHETIC_REQUIRED` | `false` only while the test bot is being provisioned; required by default |
-| GitHub repository variable (optional) | `STAGING_EMPTY_GRACE_SECONDS` | staging empty grace, default 60 |
+| GitHub repository variable (optional) | `STAGING_EMPTY_GRACE_SECONDS` | staging empty grace, default 60 (every timing input — `--create-within`, `--settle`, `--grace`, `--delete-slack`, flag or env — must be finite, above 0 and at most 600 s, else the run refuses with exit 2 before any live call) |
 | Staging Worker setting | `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` | the test bot's user ID |
 
 A missing token fails the run: the voice gate is required by default, so an
@@ -113,7 +115,7 @@ Channels: grant the test bot's staging role Manage Channels once (staging
 guild only; the test bot lives nowhere else). Until then the check reports
 SKIP with that detail and every other check still runs. A rename PATCH
 answered with HTTP 429 (Discord allows 2 channel renames per 10 minutes)
-also reports SKIP: the workflow retries after 30 seconds and dispatches can
+also reports SKIP: the workflow retries after 60 seconds and dispatches can
 collide within 10 minutes, and neither must fail the run. A name already
 carrying ` (synthetic)` means a previous run did not restore: the rename is
 skipped and the check FAILs naming the residue, so it is restored manually

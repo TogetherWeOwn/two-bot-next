@@ -11,7 +11,8 @@ const NOW = 1_000_000;
 function body(extra: string[]): string {
   return ["# HELP x y", "# TYPE x gauge", ...extra, ""].join("\n");
 }
-const ev = (lines: string[], prev = EMPTY_STATE) => evaluateMetrics(parseExposition(body(lines)), prev, NOW);
+const ev = (lines: string[], prev: MetricsAlertState = EMPTY_STATE, gatewayReady?: boolean) =>
+  evaluateMetrics(parseExposition(body(lines)), prev, NOW, gatewayReady);
 
 /** GitHub-style heading slugs for a doc's text; literal underscores survive. */
 function headingAnchors(text: string): Set<string> {
@@ -351,9 +352,47 @@ test("voice join slow burn tickets on a sustained 6 h grind that never trips fas
   const grinding = evAt(joinLines(361 * 100, 0, 361 * 96), state, 361 * 60);
   // 361 ticks: 36,100 genuine, 34,656 fast, 1,444 slow = 8x burn.
   assert.deepEqual(grinding.firing, ["voice_join_slow_burn"]);
+  assert.equal(grinding.joinSlowCovered, true);
   assert.equal(ruleFor("voice_join_slow_burn")?.severity, "ticket");
   // The same 8x never reaches the 14.4x fast line in any 1 h / 5 min window.
   assert.ok(!grinding.firing.includes("voice_join_fast_burn"));
+});
+
+test("voice join burn holds the previous firing state when the join series go missing", () => {
+  // A firing ticket survives an exposition without the join series: the
+  // tracker reads joinHeld to decide nothing instead of resolving the card.
+  let state = EMPTY_STATE;
+  for (let i = 0; i <= 360; i++) {
+    state = evAt(joinLines(i * 100, 0, i * 96), state, i * 60).state;
+  }
+  const firing = evAt(joinLines(361 * 100, 0, 361 * 96), state, 361 * 60);
+  assert.deepEqual(firing.firing, ["voice_join_slow_burn"]);
+  assert.equal(firing.joinHeld, false);
+  assert.equal(firing.joinSlowCovered, true);
+  const held = evAt([], firing.state, 362 * 60);
+  assert.deepEqual(held.firing, ["voice_join_slow_burn"]);
+  assert.equal(held.joinHeld, true);
+  assert.equal(held.joinSlowCovered, false);
+});
+
+test("voice join burn reports slow-window coverage separately from the firing verdict", () => {
+  // A fresh ring is silent but uncovered: the tracker must read coverage,
+  // not silence, before it may resolve the card.
+  const first = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0);
+  assert.deepEqual(first.firing, []);
+  assert.equal(first.joinSlowCovered, false);
+  const second = evAt(joinLines(12, 0, 10), first.state, 60);
+  assert.deepEqual(second.firing, []);
+  assert.equal(second.joinSlowCovered, false);
+  // Full quiet history is covered and stays silent: covered-but-quiet may
+  // still resolve, uncovered may not.
+  let state = EMPTY_STATE;
+  for (let now = -21600; now <= 0; now += 60) {
+    state = evAt(joinLines(0, 0, 0), state, now).state;
+  }
+  const quiet = evAt(joinLines(0, 0, 0), state, 60);
+  assert.deepEqual(quiet.firing, []);
+  assert.equal(quiet.joinSlowCovered, true);
 });
 
 test("voice join burn stays silent on healthy traffic, quiet windows and benign duplicates", () => {
@@ -396,7 +435,9 @@ test("voice join burn waits for full window history after a fresh ring", () => {
   state = evAt(joinLines(12, 0, 10), state, 60).state;
   // The next scrape sees the received counter, but no long-window boundary
   // has a snapshot before it yet. A partial ring must not act like full windows.
-  assert.deepEqual(evAt(joinLines(12, 0, 10), state, 120).firing, []);
+  const partial = evAt(joinLines(12, 0, 10), state, 120);
+  assert.deepEqual(partial.firing, []);
+  assert.equal(partial.joinSlowCovered, false);
 });
 
 test("voice join burn stays silent when healthy bursts land on window edges", () => {
@@ -411,6 +452,7 @@ test("voice join burn stays silent when healthy bursts land on window edges", ()
   }
   const settled = evAt(joinLines(state.joinBurn?.at(-1)?.received ?? 0, 0, state.joinBurn?.at(-1)?.fastMoves ?? 0), state, 360 * 60 + 60);
   assert.deepEqual(settled.firing, []);
+  assert.equal(settled.joinSlowCovered, true);
   assert.ok(!settled.firing.includes("voice_join_fast_burn"), "healthy bursts must not page");
   assert.ok(!settled.firing.includes("voice_join_slow_burn"), "healthy bursts must not ticket");
 });
@@ -602,6 +644,127 @@ test("gateway unpaired: missing, duplicated, or non-numeric samples never clear 
   assert.deepEqual(ev(gateway(1, 1), absent.state).firing, []);
 });
 
+const NOT_READY = "gateway_not_ready";
+
+test("gateway not ready pages on the third consecutive non-ready sample and clears on any ready sample", () => {
+  // The first valid sample only stores the baseline, even while non-ready.
+  const one = ev([], EMPTY_STATE, false);
+  assert.deepEqual(one.firing, []);
+  assert.equal(one.state.gatewayNotReadySeen, true);
+  assert.equal(one.state.gatewayNotReadyStreak, 1);
+  const two = ev([], one.state, false);
+  assert.deepEqual(two.firing, []);
+  assert.equal(two.state.gatewayNotReadyStreak, 2);
+  const fire = ev([], two.state, false);
+  assert.deepEqual(fire.firing, [NOT_READY]);
+  // Stays firing while non-ready; starting (Armed) counts, not just down.
+  assert.deepEqual(ev([], fire.state, false).firing, [NOT_READY]);
+  // Any ready sample clears at once.
+  const clear = ev([], fire.state, true);
+  assert.deepEqual(clear.firing, []);
+  assert.equal(clear.state.gatewayNotReadyStreak, 0);
+  // Ready never fires and never starts a streak.
+  const calm = ev([], EMPTY_STATE, true);
+  assert.deepEqual(calm.firing, []);
+  assert.equal(calm.state.gatewayNotReadyStreak, 0);
+});
+
+test("gateway not ready: invalid samples hold the streak and the firing state", () => {
+  let fired = ev([], EMPTY_STATE, false);
+  fired = ev([], fired.state, false);
+  fired = ev([], fired.state, false);
+  assert.deepEqual(fired.firing, [NOT_READY]);
+  // An invalid sample (failed probe or unparsable body) changes nothing.
+  const held = ev([], fired.state, undefined);
+  assert.deepEqual(held.firing, [NOT_READY]);
+  assert.equal(held.state.gatewayNotReadyStreak, fired.state.gatewayNotReadyStreak);
+  // ...and never starts a streak on its own.
+  const fresh = ev([], EMPTY_STATE, undefined);
+  assert.deepEqual(fresh.firing, []);
+  assert.equal(fresh.state.gatewayNotReadySeen, false);
+});
+
+test("gateway not ready restart re-baselines the streak and holds a firing alert", () => {
+  const flat = (disconnects: number, recoveries: number) => [
+    `two_bot_gateway_disconnects_total ${disconnects}`,
+    `two_bot_gateway_resumes_total ${recoveries}`,
+    `two_bot_gateway_events_total{event="READY"} 0`,
+  ];
+  let fired = ev(flat(5, 3), EMPTY_STATE, false);
+  fired = ev(flat(5, 3), fired.state, false);
+  fired = ev(flat(5, 3), fired.state, false);
+  assert.deepEqual(fired.firing, [NOT_READY]);
+  // Counters went backwards: the process restarted. The streak re-baselines
+  // from this sample but the firing alert holds rather than clearing.
+  const restart = ev(flat(0, 0), fired.state, false);
+  assert.deepEqual(restart.firing, [NOT_READY]);
+  assert.equal(restart.state.gatewayNotReadyStreak, 1);
+  // Samples after the restart recount from the new baseline while held.
+  const again = ev(flat(0, 0), restart.state, false);
+  assert.deepEqual(again.firing, [NOT_READY]);
+  assert.equal(again.state.gatewayNotReadyStreak, 2);
+  // A restart that lands on ready clears at once: the new process came up
+  // connected, so readiness resolves even across the restart re-baseline.
+  const restartReady = ev(flat(0, 0), fired.state, true);
+  assert.deepEqual(restartReady.firing, []);
+  assert.equal(restartReady.state.gatewayNotReadyStreak, 0);
+  assert.deepEqual(ev(flat(0, 0), restartReady.state, true).firing, []);
+});
+
+test("gateway not ready restart with an invalid sample re-baselines the streak and holds firing", () => {
+  const flat = (disconnects: number, recoveries: number) => [
+    `two_bot_gateway_disconnects_total ${disconnects}`,
+    `two_bot_gateway_resumes_total ${recoveries}`,
+    `two_bot_gateway_events_total{event="READY"} 0`,
+  ];
+  let fired = ev(flat(5, 3), EMPTY_STATE, false);
+  fired = ev(flat(5, 3), fired.state, false);
+  fired = ev(flat(5, 3), fired.state, false);
+  assert.deepEqual(fired.firing, [NOT_READY]);
+  // Counters went backwards but this sample's readiness is invalid: the stale
+  // streak re-baselines to zero instead of surviving the restart, while the
+  // firing alert holds rather than clearing.
+  const restart = ev(flat(0, 0), fired.state, undefined);
+  assert.deepEqual(restart.firing, [NOT_READY]);
+  assert.equal(restart.state.gatewayNotReadyStreak, 0);
+  // The next valid non-ready sample recounts from 1: it cannot fire off the
+  // pre-restart streak.
+  const one = ev(flat(0, 0), restart.state, false);
+  assert.equal(one.state.gatewayNotReadyStreak, 1);
+  // ...and a sub-threshold streak never pages off a restart either.
+  const pending = ev(flat(5, 3), ev(flat(5, 3), EMPTY_STATE, false).state, false);
+  const stale = ev(flat(0, 0), pending.state, undefined);
+  assert.deepEqual(stale.firing, []);
+  assert.equal(stale.state.gatewayNotReadyStreak, 0);
+  assert.deepEqual(ev(flat(0, 0), stale.state, false).firing, []);
+});
+
+test("gateway not ready restart never pages by itself", () => {
+  const flat = (disconnects: number, recoveries: number) => [
+    `two_bot_gateway_disconnects_total ${disconnects}`,
+    `two_bot_gateway_resumes_total ${recoveries}`,
+    `two_bot_gateway_events_total{event="READY"} 0`,
+  ];
+  const pending = ev(flat(5, 3), ev(flat(5, 3), EMPTY_STATE, false).state, false);
+  const restart = ev(flat(0, 0), pending.state, false);
+  assert.deepEqual(restart.firing, []);
+  assert.equal(restart.state.gatewayNotReadyStreak, 1);
+  const s1 = ev(flat(0, 0), restart.state, false);
+  assert.deepEqual(s1.firing, []);
+});
+
+test("gateway not ready reads Durable Object state written before its fields existed", () => {
+  const legacy = {
+    firing: [] as string[], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0,
+    voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false,
+    receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {},
+  } as MetricsAlertState;
+  const first = ev([], legacy, false);
+  assert.deepEqual(first.firing, []);
+  assert.equal(first.state.gatewayNotReadySeen, true);
+  assert.equal(first.state.gatewayNotReadyStreak, 1);
+});
+
 test("gateway unpaired reads Durable Object state written before its fields existed", () => {
   const legacy = {
     firing: [] as string[], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0,
@@ -791,6 +954,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "voice_failures",
     "gateway_missed_events",
     "gateway_unpaired_disconnect",
+    "gateway_not_ready",
     "ticker_stale",
     "receiver_refusals",
     "dispatch_drops",
@@ -799,6 +963,15 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "voice_join_fast_burn",
     "voice_join_slow_burn",
     "voice_creator_map_stale",
+    "community_facts_drain_failures",
+    "eventsub_post_failed_share",
+    "error_budget_fast_burn",
+    "error_budget_slow_burn",
+    "audit_delivery_halt",
+    "rest_admission_breaker_open",
+    "eventsub_tampered",
+    "eventsub_reconcile_failed",
+    "event_store_consumer_lag",
     "prefix_trigger_verdict_refusals",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
@@ -811,6 +984,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("voice_failures", window), `evidence-voice_failures-${window}.json`);
   assert.equal(packetFilename("gateway_missed_events", window), `evidence-gateway_missed_events-${window}.json`);
   assert.equal(packetFilename("gateway_unpaired_disconnect", window), `evidence-gateway_unpaired_disconnect-${window}.json`);
+  assert.equal(packetFilename("gateway_not_ready", window), `evidence-gateway_not_ready-${window}.json`);
   assert.equal(packetFilename("ticker_stale:scheduled_messages", window), `evidence-ticker_stale-${window}.json`);
   assert.equal(packetFilename("receiver_refusals:moderation", window), `evidence-receiver_refusals-${window}.json`);
   assert.equal(packetFilename("dispatch_drops:reactions", window), `evidence-dispatch_drops-${window}.json`);
@@ -819,11 +993,49 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("voice_join_fast_burn", window), `evidence-voice_join_fast_burn-${window}.json`);
   assert.equal(packetFilename("voice_join_slow_burn", window), `evidence-voice_join_slow_burn-${window}.json`);
   assert.equal(packetFilename("voice_creator_map_stale", window), `evidence-voice_creator_map_stale-${window}.json`);
+  assert.equal(packetFilename("community_facts_drain_failures", window), `evidence-community_facts_drain_failures-${window}.json`);
+  assert.equal(packetFilename("eventsub_post_failed_share", window), `evidence-eventsub_post_failed_share-${window}.json`);
+  assert.equal(packetFilename("event_store_consumer_lag", window), `evidence-event_store_consumer_lag-${window}.json`);
+  assert.equal(packetFilename("error_budget_fast_burn", window), `evidence-error_budget_fast_burn-${window}.json`);
+  assert.equal(packetFilename("error_budget_slow_burn", window), `evidence-error_budget_slow_burn-${window}.json`);
+  assert.equal(packetFilename("rest_admission_breaker_open", window), `evidence-rest_admission_breaker_open-${window}.json`);
+  assert.equal(packetFilename("audit_delivery_halt", window), `evidence-audit_delivery_halt-${window}.json`);
+  assert.equal(packetFilename("eventsub_tampered", window), `evidence-eventsub_tampered-${window}.json`);
+  assert.equal(packetFilename("eventsub_reconcile_failed", window), `evidence-eventsub_reconcile_failed-${window}.json`);
   assert.equal(packetFilename("prefix_trigger_verdict_refusals", window), `evidence-prefix_trigger_verdict_refusals-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
   assert.equal(packetFilename("rest_429_rate", "2026-10-09T20:11:06Z"), "evidence-rest_429_rate-2026-10-09T20-11-06Z.json");
+});
+
+test("eventsub post failures accumulate across low-volume samples until the floor", () => {
+  const posts = (attempted: number, succeeded: number, failed: number, other: number) => [
+    `two_bot_eventsub_posts_total{outcome="attempted"} ${attempted}`,
+    `two_bot_eventsub_posts_total{outcome="succeeded"} ${succeeded}`,
+    `two_bot_eventsub_posts_total{outcome="failed"} ${failed}`,
+    `two_bot_eventsub_posts_total{outcome="other"} ${other}`,
+  ];
+  // One failed post per sample: every window is sub-floor, so nothing fires
+  // while attempts accumulate toward the 10-attempt floor.
+  let state = ev(posts(10, 9, 1, 0)).state;
+  for (let n = 11; n <= 18; n++) {
+    const next = ev(posts(n, 9, n - 9, 0), state);
+    assert.deepEqual(next.firing, [], `one failure per sample stays quiet with ${n - 10} accumulated`);
+    state = next.state;
+  }
+  // The tenth accumulated attempt reaches the floor at a 100% share: fires.
+  const fired = ev(posts(20, 9, 11, 0), state);
+  assert.deepEqual(fired.firing, ["eventsub_post_failed_share"]);
+  // The judged window rebaselines but the ticket holds: the next sub-floor
+  // window accumulates toward the next floor instead of resolving.
+  const held = ev(posts(21, 9, 12, 0), fired.state);
+  assert.deepEqual(held.firing, ["eventsub_post_failed_share"]);
+  assert.deepEqual(transitionMessages(fired.firing, held.firing), [], "holding is not a new ALERT");
+  // A healthy accumulation (floor met, share at the line) rebaselines quietly.
+  let healthy = ev(posts(0, 0, 0, 0)).state;
+  for (let n = 1; n <= 9; n++) healthy = ev(posts(n, n, 0, 0), healthy).state;
+  assert.deepEqual(ev(posts(10, 10, 0, 0), healthy).firing, []);
 });
 
 test("every rule links to an existing runbook heading", () => {
@@ -904,6 +1116,9 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   let unpaired = ev(gateway(0, 0));
   for (let i = 0; i < 3; i++) unpaired = ev(gateway(1, 0), unpaired.state);
   firing.push(...unpaired.firing);
+  let notReady = ev([], EMPTY_STATE, false);
+  for (let i = 0; i < 2; i++) notReady = ev([], notReady.state, false);
+  firing.push(...notReady.firing);
   firing.push(
     ...ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 601}`]).firing,
   );
@@ -933,7 +1148,75 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   burn = evaluateMetrics(parseExposition(body(joinLines(900, 9, 720))), burn.state, burnBase + 3300);
   burn = evaluateMetrics(parseExposition(body(joinLines(1000, 10, 800))), burn.state, burnBase + 3600);
   firing.push(...burn.firing);
+  // Forced REST error-budget burn: ~10k eligible events/hour with 2 budget
+  // errors/min over 125 min burns near 12x in the 15 min / 2 min windows
+  // (fast page) and near 12x in the 2 h / 15 min windows (slow ticket); the
+  // per-sample 5xx share stays ~1%, so rest_5xx_rate stays silent.
+  const restBudget = (total: number, errors5xx: number) => [
+    `two_bot_rest_requests_total{route="other",result="2xx"} ${total - errors5xx}`,
+    `two_bot_rest_requests_total{route="other",result="5xx"} ${errors5xx}`,
+  ];
+  let budget = evaluateMetrics(parseExposition(body(restBudget(100_000, 1_000))), EMPTY_STATE, NOW - 7600);
+  let budgetTotal = 100_000;
+  let budgetErrors = 1_000;
+  for (let minute = 1; minute <= 125; minute += 1) {
+    budgetTotal += 167;
+    budgetErrors += 2;
+    budget = evaluateMetrics(
+      parseExposition(body(restBudget(budgetTotal, budgetErrors))),
+      budget.state,
+      NOW - 7600 + minute * 60,
+    );
+  }
+  firing.push(...budget.firing);
   firing.push(...ev(["two_bot_voice_creator_map_generation 3", "two_bot_voice_creator_map_age_seconds 601"]).firing);
+  let halted = EMPTY_STATE;
+  for (let i = 0; i < 3; i++) halted = ev(["two_bot_audit_delivery_halt 1"], halted).state;
+  firing.push(...halted.firing);
+  const drainFamily = (error: number) => [
+    `two_bot_community_facts_drain_failures_total{reason="error"} ${error}`,
+    `two_bot_community_facts_drain_failures_total{reason="timeout"} 0`,
+    `two_bot_community_facts_drain_failures_total{reason="other"} 0`,
+  ];
+  let drained = ev(drainFamily(0));
+  for (const n of [1, 2, 3]) {
+    drained = ev(drainFamily(n), drained.state);
+  }
+  firing.push(...drained.firing);
+  firing.push(
+    ...ev(
+      [
+        `two_bot_eventsub_posts_total{outcome="attempted"} 120`,
+        `two_bot_eventsub_posts_total{outcome="succeeded"} 90`,
+        `two_bot_eventsub_posts_total{outcome="failed"} 25`,
+        `two_bot_eventsub_posts_total{outcome="other"} 5`,
+      ],
+      ev([
+        `two_bot_eventsub_posts_total{outcome="attempted"} 100`,
+        `two_bot_eventsub_posts_total{outcome="succeeded"} 90`,
+        `two_bot_eventsub_posts_total{outcome="failed"} 5`,
+        `two_bot_eventsub_posts_total{outcome="other"} 5`,
+      ]).state,
+    ).firing,
+  );
+  let breaker = EMPTY_STATE;
+  for (let i = 0; i < 3; i++) breaker = ev(["two_bot_rest_guard_breaker_open 1"], breaker).state;
+  firing.push(...breaker.firing);
+  let tampered = ev([`two_bot_eventsub_classified_total{kind="tampered"} 0`]);
+  for (const n of [1, 2, 3]) {
+    tampered = ev([`two_bot_eventsub_classified_total{kind="tampered"} ${n}`], tampered.state);
+  }
+  firing.push(...tampered.firing);
+  let lag = ev(["two_bot_event_store_consumer_lag_seconds 90"]);
+  lag = ev(["two_bot_event_store_consumer_lag_seconds 90"], lag.state);
+  lag = ev(["two_bot_event_store_consumer_lag_seconds 90"], lag.state);
+  firing.push(...lag.firing);
+  const reconcilePasses = (healthy: number, pending: number, failed: number) => [
+    `two_bot_eventsub_reconcile_passes_total{outcome="healthy"} ${healthy}`,
+    `two_bot_eventsub_reconcile_passes_total{outcome="pending"} ${pending}`,
+    `two_bot_eventsub_reconcile_passes_total{outcome="failed"} ${failed}`,
+  ];
+  firing.push(...ev(reconcilePasses(3, 1, 1), ev(reconcilePasses(3, 1, 0)).state).firing);
   let prefix = ev([`two_bot_gateway_prefix_trigger_refused_total{reason="verdict"} 0`]);
   for (const n of [1, 2, 3]) {
     prefix = ev([`two_bot_gateway_prefix_trigger_refused_total{reason="verdict"} ${n}`], prefix.state);
@@ -981,4 +1264,94 @@ test("/ops/metrics: 404 without a configured token, 401 without/with a wrong bea
   assert.equal(calls.length, 1);
   const post = await worker.fetch(new Request("https://w.invalid/ops/metrics", { method: "POST", headers: { authorization: `Bearer ${token}` } }), env(token), ctx);
   assert.equal(post.status, 404);
+});
+
+test("slow-burn ticket survives a counter reset instead of resolving", () => {
+  // Firing ~6x slow burn (167 eligible/min, 1 budget error/min), then a
+  // container restart sends the cumulative counters backwards while the
+  // leak continues: the ticket must hold, never post RESOLVED, and must
+  // not need a fresh 2 h ring to stay filed.
+  const restBudget = (total: number, errors5xx: number) => [
+    `two_bot_rest_requests_total{route="other",result="2xx"} ${total - errors5xx}`,
+    `two_bot_rest_requests_total{route="other",result="5xx"} ${errors5xx}`,
+  ];
+  const base = NOW - 200 * 60;
+  let state = evaluateMetrics(parseExposition(body(restBudget(100_000, 1_000))), EMPTY_STATE, base).state;
+  let total = 100_000;
+  let errors = 1_000;
+  for (let minute = 1; minute <= 125; minute += 1) {
+    total += 167;
+    errors += 1;
+    state = evaluateMetrics(parseExposition(body(restBudget(total, errors))), state, base + minute * 60).state;
+  }
+  const firingAt = base + 125 * 60;
+  assert.ok(
+    evaluateMetrics(parseExposition(body(restBudget(total, errors))), state, firingAt + 60).firing.includes(
+      "error_budget_slow_burn",
+    ),
+    "125 min of ~6x burn must ticket before the restart",
+  );
+  const reset = evaluateMetrics(parseExposition(body(restBudget(2_000, 20))), state, firingAt + 60);
+  assert.ok(
+    reset.firing.includes("error_budget_slow_burn"),
+    "counter reset must hold the firing slow ticket, not resolve it",
+  );
+  // The leak continues after the restart: the held ticket stays filed while
+  // the ring rebuilds, instead of re-ticketing as a new incident 2 h later.
+  let rebuilt = reset;
+  let rebuiltTotal = 2_000;
+  let rebuiltErrors = 20;
+  for (let minute = 1; minute <= 20; minute += 1) {
+    rebuiltTotal += 167;
+    rebuiltErrors += 1;
+    rebuilt = evaluateMetrics(
+      parseExposition(body(restBudget(rebuiltTotal, rebuiltErrors))),
+      rebuilt.state,
+      firingAt + 60 + minute * 60,
+    );
+    assert.ok(
+      rebuilt.firing.includes("error_budget_slow_burn"),
+      `ticket must stay filed while the ring rebuilds (minute ${minute} after restart)`,
+    );
+  }
+});
+
+test("slow-burn ticket resolves on a covered quiet short window while the long window is unknown", () => {
+  // Firing slow burn, then a ~2 h scrape stall with quiet counters ages the
+  // 2 h baseline out of tolerance while later quiet scrapes cover the
+  // 15 min window: the covered quiet short window must resolve the ticket
+  // instead of holding it on history alone.
+  const restBudget = (total: number, errors5xx: number) => [
+    `two_bot_rest_requests_total{route="other",result="2xx"} ${total - errors5xx}`,
+    `two_bot_rest_requests_total{route="other",result="5xx"} ${errors5xx}`,
+  ];
+  const base = NOW - 200 * 60;
+  let state = evaluateMetrics(parseExposition(body(restBudget(100_000, 1_000))), EMPTY_STATE, base).state;
+  let total = 100_000;
+  let errors = 1_000;
+  for (let minute = 1; minute <= 125; minute += 1) {
+    total += 167;
+    errors += 1;
+    state = evaluateMetrics(parseExposition(body(restBudget(total, errors))), state, base + minute * 60).state;
+  }
+  const firingAt = base + 125 * 60;
+  total += 100;
+  const stalledAt = firingAt + 7500;
+  let current = evaluateMetrics(parseExposition(body(restBudget(total, errors))), state, stalledAt);
+  assert.ok(
+    current.firing.includes("error_budget_slow_burn"),
+    "ticket must hold across the stall while the short window is uncovered",
+  );
+  for (let minute = 1; minute <= 16; minute += 1) {
+    total += 167;
+    current = evaluateMetrics(
+      parseExposition(body(restBudget(total, errors))),
+      current.state,
+      stalledAt + minute * 60,
+    );
+  }
+  assert.ok(
+    !current.firing.includes("error_budget_slow_burn"),
+    "covered quiet 15 min window must resolve the ticket even with the 2 h window unknown",
+  );
 });

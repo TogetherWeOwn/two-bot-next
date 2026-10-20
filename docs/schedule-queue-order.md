@@ -20,7 +20,8 @@ predicates in memory:
 
 | Store call | SQL predicate | Test model |
 | --- | --- | --- |
-| `list_scheduled` | `ORDER BY next_run_at` | sort rows by the ISO string |
+| `list_scheduled` | `ORDER BY next_run_at, id LIMIT 25` (the per-guild quota; `count_scheduled` sizes the overflow line) | sort rows by the ISO string, ties by id, then take the first 25 |
+| `list_scheduled_window` | `ORDER BY next_run_at, id LIMIT 25 OFFSET 25` (one bounded hidden window, only for `page` past the first window when the count proves overflow) | skip the first 25 of the sorted rows, then take the next 25 |
 | `claim_due` | `enabled AND next_run_at <= now ORDER BY next_run_at, id LIMIT 1`, then park at `lease_until_ms(now)` | `Queue::claim` |
 | `complete_run` | recurring rows advance from the run instant; one-shot rows disable | `Queue::complete` |
 | `retry_scheduled` | re-queue at `now + clamp_retry_delay_ms(hint)` | `Queue::fail` on a retryable status |
@@ -38,12 +39,14 @@ no row is claimed, posted or audited; the `/readyz` status map lists
 
 ## Acceptance
 
-1. **List order.** `/schedule-list` rows come back in ascending `next_run_at`
-   order. Lexicographic order of the fixed-width strings equals instant
-   order across millisecond carries and day, month, year and leap-day
-   rollovers. `schedule_list_line`/`schedule_list_text` keep that order. The
-   claim order breaks ties by `id`, and one tick takes at most the 10
-   earliest due rows.
+1. **List order.** `/schedule-list` rows come back in ascending
+   (`next_run_at`, `id`) order. Lexicographic order of the fixed-width strings
+   equals instant order across millisecond carries and day, month, year and
+   leap-day rollovers, with tied instants ordered by id.
+   `schedule_list_line`/`schedule_list_text` keep that order, and the paged
+   list (`schedule_list_pages`/`schedule_list_page` with the optional `page`
+   option) preserves it across bounded whole-row pages. The claim order breaks
+   ties by `id`, and one tick takes at most the 10 earliest due rows.
 2. **No catch-up burst.** In the test, an hourly row is five intervals overdue
    when the bot resumes. It posts once. `advance_next_run_ms` sets the next run
    one interval after the run time, not after the missed schedule slot, so no
@@ -69,6 +72,24 @@ no row is claimed, posted or audited; the `/readyz` status map lists
    refused as `Ambiguous`, including an exact id that has a longer sibling
    (legacy behaviour) and an empty prefix over several rows. The verdict does
    not depend on input order. Both refusals share `no_unique_match_text`.
+6. **Bounded listing.** `/schedule-list` reads at most the 25 earliest rows
+   per window (the per-guild schedule quota). A guild holding more —
+   possible only via legacy rows or direct repairs, since quota admission
+   never writes past 25 — renders those 25 plus a final `(truncated, N
+   more)` line with N = total minus 25, or `(truncated)` when the overflow
+   count itself fails, so a cut is never silent. `page` past the first
+   window's packed pages reads one bounded hidden window
+   (`list_scheduled_window`, `OFFSET 25 LIMIT 25`), so rows through the
+   first 50 stay discoverable on higher pages and every reply stays
+   bounded; the hidden window carries its own overflow line when still
+   more remain. Hidden pages carry continuing global numbers (never
+   restarted), and the last first-window page of a multi-page window names
+   the next page (`Continued on page N.`), so no footer reads as the end
+   of the list. A failed hidden-window or overflow-count read fails closed
+   ("Schedule command failed; try again.") instead of reporting a
+   possibly-false out-of-range page. Rows past the cap keep their order
+   and keep firing via `claim_due`. At/under-cap guilds render exactly as
+   before.
 
 ## Out of scope
 

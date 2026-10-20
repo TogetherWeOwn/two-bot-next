@@ -1,3 +1,5 @@
+import { withSecurityHeaders } from "./security-headers.ts";
+
 /** Persisted singleton ownership. Missing/corrupt/unreadable state never grants ownership. */
 export const OWNER_KEY = "two-bot:owner:v1";
 export const AUDIT_PREFIX = "two-bot:ownership-audit:v1:";
@@ -141,22 +143,33 @@ export class OwnershipFence {
   }
 }
 
+/** Whole-body deadline mirroring the receiver convention (internal-actions BODY_TIMEOUT_MS). */
+export const CONTROL_BODY_TIMEOUT_MS = 5_000;
+
 /** Bound control input independently of the untrusted Content-Length header. */
 export async function readChange(request: Request): Promise<OwnershipChange | null> {
   const reader = request.body?.getReader();
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
   let size = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), CONTROL_BODY_TIMEOUT_MS);
+  });
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > 1024) {
-        await reader.cancel();
+    for (;;) {
+      const step = await Promise.race([reader.read(), timeout]);
+      if (step === "timeout") {
+        void reader.cancel().catch(() => {});
         return null;
       }
-      chunks.push(value);
+      if (step.done) break;
+      size += step.value.byteLength;
+      if (size > 1024) {
+        void reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(step.value);
     }
     const bytes = new Uint8Array(size);
     let offset = 0;
@@ -164,6 +177,8 @@ export async function readChange(request: Request): Promise<OwnershipChange | nu
     return parseChange(JSON.parse(new TextDecoder().decode(bytes)));
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -189,6 +204,6 @@ export function refused(error: unknown): Response {
   console.warn(`two-bot ownership refused: ${reason}`);
   return Response.json({ error: "ownership_fenced", reason }, {
     status: reason === "epoch_conflict" ? 409 : 503,
-    headers: { "cache-control": "no-store" },
+    headers: withSecurityHeaders({ "cache-control": "no-store" }),
   });
 }

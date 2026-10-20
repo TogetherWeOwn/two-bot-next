@@ -23,7 +23,8 @@ use two_bot_core::{
         voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite, MessageFactInput,
     },
     leveling::{
-        leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
+        leaderboard_reply_for_season, plan_reward_roles, rank_reply, season_id_for_ms, XpAward,
+        LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
     ClassifierConfig, ClassifyInput, FactsSink, FunnelHandlers, FunnelStore, HandlerId,
@@ -57,6 +58,12 @@ pub struct AwardRequest {
     channel_id: Snowflake,
     at: String,
     duration: Option<u64>,
+    /// Transient short-message shape: `None` is unknown (MESSAGE_CONTENT
+    /// absent, existing award preserved); `Some` is the trimmed scalar count.
+    /// Bodies never travel here, only the count.
+    pub content_length: Option<usize>,
+    /// Whether the gateway message carried an embed or attachment.
+    pub has_embed_or_attachment: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -69,8 +76,9 @@ impl LevelingHook for DeferredLeveling {
         member_id: u64,
         at: &str,
         channel_id: u64,
+        shape: two_bot_core::MessageShape,
     ) -> LevelOutcome {
-        self.push(guild_id, member_id, at, channel_id, None)
+        self.push_message(guild_id, member_id, at, channel_id, shape)
     }
 
     fn award_voice(
@@ -86,6 +94,30 @@ impl LevelingHook for DeferredLeveling {
 }
 
 impl DeferredLeveling {
+    fn push_message(
+        &self,
+        guild_id: u64,
+        member_id: u64,
+        at: &str,
+        channel_id: u64,
+        shape: two_bot_core::MessageShape,
+    ) -> LevelOutcome {
+        self.0.lock().expect("leveling buffer").push(AwardRequest {
+            guild_id,
+            member_id,
+            channel_id,
+            at: at.to_owned(),
+            duration: None,
+            content_length: shape.content_length,
+            has_embed_or_attachment: shape.has_embed_or_attachment,
+        });
+        // Only the awaited store result can report a threshold crossing.
+        LevelOutcome {
+            leveled_up: false,
+            level: 0,
+        }
+    }
+
     fn push(
         &self,
         guild_id: u64,
@@ -100,6 +132,8 @@ impl DeferredLeveling {
             channel_id,
             at: at.to_owned(),
             duration,
+            content_length: None,
+            has_embed_or_attachment: false,
         });
         // Only the awaited store result can report a threshold crossing.
         LevelOutcome {
@@ -508,6 +542,8 @@ impl LevelingRuntime {
                     &member,
                     &request.at,
                     Some(&channel),
+                    request.content_length,
+                    request.has_embed_or_attachment,
                 )
                 .await?
             }
@@ -537,6 +573,22 @@ impl LevelingRuntime {
         &self,
         interaction: &Interaction,
         handler: HandlerId,
+    ) -> Result<bool, LevelingRuntimeError> {
+        self.handle_interaction_at(interaction, handler, &two_bot_core::now_iso())
+            .await
+    }
+
+    /// [`Self::handle_interaction`] at an explicit event-time instant (AC3):
+    /// the routed `/leaderboard` serves `season_id_for_ms` of `at`, scoped to
+    /// `member_season_xp`, with an explicit season label and no lifetime
+    /// fallback. `/rank` stays lifetime-based at every instant. Shaped like
+    /// the pipeline's existing `handle_at` ISO-millis convention; the season
+    /// convention itself is unchanged.
+    pub async fn handle_interaction_at(
+        &self,
+        interaction: &Interaction,
+        handler: HandlerId,
+        at: &str,
     ) -> Result<bool, LevelingRuntimeError> {
         if interaction.guild_id.map(|id| id.get()) != Some(self.configured_guild)
             || !matches!(handler, HandlerId::Rank | HandlerId::Leaderboard)
@@ -580,10 +632,17 @@ impl LevelingRuntime {
                 }
             }
             HandlerId::Leaderboard => {
-                let entries =
-                    leveling_store::leaderboard(&self.pool, &guild, LEADERBOARD_DEFAULT_LIMIT)
-                        .await?;
-                let reply = leaderboard_reply(&entries);
+                let at_ms = two_bot_core::parse_iso_millis(at)
+                    .ok_or(LevelingRuntimeError::InvalidInteraction)?;
+                let season = season_id_for_ms(at_ms);
+                let entries = leveling_store::seasonal_leaderboard(
+                    &self.pool,
+                    &guild,
+                    &season,
+                    LEADERBOARD_DEFAULT_LIMIT,
+                )
+                .await?;
+                let reply = leaderboard_reply_for_season(&entries, &season);
                 InteractionResponse {
                     kind: InteractionResponseType::ChannelMessageWithSource,
                     data: Some(InteractionResponseData {

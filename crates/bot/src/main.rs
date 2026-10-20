@@ -15,6 +15,8 @@ mod automod_gateway;
 mod backfill_error_chain_acceptance_tests;
 mod backfill_retention_chains;
 mod backup_cli;
+#[cfg(test)]
+mod backup_cli_pool_open_tests;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.
 #[allow(dead_code)]
 mod burn_rate;
@@ -26,6 +28,8 @@ mod command_runtime_tests;
 mod commands_cli;
 mod community_jobs;
 mod containment_runtime;
+#[cfg(test)]
+mod containment_runtime_evidence_tests;
 #[cfg(test)]
 mod containment_runtime_tests;
 mod database_roles_cli;
@@ -40,8 +44,12 @@ mod event_cli;
 mod eventsub_delivery;
 mod eventsub_http;
 mod eventsub_reconcile;
+#[cfg(test)]
+mod fast_burn_page_tests;
 mod feed_jobs;
 mod gateway;
+#[cfg(test)]
+mod slow_burn_ticket_tests;
 // Bounded reconnect schedule and runner: no runtime caller yet. Test-only
 // until the gateway loop adopts it, so it lives in test builds instead of
 // shipping dead code to the container.
@@ -63,6 +71,8 @@ mod join_risk_runtime;
 #[cfg(test)]
 mod join_risk_runtime_tests;
 #[cfg(test)]
+mod join_risk_tuning_refusal_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod log_volume_guard_tests;
@@ -76,10 +86,19 @@ mod moderation_release_cli;
 mod observability_event_conformance_tests;
 mod onboarding;
 #[cfg(test)]
+mod onboarding_queue_cause_forwarding_tests;
+#[cfg(test)]
 mod onboarding_tests;
+#[cfg(test)]
+mod onboarding_unknown_only_acceptance_tests;
+#[cfg(test)]
+mod onboarding_worker_failure_acceptance_tests;
+#[cfg(test)]
+mod ops_audit_acceptance_tests;
 mod ops_backfill;
 mod ops_http;
 mod preflight;
+mod privacy_command;
 mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
@@ -106,9 +125,16 @@ mod ticket_runtime;
 #[cfg(test)]
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
+// Shared by the raid/containment tuning test modules; declared once so the
+// file is not loaded as two modules (clippy::duplicate_mod).
+#[cfg(test)]
+mod tuning_test_support;
 mod website_jobs;
+#[cfg(test)]
+mod website_roster_cap_acceptance_tests;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 use tracing::{info, Instrument};
@@ -178,6 +204,26 @@ async fn run(cli_args: &[String]) {
         );
         std::process::exit(1);
     });
+    // Go-live delivery is a second, independent gate on the receiver: an
+    // enabled-but-invalid delivery config (including delivery without the
+    // receiver) refuses startup, never silently acks only.
+    let eventsub_delivery_config =
+        two_bot_core::eventsub_delivery_config::EventsubDeliveryConfig::from_env().unwrap_or_else(
+            |_| {
+                tracing::error!(
+                    error_class = "receiver_config_invalid",
+                    "eventsub startup refused"
+                );
+                std::process::exit(1);
+            },
+        );
+    if eventsub_delivery_config.is_some() && eventsub_config.is_none() {
+        tracing::error!(
+            error_class = "receiver_config_invalid",
+            "eventsub startup refused"
+        );
+        std::process::exit(1);
+    }
     let config = Config::from_env().unwrap_or_else(|err| {
         if receiver_config.is_some() {
             tracing::error!(
@@ -352,21 +398,63 @@ async fn run(cli_args: &[String]) {
         None => None,
     };
 
-    // Private EventSub listener: verified deliveries only. Boot injects no
-    // delivery dependencies yet (no announcements-channel/invite config is
-    // provisioned), so notifications are acknowledged without a send; see
-    // `eventsub_delivery`. Enabled failures never fall back; a bound
-    // listener that later fails stops the container.
+    // Private EventSub listener: verified deliveries only. While delivery
+    // stays dark boot injects no dependencies and notifications are
+    // acknowledged without a send; with delivery enabled boot builds the
+    // production deps (bot pool ledger plus an admission-backed executor,
+    // the same send-admission construction as the command runtime) or
+    // refuses startup — see `eventsub_delivery`. The identity activation
+    // fence is evaluated first, like every other bot-identity posting job:
+    // a refused Announcements capability refuses startup rather than
+    // posting go-lives under an uncleared identity. Enabled failures never
+    // fall back; a bound listener that later fails stops the container.
     let eventsub_receiver = match eventsub_config {
-        Some(eventsub_config) => Some(eventsub_http::bind(eventsub_config).await.unwrap_or_else(
-            |_| {
-                tracing::error!(
-                    error_class = "receiver_bind_failed",
-                    "eventsub startup refused"
-                );
-                std::process::exit(1);
-            },
-        )),
+        Some(eventsub_config) => {
+            let delivery = eventsub_delivery_config.map(|delivery_config| {
+                let refuse = |error_class: &'static str| -> ! {
+                    tracing::error!(error_class, "eventsub startup refused");
+                    std::process::exit(1);
+                };
+                let Some(db) = store.as_ref() else {
+                    refuse("receiver_prerequisites_invalid")
+                };
+                let pool = db.pool().clone();
+                let Some(token) = config
+                    .discord_token
+                    .as_ref()
+                    .map(|secret| secret.expose().as_str())
+                    .filter(|token| !token.is_empty())
+                else {
+                    refuse("receiver_prerequisites_invalid")
+                };
+                let proxy = std::env::var("DISCORD_API_BASE")
+                    .ok()
+                    .filter(|value| !value.is_empty());
+                // One-line delegation: the capability choice lives in the
+                // tested `go_live_delivery_permitted` helper so a swap to a
+                // live-cleared capability cannot slip past the delivery tests.
+                let announcements_permitted = activation.go_live_delivery_permitted();
+                eventsub_delivery::build_delivery_deps(
+                    pool,
+                    token,
+                    proxy,
+                    &delivery_config,
+                    announcements_permitted,
+                )
+                .unwrap_or_else(|error_class| refuse(error_class))
+            });
+            Some(
+                eventsub_http::bind_with_delivery(eventsub_config, delivery)
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::error!(
+                            error_class = "receiver_bind_failed",
+                            "eventsub startup refused"
+                        );
+                        std::process::exit(1);
+                    }),
+            )
+        }
         None => None,
     };
 
@@ -402,8 +490,19 @@ async fn run(cli_args: &[String]) {
     // M3.3 reconcile: once at startup plus a bounded interval while
     // `TWO_EVENTSUB` is exactly `1`. Dark parks with an info log;
     // enabled-but-invalid configuration logs with an error class and never
-    // mutates.
-    eventsub_reconcile::spawn_if_enabled(shutdown.subscribe());
+    // mutates. The handle is retained and joined after the supervisor
+    // drains below, never detached.
+    let reconcile_task = eventsub_reconcile::spawn_if_enabled(shutdown.subscribe());
+    // Record when the shutdown watch latches so the reconcile join below
+    // shares the same `SHUTDOWN_TIMEOUT_SECONDS` budget instead of starting
+    // a second drain after the service drain has spent it.
+    let latch_mark: Arc<std::sync::Mutex<Option<Instant>>> = Arc::new(std::sync::Mutex::new(None));
+    let latch_mark_task = Arc::clone(&latch_mark);
+    let mut latch_rx = shutdown.subscribe();
+    let latch_observer = tokio::spawn(async move {
+        let _ = latch_rx.wait_for(|latched| *latched).await;
+        *latch_mark_task.lock().expect("latch mark") = Some(Instant::now());
+    });
 
     // Filled by the gateway task; read by the shared maintenance tick.
     let automod_slot: automod_gateway::Slot = Arc::default();
@@ -489,17 +588,23 @@ async fn run(cli_args: &[String]) {
                         )
                     });
                     if let Some(runtime) = &runtime {
-                        let config = gateway_commands::GatewayCommandConfig::from_map(
-                            guild_id,
-                            &std::env::vars().collect(),
-                        )
-                        .map_err(|error| {
-                            step_failure(
-                                FailureClass::CustomCommandsInitFailed,
-                                "custom_commands_config",
-                                error,
+                        let vars: std::collections::HashMap<String, String> =
+                            std::env::vars().collect();
+                        let config =
+                            gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                                guild_id,
+                                &vars,
+                                activation.permitted(
+                                    two_bot_core::activation::LiveCapability::Moderation,
+                                ),
                             )
-                        })?;
+                            .map_err(|error| {
+                                step_failure(
+                                    FailureClass::CustomCommandsInitFailed,
+                                    "custom_commands_config",
+                                    error,
+                                )
+                            })?;
                         runtime
                             .initialize_custom_commands(config)
                             .await
@@ -754,6 +859,22 @@ async fn run(cli_args: &[String]) {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
         None => http.await,
     };
+    // Both branches latch the shutdown watch before returning (the gateway
+    // supervisor sends it before its drain; the HTTP/job serve path sends
+    // it before joining its supervisor), so the reconcile task has been
+    // draining concurrently. Join it with what is left of the same shutdown
+    // deadline — never a fresh drain — rather than exiting over a possibly
+    // in-flight subscription mutation. The whole drain stays bounded by
+    // `SHUTDOWN_TIMEOUT_SECONDS`; a zero budget still reaps an
+    // already-finished task and only aborts one that outlived the deadline
+    // it already had concurrently.
+    latch_observer.abort();
+    let elapsed = latch_mark
+        .lock()
+        .expect("latch mark")
+        .map(|latched_at| latched_at.elapsed())
+        .unwrap_or_default();
+    eventsub_reconcile::join(reconcile_task, reconcile_join_budget(elapsed)).await;
     if result.is_err() {
         tracing::error!(
             msg = "shutdown_failed",
@@ -912,6 +1033,23 @@ fn gateway_prerequisites(config: &Config) -> Result<(&str, &str, u64), &'static 
     Ok((token, url, guild_id))
 }
 
+/// Reconcile join budget sharing the service shutdown deadline.
+///
+/// The reconcile task drains concurrently with the gateway/HTTP drain, so by
+/// the time the supervisor returns it has already had `elapsed_since_latch`
+/// to stop. Waiting another full [`eventsub_reconcile::SHUTDOWN_DRAIN`] would
+/// stack a second drain after [`shutdown::deadline`] (up to ~70 s total).
+/// Instead wait at most what is left of the deadline, capped by
+/// `SHUTDOWN_DRAIN`. No floor: a zero budget still reaps an already-finished
+/// task immediately, and only a still-running task is aborted — the correct
+/// drain-exceeded outcome after it already had the full deadline concurrently.
+/// This keeps the fatal restart path fast instead of delaying `exit(1)`.
+fn reconcile_join_budget(elapsed_since_latch: Duration) -> Duration {
+    shutdown::deadline()
+        .saturating_sub(elapsed_since_latch)
+        .min(eventsub_reconcile::SHUTDOWN_DRAIN)
+}
+
 /// A configured gateway is essential: never leave a health-only zombie after
 /// initialization/dispatch failure, stream termination, or a task panic. Exit
 /// nonzero so the Container supervisor can restart from the committed checkpoint.
@@ -1005,5 +1143,58 @@ async fn healthcheck() -> i32 {
         0
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod reconcile_budget_tests {
+    use super::*;
+
+    /// The reconcile join shares the service shutdown deadline: supervisor
+    /// drain plus reconcile budget never exceeds the deadline, and the budget
+    /// never exceeds `SHUTDOWN_DRAIN`. Paused clock so the simulated drain
+    /// consumes virtual time deterministically.
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_join_shares_the_shutdown_budget() {
+        let deadline = shutdown::deadline();
+        // Elapsed since latch that the supervisor could have consumed.
+        for consumed_secs in [0, 1, 5, 30, 34] {
+            let elapsed = Duration::from_secs(consumed_secs);
+            if elapsed > deadline {
+                continue;
+            }
+            let budget = reconcile_join_budget(elapsed);
+            assert!(
+                budget <= eventsub_reconcile::SHUTDOWN_DRAIN,
+                "budget {budget:?} exceeds SHUTDOWN_DRAIN for elapsed {elapsed:?}"
+            );
+            // Simulate the supervisor drain, then the reconcile join, on the
+            // paused clock: the total must stay within the deadline.
+            let start = tokio::time::Instant::now();
+            tokio::time::sleep(elapsed).await;
+            tokio::time::timeout(budget, std::future::pending::<()>())
+                .await
+                .expect_err("pending never completes within budget");
+            assert!(
+                start.elapsed() <= deadline,
+                "total {:?} exceeds deadline {deadline:?} for elapsed {elapsed:?}",
+                start.elapsed()
+            );
+            assert_eq!(
+                elapsed.saturating_add(budget),
+                deadline.min(elapsed.saturating_add(eventsub_reconcile::SHUTDOWN_DRAIN)),
+                "budget must be exactly the remaining deadline capped by SHUTDOWN_DRAIN"
+            );
+        }
+        // Past the deadline there is nothing left: immediate abort, which
+        // still reaps an already-finished task without delaying the restart.
+        assert_eq!(
+            reconcile_join_budget(deadline + Duration::from_secs(1)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            reconcile_join_budget(Duration::from_secs(3_600)),
+            Duration::ZERO
+        );
     }
 }

@@ -38,7 +38,14 @@ impl FactsSink for MessageCalls {
 }
 
 impl LevelingHook for MessageCalls {
-    fn award_message(&self, _: u64, _: u64, _: &str, _: u64) -> LevelOutcome {
+    fn award_message(
+        &self,
+        _: u64,
+        _: u64,
+        _: &str,
+        _: u64,
+        _: two_bot_core::MessageShape,
+    ) -> LevelOutcome {
         self.0.fetch_add(1, Ordering::SeqCst);
         LevelOutcome {
             leveled_up: false,

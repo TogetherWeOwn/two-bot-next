@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v8 dump format with v3/v4/v5/v6/v7 read compatibility,
+`two-bot` `main @ d5d11793`): v9 dump format with v3/v4/v5/v6/v7/v8 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -17,13 +17,14 @@ require `--force`. This confirmation is not authorization to target production.
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v8** (including durable voice-create reservations, the retention
+write **v9** (including durable voice-create reservations, the retention
 queues, the seasonal XP projection, the event store: voice capture plus
 presence capture plus member-capture deltas plus message/reaction capture
 plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
-invite/scheduled-event capture, and the stream go-live ledger); the reader
-also accepts frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**,
-pre-seasonal **v6** and pre-ledger **v7**.
+invite/scheduled-event capture, the stream go-live ledger, guild game-activity
+aggregates and the assistant monthly-cap ledger); the reader also accepts
+frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**,
+pre-stream-ledger **v7** and pre-guild-counters **v8**.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
@@ -56,10 +57,10 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, v5, v6, v7 and v8)
+### Coverage and recovery semantics (v4, v5, v6, v7, v8 and v9)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **94 durable tables from the
+inventory for both dump and restore. It includes **96 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
@@ -77,42 +78,34 @@ invite/scheduled-event capture)
 (`event_store`: 0427 voice, 0428 presence, 0429 thread lifecycle, 0430
 message/reaction capture, 0431 stage/interaction-observe/audit-log capture
 plus 0432 member-capture deltas plus 0439 invite/scheduled-event capture)
-and the stream go-live ledger (`stream_live_claims`: 0440/0443).
+the stream go-live ledger (`stream_live_claims`: 0440/0443), guild game-activity
+aggregates (`game_activity_guild_aggregates`: 0441/0442) and the assistant
+monthly-cap ledger (`assistant_monthly_builds`: 0446/0447).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 94 table entries. A missing current table refuses a dump/restore: migrate
+has 96 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
-A v4 archive must declare every covered table except the ones v5 added
-(`V5_ADDED_TABLES`), the one v6 added (`V6_ADDED_TABLES`: event-store capture
-0427 voice, 0428 presence, 0429 thread lifecycle, 0430 message/reaction
-capture, 0431 stage/interaction-observe/audit-log capture and 0432 member
-deltas), the ones v7 added (`V7_ADDED_TABLES`: seasonal XP projection
-0100 plus retention queues 0438) and the one v8 added (`V8_ADDED_TABLES`:
-stream go-live ledger 0440/0443), so recovery points written before
-create-reservation persistence, event-store capture, the seasonal XP
-projection (0100), the retention queues (0438) and the stream ledger (0440/0443)
-remain inspectable and restorable.
-A v4 archive written before any other table joined the inventory is refused at
-inspect ("manifest is missing tables"); take a fresh dump after upgrading. V5
-requires everything except `V6_ADDED_TABLES`, `V7_ADDED_TABLES` and
-`V8_ADDED_TABLES`, so recovery points written before event-store capture
-(0427 voice, 0428 presence, 0429 thread lifecycle, 0430 message/reaction
-capture, 0431 stage/interaction-observe/audit-log capture, 0432 member deltas
-and 0439 invite/scheduled-event capture), before the seasonal XP projection
-(0100) and retention queues (0438) and before the stream ledger (0440/0443) stay
-readable; V6 requires everything except `V7_ADDED_TABLES` and
-`V8_ADDED_TABLES`, so recovery points written before the seasonal XP
-projection, the retention queues and the stream ledger stay readable; V7
-requires everything except `V8_ADDED_TABLES`, so recovery points written
-before the stream ledger stay readable; V8 requires the full current
-inventory, and an incomplete new archive refuses at inspection. Restoring a
-pre-reservation archive clears the destination's reservation, retention,
-seasonal, event-store and stream-ledger tables, as with other tables absent
-from an older version; restoring a pre-event-store archive clears the
-destination's retention, seasonal, event-store and stream-ledger tables the
-same way; restoring a pre-retention v6 archive clears only the destination's
-seasonal, retention and stream-ledger tables; restoring a pre-ledger v7
-archive clears only the destination's stream-ledger table.
+Each readable version requires its historical inventory and waives only
+versioned additions introduced later:
+
+| Version | Tables it may omit |
+| --- | --- |
+| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters) |
+| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES` |
+| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES` |
+| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES` |
+| v8 | `V9_ADDED_TABLES`: `game_activity_guild_aggregates`, `assistant_monthly_builds` |
+| v9 | None: the full current inventory is required |
+
+These are narrow waivers, not permission to omit arbitrary tables. An
+incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
+is unchanged from before these additions; older v4–v8 archives need not
+invent entries for the v9 guild counters. Restoring an older archive clears
+destination rows for every omitted later table instead of retaining unrelated
+target state. In particular, restoring v8 without guild counters clears both
+counters; it cannot recover assistant usage that predates its persistence.
+Use a v9 recovery point to preserve the monthly cap. Current v9 archives must
+include the ledger, so routine restores retain its archived usage.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.
@@ -122,8 +115,12 @@ Three application tables are excluded, each with its reason inline in
 target cooldowns), `discord_send_admission` (per-credential lane state that a
 recovered process re-learns) and `gateway_onboarding_jobs` (a restart-recovery
 queue bound to a gateway session). The store chain's `rollback_journal` and
-`rollback_watermarks` are excluded too: the journal is unwired append-only
-cutover evidence (no writer calls `record` yet, and its rows are re-capturable
+`rollback_watermarks` are excluded too: the journal is append-only
+cutover evidence (the `PgFunnelStore` funnel append — not yet the production
+gateway batch writer in `crates/cutover/src/gateway_session.rs`, which needs
+its own slice — journals each `events` insert inside the primary transaction
+under a savepoint best-effort via `journal::record_in`, and its rows stay
+re-capturable
 during the watch window), and restoring pre-backup watermarks could mark
 post-backup writes as already journaled, silently breaking rollback coverage.
 Migration ledgers (`_sqlx_migrations`, `schema_migrations` and the store
@@ -308,7 +305,9 @@ and re-verify hash + seal, then upload **both** via
 snapshot is an error, not success. Each upload shares the 30-minute
 bounded-helper contract from the nightly backup above: a hung helper is
 terminated and reaped (direct child only), the run fails, and both files
-stay on disk.
+stay on disk. The snapshot + drift report land in
+`TWO_GUILD_CONFIG_BACKUP_DIR` (default `./guild-config-backups`;
+`crates/bot/src/backup_cli.rs:1044`, usage at `:200`).
 
 Both guild-config commands first read `CREDENTIALS_DIRECTORY/discord_staging_token`
 (the service's `LoadCredential` contract). Only an absent credential/no configured

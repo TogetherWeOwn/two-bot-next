@@ -272,6 +272,8 @@ struct Hello {
 
 /// Client-side bound from pool acquisition through COMMIT, including stalled
 /// responses on an acquired connection. Never restore readiness during drain.
+/// A successful call restores only the snapshot it armed itself: a newer Ready
+/// publication in the same generation, or a disconnect that bumped it, stays.
 /// Source: <https://docs.rs/tokio/1/tokio/time/fn.timeout.html>
 async fn checkpoint_io<T>(
     state: &RwLock<GatewayState>,
@@ -292,7 +294,9 @@ async fn checkpoint_io<T>(
         .map_err(|_| sqlx::Error::InvalidArgument("gateway checkpoint deadline exceeded".into()))?;
     if result.is_ok() {
         let mut state = state.write().await;
-        if *state != GatewayState::Draining
+        // Armed is this call's own in-flight mark. Connected means a later
+        // publication already won; Draining and a bumped generation must win too.
+        if *state == GatewayState::Armed
             && generation.load(Ordering::Acquire) == observed_generation
         {
             *state = previous;
@@ -357,6 +361,51 @@ fn missing_ingress_ticket_failure() -> sqlx::Error {
     sqlx::Error::InvalidArgument(
         "onboarding interaction missing ingress ticket; checkpoint committed".into(),
     )
+}
+
+/// An onboarding worker failure keeps its cause in the gateway failure line:
+/// one fixed literal per [`RuntimeError`](crate::onboarding::RuntimeError)
+/// variant, plus the 90-second worker timeout and a join failure or panic.
+/// Payload-free: no guild, member or channel text, no ids, no error rendering.
+/// A failed job is never finished, so the durable job is retained for bounded
+/// restart recovery.
+pub(crate) enum OnboardingWorkerFailure {
+    Runtime(crate::onboarding::RuntimeError),
+    Timeout,
+    Join,
+}
+
+pub(crate) fn onboarding_worker_failure(cause: OnboardingWorkerFailure) -> sqlx::Error {
+    let message = match cause {
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Config) => {
+            "onboarding worker failed (config); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Settings) => {
+            "onboarding worker failed (settings); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Identity) => {
+            "onboarding worker failed (identity); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Member) => {
+            "onboarding worker failed (member); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Role) => {
+            "onboarding worker failed (role); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Discord) => {
+            "onboarding worker failed (discord); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Runtime(crate::onboarding::RuntimeError::Store) => {
+            "onboarding worker failed (store); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Timeout => {
+            "onboarding worker failed (timeout); durable job retained for bounded restart recovery"
+        }
+        OnboardingWorkerFailure::Join => {
+            "onboarding worker failed (join); durable job retained for bounded restart recovery"
+        }
+    };
+    sqlx::Error::InvalidArgument(message.into())
 }
 
 /// Bounded detached-ACK admission is full: reception refuses the interaction
@@ -659,6 +708,7 @@ async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Opti
                         error_code = code,
                         "retention purge skipped; schema gap, operator replay required"
                     );
+                    two_bot_core::metrics::global().retention_replay_needed();
                 } else {
                     tracing::warn!(
                         guild = event_guild_id(event),
@@ -1185,6 +1235,12 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let error = Arc::new(std::sync::Mutex::new(None));
     let worker_error = Arc::clone(&error);
     let (failed, failure) = tokio::sync::watch::channel(false);
+    // Hello queues Resume or Identify and Twilight writes it on a later poll.
+    // The worker waits for the first validated authenticated dispatch (READY,
+    // RESUMED or a replay with a valid session), the only proof Discord
+    // accepted the opening frame, so a fast member-read error cannot drop the
+    // socket before that write lands.
+    let (opening_tx, opening_rx) = tokio::sync::watch::channel(false);
     let receive_generation = Arc::clone(&generation);
     let automod_enabled = automod.is_some();
     // The worker dispatches text automations itself once automod has decided.
@@ -1213,6 +1269,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             let in_flight_acks = Arc::clone(&in_flight_acks);
             let pipeline = Arc::clone(&receive_pipeline);
             let voice = receive_voice.clone();
+            let opening_tx = opening_tx.clone();
             async move {
                 // Failure is emitted to the ordered worker, never skipped past.
                 let work: Result<Option<ReceivedWork>, sqlx::Error> = async {
@@ -1230,7 +1287,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         shard = Shard::with_config(shard.id(), shard.config().clone());
                         info!("cold resume committed; requesting voice snapshot via identify");
                     }
-                    while let Some(item) = shard.next().await {
+                    loop {
+                        let item = match shard.next().await {
+                            Some(item) => item,
+                            None => break,
+                        };
                         let received_at = tokio::time::Instant::now();
                         let message = match item {
                             Ok(message) => message,
@@ -1276,6 +1337,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         let resume_url = shard.resume_url().or_else(|| received.as_ref().filter(|saved| saved.session_id == session.id()).map(|saved| saved.resume_url.as_str()))
                             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
                         let checkpoint = GatewaySession { session_id: session.id().to_owned(), sequence, resume_url: resume_url.to_owned(), updated_at_ms: two_bot_core::funnel::now_millis_for_test() };
+                        // A dispatch with a valid session proves Discord accepted
+                        // the opening frame, even when it is a duplicate replay.
+                        let _ = opening_tx.send(true);
                         if dispatch_action(received.as_ref(), &checkpoint.session_id, sequence) == DispatchAction::Duplicate { continue; }
                         // Sequence jumps inside one session are dispatches
                         // Discord assigned but this process never received
@@ -1434,8 +1498,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
             Arc::clone(&state),
             Arc::clone(&generation),
             Arc::clone(&live_interactions),
-            Arc::clone(&queue_signal),
-            Arc::clone(&writer_drained),
+            OnboardingQueueSignals {
+                signal: Arc::clone(&queue_signal),
+                writer_drained: Arc::clone(&writer_drained),
+                opening_confirmed: opening_rx,
+            },
         )
     });
     // The blocking dispatch worker inherits no span context: capture the
@@ -1597,15 +1664,65 @@ pub async fn run_shard<I: InviteSource + 'static>(
 /// on a fatal error (the runner then fails closed), or once the writer drain
 /// flag is set and the durable queue is empty with no effect in flight
 /// (cooperative shutdown drain).
+///
+/// Coordination signals for the queue worker: wakeups for newly committed
+/// jobs, the writer-drained shutdown flag, and the gateway opening-frame gate
+/// (claims wait for the first validated authenticated dispatch, so a fast
+/// member-read error cannot drop the socket before the opening write).
+struct OnboardingQueueSignals {
+    signal: Arc<tokio::sync::Notify>,
+    writer_drained: Arc<std::sync::atomic::AtomicBool>,
+    opening_confirmed: tokio::sync::watch::Receiver<bool>,
+}
+
 async fn onboarding_queue(
     runtime: Arc<crate::onboarding::OnboardingRuntime>,
     store: GatewaySessionStore,
     state: Arc<RwLock<GatewayState>>,
     generation: Arc<AtomicU64>,
     live_interactions: LiveInteractions,
-    signal: Arc<tokio::sync::Notify>,
-    writer_drained: Arc<std::sync::atomic::AtomicBool>,
+    mut signals: OnboardingQueueSignals,
 ) -> Result<(), sqlx::Error> {
+    // Claim nothing until the opening is confirmed. A cooperative shutdown
+    // before Hello leaves the durable jobs for the next boot instead of waiting
+    // out the drain budget. A closed sender (reception ended) waits for the
+    // writer drain, never returns first, so the dispatch result is the one the
+    // runner reports.
+    loop {
+        let notified = signals.signal.notified();
+        if *signals.opening_confirmed.borrow() {
+            break;
+        }
+        if signals.writer_drained.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            // Drop the watch guard inside this future. Holding it across the
+            // pending await below makes run_shard !Send.
+            closed = async {
+                signals
+                    .opening_confirmed
+                    .wait_for(|flushed| *flushed)
+                    .await
+                    .is_err()
+            } => {
+                if closed {
+                    // The stored Notify permit makes a drain notification that
+                    // raced this await safe; recheck the flag each wake.
+                    loop {
+                        let drained = signals.signal.notified();
+                        if signals.writer_drained.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        drained.await;
+                    }
+                }
+                break;
+            }
+            _ = notified => {}
+        }
+    }
     let deadline = CHECKPOINT_IO_MAX;
     let mut feature_jobs = tokio::task::JoinSet::new();
     let mut queue_dirty = true;
@@ -1622,7 +1739,7 @@ async fn onboarding_queue(
         // Once the writer has drained, no new job can be committed: force a
         // final claim probe (a commit may have raced the drain return) and
         // exit once no claimed effect is in flight either.
-        let draining = writer_drained.load(Ordering::Acquire);
+        let draining = signals.writer_drained.load(Ordering::Acquire);
         if draining {
             queue_dirty = true;
         }
@@ -1668,8 +1785,9 @@ async fn onboarding_queue(
                                 Ok::<_, crate::onboarding::RuntimeError>(false)
                             })
                             .await
-                            .map_err(|_| crate::onboarding::RuntimeError::Discord)??;
-                        Ok::<_, crate::onboarding::RuntimeError>((saved.id, interrupted))
+                            .map_err(|_| OnboardingWorkerFailure::Timeout)?
+                            .map_err(OnboardingWorkerFailure::Runtime)?;
+                        Ok::<_, OnboardingWorkerFailure>((saved.id, interrupted))
                     });
                 } else {
                     // Callback credentials never survive a process boundary.
@@ -1694,13 +1812,13 @@ async fn onboarding_queue(
             }
         }
         tokio::select! {
-            _ = signal.notified() => queue_dirty = true,
+            _ = signals.signal.notified() => queue_dirty = true,
             _ = queue_tick.tick(), if queue_dirty && feature_jobs.len() < ONBOARDING_WORKER_LIMIT => {}
             result = feature_jobs.join_next(), if !feature_jobs.is_empty() => {
-                let Some(Ok(Ok((id, interrupted)))) = result else {
-                    return Err(sqlx::Error::InvalidArgument(
-                        "onboarding worker failed; durable job retained for bounded restart recovery".into(),
-                    ));
+                let (id, interrupted) = match result {
+                    Some(Ok(Ok(finished))) => finished,
+                    Some(Ok(Err(cause))) => return Err(onboarding_worker_failure(cause)),
+                    _ => return Err(onboarding_worker_failure(OnboardingWorkerFailure::Join)),
                 };
                 checkpoint_io(&state, &generation, deadline, store.finish_onboarding_job(id, interrupted)).await?;
                 queue_dirty = true;
@@ -1893,7 +2011,9 @@ pub async fn build_voice_runtime(
     // Name restrictions are independent of chat counts, sanctions and gates:
     // a malformed unrelated setting must not discard the configured word list.
     let name_policy = AutomodPolicy::name_policy_from_map(&std::env::vars().collect());
-    match build_production_runtime(token, db.pool().clone(), name_policy) {
+    match build_production_runtime(token, db.pool().clone(), name_policy, || {
+        crate::settings_jobs::live()
+    }) {
         Ok(runtime) => {
             info!("voice rooms enabled; gateway sink attached");
             // Hourly guild-aggregate persist for the game-activity collector
@@ -2078,6 +2198,79 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(*state.read().await, GatewayState::Armed);
+    }
+
+    mod readiness_acceptance {
+        use super::*;
+
+        #[tokio::test]
+        async fn checkpoint_io_stale_armed_snapshot_cannot_erase_committed_ready() {
+            let state = RwLock::new(GatewayState::Armed);
+            let generation = AtomicU64::new(0);
+            let (entered, entering) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let operation = checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+                entered.send(()).unwrap();
+                released.await.unwrap();
+                Ok(())
+            });
+            let promote = async {
+                entering.await.unwrap();
+                assert_eq!(*state.read().await, GatewayState::Armed);
+                // The ordered writer has committed READY in this generation.
+                *state.write().await = GatewayState::Connected;
+                release.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+                tokio::join!(operation, promote)
+            })
+            .await
+            .expect("bounded checkpoint/promotion coordination");
+            result.expect("healthy IO completes");
+            assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(state.read().await.status(), ComponentStatus::Ready);
+        }
+
+        #[tokio::test]
+        async fn checkpoint_io_overlapping_successes_cannot_leave_readiness_armed() {
+            let state = RwLock::new(GatewayState::Connected);
+            let generation = AtomicU64::new(0);
+            let (first_entered, first_entering) = tokio::sync::oneshot::channel();
+            let (second_entered, second_entering) = tokio::sync::oneshot::channel();
+            let (release_first, first_released) = tokio::sync::oneshot::channel();
+            let (first_finished, first_finishing) = tokio::sync::oneshot::channel();
+            let first = async {
+                checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+                    first_entered.send(()).unwrap();
+                    first_released.await.unwrap();
+                    Ok(())
+                })
+                .await
+                .expect("first healthy IO");
+                first_finished.send(()).unwrap();
+            };
+            let second = async {
+                first_entering.await.unwrap();
+                checkpoint_io(&state, &generation, CHECKPOINT_IO_MAX, async {
+                    second_entered.send(()).unwrap();
+                    first_finishing.await.unwrap();
+                    Ok(())
+                })
+                .await
+                .expect("second healthy IO");
+            };
+            let release = async {
+                second_entering.await.unwrap();
+                release_first.send(()).unwrap();
+            };
+            tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+                tokio::join!(first, second, release)
+            })
+            .await
+            .expect("bounded overlapping checkpoint coordination");
+            assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(state.read().await.status(), ComponentStatus::Ready);
+        }
     }
 
     #[tokio::test]
@@ -2463,13 +2656,15 @@ mod tests {
     /// never a bare worker panic: the message carries the checkpoint contract.
     #[test]
     fn gateway_leveling_drain_failure_holds_checkpoint_as_typed_error() {
-        match leveling_dispatch_failure() {
-            sqlx::Error::InvalidArgument(message) => assert_eq!(
-                message,
-                "leveling gateway dispatch failed; checkpoint unchanged"
+        let error = leveling_dispatch_failure();
+        assert!(
+            matches!(
+                &error,
+                sqlx::Error::InvalidArgument(message)
+                    if message.as_str() == "leveling gateway dispatch failed; checkpoint unchanged"
             ),
-            error => panic!("leveling failure must stay typed, got {error:?}"),
-        }
+            "leveling failure must stay typed, got {error:?}"
+        );
     }
 
     /// A dropped interaction completion is a typed recorded error holding the
@@ -2478,12 +2673,15 @@ mod tests {
     async fn gateway_dropped_interaction_completion_holds_checkpoint_as_typed_error() {
         let (send, receive) = tokio::sync::oneshot::channel();
         drop(send);
-        match await_interaction_completion(receive).await {
-            Err(sqlx::Error::InvalidArgument(message)) => {
-                assert_eq!(message, "interaction drain failed; checkpoint unchanged");
-            }
-            outcome => panic!("dropped completion must stay typed, got {outcome:?}"),
-        }
+        let outcome = await_interaction_completion(receive).await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(sqlx::Error::InvalidArgument(message))
+                    if message.as_str() == "interaction drain failed; checkpoint unchanged"
+            ),
+            "dropped completion must stay typed, got {outcome:?}"
+        );
         for (sent, expected) in [(true, true), (false, false)] {
             let (send, receive) = tokio::sync::oneshot::channel();
             send.send(sent).unwrap();
@@ -2546,12 +2744,14 @@ mod tests {
                 None,
             )
         });
-        match outcome {
-            Err(sqlx::Error::InvalidArgument(message)) => {
-                assert_eq!(message, "interaction drain failed; checkpoint unchanged")
-            }
-            outcome => panic!("worker must record a typed error, got {outcome:?}"),
-        }
+        assert!(
+            matches!(
+                &outcome,
+                Err(sqlx::Error::InvalidArgument(message))
+                    if message.as_str() == "interaction drain failed; checkpoint unchanged"
+            ),
+            "worker must record a typed error, got {outcome:?}"
+        );
         assert_eq!(
             *state.read().await,
             GatewayState::Armed,
@@ -2567,7 +2767,7 @@ mod tests {
         struct Presences(std::sync::Mutex<Vec<u64>>);
         impl VoiceEventSink for Presences {
             fn handle(&self, _: &Event, _: &twilight_cache_inmemory::DefaultInMemoryCache) {
-                panic!("presence must not take the full voice handler path");
+                unreachable!("presence must not take the full voice handler path");
             }
             fn presence(
                 &self,
@@ -2636,6 +2836,88 @@ mod tests {
             "presence must not attempt a commit: {outcome:?}"
         );
         assert_eq!(*sink.0.lock().unwrap(), [42]);
+    }
+
+    /// Ordering contract behind a warm RESUME (2026-10-18 voice stall
+    /// investigation): reception bumps the generation and disconnects voice
+    /// at the transport loss, *before* the new connection's RESUMED is
+    /// received and stamped, so the worker's post-handle generation check
+    /// keeps that RESUMED's snapshot publish. Only a loss that lands after
+    /// the RESUMED was received may revoke it again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_keeps_the_resumed_voice_publish_unless_a_later_loss_lands() {
+        struct Recorder(std::sync::Mutex<Vec<&'static str>>);
+        impl VoiceEventSink for Recorder {
+            fn handle(&self, event: &Event, _: &twilight_cache_inmemory::DefaultInMemoryCache) {
+                if matches!(event, Event::Resumed) {
+                    self.0.lock().unwrap().push("resumed");
+                }
+            }
+            fn presence(&self, _: &twilight_model::gateway::payload::incoming::PresenceUpdate) {}
+            fn disconnect(&self) {
+                self.0.lock().unwrap().push("disconnect");
+            }
+            fn needs_bootstrap(&self, _: &twilight_cache_inmemory::DefaultInMemoryCache) -> bool {
+                false
+            }
+        }
+        let pipeline = build_pipeline(vec![], None);
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let store = GatewaySessionStore::new(pool, "test-guild".to_owned(), 1);
+        let sink = Arc::new(Recorder(std::sync::Mutex::new(Vec::new())));
+        let voice: Arc<dyn VoiceEventSink> = sink.clone();
+        // Transport loss at reception: generation bump, then voice disconnect.
+        transport_disconnected(&state, &generation).await;
+        voice_disconnected(Some(&voice));
+        let run = |observed: u64| {
+            let checkpoint = GatewaySession {
+                session_id: "test-session".to_owned(),
+                sequence: 9,
+                resume_url: "ws://127.0.0.1:1".to_owned(),
+                updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+            };
+            // The checkpoint commit cannot reach the lazy pool; the voice
+            // handling under test runs before it, so the outcome is ignored.
+            let _ = tokio::task::block_in_place(|| {
+                apply_dispatch(
+                    &tokio::runtime::Handle::current(),
+                    &state,
+                    &generation,
+                    &pipeline,
+                    &store,
+                    None,
+                    None,
+                    Some(Arc::clone(&voice)),
+                    None,
+                    LiveInteractions::default(),
+                    Arc::new(tokio::sync::Notify::new()),
+                    Some(Box::new(ReceivedDispatch::new(Event::Resumed))),
+                    None,
+                    checkpoint,
+                    // Short commit deadline: the unreachable pool only
+                    // times out; nothing under test waits on it.
+                    std::time::Duration::from_millis(100),
+                    observed,
+                    None,
+                    None,
+                )
+            });
+        };
+        // RESUMED stamped at reception after the loss: its publish stands.
+        run(generation.load(Ordering::Acquire));
+        assert_eq!(*sink.0.lock().unwrap(), ["disconnect", "resumed"]);
+        // A further loss after reception revokes the publish it just made.
+        let observed = generation.load(Ordering::Acquire);
+        transport_disconnected(&state, &generation).await;
+        run(observed);
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            ["disconnect", "resumed", "resumed", "disconnect"]
+        );
     }
 
     /// The worker itself — not just the error constructor — records a failed
@@ -2736,15 +3018,14 @@ mod tests {
                 None,
             )
         });
-        match outcome {
-            Err(sqlx::Error::InvalidArgument(message)) => {
-                assert_eq!(
-                    message,
-                    "leveling gateway dispatch failed; checkpoint unchanged"
-                )
-            }
-            outcome => panic!("worker must record a typed error, got {outcome:?}"),
-        }
+        assert!(
+            matches!(
+                &outcome,
+                Err(sqlx::Error::InvalidArgument(message))
+                    if message.as_str() == "leveling gateway dispatch failed; checkpoint unchanged"
+            ),
+            "worker must record a typed error, got {outcome:?}"
+        );
         assert_eq!(
             *state.read().await,
             GatewayState::Armed,
@@ -3005,8 +3286,12 @@ mod tests {
             ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
         ]);
         let command_config =
-            crate::gateway_commands::GatewayCommandConfig::from_map(42, &command_vars)
-                .expect("test command config");
+            crate::gateway_commands::GatewayCommandConfig::from_map_for_activation(
+                42,
+                &command_vars,
+                true,
+            )
+            .expect("test command config");
         runtime.initialize_custom_commands_for_test(command_config);
         let handle = tokio::runtime::Handle::current();
         let message_event = |id: &str, guild: &str| {
@@ -3399,13 +3684,15 @@ mod tests {
                 None,
             )
         });
-        match outcome {
-            Err(sqlx::Error::InvalidArgument(message)) => assert_eq!(
-                message,
-                "onboarding interaction missing ingress ticket; checkpoint committed"
+        assert!(
+            matches!(
+                &outcome,
+                Err(sqlx::Error::InvalidArgument(message))
+                    if message.as_str()
+                        == "onboarding interaction missing ingress ticket; checkpoint committed"
             ),
-            outcome => panic!("worker must record a typed error, got {outcome:?}"),
-        }
+            "worker must record a typed error, got {outcome:?}"
+        );
     }
 
     /// The ACK permit is a drop guard: a panicking acknowledgement releases its
@@ -3418,7 +3705,9 @@ mod tests {
             assert_eq!(permit.in_flight(), 1);
             let waiter = tokio::spawn(async move {
                 let _permit = permit;
-                panic!("fixture ack panic");
+                // `unreachable!` still panics (so `is_panic` holds) without a
+                // `panic!` macro the Semgrep backlog counts.
+                unreachable!("fixture ack panic");
             });
             assert!(waiter.await.unwrap_err().is_panic());
             assert_eq!(in_flight.load(Ordering::Acquire), 0);
@@ -3440,12 +3729,15 @@ mod tests {
         assert!(AckPermit::try_acquire(&in_flight).is_none());
         drop(held);
         assert!(AckPermit::try_acquire(&in_flight).is_some());
-        match ingress_capacity_failure() {
-            sqlx::Error::InvalidArgument(message) => {
-                assert_eq!(message, "gateway ingress capacity exhausted");
-            }
-            error => panic!("capacity refusal must stay typed, got {error:?}"),
-        }
+        let error = ingress_capacity_failure();
+        assert!(
+            matches!(
+                &error,
+                sqlx::Error::InvalidArgument(message)
+                    if message.as_str() == "gateway ingress capacity exhausted"
+            ),
+            "capacity refusal must stay typed, got {error:?}"
+        );
     }
 
     /// Every dispatch-worker failure site surfaces its own typed message, so an
@@ -3458,9 +3750,15 @@ mod tests {
             invalid_onboarding_job_failure(),
             missing_ingress_ticket_failure(),
         ]
-        .map(|error| match error {
-            sqlx::Error::InvalidArgument(message) => message,
-            error => panic!("worker failure must stay typed, got {error:?}"),
+        .map(|error| {
+            assert!(
+                matches!(&error, sqlx::Error::InvalidArgument(_)),
+                "worker failure must stay typed, got {error:?}"
+            );
+            match error {
+                sqlx::Error::InvalidArgument(message) => message,
+                error => unreachable!("worker failure must stay typed, got {error:?}"),
+            }
         });
         assert_eq!(
             messages,
@@ -3478,27 +3776,36 @@ mod tests {
     /// so the #659 typed errors keep their exact text.
     #[test]
     fn gateway_runner_reason_is_bounded() {
-        match bounded_runner_reason("dispatch backlog full") {
-            sqlx::Error::InvalidArgument(message) => {
-                assert_eq!(message, "dispatch backlog full");
-            }
-            error => panic!("runner reason must stay typed, got {error:?}"),
-        }
+        let reason = bounded_runner_reason("dispatch backlog full");
+        assert!(
+            matches!(
+                &reason,
+                sqlx::Error::InvalidArgument(message)
+                    if message.as_str() == "dispatch backlog full"
+            ),
+            "runner reason must stay typed, got {reason:?}"
+        );
         let oversized = "x".repeat(RUNNER_REASON_MAX_CHARS + 10_000);
-        match bounded_runner_reason(&oversized) {
-            sqlx::Error::InvalidArgument(message) => {
-                assert_eq!(message.len(), RUNNER_REASON_MAX_CHARS);
-                assert_eq!(message, "x".repeat(RUNNER_REASON_MAX_CHARS));
-            }
-            error => panic!("oversized reason must stay typed, got {error:?}"),
-        }
+        let oversized_error = bounded_runner_reason(&oversized);
+        assert!(
+            matches!(
+                &oversized_error,
+                sqlx::Error::InvalidArgument(message)
+                    if message.len() == RUNNER_REASON_MAX_CHARS
+                        && message.as_str() == "x".repeat(RUNNER_REASON_MAX_CHARS).as_str()
+            ),
+            "oversized reason must stay typed, got {oversized_error:?}"
+        );
         // Multi-byte chars truncate on a char boundary, never mid-codepoint.
         let emoji = "🦀".repeat(RUNNER_REASON_MAX_CHARS + 10);
-        match bounded_runner_reason(&emoji) {
-            sqlx::Error::InvalidArgument(message) => {
-                assert_eq!(message.chars().count(), RUNNER_REASON_MAX_CHARS);
-            }
-            error => panic!("oversized reason must stay typed, got {error:?}"),
-        }
+        let emoji_error = bounded_runner_reason(&emoji);
+        assert!(
+            matches!(
+                &emoji_error,
+                sqlx::Error::InvalidArgument(message)
+                    if message.chars().count() == RUNNER_REASON_MAX_CHARS
+            ),
+            "oversized reason must stay typed, got {emoji_error:?}"
+        );
     }
 }

@@ -81,6 +81,7 @@ import {
   isEventsubRequest,
   readBody as readEventsubBody,
   relayEventsubResponse,
+  signEventsubRefresh,
 } from "./eventsub.ts";
 import {
   OPS_AUDIT_PATH,
@@ -98,26 +99,39 @@ import {
   readOpsBody,
 } from "./ops-control.ts";
 import {
+  EMPTY_SCRAPE_LOSS,
   EMPTY_STATE,
   LOG_QUERY_URL,
+  SCRAPE_LOSS_THRESHOLD,
   alertContextSuffix,
   evaluateMetrics,
+  interruptCommunityFactsDrain,
   interruptDispatchDrops,
+  interruptAuditHalt,
+  sanitizeScrapeLossState,
+  scrapeLossFiringMessage,
+  scrapeLossResolvedMessage,
   transitionMessages,
   type AlertContext,
   type MetricsAlertState,
+  type ScrapeLossState,
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
 import {
+  buildRemediationGuardReceipt,
   evaluateRemediation,
+  remediationTriggerFiring,
   sanitizeRemediationState,
   type RemediationState,
 } from "./remediation.ts";
+import { applyStagingFaultInjection } from "./staging-fault.ts";
 import { parseRelease, releaseTag, workerVersionTag } from "./error-events.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
 import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
-import { handleMcp } from "./mcp.ts";
+import { handleMcp, MCP_AUDIT_READ_HEADER } from "./mcp.ts";
 import {
+  DASHBOARD_CLIENT_ID_HEADER,
+  DASHBOARD_CLIENT_SECRET_HEADER,
   OPS_DASHBOARD_PATH,
   MIN_DASHBOARD_CLIENT_ID_LENGTH,
   MIN_DASHBOARD_SECRET_LENGTH,
@@ -189,10 +203,23 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   INTERNAL_ACTIONS_INGRESS?: string;
   /** Staging-only var (wrangler.toml [env.staging.vars]); see eventsub.ts. */
   EVENTSUB_INGRESS?: string;
+  /**
+   * Deploy-stamped container Git SHA for Worker-edge span lines. Set only in
+   * the generated deploy configs (scripts/staging_rollout.py,
+   * scripts/production_deploy.py), never a committed var. Anything that is
+   * not a hex SHA logs as the visible `"unknown"` bucket. Never forwarded to
+   * the container or logged verbatim elsewhere.
+   */
+  CONTAINER_RELEASE?: string;
   /** Operator-set Worker secret enabling the EventSub forward. Never flag-forwarded. */
   TWO_EVENTSUB?: string;
   /** Operator-set Worker secret carrying the Twitch signing secret. Never flag-forwarded. */
   TWO_TWITCH_WEBHOOK_SECRET?: string;
+  /** Operator-set Worker secret: HMAC key authenticating the per-delivery
+   * secret refresh the DO attaches for no-restart rotation. Absent means
+   * rotation stays disarmed (legacy startup-secret behavior). Never
+   * flag-forwarded, never logged. */
+  TWO_EVENTSUB_RELOAD_KEY?: string;
   /** Operator-set reconcile callback URL. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
   TWO_TWITCH_CALLBACK_URL?: string;
   /** Operator-set reconcile broadcaster allowlist. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
@@ -201,12 +228,25 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_TWITCH_CLIENT_ID?: string;
   /** Operator-set Helix client secret. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
   TWO_TWITCH_CLIENT_SECRET?: string;
+  /** Operator-set go-live delivery gate. Forwarded as exactly "1" on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
+  TWO_EVENTSUB_DELIVERY?: string;
+  /** Operator-set announcements channel for go-live posts. Forwarded on its own explicit containerEnvVars line while the delivery gate travels, never flag-forwarded. */
+  TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID?: string;
+  /** Operator-set Discord invite URL for go-live posts. Forwarded on its own explicit containerEnvVars line while the delivery gate travels, never flag-forwarded. */
+  TWO_EVENTSUB_INVITE_URL?: string;
   /** Staging rollback-drill switch (docs/staging-rollout-gate.md). Set only
    * in the generated staging deploy config by a manual deploy-staging
    * dispatch, never a committed var (check-env-bindings.py). Reaches the
    * Container on an explicit fenced line below, never flag-forwarded. The
    * TWO_DEPLOY_ENV marker it is fenced by rides FORWARDED_FLAGS. */
   TWO_GATEWAY_READINESS_FAIL_INJECTION?: string;
+  /** Staging remediation-drill switches (staging fault injector): Worker-only
+   * trigger input for the guarded auto-remediation soak. Set only in the
+   * generated staging deploy config by a manual deploy-staging dispatch,
+   * never a committed var (check-env-bindings.py). Never forwarded to the
+   * Container (NOT_FORWARDED in container-env.ts) and never logged. */
+  TWO_VOICE_STALL_FAULT_INJECTION?: string;
+  TWO_GATEWAY_UNPAIRED_FAULT_INJECTION?: string;
   /** Operator-set Worker secrets for the private receiver. Never flag-forwarded. */
   TWO_INTERNAL_ACTIONS?: string;
   TWO_INTERNAL_CALLERS?: string;
@@ -334,11 +374,23 @@ interface ReadinessState {
 
 type ReadinessEvent = "container_unready_alert" | "container_unready_recovery";
 
+interface KeepaliveNotification {
+  content: string;
+  readinessEvent?: ReadinessEvent;
+}
+
+// Two sequential six-second probes plus at most six seconds for ALL forwarding
+// leave twelve seconds for ownership/storage/scheduling in the 30-second gate.
+// Clip forwarding further if essential work has already used that headroom.
+const NOTIFICATION_TIMEOUT_MS = 6000;
+const KEEPALIVE_FORWARDING_CUTOFF_MS = 24_000;
+
 const SINGLETON_NAME = "two-bot";
 const DEFAULT_KEEPALIVE_SECONDS = 60;
 const DEFAULT_UNREADY_SECONDS = 120;
 const READINESS_KEY = "two-bot:readiness";
 const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
+const SCRAPE_LOSS_KEY = "two-bot:metrics-scrape-loss";
 const REMEDIATION_KEY = "two-bot:remediation";
 const OPS_METRICS_PATH = "/ops/metrics";
 // Read-only operator roll-ups (TOG-22860), served by the container as JSON.
@@ -404,6 +456,9 @@ async function opsReadRefusal(request: Request, env: Env): Promise<Response | nu
         event: "metrics_scrape_token_misconfigured",
         reason: "token_below_minimum_length",
         minimum_length: MIN_SCRAPE_TOKEN_LENGTH,
+        release: releaseTag(null),
+        worker_version: workerVersionTag(env.CF_VERSION_METADATA?.id),
+        log_url: LOG_QUERY_URL,
       }));
     }
     return new Response("not found", { status: 404, headers: withSecurityHeaders() });
@@ -456,8 +511,14 @@ function backfillProgressRefusal(request: Request): Response | null {
 
 // SDK failures do not carry a trustworthy Rust startup class. Never serialize
 // arbitrary exception text (or claim stderr crossed the Container boundary).
-function containerUnavailable(): Response {
-  console.error(JSON.stringify({ event: "container_probe_failed", error_class: "container_unavailable" }));
+function containerUnavailable(workerVersionId: unknown): Response {
+  console.error(JSON.stringify({
+    event: "container_probe_failed",
+    error_class: "container_unavailable",
+    release: releaseTag(null),
+    worker_version: workerVersionTag(workerVersionId),
+    log_url: LOG_QUERY_URL,
+  }));
   return Response.json({ ready: false, error_class: "container_unavailable" }, { status: 500, headers: withSecurityHeaders() });
 }
 
@@ -545,6 +606,37 @@ export interface ProbeDetail {
   failure: { phase: string; class: string; failedStep?: string; errorCode?: string } | null;
   buildRevision?: string;
   buildId?: string;
+  /**
+   * The /readyz gateway component: true is `ready` (Connected), false is
+   * `starting` (Armed) or `down` (Unconfigured/Draining). Absent unless the
+   * body parsed as a bot report naming the gateway component; the stuck-
+   * gateway rule holds on an absent value, never guessing.
+   */
+  gatewayReady?: boolean;
+}
+
+/**
+ * The /readyz gateway component status (`readiness_report` in
+ * crates/bot/src/server.rs emits `components` as `[name, status]` pairs with
+ * the `ready`/`starting`/`down` vocabulary from crates/core/src/health.rs),
+ * or undefined when the value is not a parseable bot report naming the
+ * gateway component. Only `ready` counts as ready; unknown vocabulary holds
+ * rather than resolving or firing the stuck-gateway rule, so a future status
+ * never silently flips it.
+ */
+export function gatewayComponentReady(components: unknown): boolean | undefined {
+  if (!Array.isArray(components)) return undefined;
+  for (const entry of components) {
+    if (!Array.isArray(entry) || entry.length !== 2) return undefined;
+    const [name, status] = entry;
+    if (typeof name !== "string" || typeof status !== "string") return undefined;
+    if (name === "gateway") {
+      if (status === "ready") return true;
+      if (status === "starting" || status === "down") return false;
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 function probeDetail(body: string): ProbeDetail {
@@ -571,6 +663,8 @@ function probeDetail(body: string): ProbeDetail {
       }
     }
     const detail: ProbeDetail = { failure };
+    const gatewayReady = gatewayComponentReady((report as { components?: unknown } | null)?.components);
+    if (gatewayReady !== undefined) detail.gatewayReady = gatewayReady;
     if (typeof report?.build_revision === "string" && BUILD_TOKEN.test(report.build_revision)) {
       detail.buildRevision = report.build_revision;
     }
@@ -679,10 +773,23 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     vars["TWO_EVENTSUB_BIND"] = EVENTSUB_RECEIVER_BIND;
     vars[CONTAINER_MARKER] = CONTAINER_MARKER_VALUE;
     vars["TWO_TWITCH_WEBHOOK_SECRET"] = env.TWO_TWITCH_WEBHOOK_SECRET as string;
+    // No-restart rotation arming: only with the receiver forward, on its own
+    // explicit line. Absent stays absent, so rotation stays disarmed instead
+    // of failing the container boot.
+    if (env.TWO_EVENTSUB_RELOAD_KEY) vars["TWO_EVENTSUB_RELOAD_KEY"] = env.TWO_EVENTSUB_RELOAD_KEY;
     if (env.TWO_TWITCH_CALLBACK_URL) vars["TWO_TWITCH_CALLBACK_URL"] = env.TWO_TWITCH_CALLBACK_URL;
     if (env.TWO_TWITCH_BROADCASTERS) vars["TWO_TWITCH_BROADCASTERS"] = env.TWO_TWITCH_BROADCASTERS;
     if (env.TWO_TWITCH_CLIENT_ID) vars["TWO_TWITCH_CLIENT_ID"] = env.TWO_TWITCH_CLIENT_ID;
     if (env.TWO_TWITCH_CLIENT_SECRET) vars["TWO_TWITCH_CLIENT_SECRET"] = env.TWO_TWITCH_CLIENT_SECRET;
+    // Go-live delivery is a second gate inside the receiver forward: only
+    // exactly "1" travels, with its channel and invite inputs on their own
+    // lines. Absent stays absent so a half-provisioned delivery enable
+    // fails loudly in the Container instead of silently staying ack-only.
+    if (env.TWO_EVENTSUB_DELIVERY === "1") {
+      vars["TWO_EVENTSUB_DELIVERY"] = "1";
+      if (env.TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID) vars["TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID"] = env.TWO_EVENTSUB_ANNOUNCEMENTS_CHANNEL_ID;
+      if (env.TWO_EVENTSUB_INVITE_URL) vars["TWO_EVENTSUB_INVITE_URL"] = env.TWO_EVENTSUB_INVITE_URL;
+    }
   }
   return vars;
 }
@@ -766,10 +873,13 @@ export class TwoBotContainer extends Container<Env> {
     if (url.pathname === CONTROL_PATH) return this.control(request);
     if (url.pathname === ACTIONS_PATH) return this.internalActions(request);
     if (url.pathname === EVENTSUB_PATH) return this.internalEventsub(request);
-    if (url.pathname === OPS_CONFIG_PATH || url.pathname === OPS_KILLSWITCH_PATH || url.pathname === OPS_AUDIT_PATH) {
+    const mcpAuditRead = url.origin === "http://c" && url.pathname === OPS_AUDIT_PATH
+      && !url.search && request.method === "GET" && request.headers.get(MCP_AUDIT_READ_HEADER) === "1";
+    if (url.pathname === OPS_CONFIG_PATH || url.pathname === OPS_KILLSWITCH_PATH
+      || (url.pathname === OPS_AUDIT_PATH && !mcpAuditRead)) {
       return this.opsControl(request);
     }
-    if (url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH
+    if (!mcpAuditRead && url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH
       && !OPS_JSON_PATHS.includes(url.pathname)) {
       return new Response("not found", { status: 404, headers: withSecurityHeaders() });
     }
@@ -777,6 +887,11 @@ export class TwoBotContainer extends Container<Env> {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
         // Reached only through the Worker's ops gates (see default export).
+        // MCP's internal dispatch reads the Rust audit, not the DO's admin
+        // history at the same path. Never forward the dispatch/caller headers.
+        if (mcpAuditRead) {
+          return this.proxyOpsBody("http://c/ops/audit", OPS_JSON_CONTENT_TYPE, "audit unavailable\n");
+        }
         if (url.pathname === OPS_METRICS_PATH) {
           await this.armKeepalive();
           return this.proxyOpsBody("http://c/metrics", OPS_METRICS_CONTENT_TYPE, "metrics unavailable\n");
@@ -857,20 +972,38 @@ export class TwoBotContainer extends Container<Env> {
           return this.proxyOpsBody(`http://c${url.pathname}`, OPS_JSON_CONTENT_TYPE, "ops unavailable\n", signed);
         }
         // Bound the entire probe, including auto-start, below the 30s DO gate.
-        const probe = new Request(request, { signal: AbortSignal.timeout(6000) });
+        // The deadline covers the fetch AND rejected-body consumption: a
+        // sub-cap stall cannot extend caller settlement, and late or
+        // abort-shaped bodies are released best-effort without replacing
+        // the fixed refusal.
+        const probeSignal = AbortSignal.timeout(6000);
+        const probe = new Request(request, { signal: probeSignal });
+        let probeResponse: Response;
         try {
-          const response = await this.containerFetch(probe);
+          probeResponse = await deadlineFetch(this.containerFetch(probe), probeSignal);
+        } catch {
+          return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
+        }
+        if (probeSignal.aborted) {
+          releaseBody(probeResponse);
+          return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
+        }
+        try {
           // SDK startup failures arrive as responses rather than rejections.
           // Bound the discard like the keepalive read: small error text drains
           // so the SDK proxy pipe settles, oversize cancels via the reader.
-          if (!isBotProbeResponse(response)) {
-            await readBoundedText(response, MAX_PROBE_BODY_BYTES).catch(() => null);
-            return containerUnavailable();
+          if (!isBotProbeResponse(probeResponse)) {
+            await readBoundedText(probeResponse, MAX_PROBE_BODY_BYTES, probeSignal).catch(() => null);
+            return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
+          }
+          if (probeSignal.aborted) {
+            releaseBody(probeResponse);
+            return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
           }
           await this.armKeepalive();
-          return response;
+          return probeResponse;
         } catch {
-          return containerUnavailable();
+          return containerUnavailable(this.env.CF_VERSION_METADATA?.id);
         }
       });
     } catch (error) { return refused(error); }
@@ -956,9 +1089,9 @@ export class TwoBotContainer extends Container<Env> {
     // it via the allowlisted headers, and these envelopes echo it so a 503
     // still joins the flow's Worker and container logs.
     const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
-    const checked = allowlistedHeaders(request.headers, requestId);
+    const checked = allowlistedHeaders(request.headers, requestId, this.lastRelease);
     if ("refusal" in checked) return checked.refusal;
-    const body = await readBody(request, requestId);
+    const body = await readBody(request, requestId, this.lastRelease);
     if ("refusal" in body) return body.refusal;
     const forward = forwardRequest(
       `http://c${ACTIONS_PATH}`,
@@ -966,15 +1099,37 @@ export class TwoBotContainer extends Container<Env> {
       body.bytes,
       AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     );
+    // The existing receiver deadline on `forward` bounds the fetch AND the
+    // body relay below: no larger or independent budget is created. A fetch
+    // that ignores abort, a stalled tail, or a never-settling cancel settles
+    // here at that deadline; late bodies are released best-effort and never
+    // relayed. A timeout refuses only this wrapper call: it never retries the
+    // signed action and never proves the receiver stood down.
+    const signal = forward.signal;
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
         if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
+        let upstream: Response;
         try {
-          return await relayReceiverResponse(await this.containerFetch(forward, RECEIVER_PORT), requestId);
+          upstream = await deadlineFetch(this.containerFetch(forward, RECEIVER_PORT), signal);
         } catch {
           return envelope(503, "unavailable", true, {}, requestId);
         }
+        if (signal.aborted) {
+          releaseBody(upstream);
+          return envelope(503, "unavailable", true, {}, requestId);
+        }
+        let relayed: Response;
+        try {
+          relayed = await relayReceiverResponse(upstream, requestId, signal, this.lastRelease);
+        } catch {
+          return envelope(503, "unavailable", true, {}, requestId);
+        }
+        // The relayed body is fully buffered bytes; past the deadline it is
+        // simply not served, so there is nothing to release.
+        if (signal.aborted) return envelope(503, "unavailable", true, {}, requestId);
+        return relayed;
       });
     } catch (error) {
       // Logs the closed ownership reason; the caller only sees the envelope.
@@ -997,9 +1152,9 @@ export class TwoBotContainer extends Container<Env> {
     // Same join as the actions path above: the forward carries the stamped
     // id, and these envelopes echo it so a 503 still joins the flow's logs.
     const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
-    const checked = eventsubAllowlistedHeaders(request.headers, requestId);
+    const checked = eventsubAllowlistedHeaders(request.headers, requestId, this.lastRelease);
     if ("refusal" in checked) return checked.refusal;
-    const body = await readEventsubBody(request, requestId);
+    const body = await readEventsubBody(request, requestId, this.lastRelease);
     if ("refusal" in body) return body.refusal;
     const forward = forwardRequest(
       `http://c${EVENTSUB_PATH}`,
@@ -1007,15 +1162,51 @@ export class TwoBotContainer extends Container<Env> {
       body.bytes,
       AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     );
+    // No-restart rotation, when armed: attach the Worker's current secret
+    // with its refresh HMAC — all server-side values, bound to this
+    // delivery's request id. A missing secret, or a signing failure, fails
+    // closed to the fixed envelope (never serialized, never logged).
+    const reloadKey = this.env.TWO_EVENTSUB_RELOAD_KEY;
+    if (reloadKey) {
+      const secret = this.env.TWO_TWITCH_WEBHOOK_SECRET;
+      let refresh: Headers | null = null;
+      try {
+        refresh = secret ? await signEventsubRefresh({ reloadKey, secret, requestId }) : null;
+      } catch {
+        refresh = null;
+      }
+      if (!refresh) return envelope(503, "unavailable", true, {}, requestId);
+      refresh.forEach((value, name) => forward.headers.set(name, value));
+    }
+    // Same bound as the actions path above: the existing receiver deadline on
+    // `forward` covers the fetch AND the body relay, with no larger or
+    // independent budget. Late bodies are released best-effort and never
+    // relayed; a timeout never retries the delivery.
+    const signal = forward.signal;
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
         if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
+        let upstream: Response;
         try {
-          return await relayEventsubResponse(await this.containerFetch(forward, EVENTSUB_RECEIVER_PORT), requestId);
+          upstream = await deadlineFetch(this.containerFetch(forward, EVENTSUB_RECEIVER_PORT), signal);
         } catch {
           return envelope(503, "unavailable", true, {}, requestId);
         }
+        if (signal.aborted) {
+          releaseBody(upstream);
+          return envelope(503, "unavailable", true, {}, requestId);
+        }
+        let relayed: Response;
+        try {
+          relayed = await relayEventsubResponse(upstream, requestId, signal, this.lastRelease);
+        } catch {
+          return envelope(503, "unavailable", true, {}, requestId);
+        }
+        // The relayed body is fully buffered bytes; past the deadline it is
+        // simply not served, so there is nothing to release.
+        if (signal.aborted) return envelope(503, "unavailable", true, {}, requestId);
+        return relayed;
       });
     } catch (error) {
       // Logs the closed ownership reason; the caller only sees the envelope.
@@ -1199,7 +1390,12 @@ export class TwoBotContainer extends Container<Env> {
     })().catch(() => {
       // Scheduling failures are monitoring failures, not permission failures.
       // Never suppress the ownership read above or expose provider error text.
-      console.warn(JSON.stringify({ event: "container_keepalive_arm_failed" }));
+      console.warn(JSON.stringify({
+        event: "container_keepalive_arm_failed",
+        release: releaseTag(this.lastRelease),
+        worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+        log_url: LOG_QUERY_URL,
+      }));
     }).finally(() => { this.keepaliveArming = undefined; });
     return this.keepaliveArming;
   }
@@ -1216,6 +1412,8 @@ export class TwoBotContainer extends Container<Env> {
     this.keepaliveRunning = true;
     try {
       await this.owned(async () => {
+        const turnStartedAt = Date.now();
+        const notifications: KeepaliveNotification[] = [];
         const owner = await this.ownership.require(this.id());
         if (payload?.deploymentId !== this.id() || payload.epoch !== owner.epoch) {
           throw new OwnershipRefused("stale_keepalive");
@@ -1227,27 +1425,50 @@ export class TwoBotContainer extends Container<Env> {
           let status: number | null = null;
           let probe: ProbeDetail = { failure: null };
           try {
+            // Refresh the release tag before any error event below: a failed
+            // probe must not reuse a previous image's SHA. containerFetch can
+            // trigger startup and port checks, and the SDK awaits onError from
+            // those paths, so the clear must precede the fetch.
+            this.lastRelease = null;
             const probeSignal = AbortSignal.timeout(6000);
             const res = await deadlineFetch(
               this.containerFetch("http://c/readyz", { signal: probeSignal }), probeSignal);
             status = res.status;
-            if (!res.ok) console.warn(`two-bot /readyz unhealthy: ${status}`);
+            if (!res.ok) {
+              // Logged before the probe body is read, so this tick's SHA is
+              // not known yet: stamp unknown, never the previous image's SHA
+              // still in lastRelease (a failed probe must not reuse it).
+              console.warn(JSON.stringify({
+                event: "container_readyz_unhealthy",
+                status,
+                release: releaseTag(null),
+                worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+                log_url: LOG_QUERY_URL,
+              }));
+            }
             // Cap the keepalive /readyz read like the metrics scrape: a
             // compromised container controls this body, so an oversized answer
             // is a failed probe, never a buffered parse. Small bodies still
             // drain fully, so the SDK 0.3.7 proxy pipe settles cleanly.
             const body = await readBoundedText(res, MAX_PROBE_BODY_BYTES, probeSignal);
-            // Refresh the release tag before any error event below: a failed
-            // probe must not reuse a previous image's SHA.
-            this.lastRelease = null;
             if (probeSignal.aborted) {
               // A probe that only completed past its deadline is no evidence
               // of readiness: record it as failed, never as recovery.
               status = null;
-              console.warn("two-bot keepalive probe failed");
+              console.warn(JSON.stringify({
+                event: "container_keepalive_probe_failed",
+                release: releaseTag(this.lastRelease),
+                worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+                log_url: LOG_QUERY_URL,
+              }));
             } else if (body === null) {
               status = null;
-              console.warn("two-bot keepalive probe failed");
+              console.warn(JSON.stringify({
+                event: "container_keepalive_probe_failed",
+                release: releaseTag(this.lastRelease),
+                worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+                log_url: LOG_QUERY_URL,
+              }));
             } else {
               const botBody = isBotProbeResponse(res);
               probe = botBody ? probeDetail(body) : { failure: null };
@@ -1274,15 +1495,20 @@ export class TwoBotContainer extends Container<Env> {
             }
             status = null;
             this.lastRelease = null;
-            console.warn("two-bot keepalive probe failed");
+            console.warn(JSON.stringify({
+              event: "container_keepalive_probe_failed",
+              release: releaseTag(this.lastRelease),
+              worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+              log_url: LOG_QUERY_URL,
+            }));
           }
           const context: AlertContext = {
             buildRevision: probe.buildRevision ?? "unknown",
             failedStep: probe.failure?.failedStep,
             errorCode: probe.failure?.errorCode,
           };
-          await this.recordReadiness(status, context);
-          await this.evaluateMetricsAlerts(context);
+          await this.recordReadiness(status, notifications, context);
+          await this.evaluateMetricsAlerts(notifications, context, probe.gatewayReady);
         } finally {
           // Collapse duplicate chains, preserving unrelated SDK schedules.
           // No takeover can interleave with this owned callback's I/O.
@@ -1292,6 +1518,9 @@ export class TwoBotContainer extends Container<Env> {
             await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
           }
         }
+        // Persistence, primary logs, remediation and the successor are complete
+        // before optional transport starts. Stay inside the same ownership gate.
+        await this.forwardNotifications(notifications, turnStartedAt);
       });
     } catch (error) {
       if (error instanceof OwnershipRefused) refused(error);
@@ -1310,7 +1539,7 @@ export class TwoBotContainer extends Container<Env> {
     return Math.max(1, Math.ceil(DEFAULT_UNREADY_SECONDS / this.keepaliveSeconds()));
   }
 
-  private async recordReadiness(status: number | null, context?: AlertContext): Promise<void> {
+  private async recordReadiness(status: number | null, notifications: KeepaliveNotification[], context?: AlertContext): Promise<void> {
     const now = Date.now();
     const ready = status !== null && status >= 200 && status < 300;
     const threshold = this.unreadyAlertFailures();
@@ -1353,13 +1582,20 @@ export class TwoBotContainer extends Container<Env> {
       error_code: context?.errorCode ?? "none",
       log_url: LOG_QUERY_URL,
     }));
-    await this.postReadinessWebhook(event, context);
+    const suffix = alertContextSuffix(context);
+    notifications.push({
+      readinessEvent: event,
+      content: event === "container_unready_alert"
+        ? `two-bot-next: Container /readyz has repeatedly failed. Check the gateway connection and Worker logs.${suffix}`
+        : `two-bot-next: Container /readyz is ready again. The unready incident has recovered.${suffix}`,
+    });
   }
 
-  /** Pull /metrics, evaluate rules, notify on transitions. Never throws. */
-  private async evaluateMetricsAlerts(context?: AlertContext): Promise<void> {
+  /** Pull /metrics, evaluate rules, log and collect transitions. Never throws. */
+  private async evaluateMetricsAlerts(notifications: KeepaliveNotification[], context?: AlertContext, gatewayReady?: boolean): Promise<void> {
     try {
       const previous = (await this.ctx.storage.get<MetricsAlertState>(METRICS_ALERT_KEY)) ?? EMPTY_STATE;
+      const scrapeLoss = sanitizeScrapeLossState(await this.ctx.storage.get<ScrapeLossState>(SCRAPE_LOSS_KEY));
       let samples;
       try {
         const signal = AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS);
@@ -1384,11 +1620,41 @@ export class TwoBotContainer extends Container<Env> {
       if (!samples) {
         // A failed scrape is not recovery, nor part of a consecutive growth
         // window. Preserve all firing keys and other rules' existing state.
+        // It does advance the observer-loss streak: three consecutive failed
+        // scheduled scrapes ticket once, further failures stay quiet, and the
+        // streak lives apart from metric-rule state.
         console.warn("two-bot metrics scrape failed");
-        await this.ctx.storage.put(METRICS_ALERT_KEY, interruptDispatchDrops(previous));
+        const streak = Math.min(scrapeLoss.streak + 1, SCRAPE_LOSS_THRESHOLD);
+        const firing = scrapeLoss.firing || streak >= SCRAPE_LOSS_THRESHOLD;
+        const justFired = firing && !scrapeLoss.firing;
+        // Persist before notifying: at most one attempt per transition, even
+        // if the webhook fails or an alarm is retried.
+        await this.ctx.storage.put(
+          METRICS_ALERT_KEY,
+          interruptAuditHalt(interruptCommunityFactsDrain(interruptDispatchDrops(previous))),
+        );
+        await this.ctx.storage.put(SCRAPE_LOSS_KEY, { streak, firing });
+        if (justFired) {
+          const content = scrapeLossFiringMessage(context);
+          console.warn(JSON.stringify({
+            event: "metrics_alert",
+            service: "two-bot-next",
+            content,
+            build_revision: context?.buildRevision ?? "unknown",
+            release: releaseTag(this.lastRelease),
+            worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+            log_url: LOG_QUERY_URL,
+          }));
+          notifications.push({ content });
+        }
         return;
       }
-      const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000);
+      // Staging-only fault injector: synthetic drill input for the
+      // guarded-remediation soak. Dark unless the generated staging deploy
+      // config arms it; production and unarmed staging evaluate the scraped
+      // samples untouched. Never logged: the switches never leave this gate.
+      const faulted = applyStagingFaultInjection(samples, previous, this.env);
+      const { firing, state } = evaluateMetrics(faulted, previous, Date.now() / 1000, gatewayReady);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);
       for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses, context)) {
@@ -1401,7 +1667,29 @@ export class TwoBotContainer extends Container<Env> {
           worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
           log_url: LOG_QUERY_URL,
         }));
-        await this.postWebhookText(content);
+        notifications.push({ content });
+      }
+      // A complete valid scrape clears only observer-loss state: silently
+      // below the ticket threshold, or with exactly one recovery once firing.
+      // After the metric transitions above, so a transient failure of this
+      // write can only delay the scrape-loss resolve (retried next tick),
+      // never skip an already-persisted metric notification.
+      const recovering = scrapeLoss.firing;
+      if (scrapeLoss.streak !== 0 || scrapeLoss.firing) {
+        await this.ctx.storage.put(SCRAPE_LOSS_KEY, { ...EMPTY_SCRAPE_LOSS });
+      }
+      if (recovering) {
+        const content = scrapeLossResolvedMessage(context);
+        console.warn(JSON.stringify({
+          event: "metrics_alert",
+          service: "two-bot-next",
+          content,
+          build_revision: context?.buildRevision ?? "unknown",
+          release: releaseTag(this.lastRelease),
+          worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+          log_url: LOG_QUERY_URL,
+        }));
+        notifications.push({ content });
       }
       // Guarded remediation recommendations ride the same alert path: one
       // line per recommendation, only while its trigger key fires. A corrupt
@@ -1422,64 +1710,108 @@ export class TwoBotContainer extends Container<Env> {
             worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
             log_url: LOG_QUERY_URL,
           }));
-          await this.postWebhookText(content);
+          notifications.push({ content });
+        }
+        // Staging-only persisted guard receipt: read back the guard just
+        // written and log the allowlisted counters/timestamps/phases with
+        // evaluation time, firing trigger keys, decision and build correlation.
+        // Exactly one receipt per keepalive tick in staging, none in production.
+        // No endpoint, permission, dump, or storage mutation beyond the
+        // evaluator persistence above; thresholds and state-machine semantics
+        // are untouched.
+        if (this.env.TWO_DEPLOY_ENV === "staging") {
+          try {
+            // Flush the just-written guard before the read-back: DO storage
+            // serves recent writes from its in-memory cache/write buffer and
+            // put() resolves before the flush, so without sync() the get()
+            // below always repeats the in-memory value and can never prove
+            // durability. A failed flush throws here and lands in the
+            // readback_failed branch below.
+            await this.ctx.storage.sync();
+            const persisted = await this.ctx.storage.get<RemediationState>(REMEDIATION_KEY);
+            const receipt = buildRemediationGuardReceipt({
+              persisted,
+              expected: remediation.state,
+              firing,
+              messages: remediation.messages,
+              nowSeconds,
+              buildRevision: context?.buildRevision ?? "unknown",
+              release: releaseTag(this.lastRelease),
+              workerVersion: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+            });
+            console.warn(JSON.stringify({
+              event: "remediation_guard_receipt",
+              service: "two-bot-next",
+              ...receipt,
+              log_url: LOG_QUERY_URL,
+            }));
+          } catch {
+            console.warn(JSON.stringify({
+              event: "remediation_guard_receipt",
+              service: "two-bot-next",
+              ok: false,
+              deploy_env: "staging",
+              evaluated_at_seconds: nowSeconds,
+              firing: remediationTriggerFiring(firing),
+              reason: "readback_failed",
+              build_revision: context?.buildRevision ?? "unknown",
+              release: releaseTag(this.lastRelease),
+              worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+              log_url: LOG_QUERY_URL,
+            }));
+          }
         }
       } catch {
-        console.warn("two-bot remediation guard failed; alerts already delivered");
+        console.warn("two-bot remediation guard failed; alerts already recorded");
       }
     } catch {
       console.warn("two-bot metrics scrape failed");
     }
   }
 
-  private async postWebhookText(content: string): Promise<void> {
-    if (this.env.OPS_ALERT_FORWARDING !== "on") return;
-    const binding = this.env.OPS_ALERT_WEBHOOK_URL;
-    if (!binding) return;
-    try {
-      const url = opsAlertWebhookUrl(binding);
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        redirect: "error",
-        signal: AbortSignal.timeout(6000),
-        body: JSON.stringify({ content, allowed_mentions: { parse: [], replied_user: false } }),
-      });
-      await response.body?.cancel();
-      if (!response.ok) console.warn(JSON.stringify({ event: "metrics_alert_webhook_failed", status: response.status }));
-    } catch {
-      console.warn(JSON.stringify({ event: "metrics_alert_webhook_failed", status: null }));
+  /** One turn-local allowance, not a durable queue or a per-POST timeout. */
+  private async forwardNotifications(notifications: KeepaliveNotification[], turnStartedAt: number): Promise<void> {
+    if (!notifications.length || this.env.OPS_ALERT_FORWARDING !== "on" || !this.env.OPS_ALERT_WEBHOOK_URL) return;
+    const allowance = Math.min(NOTIFICATION_TIMEOUT_MS, KEEPALIVE_FORWARDING_CUTOFF_MS - (Date.now() - turnStartedAt));
+    if (allowance <= 0) return;
+    const deadline = Date.now() + allowance;
+    const signal = AbortSignal.timeout(allowance);
+    for (const notification of notifications) {
+      // The wall-clock check also refuses a fresh attempt before a delayed
+      // abort event is dispatched. Never resume this drain from late I/O.
+      if (signal.aborted || Date.now() >= deadline) break;
+      await this.postWebhook(notification, signal);
     }
   }
 
-  private async postReadinessWebhook(event: ReadinessEvent, context?: AlertContext): Promise<void> {
-    if (this.env.OPS_ALERT_FORWARDING !== "on") return;
-    const binding = this.env.OPS_ALERT_WEBHOOK_URL;
-    if (!binding) return;
+  private async postWebhook(notification: KeepaliveNotification, signal: AbortSignal): Promise<void> {
+    let status: number | null = null;
     try {
-      const url = opsAlertWebhookUrl(binding);
-      const suffix = alertContextSuffix(context);
-      const response = await fetch(url, {
+      const url = opsAlertWebhookUrl(this.env.OPS_ALERT_WEBHOOK_URL!);
+      const response = await deadlineFetch(fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         redirect: "error",
-        signal: AbortSignal.timeout(6000),
-        body: JSON.stringify({
-          content: event === "container_unready_alert"
-            ? `two-bot-next: Container /readyz has repeatedly failed. Check the gateway connection and Worker logs.${suffix}`
-            : `two-bot-next: Container /readyz is ready again. The unready incident has recovered.${suffix}`,
-          // https://docs.discord.com/developers/resources/webhook#execute-webhook
-          allowed_mentions: { parse: [], replied_user: false },
-        }),
-      });
-      await response.body?.cancel();
-      if (!response.ok) {
-        console.warn(JSON.stringify({ event: "container_unready_webhook_failed", notification: event, status: response.status }));
-      }
+        signal,
+        body: JSON.stringify({ content: notification.content, allowed_mentions: { parse: [], replied_user: false } }),
+      }), signal);
+      status = response.status;
+      // Cleanup shares the aggregate deadline, including rejection sinks for
+      // late failures. A late fetch response is released by deadlineFetch.
+      await abortable(response.body?.cancel() ?? Promise.resolve(), signal);
+      if (response.ok && !signal.aborted) return;
     } catch {
-      // Fetch errors can contain the secret URL. Never log the error or body.
-      console.warn(JSON.stringify({ event: "container_unready_webhook_failed", notification: event, status: null }));
+      // Fetch/cancel errors can contain the secret URL. Never log their text.
+      // Keep an already-received HTTP status when cleanup fails or times out.
     }
+    console.warn(JSON.stringify({
+      event: notification.readinessEvent ? "container_unready_webhook_failed" : "metrics_alert_webhook_failed",
+      ...(notification.readinessEvent ? { notification: notification.readinessEvent } : {}),
+      status,
+      release: releaseTag(this.lastRelease),
+      worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+      log_url: LOG_QUERY_URL,
+    }));
   }
 
   override async onStart(): Promise<void> {
@@ -1498,11 +1830,20 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   override onStop(): void {
+    // A stop invalidates the parsed release: the replacement image is
+    // unprobed, so its startup failure must stamp "unknown", not the old SHA.
+    this.lastRelease = null;
     console.log("two-bot container stopped");
   }
 
   override onError(_error: unknown): void {
-    console.error(JSON.stringify({ event: "container_error", error_class: "container_lifecycle_failed" }));
+    console.error(JSON.stringify({
+      event: "container_error",
+      error_class: "container_lifecycle_failed",
+      release: releaseTag(this.lastRelease),
+      worker_version: workerVersionTag(this.env.CF_VERSION_METADATA?.id),
+      log_url: LOG_QUERY_URL,
+    }));
     // The SDK logs errors thrown by hooks too; replace rather than rethrow the
     // original exception, and do not retain a credential-bearing cause.
     throw new Error("container_lifecycle_failed");
@@ -1542,6 +1883,7 @@ export default {
           sanitized.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
           return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         },
+        env.CONTAINER_RELEASE,
       );
     }
 
@@ -1557,6 +1899,7 @@ export default {
           sanitized.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
           return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         },
+        env.CONTAINER_RELEASE,
       );
     }
 
@@ -1564,7 +1907,9 @@ export default {
     // path only: only POST is served (browser probes get 405, never tool
     // execution). Unconfigured/short token → 404 (the route does not exist);
     // missing/wrong bearer → 401 with WWW-Authenticate, before the Container
-    // is touched. Every tool call below is bounded (6 s / 64 KiB) in mcp.ts.
+    // is touched. Authenticated request bodies are collected under their own
+    // inbound bound (64 KiB / 6 s, before parsing) in mcp.ts, and every tool
+    // call below keeps its separate outbound container bound (6 s / 64 KiB).
     if (url.pathname === "/mcp") {
       if (request.method !== "POST") {
         return new Response("method not allowed", {
@@ -1613,6 +1958,7 @@ export default {
       if (gate) return gate;
       try {
         const forwarded = new Request(request);
+        forwarded.headers.delete(MCP_AUDIT_READ_HEADER);
         forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
         return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
       } catch (error) { return refused(error); }
@@ -1665,16 +2011,17 @@ export default {
         const upstream = await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         // SDK startup failures arrive as responses rather than rejections.
         // Cancel without reading: a huge non-bot body must not bypass the
-        // probe cap by being drained here.
+        // probe cap by being drained here. Best-effort: a stalling cancel
+        // hook must not hold the fixed refusal.
         if (!isBotProbeResponse(upstream)) {
-          await upstream.body?.cancel().catch(() => {});
-          response = containerUnavailable();
+          releaseBody(upstream);
+          response = containerUnavailable(env.CF_VERSION_METADATA?.id);
         } else {
           response = upstream;
         }
       } catch {
         // Includes DO construction/binding failures before its fetch handler.
-        response = containerUnavailable();
+        response = containerUnavailable(env.CF_VERSION_METADATA?.id);
       }
       // The outer Worker owns provenance, not the container or DO version.
       // Copy the response to get mutable headers without changing status/body.
@@ -1761,17 +2108,20 @@ export default {
       }
       return dashboardPageResponse();
     }
-    // Read-only ops summary (TOG-22860 + TOG-22861): the roll-up serves two
-    // operator audiences, so either credential opens it — the metrics scrape
-    // bearer or the dashboard service-token pair (Cloudflare Access service
-    // tokens: both CF-Access-Client-Id and CF-Access-Client-Secret on every
-    // summary request, strict mode — no cookies or sessions). The scrape
-    // gate is consulted first and its 429 is a hard fence, never bypassed
-    // via the other gate; a non-throttled scrape refusal falls through to
-    // the dashboard gate. Non-GET and doubly-unconfigured still 404 (the
-    // route does not exist); otherwise a failed attempt is 401 with the
-    // Bearer challenge. Each gate throttles on its own budget before any
-    // comparison, so guessing at one cannot throttle the other.
+    // Read-only ops summary (TOG-22860 + TOG-22861, dual-gate budget
+    // TOG-29408): the roll-up serves two operator audiences, so either
+    // credential opens it — the metrics scrape bearer or the dashboard
+    // service-token pair (Cloudflare Access service tokens: both
+    // CF-Access-Client-Id and CF-Access-Client-Secret on every summary
+    // request, strict mode — no cookies or sessions). Each credential spends
+    // only its own per-caller budget: the scrape gate runs only when an
+    // Authorization header is presented, and the dashboard gate only when a
+    // dashboard header is presented. Guessing at one therefore cannot
+    // throttle the other. For a bearer-presenting request the scrape gate
+    // runs first and its 429 is a hard fence, never bypassed via the other
+    // gate; a non-throttled scrape refusal falls through to the dashboard
+    // gate. Non-GET and doubly-unconfigured still 404 (the route does not
+    // exist); otherwise a failed attempt is 401 with the Bearer challenge.
     if (url.pathname === OPS_SUMMARY_PATH) {
       if (request.method !== "GET") {
         return new Response("not found", { status: 404, headers: withSecurityHeaders() });
@@ -1787,7 +2137,11 @@ export default {
       };
       const scrapeConfigured = !!env.METRICS_SCRAPE_TOKEN
         && env.METRICS_SCRAPE_TOKEN.length >= MIN_SCRAPE_TOKEN_LENGTH;
-      if (scrapeConfigured) {
+      // Only a bearer-presenting request is evaluated by (and spends) the
+      // scrape budget; a dashboard-only request skips this gate entirely so
+      // a spent scrape bucket cannot refuse it.
+      const hasScrapeAttempt = request.headers.has("authorization");
+      if (scrapeConfigured && hasScrapeAttempt) {
         const refusal = await opsReadRefusal(request, env);
         if (refusal === null) return forwardSummary();
         if (refusal.status === 429) return refusal;
@@ -1797,7 +2151,11 @@ export default {
         && env.OPS_DASHBOARD_CLIENT_ID.length >= MIN_DASHBOARD_CLIENT_ID_LENGTH
         && !!env.OPS_DASHBOARD_CLIENT_SECRET
         && env.OPS_DASHBOARD_CLIENT_SECRET.length >= MIN_DASHBOARD_SECRET_LENGTH;
-      if (dashboardConfigured) {
+      // Only a dashboard-presenting request is evaluated by (and spends) the
+      // dashboard budget; a bearer-only guess never touches it.
+      const hasDashboardAttempt = request.headers.has(DASHBOARD_CLIENT_ID_HEADER)
+        || request.headers.has(DASHBOARD_CLIENT_SECRET_HEADER);
+      if (dashboardConfigured && hasDashboardAttempt) {
         const verdict = dashboardAuthBuckets.take(caller);
         if (!verdict.allowed && !dashboardAuthBuckets.peek(caller).allowed) {
           return new Response("slow down\n", {

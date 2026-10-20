@@ -1,15 +1,19 @@
 # Error-budget burn alerts (48h watch)
 
-Manual checkpoint thresholds for error-budget consumption on the bot container
-during the 48h production watch. **Status: the multi-window burn alerts are not
-installed.** The burn math has no runtime caller, and the Worker alert state
-retains only the previous sample, not the history needed for these windows.
-No automatic fast-burn page or slow-burn ticket exists; silence is not health.
-Log volume and cardinality are covered by a separate guard. The Rust burn
-constants and math are pinned by the offline test
-`crates/bot/src/burn_rate_tests.rs`; this document must stay aligned with them
-(the test does not parse this page). No staging, secret or live paging test
-is involved.
+Error-budget burn policy for the bot container during the 48h production
+watch. **Status: both burns are installed** (`error_budget_fast_burn` pages
+and `error_budget_slow_burn` tickets in `wrangler/src/alert-rules.ts`,
+evaluated on the keepalive schedule against the shared Worker snapshot ring
+covering the 2 h / 15 min / 2 min windows); the manual checkpoint below is
+the fallback when forwarding is off or history is incomplete.
+The absence claim covers this REST/gateway watch SLO only: the creator-join
+burn alerts (`voice_join_fast_burn`, `voice_join_slow_burn`) are separate
+installed rules over a different budget. An installed rule is not proof that
+a page was delivered; silence is not health. Log volume and cardinality are
+covered by a separate guard. The Rust burn constants and math are pinned by
+the offline test `crates/bot/src/burn_rate_tests.rs`; this document must stay
+aligned with them (the test does not parse this page). No staging, secret or
+live paging test is involved.
 
 ## SLO and budget
 
@@ -25,16 +29,16 @@ is involved.
 
 ## Alert thresholds
 
-Two multi-window thresholds, **not installed alerts**. At each watch
-checkpoint (+15 min, +1 h, +6 h, +24 h, +48 h), evaluate both the long window
-(the burn rate) and the short window (the confirmation). Escalate manually
-only when both meet the threshold; one bad minute alone is not a burn trigger.
-The page/ticket severities below describe the manual response, not delivery.
+Two multi-window thresholds. Both are **installed automatic alerts**;
+the manual checkpoint below remains the fallback at each watch checkpoint
+(+15 min, +1 h, +6 h, +24 h, +48 h). Escalate manually only when both windows
+of either threshold meet their rate; one bad minute alone is
+not a burn trigger.
 
-| Alert (not installed) | Manual severity | Burn rate | Long window | Short window | Budget spent if sustained |
+| Alert | Severity | Burn rate | Long window | Short window | Budget spent if sustained |
 | --- | --- | --- | --- | --- | --- |
-| Fast burn | page | 12 | 15 min | 2 min | 6.25% per 15 min |
-| Slow burn | ticket | 3 | 2 h | 15 min | 12.5% per 2 h |
+| Fast burn (installed page) | page | 12 | 15 min | 2 min | 6.25% per 15 min |
+| Slow burn (installed ticket) | ticket | 3 | 2 h | 15 min | 12.5% per 2 h |
 
 Budget math: fraction spent = burn x window / period.
 
@@ -51,11 +55,12 @@ Assumed rate ~2.8 events/s. 48h gives 480,000 eligible events, so the
 watch budget is 480 errors. Allowed errors per window = burn x 0.001 x
 window events:
 
-- Fast burn calls for a manual page at 30 errors in 15 minutes
-  (12 x 0.001 x 2,500), confirmed by 4 errors in 2 minutes
-  (12 x 0.001 x ~333, rounded up).
-- Slow burn calls for a manually opened ticket at 60 errors in 2 hours
-  (3 x 0.001 x 20,000), confirmed by 8 errors in 15 minutes
+- Fast burn triggers the automatic `error_budget_fast_burn` page at 30 errors
+  in 15 minutes (12 x 0.001 x 2,500), confirmed by 4 errors in 2 minutes
+  (12 x 0.001 x ~333, rounded up). Manual evaluation is only the checkpoint
+  fallback below, not the routine fast-burn path.
+- Slow burn files the automatic `error_budget_slow_burn` ticket at 60 errors
+  in 2 hours (3 x 0.001 x 20,000), confirmed by 8 errors in 15 minutes
   (3 x 0.001 x 2,500, rounded up).
 
 Scale to real traffic by replacing 10,000/hour with the observed
@@ -104,7 +109,8 @@ positive. Counter resets are handled by `increase`, but scrape gaps or a
 missing error series are unknown, not zero. Without an existing history store,
 retain timestamped read-only snapshots at the normal scrape cadence and compute
 each window's error/request deltas by hand; split on resets and reject uncovered
-windows. The Worker's one previous sample cannot supply these windows.
+windows. The Worker keeps about 2 h of snapshot history for both burns; use
+these manual queries when forwarding is off or the ring is incomplete.
 
 For gateway evidence, inspect these counts at the same evaluation time
 (repeat with `[2m]` / `[2h]` for the other windows):
@@ -124,21 +130,26 @@ identity-paired evidence leaves the combined budget unknown.
 
 ## Response
 
-- Fast-burn manual page: notify the watch responder, check recent deploys
-  and the Discord API status, then follow the rollback one-pager. Record
-  the acknowledgement and disposition in the watch log.
-- Slow-burn manual ticket: open and triage it within the watch shift.
-  Escalate manually to a page if half the 48h budget (240 errors at the
-  example rate) is spent, or if slow burn persists across two consecutive
-  long windows.
+- Fast-burn automatic page (`error_budget_fast_burn`): the page carries the
+  build SHA and the log-query URL and links its runbook section
+  ([runbook](runbook.md#alert-error-budget-fast-burn)). Acknowledge as the
+  watch responder, check recent deploys and the Discord API status, then
+  follow the rollback one-pager. Record the acknowledgement and disposition
+  in the watch log. If the page never arrives (forwarding off, no history
+  yet), fall back to the manual 15 min / 2 min queries above.
+- Slow-burn automatic ticket (`error_budget_slow_burn`): triage it within
+  the watch shift. Escalate manually to a page if half the 48h budget
+  (240 errors at the example rate) is spent, or if slow burn persists
+  across two consecutive long windows.
 - Record recovery when neither window meets its burn threshold. If burn
-  recurs after a closed disposition, manually open a new finding; there is
-  no automatic reset, ticket creation or reopening.
+  recurs after a closed disposition, the rule re-tickets on the next
+  covered burn; there is no manual reset.
 
 ## Related immediate alerts (not burn)
 
-Unlike the uninstalled fast/slow burn alerts above, these five **installed
-Worker rules** evaluate keepalive samples independently of the burn math.
+Unlike the slow-burn ticket and fast-burn page above (both installed
+automatic rules), these five **installed Worker rules** evaluate keepalive
+samples independently of the burn math.
 They fire on their own conditions; notification additionally requires the
 configured [alert-forwarding path](metrics.md#off-container-scrape-and-alert-rules).
 An installed rule is not proof that a page was delivered:

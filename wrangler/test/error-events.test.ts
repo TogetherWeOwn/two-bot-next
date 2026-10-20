@@ -12,7 +12,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseRelease, releaseTag, workerVersionTag } from "../src/error-events.ts";
+import { normalizeRelease, parseRelease, releaseTag, workerVersionTag } from "../src/error-events.ts";
 
 const SHA = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
 
@@ -44,7 +44,7 @@ test("parseRelease drops everything that is not a hex SHA", () => {
   ] as const;
   for (const [name, body] of hostile) {
     assert.equal(parseRelease(body), null, name);
-    assert.ok(!String(body).includes("hunter2") || true, name);
+    assert.ok(!String(parseRelease(body) ?? "").includes("hunter2"), name);
   }
 });
 
@@ -66,6 +66,18 @@ test("parseRelease rejects an oversize /readyz body without parsing it", () => {
 test("releaseTag maps an unparsed release to the visible unknown bucket", () => {
   assert.equal(releaseTag(SHA), SHA);
   assert.equal(releaseTag(null), "unknown");
+});
+
+test("normalizeRelease keeps edge-supplied SHAs and buckets everything else", () => {
+  assert.equal(normalizeRelease(SHA), SHA);
+  assert.equal(normalizeRelease("9f3a1c7"), "9f3a1c7");
+  assert.equal(normalizeRelease(undefined), "unknown");
+  assert.equal(normalizeRelease(null), "unknown");
+  assert.equal(normalizeRelease(""), "unknown");
+  assert.equal(normalizeRelease("unknown"), "unknown");
+  assert.equal(normalizeRelease(SHA.toUpperCase()), "unknown");
+  assert.equal(normalizeRelease("postgres://user:hunter2@db.internal/app"), "unknown");
+  assert.equal(normalizeRelease(7), "unknown");
 });
 
 test("workerVersionTag keeps platform version ids and drops anything else", () => {

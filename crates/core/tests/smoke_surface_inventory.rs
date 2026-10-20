@@ -5,7 +5,7 @@
 //! `fixtures/smoke_surface_inventory.json` exactly, in publish order. The
 //! fixture additionally marks the five smoke-covered commands (one per
 //! routing family, matching `crates/discord/tests/top5_reply_fixtures.rs`)
-//! versus the 23 explicitly deferred, with a reason per deferral.
+//! versus the 24 explicitly deferred, with a reason per deferral.
 //!
 //! Offline only: no staging guild, no live Discord, no network, no database.
 
@@ -37,6 +37,7 @@ fn fixture() -> Value {
 
 fn option_type_name(kind: u8) -> &'static str {
     match kind {
+        1 => "subcommand",
         3 => "string",
         4 => "integer",
         6 => "user",
@@ -48,14 +49,14 @@ fn option_type_name(kind: u8) -> &'static str {
 fn inventory_matches_registry_output_in_publish_order() {
     let published = all_on_router().publish_set(&[]).expect("publish set");
     let fixture = fixture();
-    assert_eq!(fixture["count"], 28, "28 built-ins");
+    assert_eq!(fixture["count"], 29, "29 built-ins");
     assert_eq!(
         fixture["dm_permission_all_false"], true,
         "fixture claims guild-only"
     );
     let rows = fixture["commands"].as_array().expect("command rows");
     assert_eq!(published.len(), rows.len(), "registry row count matches");
-    assert_eq!(published.len(), 28, "28 built-ins in the registry");
+    assert_eq!(published.len(), 29, "29 built-ins in the registry");
 
     for (definition, row) in published.iter().zip(rows.iter()) {
         let name = row["name"].as_str().expect("row name");
@@ -130,6 +131,64 @@ fn inventory_matches_registry_output_in_publish_order() {
                     "/{name} option {option_name} choice value"
                 );
             }
+            let expected_sub_options = expected["options"].as_array().cloned().unwrap_or_default();
+            assert_eq!(
+                option.options.len(),
+                expected_sub_options.len(),
+                "/{name} option {option_name} nested option count"
+            );
+            for (sub_option, expected_sub_option) in
+                option.options.iter().zip(expected_sub_options.iter())
+            {
+                let sub_option_name = expected_sub_option["name"]
+                    .as_str()
+                    .expect("nested option name");
+                assert_eq!(sub_option.name, sub_option_name);
+                assert_eq!(
+                    sub_option.description.as_str(),
+                    expected_sub_option["description"]
+                        .as_str()
+                        .expect("nested option description")
+                );
+                assert_eq!(
+                    option_type_name(sub_option.kind),
+                    expected_sub_option["type"]
+                        .as_str()
+                        .expect("nested option type")
+                );
+                assert_eq!(
+                    sub_option.required.unwrap_or(false),
+                    expected_sub_option["required"]
+                        .as_bool()
+                        .expect("nested option required")
+                );
+                assert_eq!(num(&expected_sub_option["min_value"]), sub_option.min_value);
+                assert_eq!(num(&expected_sub_option["max_value"]), sub_option.max_value);
+                assert_eq!(
+                    expected_sub_option["max_length"].as_u64().map(|v| v as u32),
+                    sub_option.max_length
+                );
+                let sub_option_choices = expected_sub_option["choices"]
+                    .as_array()
+                    .expect("nested option choices");
+                assert_eq!(sub_option.choices.len(), sub_option_choices.len());
+                for (choice, expected_choice) in
+                    sub_option.choices.iter().zip(sub_option_choices.iter())
+                {
+                    assert_eq!(
+                        choice.name.as_str(),
+                        expected_choice["name"]
+                            .as_str()
+                            .expect("nested choice name")
+                    );
+                    assert_eq!(
+                        choice.value.as_str(),
+                        expected_choice["value"]
+                            .as_str()
+                            .expect("nested choice value")
+                    );
+                }
+            }
         }
     }
 }
@@ -143,7 +202,7 @@ fn exactly_five_covered_with_response_links_rest_deferred_with_reasons() {
     let covered: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "covered").collect();
     let deferred: Vec<&Value> = rows.iter().filter(|r| r["smoke"] == "deferred").collect();
     assert_eq!(covered.len(), 5, "exactly the top five");
-    assert_eq!(covered.len() + deferred.len(), 28, "every row marked");
+    assert_eq!(covered.len() + deferred.len(), 29, "every row marked");
 
     let mut covered_names: Vec<&str> = covered
         .iter()

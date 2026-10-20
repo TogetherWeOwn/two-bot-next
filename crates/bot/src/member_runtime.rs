@@ -5,14 +5,14 @@
 //! decode options → resolve actor/target role facts over REST → validate →
 //! exactly-once execute through the shared REST executor → ephemeral outcome.
 //! Routing, the `TWO_MODERATION` gate and the handler-level permission check
-//! all happen in the shared router before these run, so the handlers assume
-//! an authorized moderation invocation.
+//! all happen in the shared router before these run. Dispatch still derives
+//! current authority independently: routing is not a freshness guarantee.
 //!
 //! The runtime holds the ONE guild store for this process: command paths
 //! clone it, and the sweep job shares the same `Arc`, so bans and unbans for
 //! one member serialize through one set of local queues. Role facts come
-//! from live guild reads (the interaction carries role ids, never positions);
-//! an incomplete snapshot refuses the command instead of guessing hierarchy.
+//! from strict current guild/member reads after that lane wait; interaction
+//! roles and permissions never authorize an effect. Incomplete evidence refuses.
 //! Until the authenticated audit-reason seam lands, the Discord reason is the
 //! plain moderator reason.
 
@@ -32,8 +32,8 @@ use twilight_model::{
 };
 use two_bot_core::{
     member_moderation::{
-        DiscordError as MemberDiscordError, MemberError, MemberExecution, MemberModerationService,
-        MemberOutcome, MemberResult, UNBAN_SWEEP_INTERVAL_SECONDS,
+        DiscordError as MemberDiscordError, MemberAuthority, MemberError, MemberExecution,
+        MemberModerationService, MemberOutcome, MemberResult, UNBAN_SWEEP_INTERVAL_SECONDS,
     },
     member_moderation_store::PgMemberModerationStore,
     moderation::{
@@ -197,6 +197,7 @@ struct GuildFacts {
     guild_id: String,
     owner_id: String,
     positions: HashMap<String, i64>,
+    permissions: HashMap<String, u64>,
 }
 
 fn text(value: &serde_json::Value, key: &str) -> Option<String> {
@@ -212,19 +213,33 @@ async fn guild_facts(executor: &ActionExecutor, guild_id: &str) -> Result<GuildF
         .await
         .map_err(|_| ())?
         .ok_or(())?;
-    let owner_id = text(&guild, "owner_id").ok_or(())?;
+    if text(&guild, "id").as_deref() != Some(guild_id) {
+        return Err(());
+    }
+    let owner_id = text(&guild, "owner_id")
+        .filter(|id| valid_id(id))
+        .ok_or(())?;
     let mut positions = HashMap::new();
+    let mut permissions = HashMap::new();
     for role in guild
         .get("roles")
         .and_then(serde_json::Value::as_array)
         .ok_or(())?
     {
-        let id = text(role, "id").ok_or(())?;
+        let id = text(role, "id").filter(|id| valid_id(id)).ok_or(())?;
         let position = role
             .get("position")
             .and_then(serde_json::Value::as_i64)
+            .filter(|position| *position >= 0)
             .ok_or(())?;
-        positions.insert(id, position);
+        let bits = text(role, "permissions")
+            .ok_or(())?
+            .parse::<u64>()
+            .map_err(|_| ())?;
+        if positions.insert(id.clone(), position).is_some() {
+            return Err(());
+        }
+        permissions.insert(id, bits);
     }
     if !positions.contains_key(guild_id) {
         return Err(());
@@ -233,6 +248,40 @@ async fn guild_facts(executor: &ActionExecutor, guild_id: &str) -> Result<GuildF
         guild_id: guild_id.to_owned(),
         owner_id,
         positions,
+        permissions,
+    })
+}
+
+fn valid_id(id: &str) -> bool {
+    id.parse::<u64>()
+        .is_ok_and(|value| value != 0 && value.to_string() == id)
+}
+
+/// Guild-wide permissions only. Check every held role even for owners/admins;
+/// an unknown role is incomplete evidence, not an implicit privilege grant.
+/// Owners and administrators hold every permission, but only the guild owner
+/// is exempt from role hierarchy: an administrator keeps the real top position.
+fn actor_authority(
+    user_id: &str,
+    held: Vec<String>,
+    facts: &GuildFacts,
+) -> Option<ModerationActor> {
+    let roles = with_everyone(held, &facts.guild_id);
+    let top = top_position(&roles, facts)?;
+    let mut permissions = 0;
+    for role in &roles {
+        permissions |= *facts.permissions.get(role)?;
+    }
+    let owner = user_id == facts.owner_id;
+    Some(ModerationActor {
+        user_id: user_id.to_owned(),
+        role_ids: roles,
+        highest_role_position: if owner { i64::MAX } else { top },
+        permissions: if owner || permissions & (1 << 3) != 0 {
+            u64::MAX
+        } else {
+            permissions
+        },
     })
 }
 
@@ -271,28 +320,10 @@ fn command_options(
     (target, reason, duration_seconds)
 }
 
-/// Roles for the target from the interaction's resolved data, if Discord
-/// attached membership.
-fn resolved_target_roles(
-    interaction: &Interaction,
-    target: Id<UserMarker>,
-) -> Option<(Vec<String>, bool)> {
-    let InteractionData::ApplicationCommand(data) = interaction.data.as_ref()? else {
-        return None;
-    };
-    let resolved = data.resolved.as_ref()?;
-    let member = resolved.members.get(&target)?;
-    let user = resolved.users.get(&target);
-    Some((
-        member.roles.iter().map(|id| id.get().to_string()).collect(),
-        user.is_some_and(|user| user.bot),
-    ))
-}
-
 /// Membership plus bot flag from `GET /guilds/{g}/members/{u}`. `None` is a
 /// departed or never-joined user (ban tolerates; kick/timeout/warn refuse).
 /// An id mismatch or malformed body fails closed.
-async fn fetched_target(
+async fn fetched_member(
     executor: &ActionExecutor,
     guild_id: &str,
     target: &str,
@@ -305,6 +336,10 @@ async fn fetched_target(
         Some(member) => member,
         None => return Ok(None),
     };
+    parse_member(&member, target).map(Some)
+}
+
+fn parse_member(member: &serde_json::Value, target: &str) -> Result<(Vec<String>, bool), ()> {
     let user = member.get("user").ok_or(())?;
     if text(user, "id").as_deref() != Some(target) {
         return Err(());
@@ -317,12 +352,18 @@ async fn fetched_target(
     {
         roles.push(role.as_str().ok_or(())?.to_owned());
     }
-    Ok(Some((
+    if !roles.iter().all(|role| valid_id(role)) {
+        return Err(());
+    }
+    Ok((
         roles,
-        user.get("bot")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-    )))
+        // Discord omits this optional field for ordinary users. A present
+        // malformed value is not a valid negative bot assertion.
+        match user.get("bot") {
+            None => false,
+            Some(value) => value.as_bool().ok_or(())?,
+        },
+    ))
 }
 
 /// Execute one member verb for an already-routed, already-deferred
@@ -375,8 +416,14 @@ fn error_text(err: MemberError) -> String {
         MemberError::Discord(MemberDiscordError::Rejected(detail)) => {
             format!("Discord refused the request: {detail}")
         }
+        MemberError::Discord(MemberDiscordError::RateLimited) => {
+            "Discord rate-limited the request; nothing was applied. Try again shortly.".to_owned()
+        }
         MemberError::Discord(_) => UNCERTAIN_REPLY.to_owned(),
-        MemberError::Store(_) | MemberError::BotIdentityUnknown => FAILURE_REPLY.to_owned(),
+        MemberError::TargetNotMember => NO_MEMBER_REPLY.to_owned(),
+        MemberError::Store(_)
+        | MemberError::BotIdentityUnknown
+        | MemberError::AuthorityUnavailable => FAILURE_REPLY.to_owned(),
     }
 }
 
@@ -403,83 +450,59 @@ async fn execute(
     }
     let (target, reason, duration_seconds) = command_options(interaction);
     let guild_id = member.guild_id.clone();
-    let facts = guild_facts(executor, &guild_id)
-        .await
-        .map_err(|_| FAILURE_REPLY.to_owned())?;
-    let partial = interaction
-        .member
-        .as_ref()
-        .ok_or_else(|| FAILURE_REPLY.to_owned())?;
-    let actor_roles: Vec<String> = partial
-        .roles
-        .iter()
-        .map(|id| id.get().to_string())
-        .collect();
-    let actor = ModerationActor {
-        user_id: actor_id,
-        highest_role_position: top_position(&actor_roles, &facts)
-            .ok_or_else(|| FAILURE_REPLY.to_owned())?,
-        role_ids: with_everyone(actor_roles, &guild_id),
-        permissions: partial
-            .permissions
-            .map(|permissions| permissions.bits())
-            .unwrap_or(0),
-    };
-    let target = match target {
-        Some(target) => {
-            let target_id = target.get().to_string();
-            let resolved_or_fetched = match resolved_target_roles(interaction, target) {
-                Some(resolved) => Some(resolved),
-                None => fetched_target(executor, &guild_id, &target_id)
-                    .await
-                    .map_err(|_| FAILURE_REPLY.to_owned())?,
-            };
-            let (roles, is_bot) = match resolved_or_fetched {
-                Some(pair) => pair,
-                None if action == ModerationAction::Ban => (vec![guild_id.clone()], false),
-                None => return Err(NO_MEMBER_REPLY.to_owned()),
-            };
-            Some(ModerationTarget {
-                user_id: target_id.clone(),
-                highest_role_position: top_position(&roles, &facts)
-                    .ok_or_else(|| FAILURE_REPLY.to_owned())?,
-                role_ids: with_everyone(roles, &guild_id),
-                is_bot,
-                is_guild_owner: target_id == facts.owner_id,
-            })
-        }
-        None => None,
-    };
-    let bot_id = member
-        .bot_id(executor)
-        .await
-        .map_err(|_| FAILURE_REPLY.to_owned())?;
-    let bot_roles = fetched_bot_roles(executor, &guild_id, bot_id)
-        .await
-        .map_err(|_| FAILURE_REPLY.to_owned())?;
-    // The policy requires a resolved bot position; unknown roles refuse here.
-    let bot_highest_role_position =
-        top_position(&bot_roles, &facts).ok_or_else(|| FAILURE_REPLY.to_owned())?;
-    let service = MemberModerationService::new(
-        executor.clone(),
-        member.store(),
-        member.policy(bot_id),
-        now_millis_i64,
-    );
+    // Identity and command content only: no interaction-time authority survives
+    // into dispatch. The callback below fills these deliberately empty facts.
     let execution = MemberExecution {
         action,
         guild_id,
-        actor,
-        target,
-        bot_highest_role_position,
+        actor: ModerationActor {
+            user_id: actor_id,
+            role_ids: Vec::new(),
+            highest_role_position: 0,
+            permissions: 0,
+        },
+        target: target.map(|id| ModerationTarget {
+            user_id: id.to_string(),
+            role_ids: Vec::new(),
+            highest_role_position: 0,
+            is_bot: false,
+            is_guild_owner: false,
+        }),
+        bot_highest_role_position: 0,
         reason: reason.unwrap_or_default(),
         duration_seconds,
         request_id: new_id(),
-        // Discord may redeliver an interaction: the interaction id replays the
-        // stored outcome instead of moderating twice.
         idempotency_key: interaction.id.get().to_string(),
     };
-    service.execute(&execution).await.map_err(error_text)
+    let bot_id = member.bot_id(executor).await.ok();
+    let policy = bot_id.map_or_else(|| member.policy.clone(), |id| member.policy(id));
+    let service =
+        MemberModerationService::new(executor.clone(), member.store(), policy, now_millis_i64);
+    let result = service
+        .execute_with_authority(&execution, || async {
+            if interaction.guild_id.map(|id| id.to_string()).as_deref() != Some(&member.guild_id) {
+                return Err(MemberError::AuthorityUnavailable);
+            }
+            current_authority(
+                executor,
+                &execution,
+                bot_id.ok_or(MemberError::AuthorityUnavailable)?,
+            )
+            .await
+        })
+        .await;
+    match result {
+        Ok(result) => {
+            two_bot_core::metrics::global()
+                .moderation_enforcement(action.command_name(), "success");
+            Ok(result)
+        }
+        Err(err) => {
+            two_bot_core::metrics::global()
+                .moderation_enforcement(action.command_name(), err.enforcement_outcome());
+            Err(error_text(err))
+        }
+    }
 }
 
 fn with_everyone(mut roles: Vec<String>, guild_id: &str) -> Vec<String> {
@@ -489,31 +512,71 @@ fn with_everyone(mut roles: Vec<String>, guild_id: &str) -> Vec<String> {
     roles
 }
 
-/// Bot membership roles for the hierarchy check. Fails closed like every
-/// other facts read.
-async fn fetched_bot_roles(
+/// Runs inside the existing ban/tempban lane, or immediately before the
+/// nonserialized verbs. Every GET is the shared executor's bounded strict read;
+/// a transport/403/5xx failure is never interpreted as absent membership.
+async fn current_authority(
     executor: &ActionExecutor,
-    guild_id: &str,
+    exec: &MemberExecution,
     bot_id: &str,
-) -> Result<Vec<String>, ()> {
-    let member = executor
-        .get_json_strict(&format!("/guilds/{guild_id}/members/{bot_id}"))
+) -> Result<MemberAuthority, MemberError> {
+    let unavailable = || MemberError::AuthorityUnavailable;
+    let facts = guild_facts(executor, &exec.guild_id)
         .await
-        .map_err(|_| ())?
-        .ok_or(())?;
-    let user = member.get("user").ok_or(())?;
-    if text(user, "id").as_deref() != Some(bot_id) {
-        return Err(());
+        .map_err(|_| unavailable())?;
+    let (actor_roles, _) = fetched_member(executor, &exec.guild_id, &exec.actor.user_id)
+        .await
+        .map_err(|_| unavailable())?
+        .ok_or_else(unavailable)?;
+    let actor =
+        actor_authority(&exec.actor.user_id, actor_roles, &facts).ok_or_else(unavailable)?;
+    let target = exec
+        .target
+        .as_ref()
+        .ok_or(two_bot_core::moderation::PolicyError::MissingTarget)?;
+    let (target_roles, is_bot) = target_membership(
+        exec.action,
+        fetched_member(executor, &exec.guild_id, &target.user_id)
+            .await
+            .map_err(|_| unavailable())?,
+    )?;
+    let target = ModerationTarget {
+        user_id: target.user_id.clone(),
+        highest_role_position: top_position(&target_roles, &facts).ok_or_else(unavailable)?,
+        role_ids: with_everyone(target_roles, &exec.guild_id),
+        is_bot,
+        is_guild_owner: target.user_id == facts.owner_id,
+    };
+    let (bot_roles, is_bot) = fetched_member(executor, &exec.guild_id, bot_id)
+        .await
+        .map_err(|_| unavailable())?
+        .ok_or_else(unavailable)?;
+    if !is_bot {
+        return Err(unavailable());
     }
-    let mut roles = Vec::new();
-    for role in member
-        .get("roles")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(())?
-    {
-        roles.push(role.as_str().ok_or(())?.to_owned());
+    let bot_highest_role_position = top_position(&bot_roles, &facts).ok_or_else(unavailable)?;
+    Ok(MemberAuthority {
+        actor,
+        target: Some(target),
+        bot_highest_role_position,
+    })
+}
+
+/// What a strict target-member read means per verb. `None` is a confirmed
+/// departed or never-joined user: ban/tempban may still act on that nonmember,
+/// while kick/timeout/warn have nothing to act on and refuse (kick would
+/// otherwise treat the 404 as success, warn would persist a nonmember warning).
+fn target_membership(
+    action: ModerationAction,
+    fetched: Option<(Vec<String>, bool)>,
+) -> Result<(Vec<String>, bool), MemberError> {
+    match fetched {
+        Some(member) => Ok(member),
+        None if matches!(action, ModerationAction::Ban | ModerationAction::TempBan) => {
+            Ok((Vec::new(), false))
+        }
+        None => Err(MemberError::TargetNotMember),
     }
-    Ok(roles)
 }
 
 /// The supervised unban sweep for the configured guild: claim one due job
@@ -561,6 +624,111 @@ async fn tick(member: &MemberRuntime, rest: &ActionExecutor) -> Result<(), Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use two_bot_core::{
+        member_moderation::StoreError,
+        moderation::{PolicyError, ReasonError},
+    };
+
+    #[test]
+    fn member_evidence_requires_identity_and_complete_roles_but_bot_is_optional() {
+        use serde_json::json;
+        assert_eq!(
+            parse_member(&json!({"user": {"id": "88"}, "roles": []}), "88"),
+            Ok((vec![], false))
+        );
+        for body in [
+            json!({"roles": []}),
+            json!({"user": {"id": "99"}, "roles": []}),
+            json!({"user": {"id": "88"}}),
+            json!({"user": {"id": "88"}, "roles": [42]}),
+            json!({"user": {"id": "88"}, "roles": ["0"]}),
+            json!({"user": {"id": "88", "bot": "false"}, "roles": []}),
+        ] {
+            assert!(parse_member(&body, "88").is_err(), "{body}");
+        }
+        for id in ["", "0", "01", "+1", "role", "18446744073709551616"] {
+            assert!(!valid_id(id));
+        }
+        assert!(valid_id("88"));
+        assert!(valid_id("18446744073709551615"));
+    }
+
+    #[test]
+    fn current_permissions_expand_owners_and_admins_only_with_complete_role_evidence() {
+        let mut facts = GuildFacts {
+            guild_id: "2222".into(),
+            owner_id: "99".into(),
+            positions: HashMap::from([("2222".into(), 0), ("101".into(), 50)]),
+            permissions: HashMap::from([("2222".into(), 4), ("101".into(), 2)]),
+        };
+        let actor = actor_authority("88", vec!["101".into()], &facts).expect("complete");
+        assert_eq!(actor.permissions, 6);
+        assert_eq!(actor.highest_role_position, 50);
+        assert_eq!(actor.role_ids, vec!["101", "2222"]);
+        assert_eq!(with_everyone(vec!["2222".into()], "2222"), vec!["2222"]);
+        facts.permissions.insert("101".into(), 8);
+        // Administrator expands permissions only: hierarchy keeps the real top
+        // role, so this actor stays below a target at position 60.
+        let admin = actor_authority("88", vec!["101".into()], &facts).expect("admin");
+        assert_eq!(
+            (admin.permissions, admin.highest_role_position),
+            (u64::MAX, 50)
+        );
+        let everyone_only = actor_authority("88", vec![], &facts).expect("everyone only");
+        assert_eq!(
+            everyone_only.permissions, 4,
+            "no admin bit without the role"
+        );
+        // Only the guild owner is exempt from role hierarchy.
+        let owner = actor_authority("99", vec![], &facts).expect("owner");
+        assert_eq!(
+            (owner.permissions, owner.highest_role_position),
+            (u64::MAX, i64::MAX)
+        );
+        assert!(actor_authority("99", vec!["unknown".into()], &facts).is_none());
+        facts.permissions.remove("101");
+        assert!(actor_authority("99", vec!["101".into()], &facts).is_none());
+        facts.permissions.remove("2222");
+        assert!(actor_authority("99", vec![], &facts).is_none());
+        assert_eq!(
+            MemberError::AuthorityUnavailable.enforcement_outcome(),
+            "refused"
+        );
+        assert_eq!(
+            MemberError::TargetNotMember.enforcement_outcome(),
+            "refused"
+        );
+        assert_eq!(error_text(MemberError::AuthorityUnavailable), FAILURE_REPLY);
+        assert_eq!(error_text(MemberError::TargetNotMember), NO_MEMBER_REPLY);
+    }
+
+    #[test]
+    fn departed_target_is_tolerated_only_by_ban_and_tempban() {
+        let present = Some((vec!["101".to_owned()], true));
+        for action in [
+            ModerationAction::Ban,
+            ModerationAction::TempBan,
+            ModerationAction::Kick,
+            ModerationAction::Timeout,
+            ModerationAction::Warn,
+        ] {
+            // A present member always passes through with its own roles and flag.
+            assert_eq!(
+                target_membership(action, present.clone()).ok(),
+                present,
+                "{action:?}"
+            );
+            let departed = target_membership(action, None);
+            if matches!(action, ModerationAction::Ban | ModerationAction::TempBan) {
+                assert_eq!(departed.ok(), Some((Vec::new(), false)), "{action:?}");
+            } else {
+                assert!(
+                    matches!(departed, Err(MemberError::TargetNotMember)),
+                    "{action:?}: a departed target must refuse, never act"
+                );
+            }
+        }
+    }
 
     #[test]
     fn unknown_bot_role_or_everyone_position_refuses() {
@@ -568,6 +736,7 @@ mod tests {
             guild_id: "guild".to_owned(),
             owner_id: "owner".to_owned(),
             positions: HashMap::from([("guild".to_owned(), 0), ("bot-role".to_owned(), 10)]),
+            permissions: HashMap::new(),
         };
         assert_eq!(top_position(&["bot-role".to_owned()], &facts), Some(10));
         assert_eq!(top_position(&["unknown".to_owned()], &facts), None);
@@ -598,5 +767,249 @@ mod tests {
         assert_eq!(cooldowns.actors.len(), ACTOR_COOLDOWN_CAPACITY);
         assert!(cooldowns.admit("overflow", 1, now + ACTOR_COOLDOWN));
         assert_eq!(cooldowns.actors.len(), 1);
+    }
+
+    #[test]
+    fn rate_limited_reply_is_retry_safe_while_uncertain_stays_fenced() {
+        assert_eq!(
+            error_text(MemberError::Discord(MemberDiscordError::RateLimited)),
+            "Discord rate-limited the request; nothing was applied. Try again shortly."
+        );
+        // Literal copy, not `UNCERTAIN_REPLY`: a changed constant must fail.
+        assert_eq!(
+            error_text(MemberError::Discord(MemberDiscordError::Timeout)),
+            "Discord did not confirm the action. It may still land; ask an operator to reconcile before retrying."
+        );
+        // `Unavailable` carries a detail but renders the same fenced copy: the
+        // detail must never leak into the ephemeral reply.
+        assert_eq!(
+            error_text(MemberError::Discord(MemberDiscordError::Unavailable(
+                "503 service unavailable".to_owned()
+            ))),
+            "Discord did not confirm the action. It may still land; ask an operator to reconcile before retrying."
+        );
+    }
+
+    #[test]
+    fn policy_error_display_passthrough_is_pinned() {
+        // `error_text` renders policy refusals verbatim: pin the copy and the
+        // passthrough shape so either change fails loudly.
+        assert_eq!(
+            error_text(MemberError::Policy(PolicyError::ActorHierarchy)),
+            "The target is equal to or above your highest role"
+        );
+        assert_eq!(
+            error_text(MemberError::Policy(PolicyError::ActorHierarchy)),
+            PolicyError::ActorHierarchy.to_string()
+        );
+    }
+
+    #[test]
+    fn reason_error_display_passthrough_is_pinned() {
+        // Same verbatim rendering for reason refusals.
+        assert_eq!(
+            error_text(MemberError::Reason(ReasonError::Empty)),
+            "\"reason\" must be a non-empty string"
+        );
+        assert_eq!(
+            error_text(MemberError::Reason(ReasonError::Empty)),
+            ReasonError::Empty.to_string()
+        );
+    }
+
+    #[test]
+    fn malformed_error_text_is_pinned() {
+        assert_eq!(
+            error_text(MemberError::Malformed {
+                field: "duration_seconds",
+                message: "\"duration_seconds\" must be an integer between 60 and 31536000"
+                    .to_owned(),
+            }),
+            "malformed duration_seconds: \"duration_seconds\" must be an integer between 60 and 31536000"
+        );
+    }
+
+    #[test]
+    fn inflight_error_text_is_pinned() {
+        assert_eq!(
+            error_text(MemberError::InFlight),
+            "A moderation action for this member is already in progress."
+        );
+    }
+
+    #[test]
+    fn key_mismatch_error_text_is_pinned() {
+        assert_eq!(
+            error_text(MemberError::KeyMismatch),
+            "This moderation request was already submitted with different details."
+        );
+    }
+
+    #[test]
+    fn rejected_detail_passthrough_is_pinned() {
+        // Representative fixed detail: a Discord 4xx refusal names its cause.
+        assert_eq!(
+            error_text(MemberError::Discord(MemberDiscordError::Rejected(
+                "missing permissions".to_owned()
+            ))),
+            "Discord refused the request: missing permissions"
+        );
+    }
+
+    #[test]
+    fn store_and_bot_identity_unknown_copy_is_pinned() {
+        // Both arms render the opaque failure reply: the store message never
+        // leaks into the ephemeral copy.
+        assert_eq!(
+            error_text(MemberError::Store(StoreError::new("db down"))),
+            "Moderation command failed; try again."
+        );
+        assert_eq!(
+            error_text(MemberError::BotIdentityUnknown),
+            "Moderation command failed; try again."
+        );
+    }
+
+    #[test]
+    fn ban_success_confirmation_copy_is_pinned() {
+        // Reply layer only: `MemberResult` carries no member data, so the
+        // pinned copy cannot paste any.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Banned,
+                replayed: false,
+            }),
+            "Banned."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Banned,
+                replayed: true,
+            }),
+            "Banned. Already applied."
+        );
+    }
+
+    #[test]
+    fn tempban_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact `/tempban` success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::TemporarilyBanned,
+                replayed: false,
+            }),
+            "Temporarily banned."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::TemporarilyBanned,
+                replayed: true,
+            }),
+            "Temporarily banned. Already applied."
+        );
+    }
+
+    #[test]
+    fn kick_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact `/kick` success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Kicked,
+                replayed: false,
+            }),
+            "Kicked."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Kicked,
+                replayed: true,
+            }),
+            "Kicked. Already applied."
+        );
+    }
+
+    #[test]
+    fn timeout_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact `/timeout` success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::TimedOut,
+                replayed: false,
+            }),
+            "Timed out."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::TimedOut,
+                replayed: true,
+            }),
+            "Timed out. Already applied."
+        );
+    }
+
+    #[test]
+    fn warn_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact `/warn` success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Warned,
+                replayed: false,
+            }),
+            "Warned."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Warned,
+                replayed: true,
+            }),
+            "Warned. Already applied."
+        );
+    }
+
+    #[test]
+    fn unban_success_confirmation_copy_is_pinned() {
+        // Same reply layer as `/ban`: `handle_command` renders through
+        // `outcome_text`, so this pins the exact unban-sweep success copy.
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Unbanned,
+                replayed: false,
+            }),
+            "Unbanned."
+        );
+        assert_eq!(
+            outcome_text(&MemberResult {
+                outcome: MemberOutcome::Unbanned,
+                replayed: true,
+            }),
+            "Unbanned. Already applied."
+        );
+    }
+
+    #[test]
+    fn replay_suffix_confirmation_copy_is_pinned() {
+        // The replay suffix is one uniform arm: every outcome replays by
+        // appending exactly ` Already applied.` to its fresh copy.
+        let fresh = [
+            (MemberOutcome::Banned, "Banned."),
+            (MemberOutcome::TemporarilyBanned, "Temporarily banned."),
+            (MemberOutcome::Kicked, "Kicked."),
+            (MemberOutcome::TimedOut, "Timed out."),
+            (MemberOutcome::Warned, "Warned."),
+            (MemberOutcome::Unbanned, "Unbanned."),
+        ];
+        for (outcome, base) in fresh {
+            assert_eq!(
+                outcome_text(&MemberResult {
+                    outcome,
+                    replayed: true,
+                }),
+                format!("{base} Already applied.")
+            );
+        }
     }
 }

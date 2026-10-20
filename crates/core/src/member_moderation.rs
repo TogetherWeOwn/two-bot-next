@@ -159,8 +159,9 @@ pub enum DiscordCall {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiscordError {
     /// Discord refused the request (4xx): provably no mutation happened, so
-    /// the claim is safe to release and the staged unban safe to cancel.
-    /// This is the ONLY retry-safe failure (legacy `discord_rejected`).
+    /// the claim is safe to release and the staged unban safe to cancel
+    /// (legacy `discord_rejected`). A 429 is equally retry-safe for the
+    /// failed attempt only; see [`DiscordError::proves_no_effect`].
     #[error("discord refused the request: {0}")]
     Rejected(String),
     /// Discord did not answer in time (legacy `upstream_timeout`): the
@@ -172,8 +173,9 @@ pub enum DiscordError {
     /// treatment as [`DiscordError::Timeout`].
     #[error("discord was unreachable: {0}")]
     Unavailable(String),
-    /// Rate limited (legacy `rate_limited`): uncertain, same treatment as
-    /// [`DiscordError::Timeout`]; the executor paces per legacy §6.
+    /// Rate limited (legacy `rate_limited`): Discord did not process the
+    /// request, so it proves no effect ([`DiscordError::proves_no_effect`])
+    /// and only the failed attempt is released; the executor paces per §6.
     #[error("discord rate-limited this request")]
     RateLimited,
 }
@@ -184,6 +186,41 @@ impl DiscordError {
     #[must_use]
     pub fn is_safe_pre_mutation(&self) -> bool {
         matches!(self, Self::Rejected(_))
+    }
+
+    /// True when the failure proves the request had no effect: everything
+    /// [`Self::is_safe_pre_mutation`] covers, plus a 429. Discord documents a
+    /// rate-limited request as not processed. Callers that fence a single
+    /// attempt may release only that attempt and retry; timeouts, transport
+    /// failures and unexpected statuses stay fenced.
+    #[must_use]
+    pub fn proves_no_effect(&self) -> bool {
+        self.is_safe_pre_mutation() || matches!(self, Self::RateLimited)
+    }
+}
+
+impl MemberError {
+    /// Bounded metrics outcome for `two_bot_moderation_enforcements_total`
+    /// (TOG-28482): `refused` for policy/validation/key-mismatch denials and
+    /// definitive Discord rejections that prove no mutation happened,
+    /// `discord_error` for uncertain Discord failures, `storage_error` for
+    /// persistence failures, `other` for anything else. The caller passes a
+    /// `ModerationAction::command_name` verb; no user id, reason text or
+    /// free-form detail ever becomes a label.
+    #[must_use]
+    pub fn enforcement_outcome(&self) -> &'static str {
+        match self {
+            Self::Policy(_)
+            | Self::Reason(_)
+            | Self::Malformed { .. }
+            | Self::KeyMismatch
+            | Self::AuthorityUnavailable
+            | Self::TargetNotMember => "refused",
+            Self::Discord(error) if error.is_safe_pre_mutation() => "refused",
+            Self::Discord(_) => "discord_error",
+            Self::Store(_) => "storage_error",
+            Self::InFlight | Self::BotIdentityUnknown => "other",
+        }
     }
 }
 
@@ -488,6 +525,16 @@ pub trait MemberModerationStore: Send + Sync {
         claimed_at: &str,
     ) -> impl Future<Output = Result<ClaimState, StoreError>> + Send;
 
+    /// Read-only: the stored outcome of a `done` row whose request hash matches.
+    /// An absent, `in_flight` or differently-bound row is `None`; this never
+    /// inserts, completes or releases anything.
+    fn completed_outcome(
+        &self,
+        guild_id: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send;
+
     /// Record the terminal result so a retry replays it (legacy `complete`).
     fn complete(
         &self,
@@ -710,6 +757,15 @@ pub struct MemberExecution {
     pub idempotency_key: String,
 }
 
+/// Current authority supplied at the dispatch boundary. Identities must match
+/// the immutable execution; only membership, roles and permissions may change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberAuthority {
+    pub actor: ModerationActor,
+    pub target: Option<ModerationTarget>,
+    pub bot_highest_role_position: i64,
+}
+
 /// Validated member request: policy passed, reason normalised, duration
 /// bounded per verb.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -741,6 +797,12 @@ pub enum MemberError {
     /// `moderation_idempotency_key_reused`).
     #[error("this idempotency key was used for a different moderation request")]
     KeyMismatch,
+    /// Current membership/role evidence could not be established. This is a
+    /// pre-dispatch refusal, not evidence about any earlier dispatched attempt.
+    #[error("Moderation command failed; try again.")]
+    AuthorityUnavailable,
+    #[error("That member is not in this server.")]
+    TargetNotMember,
     /// Scheduled unbans wait for the bot identity; they never run unattributed.
     #[error("the bot identity is unresolved; scheduled unbans wait for it")]
     BotIdentityUnknown,
@@ -788,6 +850,16 @@ pub fn validate_member_request(
         policy,
     )
     .map_err(MemberError::Policy)?;
+    validate_request_content(action, reason, duration_seconds)
+}
+
+/// The authority-free half of validation: the audit reason and duration bounds
+/// that, with the action and target, define a request's idempotency hash.
+fn validate_request_content(
+    action: ModerationAction,
+    reason: &str,
+    duration_seconds: Option<i64>,
+) -> Result<ValidatedMemberRequest, MemberError> {
     let reason = require_moderation_reason(reason).map_err(MemberError::Reason)?;
     let duration_seconds = match action {
         ModerationAction::TempBan => Some(bounded_duration(
@@ -806,6 +878,18 @@ pub fn validate_member_request(
         action,
         reason,
         duration_seconds,
+    })
+}
+
+/// The nonmutating result of a stored `done` outcome; an unreadable outcome is
+/// a store fault, never a guess.
+fn replayed_result(outcome: &str) -> Result<MemberResult, MemberError> {
+    let outcome = MemberOutcome::from_stored(outcome).ok_or(MemberError::Store(
+        StoreError::new(format!("stored unknown outcome: {outcome}")),
+    ))?;
+    Ok(MemberResult {
+        outcome,
+        replayed: true,
     })
 }
 
@@ -899,41 +983,40 @@ where
         exec: &'a MemberExecution,
     ) -> impl Future<Output = Result<MemberResult, MemberError>> + Send + 'a {
         async move {
-            let validated = match self.validate(exec) {
-                Ok(validated) => validated,
-                Err(err @ MemberError::Policy(_)) => {
-                    self.store
-                        .record_audit(&AuditRow {
-                            // A refusal must not mask a later accepted audit
-                            // when the caller retries with this request id.
-                            request_id: format!("{}:denied", exec.request_id),
-                            guild_id: exec.guild_id.clone(),
-                            actor_id: exec.actor.user_id.clone(),
-                            action: exec.action.action_name(),
-                            target_id: exec.target.as_ref().map(|target| target.user_id.clone()),
-                            reason: "Member moderation policy refused the request".to_owned(),
-                            outcome: "denied",
-                            idempotency_key: exec.idempotency_key.clone(),
-                            metadata_json: serde_json::json!({
-                                "stage": "policy",
-                                "request_id": exec.request_id,
-                            })
-                            .to_string(),
-                        })
-                        .await?;
-                    return Err(err);
-                }
-                Err(err) => return Err(err),
-            };
-            let hash = request_hash(
-                validated.action,
-                &exec.guild_id,
-                exec.target.as_ref().map(|t| t.user_id.as_str()),
-                &validated.reason,
-                validated.duration_seconds,
-            );
+            self.execute_with_authority(exec, || async {
+                Ok(MemberAuthority {
+                    actor: exec.actor.clone(),
+                    target: exec.target.clone(),
+                    bot_highest_role_position: exec.bot_highest_role_position,
+                })
+            })
+            .await
+        }
+    }
+
+    /// Resolve and validate current authority after the ban/tempban lane wait,
+    /// before claiming or preparing an effect. Other verbs resolve immediately
+    /// before the same validation/claim boundary. The resolver must use complete,
+    /// identity-bound current facts, not interaction snapshots. This closes the
+    /// local queue-wait window, not races with a later Discord-side role change.
+    ///
+    /// A failed read never releases a key: it proves nothing about an earlier
+    /// unknown dispatch. Existing callers of `execute` supply their own facts;
+    /// network-facing adapters should use this resolver boundary instead.
+    pub fn execute_with_authority<'a, R, RFut>(
+        &'a self,
+        exec: &'a MemberExecution,
+        refresh: R,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<MemberResult, MemberError>> + Send + 'a>>
+    where
+        R: FnOnce() -> RFut + Send + 'a,
+        RFut: Future<Output = Result<MemberAuthority, MemberError>> + Send + 'a,
+    {
+        // Erase the resolver future to preserve Send across generic lane
+        // callbacks and the runtime's detached interaction tasks.
+        Box::pin(async move {
             if matches!(
-                validated.action,
+                exec.action,
                 ModerationAction::Ban | ModerationAction::TempBan
             ) {
                 let target_id = exec
@@ -943,13 +1026,124 @@ where
                     .unwrap_or("");
                 self.store
                     .serialize_member(&exec.guild_id, target_id, || {
-                        self.execute_claimed(exec, &validated, &hash)
+                        self.execute_refreshed(exec, refresh)
                     })
                     .await
             } else {
-                self.execute_claimed(exec, &validated, &hash).await
+                self.execute_refreshed(exec, refresh).await
             }
-        }
+        })
+    }
+
+    async fn execute_refreshed<R, RFut>(
+        &self,
+        exec: &MemberExecution,
+        refresh: R,
+    ) -> Result<MemberResult, MemberError>
+    where
+        R: FnOnce() -> RFut + Send,
+        RFut: Future<Output = Result<MemberAuthority, MemberError>> + Send,
+    {
+        let authority = match refresh().await {
+            Ok(authority)
+                if authority.actor.user_id == exec.actor.user_id
+                    && authority.target.as_ref().map(|t| &t.user_id)
+                        == exec.target.as_ref().map(|t| &t.user_id) =>
+            {
+                authority
+            }
+            Ok(_) => {
+                self.audit_refused(exec, "authority").await?;
+                return Err(MemberError::AuthorityUnavailable);
+            }
+            Err(MemberError::TargetNotMember) => {
+                // A completed removal is the expected end state of a kick, so
+                // its redelivery must replay, not refuse. Only a stored,
+                // hash-matching `done` row does; anything else still refuses.
+                if let Some(replayed) = self.completed_replay(exec).await? {
+                    return Ok(replayed);
+                }
+                self.audit_refused(exec, "authority").await?;
+                return Err(MemberError::TargetNotMember);
+            }
+            Err(err) => {
+                self.audit_refused(exec, "authority").await?;
+                return Err(err);
+            }
+        };
+        let current = MemberExecution {
+            actor: authority.actor,
+            target: authority.target,
+            bot_highest_role_position: authority.bot_highest_role_position,
+            ..exec.clone()
+        };
+        let validated = match self.validate(&current) {
+            Ok(validated) => validated,
+            Err(err @ MemberError::Policy(_)) => {
+                self.audit_refused(exec, "policy").await?;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
+        let hash = request_hash(
+            validated.action,
+            &current.guild_id,
+            current.target.as_ref().map(|t| t.user_id.as_str()),
+            &validated.reason,
+            validated.duration_seconds,
+        );
+        self.execute_claimed(&current, &validated, &hash).await
+    }
+
+    /// Nonmutating replay of a completed request whose target has since left
+    /// the guild. Reads the existing row only: no claim, release, audit or
+    /// Discord call, and an invalid request cannot have a stored row.
+    async fn completed_replay(
+        &self,
+        exec: &MemberExecution,
+    ) -> Result<Option<MemberResult>, MemberError> {
+        let Ok(validated) =
+            validate_request_content(exec.action, &exec.reason, exec.duration_seconds)
+        else {
+            return Ok(None);
+        };
+        let hash = request_hash(
+            validated.action,
+            &exec.guild_id,
+            exec.target.as_ref().map(|t| t.user_id.as_str()),
+            &validated.reason,
+            validated.duration_seconds,
+        );
+        let Some(outcome) = self
+            .store
+            .completed_outcome(&exec.guild_id, &exec.idempotency_key, &hash)
+            .await?
+        else {
+            return Ok(None);
+        };
+        replayed_result(&outcome).map(Some)
+    }
+
+    async fn audit_refused(&self, exec: &MemberExecution, stage: &str) -> Result<(), MemberError> {
+        self.store
+            .record_audit(&AuditRow {
+                // A refusal must not mask a later accepted audit on retry.
+                request_id: format!("{}:denied", exec.request_id),
+                guild_id: exec.guild_id.clone(),
+                actor_id: exec.actor.user_id.clone(),
+                action: exec.action.action_name(),
+                target_id: exec.target.as_ref().map(|target| target.user_id.clone()),
+                reason: "Member moderation policy refused the request".to_owned(),
+                outcome: "denied",
+                idempotency_key: exec.idempotency_key.clone(),
+                metadata_json: serde_json::json!({
+                    "stage": stage,
+                    "request_id": exec.request_id,
+                })
+                .to_string(),
+            })
+            .await?;
+        Ok(())
     }
 
     /// Fire at most 25 due expiries for the owning guild. Claim immediately
@@ -1018,15 +1212,7 @@ where
             )
             .await?
         {
-            ClaimState::Replayed { outcome } => {
-                let outcome = MemberOutcome::from_stored(&outcome).ok_or(MemberError::Store(
-                    StoreError::new(format!("stored unknown outcome: {outcome}")),
-                ))?;
-                return Ok(MemberResult {
-                    outcome,
-                    replayed: true,
-                });
-            }
+            ClaimState::Replayed { outcome } => return replayed_result(&outcome),
             ClaimState::InFlight => return Err(MemberError::InFlight),
             ClaimState::Mismatch => return Err(MemberError::KeyMismatch),
             ClaimState::Claimed => {}
@@ -1036,9 +1222,11 @@ where
             Ok(outcome) => outcome,
             Err(err) => {
                 let release_cause = match &err {
-                    // Discord refused before mutating: provably nothing
-                    // happened, so the key is safe to give back.
-                    MemberError::Discord(d) if d.is_safe_pre_mutation() => Some("discord_rejected"),
+                    // Discord refused before mutating, or rate-limited the
+                    // request without processing it: provably nothing
+                    // happened, so only this attempt's key is given back.
+                    MemberError::Discord(DiscordError::RateLimited) => Some("discord_rate_limited"),
+                    MemberError::Discord(d) if d.proves_no_effect() => Some("discord_rejected"),
                     // Storage rolled back before any durable write for this
                     // request (or wrote nothing): equally safe to retry.
                     MemberError::Store(s) if s.is_safe_pre_mutation() => Some("store_rolled_back"),
@@ -1199,7 +1387,7 @@ where
             .ban(&exec.guild_id, target, &validated.reason)
             .await
         {
-            if err.is_safe_pre_mutation() {
+            if err.proves_no_effect() {
                 self.store
                     .reject_ban_attempt(
                         &exec.guild_id,
@@ -1298,7 +1486,7 @@ where
                     .unban(&job.guild_id, &job.user_id, &job.reason)
                     .await
                 {
-                    if err.is_safe_pre_mutation() {
+                    if err.proves_no_effect() {
                         self.store
                             .requeue_unban(&job.request_id, &job.claim_token)
                             .await?;
@@ -1647,6 +1835,20 @@ impl MemberModerationStore for MemMemberStore {
             },
         );
         Ok(ClaimState::Claimed)
+    }
+
+    async fn completed_outcome(
+        &self,
+        guild_id: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .lock()
+            .idempotency
+            .get(&(guild_id.to_owned(), idempotency_key.to_owned()))
+            .filter(|row| row.state == IdemState::Done && row.hash == request_hash)
+            .map(|row| row.outcome.clone().unwrap_or_else(|| "unknown".to_owned())))
     }
 
     async fn complete(
@@ -2276,6 +2478,17 @@ mod tests {
     const TARGET_ID: &str = "333333333333333333";
     const STAFF_ROLE: &str = "444444444444444444";
     const BOT_ID: &str = "555555555555555555";
+
+    #[test]
+    fn proves_no_effect_adds_only_rate_limits_to_safe_pre_mutation() {
+        assert!(DiscordError::RateLimited.proves_no_effect());
+        assert!(DiscordError::Rejected("refused".to_owned()).proves_no_effect());
+        assert!(!DiscordError::Timeout.proves_no_effect());
+        assert!(!DiscordError::Unavailable("503".to_owned()).proves_no_effect());
+        // The narrower legacy predicate is unchanged: a 429 is not a
+        // pre-mutation refusal, only a proven no-effect response.
+        assert!(!DiscordError::RateLimited.is_safe_pre_mutation());
+    }
 
     #[test]
     fn unban_debug_redacts_claim_tokens() {
@@ -3296,6 +3509,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_requeues_rate_limited_unbans() {
+        let discord = MockMemberDiscord::new();
+        let store = MemMemberStore::new();
+        let svc = service(discord.clone(), store.clone());
+
+        let mut exec = execution(ModerationAction::TempBan);
+        exec.request_id = "req-tempban-429".to_owned();
+        exec.idempotency_key = "test-key-429".to_owned();
+        svc.execute(&exec).await.expect("tempban");
+        {
+            let mut inner = svc.store.inner.lock().expect("lock");
+            let row = inner.unbans.get_mut("req-tempban-429").expect("staged");
+            row.execute_at = "2023-11-14T22:00:00.000Z".to_owned();
+        }
+        svc.discord.fail_with("unban", DiscordError::RateLimited);
+        let err = svc
+            .run_due_unbans(GUILD)
+            .await
+            .expect_err("first error rethrown");
+        assert_eq!(err, MemberError::Discord(DiscordError::RateLimited));
+        assert_eq!(
+            svc.store.unban_state("req-tempban-429"),
+            Some("pending".to_owned())
+        );
+        svc.discord.clear_failure("unban");
+        assert_eq!(svc.run_due_unbans(GUILD).await.expect("retry sweep"), 1);
+        assert_eq!(
+            svc.store.unban_state("req-tempban-429"),
+            Some("done".to_owned())
+        );
+    }
+
+    #[tokio::test]
     async fn tempban_ban_rejection_cancels_the_staged_row() {
         let discord = MockMemberDiscord::new();
         let store = MemMemberStore::new();
@@ -3894,6 +4140,17 @@ mod tests {
                 .await
         }
 
+        async fn completed_outcome(
+            &self,
+            guild_id: &str,
+            idempotency_key: &str,
+            request_hash: &str,
+        ) -> Result<Option<String>, StoreError> {
+            self.inner
+                .completed_outcome(guild_id, idempotency_key, request_hash)
+                .await
+        }
+
         async fn complete(
             &self,
             guild_id: &str,
@@ -4276,8 +4533,20 @@ mod tests {
     /// Process-wide log capture. A scoped subscriber loses events when a
     /// sibling test thread caches the callsite first, so install one global
     /// writer and let each test read only the text after its own mark.
+    /// Marks hold a process-wide assertion lock until consumed by
+    /// [`LogCapture::lines`], so two tests asserting on the same
+    /// event+action pair serialize their mark/execute/assert windows and a
+    /// sibling's emission cannot land inside this window.
     #[derive(Clone, Default)]
     struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    /// A position in the capture buffer. Holds the assertion lock from
+    /// [`LogCapture::mark`] until [`LogCapture::lines`] consumes it; dropping
+    /// it without calling `lines` (e.g. on panic) releases the lock.
+    struct Mark {
+        pos: usize,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl LogCapture {
         fn global() -> LogCapture {
@@ -4299,15 +4568,26 @@ mod tests {
                 .clone()
         }
 
-        fn mark(&self) -> usize {
-            self.0.lock().expect("capture lock").len()
+        fn mark(&self) -> Mark {
+            static ASSERT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // Lock first, then read the position: every earlier window's
+            // emissions are already in the buffer, so they fall before this
+            // mark. (Reading the length before locking would admit a
+            // sibling's emission between the read and the lock.)
+            // A sibling that panicked mid-window poisons the lock; the suite
+            // is already failing then, so recover instead of cascading.
+            let guard = ASSERT_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            let pos = self.0.lock().expect("capture lock").len();
+            Mark { pos, _guard: guard }
         }
 
-        /// Lines logged since `mark` that carry `event` for `action`; other
-        /// tests' lines are ignored so concurrent tests cannot interfere.
-        fn lines(&self, mark: usize, event: &str, action: &str) -> Vec<String> {
+        /// Lines logged since `mark` that carry `event` for `action`.
+        /// Consumes the mark, releasing the assertion lock: the whole
+        /// mark/execute/assert window ran alone, so no sibling emission for
+        /// this pair can appear here.
+        fn lines(&self, mark: Mark, event: &str, action: &str) -> Vec<String> {
             let bytes = self.0.lock().expect("capture lock");
-            String::from_utf8_lossy(&bytes[mark..])
+            String::from_utf8_lossy(&bytes[mark.pos..])
                 .lines()
                 .filter(|line| line.contains(event) && line.contains(action))
                 .map(str::to_owned)
@@ -4329,7 +4609,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn log_capture_mark_serializes_assertion_windows() {
+        // Pins the process-wide assertion lock: a second `mark` must block
+        // until the first window is consumed via `lines`. Replacing the
+        // static lock with a per-call mutex lets the second mark complete
+        // while the first is still open, failing the timeout assert below.
+        // Never-matching filters keep this window silent for other tests.
+        const EVENT: &str = "never-matching-event-7f3a";
+        const ACTION: &str = "never-matching-action-9c1e";
+        let capture = LogCapture::global();
+        let first = capture.mark();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let capture2 = capture.clone();
+        let handle = std::thread::spawn(move || {
+            ready_tx.send(()).expect("ready signal");
+            let second = capture2.mark();
+            done_tx.send(()).expect("done signal");
+            let _ = capture2.lines(second, EVENT, ACTION);
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawned thread never reached mark");
+        // The spawned thread is now blocked in `mark` (or would complete at
+        // once if the lock were broken). A held static lock cannot release
+        // early, so a timeout here is deterministic; a broken lock acquires
+        // within milliseconds.
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "second mark completed while the first window was still open"
+        );
+        let _ = capture.lines(first, EVENT, ACTION);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second mark never completed after the first window closed");
+        handle.join().expect("spawned thread panicked");
+    }
+
     const RELEASE_FAILED: &str = "moderation_idempotency_release_failed";
+
+    /// The release tests share one process-global capture, and the two kick
+    /// tests emit the identical event+action pair, so overlapping runs
+    /// double-count lines. Serialize all three; the guard is held across
+    /// `.await` by design.
+    static RELEASE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     // A provably mutation-free refusal gives the key back. When that release
     // itself fails the row stays `in_flight` (a retry answers `InFlight`), and
@@ -4337,6 +4663,7 @@ mod tests {
     // the key, an id nor the raw store error, and must change nothing else.
     #[tokio::test]
     async fn failed_release_is_logged_without_changing_the_result() {
+        let _guard = RELEASE_TEST_LOCK.lock().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());
@@ -4396,10 +4723,39 @@ mod tests {
         assert_eq!(discord.call_count("kick"), 2);
     }
 
+    #[tokio::test]
+    async fn failed_release_after_rate_limit_names_the_rate_limit_cause() {
+        let _guard = RELEASE_TEST_LOCK.lock().await;
+        let capture = LogCapture::global();
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_000_000_000
+        });
+        let request = execution_with_id(ModerationAction::Kick, "req-rate-limit-release-fault");
+
+        discord.fail_with("kick", DiscordError::RateLimited);
+        store.arm_release();
+        let mark = capture.mark();
+        let err = svc.execute(&request).await.expect_err("rate limited");
+        assert_eq!(err, MemberError::Discord(DiscordError::RateLimited));
+        let lines = capture.lines(mark, RELEASE_FAILED, "moderation.kick");
+        assert_eq!(lines.len(), 1, "one diagnostic per failed release");
+        assert!(
+            lines[0].contains("cause=\"discord_rate_limited\""),
+            "{}",
+            lines[0]
+        );
+        assert!(!lines[0].contains("req-rate-limit-release-fault"));
+        assert_eq!(svc.execute(&request).await, Err(MemberError::InFlight));
+        assert_eq!(discord.call_count("kick"), 1);
+    }
+
     // The storage branch of the same rule: a rolled-back stage releases the
     // key, and a failed release is named with the storage cause.
     #[tokio::test]
     async fn failed_release_after_a_rolled_back_stage_names_the_store_cause() {
+        let _guard = RELEASE_TEST_LOCK.lock().await;
         let capture = LogCapture::global();
         let discord = MockMemberDiscord::new();
         let store = FaultyStore::wrap(MemMemberStore::new());

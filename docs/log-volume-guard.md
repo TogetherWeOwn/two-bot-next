@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 646 samples
+## Cardinality budget: 715 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -28,6 +28,7 @@ table and the test are updated together.
 
 | Family | Series | How |
 | --- | --- | --- |
+| `two_bot_process_incarnation{part}` | 4 | process-lifetime identity as exact unsigned 32-bit numeric parts; only fixed labels `0`, `1`, `2`, `3`, never identity-valued labels |
 | `two_bot_gateway_events_total{event}` | 21 | `EVENTS` allowlist |
 | reconnects, resumes, disconnects, missed | 4 | scalar counters |
 | `two_bot_gateway_latency_seconds` | 1 | gauge, `NaN` until measured |
@@ -37,7 +38,7 @@ table and the test are updated together.
 | `two_bot_rest_guard_*` | 11 | Fixed, label-free shared admission-guard counters and gauges |
 | job runs, timestamps, failure streaks | 64 | 16 jobs x (2 outcomes + timestamp + streak) |
 | `two_bot_job_last_error_class{job,class}` | 112 | 16 jobs x 7 classes (`database`, `rest`, `configuration`, `timeout`, `panic`, `feed`, `recovery_required`) |
-| voice ops, reconcile, dead-letters, state | 53 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans + 7 join-refused reasons + 2 queue lanes + halted + oldest-age + rest-age + creator-map generation + creator-map age + backoff-capped + dispatch-timeouts + watchdog-stucks + halt-recoveries |
+| voice ops, reconcile, dead-letters, state | 55 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans + 7 join-refused reasons + 2 queue lanes + halted + oldest-age + live-not-ready age + live self-heals + rest-age + creator-map generation + creator-map age + backoff-capped + dispatch-timeouts + watchdog-stucks + halt-recoveries |
 | `two_bot_voice_join_occupancy_total{occupancy}` | 8 | seeding-TEST occupancy buckets `0`-`6` + `7+`; fixed vocabulary, no per-channel/member labels |
 | pool gauges | 4 | configured, size, idle, max |
 | `two_bot_db_errors_total{op}` | 2 | `admission`, `other` |
@@ -45,9 +46,10 @@ table and the test are updated together.
 | `two_bot_gateway_prefix_trigger_refused_total{reason}` | 2 | `verdict`, `other` |
 | `two_bot_dispatch_drops_total{lane}` | 6 | `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` |
 | `two_bot_voice_vote_kick_total{outcome}` | 26 | `started` + 2 worker refusals + 15 vote-core refusals (including `cooldown`, `initiator_limited`) + 7 enforcements + `other` |
-| `two_bot_voice_names_total{outcome}` | 15 | 1 create + 5 template-render outcomes + 8 dispatch outcomes + `other` |
+| `two_bot_voice_names_total{outcome}` | 16 | 1 create + 5 template-render outcomes + 9 dispatch outcomes (including `name_blocked` for rename or custom-override refusal) + `other` |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | 2 | `pre_commit`, `commit` |
 | `two_bot_internal_actions_total{family,outcome}` | 72 | 6 families x 12 outcomes (`announcement`, `event`, `settings`, `moderation`, `membership`, `other` x `executed` + 11 refusal classes) |
+| `two_bot_moderation_enforcements_total{verb,outcome}` | 45 | 9 verbs (`ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`, `slowmode`, `lockdown`, `unlock`) x 5 outcomes (`success`, `refused`, `discord_error`, `storage_error`, `other`) |
 | `two_bot_community_facts_drain_failures_total{reason}` | 3 | `error`, `timeout`, `other` |
 | `two_bot_presence_capture_total{outcome}` | 3 | `inserted`, `duplicate`, `rejected` |
 | `two_bot_automod_decisions_total{outcome}` | 8 | `accepted`, `already_processed`, `dry_run`, `protected`, `deleted`, `warned`, `timed_out`, `sanction_refused`; no message text, excerpts or user IDs in labels |
@@ -59,7 +61,10 @@ table and the test are updated together.
 | `two_bot_eventsub_reconcile_passes_total{outcome}` | 3 | `healthy`, `pending`, `failed`; one sample per pass, unknown outcomes collapse to `failed` |
 | `two_bot_eventsub_reconcile_actions_total{action}` | 2 | `create`, `delete`; 409 already-exists confirmations fold into the pass outcome |
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | 5 | `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed`, `other`; no status, body or response bytes in labels |
-| `# HELP` / `# TYPE` headers | 132 | 66 families x 2 |
+| `two_bot_feed_fetches_total{outcome}` | 4 | `success`, `invalid_source`, `refused_redirect`, `failure`; per-outcome, never per-feed |
+| `two_bot_feed_fetch_errors_total{error_class}` | 12 | 11 named classes + `other` (`invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error`); successes record nothing here |
+| `two_bot_retention_replay_needed_total` | 1 | label-free counter: skipped retention purges needing Operator replay (one per real guild removal whose purge-queue write hit the schema gap); resets on process restart |
+| `# HELP` / `# TYPE` headers | 146 | 73 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 

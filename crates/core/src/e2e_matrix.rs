@@ -33,7 +33,7 @@ use crate::commands::{
 /// must set on staging for the command to be published at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum E2eGate {
-    /// Always published (`rank`, `leaderboard`, `help`).
+    /// Always published (`rank`, `leaderboard`, `help`, `privacy`).
     Always,
     /// `TWO_COMMUNITY_SCORECARD=1`.
     Scorecard,
@@ -121,7 +121,7 @@ const fn row(
 //   staff protection, bot hierarchy, actor hierarchy, in that order.
 // - `Valid:<FIELD>:<BOUNDS>` — option validation before any side effect.
 
-/// The 28-row contract in publish order (core, scorecard, automation,
+/// The 29-row contract in publish order (core, scorecard, automation,
 /// announcement, moderation). The coverage test asserts this is exactly the
 /// all-gates-on [`crate::router::InteractionRouter::publish_set`].
 #[must_use]
@@ -156,6 +156,19 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
             "Help",
             "Immediate ephemeral reply (no defer, no store read) listing the live published commands grouped by audience with permission hints.",
             &[],
+        ),
+        row(
+            "privacy",
+            32,
+            E2eGate::Always,
+            0,
+            "Everyone",
+            "Privacy",
+            "Deferred ephemeral reply; analytics opt-out purges the invoker's guild rows plus suppression plus one audit receipt, opt-in clears suppression, status reports suppression plus guild analytics switches; delete queues a member-erasure request, and deletion status/receipt reads bind to the authenticated requester and guild.",
+            &[
+                "Valid:subcommand:required,opt-out|opt-in|status|delete|deletion-status|deletion-receipt",
+                "Valid:request-id:required,max128,deletion-status|deletion-receipt",
+            ],
         ),
         row(
             "attendance",
@@ -542,6 +555,34 @@ mod tests {
                 "duplicate parity row {}",
                 row.parity_row
             );
+        }
+    }
+
+    #[test]
+    fn privacy_matrix_pins_required_bounded_request_ids() {
+        let matrix = e2e_command_matrix();
+        let privacy = matrix
+            .iter()
+            .find(|row| row.command == "privacy")
+            .expect("privacy matrix row");
+        assert!(privacy
+            .denials
+            .contains(&"Valid:request-id:required,max128,deletion-status|deletion-receipt"));
+
+        let definition = crate::commands::core_commands()
+            .into_iter()
+            .find(|definition| definition.name == "privacy")
+            .expect("published privacy command");
+        for subcommand in ["deletion-status", "deletion-receipt"] {
+            let option = definition
+                .options
+                .iter()
+                .find(|option| option.name == subcommand)
+                .and_then(|option| option.options.first())
+                .expect("request-id option");
+            assert_eq!(option.name, "request-id");
+            assert_eq!(option.required, Some(true));
+            assert_eq!(option.max_length, Some(128));
         }
     }
 

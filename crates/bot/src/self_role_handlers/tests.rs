@@ -382,3 +382,68 @@ async fn reaction_partials_mint_unique_identity_before_work_and_match_deleted_cu
     };
     assert!(service.reaction_input(&custom, false).is_some());
 }
+
+#[test]
+fn every_result_reply_pins_its_exact_text_in_both_color_modes() {
+    for color in [false, true] {
+        assert_eq!(
+            SelfRoleResult::Settled(SettledOutcome::Assigned).reply(color),
+            "Role added.",
+            "color={color}"
+        );
+        assert_eq!(
+            SelfRoleResult::Settled(SettledOutcome::Removed).reply(color),
+            "Role removed.",
+            "color={color}"
+        );
+        assert_eq!(
+            SelfRoleResult::Settled(SettledOutcome::Switched).reply(color),
+            if color {
+                "Color updated."
+            } else {
+                "Role updated."
+            },
+            "color={color}"
+        );
+        assert_eq!(
+            SelfRoleResult::Settled(SettledOutcome::AlreadyHeld).reply(color),
+            "No role changes were needed.",
+            "color={color}"
+        );
+        assert_eq!(
+            SelfRoleResult::Settled(SettledOutcome::AlreadyAbsent).reply(color),
+            "No role changes were needed.",
+            "color={color}"
+        );
+        assert_eq!(
+            SelfRoleResult::Settled(SettledOutcome::Rejected).reply(color),
+            "I could not change that role. Staff have been notified in the logs.",
+            "color={color}"
+        );
+        assert_eq!(
+            SelfRoleResult::DryRun.reply(color),
+            "Dry run recorded; no roles were changed.",
+            "color={color}"
+        );
+        assert_eq!(
+            SelfRoleResult::Duplicate.reply(color),
+            "This selection is already being handled or was handled earlier.",
+            "color={color}"
+        );
+        assert_eq!(
+            SelfRoleResult::Ignored.reply(color),
+            "This role selection could not be applied.",
+            "color={color}"
+        );
+        assert_eq!(
+            SelfRoleResult::Rejected.reply(color),
+            "This role selection could not be applied.",
+            "color={color}"
+        );
+        assert_eq!(
+            SelfRoleResult::Pending.reply(color),
+            "This role selection is unresolved; no successful change has been confirmed.",
+            "color={color}"
+        );
+    }
+}
