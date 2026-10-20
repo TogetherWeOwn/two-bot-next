@@ -31,7 +31,7 @@
 
 use std::collections::BTreeSet;
 
-use sqlx::{Pool, Postgres};
+use sqlx::{PgConnection, Pool, Postgres};
 
 use super::game_activity::{
     aggregate_guild, sessionize, GuildGameAggregate, PresenceDelta, VoiceSpan,
@@ -81,6 +81,23 @@ pub async fn upsert_guild_aggregates(
         return Ok(0);
     }
     let mut tx = pool.begin().await?;
+    let written = upsert_guild_aggregates_in(&mut tx, aggregates).await?;
+    tx.commit().await?;
+    Ok(written)
+}
+
+/// [`upsert_guild_aggregates`] on a borrowed connection: the rows join the
+/// caller's transaction instead of opening their own. The flush runs its
+/// suppression gate reads and this batch in one serializing transaction, so
+/// the gate and the upsert linearize atomically against opt-outs. Empty
+/// input writes nothing and reports zero rows, as the pooled wrapper.
+pub async fn upsert_guild_aggregates_in(
+    connection: &mut PgConnection,
+    aggregates: &[GuildGameAggregate],
+) -> Result<u64, GameActivityStoreError> {
+    if aggregates.is_empty() {
+        return Ok(0);
+    }
     let mut written = 0u64;
     for aggregate in aggregates {
         written = written.saturating_add(
@@ -107,12 +124,11 @@ pub async fn upsert_guild_aggregates(
                     .min(aggregate.total_play_ms.max(0)),
             )
             .bind(i64::try_from(aggregate.session_count).unwrap_or(i64::MAX))
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?
             .rows_affected(),
         );
     }
-    tx.commit().await?;
     Ok(written)
 }
 
@@ -353,10 +369,20 @@ pub async fn opted_out_user_keys(
     pool: &Pool<Postgres>,
     guild_id: &str,
 ) -> Result<BTreeSet<String>, GameActivityStoreError> {
+    opted_out_user_keys_in(&mut *pool.acquire().await?, guild_id).await
+}
+
+/// [`opted_out_user_keys`] on a borrowed connection: the flush reads
+/// suppression inside its serializing transaction, so the gate read and the
+/// upsert share one lock span against concurrent opt-outs.
+pub async fn opted_out_user_keys_in(
+    connection: &mut PgConnection,
+    guild_id: &str,
+) -> Result<BTreeSet<String>, GameActivityStoreError> {
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT member_id FROM privacy_opt_outs WHERE guild_id = $1")
             .bind(guild_id)
-            .fetch_all(pool)
+            .fetch_all(&mut *connection)
             .await?;
     Ok(rows.into_iter().map(|(member_id,)| member_id).collect())
 }
@@ -369,12 +395,16 @@ pub async fn game_analytics_disabled(
     pool: &Pool<Postgres>,
     guild_id: &str,
 ) -> Result<bool, GameActivityStoreError> {
-    Ok(category_off_in(
-        &mut *pool.acquire().await?,
-        guild_id,
-        AnalyticsCategory::Presence,
-    )
-    .await?)
+    game_analytics_disabled_in(&mut *pool.acquire().await?, guild_id).await
+}
+
+/// [`game_analytics_disabled`] on a borrowed connection: the flush reads the
+/// toggle inside its serializing transaction.
+pub async fn game_analytics_disabled_in(
+    connection: &mut PgConnection,
+    guild_id: &str,
+) -> Result<bool, GameActivityStoreError> {
+    Ok(category_off_in(connection, guild_id, AnalyticsCategory::Presence).await?)
 }
 
 /// True when the guild disabled the voice analytics family. Each toggle is
@@ -385,12 +415,16 @@ pub async fn voice_analytics_disabled(
     pool: &Pool<Postgres>,
     guild_id: &str,
 ) -> Result<bool, GameActivityStoreError> {
-    Ok(category_off_in(
-        &mut *pool.acquire().await?,
-        guild_id,
-        AnalyticsCategory::Voice,
-    )
-    .await?)
+    voice_analytics_disabled_in(&mut *pool.acquire().await?, guild_id).await
+}
+
+/// [`voice_analytics_disabled`] on a borrowed connection: the flush reads the
+/// toggle inside its serializing transaction.
+pub async fn voice_analytics_disabled_in(
+    connection: &mut PgConnection,
+    guild_id: &str,
+) -> Result<bool, GameActivityStoreError> {
+    Ok(category_off_in(connection, guild_id, AnalyticsCategory::Voice).await?)
 }
 
 /// Drop every delta and span whose member opted out. Both sides filter on

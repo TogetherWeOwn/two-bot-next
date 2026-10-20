@@ -7,6 +7,7 @@ response body read is capped at MCP_MAX_BODY_BYTES.
 """
 
 import io
+import json
 import os
 import sys
 import tempfile
@@ -151,6 +152,84 @@ class MainFenceTests(unittest.TestCase):
             build_opener.assert_not_called()
             do_post.assert_not_called()
             self.assertFalse(Path(out).exists())
+
+
+class AuditContractTests(unittest.TestCase):
+    def run_proveout(self, audit_reply):
+        token = "test-bearer-000000000000000000000000"
+
+        def reply(_url, payload, bearer):
+            envelope = {"jsonrpc": "2.0", "id": payload["id"]}
+            if bearer != token:
+                return 401, {"www-authenticate": "Bearer"}, "{}"
+            if payload["method"] == "initialize":
+                envelope["result"] = {"protocolVersion": "2025-06-18"}
+            elif payload["method"] == "tools/list":
+                envelope["result"] = {"tools": [{"name": t} for t in proveout.EXPECTED_TOOLS]}
+            else:
+                tool = payload["params"]["name"]
+                if tool == "get_audit":
+                    envelope.update(audit_reply)
+                elif tool == "no_such_tool":
+                    envelope["error"] = {"code": -32601}
+                else:
+                    envelope["result"] = {"content": []}
+            return 200, {}, json.dumps(envelope)
+
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            out = str(Path(tmp) / "proveout.json")
+            with mock.patch.object(sys, "argv", ["proveout", "--output", out]), \
+                    mock.patch.dict(os.environ, {proveout.TOKEN_ENV: token,
+                                                proveout.URL_ENV: proveout.DEFAULT_URL}), \
+                    mock.patch.object(proveout, "do_post", side_effect=reply) as do_post, \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                code = proveout.main()
+            self.assertEqual(do_post.call_count, 10)
+            self.assertNotIn(token, stdout.getvalue())
+            artifact_text = Path(out).read_text()
+            self.assertNotIn(token, artifact_text)
+            return code, json.loads(artifact_text)["failures"]
+
+    def test_real_available_and_unavailable_excerpts_pass(self):
+        for excerpt in (
+            {"available": True, "rows": [], "truncated": False},
+            {"available": False, "rows": [], "truncated": False},
+            {"available": True, "rows": [{"entry_id": "synthetic-entry"}], "truncated": False},
+            {"available": True, "rows": [{}] * 50, "truncated": True},
+        ):
+            with self.subTest(excerpt=excerpt):
+                self.assertEqual(self.run_proveout({"result": {
+                    "content": [], "structuredContent": excerpt,
+                }}), (0, []))
+
+    def test_audit_container_failure_is_expected_while_fenced(self):
+        self.assertEqual(self.run_proveout({"error": {
+            "code": -32000, "message": "container request failed",
+        }}), (0, []))
+
+    def test_other_audit_errors_still_fail(self):
+        code, failures = self.run_proveout({"error": {"code": -32603}})
+        self.assertEqual(code, 1)
+        self.assertEqual(failures, ["tools/call get_audit: unexpected JSON-RPC error code -32603"])
+
+    def test_stub_and_malformed_audit_envelopes_fail(self):
+        for excerpt in (
+            {"implemented": False}, None, [],
+            {"available": True, "rows": [], "truncated": False, "extra": 1},
+            {"available": 1, "rows": [], "truncated": False},
+            {"available": True, "rows": None, "truncated": False},
+            {"available": True, "rows": ["not-a-row"], "truncated": False},
+            {"available": True, "rows": [{}] * 51, "truncated": True},
+            {"available": True, "rows": [], "truncated": 0},
+            {"available": False, "rows": [{}], "truncated": False},
+            {"available": False, "rows": [], "truncated": True},
+        ):
+            with self.subTest(excerpt=excerpt):
+                code, failures = self.run_proveout({"result": {
+                    "content": [], "structuredContent": excerpt,
+                }})
+                self.assertEqual(code, 1)
+                self.assertEqual(failures, ["tools/call get_audit: expected bounded audit excerpt envelope"])
 
 
 class BodyCapTests(unittest.TestCase):

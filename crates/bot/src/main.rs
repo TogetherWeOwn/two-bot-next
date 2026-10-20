@@ -91,6 +91,8 @@ mod onboarding_tests;
 mod onboarding_unknown_only_acceptance_tests;
 #[cfg(test)]
 mod onboarding_worker_failure_acceptance_tests;
+#[cfg(test)]
+mod ops_audit_acceptance_tests;
 mod ops_backfill;
 mod ops_http;
 mod preflight;
