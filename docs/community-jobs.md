@@ -67,9 +67,24 @@ except for the rank self-heal below, the one tick that writes to Discord:
   `Legend missing matches=0`); it never logs a Discord role name or id and
   still fails closed with `configuration`.
 - Non-nested ranks self-heal when the live-identity fence permits the
-  `rank_heal` capability: the tick grants the missing lower rungs (bounded,
-  hierarchy-fenced, with an audit reason) and republishes; a refused identity
-  keeps the old refusal.
+  `rank_heal` capability; a refused identity keeps the old refusal. The initial
+  plan must contain at most 25 grants and every target must be below the bot's
+  highest role. Before each candidate grant, the tick reads that member again
+  and recomputes their missing lower rungs. Removed higher ranks, departures,
+  bots and already-held rungs cannot authorize a grant. Wrong user identity,
+  incomplete roles or failed reads refuse repair, not an empty membership.
+- Repair never grows its initial candidate queue: at most 25 eligibility reads,
+  25 additive-only grants with the existing audit reason, and one final read
+  per affected member (at most 25). All affected entries are replaced by their
+  observed roles, or removed on a confirmed 404, before rebuilding publication.
+  Unverifiable or still-nonnested results leave the prior snapshot and its
+  timestamps unchanged. New missing rungs outside the initial queue wait for a
+  later tick rather than causing unbounded replanning. Logs identify actual
+  applied grants separately from successful observed nesting verification.
+- These reads narrow observed-staleness windows, not a distributed atomic
+  transaction: Discord may change roles between the last eligibility read and
+  its PUT, or after the final member observation. A failed tick cannot undo
+  Discord grants already applied; no automatic role removals are performed.
 - Failed or malformed scheduled-event reads keep the previous mirror. Only a
   valid empty event array clears it.
 
