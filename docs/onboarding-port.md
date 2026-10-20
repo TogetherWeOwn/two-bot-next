@@ -60,6 +60,25 @@ this slice.
    general parsing lists. Attach the games/session menu according to
    `PickerKind`; anchor attaches **nothing**, not even a footer. Build games
    with min 0/max 10 and current game-role defaults; session min 1/max 2.
+   A queued welcome re-reads `GET /guilds/{guild}/members/{member}` after the
+   postable-channel check and before `begin_prompt`. That read may narrow the
+   eligibility captured at dispatch, never widen it: the captured guild,
+   trigger, bot and pending filter still runs first and performs no member
+   read. HTTP 404, `pending: true` and `user.bot: true` are terminal skips
+   with no post and no prompt or route marker, so a later genuine gate-clear
+   can still send. A wrong user id, a missing user, a non-boolean `pending`
+   or `bot`, a missing or non-array `roles` field, a non-snowflake role id,
+   HTTP 403 or 5xx, and a timed-out read return before the prompt lock and
+   leave the durable job retryable. The worker claims no job until the shard
+   receives an authenticated dispatch (READY, RESUMED or a replay with a valid
+   session), proving Discord accepted the Hello-queued Resume or Identify. A
+   cooperative shutdown before authentication leaves jobs unclaimed and waits
+   for the ordered writer to drain. Games-menu defaults come from
+   that fresh role list, not the roles captured at dispatch. Omitted `pending`
+   and `bot` mean false. The read is the shared strict GET (only 404 is
+   absence) on its existing five-second moderation deadline, inside the
+   worker's ninety-second budget. This does not enable onboarding as a live
+   flow or claim deployment parity.
 5. Dispatch `two:onboarding:games` only outside session mode, and
    `two:onboarding:session` in session mode. Defer ephemerally. Execute game
    add/remove-to-match effects; on role failure use `PICKER_ROLE_FAILURE_REPLY`
@@ -220,8 +239,10 @@ not for the reconciliation with main `8af9b23` (shared command runtime and outbo
 message safety). The complete reconciled head still requires exact-head green CI
 and independent review on the same review card. Database isolation alone does not
 establish Discord's three-second ACK budget.
-Local Rust compilation has no certified bounded admission in this workspace; use the existing authorized CI
-service containers, never a speculative local build or target-directory bypass.
+**Historical local-admission constraint at that checkpoint:** local Rust
+compilation had no certified bounded admission in that workspace; the instruction
+was to use existing authorized CI service containers, never a speculative local
+build or target-directory bypass. This is not a current pool-health assessment.
 Do not enable this checkpoint as a live onboarding flow or claim deployment
 parity.
 
@@ -234,16 +255,46 @@ Framework references:
 
 ## Verification
 
+These are runnable recipes, not new execution evidence for the checkpoint above.
+On the persistent controller, use the
+[bounded build-cache wrapper](build-cache.md#local-builds) from the isolated
+worktree, with a 600000 ms Bash timeout or in the background. If admission is
+refused or missing, stop and follow the
+[Operator path](build-cache.md#operator-handoff-and-rollback-one-host-step);
+never use direct compiling Cargo, another cache or a speculative target.
+`cargo fmt` does not compile and may run directly.
+
 ```sh
+# Persistent controller only (fmt may run anywhere).
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --locked
+python3 scripts/cargo_cache.py run -- clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
+python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test onboarding_wire --locked
+TWO_GATEWAY_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test \
+  python3 scripts/cargo_cache.py run -- test -p two-bot --locked onboarding_ -- --include-ignored
+```
+
+Ephemeral hosted CI keeps its direct Cargo variants and the same filters:
+
+```sh
+# Ephemeral hosted CI only, not a controller fallback.
 cargo test -p two-bot-core --locked
 cargo clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 cargo test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
 cargo test -p two-bot-discord --test onboarding_wire --locked
-cargo test -p two-bot --locked onboarding_ -- --include-ignored
+TWO_GATEWAY_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test \
+  cargo test -p two-bot --locked onboarding_ -- --include-ignored
 ```
 
-The DB proof is opt-in and hardwired to
+The broad `onboarding_` filter also selects gateway onboarding recovery tests,
+which require the dedicated `TWO_GATEWAY_TEST_DATABASE_URL` shown above; the
+gateway guard restricts it to the disposable `agent_test` user/database on the
+test host (or CI loopback), never runtime `DATABASE_URL`. This variable does not
+override the hardwired endpoint in `onboarding_tests`.
+
+The core `onboarding_store` DB proof is opt-in and hardwired to
 `postgres://agent_test@agent-testdb:5432/postgres` with an empty password. It
 never reads `DATABASE_URL` or Discord credentials. Each run creates two unique
 schemas and installs `search_path` on **every** pooled connection. It verifies

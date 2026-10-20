@@ -124,7 +124,7 @@ the Join channel. The join-request flow is in
   authoritative snapshot that still shows the room.
 - **Grants are durable.** Approved members' Connect allows are witnessed in
   `voice_join_grants` (one row per room member, written before the grant PUT
-  and retired only after the revoke lands or the grant is refused), so a
+  and retired only after a safe revoke or a fresh intent's PUT is refused), so a
   restart cannot strand a Connect allow past `/public`. Worker load hydrates
   private rooms' grants and re-queues revocations for grants whose room is
   public or gone. Revocation clears only the Connect bit and keeps every other
@@ -160,7 +160,8 @@ the Join channel. The join-request flow is in
     only (never Manage Roles, other bits kept), then a move from the Join
     channel, but only if the member is still there. It refuses when the member
     carries a Connect deny from a passed vote-kick: an owner cannot undo a vote.
-    A refused grant is not claimed, so the member can ask again.
+    A fresh intent whose first PUT is definitively refused is not claimed, so
+    the member can ask again. A later refusal cannot clear an older witness.
   - *Deny* writes nothing.
   - *Block* persists through the privacy record (`voice_room_blocks`), so it
     survives a restart and `/public`.
@@ -169,17 +170,28 @@ the Join channel. The join-request flow is in
   waiting. `/public` takes approved members' Connect allow back and retires
   open prompts. A room delete forgets the state; its prompts go with the
   channel.
-- **Request ids.** Pending requests, grants and prompts are runtime-only. Each
-  button appends the worker's fresh 128-bit CSPRNG epoch to the numeric core
+- **Request ids.** Pending requests and prompts are runtime-only; grants are
+  durable. Each button appends the worker's fresh 128-bit CSPRNG epoch to the numeric core
   request id. The worker refuses a different or missing epoch before deciding,
   so a reset counter or a repeated/backward wall clock cannot revive an old
   button. Epochs are collision-resistant, not clock-based; ids remain within
   Discord's 100-character limit even with maximum-width numeric fields.
-- **Grants are durable.** The approval intent is recorded in
-  `voice_join_grants` before the Connect PUT; a refused grant retires its row
-  so the member can ask again, while an unknown grant or revoke outcome keeps
-  its row so a retry or a restart can still revoke. Only a successful revoke
-  (or a refused grant) retires the witness.
+- **Grant-witness failure contract.** The approval intent is recorded in
+  `voice_join_grants` before the Connect PUT. The existing insert boundary
+  reports `Fresh`, `Retained` or `RoomMissing`; only the call that inserts a
+  fresh row may unwind it after a proven-unsent PUT refusal. An existing row
+  is an access obligation, not proof of a new grant: an earlier PUT may have
+  landed even if a retry returns AccessDenied, cancellation or another
+  definitive refusal. Unknown grant outcomes retain the row through those
+  refusals and across restart hydration. A successful grant followed by a
+  failed move also retains it. A retained row can conservatively represent an
+  unsent earlier attempt; do not infer ownership from arbitrary Connect allows.
+  `/public` still clears only the witnessed Connect allow, preserving unrelated
+  member allow/deny bits and vote-kick denies. Refused or uncertain revocation
+  retains the row. Successful revocation, authoritative absence under the
+  existing revoke path, or room deletion resolves it; a refused grant retry
+  cannot resolve a retained witness. No schema migration or new grant/release
+  authority is introduced.
 
 ## Residual parent work
 

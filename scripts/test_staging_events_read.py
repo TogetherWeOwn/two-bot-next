@@ -535,6 +535,14 @@ class FenceTests(unittest.TestCase):
 
 
 class ShapeTests(unittest.TestCase):
+    def test_the_artifact_window_is_capped_independently_of_cli_validation(self):
+        rows = [{"event_type": "member_join", "recorded_at": "2026-10-07T14:01:00.000Z"}]
+        for end, expected in (("2026-10-07T14:15:00.000Z", []),
+                              ("2026-10-07T14:15:00.001Z", ["window"])):
+            with self.subTest(end=end):
+                artifact = reader.build_artifact("2026-10-07T14:00:00.000Z", end, rows)
+                self.assertEqual(reader.artifact_errors(artifact), expected)
+
     def test_the_artifact_contract_rejects_extra_fields(self):
         good = reader.build_artifact("2026-10-07T14:00:00.000Z", "2026-10-07T14:15:00.000Z",
                                      [{"event_type": "member_join", "recorded_at": "2026-10-07T14:01:00.000Z"}])

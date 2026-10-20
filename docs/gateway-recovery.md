@@ -19,6 +19,36 @@ A crash before commit rolls the batch and checkpoint back together; a crash afte
 
 Open voice sessions are **never** restored. The existing pipeline drops them on READY and RESUMED (legacy `ShardReady`/`ShardResume`). This intentionally avoids outage-inflated durations. Twilight's channel/member cache is also cold after a process restart; this slice does not claim a fully restored cache or invite baseline. Facts, real leveling, REST side effects and invite fetching remain the existing S4/S6 seams; this transaction currently covers the S3 funnel, not arbitrary external side effects. Maintain one running shard owner per guild; overlapping independent deployments are not a supported recovery mechanism.
 
+### Voice accounting across lifecycle gaps
+
+A guild-unavailable frame (including an unavailable `GuildCreate`) or permanent
+`GuildDelete` discards that guild's measured starts and serial chains. A guild
+`ChannelDelete` discards starts in that channel and their associated chains;
+other channels and guilds keep their witnessed starts. READY/RESUMED still
+invalidate every guild. A lifecycle write barrier waits for complete in-flight
+voice/member effects before discarding state and updating the cache, so an
+older join cannot put its start back after invalidation.
+
+Invalidation writes no end/start rows, facts or XP. A returning guild roster
+updates cache occupancy, not measured starts. A later real boundary is either
+omitted (for example, server leave with no tracked start) or honestly unknown;
+only a newly observed join can begin a new measured interval. Mute-only frames,
+normal moves (end before start at one receipt time), and ordinary member leaves
+keep their existing semantics. No room-management or reward-rate policy changes.
+
+The offline `funnel_voice_lifecycle_acceptance` suite drives the real pipeline
+with explicit timestamps and recording facts/leveling hooks. Its cache-only
+control pins that the current Twilight resource configuration **retains** the
+old channel after guild-unavailable, permanent-removal and channel-delete frames;
+a subsequent null frame clears it. A returning available roster replaces the
+guild's voice-membership index but can leave absent members' old state objects;
+those objects cannot witness the old half of a fresh join/move. A missing index
+and real null frames retain the existing READY unknown-end behavior. This proves
+missing accounting invalidation, not an evicted-cache equal-null bug. Recordings prove funnel rows, facts and XP
+hook inputs, not persisted rewards, live gateway ordering or installed behavior.
+Internal pipeline unit tests additionally cover scoped chain retirement and an
+in-flight join overlapping deletion. Deployment/acceptance evidence is separate.
+
 ## RSVP interaction scheduling (S4)
 
 The shared executor resolves the current bot application and synchronizes the full guild command registry before polling the shard. This also covers a persisted-session boot that receives RESUMED without READY; failed registry sync prevents gateway readiness.
@@ -75,9 +105,10 @@ TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_te
 # Ephemeral CI only — on the persistent controller use the wrapper form above.
 TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_test \
   cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
-# Ephemeral CI only — on the persistent controller use the wrapper form below.
+# Persistent controller: bounded wrapper.
 TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
   python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --locked --test gateway_force_identify_cli
+# Ephemeral CI only — on the persistent controller use the wrapper form above.
 TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
   cargo test -p two-bot-cutover --locked --test gateway_force_identify_cli
 ```

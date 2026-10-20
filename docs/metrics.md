@@ -17,6 +17,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 
 | Metric | Meaning |
 | --- | --- |
+| `two_bot_process_incarnation{part}` | Nonzero random process-lifetime identity in four unsigned 32-bit numeric parts (`0`, `1`, `2`, `3`), emitted with the counters in the same scrape; no PID, timestamp, build or identity-valued label. Stable across renders and new on process replacement. Optional for older containers; partial, duplicate, mislabeled or invalid parts invalidate the scrape. Used only to attribute gateway pairing windows, not as recovery or health evidence |
 | `two_bot_gateway_latency_seconds` | Last heartbeat round-trip from Twilight's completed ACK sample |
 | `two_bot_gateway_reconnects_total` | New HELLOs after the first HELLO in the running loop (successful transport reconnections, not failed dial attempts) |
 | `two_bot_gateway_resumes_total` | Received RESUMED dispatches |
@@ -643,7 +644,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
 | `voice_failures` | room-op failures > 5% of >= 10 ops between samples, any new dead-letter/orphan, or any new vote-kick enforcement failure (`discord_error`/`gave_up`/`permission_missing`; benign refusals and terminal skips never fire; missing/invalid samples hold, restarts skip the window) | [voice failures](runbook.md#alert-voice-failures) |
 | `gateway_missed_events` | any increase of `two_bot_gateway_missed_events_total` between samples (first sample and restarts skip the window) | [gateway missed events](runbook.md#alert-gateway-missed-events) |
-| `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` grew and RESUMED plus fresh READY (`two_bot_gateway_events_total{event="READY"}`) have not grown for 3 consecutive samples; any RESUMED or fresh READY growth clears at once (first sample sets the baseline, restarts re-baseline and hold a firing alert, invalid samples change nothing) | [gateway unpaired disconnect](runbook.md#alert-gateway-unpaired-disconnect) |
+| `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` grew and RESUMED plus fresh READY (`two_bot_gateway_events_total{event="READY"}`) have not grown for 3 consecutive samples; any RESUMED or fresh READY growth clears at once (first sample sets the baseline; counter decreases or validated same-scrape process-identity changes re-baseline and hold a firing alert for one sample; legacy identity adoption never clears by itself; missing identity after attribution and invalid samples hold state) | [gateway unpaired disconnect](runbook.md#alert-gateway-unpaired-disconnect) |
 | `gateway_not_ready` | `/readyz` gateway component non-ready (`starting`/`down`) for 3 consecutive valid samples with no disconnect edge required; any ready sample clears at once (first valid sample sets the baseline, restarts re-baseline and hold a firing alert, invalid probes/scrapes change nothing) | [gateway not ready](runbook.md#alert-gateway-not-ready) |
 | `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | [ticker stale](runbook.md#alert-ticker-stale) |
 | `receiver_refusals:<family>` | refused `two_bot_internal_actions_total` outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak) | [receiver refusals](runbook.md#alert-receiver-refusals) |
@@ -689,8 +690,9 @@ it, while a valid flat or backwards window resolves it. Legacy DO state without
 the new per-lane maps reads as unbaselined. A backwards counter in any observed
 lane signals a process reset: all valid lanes re-baseline with zero streaks and
 resolve, even if another lane's new count overtook its previous value. Missing
-lanes still retain active tickets. Without a process identity in the exposition a restart whose
-new count already exceeds the old count cannot be distinguished from growth.
+lanes still retain active tickets. Dispatch-drop rules do not consume the
+process-incarnation family: a restart whose new count already exceeds the old
+count cannot be distinguished from growth by this rule.
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
 Rust `*_INTERVAL_MS / 1000`. The 15 s tickers (`scheduled_messages`,

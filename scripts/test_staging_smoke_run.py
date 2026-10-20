@@ -40,8 +40,10 @@ PUBLISHED = json.loads(smoke.PUBLISH_SET.read_text(encoding="utf-8"))["builtins_
 
 
 def command(name, index):
+    # Discord command objects always carry the owning application_id.
     return {"id": str(2000000000000000000 + index), "name": name, "type": 1,
-            "guild_id": STAGING_GUILD, "version": str(1000000000000000000 + index)}
+            "application_id": STAGING_APP, "guild_id": STAGING_GUILD,
+            "version": str(1000000000000000000 + index)}
 
 
 def commands(*names):
@@ -393,6 +395,35 @@ class SmokeRunTests(unittest.TestCase):
         self.assertEqual(code, 1)
         row = self.rows(self.written())["/rank (registry read)"]
         self.assertEqual(row["failure_signature"], smoke.SIGNATURE_DETAIL)
+
+    def test_unadmitted_list_id_is_never_read_or_echoed(self):
+        sentinel = "REMOTE_REGISTRY_SENTINEL"
+        entries = commands(*PUBLISHED)
+        entries[0]["id"] = "1/" + sentinel
+        code, out = self.drive(discord=self.discord_fetch(list_response=json_body(entries)))
+        self.assertEqual(code, 1)
+        self.assertFalse([url for url in self.discord_requested if sentinel in url])
+        record = self.written()
+        row = self.rows(record)["/rank (registry read)"]
+        self.assertEqual(row["result"], "fail")
+        self.assertEqual(row["failure_signature"], smoke.SIGNATURE_DETAIL)
+        self.assertEqual(self.rows(record)["/leaderboard (registry read)"]["result"], "pass")
+        self.assertNotIn(sentinel, out)
+        self.assertNotIn(sentinel, json.dumps(record))
+
+    def test_resource_must_bind_the_listed_id_slash_type_and_a_valid_version(self):
+        sentinel = "REMOTE_REGISTRY_SENTINEL"
+        for change in ({"id": "2000000000000000099"}, {"type": 2}, {"version": sentinel}):
+            with self.subTest(change=change):
+                detail = {"rank": json_body(dict(command("rank", 0), **change))}
+                code, out = self.drive(discord=self.discord_fetch(detail=detail))
+                self.assertEqual(code, 1)
+                record = self.written()
+                row = self.rows(record)["/rank (registry read)"]
+                self.assertEqual(row["result"], "fail")
+                self.assertEqual(row["failure_signature"], smoke.SIGNATURE_DETAIL)
+                self.assertNotIn(sentinel, out)
+                self.assertNotIn(sentinel, json.dumps(record))
 
     def test_foreign_application_token_is_refused_and_not_retried(self):
         discord = self.discord_fetch(identity=json_body({"id": OTHER_APP}))

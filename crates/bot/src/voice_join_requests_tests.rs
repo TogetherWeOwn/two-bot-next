@@ -967,6 +967,67 @@ async fn a_grant_survives_a_restart_and_public_revokes_only_its_connect_bit() {
 }
 
 #[tokio::test]
+async fn join_grant_witness_landed_unknown_then_refused_restarts_and_revokes() {
+    for refusal in [
+        RoomHttpError::AccessDenied,
+        RoomHttpError::Cancelled,
+        RoomHttpError::NotFound,
+        RoomHttpError::Unauthorized,
+    ] {
+        let (mut worker, _trace) = private_room().await;
+        enter(&worker, OUTSIDER, 2_000);
+        worker.reconcile();
+        drain(&mut worker).await;
+        let request = request_of(&worker, OUTSIDER);
+        worker
+            .http
+            .overwrite_errors
+            .lock()
+            .unwrap()
+            .extend([RoomHttpError::UnknownOutcome, refusal]);
+        press(&mut worker, OWNER, JoinDecision::Approve, request.id.0);
+        assert!(worker.dispatch_one(1_000_000).await);
+        assert_eq!(stored_grants(&worker), [OUTSIDER]);
+        // Model the first PUT actually landing, with the gateway echo arriving
+        // before a refused retry. Revocation must remove a real Connect allow.
+        worker.note_overwrite(
+            ROOM,
+            &PermissionOverwrite {
+                allow: Permissions::CONNECT | Permissions::SPEAK,
+                deny: Permissions::MUTE_MEMBERS,
+                id: Id::new(OUTSIDER),
+                kind: PermissionOverwriteType::Member,
+            },
+        );
+        for step in 2..=40 {
+            if !worker.dispatch_one(step * 1_000_000).await {
+                break;
+            }
+        }
+        assert!(worker.http.overwrite_errors.lock().unwrap().is_empty());
+        assert_eq!(stored_grants(&worker), [OUTSIDER], "{refusal:?}");
+        assert!(worker.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
+        let mut after = restarted(&worker).await;
+        assert!(after.privacy[&ROOM].granted.contains(&MemberId(OUTSIDER)));
+        assert!(after
+            .apply_privacy(OWNER, false, "Ana", PrivacyCommand::Public)
+            .contains("public again"));
+        drain(&mut after).await;
+        let kept = after
+            .live_overwrites(ROOM)
+            .unwrap()
+            .into_iter()
+            .find(|entry| {
+                entry.kind == PermissionOverwriteType::Member && entry.id.get() == OUTSIDER
+            })
+            .expect("unrelated bits survive revocation");
+        assert_eq!(kept.allow, Permissions::SPEAK);
+        assert_eq!(kept.deny, Permissions::MUTE_MEMBERS);
+        assert!(stored_grants(&after).is_empty());
+    }
+}
+
+#[tokio::test]
 async fn an_unknown_grant_outcome_keeps_its_witness() {
     let (mut worker, _trace) = private_room().await;
     enter(&worker, OUTSIDER, 2_000);

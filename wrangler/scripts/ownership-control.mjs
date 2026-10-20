@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Staging-only control client. Secrets are read from env, never argv or stdout.
 // Production handoff remains B4's separately authorized execution sheet.
+import { isDirectInvocation } from "./is-direct-invocation.mjs";
+
 class ControlError extends Error {}
 
 class HttpFailure extends ControlError {
@@ -152,7 +154,7 @@ export async function control({ action, url, token, actor, expectedEpoch, expect
   }
 }
 
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+if (isDirectInvocation(process.argv[1], import.meta.url)) {
   const [action, epoch] = process.argv.slice(2);
   try {
     const result = await control({

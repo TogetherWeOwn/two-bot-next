@@ -620,16 +620,20 @@ impl HyperTransport {
             },
         };
         let status = response.status().as_u16();
-        let accounting = crate::ratelimit_guard::ResponseAccounting::new(
+        let mut accounting = crate::ratelimit_guard::ResponseAccounting::new(
             &self.guard,
             status,
             response.headers(),
             !is_interaction_token_request(request),
         );
-        // Learn per-route bucket state from this response's `X-RateLimit-*`
-        // headers before the body is read: the next admission gates on it.
+        // Full bucket state is known at headers. Bare Retry-After waits for
+        // body classification so existing body timing/scope policy still wins.
+        let route_key = bucket_route_key(request);
         self.guard
-            .observe_bucket(&bucket_route_key(request), response.headers());
+            .observe_bucket_headers(&route_key, response.headers());
+        if status == 429 {
+            accounting.track_bare_bucket(&route_key, response.headers());
+        }
         attempt.finish(Some(status));
         // The 429 wait honors `retry-after` first, then the bucket
         // `reset-after` hint: on a 429 both name the same pause, and the reset
@@ -1135,18 +1139,17 @@ impl ActionExecutor {
         essential: bool,
     ) -> Result<(), GuardError> {
         let guard = &self.inner.transport.guard;
-        // Route-aware admission on the paced lanes: the guard paces all
-        // executors sharing it and holds same-bucket reads until the header
-        // reset (see admit_route). Lane-less sends keep plain admission.
+        // Lane-less admission also honors learned route deadlines, but only
+        // paced lanes take a shared pacing turn.
+        let route_key = bucket_route_key(request);
         let Some(kick_lane) = lane else {
-            return guard.admit(essential).await;
+            return guard.admit_route_recheck(&route_key, essential).await;
         };
         let (lock, interval) = if kick_lane {
             (&self.inner.kick_last_at, self.inner.kick_interval)
         } else {
             (&self.inner.pace_last_at, self.inner.pace_interval)
         };
-        let route_key = bucket_route_key(request);
         // Wait out guard gates (global pause, this route's bucket deadline,
         // shared pacing) before taking the lane lock: a route-local bucket
         // reset can be seconds away, and sleeping it out under the lane
@@ -2768,15 +2771,32 @@ impl ActionExecutor {
             let rows: Vec<serde_json::Value> = serde_json::from_slice(&res.body)
                 .map_err(|_| DiscordError::Unavailable("unreadable message history".into()))?;
             for row in &rows {
-                if row["nonce"].as_str() == Some(nonce)
-                    && row["author"]["id"].as_str() == Some(&bot_user_id.to_string())
-                    && row["channel_id"].as_str() == Some(channel_id)
+                // A non-match proves absence only if its required evidence is readable.
+                // Map upstream ID failures to a fixed error, never a raw snowflake value.
+                let unreadable = || DiscordError::Unavailable("unreadable message history".into());
+                let id = row["id"].as_str().ok_or_else(unreadable)?;
+                let author = row["author"]["id"].as_str().ok_or_else(unreadable)?;
+                let message_id: Id<MessageMarker> = snowflake(id).map_err(|_| unreadable())?;
+                let author_id: Id<UserMarker> = snowflake(author).map_err(|_| unreadable())?;
+                if message_id.to_string() != id
+                    || author_id.to_string() != author
+                    || row["channel_id"].as_str() != Some(channel_id)
                 {
-                    let id = row["id"].as_str().ok_or_else(|| {
-                        DiscordError::Unavailable("accepted message missing id".into())
-                    })?;
-                    let _: Id<MessageMarker> = snowflake(id)?;
-                    return Ok(Some(id.to_owned()));
+                    return Err(unreadable());
+                }
+                if author_id.get() == bot_user_id {
+                    let row_nonce = &row["nonce"];
+                    // Only the bot's rows need readable nonce evidence to prove a non-match.
+                    if !row_nonce.is_null()
+                        && !row_nonce.is_string()
+                        && !row_nonce.is_i64()
+                        && !row_nonce.is_u64()
+                    {
+                        return Err(unreadable());
+                    }
+                    if row_nonce.as_str() == Some(nonce) {
+                        return Ok(Some(id.to_owned()));
+                    }
                 }
             }
             if rows.len() < 100 {
