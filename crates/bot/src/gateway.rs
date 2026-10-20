@@ -19,7 +19,7 @@ use std::sync::{
 
 use crate::onboarding::OnboardingJob;
 
-use futures_util::{Stream as _, StreamExt as _};
+use futures_util::StreamExt as _;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Message, Session, Shard, ShardId};
@@ -1186,9 +1186,11 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let error = Arc::new(std::sync::Mutex::new(None));
     let worker_error = Arc::clone(&error);
     let (failed, failure) = tokio::sync::watch::channel(false);
-    // Hello queues Resume or Identify; Twilight writes that frame on the next
-    // poll. The worker waits so a fast member-read error cannot drop the socket
-    // before the write.
+    // Hello queues Resume or Identify and Twilight writes it on a later poll.
+    // The worker waits for the first validated authenticated dispatch (READY,
+    // RESUMED or a replay with a valid session), the only proof Discord
+    // accepted the opening frame, so a fast member-read error cannot drop the
+    // socket before that write lands.
     let (opening_tx, opening_rx) = tokio::sync::watch::channel(false);
     let receive_generation = Arc::clone(&generation);
     let automod_enabled = automod.is_some();
@@ -1236,17 +1238,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         shard = Shard::with_config(shard.id(), shard.config().clone());
                         info!("cold resume committed; requesting voice snapshot via identify");
                     }
-                    let mut prefetched: Option<
-                        Result<Message, twilight_gateway::error::ReceiveMessageError>,
-                    > = None;
                     loop {
-                        let item = if let Some(item) = prefetched.take() {
-                            item
-                        } else {
-                            match shard.next().await {
-                                Some(item) => item,
-                                None => break,
-                            }
+                        let item = match shard.next().await {
+                            Some(item) => item,
+                            None => break,
                         };
                         let received_at = tokio::time::Instant::now();
                         let message = match item {
@@ -1279,21 +1274,6 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             let hello: HelloPacket = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway hello".into()))?;
                             if hello.d.heartbeat_interval == 0 { return Err(sqlx::Error::InvalidArgument("zero heartbeat interval".into())); }
                             deadline = CHECKPOINT_IO_MAX.min(std::time::Duration::from_millis(hello.d.heartbeat_interval) / 4);
-                            // Flush the Hello-queued Resume/Identify before this
-                            // task yields. A frame that arrives in the same wake
-                            // is kept; Pending means the write finished or the
-                            // socket will finish it on the next poll.
-                            if let Some(item) = std::future::poll_fn(|cx| {
-                                match std::pin::Pin::new(&mut shard).poll_next(cx) {
-                                    std::task::Poll::Pending => std::task::Poll::Ready(None),
-                                    std::task::Poll::Ready(item) => std::task::Poll::Ready(item),
-                                }
-                            })
-                            .await
-                            {
-                                prefetched = Some(item);
-                            }
-                            let _ = opening_tx.send(true);
                         }
                         if header.op == 9 {
                             let packet: serde_json::Value = serde_json::from_str(&text).map_err(|_| sqlx::Error::InvalidArgument("invalid gateway session packet".into()))?;
@@ -1308,6 +1288,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         let resume_url = shard.resume_url().or_else(|| received.as_ref().filter(|saved| saved.session_id == session.id()).map(|saved| saved.resume_url.as_str()))
                             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
                         let checkpoint = GatewaySession { session_id: session.id().to_owned(), sequence, resume_url: resume_url.to_owned(), updated_at_ms: two_bot_core::funnel::now_millis_for_test() };
+                        // A dispatch with a valid session proves Discord accepted
+                        // the opening frame, even when it is a duplicate replay.
+                        let _ = opening_tx.send(true);
                         if dispatch_action(received.as_ref(), &checkpoint.session_id, sequence) == DispatchAction::Duplicate { continue; }
                         // Sequence jumps inside one session are dispatches
                         // Discord assigned but this process never received
@@ -1469,7 +1452,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             OnboardingQueueSignals {
                 signal: Arc::clone(&queue_signal),
                 writer_drained: Arc::clone(&writer_drained),
-                opening_flushed: opening_rx,
+                opening_confirmed: opening_rx,
             },
         )
     });
@@ -1635,12 +1618,12 @@ pub async fn run_shard<I: InviteSource + 'static>(
 ///
 /// Coordination signals for the queue worker: wakeups for newly committed
 /// jobs, the writer-drained shutdown flag, and the gateway opening-frame gate
-/// (claims wait until the Hello-queued Resume/Identify is flushed, so a fast
-/// member-read error cannot drop the socket before the write).
+/// (claims wait for the first validated authenticated dispatch, so a fast
+/// member-read error cannot drop the socket before the opening write).
 struct OnboardingQueueSignals {
     signal: Arc<tokio::sync::Notify>,
     writer_drained: Arc<std::sync::atomic::AtomicBool>,
-    opening_flushed: tokio::sync::watch::Receiver<bool>,
+    opening_confirmed: tokio::sync::watch::Receiver<bool>,
 }
 
 async fn onboarding_queue(
@@ -1651,13 +1634,14 @@ async fn onboarding_queue(
     live_interactions: LiveInteractions,
     mut signals: OnboardingQueueSignals,
 ) -> Result<(), sqlx::Error> {
-    // Claim nothing until the opening frame is written. A cooperative shutdown
+    // Claim nothing until the opening is confirmed. A cooperative shutdown
     // before Hello leaves the durable jobs for the next boot instead of waiting
-    // out the drain budget. A dropped sender stays pending so the dispatch
-    // result is the one the runner reports.
+    // out the drain budget. A closed sender (reception ended) waits for the
+    // writer drain, never returns first, so the dispatch result is the one the
+    // runner reports.
     loop {
         let notified = signals.signal.notified();
-        if *signals.opening_flushed.borrow() {
+        if *signals.opening_confirmed.borrow() {
             break;
         }
         if signals.writer_drained.load(Ordering::Acquire) {
@@ -1669,13 +1653,21 @@ async fn onboarding_queue(
             // pending await below makes run_shard !Send.
             closed = async {
                 signals
-                    .opening_flushed
+                    .opening_confirmed
                     .wait_for(|flushed| *flushed)
                     .await
                     .is_err()
             } => {
                 if closed {
-                    std::future::pending::<()>().await;
+                    // The stored Notify permit makes a drain notification that
+                    // raced this await safe; recheck the flag each wake.
+                    loop {
+                        let drained = signals.signal.notified();
+                        if signals.writer_drained.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        drained.await;
+                    }
                 }
                 break;
             }
