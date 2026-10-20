@@ -28,6 +28,29 @@ REST must return the requested channel ID, configured guild ID, and text or
 announcement channel type (0 or 5). Foreign-guild/malformed channels and missing
 lockdown recovery state never cause a permission mutation.
 
+## Purge completion and early stops
+
+A completed purge keeps the slash reply `Moderation action completed: purged (N).`
+and the existing audit metadata, internal response and stored replay payload byte
+for byte. It omits `stop_reason` entirely, rather than adding a null field, and
+its outer receipt stores NULL.
+
+If a delete is refused after at least one confirmed deletion, the purge stops
+without retrying or resuming. The count still includes only confirmed deletions.
+The slash reply is `Moderation action completed: purged (N, stopped early: refused).`
+or `Moderation action completed: purged (N, stopped early: rate_limited).` A 429
+produces `rate_limited`; other definitive refusals produce `refused`. Both audit
+paths and the internal stored result append `stop_reason` last. The signed HTTP
+response appends it to `result` after `affected`, for example
+`{"outcome":"purged","affected":1,"stop_reason":"rate_limited"}`. The outer
+receipt and its terminal audit keep the reason (migration `0448`), so outer and
+inner replays return the same reason without another Discord call. The audit
+outcome remains `purged`.
+
+A refusal before any deletion still errors; a timeout or unavailable response
+after a deletion still retains the uncertain-effect fences rather than claiming
+completion. A message already gone (404) does not increment the deleted count.
+
 ## Shared ledger and recovery
 
 Run the embedded migrations, including `0123_channel_execution_fence.sql`.

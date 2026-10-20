@@ -349,6 +349,10 @@
       "sha256": "f5280fb02325d7f63a2f563f410f71bb7b79e228a4362537511ae687cab27980",
       "justification": "Audit resource witness for event intents: nullable resource_id/affected/outcome on internal_action_log copied from the completed receipt so a target-less event create still names its Discord event; additive, backout drops the columns."
     },
+    "crates/cutover/migrations/0448_internal_action_stop_reason.sql": {
+      "sha256": "de10c43d5c2935c8bb0056df56137a431f5c5730600ab7e05c1d1f4578c3a57c",
+      "justification": "Durable purge stop reason for website channel-moderation receipts: nullable refused/rate_limited on internal_idempotency and its terminal audit so an outer replay of an early-stopped purge keeps its reason; additive, backout drops both columns. Numbered 0448 because the store chain owns 0446 and the cutover chain 0447; global migration numbers remain unique across both chains."
+    },
     "crates/cutover/migrations/0426_community_facts_guild_source.sql": {
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
