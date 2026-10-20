@@ -1023,3 +1023,361 @@ async fn receiver_shutdown_admits_no_new_children() {
     assert_eq!(sender.calls().len(), 1);
     assert_eq!(ledger.delivered.load(Ordering::SeqCst), 1);
 }
+
+/// Review-regression acceptance, authored against the immutable receiver head.
+/// Protected with the original controls above: no production timeout changes,
+/// database, external API, or replacement supervisor in these fixtures.
+mod production_composition_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_admission_refuses_valid_router_request_before_claim_or_send() {
+        let _serial = RECEIVER_LOG_SERIAL.lock().await;
+        let attempted = post_count("attempted");
+        let succeeded = post_count("succeeded");
+        let failed = post_count("failed");
+        let ledger = GateLedger::new();
+        let sender = GateSender::scripted(vec![Ok("msg-must-not-send".to_owned())]);
+        let state = Arc::new(ReceiverState::with_delivery(
+            &config(),
+            Some(gated_deps(Arc::clone(&ledger), Arc::clone(&sender))),
+        ));
+        let app = router(Arc::clone(&state));
+
+        // Reach the handler after the latch, not a TCP connection that Axum
+        // can refuse without ever exercising the child-admission guard.
+        BoundReceiver::close_admission(&state).await;
+        // If the guard is removed, the request completes as a wrong 200,
+        // rather than hanging in our sender and hiding the missing guard.
+        sender.release.add_permits(1);
+        let response = post_stream(app, 700, "synthetic-closed-latch").await;
+        let (status, code) = status_and_code(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "busy");
+        assert_eq!(ledger.claims.load(Ordering::SeqCst), 0);
+        assert_eq!(ledger.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(ledger.delivered.load(Ordering::SeqCst), 0);
+        assert_eq!(ledger.releases.load(Ordering::SeqCst), 0);
+        assert!(ledger.rows.lock().unwrap().is_empty());
+        assert!(sender.calls().is_empty());
+        assert_eq!(sender.entered.load(Ordering::SeqCst), 0);
+        assert_eq!(post_count("attempted"), attempted);
+        assert_eq!(post_count("succeeded"), succeeded);
+        assert_eq!(post_count("failed"), failed);
+    }
+
+    #[tokio::test]
+    async fn cancelled_last_receiver_owner_detaches_child_to_settle_and_count_once() {
+        let _serial = RECEIVER_LOG_SERIAL.lock().await;
+        let attempted = post_count("attempted");
+        let succeeded = post_count("succeeded");
+        let failed = post_count("failed");
+        let ledger = GateLedger::new();
+        let sender = GateSender::scripted(vec![Ok("msg-last-owner".to_owned())]);
+        let state = Arc::new(ReceiverState::with_delivery(
+            &config(),
+            Some(gated_deps(Arc::clone(&ledger), Arc::clone(&sender))),
+        ));
+        let last_owner = Arc::downgrade(&state);
+        let request = tokio::spawn(post_stream(
+            router(Arc::clone(&state)),
+            710,
+            "synthetic-last-owner",
+        ));
+        assert!(wait_until(|| sender.entered.load(Ordering::SeqCst) == 1).await);
+        assert_eq!(ledger.claims.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(sender.completed.load(Ordering::SeqCst), 0);
+        assert_eq!(post_count("attempted"), attempted);
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        drop(state);
+        assert!(
+            wait_until(|| last_owner.strong_count() == 0).await,
+            "the last receiver/router owner must be dropped before sender release"
+        );
+        // No serve(), shutdown latch, deadline, or explicit join/detach path
+        // runs here. Removing ReceiverState::drop's detach must abort this
+        // still-blocked child and fail the settlement witness below.
+        for _ in 0..128 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(ledger.delivered.load(Ordering::SeqCst), 0);
+        assert_eq!(ledger.releases.load(Ordering::SeqCst), 0);
+        assert_eq!(post_count("attempted"), attempted);
+        sender.release.add_permits(1);
+        assert!(
+            wait_until(|| ledger.delivered.load(Ordering::SeqCst) == 1
+                && post_count("attempted") == attempted + 1)
+            .await,
+            "a child detached by last-owner Drop must settle and count its late success"
+        );
+        for _ in 0..128 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(last_owner.strong_count(), 0);
+        assert_eq!(sender.entered.load(Ordering::SeqCst), 1);
+        assert_eq!(sender.completed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            sender.calls().len(),
+            1,
+            "no second send after owner cancellation"
+        );
+        assert_eq!(ledger.claims.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger.delivered.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger.releases.load(Ordering::SeqCst), 0);
+        let rows = ledger.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows.values().all(|row| *row == GateRow::Delivered));
+        assert_eq!(post_count("attempted"), attempted + 1);
+        assert_eq!(post_count("succeeded"), succeeded + 1);
+        assert_eq!(post_count("failed"), failed);
+    }
+
+    /// Set the real service override only in a fresh test process. Mutating
+    /// process env in this binary would race unrelated shutdown tests. Keep
+    /// inherited coverage/runtime env, and verify that exactly one test ran.
+    fn run_isolated_deadline_case(name: &str, service_seconds: u64) -> bool {
+        const CASE_ENV: &str = "TWO_TEST_EVENTSUB_COMPOSITION_CASE";
+        if std::env::var(CASE_ENV).ok().as_deref() == Some(name) {
+            assert_eq!(
+                crate::shutdown::deadline(),
+                Duration::from_secs(service_seconds)
+            );
+            return false;
+        }
+        let test = format!(
+            "eventsub_http::tests::delivery_shutdown_tests::production_composition_tests::{name}"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env(CASE_ENV, name)
+            .env(crate::shutdown::TIMEOUT_ENV, service_seconds.to_string())
+            .output()
+            .expect("run isolated shutdown configuration");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("running 1 test"),
+            "test selector missed {test}: {stdout}\n{stderr}"
+        );
+        assert!(output.status.success(), "{test}:\n{stdout}\n{stderr}");
+        true
+    }
+
+    async fn scheduler_turns() {
+        // Always runnable while paused: no auto-advance over a deadline while
+        // waiting for loopback I/O or shutdown-watch propagation.
+        for _ in 0..128 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn production_drain_case(service_seconds: u64, complete_inside_budget: bool) {
+        let _serial = RECEIVER_LOG_SERIAL.lock().await;
+        let capture = crate::tracing_capture::global();
+        let log_start = capture.text().len();
+        let attempted = post_count("attempted");
+        let succeeded = post_count("succeeded");
+        let failed = post_count("failed");
+        let ledger = GateLedger::new();
+        let sender = GateSender::scripted(vec![Ok("msg-composed-drain".to_owned())]);
+        let bound = bind_with_delivery(
+            bind_config(),
+            Some(gated_deps(Arc::clone(&ledger), Arc::clone(&sender))),
+        )
+        .await
+        .expect("receiver loopback bind");
+        let addr = bound.listener.local_addr().unwrap();
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let status = crate::jobs::statuses(&[], true);
+        let gateway_state = Arc::new(tokio::sync::RwLock::new(
+            crate::gateway::GatewayState::Armed,
+        ));
+        let gateway_stop = stop.subscribe();
+        let gateway = tokio::spawn(async move {
+            crate::server::shutdown_requested(gateway_stop).await;
+            Ok::<(), sqlx::Error>(())
+        });
+        let public = crate::server::serve(
+            crate::server::bind("127.0.0.1:0").await.unwrap(),
+            crate::server::SharedState::new(Arc::clone(&gateway_state), None),
+            status.clone(),
+            stop.clone(),
+        );
+        let http = crate::website_jobs::serve_listeners(
+            public,
+            bound.serve(stop.subscribe()),
+            stop.clone(),
+        );
+        // These are the real nested production supervisors, not a copy of
+        // drain_http or a receiver-only substitute. The gateway fixture has
+        // no external connection and completes only when stop latches.
+        let http = crate::website_jobs::serve_jobs(vec![], status, stop.clone(), http);
+        let service_stop = stop.clone();
+        let service = tokio::spawn(async move {
+            let result = crate::supervise_gateway(gateway, http, gateway_state, service_stop).await;
+            (result, tokio::time::Instant::now())
+        });
+
+        // Connect on live time; only pause once the real handler has admitted
+        // a child and committed its start fence. Keep its HTTP request live
+        // throughout the drain, so HTTP and child cleanup must share ONE
+        // deadline rather than each receiving a fresh allowance.
+        let client = connect_and_send(addr, 720, "synthetic-composed-drain").await;
+        assert!(wait_until(|| sender.entered.load(Ordering::SeqCst) == 1).await);
+        assert_eq!(ledger.claims.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger.starts.load(Ordering::SeqCst), 1);
+        tokio::time::pause();
+        let stopped_at = tokio::time::Instant::now();
+        stop.send_replace(true);
+        scheduler_turns().await;
+
+        // Independent contract: five-second HTTP cap, service override when
+        // shorter, and the sibling receiver's 500 ms supervisor headroom.
+        let supervisor_bound = Duration::from_secs(service_seconds.min(5));
+        let receiver_budget = supervisor_bound - Duration::from_millis(500);
+        tokio::time::advance(receiver_budget - Duration::from_millis(100)).await;
+        scheduler_turns().await;
+        assert!(
+            !service.is_finished(),
+            "an admitted child must be joined, not abandoned early"
+        );
+        assert_eq!(ledger.delivered.load(Ordering::SeqCst), 0);
+        assert_eq!(post_count("attempted"), attempted);
+
+        if complete_inside_budget {
+            sender.release.add_permits(1);
+            assert!(
+                wait_until(|| service.is_finished()).await,
+                "in-budget delivery must settle and the real supervisors must join it"
+            );
+            let (result, finished_at) = service.await.expect("service task");
+            assert!(
+                result.is_ok(),
+                "in-budget shutdown must succeed: {result:?}"
+            );
+            assert!(finished_at.duration_since(stopped_at) < receiver_budget);
+            assert_eq!(ledger.delivered.load(Ordering::SeqCst), 1);
+            assert_eq!(post_count("attempted"), attempted + 1);
+            assert_eq!(post_count("succeeded"), succeeded + 1);
+            assert_eq!(post_count("failed"), failed);
+            assert!(!capture.text()[log_start..].contains("receiver shutdown deadline exhausted"));
+        } else {
+            tokio::time::advance(Duration::from_millis(200)).await;
+            scheduler_turns().await;
+            let finished_inside_supervisors = service.is_finished();
+            if !finished_inside_supervisors {
+                // Collect the baseline's real error for the failure report:
+                // the HTTP or service backstop, not a helper timeout/panic.
+                let until_backstop =
+                    supervisor_bound + Duration::from_millis(100) - stopped_at.elapsed();
+                tokio::time::advance(until_backstop).await;
+                scheduler_turns().await;
+            }
+            assert!(
+                wait_until(|| service.is_finished()).await,
+                "production drain must be finite"
+            );
+            let (result, finished_at) = service.await.expect("service task");
+            let error = result.expect_err("held send must exhaust the receiver deadline");
+            let elapsed = finished_at.duration_since(stopped_at);
+            let logs = capture.text()[log_start..].to_owned();
+
+            assert_eq!(ledger.claims.load(Ordering::SeqCst), 1);
+            assert_eq!(ledger.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(ledger.delivered.load(Ordering::SeqCst), 0);
+            assert_eq!(ledger.releases.load(Ordering::SeqCst), 0);
+            assert_eq!(sender.completed.load(Ordering::SeqCst), 0);
+            assert_eq!(post_count("attempted"), attempted);
+            {
+                let rows = ledger.rows.lock().unwrap();
+                assert_eq!(rows.len(), 1);
+                assert!(rows.values().all(|row| *row == GateRow::Started));
+            }
+            // Fixture cleanup also witnesses that deadline exhaustion did
+            // not abort an uncertain send or release its durable fence.
+            sender.release.add_permits(1);
+            assert!(
+                wait_until(|| ledger.delivered.load(Ordering::SeqCst) == 1
+                    && post_count("attempted") == attempted + 1)
+                .await
+            );
+            assert_eq!(post_count("succeeded"), succeeded + 1);
+            assert_eq!(post_count("failed"), failed);
+
+            assert!(
+                finished_inside_supervisors && elapsed < supervisor_bound,
+                "receiver must report inside {supervisor_bound:?}, before either generic supervisor; observed at {elapsed:?}: {error}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "EventSub receiver shutdown deadline exceeded"
+            );
+            assert!(
+                logs.contains("event=\"eventsub_receiver\""),
+                "receiver evidence missing: {logs}"
+            );
+            assert!(
+                logs.contains("receiver shutdown deadline exhausted"),
+                "receiver deadline evidence missing: {logs}"
+            );
+            assert!(
+                !logs.contains("shutdown_deadline_exceeded"),
+                "service backstop won: {logs}"
+            );
+        }
+        drop(client);
+        assert_eq!(ledger.claims.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger.releases.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sender.calls().len(),
+            1,
+            "no second send to meet a drain deadline"
+        );
+        assert_eq!(sender.completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn production_drain_reports_receiver_deadline_before_http_backstop() {
+        if !run_isolated_deadline_case(
+            "production_drain_reports_receiver_deadline_before_http_backstop",
+            30,
+        ) {
+            production_drain_case(30, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn production_drain_reports_receiver_deadline_before_short_service_backstop() {
+        if !run_isolated_deadline_case(
+            "production_drain_reports_receiver_deadline_before_short_service_backstop",
+            2,
+        ) {
+            production_drain_case(2, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn production_drain_joins_valid_completion_inside_http_budget() {
+        if !run_isolated_deadline_case(
+            "production_drain_joins_valid_completion_inside_http_budget",
+            30,
+        ) {
+            production_drain_case(30, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn production_drain_joins_valid_completion_inside_short_service_budget() {
+        if !run_isolated_deadline_case(
+            "production_drain_joins_valid_completion_inside_short_service_budget",
+            2,
+        ) {
+            production_drain_case(2, true).await;
+        }
+    }
+}
