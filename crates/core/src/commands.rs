@@ -255,7 +255,7 @@ pub const PERM_MANAGE_EVENTS: u64 = 8589934592;
 /// Always-published core commands (two-bot `CORE_COMMAND_DATA` = leveling,
 /// plus the Next-only `/help` discovery surface — legacy has no help command,
 /// see the `help` row in the registry golden exceptions — plus the Next-only
-/// `/privacy` member self-serve for per-guild analytics opt-out).
+/// `/privacy` member self-serve for analytics privacy and deletion requests).
 #[must_use]
 pub fn core_commands() -> Vec<CommandDefinition> {
     vec![
@@ -280,6 +280,39 @@ pub fn core_commands() -> Vec<CommandDefinition> {
                 "Show whether you are opted out and this server's analytics switches.",
                 CommandOptionType::SubCommand,
             ),
+            CommandOption::new(
+                "delete",
+                "Request deletion of your stored data for this server.",
+                CommandOptionType::SubCommand,
+            ),
+            CommandOption::new(
+                "deletion-status",
+                "Show the status of your deletion request.",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new(
+                    "request-id",
+                    "The request id returned when you requested deletion.",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(128),
+            ]),
+            CommandOption::new(
+                "deletion-receipt",
+                "Show the completed receipt for your deletion request.",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new(
+                    "request-id",
+                    "The request id returned when you requested deletion.",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(128),
+            ]),
         ]),
     ]
 }
@@ -288,7 +321,8 @@ pub fn core_commands() -> Vec<CommandDefinition> {
 pub const HELP_DESCRIPTION: &str = "Show this server's live commands, grouped by who can use them.";
 
 /// Member self-serve privacy description, shared by the registry fixtures.
-pub const PRIVACY_DESCRIPTION: &str = "Manage your analytics privacy for this server.";
+pub const PRIVACY_DESCRIPTION: &str =
+    "Manage your analytics privacy and deletion requests for this server.";
 
 /// Merge the authoritative guild command set.
 ///
@@ -513,18 +547,36 @@ mod tests {
         assert!(core[2].options.is_empty());
         assert_eq!(core[2].description, HELP_DESCRIPTION);
         assert!(core[2].default_member_permissions.is_none());
-        // The Next-only `privacy` self-serve carries the three subcommands,
-        // is open to everyone, and takes no other option.
+        // The Next-only `privacy` self-serve carries analytics and deletion
+        // subcommands, is open to everyone, and takes no target-user option.
         assert_eq!(core[3].description, PRIVACY_DESCRIPTION);
         assert!(core[3].default_member_permissions.is_none());
-        assert_eq!(core[3].options.len(), 3);
+        assert_eq!(core[3].options.len(), 6);
         let mut subcommands: Vec<&str> = core[3].options.iter().map(|o| o.name.as_str()).collect();
         subcommands.sort_unstable();
-        assert_eq!(subcommands, ["opt-in", "opt-out", "status"]);
+        assert_eq!(
+            subcommands,
+            [
+                "delete",
+                "deletion-receipt",
+                "deletion-status",
+                "opt-in",
+                "opt-out",
+                "status"
+            ]
+        );
         for option in &core[3].options {
             assert_eq!(option.kind, CommandOptionType::SubCommand.as_u8());
             assert!(option.required.is_none());
-            assert!(option.options.is_empty());
+            if matches!(option.name.as_str(), "deletion-status" | "deletion-receipt") {
+                assert_eq!(option.options.len(), 1);
+                assert_eq!(option.options[0].name, "request-id");
+                assert_eq!(option.options[0].kind, CommandOptionType::String.as_u8());
+                assert_eq!(option.options[0].required, Some(true));
+                assert_eq!(option.options[0].max_length, Some(128));
+            } else {
+                assert!(option.options.is_empty());
+            }
         }
     }
 

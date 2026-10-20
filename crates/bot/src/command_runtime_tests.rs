@@ -58,7 +58,7 @@ use crate::command_runtime::{
 };
 use crate::internal_action_http::MODERATION_METRICS_LOCK;
 use crate::member_runtime::MemberRuntime;
-use crate::privacy_command::{privacy_action, PrivacyAction};
+use crate::privacy_command::{deletion_request_id, privacy_action, PrivacyAction};
 use crate::schedule_runtime::{schedule_options, schedule_remove_option};
 
 const GUILD: u64 = 2222;
@@ -8717,8 +8717,35 @@ fn privacy_interaction_in(guild: u64, member: u64, subcommand: Option<&str>) -> 
     interaction
 }
 
+fn privacy_request_interaction_in(
+    guild: u64,
+    member: u64,
+    subcommand: &str,
+    request_id: Option<&str>,
+) -> Interaction {
+    let nested = request_id
+        .map(|request_id| {
+            vec![option(
+                "request-id",
+                CommandOptionValue::String(request_id.to_owned()),
+            )]
+        })
+        .unwrap_or_default();
+    let mut interaction = from_member(
+        slash(
+            "privacy",
+            Some(CHANNEL),
+            vec![option(subcommand, CommandOptionValue::SubCommand(nested))],
+        ),
+        member,
+        Permissions::empty(),
+    );
+    interaction.guild_id = Some(Id::new(guild));
+    interaction
+}
+
 #[test]
-fn privacy_action_decodes_only_the_three_known_subcommands() {
+fn privacy_action_decodes_known_analytics_and_deletion_subcommands() {
     assert_eq!(
         privacy_action(&privacy_interaction(88, Some("opt-out"))),
         PrivacyAction::OptOut
@@ -8730,6 +8757,18 @@ fn privacy_action_decodes_only_the_three_known_subcommands() {
     assert_eq!(
         privacy_action(&privacy_interaction(88, Some("status"))),
         PrivacyAction::Status
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("delete"))),
+        PrivacyAction::DeletionRequest
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("deletion-status"))),
+        PrivacyAction::DeletionStatus
+    );
+    assert_eq!(
+        privacy_action(&privacy_interaction(88, Some("deletion-receipt"))),
+        PrivacyAction::DeletionReceipt
     );
     // Missing options, a non-subcommand value and an unknown name all
     // refuse before any database access.
@@ -8755,6 +8794,48 @@ fn privacy_action_decodes_only_the_three_known_subcommands() {
     let mut component = privacy_interaction(88, Some("opt-out"));
     component.data = None;
     assert_eq!(privacy_action(&component), PrivacyAction::Invalid);
+}
+
+#[test]
+fn deletion_status_and_receipt_accept_only_a_nested_request_id_string() {
+    let request_id = "del-0123456789abcdef";
+    let nested = vec![option(
+        "deletion-status",
+        CommandOptionValue::SubCommand(vec![option(
+            "request-id",
+            CommandOptionValue::String(request_id.to_owned()),
+        )]),
+    )];
+    let interaction = from_member(
+        slash("privacy", Some(CHANNEL), nested),
+        88,
+        Permissions::empty(),
+    );
+    assert_eq!(deletion_request_id(&interaction), Some(request_id));
+    let unrelated = privacy_request_interaction_in(
+        100000000000000431,
+        100000000000000432,
+        "delete",
+        Some(request_id),
+    );
+    assert_eq!(deletion_request_id(&unrelated), None);
+
+    let malformed = from_member(
+        slash(
+            "privacy",
+            Some(CHANNEL),
+            vec![option(
+                "deletion-receipt",
+                CommandOptionValue::SubCommand(vec![option(
+                    "request-id",
+                    CommandOptionValue::Integer(123),
+                )]),
+            )],
+        ),
+        88,
+        Permissions::empty(),
+    );
+    assert_eq!(deletion_request_id(&malformed), None);
 }
 
 /// `/privacy` end to end through gateway dispatch: `opt-out` purges the
@@ -8987,6 +9068,134 @@ async fn privacy_command_purges_suppresses_receipts_and_reenables_through_dispat
         assert!(!content.contains("token-"), "no interaction token echoes");
         assert!(!content.contains("@everyone"), "no mass mentions");
     }
+    mock.shutdown().await;
+    db.close().await.expect("drop own disposable database");
+}
+
+/// `/privacy` deletion commands cross the real gateway dispatcher with the
+/// interaction-derived guild/member pair; another member cannot read status or
+/// the completed receipt. Completion is synthesized only inside this disposable
+/// database so the test does not enable retention execution or run the scheduler.
+#[tokio::test]
+#[ignore = "requires disposable agent-testdb and mock REST only"]
+async fn privacy_deletion_dispatch_binds_request_status_and_receipt_to_invoker() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test bootstrap URL");
+    let db =
+        two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .expect("migrated test database; no credential fallback");
+    const PRIVACY_GUILD: u64 = 100000000000000431;
+    const MEMBER_A: u64 = 100000000000000432;
+    const MEMBER_B: u64 = 100000000000000433;
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap();
+    let mut privacy_gates = gates(false, false);
+    privacy_gates.configured_guild = Some(PRIVACY_GUILD);
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor,
+        router_with_commands(privacy_gates),
+        PRIVACY_GUILD,
+        false,
+    );
+
+    let delete = privacy_request_interaction_in(PRIVACY_GUILD, MEMBER_A, "delete", None);
+    runtime.on_interaction(&delete).await;
+    let request: (String, String, String, String) = sqlx::query_as(
+        "SELECT request_id, guild_id, user_id, status FROM retention_deletion_requests \
+         WHERE guild_id = $1 AND user_id = $2",
+    )
+    .bind(PRIVACY_GUILD.to_string())
+    .bind(MEMBER_A.to_string())
+    .fetch_one(db.pool())
+    .await
+    .expect("live dispatch queued a requester-bound deletion");
+    assert_eq!(request.1, PRIVACY_GUILD.to_string());
+    assert_eq!(request.2, MEMBER_A.to_string());
+    assert_eq!(request.3, "pending");
+
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            "deletion-status",
+            Some(&request.0),
+        ))
+        .await;
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_B,
+            "deletion-status",
+            Some(&request.0),
+        ))
+        .await;
+
+    // Simulate only the settled ledger state needed to exercise receipt reads;
+    // no erasure, purge, scheduler, or production database is involved.
+    sqlx::query(
+        "UPDATE retention_deletion_requests \
+         SET status = 'completed', completed_at = clock_timestamp(), receipt_id = 'test-receipt' \
+         WHERE request_id = $1",
+    )
+    .bind(&request.0)
+    .execute(db.pool())
+    .await
+    .expect("fixture marks this disposable-ledger row completed");
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            "delete",
+            None,
+        ))
+        .await;
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_A,
+            "deletion-receipt",
+            Some(&request.0),
+        ))
+        .await;
+    runtime
+        .on_interaction(&privacy_request_interaction_in(
+            PRIVACY_GUILD,
+            MEMBER_B,
+            "deletion-receipt",
+            Some(&request.0),
+        ))
+        .await;
+
+    let edits: Vec<serde_json::Value> = mock
+        .requests()
+        .iter()
+        .filter(|request| request.method == "PATCH" && request.path.ends_with("/@original"))
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    assert_eq!(
+        edits.len(),
+        6,
+        "each dispatched command completes its defer"
+    );
+    assert!(edits[0]["content"].as_str().unwrap().contains("pending"));
+    assert!(edits[1]["content"].as_str().unwrap().contains("pending"));
+    assert_eq!(
+        edits[2]["content"], "Privacy command failed; try again.",
+        "another member cannot read the request status"
+    );
+    let retry_reply = edits[3]["content"].as_str().unwrap();
+    assert!(retry_reply.contains("already accepted"));
+    assert!(retry_reply.contains("check its current status"));
+    assert!(!retry_reply.contains("queued"));
+    assert!(edits[4]["content"]
+        .as_str()
+        .unwrap()
+        .contains("erasable rows in the member erasure plan"));
+    assert_eq!(
+        edits[5]["content"], "Privacy command failed; try again.",
+        "another member cannot read the completion receipt"
+    );
     mock.shutdown().await;
     db.close().await.expect("drop own disposable database");
 }
