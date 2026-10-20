@@ -921,6 +921,34 @@ fn observe_voice_actor_load_failure_kind(guild: Snowflake, error: &str, retrying
     }
 }
 
+/// Fixed token naming a voice admin store failure without its internals.
+/// [`StoreError`] is already bounded to three variants with no driver detail,
+/// so the token is the variant in snake_case: rerun the failing admin command
+/// path for detail.
+fn admin_store_error_token(error: StoreError) -> &'static str {
+    match error {
+        StoreError::Unavailable => "unavailable",
+        StoreError::CredentialRefused => "credential_refused",
+        StoreError::Conflict => "conflict",
+    }
+}
+
+/// One operator signal per failed admin store read/write (`/access`,
+/// `/logging`, `/export`, `/import`): a fixed `op` per arm plus the bounded
+/// [`StoreError`] variant token. No settings, bytes or driver text: the reply
+/// already tells the member to retry, and the guild id plus op locate the outage.
+/// A single callsite, not one per arm: each `tracing` callsite costs
+/// release-binary bytes against the container size budget.
+fn log_admin_store_failure(op: &'static str, guild_id: Snowflake, error: StoreError) {
+    warn!(
+        voice_event = "voice_admin_store",
+        op,
+        reason = admin_store_error_token(error),
+        guild_id = guild_id.to_string(),
+        "voice admin store failed"
+    );
+}
+
 /// One structured line per executed rename decision, so a room that keeps
 /// its default name is diagnosable from logs alone: `decision` names the
 /// outcome, `reason` carries the bounded skip reason when there is one
@@ -11664,9 +11692,13 @@ async fn execute_access<S: RoomPersistence>(
     action: AccessAction,
     on_saved: impl FnOnce(AccessControls),
 ) -> String {
-    let Ok(mut controls) = store.access_controls(guild_id).await else {
-        return "Could not read the voice-room settings. Nothing was changed; try again."
-            .to_owned();
+    let mut controls = match store.access_controls(guild_id).await {
+        Ok(controls) => controls,
+        Err(error) => {
+            log_admin_store_failure("access_read", guild_id, error);
+            return "Could not read the voice-room settings. Nothing was changed; try again."
+                .to_owned();
+        }
     };
     match action {
         AccessAction::Show => return access_summary(&controls),
@@ -11697,7 +11729,8 @@ async fn execute_access<S: RoomPersistence>(
             on_saved(controls);
             format!("Saved.\n{summary}")
         }
-        Err(_) => {
+        Err(error) => {
+            log_admin_store_failure("access_save", guild_id, error);
             "Could not save the voice-room settings. Nothing was changed; try again.".to_owned()
         }
     }
@@ -11728,8 +11761,13 @@ async fn execute_logging<S: RoomPersistence>(
     guild_id: Snowflake,
     action: LoggingAction,
 ) -> String {
-    let Ok(mut settings) = store.logging_settings(guild_id).await else {
-        return "Could not read the logging settings. Nothing was changed; try again.".to_owned();
+    let mut settings = match store.logging_settings(guild_id).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            log_admin_store_failure("logging_read", guild_id, error);
+            return "Could not read the logging settings. Nothing was changed; try again."
+                .to_owned();
+        }
     };
     match action {
         LoggingAction::Show => return logging_summary(&settings),
@@ -11745,7 +11783,10 @@ async fn execute_logging<S: RoomPersistence>(
     }
     match store.save_logging_settings(guild_id, &settings).await {
         Ok(()) => format!("Saved.\n{}", logging_summary(&settings)),
-        Err(_) => "Could not save the logging settings. Nothing was changed; try again.".to_owned(),
+        Err(error) => {
+            log_admin_store_failure("logging_save", guild_id, error);
+            "Could not save the logging settings. Nothing was changed; try again.".to_owned()
+        }
     }
 }
 
@@ -12413,7 +12454,8 @@ where
             let (store, _) = runtime.make_pair();
             let config = match store.config_snapshot(guild_id).await {
                 Ok(config) => config,
-                Err(_) => {
+                Err(error) => {
+                    log_admin_store_failure("export_read", guild_id, error);
                     reply(ephemeral_response(
                         "Could not read the voice configuration. Nothing was sent; try again.",
                     ))
@@ -12517,7 +12559,8 @@ where
     let (store, http) = runtime.make_pair();
     let current = match store.config_snapshot(guild_id).await {
         Ok(config) => config,
-        Err(_) => {
+        Err(error) => {
+            log_admin_store_failure("import_read", guild_id, error);
             reply(ephemeral_response(
                 "Could not read the current voice configuration. Nothing was changed; try again.",
             ))
