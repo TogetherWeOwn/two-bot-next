@@ -11,6 +11,7 @@
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import vm from "node:vm";
 import { DatabaseSync } from "node:sqlite";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
@@ -135,6 +136,7 @@ test(`${OPS_DASHBOARD_PATH}: non-GET methods 404 and never reach the container`,
   for (const method of ["POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]) {
     const res = await get(env, OPS_DASHBOARD_PATH, { method });
     assert.equal(res.status, 404, `${method} ${OPS_DASHBOARD_PATH} must 404`);
+    assert.equal(res.headers.get("content-security-policy"), null, "non-HTML refusals have no CSP");
     await res.text();
   }
   assert.equal(calls.length, 0, "mutations must never reach the container");
@@ -164,6 +166,48 @@ test(`${OPS_DASHBOARD_PATH}: serves the static read-only page with the right hea
   assert.ok(html.includes("res.status === 503"), "page must render the 503 readiness report");
   assert.ok(html.includes("status === 200"), "page must derive readiness from the status");
   assert.equal(calls.length, 0, "serving the page must not touch the container");
+});
+
+test(`${OPS_DASHBOARD_PATH}: CSP authorizes only the unchanged page's inline blocks`, async () => {
+  const { env } = configured();
+  const res = await get(env, OPS_DASHBOARD_PATH);
+  const csp = res.headers.get("content-security-policy");
+  assert.ok(csp, "the HTML response must carry a CSP");
+  assert.doesNotMatch(csp, /unsafe-inline|unsafe-eval/);
+  const directives = csp.split(";").map((part) => part.trim().split(/\s+/));
+  const expected: Record<string, string[]> = {
+    "default-src": ["'none'"],
+    "connect-src": ["'self'"],
+    "base-uri": ["'none'"],
+    "form-action": ["'none'"],
+    "frame-ancestors": ["'none'"],
+  };
+  const html = await res.text();
+  for (const tag of ["script", "style"]) {
+    const blocks = [...html.matchAll(new RegExp(`<${tag}\\b([^>]*)>([\\s\\S]*?)</${tag}\\s*>`, "gi"))];
+    assert.equal(blocks.length, 1, `page must contain one inline ${tag} block`);
+    expected[`${tag}-src`] = blocks.map((block) => {
+      assert.equal(block[1], "", `${tag} must remain inline without attributes`);
+      return `'sha256-${createHash("sha256").update(block[2]!).digest("base64")}'`;
+    });
+  }
+  assert.equal(directives.length, Object.keys(expected).length, "no duplicate or extra directives");
+  assert.deepEqual(Object.fromEntries(directives.map(([name, ...sources]) => [name, sources])), expected);
+  assert.doesNotMatch(html, /\s(?:on[\w:-]+|style)\s*=/i, "no inline event handlers or style attributes");
+  // Hashes leave the served body byte-for-byte identical to the pre-CSP page.
+  assert.equal(
+    createHash("sha256").update(html).digest("hex"),
+    "b31222e7fb8f15e1826a58f7a6c33c09f83e4b86c8ecb099cd184006291e5124",
+  );
+  const headers = new Headers(res.headers);
+  headers.delete("content-security-policy");
+  assert.deepEqual(Object.fromEntries(headers), {
+    "cache-control": "no-store",
+    "content-type": "text/html; charset=utf-8",
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+  }, "all existing page headers stay unchanged");
 });
 
 function extractPageScript(html: string): string {

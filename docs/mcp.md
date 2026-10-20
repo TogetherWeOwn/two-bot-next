@@ -28,11 +28,16 @@ cap (same bound as the metrics scrape). Oversize surfaces a generic
 `-32000` JSON-RPC error without echoing upstream bytes; timeouts and
 non-bot upstreams surface a generic `-32000` without proxied error text.
 `/readyz` accepts 200 and its routine 503 JSON (any component not ready)
-only when the body is a readiness report (`components` is an array);
-ownership-fence and junk bodies (e.g. `{error:"ownership_fenced"}`),
-other statuses, and non-JSON stay failures. `get_gateway` reads the `[name, status]`
-pairs in `components` plus `gateway_failure`. `get_config.build_revision`
-is the Worker version (`CF_VERSION_METADATA.id`).
+only when the body is a readiness report: `components` must be an array and
+**every row** must be an exact two-element `[name, status]` pair with a string
+name and status exactly `ready`, `starting` or `down`. Both `get_gateway` and
+`get_backfill_progress` refuse the whole report with the same generic `-32000`
+error if any row is malformed, with no result or echoed upstream content.
+Arbitrary component names, extra report fields and empty component lists remain
+valid; no gateway component is required. Ownership-fence and junk bodies
+(e.g. `{error:"ownership_fenced"}`), other statuses, and non-JSON stay failures.
+`get_gateway` reads the `[name, status]` pairs in `components` plus `gateway_failure`.
+`get_config.build_revision` is the Worker version (`CF_VERSION_METADATA.id`).
 `initialize` echoes only a supported protocol version, else the default.
 Unknown tool names return `-32601`. `GET /mcp` returns `405` with
 `Allow: POST` and never executes tools. Client stream close aborts the

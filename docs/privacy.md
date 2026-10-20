@@ -173,11 +173,21 @@ disposable/staging binding first per the rollout gates. Either actor label
 carries attribution only: never put a member ID, content, count or secret
 in it.
 
-Repeat `/privacy opt-out` taps take no purge lock: an already-suppressed
-pair gets the already-opted-out reply, and a pair with a purge receipt
-younger than 10 minutes gets a cooldown reply. Either early return writes
-no new receipt; only a fresh purge locks, deletes and receipts. Assisted
-operator calls go through the service directly and are unaffected.
+Opt-out and opt-in serialize per `(guild, member)` in the privacy service,
+including assisted operator calls. The transaction takes a pair-scoped
+advisory lock before checking suppression or taking the existing purge
+locks (5-second lock timeout, 15-second statement timeout). Concurrent
+opt-outs produce one purge and receipt; already-suppressed calls take no
+purge lock and write no receipt. A first opt-out with no stored activity
+still installs suppression, writes its receipt and gets the opted-out reply.
+
+For member self-serve, the service checks the existing 10-minute receipt
+cooldown under that same pair lock, after suppression. Already-suppressed
+taps get the already-opted-out reply, not a cooldown reply. A recent receipt
+on an unsuppressed pair gets the cooldown reply without reinstalling
+suppression or writing a receipt. Replies use the service's explicit
+outcome, not a preflight read or a zero-row purge count. Assisted operator
+calls remain exempt from the member cooldown.
 
 **Policy note (verified 2026-10-12):** the live Discord Developer Policy
 now lives on Discord's developer support help center (the old

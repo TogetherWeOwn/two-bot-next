@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import textwrap
@@ -14,6 +15,10 @@ from unittest import mock
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/check.yml"
 WORKFLOW_TEXT = WORKFLOW.read_text()
+NEXTEST_WORKFLOW = (
+    Path(__file__).resolve().parents[1] / ".github/workflows/reusable-rust-nextest.yml"
+)
+NEXTEST_WORKFLOW_TEXT = NEXTEST_WORKFLOW.read_text()
 # The three Rust test lanes (rust-tests, ignored-db-stores, ignored-db-runtime)
 # each run their own copy of this service; the first one in the file is the
 # reference and the others must match it exactly.
@@ -21,10 +26,34 @@ SERVICES = [part.split("    steps:\n", 1)[0] for part in WORKFLOW_TEXT.split("  
 SERVICE = SERVICES[0]
 TOKENS = shlex.split(SERVICE.split("        options: >-\n", 1)[1])
 OPTIONS = dict(zip(TOKENS[::2], TOKENS[1::2]))
-STEP = WORKFLOW_TEXT.split("      - name: Verify disposable Postgres defaults\n", 1)[1].split(
-    "      # Preserve cargo test's default", 1
-)[0]
-SCRIPT = textwrap.dedent(STEP.split("python3 - <<'PY'\n", 1)[1].rsplit("          PY", 1)[0])
+VERIFY_TAILS = WORKFLOW_TEXT.split("      - name: Verify disposable Postgres defaults\n")[1:]
+PREPARE_TAILS = WORKFLOW_TEXT.split("      - name: Prepare isolated test databases\n")[1:]
+SCRIPTS = [
+    textwrap.dedent(tail.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+    for tail in VERIFY_TAILS
+]
+PREPARES = [tail.split("\n      - name: ", 1)[0] for tail in PREPARE_TAILS]
+SCRIPT = SCRIPTS[0]
+NEXTEST_VERIFY_TAILS = NEXTEST_WORKFLOW_TEXT.split("      - name: Verify disposable Postgres defaults\n")[1:]
+NEXTEST_SCRIPT = textwrap.dedent(
+    NEXTEST_VERIFY_TAILS[0].split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+)
+POSTGRES_LANES = ("rust-tests", "ignored-db-stores", "ignored-db-runtime")
+
+
+def job_text(job_key):
+    """Raw text of one top-level job block in check.yml."""
+    lines = WORKFLOW_TEXT.splitlines(keepends=True)
+    start = next(
+        i for i, line in enumerate(lines)
+        if re.match(rf"^  {re.escape(job_key)}:\s*$", line)
+    )
+    taken = []
+    for line in lines[start + 1:]:
+        if line.strip() and re.match(r"^  \S", line):
+            break
+        taken.append(line)
+    return "".join(taken)
 EXPECTED = {
     "data_directory": "/var/lib/postgresql/18/docker",
     "fsync": "on",
@@ -69,6 +98,63 @@ class PostgresStorageTests(unittest.TestCase):
                 )
                 result = subprocess.run(["sh", "-c", stubs + command], check=False)
                 self.assertEqual(result.returncode, expected)
+
+    def test_all_three_lanes_bound_wal_and_verify_it(self):
+        # Run 39209332791: only rust-tests bounded WAL while the ignored lanes
+        # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
+        # the stores lane PANICed with ENOSPC mid-suite. Every lane that mounts
+        # the bounded service must carry the budget and verify it. Scope the
+        # checks per job: a global count lets one lane's two prepares satisfy
+        # another lane's missing one.
+        self.assertEqual(len(PREPARE_TAILS), 3)
+        self.assertEqual(len(VERIFY_TAILS), 3)
+        scripts = []
+        for lane in POSTGRES_LANES:
+            with self.subTest(lane=lane):
+                job = job_text(lane)
+                self.assertIn("agent-testdb:", job)
+                self.assertIn("--tmpfs /var/lib/postgresql:", job)
+                self.assertEqual(
+                    job.count("      - name: Prepare isolated test databases\n"), 1,
+                    f"{lane} must carry exactly one WAL prepare step",
+                )
+                self.assertEqual(
+                    job.count("      - name: Verify disposable Postgres defaults\n"), 1,
+                    f"{lane} must carry exactly one WAL verify step",
+                )
+                prepare = job.split(
+                    "      - name: Prepare isolated test databases\n", 1,
+                )[1].split("\n      - name: ", 1)[0]
+                self.assertIn("ALTER SYSTEM SET max_wal_size = '512MB'", prepare)
+                self.assertIn("ALTER SYSTEM SET min_wal_size = '64MB'", prepare)
+                self.assertIn("pg_reload_conf()", prepare)
+                self.assertLess(
+                    prepare.index("ALTER SYSTEM SET max_wal_size"),
+                    prepare.index("pg_reload_conf()"),
+                )
+                self.assertLess(
+                    prepare.index("ALTER SYSTEM SET min_wal_size"),
+                    prepare.index("pg_reload_conf()"),
+                )
+                verify_tail = job.split(
+                    "      - name: Verify disposable Postgres defaults\n", 1,
+                )[1]
+                script = textwrap.dedent(
+                    verify_tail.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+                )
+                self.assertIn("'max_wal_size': '512MB'", script)
+                self.assertIn("'min_wal_size': '64MB'", script)
+                scripts.append(script)
+        self.assertEqual(len(set(scripts)), 1, "the lanes' verify probes drifted apart")
+        # The nextest lane carries a fourth copy of this probe in the reusable
+        # workflow. It must stay identical to the executed reference, so the
+        # rejection tests below cover it too: without this, deleting the
+        # comparison in the nextest copy alone stays green everywhere.
+        self.assertEqual(len(NEXTEST_VERIFY_TAILS), 1)
+        self.assertEqual(
+            NEXTEST_SCRIPT, SCRIPT,
+            "the nextest verify probe drifted from the executed reference",
+        )
 
     def test_probe_preserves_durability_and_uses_only_explicit_test_connection(self):
         output = io.StringIO()
