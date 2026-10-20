@@ -885,12 +885,13 @@ jobs:
           # URL form. (MEMBER_TESTDB is exported before the ignored sweep
           # above so the member-moderation suite runs green there too.)
           export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test
-          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --test stream_live_store --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test internal_events -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test raid_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test reengagement_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test game_activity_report_db --locked -- --test-threads=1 --skip regenerate_reference_docs
-          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test member_moderation_db -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          # Both core targets use the same guarded URL and ignored/serial flags;
+          # collect them together without another coverage-tool invocation.
+          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test member_moderation_db --test stream_live_store -- --ignored --test-threads=1 --skip regenerate_reference_docs
           # Merge every collected profile into the mounted workspace report the gate reads.
           # `report` must carry --workspace: without it the report scopes to
           # the current (root) package only and excludes every crates/*
