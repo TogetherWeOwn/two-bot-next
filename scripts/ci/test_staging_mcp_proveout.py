@@ -442,5 +442,83 @@ class HostileBodyTests(unittest.TestCase):
                 self.assertLess(len(raw), proveout.MAX_BODY_BYTES)
 
 
+class OutputSafetyTests(unittest.TestCase):
+    def test_reflected_bearer_is_redacted_from_logs_artifact_and_failures(self):
+        token = HostileBodyTests.TOKEN
+        code, stdout, artifact, raw = HostileBodyTests().run_main({
+            0: (200, {"www-authenticate": f"Bearer {token}"}, json.dumps({
+                "result": {"protocolVersion": token},
+            })),
+            1: (200, {}, json.dumps({
+                "result": {"tools": [{"name": token}]},
+            })),
+            7: (200, {}, json.dumps({
+                "error": {"code": -32000, "message": token},
+            })),
+        })
+        self.assertEqual(code, 1)
+        self.assertNotIn(token, stdout)
+        self.assertNotIn(token.encode(), raw)
+        self.assertNotIn(token, json.dumps(artifact))
+        self.assertEqual(
+            artifact["probes"][0]["body"]["result"]["protocolVersion"], "***"
+        )
+        self.assertEqual(
+            artifact["probes"][0]["response_headers"]["www-authenticate"],
+            "Bearer ***",
+        )
+        self.assertTrue(any("tools/list" in failure for failure in artifact["failures"]))
+        self.assertTrue(any("tools/call unknown" in failure for failure in artifact["failures"]))
+
+    def test_bearer_is_redacted_before_text_fallback_truncation(self):
+        token = HostileBodyTests.TOKEN
+        body = "🧪" * 5459 + token
+        self.assertLessEqual(len(body.encode("utf-8")), proveout.MAX_BODY_BYTES)
+        code, stdout, artifact, raw = HostileBodyTests().run_main({
+            0: (200, {}, body),
+        })
+        self.assertEqual(code, 1)
+        self.assertFalse(
+            token[:28] in stdout, "partial bearer prefix escaped in stdout"
+        )
+        self.assertFalse(
+            token[:28].encode() in raw, "partial bearer prefix escaped in receipt"
+        )
+        self.assertEqual(
+            artifact["probes"][0]["body"]["_text"][-3:], "***"
+        )
+
+    def test_nonstandard_json_numbers_keep_the_receipt_parseable(self):
+        def reject_constant(value):
+            raise ValueError(f"non-standard JSON constant: {value}")
+
+        for body in ("NaN", "Infinity", "-Infinity", "1e999"):
+            with self.subTest(body=body):
+                code, _stdout, artifact, raw = HostileBodyTests().run_main({
+                    0: (200, {}, body),
+                })
+                self.assertEqual(code, 1)
+                self.assertEqual(artifact["probes"][0]["body"], {"_text": body})
+                json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+
+    def test_unicode_and_control_text_fallback_serialization_is_bounded(self):
+        cap = proveout.MAX_BODY_BYTES
+        for character in ("�", "\x00", "🧪"):
+            with self.subTest(character=character):
+                code, stdout, artifact, raw = HostileBodyTests().run_main({
+                    0: (200, {}, character * cap),
+                })
+                self.assertEqual(code, 1)
+                rendered_body = json.dumps(
+                    artifact["probes"][0]["body"],
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                self.assertLessEqual(
+                    len(rendered_body), cap + len(b'{"_text":""}')
+                )
+                self.assertLess(len(stdout.encode("utf-8")), 2 * cap)
+                self.assertLess(len(raw), 2 * cap)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,11 +22,12 @@ Probes against $STAGING_MCP_URL (default the staging Worker /mcp) with
   * wrong bearer (fixed dummy, never the real token) and no bearer ->
     HTTP 401 with WWW-Authenticate: Bearer.
 
-Output: redacted commands plus full response bodies on stdout (responses
-carry no credential), plus a sanitized JSON artifact with the same bodies
-and no bearer. Bodies over 64 KiB are refused before parsing and recorded
-as probe failures with the fixed cap verdict. JSON deeper than 32 containers
-falls back to bounded text; compact output avoids indentation amplification.
+Output: redacted commands and safely redacted responses on stdout, plus a
+sanitized JSON artifact with the same bounded response bodies. The bearer is
+removed from response bodies, selected headers and failure text before output.
+Bodies over 64 KiB are refused before parsing and recorded as probe failures
+with the fixed cap verdict. Deep or oversized serialized JSON falls back to
+bounded text; compact output avoids indentation amplification.
 Exit 0 proves the
 Worker-side slice; exit 1 is a probe failure; exit 2 is a pre-flight
 refusal (nothing was sent).
@@ -37,6 +38,7 @@ Usage (the workflow supplies the environment):
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -125,9 +127,10 @@ def redacted_request_line(rpc_method, rpc_id, extra=""):
 def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
     """POST one JSON-RPC payload. Returns (http_status, headers_dict, body_text).
 
-    Network errors return (None, {}, "<error-class>") with no secret text.
-    The bearer is never included in any returned string. Redirects are
-    refused (NoRedirect) so the bearer never leaves the target origin;
+    Network errors return (None, {}, "network-error") with no secret text.
+    Response text is untrusted and may echo the bearer; main redacts it from
+    all logged and stored values. Redirects are refused (NoRedirect) so the
+    bearer never leaves the target origin;
     a 3xx surfaces as its HTTP status and is recorded as a failure.
     Both read paths take at most MAX_BODY_BYTES+1 bytes; a longer body
     raises BodyTooLarge before decoding/parsing, never echoing body bytes.
@@ -169,22 +172,78 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
         return None, {}, "network-error"
 
 
-def parse_json_or_text(body):
+def _bounded_text_fallback(body, secret=None):
+    if secret:
+        body = body.replace(secret, "***")
+    candidate = body[:MAX_BODY_BYTES]
+    envelope_bytes = len(b'{"_text":""}')
+    output_limit = MAX_BODY_BYTES + envelope_bytes
+
+    def fits(char_count):
+        value = {"_text": candidate[:char_count]}
+        rendered = json.dumps(value, separators=(",", ":"))
+        return len(rendered.encode("utf-8")) <= output_limit
+
+    if fits(len(candidate)):
+        return {"_text": candidate}
+
+    low = 0
+    high = len(candidate)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(middle):
+            low = middle
+        else:
+            high = middle - 1
+    return {"_text": candidate[:low]}
+
+
+def _reject_json_constant(_value):
+    raise ValueError("non-standard JSON constant")
+
+
+def parse_json_or_text(body, secret=None):
     try:
-        parsed = json.loads(body)
+        parsed = json.loads(body, parse_constant=_reject_json_constant)
     except Exception:
-        return {"_text": body[:MAX_BODY_BYTES]}
+        return _bounded_text_fallback(body, secret)
     # Decoder and encoder recursion limits differ. Check iteratively before
     # handing parsed containers to either the stdout or artifact encoder.
     pending = [(parsed, 0)]
     while pending:
         value, depth = pending.pop()
+        if isinstance(value, float) and not math.isfinite(value):
+            return _bounded_text_fallback(body, secret)
         if isinstance(value, (dict, list)):
             if depth >= MAX_JSON_DEPTH:
-                return {"_text": body[:MAX_BODY_BYTES]}
+                return _bounded_text_fallback(body, secret)
             children = value.values() if isinstance(value, dict) else value
             pending.extend((child, depth + 1) for child in children)
+    parsed = redact_secret(parsed, secret)
+    try:
+        serialized_size = len(
+            json.dumps(parsed, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        )
+    except (TypeError, ValueError, RecursionError):
+        return _bounded_text_fallback(body, secret)
+    if serialized_size > MAX_BODY_BYTES:
+        return _bounded_text_fallback(body, secret)
     return parsed
+
+
+def redact_secret(value, secret):
+    if not secret:
+        return value
+    if isinstance(value, str):
+        return value.replace(secret, "***")
+    if isinstance(value, dict):
+        return {
+            redact_secret(key, secret): redact_secret(item, secret)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_secret(item, secret) for item in value]
+    return value
 
 
 def jsonrpc_code(err):
@@ -224,12 +283,12 @@ def main():
     failures = []
 
     def record(name, redacted_cmd, http_status, headers, body_text):
-        body_json = parse_json_or_text(body_text)
+        body_json = parse_json_or_text(body_text, secret=token)
         # Keep only the safe response headers; never store request headers.
         safe_headers = {}
         for key in ("content-type", "www-authenticate", "allow", "retry-after"):
             if key in headers:
-                safe_headers[key] = headers[key]
+                safe_headers[key] = redact_secret(headers[key], token)
         probes.append(
             {
                 "name": name,
@@ -296,7 +355,10 @@ def main():
                 isinstance(t, dict) and isinstance(t.get("name"), str) for t in tools):
             names = sorted(t["name"] for t in tools)
         if status != 200 or names != sorted(EXPECTED_TOOLS):
-            failures.append(f"tools/list: expected exactly {','.join(sorted(EXPECTED_TOOLS))}, got {names}")
+            failures.append(
+                "tools/list: expected exactly "
+                f"{','.join(sorted(EXPECTED_TOOLS))}, got unexpected tool names"
+            )
     rpc_id += 1
 
     # 3-7. tools/call each of the five (authenticated, bodies recorded).
@@ -354,8 +416,12 @@ def main():
         parsed = parse_json_or_text(body)
         err = parsed.get("error") if isinstance(parsed, dict) else None
         err = err if isinstance(err, dict) else {}
-        if status != 200 or jsonrpc_code(err) != -32601:
-            failures.append(f"tools/call unknown: expected JSON-RPC -32601, got HTTP {status} {err}")
+        code = jsonrpc_code(err)
+        if status != 200 or code != -32601:
+            failures.append(
+                "tools/call unknown: expected JSON-RPC -32601, "
+                f"got HTTP {status}, JSON-RPC code {code}"
+            )
     rpc_id += 1
 
     # 9. Wrong bearer (fixed dummy, never the real token) -> 401 Bearer.
@@ -384,13 +450,14 @@ def main():
         if status != 401 or "bearer" not in www.lower():
             failures.append(f"no bearer: expected HTTP 401 WWW-Authenticate: Bearer, got HTTP {status}")
 
+    failures = redact_secret(failures, token)
     artifact = {
         "schema_version": SCHEMA_VERSION,
         "proved_at": datetime.now(timezone.utc).isoformat(),
         "mcp_url": url,
         "user_agent": UA,
         "expected_tools": sorted(EXPECTED_TOOLS),
-        "note": "Bodies carry no credential. Bearer never logged, stored, or uploaded.",
+        "note": "Bearer redacted from logged, stored and uploaded response values.",
         "probes": probes,
         "failures": failures,
     }
