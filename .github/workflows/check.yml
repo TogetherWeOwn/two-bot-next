@@ -871,7 +871,8 @@ jobs:
             --skip post_apply_unreadable_ledger_is_unknown_not_empty \
             --skip store_failure_keeps_committed_cutover_evidence \
             --skip connection_count_sees_other_roles_from_plan_login \
-            --skip list_is_guild_scoped_selector_shaped_and_read_only
+            --skip list_is_guild_scoped_selector_shaped_and_read_only \
+            --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
           # Guarded channel suites accept the exact agent_test URL and the
           # workspace bootstrap URL (they always connect to agent_test with
           # an isolated schema). The sweep above already runs them green, and

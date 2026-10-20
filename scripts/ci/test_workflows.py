@@ -3394,6 +3394,12 @@ class WorkflowTests(unittest.TestCase):
             "--skip list_is_guild_scoped_selector_shaped_and_read_only",
             ignored_sweep,
         )
+        # The internal_events DB acceptance rejects the bootstrap URL; it
+        # runs only in its dedicated agent_test coverage invocation below.
+        self.assertIn(
+            "--skip database::actions_persist_rows_and_preserve_other_events_and_guilds",
+            ignored_sweep,
+        )
         guarded = [run for run in cov_runs if "llvm-cov --no-report -p " in run]
         self.assertEqual(len(guarded), 14)
         for run in guarded:
