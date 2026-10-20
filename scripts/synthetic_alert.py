@@ -36,6 +36,25 @@ class AlertError(Exception):
     """A fixed-vocabulary alert failure (never carries the webhook URL)."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Turn every redirect into an HTTPError without contacting its target."""
 
@@ -46,7 +65,9 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 def load_evidence(path):
     try:
         with open(path, encoding="utf-8") as handle:
-            value = json.load(handle)
+            value = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise AlertError("evidence refused: duplicate JSON object key") from None
     except (OSError, ValueError):
         return None
     return value if isinstance(value, dict) else None
@@ -174,7 +195,11 @@ def post_event(env, environment, evidence_path, event):
     if not webhook_url:
         print("synthetic_alert: SYNTHETIC_ALERT_WEBHOOK_URL is not set", file=sys.stderr)
         return 1
-    evidence = load_evidence(evidence_path)
+    try:
+        evidence = load_evidence(evidence_path)
+    except AlertError as error:
+        print(f"synthetic_alert: {error}", file=sys.stderr)
+        return 1
     content = build_content(environment, evidence,
                             env.get("GIT_SHA") or env.get("GITHUB_SHA"),
                             run_link(), event)
