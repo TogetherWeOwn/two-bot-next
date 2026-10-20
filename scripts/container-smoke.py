@@ -122,6 +122,14 @@ def report(message):
             summary.write(message + "\n\n")
 
 
+def report_diagnostic(message):
+    """Diagnostic I/O must not replace the smoke or cleanup failure."""
+    try:
+        report(message)
+    except OSError:
+        pass
+
+
 class CleanupFailure(RuntimeError):
     """An owned container could not be removed (fixed vocabulary only)."""
 
@@ -147,7 +155,7 @@ def owned_container(name, stage):
             reason = "removal process failed"
         if reason is not None:
             message = f"FAIL cleanup {stage}: {reason}"
-            report(message)
+            report_diagnostic(message)
             if not primary_failed:
                 raise CleanupFailure(message) from None
 
@@ -321,7 +329,7 @@ def smoke(image, image_max_bytes=IMAGE_MAX_BYTES, binary_max_bytes=BINARY_MAX_BY
                 logs = docker("logs", "--tail", "80", name, check=False)
                 print(logs.stdout + logs.stderr)
             except (OSError, subprocess.SubprocessError):
-                report("FAIL container smoke: diagnostic logs unavailable")
+                report_diagnostic("FAIL container smoke: diagnostic logs unavailable")
             raise
 
 

@@ -882,6 +882,83 @@ class ContainerSmokeTests(unittest.TestCase):
         self.assertEqual(len(fixture.removals()), 3)
         self.assertFalse(any(args[0] == "logs" for args, _ in fixture.calls))
 
+    def test_cleanup_report_io_failure_preserves_arbitrated_exception(self):
+        name = "two-bot-smoke-" + "a" * 32
+        for stage in ("measurement", "health-probe", "main"):
+            for error in (OSError(28, "summary disk full"), BrokenPipeError("stdout closed")):
+                for primary in (None, RuntimeError("primary smoke failure")):
+                    with self.subTest(stage=stage, error=type(error), primary=primary):
+                        with patch.object(smoke, "docker", return_value=subprocess.CompletedProcess([], 1)), \
+                                patch.object(smoke, "report", side_effect=error) as report:
+                            with self.assertRaises(RuntimeError) as caught:
+                                with smoke.owned_container(name, stage):
+                                    if primary is not None:
+                                        raise primary
+                        report.assert_called_once_with(f"FAIL cleanup {stage}: nonzero removal exit")
+                        if primary is not None:
+                            self.assertIs(caught.exception, primary)
+                        else:
+                            self.assertIsInstance(caught.exception, smoke.CleanupFailure)
+                            self.assertEqual(str(caught.exception), f"FAIL cleanup {stage}: nonzero removal exit")
+
+    def test_cleanup_summary_write_failure_does_not_collect_runtime_logs(self):
+        real_report = smoke.report
+        for stage in ("measurement", "health-probe", "main"):
+            with self.subTest(stage=stage):
+                fixture = DockerFixture()
+                def docker(*args, **kwargs):
+                    result = fixture(*args, **kwargs)
+                    if args[:2] == ("rm", "--force"):
+                        name = args[2]
+                        actual = "measurement" if name.startswith("two-bot-measure-") else (
+                            "health-probe" if name.endswith("-probe") else "main")
+                        if actual == stage:
+                            result.returncode = 1
+                    return result
+                self.fixture = docker
+                def report(message):
+                    if message.startswith("FAIL cleanup"):
+                        with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": "fixture-summary"}), \
+                                patch.object(smoke.Path, "open", side_effect=OSError(28, "summary disk full")):
+                            real_report(message)
+                    else:
+                        real_report(message)
+                with patch.object(smoke, "report", side_effect=report):
+                    with self.assertRaises(smoke.CleanupFailure) as caught:
+                        self.run_smoke()
+                self.assertEqual(str(caught.exception), f"FAIL cleanup {stage}: nonzero removal exit")
+                self.assertEqual(len(fixture.removals()), 1 if stage == "measurement" else 3)
+                self.assertFalse(any(args[0] == "logs" for args, _ in fixture.calls))
+                with patch.object(smoke, "smoke", side_effect=caught.exception), \
+                        patch.object(sys, "argv", ["container-smoke.py", "two-bot:fixture"]):
+                    with self.assertRaises(SystemExit) as exit_result:
+                        smoke.main()
+                self.assertEqual(exit_result.exception.code,
+                                 f"FAIL container smoke: FAIL cleanup {stage}: nonzero removal exit")
+
+    def test_unavailable_log_report_io_failure_preserves_primary(self):
+        real_report = smoke.report
+        for error in (OSError(28, "summary disk full"), BrokenPipeError("stdout closed")):
+            with self.subTest(error=type(error)):
+                fixture = DockerFixture()
+                primary = RuntimeError("primary smoke failure")
+                def docker(*args, **kwargs):
+                    if args[0] == "logs":
+                        raise OSError("log process unavailable")
+                    return fixture(*args, **kwargs)
+                def http(url):
+                    raise primary
+                def report(message):
+                    if message == "FAIL container smoke: diagnostic logs unavailable":
+                        raise error
+                    real_report(message)
+                self.fixture, self.http = docker, http
+                with patch.object(smoke, "report", side_effect=report):
+                    with self.assertRaises(RuntimeError) as caught:
+                        self.run_smoke()
+                self.assertIs(caught.exception, primary)
+                self.assertEqual(len(fixture.removals()), 2)
+
     def test_summary_records_measurements(self):
         scratch = os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or os.environ.get("RUNNER_TEMP")
         with tempfile.TemporaryDirectory(dir=scratch) as directory:
