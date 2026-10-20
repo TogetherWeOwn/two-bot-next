@@ -122,8 +122,23 @@ function track<T>(promise: Promise<T>) {
   return state;
 }
 
+/** Drain stream/promise reactions only after the real auth boundary is observed. */
 async function flush() {
   for (let i = 0; i < 4; i++) await setImmediate();
+}
+
+/**
+ * WebCrypto completion is not bounded by a fixed number of event-loop turns.
+ * Observe intake/dispatch (or a terminal response) before driving fake time.
+ * The real-time bound fails a stuck fixture; it never advances either 6000 ms
+ * application budget or waits for cancellation/refusal settlement after a tick.
+ */
+async function waitForBoundary(label: string, ready: () => boolean) {
+  const deadline = performance.now() + 5_000;
+  while (!ready()) {
+    assert.ok(performance.now() < deadline, `timed out awaiting ${label}`);
+    await setImmediate();
+  }
 }
 
 /** Track live timers, not clear-call counts (a fired timer is no longer live). */
@@ -190,7 +205,8 @@ for (const mode of ["never", "reject-late"] as const) {
       if (scenario === "pre-abort") client.abort(new Error(SENTINEL));
       const h = harness();
       const state = track(h.fetch(req));
-      await flush();
+      await waitForBoundary("authenticated intake", () =>
+        body.state.pulls > 0 || body.state.cancels > 0 || state.settled);
       if (scenario === "overflow") {
         // A complete, valid JSON call at cap+1 must be refused before parsing.
         const value = JSON.stringify({ jsonrpc: "2.0", id: 17, method: "tools/call",
@@ -246,7 +262,7 @@ for (const mode of ["never", "reject-late"] as const) {
         return response();
       });
       const state = track(h.fetch(req));
-      await flush();
+      await waitForBoundary("authenticated tool dispatch", () => h.requests.length > 0 || state.settled);
       assert.equal(h.requests.length, 1, "one tool call makes one container request");
       assert.equal(h.requests[0]!.headers.has("authorization"), false, "bearer never forwarded");
       if (scenario === "streamed-overflow") {
@@ -283,7 +299,7 @@ test("MCP outbound late rejected status cannot start a second cleanup budget", a
   const h = harness(() => new Promise<Response>((resolve) => { headers = resolve; }));
   const req = request();
   const state = track(h.fetch(req));
-  await flush();
+  await waitForBoundary("authenticated tool dispatch", () => h.requests.length > 0 || state.settled);
   await c.tick(OUTBOUND_MS - 1);
   headers(new Response(body.stream, { status: 500 }));
   await flush();
@@ -300,13 +316,13 @@ test("MCP valid control: intake and outbound use distinct whole-body budgets", a
   const h = harness(() => new Response(output.stream));
   const req = request(intake.stream);
   const state = track(h.fetch(req));
-  await flush();
+  await waitForBoundary("authenticated intake", () => intake.state.pulls > 0 || state.settled);
   intake.enqueue(encode(call));
   await c.tick(INTAKE_MS - 1);
   assert.equal(state.settled, false);
   assert.equal(h.requests.length, 0, "no tool fetch until intake EOF");
   intake.close();
-  await flush();
+  await waitForBoundary("tool dispatch after intake EOF", () => h.requests.length > 0 || state.settled);
   assert.equal(h.requests.length, 1);
   await c.tick(OUTBOUND_MS - 1);
   assert.equal(state.settled, false, "outbound has its own budget after slow valid intake");
@@ -337,7 +353,7 @@ test("MCP valid control: exact-cap intake and exact-cap healthy output remain ac
   const state = track(h.fetch(req));
   intake.enqueue(padded(call));
   intake.close();
-  await flush();
+  await waitForBoundary("authenticated exact-cap dispatch", () => h.requests.length > 0 || state.settled);
   assert.equal(h.requests.length, 1, "exact-cap request is accepted");
   output.enqueue(padded('{"ok":true}'));
   output.close();
@@ -357,7 +373,7 @@ test("MCP auth control: missing bearer refuses without pulling a hostile body", 
   const h = harness();
   const req = request(body.stream, undefined, false);
   const state = track(h.fetch(req));
-  await flush();
+  await waitForBoundary("authentication refusal", () => state.settled);
   assert.equal(state.settled, true);
   assert.equal(state.error, undefined);
   assert.ok(state.value);
@@ -374,7 +390,7 @@ test("MCP notification control: valid notification keeps empty 202 acknowledgeme
   const h = harness();
   const req = request(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
   const state = track(h.fetch(req));
-  await flush();
+  await waitForBoundary("authenticated notification acknowledgement", () => state.settled);
   assert.equal(state.settled, true);
   assert.equal(state.error, undefined);
   assert.ok(state.value);
