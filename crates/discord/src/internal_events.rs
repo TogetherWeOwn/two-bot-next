@@ -18,6 +18,15 @@ use crate::executor::snowflake;
 use crate::ratelimit_guard::GuardError;
 use crate::{ActionExecutor, DiscordError};
 
+/// Require a canonical decimal nonzero `u64` wire identity without rewriting it.
+/// Shared by both scheduled-event mirror writers before normalization/storage.
+#[must_use]
+pub fn canonical_snowflake(value: &Value) -> Option<&str> {
+    let raw = value.as_str()?;
+    let id = raw.parse::<u64>().ok()?;
+    (id != 0 && id.to_string() == raw).then_some(raw)
+}
+
 /// An already-validated action. `None` creates; a mapped ID updates. Cancelling
 /// retains the mapping so a later edit cannot silently recreate the event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,24 +248,33 @@ impl ActionExecutor {
         let mut response = self.call_once_raw(request, &[200, 201]).await?;
         let body: Value = serde_json::from_slice(&response.body)
             .map_err(|_| EventActionError::InvalidResponse)?;
+        // Bind every response to the requested guild and, when known, event
+        // before normalizing or completing a mutation's retained permit.
+        let id = canonical_snowflake(&body["id"]).ok_or(EventActionError::InvalidResponse)?;
+        if canonical_snowflake(&body["guild_id"]) != Some(guild_id)
+            || expected_id.is_some_and(|expected| expected != id)
+        {
+            return Err(EventActionError::InvalidResponse);
+        }
+        let channel_id = match body.get("channel_id") {
+            None | Some(Value::Null) => None,
+            Some(channel) => Some(
+                canonical_snowflake(channel)
+                    .ok_or(EventActionError::InvalidResponse)?
+                    .to_owned(),
+            ),
+        };
         let string = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_owned);
         let event = normalize_event(&RawScheduledEvent {
-            id: string("id"),
+            id: Some(id.to_owned()),
             name: string("name"),
             scheduled_start_time: string("scheduled_start_time"),
-            channel_id: string("channel_id"),
+            channel_id,
             description: string("description"),
             status: body.get("status").and_then(Value::as_i64),
         })
         .ok_or(EventActionError::InvalidResponse)?;
-        // A mismatched identity must never refresh another event/guild row.
-        if snowflake::<ScheduledEventMarker>(&event.id).is_err()
-            || expected_id.is_some_and(|id| id != event.id)
-            || body
-                .get("guild_id")
-                .is_some_and(|id| id.as_str() != Some(guild_id))
-            || (matches!(call, EventCall::Cancel { .. }) && event.status != EventStatus::Cancelled)
-        {
+        if matches!(call, EventCall::Cancel { .. }) && event.status != EventStatus::Cancelled {
             return Err(EventActionError::InvalidResponse);
         }
         // The accepted outcome and required receipt are validated, so the

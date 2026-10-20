@@ -81,6 +81,12 @@ except for the rank self-heal below, the one tick that writes to Discord:
   stays unchanged; wire identity validation belongs to the adapter. Only a valid
   empty event array clears the mirror. The observation timestamp is still taken
   before the GET, preserving the store's last-observed-wins fencing.
+  The internal-action event writer uses the same `internal_events::canonical_snowflake`
+  helper for required guild/event IDs and non-null channel IDs before normalization
+  or storage, binding the response to the requested guild and known event ID.
+  An invalid response remains `InvalidResponse` (not retry-safe), and a mutation
+  retains its admission fence without completing the permit. GET admission behavior
+  and the internal writer's post-response observation timestamp remain unchanged.
 
 `/readyz` retains its existing `components` array and adds an informational
 `jobs` object keyed by the four names above plus the three community-job names below. Each entry carries `parked`, `running`,

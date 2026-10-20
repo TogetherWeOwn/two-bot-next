@@ -16,6 +16,7 @@ use two_bot_core::{
     RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::{ActionExecutor, DiscordError};
+use two_bot_discord::internal_events::canonical_snowflake;
 
 use crate::{
     activation::BootActivation,
@@ -596,24 +597,18 @@ pub(crate) async fn bot_floor_scan(
     Ok(two_bot_core::BotFloorScan::Truncated)
 }
 
-/// Reject wire aliases rather than silently rewriting identities. Canonical
-/// IDs let the pure normalizer's exact-text duplicate check cover numeric IDs.
-fn canonical_snowflake(value: &Value) -> Result<&str, ErrorClass> {
-    let id = snowflake(value)?;
-    value
-        .as_str()
-        .filter(|raw| id.to_string() == *raw)
-        .ok_or(ErrorClass::Rest)
-}
-
 fn raw_event(value: &Value, guild: &str) -> Result<RawScheduledEvent, ErrorClass> {
-    if !value.is_object() || canonical_snowflake(&value["guild_id"])? != guild {
+    if !value.is_object() || canonical_snowflake(&value["guild_id"]) != Some(guild) {
         return Err(ErrorClass::Rest);
     }
-    let id = canonical_snowflake(&value["id"])?;
+    let id = canonical_snowflake(&value["id"]).ok_or(ErrorClass::Rest)?;
     let channel_id = match value.get("channel_id") {
         None | Some(Value::Null) => None,
-        Some(channel) => Some(canonical_snowflake(channel)?.to_owned()),
+        Some(channel) => Some(
+            canonical_snowflake(channel)
+                .ok_or(ErrorClass::Rest)?
+                .to_owned(),
+        ),
     };
     let optional = |name: &str| match value.get(name) {
         None | Some(Value::Null) => Ok(None),
