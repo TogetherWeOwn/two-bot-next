@@ -704,20 +704,21 @@ async fn role_removed_between_grants_skips_the_second_grant() {
         1,
         "only the still-eligible member is repaired: {grants:?}"
     );
-    let seen = shared.lock().unwrap();
-    assert_eq!(
-        seen.puts
-            .iter()
-            .map(|put| (put.member.clone(), put.role.clone()))
-            .collect::<Vec<_>>(),
-        grants,
-        "mock grant log matches the wire"
-    );
-    assert!(
-        seen.puts.iter().all(|put| put.eligible_at_put),
-        "every grant held its higher rank at PUT time"
-    );
-    drop(seen);
+    {
+        let seen = shared.lock().unwrap();
+        assert_eq!(
+            seen.puts
+                .iter()
+                .map(|put| (put.member.clone(), put.role.clone()))
+                .collect::<Vec<_>>(),
+            grants,
+            "mock grant log matches the wire"
+        );
+        assert!(
+            seen.puts.iter().all(|put| put.eligible_at_put),
+            "every grant held its higher rank at PUT time"
+        );
+    }
     let (granted, rung) = &grants[0];
     assert_eq!(rung, "11");
     assert_eq!(
