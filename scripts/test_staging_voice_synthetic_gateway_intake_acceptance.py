@@ -55,7 +55,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import staging_voice_synthetic as synth  # noqa: E402
+import staging_voice_synthetic as synth
 
 FRAME_MSG = "gateway frame answered over the byte cap"
 MESSAGE_MSG = "gateway message answered over the byte cap"
@@ -161,7 +161,7 @@ class GatewayCapTest(unittest.TestCase):
         ws, _ = reader(frame(0x1, payload))
         try:
             ws.recv()
-        except Exception as exc:  # noqa: BLE001 - the contract pins str(exc), not the type
+        except Exception as exc:
             self.assertEqual(str(exc), FRAME_MSG)
             self.assertNotIn(SENTINEL, str(exc))
         else:
@@ -182,7 +182,7 @@ class GatewayCapTest(unittest.TestCase):
         ws, _ = reader(frame(0x1, first, fin=False) + frame(0x0, rest))
         try:
             ws.recv()
-        except Exception as exc:  # noqa: BLE001 - the contract pins str(exc), not the type
+        except Exception as exc:
             self.assertEqual(str(exc), MESSAGE_MSG)
             self.assertNotIn(SENTINEL, str(exc))
         else:
@@ -200,7 +200,7 @@ class GatewayCapTest(unittest.TestCase):
         ws, sock = reader(header + b"0123456789abcdef")
         try:
             ws.recv()
-        except Exception as exc:  # noqa: BLE001 - the contract pins str(exc), not the type
+        except Exception as exc:
             self.assertLessEqual(sum(sock.requested), 1024,
                                  "the declared length must be validated before the payload is read")
             self.assertEqual(str(exc), FRAME_MSG)
@@ -220,7 +220,7 @@ class GatewayHelloTest(unittest.TestCase):
         with mock.patch.object(synth, "WebSocket", return_value=gateway):
             try:
                 synth.Session(FAKE_TOKEN)
-            except Exception as exc:  # noqa: BLE001 - the contract pins str(exc), not the type
+            except Exception as exc:
                 self.assertEqual(str(exc), HELLO_MSG)
                 self.assertNotIn(SENTINEL, str(exc))
             else:
@@ -265,7 +265,7 @@ class GatewayDispatchTest(unittest.TestCase):
         session = pump_session([message])
         try:
             session.pump(lambda event: False, time.monotonic() + 5)
-        except Exception as exc:  # noqa: BLE001 - the contract pins str(exc), not the type
+        except Exception as exc:
             self.assertEqual(str(exc), DISPATCH_MSG)
             self.assertNotIn(SENTINEL, str(exc))
         else:
