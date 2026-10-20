@@ -207,6 +207,7 @@ fn resolution_of(
                 resource_id: Some(DiscordId::new(event_id).expect("event id validated")),
                 affected: 1,
                 outcome: Some(EventOutcome::Created),
+                stop_reason: None,
             },
             ReconciliationEvidence::DiscordConfirmedEffect,
             Some((event_key.as_str(), event_id.as_str())),
@@ -219,6 +220,7 @@ fn resolution_of(
                 resource_id: Some(DiscordId::new(event_id).expect("event id validated")),
                 affected: 1,
                 outcome: Some(EventOutcome::Updated),
+                stop_reason: None,
             },
             ReconciliationEvidence::DiscordConfirmedEffect,
             Some((event_key.as_str(), event_id.as_str())),
@@ -228,6 +230,7 @@ fn resolution_of(
                 resource_id: Some(DiscordId::new(event_id).expect("event id validated")),
                 affected: 1,
                 outcome: Some(EventOutcome::Cancelled),
+                stop_reason: None,
             },
             ReconciliationEvidence::DiscordConfirmedEffect,
             None,
@@ -496,6 +499,7 @@ mod tests {
                 resource_id: Some(DiscordId::new("333333333333333333").unwrap()),
                 affected: 1,
                 outcome: Some(EventOutcome::Created),
+                stop_reason: None,
             }
         );
         assert_eq!(evidence, ReconciliationEvidence::DiscordConfirmedEffect);

@@ -1153,7 +1153,9 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
 
     // Deduplicated voice seconds per actor (legacy `unionVoiceSeconds`):
     // encounter order preserved (insertion-ordered merge, no float-order drift).
+    // Linear: an actor-to-index map replaces the per-fact linear scan.
     let mut voice_intervals: Vec<(String, Vec<(i64, i64)>)> = Vec::new();
+    let mut voice_index: HashMap<&str, usize> = HashMap::new();
     for f in &facts {
         if f.row.event_type != "voice_session_ended"
             || f.classification != "eligible_human"
@@ -1178,10 +1180,13 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
         if b <= a {
             continue;
         }
-        let actor = f.row.actor_id.clone().unwrap_or_default();
-        match voice_intervals.iter_mut().find(|(a, _)| *a == actor) {
-            Some((_, list)) => list.push((a, b)),
-            None => voice_intervals.push((actor, vec![(a, b)])),
+        let actor = f.row.actor_id.as_deref().unwrap_or_default();
+        match voice_index.get(actor) {
+            Some(&idx) => voice_intervals[idx].1.push((a, b)),
+            None => {
+                voice_index.insert(actor, voice_intervals.len());
+                voice_intervals.push((actor.to_owned(), vec![(a, b)]));
+            }
         }
     }
     let mut voice_seconds: Vec<(String, f64)> = Vec::new();
@@ -1275,7 +1280,17 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
     let bot_alert = bot_ratio.is_some_and(|r| r >= BOT_NOISE_THRESHOLD);
 
     // First-human-reply clock (legacy `firstHumanReply`).
-    let mut accepted: HashMap<&str, &str> = HashMap::new();
+    // Honest timestamps: a join, rules-accepted, own message, or reply whose
+    // `occurred_at` fails `parse_iso_millis` is excluded, never defaulted to
+    // epoch, zero, or the start time. Any exclusion sets
+    // `invalid_timestamp_dropped` for the quality note below. A join whose
+    // actor has any malformed rules-accepted clock is excluded entirely rather
+    // than falling back to the join clock. Linear: per-actor indexes plus a
+    // global time order with O(1) next-different-actor jumps replace the two
+    // per-join linear scans. Stable sorts preserve encounter order for ties.
+    let mut invalid_timestamp_dropped = false;
+    let mut accepted: HashMap<&str, i64> = HashMap::new();
+    let mut bad_rules_actors: HashSet<&str> = HashSet::new();
     for f in &facts {
         if f.row.event_type != "rules_accepted" || f.classification != "eligible_human" {
             continue;
@@ -1283,74 +1298,150 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
         let Some(actor) = f.row.actor_id.as_deref() else {
             continue;
         };
-        accepted
-            .entry(actor)
-            .and_modify(|cur| {
-                if f.row.occurred_at.as_str() < *cur {
-                    *cur = f.row.occurred_at.as_str();
-                }
-            })
-            .or_insert(f.row.occurred_at.as_str());
+        match parse_iso_millis(&f.row.occurred_at) {
+            Some(ms) => {
+                accepted
+                    .entry(actor)
+                    .and_modify(|cur| {
+                        if ms < *cur {
+                            *cur = ms;
+                        }
+                    })
+                    .or_insert(ms);
+            }
+            None => {
+                invalid_timestamp_dropped = true;
+                bad_rules_actors.insert(actor);
+            }
+        }
     }
-    let mut channel_messages: Vec<&ParsedFact> = facts
-        .iter()
-        .filter(|f| {
-            f.row.event_type == "message_created"
-                && f.classification == "eligible_human"
-                && f.row.actor_id.as_deref().is_some_and(|a| !a.is_empty())
-                && ["welcome", "human"].contains(
-                    &f.meta
-                        .get("channelClass")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(""),
-                )
-        })
-        .collect();
-    channel_messages.sort_by(|a, b| a.row.occurred_at.cmp(&b.row.occurred_at));
+    let mut channel_messages: Vec<(&ParsedFact, i64)> = Vec::new();
+    for f in &facts {
+        if f.row.event_type != "message_created"
+            || f.classification != "eligible_human"
+            || f.row.actor_id.as_deref().is_none_or(str::is_empty)
+            || !["welcome", "human"].contains(
+                &f.meta
+                    .get("channelClass")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            )
+        {
+            continue;
+        }
+        match parse_iso_millis(&f.row.occurred_at) {
+            Some(ms) => channel_messages.push((f, ms)),
+            None => {
+                invalid_timestamp_dropped = true;
+            }
+        }
+    }
+    channel_messages.sort_by_key(|(_, ms)| *ms);
+    // Per-actor time lists in global order for O(log k) first-own lookup.
+    let mut own_index: HashMap<&str, Vec<(i64, usize)>> = HashMap::new();
+    for (pos, (fact, ms)) in channel_messages.iter().enumerate() {
+        if let Some(actor) = fact.row.actor_id.as_deref() {
+            own_index.entry(actor).or_default().push((*ms, pos));
+        }
+    }
+    // Global time order with O(1) next-different-actor jumps: `next_diff[i]`
+    // is the first position after `i` with a different actor, or `None` when
+    // the suffix is all the same actor.
+    let mut next_diff: Vec<Option<usize>> = vec![None; channel_messages.len()];
+    for i in (0..channel_messages.len().saturating_sub(1)).rev() {
+        let actor_i = channel_messages[i]
+            .0
+            .row
+            .actor_id
+            .as_deref()
+            .unwrap_or_default();
+        let actor_next = channel_messages[i + 1]
+            .0
+            .row
+            .actor_id
+            .as_deref()
+            .unwrap_or_default();
+        if actor_i != actor_next {
+            next_diff[i] = Some(i + 1);
+        } else {
+            next_diff[i] = next_diff[i + 1];
+        }
+    }
+    let global_times: Vec<i64> = channel_messages.iter().map(|(_, ms)| *ms).collect();
+    // Valid reply sample: joins with parseable clocks whose actor has no
+    // malformed rules-accepted clock.
+    let mut reply_joins: Vec<(&str, i64)> = Vec::with_capacity(joins.len());
+    for join in &joins {
+        let actor = join.row.actor_id.as_deref().unwrap_or_default();
+        if bad_rules_actors.contains(actor) {
+            continue;
+        }
+        let join_ms = match parse_iso_millis(&join.row.occurred_at) {
+            Some(ms) => ms,
+            None => {
+                invalid_timestamp_dropped = true;
+                continue;
+            }
+        };
+        let start_ms = if let Some(&ms) = accepted.get(actor) {
+            ms
+        } else {
+            join_ms
+        };
+        reply_joins.push((actor, start_ms));
+    }
     let mut durations: Vec<f64> = Vec::new();
     let mut no_reply_within_24h = 0usize;
     let mut pending = 0usize;
-    for join in &joins {
-        let actor = join.row.actor_id.as_deref().unwrap_or_default();
-        let clock_start = accepted
-            .get(actor)
-            .copied()
-            .unwrap_or(join.row.occurred_at.as_str());
-        let first_own = channel_messages.iter().find(|m| {
-            m.row.actor_id.as_deref() == Some(actor) && m.row.occurred_at.as_str() >= clock_start
+    for (actor, start_ms) in &reply_joins {
+        let first_own_pos = own_index.get(actor).and_then(|times| {
+            let idx = times.partition_point(|(ms, _)| *ms < *start_ms);
+            times.get(idx).map(|(_, pos)| *pos)
         });
-        let Some(first_own) = first_own else {
-            let start_ms = parse_iso_millis(clock_start).unwrap_or(i64::MIN);
-            if week_end_ms.saturating_sub(start_ms) > FIRST_REPLY_BREACH_MS {
+        let Some(own_pos) = first_own_pos else {
+            if week_end_ms.saturating_sub(*start_ms) > FIRST_REPLY_BREACH_MS {
                 no_reply_within_24h += 1;
             } else {
                 pending += 1;
             }
             continue;
         };
-        match channel_messages.iter().find(|m| {
-            m.row.actor_id.as_deref() != Some(actor)
-                && m.row.occurred_at > first_own.row.occurred_at
-        }) {
-            Some(reply) => {
-                let start_ms = parse_iso_millis(clock_start).unwrap_or(0);
-                let reply_ms = parse_iso_millis(&reply.row.occurred_at).unwrap_or(start_ms);
-                durations.push((reply_ms.saturating_sub(start_ms)) as f64 / 1000.0);
+        let own_ms = channel_messages[own_pos].1;
+        let mut reply_pos = global_times.partition_point(|ms| *ms <= own_ms);
+        if reply_pos >= channel_messages.len() {
+            if week_end_ms.saturating_sub(*start_ms) > FIRST_REPLY_BREACH_MS {
+                no_reply_within_24h += 1;
+            } else {
+                pending += 1;
             }
-            None => {
-                let start_ms = parse_iso_millis(clock_start).unwrap_or(i64::MIN);
-                if week_end_ms.saturating_sub(start_ms) > FIRST_REPLY_BREACH_MS {
-                    no_reply_within_24h += 1;
-                } else {
-                    pending += 1;
+            continue;
+        }
+        let reply_actor = channel_messages[reply_pos]
+            .0
+            .row
+            .actor_id
+            .as_deref()
+            .unwrap_or_default();
+        if reply_actor == *actor {
+            match next_diff[reply_pos] {
+                Some(jump) => reply_pos = jump,
+                None => {
+                    if week_end_ms.saturating_sub(*start_ms) > FIRST_REPLY_BREACH_MS {
+                        no_reply_within_24h += 1;
+                    } else {
+                        pending += 1;
+                    }
+                    continue;
                 }
             }
         }
+        let reply_ms = channel_messages[reply_pos].1;
+        durations.push((reply_ms.saturating_sub(*start_ms)) as f64 / 1000.0);
     }
     let reply = FirstHumanReply {
         median_seconds: median(&durations),
         resolved_count: durations.len(),
-        eligible_join_count: joins.len(),
+        eligible_join_count: reply_joins.len(),
         no_reply_within_24h_count: no_reply_within_24h,
         pending_count: pending,
     };
@@ -1443,7 +1534,7 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
     // season transition watermarks, and the abuse detectors. Detectors run
     // only under complete coverage (fail-closed); voice-AFK without occupancy
     // data yields `insufficient_data`, never a verdict.
-    let (abuse_flags, abuse_candidates, abuse_data_quality, detector_inputs) = if complete {
+    let (abuse_flags, abuse_candidates, mut abuse_data_quality, detector_inputs) = if complete {
         detect_abuse(&facts)
     } else {
         (
@@ -1453,6 +1544,9 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
             DetectorInputs::default(),
         )
     };
+    if complete && invalid_timestamp_dropped {
+        abuse_data_quality.push("first_reply:invalid_timestamp".to_owned());
+    }
     // Event-time season (AC3): the scorecard stays in its week's season even
     // when rebuilt after a quarter change. Watermarks fire only when the week
     // start itself is a season boundary: seasons start Monday 00:00 UTC, so

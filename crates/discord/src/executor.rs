@@ -59,7 +59,8 @@ use twilight_model::id::Id;
 use two_bot_core::{
     backoff_ms, classify_kick_status, pace_wait_ms, parse_retry_after_secs, plan_purge,
     retry_after_ms, retry_after_ms_unclamped, utf16_len, ActionOutcome, KickOutcome, KickResult,
-    KickStatus, ModerationExecution, MAX_HTTP_TRIES, MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
+    KickStatus, ModerationExecution, PurgeReport, PurgeStopReason, MAX_HTTP_TRIES,
+    MAX_RETRY_AFTER_MS, SEND_MESSAGES_BIT,
 };
 
 /// Minimum gap between paced requests, ms (legacy `rest.ts` default).
@@ -2494,14 +2495,14 @@ impl ActionExecutor {
     }
 
     /// Purge: list, then `POST .../bulk-delete` for recent messages and one
-    /// `DELETE` per older or lone message (legacy `ModerationDiscord::purge`
-    /// returns the affected count).
+    /// `DELETE` per older or lone message. Report the confirmed count and any
+    /// definitive refusal that stopped a later delete.
     pub async fn purge(
         &self,
         channel_id: &str,
         count: u64,
         reason: &str,
-    ) -> Result<u64, DiscordError> {
+    ) -> Result<PurgeReport, DiscordError> {
         // Keep reason validation before any I/O for the combined public call.
         audit_reason(reason)?;
         let ids = self.list_purge_messages(channel_id, count).await?;
@@ -2559,14 +2560,14 @@ impl ActionExecutor {
     /// older ones, which make the whole bulk call fail with a 400, are deleted
     /// singly. Uncertain wire failures must retain caller fences. Once some
     /// message is gone, a failure that proves only the failing call had no
-    /// effect stops the purge and reports the count deleted so far; it must not
-    /// claim that no mutation was accepted.
+    /// effect stops the purge and reports the count deleted so far and why it
+    /// stopped; it must not claim that no mutation was accepted.
     pub(crate) async fn purge_messages(
         &self,
         channel_id: &str,
         ids: &[Id<MessageMarker>],
         reason: &str,
-    ) -> Result<u64, DiscordError> {
+    ) -> Result<PurgeReport, DiscordError> {
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
         let reason = audit_reason(reason)?;
         let raw: Vec<u64> = ids.iter().map(|id| id.get()).collect();
@@ -2596,10 +2597,21 @@ impl ActionExecutor {
                 Err(error @ (DiscordError::Timeout | DiscordError::Unavailable(_))) => {
                     return Err(error)
                 }
-                Err(_) => break,
+                Err(error) => {
+                    return Ok(PurgeReport {
+                        affected: deleted,
+                        stop_reason: Some(match error {
+                            DiscordError::RateLimited => PurgeStopReason::RateLimited,
+                            _ => PurgeStopReason::Refused,
+                        }),
+                    });
+                }
             }
         }
-        Ok(deleted)
+        Ok(PurgeReport {
+            affected: deleted,
+            stop_reason: None,
+        })
     }
 
     /// One purge delete. A 404 means the message vanished after the listing, so
@@ -3074,9 +3086,13 @@ impl ActionExecutor {
                 channel_id,
                 count,
                 reason,
-            } => Ok(ChannelCallOutcome::Purged {
-                affected: self.purge(channel_id, *count, reason).await?,
-            }),
+            } => {
+                let report = self.purge(channel_id, *count, reason).await?;
+                Ok(ChannelCallOutcome::Purged {
+                    affected: report.affected,
+                    stop_reason: report.stop_reason,
+                })
+            }
             ChannelCall::Slowmode {
                 channel_id,
                 seconds,
@@ -3719,11 +3735,11 @@ impl ActionExecutor {
                 let count = exec
                     .count
                     .ok_or_else(|| DiscordError::Rejected("purge count required".into()))?;
-                let affected = self.purge(channel_id, count, &exec.reason).await?;
+                let report = self.purge(channel_id, count, &exec.reason).await?;
                 return Ok(ActionOutcome::Purged {
                     channel_id: channel_id.clone(),
                     // `purge` counts listed ids (≤100 by validated limit); always fits.
-                    affected: affected as usize,
+                    affected: report.affected as usize,
                 });
             }
             ActionOutcome::SlowmodeUpdated {
@@ -3772,11 +3788,16 @@ impl ActionExecutor {
 /// Channel-verb outcome (affected counts for purge/post).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelCallOutcome {
-    Purged { affected: u64 },
+    Purged {
+        affected: u64,
+        stop_reason: Option<PurgeStopReason>,
+    },
     SlowmodeUpdated,
     OverwriteWritten,
     OverwriteDeleted,
-    Posted { message_id: String },
+    Posted {
+        message_id: String,
+    },
     MessageDeleted,
 }
 

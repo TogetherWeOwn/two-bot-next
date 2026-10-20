@@ -83,9 +83,16 @@ Rules for the signing secret:
   Source: `crates/core/src/twitch_eventsub.rs:99-125`,
   `crates/core/src/twitch_eventsub.rs:436-455`.
 - The handler never re-reads the environment: the secret is cloned into
-  receiver state at bind time. A new value takes effect on container restart,
-  not on secret edit alone.
-  Source: `crates/bot/src/eventsub_http.rs:47-56`.
+  receiver state at bind time. Unarmed, a new value takes effect on container
+  restart, not on secret edit alone. Armed (the Operator provisioned
+  `TWO_EVENTSUB_RELOAD_KEY` on both sides), the fenced DO attaches the
+  Worker's current secret to every delivery with its own HMAC, and the
+  receiver swaps its in-memory snapshot before verifying that delivery —
+  without dropping the gateway or the receiver socket. Any refresh failure
+  answers retryable 503 `unavailable` without verifying against the stale
+  snapshot.
+  Source: `crates/bot/src/eventsub_http.rs:47-56`,
+  `crates/core/src/eventsub_refresh.rs`.
 - Logs carry only scalar `event` / `status` / `error_class`. Header values,
   the challenge, body bytes, and query strings are never logged.
   Source: `crates/bot/src/eventsub_http.rs:1-11`,
@@ -119,6 +126,19 @@ unauthorized` (see the matrix below). Confirm agreement by watching for
 `notification acknowledged` or `challenge answered` lines after the
 reconciler's recreated subscription verifies, not by printing either value.
 Never use a test fixture as a runtime credential.
+
+Armed-refresh variant (staging only, needs its own authorization like any
+rotation): with `TWO_EVENTSUB_RELOAD_KEY` provisioned and unchanged, the
+verification side needs no restart — the running container swaps to the new
+secret on the first delivery served by the new Worker version, so a controlled delivery
+signed with the new secret verifies with no restart. The subscription
+creation side still reads the boot secret per pass
+(`crates/bot/src/eventsub_reconcile.rs`, `webhook_secret_from_env`), so a
+full rotation that re-creates subscriptions with the new secret still
+restarts the container before the delete step, exactly as above, until the
+reconciler learns the refreshed snapshot. Do not arm the reload key in
+staging while live subscriptions exist without that follow-up: the swap
+moves the 401 window to the Worker cutover instead of the restart.
 Source: `crates/core/src/twitch_eventsub.rs:542-545` (deletes first; a
 duplicate create answers `409`), `:559-563` (healthy wanted subscriptions
 on our callback are kept without comparing secrets), `:481-488`
@@ -126,6 +146,17 @@ on our callback are kept without comparing secrets), `:481-488`
 `crates/core/src/twitch_helix.rs:591-593` (a `409` create counts as
 `AlreadyExists` only after a follow-up listing confirms a healthy
 subscription on our callback).
+
+The reload key itself is startup-only: arming, rotating, or removing
+`TWO_EVENTSUB_RELOAD_KEY` requires an authorized container restart after the
+corresponding Worker version takes ownership. Until the running container
+loads the matching configuration, deliveries may return retryable 503
+`unavailable`: a changed key fails refresh authentication, while removing
+the key leaves an armed receiver without refresh headers. Adding the key
+does not arm a receiver that was started without it. This restart requirement
+does not relax the staging and subscription-rotation restrictions above.
+Source: `crates/core/src/eventsub_receiver_config.rs` (`from_lookup`),
+`crates/bot/src/eventsub_http.rs` (`ReceiverState::with_delivery`, `receive`).
 
 ## Subscription reconciler
 
@@ -323,11 +354,11 @@ public URL):
 | Status | Code | Retryable | Meaning / first action |
 |---|---|---|---|
 | 404 | plain-text `not found` | false | Non-POST, wrong path, or any query (`isEventsubRequest`). Via the public URL a GET answers 404 here and never reaches the container 405 row; `?x=1` answers 404 here and never reaches the container 400 row. Source: `wrangler/src/eventsub.ts:101-103,133-137,241`. |
-| 400 | `malformed` | false | Present-but-badly-shaped delivery header, signature without the `sha256=` prefix, or malformed `content-length` / body framing. Check the request shape, not the secret. Source: `wrangler/src/eventsub.ts:158-169` (header/signature shape), `:181,184,208,212` (content-length and body framing). |
+| 400 | `malformed` | false | Present-but-badly-shaped delivery header, signature without the `sha256=` prefix, malformed `content-length` / body framing, or any caller-supplied `x-two-eventsub-*` refresh header (a privileged DO-set field, never Twitch input). Check the request shape, not the secret. Source: `wrangler/src/eventsub.ts:158-169` (header/signature shape), `:181,184,208,212` (content-length and body framing), refresh-header refusal in `allowlistedHeaders`. |
 | 401 | `unauthorized` | false | Missing delivery header or signature. Check that the sender forwarded every header. Source: `wrangler/src/eventsub.ts:158-169`. |
 | 429 | `rate_limited` | true | Per-isolate burst budget or in-flight cap hit. The sender backs off and redelivers. Source: `wrangler/src/eventsub.ts:243-248`. |
 | 504 | `upstream_timeout` | true | The fenced DO did not answer within the Worker deadline. Source: `wrangler/src/eventsub.ts:264`. |
-| 503 | `unavailable` | true | DO construction / binding failure, cold container, ownership-fence refusal, or relay failure (see the 503 triage below). Source: `wrangler/src/eventsub.ts:268,299-308,328,338,343` (ingress and relay failures), `wrangler/src/index.ts:905-915` (cold container at `:905`, `containerFetch` failure at `:906-910`, fence refusal at `:912-915`). |
+| 503 | `unavailable` | true | DO construction / binding failure, cold container, ownership-fence refusal, relay failure (see the 503 triage below), or — with rotation armed — a missing signing secret or refresh-signing failure before the container is contacted. Source: `wrangler/src/eventsub.ts:268,299-308,328,338,343` (ingress and relay failures), `wrangler/src/index.ts:905-915` (cold container at `:905`, `containerFetch` failure at `:906-910`, fence refusal at `:912-915`), refresh attach in `internalEventsub`. |
 
 The DO relays receiver answers through `relayEventsubResponse`, which
 projects them to the supported contract before they leave: JSON
@@ -358,7 +389,7 @@ direct `containerFetch`, because the Worker answers those shapes first):
 | 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:37,290-301`, `crates/core/src/twitch_eventsub.rs:49-51`. |
 | 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:247-266`. |
 | 503 | `busy` / `upstream_timeout` | true | All 32 permits held (`busy`), or the whole request past the 20 s budget (`upstream_timeout`). Both mean the receiver is saturated or stalled, not that the delivery was bad; the sender retries. Check container saturation, not the secret. Source: `crates/bot/src/eventsub_http.rs:38-40,167-199`. |
-| 503 | `unavailable` | true | A future/unrecognized post-verification classification error; the receiver fails closed so Twitch retries and counts it as metric `kind="other"`. This is distinct from Worker-ingress `unavailable` above. Inspect the `eventsub delivery refused` warning and the `two_bot_eventsub_classified_total{kind="other"}` counter; the refusal log uses the bounded error class `unavailable`, so it does not identify a specific future variant. Do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs:426-439`. |
+| 503 | `unavailable` | true | A future/unrecognized post-verification classification error, or — with rotation armed — a missing, malformed, unauthenticated, stale, replayed, or invalid secret refresh. Both fail closed without verifying against a stale snapshot; the classification case counts metric `kind="other"`, the refresh case never reaches verification or classification. This is distinct from Worker-ingress `unavailable` above. The refusal log uses the bounded error class `unavailable`, so it identifies neither a specific future variant nor a specific refresh cause: check Worker secret/version and reload-key agreement, not the secret value. Do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs:426-439`, `crates/core/src/eventsub_refresh.rs`. |
 
 Verified deliveries that need no operator action answer `200`:
 

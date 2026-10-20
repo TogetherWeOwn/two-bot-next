@@ -3344,6 +3344,49 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        self.assertIn(
+            "--skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected",
+            ignored_sweeps[0],
+        )
+        self.assertIn(
+            "--skip list_is_guild_scoped_selector_shaped_and_read_only",
+            ignored_sweeps[0],
+        )
+        # The stream go-live ledger suite, the internal-events DB test, the
+        # legacy-verify/TLS-fence/migrate suites and the mutation-429 suite
+        # share the same strict agent_test guard: they run only in their
+        # dedicated agent_test runs below, never in the bootstrap sweep.
+        for skipped in (
+            "claim_is_owned_once_then_in_flight",
+            "failed_send_releases_the_claim_for_the_retry",
+            "delivered_rows_are_never_reclaimed",
+            "delivered_rows_expire_only_past_the_horizon_with_the_fence_intact",
+            "fresh_claim_cannot_be_reclaimed",
+            "stale_unposted_claim_is_taken_over_atomically",
+            "started_claim_is_never_reclaimed_even_when_stale",
+            "started_send_that_provably_failed_releases_for_the_retry",
+            "reclaiming_a_missing_key_claims_it_fresh",
+            "database::actions_persist_rows_and_preserve_other_events_and_guilds",
+            "parity_mismatch_cursor_and_read_only_acceptance",
+            "legacy_verify_policy_gates_the_real_test_endpoints",
+            "real_sqlx_runner_cases",
+            "post_failure_unreadable_ledger_is_unknown_not_empty",
+            "post_failure_readable_ledger_keeps_array_output",
+            "post_apply_unreadable_ledger_is_unknown_not_empty",
+            "store_failure_keeps_committed_cutover_evidence",
+            "connection_count_sees_other_roles_from_plan_login",
+            "single_delete_429_releases_attempt_for_same_key_retry",
+            "bulk_delete_429_releases_attempt_for_same_key_retry",
+            "channel_overwrite_429_releases_attempt_and_retires_only_its_seed",
+            "slowmode_429_releases_attempt_for_same_and_distinct_keys",
+            "unlock_429_releases_lane_but_preserves_recovery_seed",
+            "lockdown_429_preserves_prior_seed_while_releasing_the_lane",
+            "slowmode_5xx_and_unexpected_statuses_stay_fenced",
+            "slowmode_timeout_stays_fenced",
+            "cancelled_lockdown_stays_fenced_with_seed_retained",
+        ):
+            with self.subTest(skipped=skipped):
+                self.assertIn(f"--skip {skipped}", ignored_sweeps[0])
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
@@ -3389,10 +3432,10 @@ class WorkflowTests(unittest.TestCase):
         for name in sorted(staging_names):
             with self.subTest(staging_skip=name):
                 self.assertIn(name, broad_skips)
-        # Mutation-429 channel fixtures accept only the exact agent_test
-        # URL; they run in the dedicated mutation_429 rerun below, never
-        # in this two_bot_test_ci sweep. Enumerate from the Rust source so
-        # a future tenth fixture cannot silently rejoin.
+        # Mutation-429 channel fixtures run in the dedicated
+        # mutation_429 rerun below, never in this two_bot_test_ci sweep.
+        # Enumerate from the Rust source so a future tenth fixture cannot
+        # silently rejoin.
         channel_source = (
             ROOT / "crates/discord/tests/mutation_429_proves_no_effect_channel.rs"
         ).read_text()
@@ -5486,6 +5529,85 @@ class WorkflowTests(unittest.TestCase):
                         else:
                             self.assertEqual(defaults, [],
                                              f"failed retry must not default anything, got: {calls}")
+
+    def early_pinned_components_retry(self):
+        # This run-step installer is not a dtolnay action. Require exactly one
+        # so removing it (or changing its id) cannot make the guard vacuous.
+        steps = self.workflows["check.yml"]["jobs"]["check"]["steps"]
+        installers = [index for index, step in enumerate(steps)
+                      if step.get("id") == "pinned_components"]
+        self.assertEqual(len(installers), 1, "check must install pinned_components before pip")
+        index = installers[0]
+        installer = steps[index]
+        self.assertNotIn("uses", installer)
+        self.assertEqual(installer.get("run", "").strip(),
+                         "rustup toolchain install --no-self-update")
+        # UniqueKeyLoader is a BaseLoader: even 'false' is a truthy string.
+        self.assertEqual(installer.get("continue-on-error"), "true")
+        self.assertLess(index + 1, len(steps), "the early installer needs an immediate retry")
+        retry = steps[index + 1]
+        self.assertNotIn("uses", retry)
+        self.assertTrue(retry.get("run"), "the immediate retry must execute a script")
+        self.assertEqual(retry.get("if"), "steps.pinned_components.outcome == 'failure'")
+        self.assertEqual(retry.get("shell"), "bash")
+        self.assertEqual(retry.get("env", {}).get("RUSTUP_PERMIT_COPY_RENAME"), "1")
+        self.assertNotIn("continue-on-error", retry, "the early retry must not swallow failure")
+        pip_steps = [index for index, step in enumerate(steps)
+                     if "python3 -m pip" in step.get("run", "")]
+        self.assertTrue(pip_steps, "check must retain its Python tooling install")
+        self.assertLess(index + 1, min(pip_steps), "finish the toolchain before pip probes rustc")
+        return retry
+
+    def test_early_rust_toolchain_install_is_retry_guarded(self):
+        self.early_pinned_components_retry()
+
+    def test_early_rust_toolchain_retry_fails_closed_behaviorally(self):
+        # Execute the real retry, but never rustup or sleep: only those external
+        # effects are shimmed. The early install resolves rust-toolchain.toml;
+        # unlike the action retries it must not issue a new `rustup default`.
+        retry = self.early_pinned_components_retry()
+        fake_prelude = (
+            "FAKE_N=0\n"
+            "rustup() {\n"
+            "  printf '%s\\0' \"$@\" >> \"$FAKE_RUSTUP_CALLS\"\n"
+            "  printf '\\n' >> \"$FAKE_RUSTUP_CALLS\"\n"
+            "  FAKE_N=$((FAKE_N + 1))\n"
+            "  [ \"$FAKE_N\" -ge \"$FAKE_SUCCEED_ON\" ]\n"
+            "}\n"
+            "sleep() { :; }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            calls_path = Path(tmp) / "rustup-calls.txt"
+            for case_name, succeed_on, expected_status, expected_installs in (
+                ("always-fails", "99", 1, 5),
+                ("succeeds-on-2", "2", 0, 2),
+            ):
+                with self.subTest(case=case_name):
+                    calls_path.write_bytes(b"")
+                    # No inherited credentials/startup hooks, real toolchain
+                    # directories or PATH tools, even if a script drifts.
+                    run_env = {
+                        "PATH": tmp,
+                        "HOME": tmp,
+                        "CARGO_HOME": str(Path(tmp) / "cargo"),
+                        "RUSTUP_HOME": str(Path(tmp) / "rustup"),
+                        "RUSTUP_PERMIT_COPY_RENAME": retry["env"]["RUSTUP_PERMIT_COPY_RENAME"],
+                        "FAKE_RUSTUP_CALLS": str(calls_path),
+                        "FAKE_SUCCEED_ON": succeed_on,
+                    }
+                    proc = subprocess.run(
+                        ["/bin/bash", "--noprofile", "--norc", "-eo", "pipefail",
+                         "-c", fake_prelude + retry["run"]],
+                        env=run_env, capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(proc.returncode, expected_status,
+                                     f"unexpected early retry status: {proc.stderr}")
+                    self.assertEqual(
+                        calls_path.read_bytes().splitlines(),
+                        [b"toolchain\0install\0--no-self-update\0"] * expected_installs,
+                        "early retry must install exactly the repository-selected toolchain; "
+                        "no extra arguments or default command",
+                    )
 
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
