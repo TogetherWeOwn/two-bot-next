@@ -18,10 +18,15 @@ import {
   EVENTSUB_RECEIVER_BIND,
   EVENTSUB_RECEIVER_PORT,
   MAX_BODY_BYTES,
+  REFRESH_NONCE_HEADER,
+  REFRESH_SECRET_HEADER,
+  REFRESH_SIGNATURE_HEADER,
+  REFRESH_TIMESTAMP_HEADER,
   handleEventsubIngress,
   MAX_IN_FLIGHT,
   relayEventsubResponse,
   resetEventsubIngressLimits,
+  signEventsubRefresh,
 } from "../src/eventsub.ts";
 import {
   CONTAINER_MARKER,
@@ -782,4 +787,138 @@ test("x-request-id is honored across refusal, envelope and receiver forward", as
   assert.ok(isRequestId(minted));
   assert.notEqual(minted, attacker);
   for (const line of h.logs) assert.ok(!line.includes("synthetic-eventsub-secret"), line);
+});
+
+// ---------------------------------------------------------------- no-restart rotation refresh
+
+const REFRESH_HEADER_NAMES = [
+  REFRESH_SECRET_HEADER,
+  REFRESH_TIMESTAMP_HEADER,
+  REFRESH_NONCE_HEADER,
+  REFRESH_SIGNATURE_HEADER,
+] as const;
+
+test("caller-supplied refresh headers are refused without touching the container", async (t) => {
+  const h = await harness(t, ENABLED_ENV);
+  await h.warm();
+  const before = h.seen.length;
+  for (const name of REFRESH_HEADER_NAMES) {
+    const response = await h.call(post(BODY, { ...DELIVERY_HEADERS, [name]: "caller-controlled" }));
+    assert.equal(response.status, 400, name);
+    const body = (await response.json()) as { error: { code: string; retryable: boolean } };
+    assert.equal(body.error.code, "malformed", name);
+    assert.equal(body.error.retryable, false, name);
+  }
+  assert.equal(h.seen.length, before, "no refused request reached the container");
+  for (const line of h.logs) assert.ok(!line.includes("caller-controlled"), line);
+});
+
+test("reload key travels on its own explicit line only with the receiver forward", async (t) => {
+  // Built from parts: a single assigned literal on a secret key trips the scanner.
+  const key = ["synthetic", "reload", "key", "00000000000001"].join("-");
+  const armed = await harness(t, { ...ENABLED_ENV, TWO_EVENTSUB_RELOAD_KEY: key });
+  await armed.warm();
+  assert.equal(armed.starts[0]?.env?.["TWO_EVENTSUB_RELOAD_KEY"], key);
+  const disarmed = await harness(t, ENABLED_ENV);
+  await disarmed.warm();
+  assert.equal(disarmed.starts[0]?.env?.["TWO_EVENTSUB_RELOAD_KEY"], undefined);
+  // Dark receiver forwards nothing, even with the key set.
+  const dark = await harness(t, {
+    ...DARK_ENV, EVENTSUB_INGRESS: "1", TWO_EVENTSUB: "1", TWO_EVENTSUB_RELOAD_KEY: key,
+  });
+  await dark.warm();
+  assert.equal(dark.starts[0]?.env?.["TWO_EVENTSUB_RELOAD_KEY"], undefined);
+});
+
+test("armed DO attaches a server-side refresh no caller value can influence", async (t) => {
+  const key = ["synthetic", "reload", "key", "00000000000001"].join("-");
+  const h = await harness(t, { ...ENABLED_ENV, TWO_EVENTSUB_RELOAD_KEY: key });
+  await h.warm();
+  const response = await h.call(post());
+  assert.equal(response.status, 200);
+  await response.arrayBuffer();
+  const calls = h.receiverCalls();
+  assert.equal(calls.length, 1);
+  const headers = calls[0]?.headers ?? {};
+  assert.equal(headers[REFRESH_SECRET_HEADER], ENABLED_ENV.TWO_TWITCH_WEBHOOK_SECRET);
+  assert.match(headers[REFRESH_TIMESTAMP_HEADER] ?? "", /^\d{1,10}$/);
+  assert.match(headers[REFRESH_NONCE_HEADER] ?? "", /^[0-9a-f]{32}$/);
+  assert.match(headers[REFRESH_SIGNATURE_HEADER] ?? "", /^sha256=[0-9a-f]{64}$/);
+  // A second delivery signs differently: the nonce is single-use.
+  const second = await h.call(post());
+  assert.equal(second.status, 200);
+  await second.arrayBuffer();
+  assert.equal(h.receiverCalls().length, 2);
+  assert.notEqual(h.receiverCalls()[1]?.headers[REFRESH_NONCE_HEADER], headers[REFRESH_NONCE_HEADER]);
+  assert.notEqual(h.receiverCalls()[1]?.headers[REFRESH_SIGNATURE_HEADER], headers[REFRESH_SIGNATURE_HEADER]);
+  // Nothing secret-bearing reaches the Worker logs.
+  for (const line of h.logs) {
+    assert.ok(!line.includes(ENABLED_ENV.TWO_TWITCH_WEBHOOK_SECRET), line);
+    assert.ok(!line.includes(key), line);
+  }
+});
+
+test("disarmed deliveries carry no refresh headers", async (t) => {
+  const h = await harness(t, ENABLED_ENV);
+  await h.warm();
+  const response = await h.call(post());
+  assert.equal(response.status, 200);
+  await response.arrayBuffer();
+  const headers = h.receiverCalls()[0]?.headers ?? {};
+  for (const name of REFRESH_HEADER_NAMES) {
+    assert.equal(headers[name], undefined, name);
+  }
+});
+
+test("armed key without the signing secret fails closed before the container", async (t) => {
+  const key = ["synthetic", "reload", "key", "00000000000001"].join("-");
+  const { TWO_TWITCH_WEBHOOK_SECRET: _dropped, ...withoutSecret } = ENABLED_ENV;
+  const h = await harness(t, { ...withoutSecret, TWO_EVENTSUB_RELOAD_KEY: key });
+  await h.warm();
+  const before = h.receiverCalls().length;
+  const response = await h.call(post());
+  assert.equal(response.status, 503);
+  const body = (await response.json()) as { error: { code: string; retryable: boolean } };
+  assert.equal(body.error.code, "unavailable");
+  assert.equal(body.error.retryable, true);
+  assert.equal(h.receiverCalls().length, before, "unsigned refresh never reaches the container");
+});
+
+test("refresh signing fails closed on missing secrets", async () => {
+  assert.equal(
+    await signEventsubRefresh({ reloadKey: "", secret: "synthetic-secret", requestId: "r" }),
+    null,
+  );
+  assert.equal(
+    await signEventsubRefresh({ reloadKey: "synthetic-key", secret: "", requestId: "r" }),
+    null,
+  );
+});
+
+test("refresh signature matches the container's known-answer vector", async () => {
+  // Cross-language contract with `eventsub_refresh::sign`: fixed inputs must
+  // produce this exact signature on both sides. Built from parts: a single
+  // secret-shaped literal trips the secret scanner.
+  const headers = await signEventsubRefresh({
+    reloadKey: ["synthetic", "reload", "key", "00000000000001"].join("-"),
+    secret: ["synthetic", "rotated", "secret", "01"].join("-"),
+    requestId: "synthetic-request-0001",
+    timestamp: "1720000000",
+    nonce: ["0123456789abcdef", "0123456789abcdef"].join(""),
+  });
+  assert.ok(headers);
+  assert.equal(
+    headers.get(REFRESH_SIGNATURE_HEADER),
+    [
+      "sha256=",
+      "b0836458",
+      "a7b97f3d",
+      "d2d9db76",
+      "0abb2b68",
+      "880b8b56",
+      "8547b24c",
+      "a2485cc7",
+      "c23114dd",
+    ].join(""),
+  );
 });

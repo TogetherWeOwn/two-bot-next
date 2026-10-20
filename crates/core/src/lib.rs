@@ -57,6 +57,7 @@ pub mod error_chain;
 pub mod events;
 pub mod eventsub_delivery_config;
 pub mod eventsub_receiver_config;
+pub mod eventsub_refresh;
 pub mod evidence;
 pub mod expected_joins;
 pub mod fb_page_events;

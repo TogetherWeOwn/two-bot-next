@@ -1,6 +1,9 @@
 //! Private Twitch EventSub receiver (`POST /hooks/twitch`). Never merge this
 //! router into the health socket. Verification (`twitch_eventsub::verify_delivery`)
-//! precedes any JSON parsing; known deterministic classification errors are
+//! precedes any JSON parsing; when `TWO_EVENTSUB_RELOAD_KEY` arms rotation, an
+//! authenticated per-delivery refresh (`eventsub_refresh`) swaps the secret
+//! before that verification, and any refresh failure refuses with retryable
+//! 503. Known deterministic classification errors are
 //! acknowledged with 2xx so Twitch does not retry them. Unknown/future errors
 //! fail closed with retryable 503. A verified `stream.online` runs the
 //! durable claim → send → settle flow (`stream_live_store::deliver_go_live`)
@@ -33,6 +36,7 @@ use tokio::{net::TcpListener, sync::Semaphore};
 use tracing::Instrument;
 use two_bot_core::{
     eventsub_receiver_config::EventsubReceiverConfig,
+    eventsub_refresh::{refresh_before_verify, RefreshVerifier},
     stream_live_store::deliver_go_live,
     twitch_eventsub::{classify, verify_delivery, Delivery, DeliveryHeaders, EventSubError},
 };
@@ -48,6 +52,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct ReceiverState {
     secret: RwLock<two_bot_core::twitch_eventsub::WebhookSecret>,
+    /// No-restart rotation, armed only when the Operator provisioned
+    /// `TWO_EVENTSUB_RELOAD_KEY`. `None` keeps the legacy startup-secret
+    /// behavior: the snapshot below never changes after bind.
+    reload: Option<RefreshVerifier>,
     capacity: Arc<Semaphore>,
     /// Go-live delivery dependencies, injected at bind time. `None` keeps
     /// verified notifications side-effect free (acknowledge only).
@@ -64,6 +72,7 @@ impl ReceiverState {
             // Keep one atomic secret snapshot in the state; handlers never
             // re-read the environment or observe partially replaced material.
             secret: RwLock::new(config.secret().clone()),
+            reload: config.reload_key().cloned().map(RefreshVerifier::new),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
             delivery: delivery.map(Arc::new),
         }
@@ -399,6 +408,35 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         }
     };
     let message_type = headers.message_type().to_owned();
+
+    // No-restart rotation, when armed: the fenced DO attached the Worker's
+    // current secret with its own HMAC. Swap before verifying this delivery;
+    // any refresh failure refuses retryably without touching the stale
+    // snapshot or the Twitch verification below.
+    if let Some(reload) = state.reload.as_ref() {
+        let refreshed = refresh_before_verify(
+            reload,
+            &state.secret,
+            |name| {
+                parts
+                    .headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+            },
+            id,
+            now_ms_u64(),
+        );
+        if refreshed.is_err() {
+            return refuse(
+                state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                true,
+                id,
+                bounded_message_type(&message_type),
+            );
+        }
+    }
 
     let raw = match tokio::time::timeout(BODY_TIMEOUT, to_bytes(body, MAX_BODY_BYTES)).await {
         Ok(Ok(raw)) => raw,

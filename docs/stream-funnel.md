@@ -204,7 +204,17 @@ four values.
   the Operator-provisioned `TWO_TWITCH_WEBHOOK_SECRET`. Any other state is
   dark; an enabled-but-invalid config stops startup, never downgrades.
 - Runs `verify_delivery` plus `classify` with the Operator secret. Nothing
-  is parsed before verification passes.
+  is parsed before verification passes. When the Operator arms no-restart
+  rotation (`TWO_EVENTSUB_RELOAD_KEY` on both sides), the fenced DO attaches
+  the Worker's current secret to every delivery with a dedicated refresh HMAC
+  (`x-two-eventsub-*` headers, never caller-supplied — the edge ingress
+  refuses them), and the receiver authenticates, validates and atomically
+  swaps its in-memory snapshot before verifying that delivery
+  (`crates/core/src/eventsub_refresh.rs`). Any refresh failure answers
+  retryable 503 `unavailable` without verifying against the stale snapshot;
+  each request swaps-then-verifies, so concurrent deliveries each use one
+  consistent snapshot and a superseded in-flight delivery is a deterministic
+  401, never a 500.
 - Echoes `Delivery::Challenge` as `200 text/plain`; acknowledges
   `Revocation`, `Ignored` and deterministic classification
   errors (`WrongSubscription`, `InvalidBody`) as `200 {"ok":true}` so Twitch
@@ -230,8 +240,10 @@ four values.
   inputs (`TWO_TWITCH_CALLBACK_URL`, `TWO_TWITCH_BROADCASTERS`) and the Twitch
   credentials (`TWO_TWITCH_CLIENT_ID`, `TWO_TWITCH_CLIENT_SECRET`,
   `TWO_TWITCH_WEBHOOK_SECRET`) on explicit lines, and forwards nothing when
-  the secret is missing. The delivery gate and its channel/invite inputs
-  travel on their own explicit lines inside that forward, only while
+  the secret is missing. The refresh HMAC key (`TWO_EVENTSUB_RELOAD_KEY`)
+  travels on its own explicit line inside that forward when set; absent stays
+  absent and rotation stays disarmed. The delivery gate and its channel/invite
+  inputs travel on their own explicit lines inside that forward, only while
   `TWO_EVENTSUB_DELIVERY` is exactly `"1"`.
   `scripts/check-env-bindings.py` rejects any `TWO_EVENTSUB*` or
   `TWO_TWITCH_*` var in `wrangler.toml`.
