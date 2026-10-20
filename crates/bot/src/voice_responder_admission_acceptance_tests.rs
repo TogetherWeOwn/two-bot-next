@@ -264,6 +264,90 @@ async fn settle(replies: &GateReplies) {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn responder_burst_is_bounded_before_spawned_tasks_can_run() {
+    let trace = Trace::default();
+    let (sink, replies, runtime) = gate_sink(trace.clone(), MODE_HOLD);
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    let cache = DefaultInMemoryCache::new();
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let tasks_before = metrics.num_alive_tasks();
+    let capacity = sink.admission.permits.available_permits();
+    assert!((1..=MAX_RESPONDER_IN_FLIGHT).contains(&capacity));
+    let drops_before = sink.admission.drops.load(Ordering::SeqCst);
+
+    // No await: a current-thread executor cannot poll any spawned task
+    // during this burst. Acquiring inside a task leaves the entire burst
+    // queued, even if the reply concurrency looks bounded after a yield.
+    for index in 0..256 {
+        send(&sink, &cache, burst_create(index));
+    }
+    assert_eq!(replies.counters(), (0, 0, 0, 0));
+    assert_eq!(
+        sink.admission.permits.available_permits(),
+        0,
+        "admission did not reserve capacity before spawning"
+    );
+    assert_eq!(
+        sink.admission.drops.load(Ordering::SeqCst) - drops_before,
+        (256 - capacity) as u64,
+        "excess interactions were queued instead of synchronously refused"
+    );
+    let spawned = metrics.num_alive_tasks() - tasks_before;
+    assert!(
+        (1..=MAX_TOTAL_REPLY_IN_FLIGHT).contains(&spawned),
+        "synchronous burst queued {spawned} tasks before admission; even with bounded busy replies the ceiling is {MAX_TOTAL_REPLY_IN_FLIGHT}"
+    );
+    assert_eq!(creates(&trace), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn responder_saturated_invite_is_refused_before_settings_snapshot() {
+    let trace = Trace::default();
+    let snapshot_reads = Arc::new(AtomicUsize::new(0));
+    let reader = Arc::clone(&snapshot_reads);
+    let runtime = Arc::new(test_runtime(trace.clone()).with_live_source(move || {
+        reader.fetch_add(1, Ordering::SeqCst);
+        None
+    }));
+    let replies = GateReplies::new(MODE_PASS);
+    let sink = VoiceResponder::new(runtime, Arc::clone(&replies));
+    let cache = DefaultInMemoryCache::new();
+    let capacity = sink.admission.permits.available_permits();
+    assert!((1..=MAX_RESPONDER_IN_FLIGHT).contains(&capacity));
+    let held = sink
+        .admission
+        .permits
+        .try_acquire_many(capacity as u32)
+        .expect("hold every responder permit");
+    let mut invite = voice_interaction(Some(command_data("invite", Vec::new())), None, true);
+    invite.id = Id::new(70_000);
+
+    // The existing live-settings reader is an observable snapshot boundary.
+    // A refused interaction must not cross it, even before any task polls.
+    send(&sink, &cache, invite.clone());
+    assert_eq!(
+        snapshot_reads.load(Ordering::SeqCst),
+        0,
+        "saturated invite read a settings snapshot before refusal"
+    );
+    assert_eq!(sink.admission.drops.load(Ordering::SeqCst), 1);
+    assert_eq!(replies.counters(), (0, 0, 0, 0));
+    assert_eq!(creates(&trace), 0);
+
+    // Positive control: the same reader must be live for an admitted invite,
+    // so deleting snapshot capture cannot satisfy the refusal assertion.
+    drop(held);
+    invite.id = Id::new(70_001);
+    send(&sink, &cache, invite);
+    wait_until("admitted invite to complete", || {
+        replies.complete_started() == 1
+    })
+    .await;
+    assert_eq!(snapshot_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(replies.defer_started(), 1);
+}
+
 #[tokio::test]
 async fn responder_burst_never_exceeds_execution_bound_while_replies_held() {
     let trace = Trace::default();
@@ -401,24 +485,31 @@ async fn responder_permits_return_after_normal_completion() {
     assert_eq!(replies.defer_started(), 40);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn responder_permits_return_after_failed_ack_and_failed_ack_never_mutates() {
     let trace = Trace::default();
     let (sink, replies, runtime) = gate_sink(trace.clone(), MODE_FAIL_DEFER);
     assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
     let cache = DefaultInMemoryCache::new();
+    let capacity = sink.admission.permits.available_permits();
+    assert!((1..=MAX_RESPONDER_IN_FLIGHT).contains(&capacity));
 
-    // Every acknowledgement fails ambiguously: no command may execute, and
-    // each failed execution must still return its permit, so far more than
-    // one bound's worth of interactions get their (failing) defer attempt.
+    // Submit successive failures, not a synchronous burst: non-waiting
+    // pre-spawn admission must drop a burst's excess even when every ack
+    // would fail. Each failed execution must return its permit so far more
+    // than one bound's worth of interactions can attempt their defer.
     for index in 0..64 {
         send(&sink, &cache, burst_create(index));
+        let expected = index + 1;
+        wait_until("failed acknowledgement and its permit to return", || {
+            replies.defer_started() == expected
+                && replies.in_flight.load(Ordering::SeqCst) == 0
+                && sink.admission.permits.available_permits() == capacity
+        })
+        .await;
     }
-    wait_until("every failed ack to be attempted", || {
-        replies.defer_started() == 64
-    })
-    .await;
     settle(&replies).await;
+    assert_eq!(replies.defer_started(), 64);
     assert_eq!(
         creates(&trace),
         0,

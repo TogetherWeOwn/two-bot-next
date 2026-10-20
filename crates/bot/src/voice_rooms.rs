@@ -12952,16 +12952,16 @@ impl InteractionReplies for RoomHttp {
     }
 }
 
-/// Maximum concurrently executing voice interaction responder tasks.
+/// Maximum outstanding voice interaction responder tasks, including queued tasks.
 ///
 /// Recognized voice interactions bypass the shared command router's admission
 /// (the router yields voice-owned interactions before its own lane check), so
-/// the responder enforces its own non-waiting bound: each spawned task takes
-/// one permit as its first statement and holds it across the whole
-/// `respond_named` future. A burst larger than this parks at most this many
-/// executions at their first reply call; every further interaction is dropped
-/// without acknowledgement (counted, log-sampled), never queued, so holding
-/// reply futures pending cannot accumulate unbounded responder tasks.
+/// the responder reserves a permit synchronously after recognition, before
+/// cloning the interaction, building cache snapshots, or spawning any task.
+/// The owned permit moves into the task and covers the whole `respond_named`
+/// future. Excess interactions are dropped without acknowledgement (counted,
+/// log-sampled), never queued, so even an unpolled burst cannot accumulate
+/// unbounded responder tasks or snapshots.
 ///
 /// The value matches the shared router's 16-slot interaction lane: a saturated
 /// voice responder sheds the same pressure the router would. Permits release
@@ -12978,7 +12978,7 @@ const VOICE_RESPONDER_DROP_WARN_INTERVAL_SECS: u64 = 60;
 /// Non-waiting admission state shared by a responder's spawned tasks: one
 /// execution bound plus a counted, log-sampled saturation drop path.
 struct ResponderAdmission {
-    permits: Semaphore,
+    permits: Arc<Semaphore>,
     drops: AtomicU64,
     drop_warn_last_secs: AtomicU64,
 }
@@ -12986,7 +12986,7 @@ struct ResponderAdmission {
 impl Default for ResponderAdmission {
     fn default() -> Self {
         Self {
-            permits: Semaphore::new(VOICE_RESPONDER_MAX_IN_FLIGHT),
+            permits: Arc::new(Semaphore::new(VOICE_RESPONDER_MAX_IN_FLIGHT)),
             drops: AtomicU64::new(0),
             drop_warn_last_secs: AtomicU64::new(0),
         }
@@ -13269,6 +13269,10 @@ where
             {
                 return;
             }
+            let Ok(permit) = Arc::clone(&self.admission.permits).try_acquire_owned() else {
+                self.admission.record_drop(created.0.id.get());
+                return;
+            };
             let interaction = created.0.clone();
             let vanity_code = vanity_code_from_cache(cache, &interaction);
             // The stored override resolves only for `/invite` (the sole
@@ -13293,23 +13297,9 @@ where
             let names = name_directory_from_cache(cache, &interaction);
             let runtime = Arc::clone(&self.runtime);
             let replies = Arc::clone(&self.replies);
-            let admission = Arc::clone(&self.admission);
             tokio::spawn(async move {
-                // Non-waiting admission as the first statement of the spawned
-                // task: a pre-spawn check in the handler would refuse all but
-                // a bound's worth of a synchronous burst even when the
-                // in-flight executions complete near-instantly (failed
-                // acknowledgements) and would recycle their permits. Gating
-                // at task start bounds
-                // concurrent executions while letting fail-fast work through
-                // in turn. The permit precedes every reply call and every
-                // mutation, and releases on completion, error, and task
-                // cancellation; the cache snapshots above stay in the handler
-                // only because they borrow the gateway cache.
-                let Ok(_permit) = admission.permits.try_acquire() else {
-                    admission.record_drop(interaction.id.get());
-                    return;
-                };
+                // Hold admission until the responder finishes or is cancelled.
+                let _permit = permit;
                 Self::respond_named(
                     &runtime,
                     &replies,
