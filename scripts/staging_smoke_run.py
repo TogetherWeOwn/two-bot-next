@@ -125,7 +125,7 @@ def fences(args, token):
         origin = health_probe.staging_origin(args.staging_url)
     except health_probe.ProbeError as error:
         raise Refused(str(error))
-    if args.expected_sha and not SHA_RE.fullmatch(args.expected_sha):
+    if args.expected_sha is not None and not SHA_RE.fullmatch(args.expected_sha):
         raise Refused("refusing: --expected-sha must be 40 lowercase hex characters")
     if args.deploy_run_id and not RUN_ID_RE.fullmatch(args.deploy_run_id):
         raise Refused("refusing: --deploy-run-id must be digits")

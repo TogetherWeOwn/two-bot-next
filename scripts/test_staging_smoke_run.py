@@ -172,6 +172,29 @@ class SmokeRunTests(unittest.TestCase):
                 self.assertEqual(code, 2)
                 self.assert_no_request()
 
+    def test_empty_cli_sha_refuses_before_requests_or_record(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code, out = self.drive(extra=("--expected-sha", ""))
+        self.assertEqual(code, 2)
+        self.assertIn("--expected-sha must be 40 lowercase hex characters", out)
+        self.assertEqual(err.getvalue(), "")
+        self.assert_no_request()
+
+    def test_empty_env_sha_refuses_before_requests_or_record(self):
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["--staging-url", ORIGIN, "--guild-id", STAGING_GUILD,
+                "--record", str(self.record)]
+        with mock.patch.dict(os.environ, {"DISCORD_STAGING_BOT_TOKEN": TOKEN,
+                                          "EXPECTED_SHA": ""}, clear=True), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = smoke.main(argv, health_fetch=self.health_fetch(),
+                              discord_fetch=self.discord_fetch())
+        self.assertEqual(code, 2)
+        self.assertIn("--expected-sha must be 40 lowercase hex characters", out.getvalue())
+        self.assertEqual(err.getvalue(), "")
+        self.assert_no_request()
+
     # -- healthy staging -----------------------------------------------------
 
     def test_healthy_run_passes_and_writes_a_valid_record(self):
