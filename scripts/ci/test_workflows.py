@@ -3140,6 +3140,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('service_ip="$(getent ahostsv4 agent-testdb 2>/dev/null | awk \'NR == 1 { print $1; exit }\')" || service_ip=""', run)
         self.assertIn('echo "agent-testdb did not resolve to an IPv4 address"', run)
 
+    def test_lfg_runtime_regressions_receive_disposable_database_url(self):
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-stores"]
+        step = next(
+            step for step in job["steps"]
+            if step.get("name") == "LFG actual-router and mock-Discord regressions"
+        )
+        self.assertEqual(
+            step["env"]["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/agent_test",
+        )
+        self.assertIn("--test lfg_interactions -- --ignored --test-threads=1", step["run"])
+
     def test_runtime_postgres_wal_budget_is_bounded(self):
         # Same budget as rust-tests and the stores lane: the runtime lane runs
         # 26 sequential database suites against the same 1 GiB tmpfs service,

@@ -1538,6 +1538,7 @@ async fn refuse_divergent_select(
 macro_rules! durable_select_divergence {
     ($name:ident, $original:expr, $divergent:expr, $guild:expr, $actor:expr) => {
         #[tokio::test]
+        #[ignore = "needs TWO_TEST_DATABASE_URL disposable database"]
         async fn $name() {
             refuse_divergent_select($original, $divergent, $guild, $actor).await;
         }
@@ -1609,6 +1610,7 @@ durable_select_divergence!(
 );
 
 #[tokio::test]
+#[ignore = "needs TWO_TEST_DATABASE_URL disposable database"]
 async fn durable_select_identical_leave_replay_preserves_later_signup() {
     let db = durable_select_db().await;
     replay_post(db.pool(), "replay-a", GUILD).await;
@@ -1690,6 +1692,7 @@ async fn durable_select_identical_leave_replay_preserves_later_signup() {
 }
 
 #[tokio::test]
+#[ignore = "needs TWO_TEST_DATABASE_URL disposable database"]
 async fn durable_select_legacy_null_reason_cannot_prove_request_identity() {
     let db = durable_select_db().await;
     replay_post(db.pool(), "replay-a", GUILD).await;
@@ -1762,6 +1765,7 @@ async fn wait_for_select_lock(pool: &sqlx::PgPool, lock_type: &str) -> bool {
 }
 
 #[tokio::test]
+#[ignore = "needs TWO_TEST_DATABASE_URL disposable database"]
 async fn durable_select_concurrent_different_posts_serialize_before_the_first_audit_exists() {
     let db = durable_select_db().await;
     replay_post(db.pool(), "replay-a", GUILD).await;
