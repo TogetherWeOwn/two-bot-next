@@ -523,32 +523,41 @@ class OutputSafetyTests(unittest.TestCase):
         self.assertIsNone(proveout.parse_json_or_text("null"))
 
     def test_unicode_json_display_fallback_does_not_reject_valid_shape(self):
-        body = json.dumps(
-            {"result": {"content": [{"type": "text", "text": "🧪" * 15000}]}},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        self.assertLessEqual(len(body.encode("utf-8")), proveout.MAX_BODY_BYTES)
-        self.assertGreater(
-            len(json.dumps(json.loads(body), separators=(",", ":"), sort_keys=True).encode("utf-8")),
-            proveout.MAX_BODY_BYTES,
-        )
+        padding = "🧪" * 15000
+        cases = [
+            (0, {"result": {"protocolVersion": "2025-06-18", "pad": padding}}),
+            (1, {"result": {"tools": [
+                {"name": tool} for tool in proveout.EXPECTED_TOOLS], "pad": padding}}),
+        ] + [(index, {"result": {
+            "content": [{"type": "text", "text": padding}],
+            "structuredContent": {"available": True, "rows": [], "truncated": False},
+        }}) for index in range(2, 2 + len(proveout.EXPECTED_TOOLS))] + [
+            (7, {"error": {"code": -32601, "message": padding}}),
+        ]
+        for index, envelope in cases:
+            with self.subTest(probe=HostileBodyTests.PROBES[index]):
+                body = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+                self.assertLessEqual(len(body.encode("utf-8")), proveout.MAX_BODY_BYTES)
+                self.assertGreater(
+                    len(json.dumps(envelope, separators=(",", ":"), sort_keys=True).encode("utf-8")),
+                    proveout.MAX_BODY_BYTES,
+                )
 
-        code, stdout, artifact, raw = HostileBodyTests().run_main({
-            2: (200, {}, body),
-        })
+                code, stdout, artifact, raw = HostileBodyTests().run_main({
+                    index: (200, {}, body),
+                })
 
-        self.assertEqual(code, 0)
-        self.assertEqual(artifact["failures"], [])
-        self.assertEqual(set(artifact["probes"][2]["body"]), {"_text"})
-        rendered_body = json.dumps(
-            artifact["probes"][2]["body"], separators=(",", ":")
-        ).encode("utf-8")
-        self.assertLessEqual(
-            len(rendered_body), proveout.MAX_BODY_BYTES + len(b'{"_text":""}')
-        )
-        self.assertLess(len(stdout.encode("utf-8")), 2 * proveout.MAX_BODY_BYTES)
-        self.assertLess(len(raw), 2 * proveout.MAX_BODY_BYTES)
+                self.assertEqual(code, 0)
+                self.assertEqual(artifact["failures"], [])
+                self.assertEqual(set(artifact["probes"][index]["body"]), {"_text"})
+                rendered_body = json.dumps(
+                    artifact["probes"][index]["body"], separators=(",", ":")
+                ).encode("utf-8")
+                self.assertLessEqual(
+                    len(rendered_body), proveout.MAX_BODY_BYTES + len(b'{"_text":""}')
+                )
+                self.assertLess(len(stdout.encode("utf-8")), 2 * proveout.MAX_BODY_BYTES)
+                self.assertLess(len(raw), 2 * proveout.MAX_BODY_BYTES)
 
     def test_reflected_bearer_in_nested_json_keys_is_redacted(self):
         token = HostileBodyTests.TOKEN
