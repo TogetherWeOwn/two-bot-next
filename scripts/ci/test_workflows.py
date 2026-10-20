@@ -3249,6 +3249,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(ignored_sweeps), 1)
         self.assertIn("--test-threads=1", ignored_sweeps[0])
         self.assertIn("--skip regenerate_reference_docs", ignored_sweeps[0])
+        self.assertIn(
+            "--skip parity_mismatch_cursor_and_read_only_acceptance",
+            ignored_sweeps[0],
+        )
+        parity_reruns = [run for run in cov_runs if "--test legacy_verify_db" in run]
+        self.assertEqual(len(parity_reruns), 1)
+        self.assertNotIn(
+            "--skip parity_mismatch_cursor_and_read_only_acceptance",
+            parity_reruns[0],
+        )
         # One MEMBER_TESTDB export serves both the ignored sweep and the
         # fail-closed member_moderation_db re-run. Pin its count and logical
         # command order so a redundant later export cannot mask a deleted or
