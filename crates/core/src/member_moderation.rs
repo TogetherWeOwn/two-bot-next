@@ -525,6 +525,16 @@ pub trait MemberModerationStore: Send + Sync {
         claimed_at: &str,
     ) -> impl Future<Output = Result<ClaimState, StoreError>> + Send;
 
+    /// Read-only: the stored outcome of a `done` row whose request hash matches.
+    /// An absent, `in_flight` or differently-bound row is `None`; this never
+    /// inserts, completes or releases anything.
+    fn completed_outcome(
+        &self,
+        guild_id: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send;
+
     /// Record the terminal result so a retry replays it (legacy `complete`).
     fn complete(
         &self,
@@ -840,6 +850,16 @@ pub fn validate_member_request(
         policy,
     )
     .map_err(MemberError::Policy)?;
+    validate_request_content(action, reason, duration_seconds)
+}
+
+/// The authority-free half of validation: the audit reason and duration bounds
+/// that, with the action and target, define a request's idempotency hash.
+fn validate_request_content(
+    action: ModerationAction,
+    reason: &str,
+    duration_seconds: Option<i64>,
+) -> Result<ValidatedMemberRequest, MemberError> {
     let reason = require_moderation_reason(reason).map_err(MemberError::Reason)?;
     let duration_seconds = match action {
         ModerationAction::TempBan => Some(bounded_duration(
@@ -858,6 +878,18 @@ pub fn validate_member_request(
         action,
         reason,
         duration_seconds,
+    })
+}
+
+/// The nonmutating result of a stored `done` outcome; an unreadable outcome is
+/// a store fault, never a guess.
+fn replayed_result(outcome: &str) -> Result<MemberResult, MemberError> {
+    let outcome = MemberOutcome::from_stored(outcome).ok_or(MemberError::Store(
+        StoreError::new(format!("stored unknown outcome: {outcome}")),
+    ))?;
+    Ok(MemberResult {
+        outcome,
+        replayed: true,
     })
 }
 
@@ -1024,6 +1056,16 @@ where
                 self.audit_refused(exec, "authority").await?;
                 return Err(MemberError::AuthorityUnavailable);
             }
+            Err(MemberError::TargetNotMember) => {
+                // A completed removal is the expected end state of a kick, so
+                // its redelivery must replay, not refuse. Only a stored,
+                // hash-matching `done` row does; anything else still refuses.
+                if let Some(replayed) = self.completed_replay(exec).await? {
+                    return Ok(replayed);
+                }
+                self.audit_refused(exec, "authority").await?;
+                return Err(MemberError::TargetNotMember);
+            }
             Err(err) => {
                 self.audit_refused(exec, "authority").await?;
                 return Err(err);
@@ -1051,6 +1093,35 @@ where
             validated.duration_seconds,
         );
         self.execute_claimed(&current, &validated, &hash).await
+    }
+
+    /// Nonmutating replay of a completed request whose target has since left
+    /// the guild. Reads the existing row only: no claim, release, audit or
+    /// Discord call, and an invalid request cannot have a stored row.
+    async fn completed_replay(
+        &self,
+        exec: &MemberExecution,
+    ) -> Result<Option<MemberResult>, MemberError> {
+        let Ok(validated) =
+            validate_request_content(exec.action, &exec.reason, exec.duration_seconds)
+        else {
+            return Ok(None);
+        };
+        let hash = request_hash(
+            validated.action,
+            &exec.guild_id,
+            exec.target.as_ref().map(|t| t.user_id.as_str()),
+            &validated.reason,
+            validated.duration_seconds,
+        );
+        let Some(outcome) = self
+            .store
+            .completed_outcome(&exec.guild_id, &exec.idempotency_key, &hash)
+            .await?
+        else {
+            return Ok(None);
+        };
+        replayed_result(&outcome).map(Some)
     }
 
     async fn audit_refused(&self, exec: &MemberExecution, stage: &str) -> Result<(), MemberError> {
@@ -1141,15 +1212,7 @@ where
             )
             .await?
         {
-            ClaimState::Replayed { outcome } => {
-                let outcome = MemberOutcome::from_stored(&outcome).ok_or(MemberError::Store(
-                    StoreError::new(format!("stored unknown outcome: {outcome}")),
-                ))?;
-                return Ok(MemberResult {
-                    outcome,
-                    replayed: true,
-                });
-            }
+            ClaimState::Replayed { outcome } => return replayed_result(&outcome),
             ClaimState::InFlight => return Err(MemberError::InFlight),
             ClaimState::Mismatch => return Err(MemberError::KeyMismatch),
             ClaimState::Claimed => {}
@@ -1772,6 +1835,20 @@ impl MemberModerationStore for MemMemberStore {
             },
         );
         Ok(ClaimState::Claimed)
+    }
+
+    async fn completed_outcome(
+        &self,
+        guild_id: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .lock()
+            .idempotency
+            .get(&(guild_id.to_owned(), idempotency_key.to_owned()))
+            .filter(|row| row.state == IdemState::Done && row.hash == request_hash)
+            .map(|row| row.outcome.clone().unwrap_or_else(|| "unknown".to_owned())))
     }
 
     async fn complete(
@@ -4060,6 +4137,17 @@ mod tests {
         ) -> Result<ClaimState, StoreError> {
             self.inner
                 .claim(guild_id, idempotency_key, action, request_hash, claimed_at)
+                .await
+        }
+
+        async fn completed_outcome(
+            &self,
+            guild_id: &str,
+            idempotency_key: &str,
+            request_hash: &str,
+        ) -> Result<Option<String>, StoreError> {
+            self.inner
+                .completed_outcome(guild_id, idempotency_key, request_hash)
                 .await
         }
 

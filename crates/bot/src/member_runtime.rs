@@ -259,6 +259,8 @@ fn valid_id(id: &str) -> bool {
 
 /// Guild-wide permissions only. Check every held role even for owners/admins;
 /// an unknown role is incomplete evidence, not an implicit privilege grant.
+/// Owners and administrators hold every permission, but only the guild owner
+/// is exempt from role hierarchy: an administrator keeps the real top position.
 fn actor_authority(
     user_id: &str,
     held: Vec<String>,
@@ -270,12 +272,16 @@ fn actor_authority(
     for role in &roles {
         permissions |= *facts.permissions.get(role)?;
     }
-    let privileged = user_id == facts.owner_id || permissions & (1 << 3) != 0;
+    let owner = user_id == facts.owner_id;
     Some(ModerationActor {
         user_id: user_id.to_owned(),
         role_ids: roles,
-        highest_role_position: if privileged { i64::MAX } else { top },
-        permissions: if privileged { u64::MAX } else { permissions },
+        highest_role_position: if owner { i64::MAX } else { top },
+        permissions: if owner || permissions & (1 << 3) != 0 {
+            u64::MAX
+        } else {
+            permissions
+        },
     })
 }
 
@@ -528,20 +534,12 @@ async fn current_authority(
         .target
         .as_ref()
         .ok_or(two_bot_core::moderation::PolicyError::MissingTarget)?;
-    let (target_roles, is_bot) = match fetched_member(executor, &exec.guild_id, &target.user_id)
-        .await
-        .map_err(|_| unavailable())?
-    {
-        Some(member) => member,
-        None if matches!(
-            exec.action,
-            ModerationAction::Ban | ModerationAction::TempBan
-        ) =>
-        {
-            (Vec::new(), false)
-        }
-        None => return Err(MemberError::TargetNotMember),
-    };
+    let (target_roles, is_bot) = target_membership(
+        exec.action,
+        fetched_member(executor, &exec.guild_id, &target.user_id)
+            .await
+            .map_err(|_| unavailable())?,
+    )?;
     let target = ModerationTarget {
         user_id: target.user_id.clone(),
         highest_role_position: top_position(&target_roles, &facts).ok_or_else(unavailable)?,
@@ -562,6 +560,23 @@ async fn current_authority(
         target: Some(target),
         bot_highest_role_position,
     })
+}
+
+/// What a strict target-member read means per verb. `None` is a confirmed
+/// departed or never-joined user: ban/tempban may still act on that nonmember,
+/// while kick/timeout/warn have nothing to act on and refuse (kick would
+/// otherwise treat the 404 as success, warn would persist a nonmember warning).
+fn target_membership(
+    action: ModerationAction,
+    fetched: Option<(Vec<String>, bool)>,
+) -> Result<(Vec<String>, bool), MemberError> {
+    match fetched {
+        Some(member) => Ok(member),
+        None if matches!(action, ModerationAction::Ban | ModerationAction::TempBan) => {
+            Ok((Vec::new(), false))
+        }
+        None => Err(MemberError::TargetNotMember),
+    }
 }
 
 /// The supervised unban sweep for the configured guild: claim one due job
@@ -652,11 +667,19 @@ mod tests {
         assert_eq!(actor.role_ids, vec!["101", "2222"]);
         assert_eq!(with_everyone(vec!["2222".into()], "2222"), vec!["2222"]);
         facts.permissions.insert("101".into(), 8);
+        // Administrator expands permissions only: hierarchy keeps the real top
+        // role, so this actor stays below a target at position 60.
         let admin = actor_authority("88", vec!["101".into()], &facts).expect("admin");
         assert_eq!(
             (admin.permissions, admin.highest_role_position),
-            (u64::MAX, i64::MAX)
+            (u64::MAX, 50)
         );
+        let everyone_only = actor_authority("88", vec![], &facts).expect("everyone only");
+        assert_eq!(
+            everyone_only.permissions, 4,
+            "no admin bit without the role"
+        );
+        // Only the guild owner is exempt from role hierarchy.
         let owner = actor_authority("99", vec![], &facts).expect("owner");
         assert_eq!(
             (owner.permissions, owner.highest_role_position),
@@ -677,6 +700,34 @@ mod tests {
         );
         assert_eq!(error_text(MemberError::AuthorityUnavailable), FAILURE_REPLY);
         assert_eq!(error_text(MemberError::TargetNotMember), NO_MEMBER_REPLY);
+    }
+
+    #[test]
+    fn departed_target_is_tolerated_only_by_ban_and_tempban() {
+        let present = Some((vec!["101".to_owned()], true));
+        for action in [
+            ModerationAction::Ban,
+            ModerationAction::TempBan,
+            ModerationAction::Kick,
+            ModerationAction::Timeout,
+            ModerationAction::Warn,
+        ] {
+            // A present member always passes through with its own roles and flag.
+            assert_eq!(
+                target_membership(action, present.clone()).ok(),
+                present,
+                "{action:?}"
+            );
+            let departed = target_membership(action, None);
+            if matches!(action, ModerationAction::Ban | ModerationAction::TempBan) {
+                assert_eq!(departed.ok(), Some((Vec::new(), false)), "{action:?}");
+            } else {
+                assert!(
+                    matches!(departed, Err(MemberError::TargetNotMember)),
+                    "{action:?}: a departed target must refuse, never act"
+                );
+            }
+        }
     }
 
     #[test]

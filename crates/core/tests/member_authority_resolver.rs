@@ -148,6 +148,98 @@ async fn resolver_failure_never_releases_an_unknown_or_completed_key() {
 }
 
 #[tokio::test]
+async fn a_departed_target_replays_only_a_completed_matching_request() {
+    for action in [
+        ModerationAction::Kick,
+        ModerationAction::Timeout,
+        ModerationAction::Warn,
+    ] {
+        let store = MemMemberStore::new();
+        let discord = MockMemberDiscord::new();
+        let service =
+            MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+                1_700_000_000_000
+            });
+        let denied = |store: &MemMemberStore| {
+            store
+                .audits()
+                .iter()
+                .filter(|a| a.outcome == "denied")
+                .count()
+        };
+        let exec = request(action, "departed");
+        // Never completed: a departed target refuses with one denial and no claim.
+        assert_eq!(
+            service
+                .execute_with_authority(&exec, || async { Err(MemberError::TargetNotMember) })
+                .await,
+            Err(MemberError::TargetNotMember)
+        );
+        assert_eq!(denied(&store), 1);
+        assert!(discord.calls().is_empty());
+        let first = service.execute(&exec).await.expect("real effect");
+        assert!(!first.replayed);
+        let (calls, audits) = (discord.calls().len(), store.audits().len());
+        // Redelivery after the effect removed the target replays nonmutatingly.
+        let replay = service
+            .execute_with_authority(&exec, || async { Err(MemberError::TargetNotMember) })
+            .await
+            .expect("completed replay");
+        assert!(replay.replayed);
+        assert_eq!(replay.outcome, first.outcome);
+        assert_eq!(discord.calls().len(), calls);
+        assert_eq!(store.audits().len(), audits, "replay writes no denial");
+        // The same key with different content is not a replay.
+        let mut changed = request(action, "departed");
+        changed.request_id = "changed".into();
+        changed.reason = "a different reason".into();
+        assert_eq!(
+            service
+                .execute_with_authority(&changed, || async { Err(MemberError::TargetNotMember) })
+                .await,
+            Err(MemberError::TargetNotMember)
+        );
+        assert_eq!(denied(&store), 2);
+        // Only a confirmed departure replays: other read failures still refuse.
+        let mut unavailable = request(action, "departed");
+        unavailable.request_id = "unavailable".into();
+        assert_eq!(
+            service
+                .execute_with_authority(&unavailable, || async {
+                    Err(MemberError::AuthorityUnavailable)
+                })
+                .await,
+            Err(MemberError::AuthorityUnavailable)
+        );
+        assert_eq!(discord.calls().len(), calls);
+    }
+}
+
+#[tokio::test]
+async fn a_departed_target_never_replays_or_releases_an_unknown_dispatch() {
+    let store = MemMemberStore::new();
+    let discord = MockMemberDiscord::new();
+    let service = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+        1_700_000_000_000
+    });
+    let exec = request(ModerationAction::Kick, "unknown");
+    discord.fail_with("kick", DiscordError::Timeout);
+    assert!(service.execute(&exec).await.is_err());
+    let calls = discord.calls().len();
+    let mut redelivery = request(ModerationAction::Kick, "unknown");
+    redelivery.request_id = "redelivery".into();
+    assert_eq!(
+        service
+            .execute_with_authority(&redelivery, || async { Err(MemberError::TargetNotMember) })
+            .await,
+        Err(MemberError::TargetNotMember)
+    );
+    assert_eq!(discord.calls().len(), calls);
+    // The refusal proved nothing about the earlier dispatch: still fenced.
+    assert_eq!(service.execute(&exec).await, Err(MemberError::InFlight));
+}
+
+#[tokio::test]
 async fn resolver_itself_waits_for_the_member_lane_and_another_member_is_independent() {
     for action in [ModerationAction::Ban, ModerationAction::TempBan] {
         let store = MemMemberStore::new();

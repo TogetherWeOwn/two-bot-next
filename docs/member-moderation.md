@@ -96,21 +96,27 @@ After the ban/tempban member-lane wait, the runtime strictly reads the current g
 memberships. The other verbs perform these same reads immediately before their
 validation/claim boundary. Actor permissions are the guild-wide union of current
 roles plus `@everyone`, not interaction permission bits or channel overwrites.
-Owner/administrator expansion bypasses only actor permission/hierarchy checks;
-self, protected-target and bot-hierarchy checks remain. Unknown held roles, missing
+Owner and administrator expansion grants every permission, but only the guild owner
+is exempt from the actor role hierarchy: an administrator keeps the real top-role
+position, as Discord and the website resolver do. Self, protected-target and
+bot-hierarchy checks remain. Unknown held roles, missing
 role facts, mismatched identities and failed reads refuse with a fixed, attributable
 `denied` audit before any prepared intent, warning, expiry or Discord mutation.
 Audit-write failures also fail closed. Only a strict target-member 404 permits a
 nonmember ban or tempban; kick/timeout/warn require present membership. No 403,
-timeout, malformed response or server error is absence.
+timeout, malformed response or server error is absence. A completed,
+hash-matching request whose target has since left (a kick's expected end state)
+still replays, nonmutatingly and without a denial: that single read-only lookup
+runs only on a confirmed departure, and any other departed-target request refuses.
 
 This closes the avoidable interaction-snapshot and **local member-lane wait** stale
 window. The reads are sequential bounded GETs, not an atomic Discord snapshot:
 a remote role/membership change after its read (including REST pacing/dispatch
 waits) can still race the final effect. Discord's bot hierarchy check is not an
 actor-policy recheck. Completed replay remains nonmutating; a failed fresh read
-may refuse a redelivery but never releases its completed or unknown idempotency
-row, prepared intent or expiry fence. No distributed lock or new reconciliation
+(other than the confirmed departed-target replay above) may refuse a redelivery but
+never releases its completed or unknown idempotency row, prepared intent or expiry
+fence. No distributed lock or new reconciliation
 rule is introduced. **This is not production activation/clearance**: moderation
 remains default-off and staging-only, and existing security/soak/release gates
 remain mandatory.
