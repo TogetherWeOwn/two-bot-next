@@ -7,6 +7,8 @@ use std::sync::Mutex;
 mod admission_config_acceptance;
 #[path = "voice_admission_spawn_tests.rs"]
 mod admission_spawn;
+#[path = "voice_boot_settings_acceptance_tests.rs"]
+mod boot_settings_acceptance;
 #[path = "voice_cold_authority_tests.rs"]
 mod cold_authority;
 #[path = "voice_creation_receipt_acceptance_tests.rs"]

@@ -1558,6 +1558,7 @@ const EMPTY_ROOM_GRACE: Duration = Duration::from_secs(60);
 
 /// Boot-only infrastructure protection. Stored settings remain unwired; these
 /// already-forwarded process keys must never be inferred from room rows.
+/// On refusal, return only the fixed setting key, never its value or parser error.
 fn configured_protected_channels(
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<HashSet<Snowflake>, &'static str> {
@@ -1573,11 +1574,9 @@ fn configured_protected_channels(
         };
         for value in raw.split(',') {
             let value = value.trim();
-            let id = value
-                .parse::<Snowflake>()
-                .map_err(|_| "invalid protected channel id")?;
+            let id = value.parse::<Snowflake>().map_err(|_| key)?;
             if id == 0 || value != id.to_string() || (!multiple && raw.contains(',')) {
-                return Err("invalid protected channel id");
+                return Err(key);
             }
             protected.insert(id);
         }
@@ -9307,6 +9306,16 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
     accepted_join
 }
 
+/// Name a refused boot setting without exposing configured values or parser errors.
+fn invalid_boot_setting(key: &'static str) -> RoomHttpError {
+    warn!(
+        key,
+        reason = "invalid_value",
+        "temp-voice boot setting invalid; refusing voice runtime"
+    );
+    RoomHttpError::InvalidRequest
+}
+
 /// Build the production sink: lifecycle actors plus the S4 responder.
 pub fn build_production_runtime(
     token: &str,
@@ -9314,24 +9323,20 @@ pub fn build_production_runtime(
     name_policy: AutomodPolicy,
     live_source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
-    // Malformed protection IDs refuse the whole runtime. The gateway reports it
-    // through its cataloged `voice HTTP setup failed` event.
+    // Fatal settings name only the first refused key, in existing validation
+    // order, before the gateway's generic `voice HTTP setup failed` event.
     let protected = configured_protected_channels(|key| std::env::var(key).ok())
-        .map_err(|_| RoomHttpError::InvalidRequest)?;
+        .map_err(invalid_boot_setting)?;
     let generator = configured_generator_channel(|key| std::env::var(key).ok())
-        .map_err(|_| RoomHttpError::InvalidRequest)?;
-    let empty_grace = configured_empty_grace(
-        std::env::var("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS")
-            .ok()
-            .as_deref(),
-    )
-    .map_err(|_| RoomHttpError::InvalidRequest)?;
+        .map_err(|_| invalid_boot_setting("TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID"))?;
+    let empty_grace = configured_empty_grace(std::env::var(EMPTY_GRACE_KEY).ok().as_deref())
+        .map_err(|_| invalid_boot_setting(EMPTY_GRACE_KEY))?;
     let synthetic_humans = configured_synthetic_humans(
         std::env::var("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS")
             .ok()
             .as_deref(),
     )
-    .map_err(|_| RoomHttpError::InvalidRequest)?;
+    .map_err(|_| invalid_boot_setting("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS"))?;
     let replies = RoomHttp::new(token.to_owned())?;
     let http = replies.clone();
     let store = PgRoomStore::new(pool);
