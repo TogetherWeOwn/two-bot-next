@@ -2771,6 +2771,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'max_wal_size': '512MB'", verify["run"])
         self.assertIn("'min_wal_size': '64MB'", verify["run"])
 
+    def test_rust_test_postgres_tmpfs_budget_covers_patch_coverage(self):
+        service = self.workflows["check.yml"]["jobs"]["rust-tests"]["services"]["agent-testdb"]
+        options = service["options"]
+        self.assertIn("--tmpfs /var/lib/postgresql:rw,size=2147483648", options)
+        self.assertIn("--memory 3221225472", options)
+        self.assertIn("--memory-swap 3221225472", options)
+
     def test_tmpfs_postgres_wal_budget_is_bounded_in_every_lane(self):
         # Run 39209332791: only rust-tests bounded WAL while the ignored lanes
         # ran the PG18 default (max_wal_size 1GB) on the same 1 GiB tmpfs, and
