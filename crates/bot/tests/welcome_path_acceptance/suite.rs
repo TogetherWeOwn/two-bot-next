@@ -326,6 +326,19 @@ impl ActionExecutor {
             }
             return Ok(Some(json!({"user":{"id":"44"},"roles":[]})));
         }
+        if let Some(member) = path.strip_prefix("/guilds/22/members/") {
+            let Ok(member) = member.parse::<u64>() else {
+                return Ok(None);
+            };
+            if !(MEMBER..MEMBER + 8).contains(&member) {
+                return Ok(None);
+            }
+            return Ok(Some(json!({
+                "user":{"id":member.to_string(),"bot":false},
+                "roles":[],
+                "pending":false
+            })));
+        }
         if path == "/channels/66" {
             let deny = if state.channel_denied { "2048" } else { "0" };
             return Ok(Some(json!({"id":"66","guild_id":"22","type":0,
@@ -334,6 +347,10 @@ impl ActionExecutor {
         panic!("unexpected fixture REST read: {path}")
     }
     pub async fn get_json(&self, path: &str) -> Result<Option<Value>, Error> {
+        self.get_json_checked(path).await
+    }
+    // Preserve the strict GET boundary's present, absent, and failed outcomes.
+    pub async fn get_json_strict(&self, path: &str) -> Result<Option<Value>, Error> {
         self.get_json_checked(path).await
     }
     pub async fn post_channel_message(
@@ -425,15 +442,34 @@ impl Fixture {
             )
             .await
     }
-    fn identity_reads(&self) -> usize {
+    fn bot_access_reads(&self) -> usize {
         self.rest
             .0
             .lock()
             .expect("fixture REST")
             .reads
             .iter()
-            .filter(|path| path.starts_with("/guilds/"))
+            .filter(|path| {
+                matches!(
+                    path.as_str(),
+                    "/guilds/22" | "/guilds/22/roles" | "/guilds/22/members/44"
+                )
+            })
             .count()
+    }
+    fn recipient_reads(&self) -> Vec<u64> {
+        self.rest
+            .0
+            .lock()
+            .expect("fixture REST")
+            .reads
+            .iter()
+            .filter_map(|path| {
+                path.strip_prefix("/guilds/22/members/")
+                    .and_then(|member| member.parse::<u64>().ok())
+            })
+            .filter(|member| *member != BOT)
+            .collect()
     }
     fn visible(&self) -> usize {
         self.rest.0.lock().expect("fixture REST").posts.len()
@@ -478,9 +514,14 @@ async fn repeated_window() {
         "distinct members must all be welcomed"
     );
     assert_eq!(
-        fixture.identity_reads(),
+        fixture.bot_access_reads(),
         3,
-        "guild, roles and bot identity load once per TTL window, not once per welcome"
+        "guild, roles and bot-member identity load once per TTL window, not once per welcome"
+    );
+    assert_eq!(
+        fixture.recipient_reads(),
+        (MEMBER..MEMBER + 8).collect::<Vec<_>>(),
+        "each welcome reads its own current recipient document"
     );
 }
 
@@ -490,12 +531,12 @@ async fn expiry() {
         .welcome(MEMBER, NOW_MS)
         .await
         .expect("first welcome");
-    let cold = fixture.identity_reads();
+    let cold = fixture.bot_access_reads();
     fixture
         .welcome(MEMBER + 1, NOW_MS)
         .await
         .expect("warm welcome");
-    let warm = fixture.identity_reads();
+    let warm = fixture.bot_access_reads();
     // No mandated TTL length: this is only a conservative finite-expiry bound.
     // Advance both clocks, accepting either event-clock or monotonic expiry.
     tokio::time::advance(std::time::Duration::from_secs(86_400)).await;
@@ -504,7 +545,7 @@ async fn expiry() {
         .welcome(MEMBER + 2, NOW_MS + 86_400_000)
         .await
         .expect("expired access is denied, not an error");
-    let expired = fixture.identity_reads();
+    let expired = fixture.bot_access_reads();
     assert_eq!(
         fixture.visible(),
         2,
@@ -527,7 +568,7 @@ async fn invalidation() {
         .welcome(MEMBER + 1, NOW_MS)
         .await
         .expect("warm welcome");
-    let warm = fixture.identity_reads();
+    let warm = fixture.bot_access_reads();
     fixture.rest.0.lock().expect("fixture REST").permissions = 1024;
     let update: twilight_model::gateway::payload::incoming::RoleUpdate =
         serde_json::from_value(json!({
@@ -553,7 +594,7 @@ async fn invalidation() {
         "a role update invalidates the bot access snapshot before the next welcome"
     );
     assert_eq!(
-        (warm, fixture.identity_reads()),
+        (warm, fixture.bot_access_reads()),
         (3, 6),
         "invalidation keeps the prior warm hit and then reloads once"
     );
@@ -820,7 +861,7 @@ async fn invalidation_during_read(
             "three attempts, not a fatal first invalidation"
         );
         assert_eq!(
-            fixture.identity_reads(),
+            fixture.bot_access_reads(),
             9,
             "each attempt reloads identity evidence"
         );
@@ -837,7 +878,7 @@ async fn invalidation_during_read(
         assert_eq!(fixture.visible(), 1);
         assert!(fixture.prompted(MEMBER));
         assert_eq!(
-            fixture.identity_reads(),
+            fixture.bot_access_reads(),
             12,
             "exhausted evidence was not published as current"
         );
@@ -845,7 +886,7 @@ async fn invalidation_during_read(
         outcome.expect("one transient invalidation must reload, not fail the worker");
         assert_eq!(invalidations, 1, "the requested in-flight race was reached");
         assert_eq!(
-            fixture.identity_reads(),
+            fixture.bot_access_reads(),
             6,
             "discard the invalidated snapshot and reload all identity evidence"
         );
@@ -897,7 +938,7 @@ async fn invalidation_during_read(
             );
             assert!(fixture.prompted(MEMBER + 1));
             assert_eq!(
-                fixture.identity_reads(),
+                fixture.bot_access_reads(),
                 6,
                 "successful reloaded evidence is cached"
             );
