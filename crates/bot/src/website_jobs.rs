@@ -541,27 +541,35 @@ fn roster_page(page: &Value, after: &mut u64) -> Result<Vec<RosterMember>, Error
     Ok(members)
 }
 
+pub(crate) enum RosterScan {
+    Complete(Vec<RosterMember>),
+    Truncated,
+}
+
 /// Discord's paginated roster is the denominator, never approximate counts.
-/// Website publication still requires the entire roster.
+/// A full final page cannot prove completion; never expose a partial roster.
 pub(crate) async fn roster(
     rest: &ActionExecutor,
     guild: &str,
-) -> Result<Vec<RosterMember>, ErrorClass> {
+    max_pages: usize,
+) -> Result<RosterScan, ErrorClass> {
     let mut after = 0;
     let mut members = Vec::new();
-    loop {
-        let page = get(
-            rest,
-            &format!("/guilds/{guild}/members?limit=1000&after={after}"),
-        )
-        .await?;
+    for _ in 0..max_pages {
+        // No hidden retries: the page ceiling also bounds wire requests.
+        let page = rest
+            .get_json_once(&format!("/guilds/{guild}/members?limit=1000&after={after}"))
+            .await
+            .map_err(|_| ErrorClass::Rest)?
+            .ok_or(ErrorClass::Rest)?;
         let page = roster_page(&page, &mut after)?;
         let complete = page.len() < 1000;
         members.extend(page);
         if complete {
-            return Ok(members);
+            return Ok(RosterScan::Complete(members));
         }
     }
+    Ok(RosterScan::Truncated)
 }
 
 /// Legacy BOT_FLOOR_MAX_PAGES: ten full pages plus one termination probe.
@@ -832,7 +840,20 @@ async fn snapshot_once(
     if publication_stopped(shutdown) {
         return Ok(());
     }
-    let members = roster(rest, guild).await?;
+    let members = match roster(rest, guild, BOT_FLOOR_MAX_PAGES).await? {
+        RosterScan::Complete(members) => members,
+        RosterScan::Truncated => {
+            tracing::warn!(
+                job = if matches!(kind, Kind::Counter) {
+                    "counter"
+                } else {
+                    "rank"
+                },
+                "roster truncated at the page budget; publication skipped"
+            );
+            return Ok(());
+        }
+    };
     if publication_stopped(shutdown) {
         return Ok(());
     }
