@@ -1083,6 +1083,7 @@ mod tests {
                 )
                 .expect("unavailable guild fixture"),
             )),
+            lifecycle_ready(),
             Event::Resumed,
         ] {
             let p = MemPipeline::for_replay();
@@ -1096,7 +1097,7 @@ mod tests {
             let other_channel = p.voice_chains.lock_for(GUILD, 2, 0);
             let expected = match event {
                 Event::ChannelDelete(_) => 2,
-                Event::Resumed => 0,
+                Event::Ready(_) | Event::Resumed => 0,
                 _ => 1,
             };
             for _ in 0..2 {
@@ -1148,6 +1149,51 @@ mod tests {
         }
     }
 
+    fn lifecycle_ready() -> Event {
+        Event::Ready(
+            serde_json::from_value(serde_json::json!({
+                "v": 10,
+                "user": {
+                    "id": "999", "username": "fixture-bot", "discriminator": "0",
+                    "bot": true, "mfa_enabled": false
+                },
+                "session_id": "fixture-ready",
+                "resume_gateway_url": "wss://gateway.discord.gg",
+                "guilds": [{"id": GUILD.to_string(), "unavailable": true}],
+                "application": {"id": "1111", "flags": 0}
+            }))
+            .expect("READY fixture"),
+        )
+    }
+
+    fn lifecycle_available_guild() -> Event {
+        let mut guild: serde_json::Value =
+            serde_json::from_str(include_str!("../../bot/tests/fixtures/voice_guild.json"))
+                .expect("available guild fixture");
+        guild["id"] = serde_json::json!(GUILD.to_string());
+        guild["roles"][0]["id"] = serde_json::json!(GUILD.to_string());
+        guild["members"] = serde_json::json!([]);
+        guild["voice_states"] = serde_json::json!([]);
+        Event::GuildCreate(Box::new(
+            twilight_model::gateway::payload::incoming::GuildCreate::Available(
+                serde_json::from_value(guild).expect("available guild"),
+            ),
+        ))
+    }
+
+    fn lifecycle_member_remove(member: u64) -> Event {
+        Event::MemberRemove(
+            serde_json::from_value(serde_json::json!({
+                "guild_id": GUILD.to_string(),
+                "user": {
+                    "id": member.to_string(), "username": "fixture-member",
+                    "discriminator": "0", "bot": false
+                }
+            }))
+            .expect("member remove fixture"),
+        )
+    }
+
     #[test]
     fn lifecycle_waits_for_inflight_join_before_invalidating_and_retiring_chain() {
         use std::sync::mpsc::sync_channel;
@@ -1156,7 +1202,23 @@ mod tests {
         for event in [
             lifecycle_delete(GUILD, None),
             lifecycle_delete(GUILD, Some(10)),
+            lifecycle_ready(),
+            Event::Resumed,
+            Event::GuildCreate(Box::new(
+                serde_json::from_value(
+                    serde_json::json!({"id": GUILD.to_string(), "unavailable": true}),
+                )
+                .expect("unavailable guild fixture"),
+            )),
+            lifecycle_available_guild(),
         ] {
+            // Available snapshots serialize too, but do not invalidate an
+            // already observed session. Every gap event discards it.
+            let expected = usize::from(matches!(
+                &event,
+                Event::GuildCreate(guild)
+                    if matches!(guild.as_ref(), twilight_model::gateway::payload::incoming::GuildCreate::Available(_))
+            ));
             let (entered, waiting) = sync_channel(1);
             let (release, paused) = sync_channel(1);
             let p = Arc::new(Pipeline::new(
@@ -1177,18 +1239,217 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("join paused before tracker write");
             let deleting = p.clone();
+            let (started, running) = sync_channel(1);
             let (finished, done) = sync_channel(1);
             let delete = std::thread::spawn(move || {
+                started.send(()).expect("lifecycle starting");
                 deleting.handle_at(&event, "2026-10-19T12:00:10.000Z");
                 finished.send(()).expect("delete finished");
             });
+            running
+                .recv_timeout(Duration::from_secs(5))
+                .expect("lifecycle started");
             let premature = done.recv_timeout(Duration::from_millis(100));
             release.send(()).expect("unpause join");
             join.join().expect("join thread");
             delete.join().expect("delete thread");
             assert!(
-                premature.is_err(),
-                "invalidation cannot overtake an in-flight join"
+                matches!(premature, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+                "lifecycle update cannot overtake an in-flight join"
+            );
+            assert_eq!(
+                p.handlers
+                    .voice_sessions
+                    .lock()
+                    .expect("tracker")
+                    .open_count(),
+                expected
+            );
+            assert_eq!(p.voice_chains.len(), expected);
+        }
+    }
+
+    #[test]
+    fn member_remove_retires_chain_after_closing_voice() {
+        let p = MemPipeline::for_replay();
+        p.handle_at(&lifecycle_voice(GUILD, 1, 10), "2026-10-19T12:00:00.000Z");
+        assert_eq!(p.voice_chains.len(), 1);
+        p.handle_at(&lifecycle_member_remove(1), "2026-10-19T12:00:10.000Z");
+        assert_eq!(p.voice_chains.len(), 0, "member leave retires its chain");
+        assert_eq!(
+            p.handlers
+                .voice_sessions
+                .lock()
+                .expect("tracker")
+                .open_count(),
+            0
+        );
+        let rows = p.handlers.store().rows();
+        let end = rows
+            .iter()
+            .find(|row| row.event_type == two_bot_core::EventType::VoiceSessionEnd)
+            .expect("member leave closes the measured session");
+        assert_eq!(
+            end.metadata.as_ref().expect("end metadata")["durationSeconds"],
+            10
+        );
+        assert_eq!(
+            rows.last().expect("member leave").event_type,
+            two_bot_core::EventType::MemberLeave
+        );
+    }
+
+    #[test]
+    fn member_remove_waits_for_inflight_join_on_the_same_chain() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        let (entered, waiting) = sync_channel(1);
+        let (release, paused) = sync_channel(1);
+        let p = Arc::new(Pipeline::new(
+            two_bot_core::MemStore::new(),
+            Some(two_bot_core::NoopLeveling),
+            Some(PausedVoiceStart {
+                entered,
+                release: Mutex::new(paused),
+            }),
+            ScriptedInvites::new(),
+            NoClassification,
+        ));
+        let joining = p.clone();
+        let join = std::thread::spawn(move || {
+            joining.handle_at(&lifecycle_voice(GUILD, 1, 10), "2026-10-19T12:00:00.000Z");
+        });
+        waiting
+            .recv_timeout(Duration::from_secs(5))
+            .expect("join paused before tracker write");
+        let leaving = p.clone();
+        let (started, running) = sync_channel(1);
+        let (finished, done) = sync_channel(1);
+        let leave = std::thread::spawn(move || {
+            started.send(()).expect("leave starting");
+            leaving.handle_at(&lifecycle_member_remove(1), "2026-10-19T12:00:10.000Z");
+            finished.send(()).expect("leave finished");
+        });
+        running
+            .recv_timeout(Duration::from_secs(5))
+            .expect("leave started");
+        let premature = done.recv_timeout(Duration::from_millis(100));
+        release.send(()).expect("unpause join");
+        join.join().expect("join thread");
+        leave.join().expect("leave thread");
+        assert!(
+            matches!(premature, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "member leave cannot overtake its in-flight join"
+        );
+        assert_eq!(
+            p.handlers
+                .voice_sessions
+                .lock()
+                .expect("tracker")
+                .open_count(),
+            0
+        );
+        assert_eq!(p.voice_chains.len(), 0);
+        let rows = p.handlers.store().rows();
+        let end = rows
+            .iter()
+            .find(|row| row.event_type == two_bot_core::EventType::VoiceSessionEnd)
+            .expect("serialized leave closes the join");
+        assert_eq!(
+            end.metadata.as_ref().expect("end metadata")["durationSeconds"],
+            10
+        );
+        assert_eq!(
+            rows.last().expect("member leave").event_type,
+            two_bot_core::EventType::MemberLeave
+        );
+    }
+
+    struct PausedVoiceEnd {
+        entered: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl FactsSink for PausedVoiceEnd {
+        fn record_member_join(&self, _: two_bot_core::MemberJoinFact<'_>) {}
+        fn record_rules_accepted(&self, _: two_bot_core::RulesAcceptedFact<'_>) {}
+        fn record_message(&self, _: two_bot_core::MessageFact<'_>) {}
+        fn record_voice_started(&self, _: two_bot_core::VoiceStartedFact<'_>) -> Option<String> {
+            None
+        }
+        fn record_voice_ended(&self, _: two_bot_core::VoiceEndedFact<'_>) {
+            if let Some(entered) = self.entered.lock().expect("entered lock").take() {
+                entered.send(()).expect("entered");
+                self.release
+                    .lock()
+                    .expect("release lock")
+                    .recv()
+                    .expect("release");
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_waits_for_inflight_member_remove_before_invalidating() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        for event in [
+            lifecycle_delete(GUILD, Some(10)),
+            lifecycle_delete(GUILD, None),
+            lifecycle_ready(),
+            Event::Resumed,
+            Event::GuildCreate(Box::new(
+                serde_json::from_value(
+                    serde_json::json!({"id": GUILD.to_string(), "unavailable": true}),
+                )
+                .expect("unavailable guild fixture"),
+            )),
+        ] {
+            let (entered, waiting) = sync_channel(1);
+            let (release, paused) = sync_channel(1);
+            let p = Arc::new(Pipeline::new(
+                two_bot_core::MemStore::new(),
+                Some(two_bot_core::NoopLeveling),
+                Some(PausedVoiceEnd {
+                    entered: Mutex::new(Some(entered)),
+                    release: Mutex::new(paused),
+                }),
+                ScriptedInvites::new(),
+                NoClassification,
+            ));
+            for member in [1, 2] {
+                p.handle_at(
+                    &lifecycle_voice(GUILD, member, 10),
+                    "2026-10-19T12:00:00.000Z",
+                );
+            }
+            let leaving = p.clone();
+            let leave = std::thread::spawn(move || {
+                leaving.handle_at(&lifecycle_member_remove(1), "2026-10-19T12:00:10.000Z");
+            });
+            waiting
+                .recv_timeout(Duration::from_secs(5))
+                .expect("member leave paused in voice end");
+            let deleting = p.clone();
+            let (started, running) = sync_channel(1);
+            let (finished, done) = sync_channel(1);
+            let delete = std::thread::spawn(move || {
+                started.send(()).expect("delete starting");
+                deleting.handle_at(&event, "2026-10-19T12:00:20.000Z");
+                finished.send(()).expect("delete finished");
+            });
+            running
+                .recv_timeout(Duration::from_secs(5))
+                .expect("delete started");
+            let premature = done.recv_timeout(Duration::from_millis(100));
+            release.send(()).expect("unpause member leave");
+            leave.join().expect("leave thread");
+            delete.join().expect("delete thread");
+            assert!(
+                matches!(premature, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+                "invalidation cannot overtake an in-flight member leave"
             );
             assert_eq!(
                 p.handlers
@@ -1197,6 +1458,24 @@ mod tests {
                     .expect("tracker")
                     .open_count(),
                 0
+            );
+            assert_eq!(p.voice_chains.len(), 0);
+            // The first leave precedes the gap; the second member's measured
+            // start is discarded even when no voice frame arrives before removal.
+            p.handle_at(&lifecycle_member_remove(2), "2026-10-19T12:01:00.000Z");
+            let ends: Vec<_> = p
+                .handlers
+                .store()
+                .rows()
+                .into_iter()
+                .filter(|row| row.event_type == two_bot_core::EventType::VoiceSessionEnd)
+                .collect();
+            assert_eq!(ends.len(), 1, "no cross-gap end for the invalidated member");
+            assert_eq!(ends[0].member_id, Some(1));
+            assert_eq!(ends[0].occurred_at, "2026-10-19T12:00:10.000Z");
+            assert_eq!(
+                ends[0].metadata.as_ref().expect("end metadata")["durationSeconds"],
+                10
             );
             assert_eq!(p.voice_chains.len(), 0);
         }
