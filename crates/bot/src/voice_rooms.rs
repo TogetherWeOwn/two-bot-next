@@ -24,7 +24,7 @@ use std::{
 use crate::voice_room_plan::{
     category_room_ids, plan_room_diagnosed, RoomPlanError, RoomPlanInput, BOT_ROOM_ACCESS,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
@@ -12975,12 +12975,85 @@ impl InteractionReplies for RoomHttp {
     }
 }
 
+/// Maximum outstanding voice interaction responder tasks, including queued tasks.
+///
+/// Recognized voice interactions bypass the shared command router's admission
+/// (the router yields voice-owned interactions before its own lane check), so
+/// the responder reserves a permit synchronously after recognition, before
+/// cloning the interaction, building cache snapshots, or spawning any task.
+/// The owned permit moves into the task and covers the whole `respond_named`
+/// future. Excess interactions are dropped without acknowledgement (counted,
+/// log-sampled), never queued, so even an unpolled burst cannot accumulate
+/// unbounded responder tasks or snapshots.
+///
+/// The value matches the shared router's 16-slot interaction lane: a saturated
+/// voice responder sheds the same pressure the router would. Permits release
+/// on normal completion, on acknowledgement failure (a failed or ambiguous
+/// ack still means no mutation), and on task cancellation, so later
+/// interactions can always run once in-flight executions settle.
+const VOICE_RESPONDER_MAX_IN_FLIGHT: usize = 16;
+
+/// Seconds between saturation `warn!` lines per responder. The drop counter
+/// increments on every refused interaction; the log samples the first drop in
+/// each window so a burst is O(1) lines.
+const VOICE_RESPONDER_DROP_WARN_INTERVAL_SECS: u64 = 60;
+
+/// Non-waiting admission state shared by a responder's spawned tasks: one
+/// execution bound plus a counted, log-sampled saturation drop path.
+struct ResponderAdmission {
+    permits: Arc<Semaphore>,
+    drops: AtomicU64,
+    drop_warn_last_secs: AtomicU64,
+}
+
+impl Default for ResponderAdmission {
+    fn default() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(VOICE_RESPONDER_MAX_IN_FLIGHT)),
+            drops: AtomicU64::new(0),
+            drop_warn_last_secs: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ResponderAdmission {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a refused interaction: count every drop, warn at most once per
+    /// [`VOICE_RESPONDER_DROP_WARN_INTERVAL_SECS`]. The refused interaction
+    /// sends no callback at all: a busy acknowledgement per refusal would be
+    /// a second detached-task flood under the same burst.
+    fn record_drop(&self, interaction_id: u64) {
+        let dropped = self.drops.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let last = self.drop_warn_last_secs.load(Ordering::Relaxed);
+        if now_secs.wrapping_sub(last) >= VOICE_RESPONDER_DROP_WARN_INTERVAL_SECS
+            && self
+                .drop_warn_last_secs
+                .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            warn!(
+                interaction_id = interaction_id.to_string(),
+                dropped,
+                "voice responder saturated; interaction dropped without acknowledgement (sampled)"
+            );
+        }
+    }
+}
+
 /// Gateway wrapper: retain lifecycle publication, spawn command work off-loop.
 /// Discord accepts one initial callback per interaction, so a rejected or
 /// ambiguous acknowledgement must never execute a non-idempotent create.
 pub struct VoiceResponder<S, H, R> {
     runtime: Arc<VoiceRuntime<S, H>>,
     replies: Arc<R>,
+    admission: Arc<ResponderAdmission>,
 }
 
 impl<S, H, R> VoiceResponder<S, H, R>
@@ -12990,7 +13063,11 @@ where
     R: InteractionReplies + 'static,
 {
     pub fn new(runtime: Arc<VoiceRuntime<S, H>>, replies: Arc<R>) -> Self {
-        Self { runtime, replies }
+        Self {
+            runtime,
+            replies,
+            admission: Arc::new(ResponderAdmission::new()),
+        }
     }
 
     /// The wrapped lifecycle runtime, for boot-owned background work (the
@@ -13215,6 +13292,10 @@ where
             {
                 return;
             }
+            let Ok(permit) = Arc::clone(&self.admission.permits).try_acquire_owned() else {
+                self.admission.record_drop(created.0.id.get());
+                return;
+            };
             let interaction = created.0.clone();
             let vanity_code = vanity_code_from_cache(cache, &interaction);
             // The stored override resolves only for `/invite` (the sole
@@ -13240,6 +13321,8 @@ where
             let runtime = Arc::clone(&self.runtime);
             let replies = Arc::clone(&self.replies);
             tokio::spawn(async move {
+                // Hold admission until the responder finishes or is cancelled.
+                let _permit = permit;
                 Self::respond_named(
                     &runtime,
                     &replies,
