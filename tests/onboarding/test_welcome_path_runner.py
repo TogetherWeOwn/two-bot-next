@@ -15,8 +15,8 @@ SCENARIOS = {
     "anchor_traps", "repeated_window", "expiry", "invalidation",
     "record_retry_legacy", "record_retry_anchor", "failed_send",
     "failed_send_anchor", "missing_identity", "duplicate_control",
-    "live_channel_denial", "unavailable_identity",
-    "roles_invalidation", "channel_invalidation",
+    "live_channel_denial", "unavailable_identity", "unavailable_channel",
+    "receipt_capacity", "roles_invalidation", "channel_invalidation",
     "guild_create_invalidation", "bot_member_invalidation",
     "roles_invalidation_revoked", "channel_invalidation_revoked",
     "roles_invalidation_exhausted", "channel_invalidation_exhausted",
@@ -80,7 +80,7 @@ class WelcomePathRunnerContract(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         cases = self.record.read_text().splitlines()
         self.assertEqual(set(cases), SCENARIOS)
-        self.assertEqual(len(cases), 20)
+        self.assertEqual(len(cases), 22)
         self.assertFalse(self.cargo_record.exists(), "prebuilt mode invoked the bounded builder")
 
     def test_invalid_explicit_paths_error_without_fallback_or_skip(self):
@@ -100,14 +100,14 @@ class WelcomePathRunnerContract(unittest.TestCase):
     def test_nonzero_case_exit_is_still_behavioral_red(self):
         result = self.run_runner(self.executable, FIXTURE_MODE="red")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("FAILED (failures=20)", result.stderr)
+        self.assertIn("FAILED (failures=22)", result.stderr)
         self.assertIn("exit 7", result.stderr)
         self.assertFalse(self.cargo_record.exists())
 
     def test_missing_pass_marker_is_still_behavioral_red(self):
         result = self.run_runner(self.executable, FIXTURE_MODE="silent")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("FAILED (failures=20)", result.stderr)
+        self.assertIn("FAILED (failures=22)", result.stderr)
         self.assertIn("not found", result.stderr)
         self.assertFalse(self.cargo_record.exists())
 

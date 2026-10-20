@@ -35,6 +35,8 @@ CASES = (
     "duplicate_control",
     "live_channel_denial",
     "unavailable_identity",
+    "unavailable_channel",
+    "receipt_capacity",
     "roles_invalidation",
     "channel_invalidation",
     "guild_create_invalidation",

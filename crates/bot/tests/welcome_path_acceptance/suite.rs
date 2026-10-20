@@ -258,6 +258,7 @@ pub struct RestState {
     pub posts: Vec<VisiblePost>,
     pub fail_send: usize,
     pub fail_identity: usize,
+    pub fail_channel_read: usize,
     pub permissions: u64,
     pub channel_denied: bool,
     pub deny_member: bool,
@@ -271,6 +272,7 @@ impl Default for RestState {
             posts: vec![],
             fail_send: 0,
             fail_identity: 0,
+            fail_channel_read: 0,
             permissions: 3072,
             channel_denied: false,
             deny_member: false,
@@ -330,7 +332,7 @@ impl ActionExecutor {
             let Ok(member) = member.parse::<u64>() else {
                 return Ok(None);
             };
-            if !(MEMBER..MEMBER + 8).contains(&member) {
+            if !(MEMBER..MEMBER + 64).contains(&member) {
                 return Ok(None);
             }
             return Ok(Some(json!({
@@ -340,6 +342,10 @@ impl ActionExecutor {
             })));
         }
         if path == "/channels/66" {
+            if state.fail_channel_read > 0 {
+                state.fail_channel_read -= 1;
+                return Err(Error);
+            }
             let deny = if state.channel_denied { "2048" } else { "0" };
             return Ok(Some(json!({"id":"66","guild_id":"22","type":0,
                 "permission_overwrites":[{"id":"22","type":0,"allow":"0","deny":deny}]})));
@@ -613,21 +619,28 @@ fn invalidate_capture<I>(
 async fn record_retry(mode: &str) {
     let fixture = Fixture::new(mode);
     fixture.pool.0.lock().expect("fixture store").fail_record = 1;
-    let _ = fixture.welcome(MEMBER, NOW_MS).await;
-    assert!(
+    fixture
+        .welcome(MEMBER, NOW_MS)
+        .await
+        .expect("one record failure is retried before welcome returns");
+    assert_eq!(
         fixture
             .pool
             .0
             .lock()
             .expect("fixture store")
-            .record_attempts
-            > 0,
-        "record-failure injection must have been reached"
+            .record_attempts,
+        2,
+        "one injected record failure is followed by exactly one retry"
     );
     assert_eq!(
         fixture.visible(),
         1,
-        "Discord accepted the first welcome before injected record failure"
+        "the immediate record retry must not resend the accepted welcome"
+    );
+    assert!(
+        fixture.prompted(MEMBER),
+        "immediate retry records the accepted welcome before returning"
     );
     fixture
         .welcome(MEMBER, NOW_MS + 1)
@@ -698,6 +711,77 @@ async fn live_channel_denial() {
         "identity caching must not cache a channel permission grant"
     );
     assert!(!fixture.prompted(MEMBER + 1));
+}
+
+async fn unavailable_channel() {
+    let fixture = Fixture::new("legacy");
+    fixture.rest.0.lock().expect("fixture REST").fail_channel_read = 1;
+    assert!(
+        matches!(
+            fixture.welcome(MEMBER, NOW_MS).await,
+            Err(subject::RuntimeError::Discord)
+        ),
+        "a failed live channel permission read is unavailable, not a terminal skip"
+    );
+    assert_eq!(fixture.visible(), 0, "unavailable channel evidence cannot send");
+    assert!(
+        !fixture.prompted(MEMBER),
+        "unavailable channel evidence cannot record the prompt marker"
+    );
+    fixture
+        .welcome(MEMBER, NOW_MS + 1)
+        .await
+        .expect("a later healthy channel read can retry");
+    assert_eq!(fixture.visible(), 1);
+    assert!(fixture.prompted(MEMBER));
+}
+
+async fn receipt_capacity() {
+    const FIRST: u64 = MEMBER;
+    const CAPACITY: usize = 32;
+    const RECORD_FAILURES: usize = 256;
+    let fixture = Fixture::new("legacy");
+    fixture
+        .pool
+        .0
+        .lock()
+        .expect("fixture store")
+        .fail_record = RECORD_FAILURES;
+
+    for offset in 0..CAPACITY {
+        let result = fixture.welcome(FIRST + offset as u64, NOW_MS + offset as i64);
+        let _ = result.await;
+    }
+    assert_eq!(fixture.visible(), CAPACITY, "all capacity slots hold accepted receipts");
+
+    let (sends, records) = {
+        let rest = fixture.rest.0.lock().expect("fixture REST");
+        let store = fixture.pool.0.lock().expect("fixture store");
+        (rest.send_attempts, store.record_attempts)
+    };
+    assert!(
+        fixture.welcome(FIRST + CAPACITY as u64, NOW_MS + CAPACITY as i64).await.is_err(),
+        "a full receipt table refuses another welcome"
+    );
+    assert_eq!(fixture.visible(), CAPACITY, "capacity refusal adds no accepted post");
+    assert_eq!(
+        fixture.rest.0.lock().expect("fixture REST").send_attempts,
+        sends,
+        "capacity refusal occurs before another Discord send"
+    );
+    assert_eq!(
+        fixture.pool.0.lock().expect("fixture store").record_attempts,
+        records,
+        "capacity refusal occurs before another record guard"
+    );
+
+    fixture.pool.0.lock().expect("fixture store").fail_record = 0;
+    fixture
+        .welcome(FIRST, NOW_MS + CAPACITY as i64 + 1)
+        .await
+        .expect("a retained receipt can reconcile after record failures stop");
+    assert_eq!(fixture.visible(), CAPACITY, "reconciliation does not resend the welcome");
+    assert!(fixture.prompted(FIRST), "reconciliation eventually records its marker");
 }
 
 async fn unavailable_identity() {
@@ -970,6 +1054,8 @@ fn main() {
             "duplicate_control" => duplicate_control().await,
             "live_channel_denial" => live_channel_denial().await,
             "unavailable_identity" => unavailable_identity().await,
+            "unavailable_channel" => unavailable_channel().await,
+            "receipt_capacity" => receipt_capacity().await,
             "roles_invalidation" => {
                 invalidation_during_read("/guilds/22/roles", AccessInvalidation::Role, false, false)
                     .await
