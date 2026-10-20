@@ -2755,13 +2755,27 @@ impl ActionExecutor {
                 let unreadable = || DiscordError::Unavailable("unreadable message history".into());
                 let id = row["id"].as_str().ok_or_else(unreadable)?;
                 let author = row["author"]["id"].as_str().ok_or_else(unreadable)?;
-                let _: Id<MessageMarker> = snowflake(id).map_err(|_| unreadable())?;
-                let _: Id<UserMarker> = snowflake(author).map_err(|_| unreadable())?;
-                if row["channel_id"].as_str() != Some(channel_id) {
+                let message_id: Id<MessageMarker> = snowflake(id).map_err(|_| unreadable())?;
+                let author_id: Id<UserMarker> = snowflake(author).map_err(|_| unreadable())?;
+                if message_id.to_string() != id
+                    || author_id.to_string() != author
+                    || row["channel_id"].as_str() != Some(channel_id)
+                {
                     return Err(unreadable());
                 }
-                if row["nonce"].as_str() == Some(nonce) && author == bot_user_id.to_string() {
-                    return Ok(Some(id.to_owned()));
+                if author_id.get() == bot_user_id {
+                    let row_nonce = &row["nonce"];
+                    // Only the bot's rows need readable nonce evidence to prove a non-match.
+                    if !row_nonce.is_null()
+                        && !row_nonce.is_string()
+                        && !row_nonce.is_i64()
+                        && !row_nonce.is_u64()
+                    {
+                        return Err(unreadable());
+                    }
+                    if row_nonce.as_str() == Some(nonce) {
+                        return Ok(Some(id.to_owned()));
+                    }
                 }
             }
             if rows.len() < 100 {
