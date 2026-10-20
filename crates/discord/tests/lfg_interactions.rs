@@ -1621,6 +1621,11 @@ async fn durable_select_identical_leave_replay_preserves_later_signup() {
         (8602, leave_action("replay-a"), "LFG left."),
         (8603, signup_action("replay-a", "healer"), "LFG joined."),
     ] {
+        if id == 8603 {
+            // Leave is cooldown-exempt, but the same actor's next signup is not.
+            // This DB test uses an unpaused clock, so wait out the signup cooldown.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
         assert_eq!(
             service
                 .execute(
