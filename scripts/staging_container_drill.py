@@ -100,6 +100,20 @@ STALE_IMAGE_POLLS = rollout.APPLICATION_IMAGE_STALE_POLLS
 WRANGLER_TIMEOUT_SECONDS = 600
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins, at any depth."""
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 class ContainerDrillClient(rollout.Client):
     """The gate's read-only client, preserving only the numeric HTTP status.
 
@@ -124,7 +138,8 @@ class ContainerDrillClient(rollout.Client):
         except HTTPError as error:
             codes = []
             try:
-                envelope = json.loads(error.read(rollout.MAX_BODY))
+                envelope = json.loads(error.read(rollout.MAX_BODY),
+                                        object_pairs_hook=_reject_duplicate_keys)
                 codes = [str(item["code"]) for item in envelope.get("errors", [])
                          if isinstance(item, dict) and type(item.get("code")) is int][:4]
             except (OSError, ValueError, AttributeError, TypeError):

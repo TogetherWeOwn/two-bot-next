@@ -52,6 +52,20 @@ AUTH_STATUSES = ("401", "403")
 OWNERSHIP_CONTROL_TIMEOUT_SECONDS = 420
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins, at any depth."""
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
 class DrillClient(rollout.Client):
     """The gate's read-only client plus the one authenticated deployment POST."""
 
@@ -88,7 +102,8 @@ class DrillClient(rollout.Client):
             # the HTTP status and integer error codes.
             codes = []
             try:
-                envelope = json.loads(error.read(rollout.MAX_BODY))
+                envelope = json.loads(error.read(rollout.MAX_BODY),
+                                        object_pairs_hook=_reject_duplicate_keys)
                 codes = [str(item["code"]) for item in envelope.get("errors", [])
                          if isinstance(item, dict) and type(item.get("code")) is int][:4]
             except (OSError, ValueError, AttributeError, TypeError):
