@@ -431,6 +431,14 @@ Absent, blank and valid settings remain silent. Nonfatal admission knobs
 retain their separate default-fallback warning below. For safe triage, see
 [voice boot-setting refusal](runbook-observability.md#voice-boot-setting-refusal).
 
+Invite-code override warning (in `stored_invite_code_with` in
+`crates/bot/src/voice_rooms.rs`, guild-only fields, no IDs):
+`stored invite-code override invalid; using vanity fallback` (warn): the
+stored per-guild `TWO_GUILD_INVITE_CODE` row is not a JSON string of 2 to
+32 ASCII alphanumerics plus `-`/`_`, so the `/invite` reply keeps the
+gateway vanity fallback. The line carries the setting key and the
+`invalid_invite_code` reason, never the rejected value.
+
 Boot admission warning (in `configured_admission` in
 `crates/bot/src/voice_rooms.rs`, key-only fields, no IDs):
 `temp-voice admission setting invalid; using default` (warn): one of the
