@@ -203,8 +203,27 @@ jobs:
       # `cargo fmt` fails with "detected conflict: 'bin/cargo-fmt'" in roughly
       # half the runs. With the components in place the probe returns at once.
       - name: Install pinned Rust toolchain components
+        id: pinned_components
         if: needs.job-inputs.outputs.rust != 'false'
         run: rustup toolchain install --no-self-update
+        # Pip can invoke rustc immediately afterward; retry this first install
+        # too, or a transient rustup network failure aborts before the later retry.
+        continue-on-error: true
+
+      - name: Retry pinned Rust toolchain components on transient network failure
+        if: steps.pinned_components.outcome == 'failure'
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install --no-self-update; then
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
 
       - name: Install pinned static audit tools
         run: |
@@ -843,7 +862,12 @@ jobs:
           # Main sweep under the bootstrap URL: non-ignored tests first at
           # full parallelism, then ignored tests serially. The ignored stores
           # share tables and locks, so parallel runs race and
-          # --ignore-run-fail would then drop their coverage silently.
+          # --ignore-run-fail would then drop their coverage silently. The raid
+          # and reengagement list suites, the stream go-live ledger suite, the
+          # internal-events DB test, the legacy-verify/TLS-fence/migrate
+          # suites and the mutation-429 suite require the exact agent_test
+          # URL, so exclude them here and measure them in their dedicated
+          # runs below.
           # The reference-docs regen never runs in CI: it rewrites committed docs.
           # These guarded acceptance tests need their own DB URLs: the
           # publication regression and game report run in dedicated steps;
@@ -870,17 +894,26 @@ jobs:
           cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail \
             --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs \
-            --skip legacy_verify_policy_gates_the_real_test_endpoints \
-            --skip parity_mismatch_cursor_and_read_only_acceptance \
             --skip flags_are_guild_scoped_half_open_deduplicated_and_activity_protected \
             --skip list_is_guild_scoped_selector_shaped_and_read_only \
+            --skip claim_is_owned_once_then_in_flight \
+            --skip failed_send_releases_the_claim_for_the_retry \
+            --skip delivered_rows_are_never_reclaimed \
+            --skip delivered_rows_expire_only_past_the_horizon_with_the_fence_intact \
+            --skip fresh_claim_cannot_be_reclaimed \
+            --skip stale_unposted_claim_is_taken_over_atomically \
+            --skip started_claim_is_never_reclaimed_even_when_stale \
+            --skip started_send_that_provably_failed_releases_for_the_retry \
+            --skip reclaiming_a_missing_key_claims_it_fresh \
+            --skip database::actions_persist_rows_and_preserve_other_events_and_guilds \
+            --skip parity_mismatch_cursor_and_read_only_acceptance \
+            --skip legacy_verify_policy_gates_the_real_test_endpoints \
             --skip real_sqlx_runner_cases \
             --skip post_failure_unreadable_ledger_is_unknown_not_empty \
             --skip post_failure_readable_ledger_keeps_array_output \
             --skip post_apply_unreadable_ledger_is_unknown_not_empty \
             --skip store_failure_keeps_committed_cutover_evidence \
             --skip connection_count_sees_other_roles_from_plan_login \
-            --skip actions_persist_rows_and_preserve_other_events_and_guilds \
             --skip single_delete_429_releases_attempt_for_same_key_retry \
             --skip bulk_delete_429_releases_attempt_for_same_key_retry \
             --skip channel_overwrite_429_releases_attempt_and_retires_only_its_seed \

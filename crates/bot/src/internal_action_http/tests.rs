@@ -148,6 +148,7 @@ impl ActionEffect for MockEffect {
                         resource_id: Some(DiscordId::new("444444444444444444").unwrap()),
                         affected: 1,
                         outcome: None,
+                        stop_reason: None,
                     })
                 }
             }
@@ -315,6 +316,7 @@ impl ModerationEffect for MockModeration {
                 resource_id: Some(target),
                 affected: 1,
                 outcome: None,
+                stop_reason: None,
             })
         })
     }
@@ -327,6 +329,7 @@ impl ModerationEffect for MockModeration {
 #[derive(Default)]
 struct MockChannel {
     calls: AtomicUsize,
+    stop_reason: Option<two_bot_core::PurgeStopReason>,
 }
 
 impl MockChannel {
@@ -346,7 +349,10 @@ impl ChannelModerationEffect for MockChannel {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let (outcome, affected) = match request.action().action_name() {
-                "moderation.purge" => ("purged".to_owned(), Some(3)),
+                "moderation.purge" => (
+                    "purged".to_owned(),
+                    Some(if self.stop_reason.is_some() { 1 } else { 3 }),
+                ),
                 "moderation.slowmode" => ("slowmode_updated".to_owned(), None),
                 "moderation.lockdown" => ("locked_down".to_owned(), None),
                 "moderation.unlock" => ("unlocked".to_owned(), None),
@@ -361,6 +367,7 @@ impl ChannelModerationEffect for MockChannel {
             Ok(InternalChannelResult {
                 outcome,
                 affected,
+                stop_reason: self.stop_reason,
                 replayed: false,
             })
         })
@@ -2584,6 +2591,101 @@ async fn moderation_channel_success_replays_and_mismatches_like_announcements() 
     );
     assert_eq!(effect.calls(), 0);
     assert_eq!(moderation.calls(), 0);
+    db.close().await.unwrap();
+}
+
+/// Dropping the executor's reason on either HTTP success or persisted outer
+/// replay loses information. A completed purge must keep its original bytes.
+#[tokio::test]
+async fn purge_stop_reason_http_receipt_survives_outer_replay() {
+    use two_bot_core::PurgeStopReason::{RateLimited, Refused};
+
+    let Some(db) = database().await else { return };
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    for (stop_reason, intent, expected_result) in [
+        (
+            Some(Refused),
+            "purge-http-refused",
+            r#"{"outcome":"purged","affected":1,"stop_reason":"refused"}"#,
+        ),
+        (
+            Some(RateLimited),
+            "purge-http-rate-limited",
+            r#"{"outcome":"purged","affected":1,"stop_reason":"rate_limited"}"#,
+        ),
+        (
+            None,
+            "purge-http-completed",
+            r#"{"outcome":"purged","affected":3}"#,
+        ),
+    ] {
+        let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+        let moderation = Arc::new(MockModeration::default());
+        let channel = Arc::new(MockChannel {
+            stop_reason,
+            ..MockChannel::default()
+        });
+        let app = router(state_full_with_channel(
+            db.pool().clone(),
+            effect.clone(),
+            Arc::new(MockEventRead::default()),
+            Arc::new(MockEventMutate),
+            moderation.clone(),
+            channel.clone(),
+        ));
+        let raw = channel_payload("moderation.purge");
+        let mut fresh = signed(&raw, "old", intent);
+        fresh.headers_mut().insert(
+            "x-request-id",
+            HeaderValue::from_static("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        );
+        set_moderation_flags(true);
+        let response = app.oneshot(fresh).await.unwrap();
+        let fresh_status = response.status();
+        let fresh_headers = response.headers().clone();
+        let fresh_bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        let calls_after_fresh = channel.calls();
+        // Rebuild the receiver over an independent connection: the repeated
+        // result must come from the durable outer receipt, not a memory cache.
+        let replay_pool = db.independent_pool().await.unwrap();
+        let restarted = router(state_full_with_channel(
+            replay_pool.clone(),
+            effect.clone(),
+            Arc::new(MockEventRead::default()),
+            Arc::new(MockEventMutate),
+            moderation.clone(),
+            channel.clone(),
+        ));
+        let mut repeat = signed(&raw, "new", intent);
+        repeat.headers_mut().insert(
+            "x-request-id",
+            HeaderValue::from_static("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        );
+        let response = restarted.oneshot(repeat).await.unwrap();
+        let replay_status = response.status();
+        let replay_headers = response.headers().clone();
+        let replay_bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        set_moderation_flags(false);
+        replay_pool.close().await;
+
+        let expected = format!(
+            r#"{{"ok":true,"result":{expected_result},"request_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}}"#,
+        );
+        assert_eq!(fresh_status, StatusCode::OK, "{intent}");
+        assert!(!fresh_headers.contains_key("idempotent-replay"), "{intent}");
+        assert_eq!(fresh_bytes.as_ref(), expected.as_bytes(), "{intent}: fresh");
+        assert_eq!(calls_after_fresh, 1, "{intent}: first effect");
+        assert_eq!(replay_status, StatusCode::OK, "{intent}");
+        assert_eq!(replay_headers["idempotent-replay"], "true", "{intent}");
+        assert_eq!(
+            replay_bytes.as_ref(),
+            expected.as_bytes(),
+            "{intent}: replay"
+        );
+        assert_eq!(channel.calls(), 1, "{intent}: no repeated effect");
+        assert_eq!(effect.calls(), 0);
+        assert_eq!(moderation.calls(), 0);
+    }
     db.close().await.unwrap();
 }
 

@@ -1,6 +1,9 @@
 //! Private Twitch EventSub receiver (`POST /hooks/twitch`). Never merge this
 //! router into the health socket. Verification (`twitch_eventsub::verify_delivery`)
-//! precedes any JSON parsing; known deterministic classification errors are
+//! precedes any JSON parsing; when `TWO_EVENTSUB_RELOAD_KEY` arms rotation, an
+//! authenticated per-delivery refresh (`eventsub_refresh`) swaps the secret
+//! before that verification, and any refresh failure refuses with retryable
+//! 503. Known deterministic classification errors are
 //! acknowledged with 2xx so Twitch does not retry them. Unknown/future errors
 //! fail closed with retryable 503. A verified `stream.online` runs the
 //! durable claim → send → settle flow (`stream_live_store::deliver_go_live`)
@@ -33,6 +36,7 @@ use tokio::{net::TcpListener, sync::Semaphore};
 use tracing::Instrument;
 use two_bot_core::{
     eventsub_receiver_config::EventsubReceiverConfig,
+    eventsub_refresh::{refresh_before_verify, RefreshVerifier},
     stream_live_store::deliver_go_live,
     twitch_eventsub::{classify, verify_delivery, Delivery, DeliveryHeaders, EventSubError},
 };
@@ -48,6 +52,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct ReceiverState {
     secret: RwLock<two_bot_core::twitch_eventsub::WebhookSecret>,
+    /// No-restart rotation, armed only when the Operator provisioned
+    /// `TWO_EVENTSUB_RELOAD_KEY`. `None` keeps the legacy startup-secret
+    /// behavior: the snapshot below never changes after bind.
+    reload: Option<RefreshVerifier>,
     capacity: Arc<Semaphore>,
     /// Go-live delivery dependencies, injected at bind time. `None` keeps
     /// verified notifications side-effect free (acknowledge only).
@@ -64,6 +72,7 @@ impl ReceiverState {
             // Keep one atomic secret snapshot in the state; handlers never
             // re-read the environment or observe partially replaced material.
             secret: RwLock::new(config.secret().clone()),
+            reload: config.reload_key().cloned().map(RefreshVerifier::new),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
             delivery: delivery.map(Arc::new),
         }
@@ -399,6 +408,35 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         }
     };
     let message_type = headers.message_type().to_owned();
+
+    // No-restart rotation, when armed: the fenced DO attached the Worker's
+    // current secret with its own HMAC. Swap before verifying this delivery;
+    // any refresh failure refuses retryably without touching the stale
+    // snapshot or the Twitch verification below.
+    if let Some(reload) = state.reload.as_ref() {
+        let refreshed = refresh_before_verify(
+            reload,
+            &state.secret,
+            |name| {
+                parts
+                    .headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+            },
+            id,
+            now_ms_u64(),
+        );
+        if refreshed.is_err() {
+            return refuse(
+                state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                true,
+                id,
+                bounded_message_type(&message_type),
+            );
+        }
+    }
 
     let raw = match tokio::time::timeout(BODY_TIMEOUT, to_bytes(body, MAX_BODY_BYTES)).await {
         Ok(Ok(raw)) => raw,
@@ -1821,5 +1859,295 @@ mod tests {
                 "secret material reached the reload-path logs"
             );
         }
+    }
+
+    // --- Armed no-restart rotation: the HTTP-boundary contract ---
+    //
+    // Builder-owned integration coverage for the armed refresh gate in
+    // `receive()`: the DO-attached refresh headers swap the snapshot before
+    // Twitch verification, and any refresh failure refuses retryably without
+    // verifying against the stale secret. Disabling the gate must turn these
+    // red: the rotated-secret challenge would 401 against the stale snapshot,
+    // and the missing-refresh delivery (valid under the current secret) would
+    // answer 200. All key material is runtime-generated per test, as above;
+    // request ids use the generated Crockford shape so the receiver honors
+    // the id the refresh was signed against.
+
+    /// Armed config: startup secret plus the Operator reload key.
+    fn armed_config_for(secret: &str, reload_key: &str) -> EventsubReceiverConfig {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("TWO_EVENTSUB".to_owned(), "1".to_owned());
+        vars.insert("TWO_EVENTSUB_BIND".to_owned(), "127.0.0.1:8092".to_owned());
+        vars.insert("TWO_TWITCH_WEBHOOK_SECRET".to_owned(), secret.to_owned());
+        vars.insert("TWO_EVENTSUB_RELOAD_KEY".to_owned(), reload_key.to_owned());
+        EventsubReceiverConfig::from_map(&vars)
+            .unwrap()
+            .expect("enabled")
+    }
+
+    /// Generated-shape request id, so `incoming_request_id` honors the id
+    /// the refresh headers were signed against.
+    fn fresh_armed_request_id() -> String {
+        let now_ms: u64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        two_bot_core::internal_actions::new_request_id(now_ms, &rand::random())
+    }
+
+    fn fresh_refresh_nonce() -> String {
+        hex::encode(rand::random::<[u8; 16]>())
+    }
+
+    fn refresh_timestamp_now() -> String {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_secs()
+            .to_string()
+    }
+
+    /// Validly signed refresh headers binding `candidate` to `request_id`
+    /// under `reload_key`: the (secret, timestamp, nonce, signature) tuple
+    /// the fenced DO would attach to the delivery.
+    fn signed_refresh(
+        reload_key: &str,
+        candidate: &str,
+        timestamp: &str,
+        nonce: &str,
+        request_id: &str,
+    ) -> (String, String, String, String) {
+        let signature = two_bot_core::eventsub_refresh::sign(
+            reload_key.as_bytes(),
+            timestamp,
+            nonce,
+            request_id,
+            candidate.as_bytes(),
+        );
+        (
+            candidate.to_owned(),
+            timestamp.to_owned(),
+            nonce.to_owned(),
+            signature,
+        )
+    }
+
+    /// Challenge delivery through the armed router: Twitch headers plus the
+    /// DO-attached refresh headers. `twitch` is (message id, timestamp,
+    /// signature); `refresh` is `None` for the missing-refresh case.
+    fn armed_challenge_request(
+        request_id: &str,
+        refresh: Option<(String, String, String, String)>,
+        twitch: (&str, &str, &str),
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(EVENTSUB_PATH)
+            .header("content-type", "application/json")
+            .header("x-request-id", request_id)
+            .header("twitch-eventsub-message-id", twitch.0)
+            .header("twitch-eventsub-message-timestamp", twitch.1)
+            .header("twitch-eventsub-message-signature", twitch.2)
+            .header(
+                "twitch-eventsub-message-type",
+                "webhook_callback_verification",
+            );
+        if let Some((secret, refresh_ts, nonce, refresh_sig)) = refresh {
+            builder = builder
+                .header("x-two-eventsub-secret", secret)
+                .header("x-two-eventsub-timestamp", refresh_ts)
+                .header("x-two-eventsub-nonce", nonce)
+                .header("x-two-eventsub-signature", refresh_sig);
+        }
+        builder.body(Body::from(challenge_body())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn armed_refresh_swaps_before_twitch_verification() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let old_secret = fresh_reload_secret();
+        let new_secret = fresh_reload_secret();
+        let reload_key = fresh_reload_secret();
+        assert_ne!(old_secret, new_secret, "rotation must change the secret");
+        let state = Arc::new(ReceiverState::new(&armed_config_for(
+            &old_secret,
+            &reload_key,
+        )));
+        let bound = router(Arc::clone(&state));
+
+        // The DO attached the current secret under this delivery's request
+        // id; the receiver swaps before verifying, so a challenge signed
+        // with the ROTATED secret answers 200 on the first armed request.
+        // With the gate disabled this would 401 against the stale snapshot.
+        let request_id = fresh_armed_request_id();
+        let refresh_ts = refresh_timestamp_now();
+        let nonce = fresh_refresh_nonce();
+        let refresh = signed_refresh(&reload_key, &new_secret, &refresh_ts, &nonce, &request_id);
+        let body = challenge_body();
+        let timestamp = fresh_timestamp();
+        let message_id = "synthetic-armed-0001";
+        let twitch_sig = sign_with(&new_secret, message_id, &timestamp, body.as_bytes());
+        let response = bound
+            .oneshot(armed_challenge_request(
+                &request_id,
+                Some(refresh),
+                (message_id, &timestamp, &twitch_sig),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"synthetic-challenge-0001");
+    }
+
+    #[tokio::test]
+    async fn armed_refresh_failure_refuses_retryable_without_verifying() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let old_secret = fresh_reload_secret();
+        let reload_key = fresh_reload_secret();
+        let state = Arc::new(ReceiverState::new(&armed_config_for(
+            &old_secret,
+            &reload_key,
+        )));
+        let bound = router(Arc::clone(&state));
+        let body = challenge_body();
+
+        // Missing refresh headers, but a Twitch signature valid under the
+        // current secret: armed, the gate refuses before verification. With
+        // the gate disabled this would answer the challenge.
+        let request_id = fresh_armed_request_id();
+        let timestamp = fresh_timestamp();
+        let message_id = "synthetic-armed-0002";
+        let twitch_sig = sign_with(&old_secret, message_id, &timestamp, body.as_bytes());
+        let missing = bound
+            .clone()
+            .oneshot(armed_challenge_request(
+                &request_id,
+                None,
+                (message_id, &timestamp, &twitch_sig),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(missing.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "unavailable");
+        assert_eq!(value["error"]["retryable"], true);
+
+        // Forged refresh (signed under the wrong key) with an otherwise
+        // valid delivery: the same retryable refusal, never 200 or 401.
+        let forged_id = fresh_armed_request_id();
+        let forged_ts = refresh_timestamp_now();
+        let wrong_key = fresh_reload_secret();
+        let wrong_candidate = fresh_reload_secret();
+        let forged_nonce = fresh_refresh_nonce();
+        let forged = signed_refresh(
+            &wrong_key,
+            &wrong_candidate,
+            &forged_ts,
+            &forged_nonce,
+            &forged_id,
+        );
+        let forged_message_id = "synthetic-armed-0003";
+        let forged_sig = sign_with(&old_secret, forged_message_id, &timestamp, body.as_bytes());
+        let forged_response = bound
+            .oneshot(armed_challenge_request(
+                &forged_id,
+                Some(forged),
+                (forged_message_id, &timestamp, &forged_sig),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forged_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(forged_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "unavailable");
+        assert_eq!(value["error"]["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn armed_pre_refresh_secret_rejected_after_swap() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let old_secret = fresh_reload_secret();
+        let new_secret = fresh_reload_secret();
+        let reload_key = fresh_reload_secret();
+        let state = Arc::new(ReceiverState::new(&armed_config_for(
+            &old_secret,
+            &reload_key,
+        )));
+        let bound = router(Arc::clone(&state));
+        let body = challenge_body();
+
+        // The first armed delivery rotates the snapshot, answering the
+        // challenge signed with the new secret.
+        let first_id = fresh_armed_request_id();
+        let first_ts = refresh_timestamp_now();
+        let first_nonce = fresh_refresh_nonce();
+        let first = signed_refresh(&reload_key, &new_secret, &first_ts, &first_nonce, &first_id);
+        let timestamp = fresh_timestamp();
+        let first_sig = sign_with(
+            &new_secret,
+            "synthetic-armed-0004",
+            &timestamp,
+            body.as_bytes(),
+        );
+        let rotated = bound
+            .clone()
+            .oneshot(armed_challenge_request(
+                &first_id,
+                Some(first),
+                ("synthetic-armed-0004", &timestamp, &first_sig),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rotated.status(), StatusCode::OK);
+
+        // A later delivery signed with the PRE-refresh secret is rejected
+        // after the swap — even with its own valid refresh — proving HMAC
+        // verification uses the current secret only.
+        let retry_id = fresh_armed_request_id();
+        let retry_ts = refresh_timestamp_now();
+        let retry_nonce = fresh_refresh_nonce();
+        let retry = signed_refresh(&reload_key, &new_secret, &retry_ts, &retry_nonce, &retry_id);
+        let retry_sig = sign_with(
+            &old_secret,
+            "synthetic-armed-0005",
+            &timestamp,
+            body.as_bytes(),
+        );
+        let stale = bound
+            .oneshot(armed_challenge_request(
+                &retry_id,
+                Some(retry),
+                ("synthetic-armed-0005", &timestamp, &retry_sig),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(
+            stale.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a stale secret is a deterministic refusal, never a 500"
+        );
+        let bytes = axum::body::to_bytes(stale.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "unauthorized");
+        assert_eq!(value["error"]["retryable"], false);
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-challenge-0001"));
     }
 }

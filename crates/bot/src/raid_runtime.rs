@@ -59,10 +59,55 @@ pub struct RaidSettings {
     pub staff_channel: Option<String>,
 }
 
+/// Key-only diagnostic: malformed configuration refuses the whole observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RaidTuningRefusal {
+    key: &'static str,
+}
+
+impl RaidTuningRefusal {
+    pub fn key(&self) -> &'static str {
+        self.key
+    }
+}
+
+impl std::fmt::Display for RaidTuningRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "raid tuning refused: {} present but unusable", self.key)
+    }
+}
+
+impl std::error::Error for RaidTuningRefusal {}
+
 impl RaidSettings {
-    /// A missing or unusable number (zero, negative, non-finite, unparsable)
-    /// falls back to the default rather than disabling the watch, and an
-    /// unusable channel falls back to log-only. Present-but-bad values warn.
+    /// Live reader: absent/empty keys retain defaults; malformed values refuse
+    /// the whole read. No input value is retained in the diagnostic.
+    pub fn try_from_vars(vars: &HashMap<String, String>) -> Result<Self, RaidTuningRefusal> {
+        let number = |key: &'static str, default: f64| match vars.get(key).map(|raw| raw.trim()) {
+            None | Some("") => Ok(default),
+            Some(raw) => match raw.parse::<f64>() {
+                Ok(value) if value.is_finite() && value > 0.0 => Ok(value),
+                _ => Err(RaidTuningRefusal { key }),
+            },
+        };
+        let window = number(WINDOW_KEY, DEFAULT_RAID_WINDOW_SECONDS)?;
+        let threshold = number(THRESHOLD_KEY, DEFAULT_RAID_THRESHOLD)?;
+        let tuning = RaidTuning::new(window, threshold)
+            .map_err(|_| RaidTuningRefusal { key: WINDOW_KEY })?;
+        let staff_channel = match vars.get(CHANNEL_KEY).map(|raw| raw.trim()) {
+            None | Some("") => None,
+            Some(raw) if is_snowflake(raw) => Some(raw.to_owned()),
+            Some(_) => return Err(RaidTuningRefusal { key: CHANNEL_KEY }),
+        };
+        Ok(Self {
+            tuning,
+            staff_channel,
+        })
+    }
+
+    /// Legacy compatibility reader, only for tests. Live callers must refuse
+    /// malformed values rather than substitute defaults or log-only delivery.
+    #[cfg(test)]
     pub fn from_vars(vars: &HashMap<String, String>) -> Self {
         let number = |key: &str, default: f64| match vars.get(key).map(|raw| raw.trim()) {
             None | Some("") => default,
@@ -94,14 +139,28 @@ impl RaidSettings {
     }
 }
 
-/// Where the live [`RaidSettings`] come from.
+/// Compatibility seam for callers supplying already-constructed settings.
+/// Raw live configuration uses [`CheckedSettingsSource`] instead.
 pub trait SettingsSource: Send + 'static {
     fn current(&mut self) -> impl Future<Output = RaidSettings> + Send;
 }
 
+/// Live settings reads can refuse an observation before the watch changes.
+pub trait CheckedSettingsSource: Send + 'static {
+    fn try_current(
+        &mut self,
+    ) -> impl Future<Output = Result<RaidSettings, RaidTuningRefusal>> + Send;
+}
+
+impl<S: SettingsSource> CheckedSettingsSource for S {
+    async fn try_current(&mut self) -> Result<RaidSettings, RaidTuningRefusal> {
+        Ok(self.current().await)
+    }
+}
+
 /// Tuning and the staff channel are store-first (hot rows win over the
 /// deployment environment) and re-read at most every `SETTINGS_MAX_AGE`; a
-/// failed refresh keeps the last good values.
+/// failed refresh keeps the last outcome, including a refusal.
 pub struct StoreSettings {
     pool: PgPool,
     guild_id: String,
@@ -109,7 +168,7 @@ pub struct StoreSettings {
     max_age: Duration,
     cache: Option<SettingsCache>,
     checked: Option<Instant>,
-    last: Option<RaidSettings>,
+    last: Option<Result<RaidSettings, RaidTuningRefusal>>,
 }
 
 impl StoreSettings {
@@ -132,11 +191,9 @@ impl StoreSettings {
         self
     }
 
-    async fn refresh(&mut self) {
+    async fn refresh(&mut self) -> Result<RaidSettings, RaidTuningRefusal> {
         let store = SettingsStore::new(&self.pool);
         let stale = self.cache.as_ref();
-        // Bound to a local so the timeout future is dropped before the borrows
-        // above end (edition-2021 tail-expression temporaries).
         let loaded = tokio::time::timeout(SETTINGS_READ_MAX, async {
             let (revision, rows) = store.poll_marks().await?;
             if stale.is_some_and(|cache| !cache.needs_refresh(revision, rows)) {
@@ -146,30 +203,29 @@ impl StoreSettings {
             Ok(Some(SettingsCache::load(&snapshot)))
         })
         .await;
-        match loaded {
-            Ok(Ok(Some(cache))) => self.cache = Some(cache),
-            Ok(Ok(None)) => {}
-            Ok(Err(_)) | Err(_) => {
-                warn!("raid settings refresh failed; keeping the last good values");
-            }
-        }
+        self.apply_refresh(match loaded {
+            Ok(Ok(cache)) => Ok(cache),
+            Ok(Err(_)) | Err(_) => Err(()),
+        })
     }
-}
 
-impl SettingsSource for StoreSettings {
-    async fn current(&mut self) -> RaidSettings {
-        if let (Some(at), Some(last)) = (self.checked, &self.last) {
-            if at.elapsed() < self.max_age {
-                return last.clone();
+    fn apply_refresh(
+        &mut self,
+        loaded: Result<Option<SettingsCache>, ()>,
+    ) -> Result<RaidSettings, RaidTuningRefusal> {
+        match loaded {
+            Ok(Some(cache)) => self.cache = Some(cache),
+            Ok(None) => {}
+            Err(()) => {
+                warn!("raid settings refresh failed; keeping the last outcome");
+                if let Some(last) = &self.last {
+                    return last.clone();
+                }
             }
         }
-        self.checked = Some(Instant::now());
-        self.refresh().await;
         let mut vars = self.deployment.clone();
         if let Some(cache) = &self.cache {
-            // Tuning and the staff channel are live (`HOT_WIRED`): a stored
-            // row moves the next observation, a delete hands the key back to
-            // the boot-time deployment value.
+            // A stored row wins; deletion hands the key back to deployment.
             vars.extend(
                 cache
                     .env_snapshot(Some(self.guild_id.as_str()))
@@ -177,17 +233,29 @@ impl SettingsSource for StoreSettings {
                     .filter(|(key, _)| SETTING_KEYS.contains(&key.as_str())),
             );
         }
-        let settings = RaidSettings::from_vars(&vars);
+        let settings = match RaidSettings::try_from_vars(&vars) {
+            Ok(settings) => settings,
+            Err(refusal) => {
+                if !matches!(&self.last, Some(Err(previous)) if previous.key() == refusal.key()) {
+                    error!(
+                        key = refusal.key(),
+                        "raid_tuning_refused: observations disabled"
+                    );
+                }
+                self.last = Some(Err(refusal));
+                return Err(refusal);
+            }
+        };
         match &self.last {
-            Some(previous) if previous.tuning != settings.tuning => info!(
+            Some(Ok(previous)) if previous.tuning != settings.tuning => info!(
                 from_threshold = previous.tuning.threshold(),
                 to_threshold = settings.tuning.threshold(),
                 from_window_seconds = previous.tuning.window_seconds(),
                 to_window_seconds = settings.tuning.window_seconds(),
                 "setting_changed: raid tuning"
             ),
-            Some(_) => {}
-            None => info!(
+            Some(Ok(_)) => {}
+            Some(Err(_)) | None => info!(
                 threshold = settings.tuning.threshold(),
                 window_seconds = settings.tuning.window_seconds(),
                 alert_target = settings
@@ -197,8 +265,20 @@ impl SettingsSource for StoreSettings {
                 "raid_watch_enabled"
             ),
         }
-        self.last = Some(settings.clone());
-        settings
+        self.last = Some(Ok(settings.clone()));
+        Ok(settings)
+    }
+}
+
+impl CheckedSettingsSource for StoreSettings {
+    async fn try_current(&mut self) -> Result<RaidSettings, RaidTuningRefusal> {
+        if let (Some(at), Some(last)) = (self.checked, &self.last) {
+            if at.elapsed() < self.max_age {
+                return last.clone();
+            }
+        }
+        self.checked = Some(Instant::now());
+        self.refresh().await
     }
 }
 
@@ -305,7 +385,7 @@ struct RaidWorker<S> {
     joins: mpsc::Receiver<JoinObservation>,
 }
 
-impl<S: SettingsSource> RaidWorker<S> {
+impl<S: CheckedSettingsSource> RaidWorker<S> {
     async fn run(mut self) {
         while let Some(join) = self.joins.recv().await {
             // An internal failure must never end the watch: log it and carry on.
@@ -324,7 +404,11 @@ impl<S: SettingsSource> RaidWorker<S> {
         if join.guild_id != self.guild_id {
             return;
         }
-        let settings = self.settings.current().await;
+        // The source logs state changes. Drop before updating the watch, so a
+        // refused join cannot contribute to a later alert or consume cooldown.
+        let Ok(settings) = self.settings.try_current().await else {
+            return;
+        };
         let Some(alert) = self.watch.observe(
             &join.guild_id.to_string(),
             &join.member_id.to_string(),
@@ -358,7 +442,7 @@ impl JoinObserver for RaidRuntime {
 }
 
 /// Spawn the worker. It ends when the last [`RaidRuntime`] reference drops.
-pub fn start<S: SettingsSource>(
+pub fn start<S: CheckedSettingsSource>(
     guild_id: u64,
     settings: S,
     executor: ActionExecutor,
@@ -395,3 +479,7 @@ pub fn start_from_env(pool: PgPool, executor: ActionExecutor, guild_id: u64) -> 
     );
     runtime
 }
+
+#[cfg(test)]
+#[path = "raid_tuning_runtime_tests.rs"]
+mod tuning_runtime_tests;

@@ -125,6 +125,10 @@ mod ticket_runtime;
 #[cfg(test)]
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
+// Shared by the raid/containment tuning test modules; declared once so the
+// file is not loaded as two modules (clippy::duplicate_mod).
+#[cfg(test)]
+mod tuning_test_support;
 mod website_jobs;
 #[cfg(test)]
 mod website_roster_cap_acceptance_tests;

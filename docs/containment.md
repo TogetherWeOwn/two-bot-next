@@ -41,10 +41,23 @@ occurrence time and audit ID, and finds the maximum sliding heat at endpoints at
 or after the trigger. An exact-window separation is excluded. This supports
 reverse delivery without summing two adjacent windows together. Defaults are a
 60s window and heat threshold 5. Policy durations are explicit integer
-milliseconds. The bot loader (`ContainmentSettings::from_vars` in
+milliseconds. The live bot loader (`ContainmentSettings::try_from_vars` in
 `crates/bot/src/containment_runtime.rs`) converts `TWO_ANTI_NUKE_*_SECONDS` to
-whole positive milliseconds; a sub-millisecond, overflowing or non-finite value
-uses the shipped default with a warning.
+positive milliseconds, truncating a fractional millisecond as before. Missing,
+empty or whitespace-only keys keep the shipped defaults. Present malformed,
+sub-millisecond, overflowing or non-finite durations, non-positive/non-integral
+heat thresholds, and malformed staff channels refuse the observation before
+claims, heat, alerts or role effects. `containment_tuning_refused` logs only the
+key at error level on entry or a changed refused key, not on every observation.
+Hot rows still override deployment values; failed refreshes retain the last
+outcome, including refusal, until a valid read recovers. The old `from_vars`
+reader exists only for compatibility tests, not the live path.
+
+Trusted/protected user lists are still cold boot settings. Each nonempty CSV
+entry must be a bare 17–20 ASCII-digit snowflake after trimming. Empty entries
+are ignored and valid entries deduplicate without changing their bytes. One
+malformed entry refuses the entire observer at boot; no partial set can reach
+containment, even when arming fences otherwise pass.
 
 `incident_candidate` proposes an incident with the triggering audit ID, state
 `Containing`, and cooldown measured from **processing time**, not occurrence

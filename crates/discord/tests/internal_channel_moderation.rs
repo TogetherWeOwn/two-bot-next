@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{fresh_message_id, MockRest, ScriptedResponse};
+use common::{aged_message_id, fresh_message_id, MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgPool, Row};
@@ -1734,6 +1734,204 @@ async fn permission_actor_and_guild_refusals_never_mutate() {
         .await
         .unwrap();
     assert_eq!(claims, 0);
+    mock.shutdown().await;
+    db.cleanup().await;
+}
+
+/// Acceptance: a purge Discord rate-limits after one successful single
+/// delete says so on the internal-action path too. The result payload, the
+/// audit metadata and the stored replay payload all carry the fixed stop
+/// reason next to the count actually deleted, and a replay returns the
+/// same payload without repeating any delete.
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn purge_stopped_early_reports_the_reason_in_the_result_and_the_audit_row() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(
+        vec![
+            channel(None, "0"),
+            ScriptedResponse::json(
+                200,
+                json!([
+                    {"id": aged_message_id(1), "author": {"bot": false}},
+                    {"id": aged_message_id(2), "author": {"bot": false}},
+                    {"id": aged_message_id(3), "author": {"bot": false}}
+                ]),
+            ),
+            ScriptedResponse::status(204),
+            ScriptedResponse::rate_limited(0.0, "0"),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let exec = executor(db.pool.clone(), &mock);
+    let req = request("moderation.purge", json!({"count":3}));
+    let key = "purge-early-stop-key";
+    let first = exec
+        .execute(&req, &actor(), "purge-early-stop-request", key, TIME)
+        .await
+        .unwrap();
+    assert_eq!(first.outcome, "purged");
+    assert_eq!(first.affected, Some(1));
+    assert_eq!(
+        first.response(),
+        json!({"result":{"outcome":"purged","affected":1,"stop_reason":"rate_limited"},"outcome":"purged"})
+    );
+    let second = exec
+        .execute(&req, &actor(), "purge-early-stop-retry", key, TIME)
+        .await
+        .unwrap();
+    assert!(second.replayed);
+    assert_eq!(second.response()["result"], first.response()["result"]);
+    let metadata: String = sqlx::query_scalar(
+        "SELECT metadata_json FROM moderation_audit WHERE action = 'moderation.purge'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        metadata,
+        r#"{"duration_seconds":null,"count":3,"seconds":null,"affected":1,"stop_reason":"rate_limited"}"#
+    );
+    let stored: String = sqlx::query_scalar(
+        "SELECT result_json FROM moderation_idempotency WHERE outcome = 'purged'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        r#"{"outcome":"purged","affected":1,"stop_reason":"rate_limited"}"#
+    );
+    let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_audit")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(audits, 1);
+    assert_eq!(
+        mock.requests().len(),
+        4,
+        "channel read, list, one successful delete, the rate-limited delete; the replay sent nothing"
+    );
+    mock.shutdown().await;
+    db.cleanup().await;
+}
+
+/// A corrupt completed receipt must fail closed, not silently flatten an
+/// unrecognized reason into a successful replay or send another Discord request.
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn purge_corrupt_stop_reason_replay_fails_closed_without_discord_requests() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let req = request("moderation.purge", json!({"count":3}));
+    let key = "purge-corrupt-stop-reason";
+    // Hand-built legacy request shape, including the normalized reason. The
+    // claim must match exactly or the test would only exercise hash mismatch.
+    let hash = two_bot_core::body_hash(
+        json!({
+            "action":"moderation.purge", "guildId":GUILD,
+            "targetId":null, "channelId":CHANNEL, "reason":"cleanup",
+            "durationSeconds":null, "count":3, "seconds":null,
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let store = db.store();
+    let two_bot_core::channel_moderation_store::ChannelClaim::Claimed { ticket } = store
+        .claim(GUILD, key, "moderation.purge", &hash, TIME)
+        .await
+        .unwrap()
+    else {
+        panic!("fresh corrupt-replay fixture must own its claim");
+    };
+    let corrupt = r#"{"outcome":"purged","affected":1,"stop_reason":"bogus"}"#;
+    assert!(store
+        .complete(&ticket, "purged", corrupt, TIME)
+        .await
+        .unwrap());
+    let exec = executor(db.pool.clone(), &mock);
+    let result = exec
+        .execute(&req, &actor(), "corrupt-stop-replay", key, TIME)
+        .await;
+    let wire_count = mock.requests().len();
+    let stored: String = sqlx::query_scalar(
+        "SELECT result_json FROM moderation_idempotency WHERE guild_id = $1 AND idempotency_key = $2",
+    )
+    .bind(GUILD)
+    .bind(key)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM moderation_audit")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    mock.shutdown().await;
+    db.cleanup().await;
+    assert!(matches!(result, Err(error) if error.code == ErrorCode::Internal));
+    assert_eq!(wire_count, 0, "corrupt replay must never reach Discord");
+    assert_eq!(
+        stored, corrupt,
+        "replay must not repair or overwrite evidence"
+    );
+    assert_eq!(audits, 0, "replay must not invent a second effect audit");
+}
+
+/// Acceptance control: a purge that runs to completion keeps today's audit
+/// metadata and stored replay payload byte for byte, with no stop-reason
+/// key.
+#[tokio::test]
+#[ignore = "requires agent-testdb or CI service container"]
+async fn full_purge_audit_metadata_and_stored_payload_are_byte_identical_to_before() {
+    let db = TestDb::new().await;
+    let mock = MockRest::start(
+        vec![
+            channel(None, "0"),
+            ScriptedResponse::json(
+                200,
+                json!([
+                    {"id": fresh_message_id(1), "author": {"bot": false}},
+                    {"id": fresh_message_id(2), "author": {"bot": false}}
+                ]),
+            ),
+            ScriptedResponse::status(204),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let exec = executor(db.pool.clone(), &mock);
+    let req = request("moderation.purge", json!({"count":2}));
+    let first = exec
+        .execute(&req, &actor(), "purge-full-request", "purge-full-key", TIME)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.response(),
+        json!({"result":{"outcome":"purged","affected":2},"outcome":"purged"})
+    );
+    let metadata: String = sqlx::query_scalar(
+        "SELECT metadata_json FROM moderation_audit WHERE action = 'moderation.purge'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        metadata,
+        r#"{"duration_seconds":null,"count":2,"seconds":null,"affected":2}"#
+    );
+    let stored: String = sqlx::query_scalar(
+        "SELECT result_json FROM moderation_idempotency WHERE outcome = 'purged'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, r#"{"outcome":"purged","affected":2}"#);
+    assert_eq!(
+        mock.requests().len(),
+        3,
+        "channel read, list, one bulk delete"
+    );
     mock.shutdown().await;
     db.cleanup().await;
 }
