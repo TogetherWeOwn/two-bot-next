@@ -202,23 +202,31 @@ def _reject_json_constant(_value):
     raise ValueError("non-standard JSON constant")
 
 
-def parse_json_or_text(body, secret=None):
+def load_bounded_json(body):
+    """Load JSON if it passes the depth and finite-number bounds."""
     try:
         parsed = json.loads(body, parse_constant=_reject_json_constant)
     except Exception:
-        return _bounded_text_fallback(body, secret)
+        return False, None
     # Decoder and encoder recursion limits differ. Check iteratively before
     # handing parsed containers to either the stdout or artifact encoder.
     pending = [(parsed, 0)]
     while pending:
         value, depth = pending.pop()
         if isinstance(value, float) and not math.isfinite(value):
-            return _bounded_text_fallback(body, secret)
+            return False, None
         if isinstance(value, (dict, list)):
             if depth >= MAX_JSON_DEPTH:
-                return _bounded_text_fallback(body, secret)
+                return False, None
             children = value.values() if isinstance(value, dict) else value
             pending.extend((child, depth + 1) for child in children)
+    return True, parsed
+
+
+def parse_json_or_text(body, secret=None):
+    valid, parsed = load_bounded_json(body)
+    if not valid:
+        return _bounded_text_fallback(body, secret)
     parsed = redact_secret(parsed, secret)
     try:
         serialized_size = len(
@@ -337,7 +345,7 @@ def main():
     }
     status, headers, body = fetch("initialize", redacted_request_line("initialize", rpc_id, '"params":{...}'), payload, token)
     if body is not None:
-        parsed = parse_json_or_text(body)
+        _valid_json, parsed = load_bounded_json(body)
         result = parsed.get("result") if isinstance(parsed, dict) else None
         if status != 200 or not isinstance(result, dict) or not result.get("protocolVersion"):
             failures.append("initialize: expected HTTP 200 with result.protocolVersion")
@@ -347,7 +355,7 @@ def main():
     payload = {"jsonrpc": "2.0", "id": rpc_id, "method": "tools/list", "params": {}}
     status, headers, body = fetch("tools/list", redacted_request_line("tools/list", rpc_id), payload, token)
     if body is not None:
-        parsed = parse_json_or_text(body)
+        _valid_json, parsed = load_bounded_json(body)
         result = parsed.get("result") if isinstance(parsed, dict) else None
         tools = result.get("tools") if isinstance(result, dict) else None
         names = None
@@ -378,7 +386,7 @@ def main():
         if body is None:
             rpc_id += 1
             continue
-        parsed = parse_json_or_text(body)
+        _valid_json, parsed = load_bounded_json(body)
         if status != 200 or not isinstance(parsed, dict):
             failures.append(f"tools/call {tool}: expected HTTP 200 JSON-RPC envelope")
         elif "error" in parsed and parsed["error"] is not None:
@@ -413,7 +421,7 @@ def main():
         token,
     )
     if body is not None:
-        parsed = parse_json_or_text(body)
+        _valid_json, parsed = load_bounded_json(body)
         err = parsed.get("error") if isinstance(parsed, dict) else None
         err = err if isinstance(err, dict) else {}
         code = jsonrpc_code(err)

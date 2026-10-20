@@ -519,6 +519,50 @@ class OutputSafetyTests(unittest.TestCase):
                 self.assertLess(len(stdout.encode("utf-8")), 2 * cap)
                 self.assertLess(len(raw), 2 * cap)
 
+    def test_json_null_remains_null_in_display(self):
+        self.assertIsNone(proveout.parse_json_or_text("null"))
+
+    def test_unicode_json_display_fallback_does_not_reject_valid_shape(self):
+        body = json.dumps(
+            {"result": {"content": [{"type": "text", "text": "🧪" * 15000}]}},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.assertLessEqual(len(body.encode("utf-8")), proveout.MAX_BODY_BYTES)
+        self.assertGreater(
+            len(json.dumps(json.loads(body), separators=(",", ":"), sort_keys=True).encode("utf-8")),
+            proveout.MAX_BODY_BYTES,
+        )
+
+        code, stdout, artifact, raw = HostileBodyTests().run_main({
+            2: (200, {}, body),
+        })
+
+        self.assertEqual(code, 0)
+        self.assertEqual(artifact["failures"], [])
+        self.assertEqual(set(artifact["probes"][2]["body"]), {"_text"})
+        rendered_body = json.dumps(
+            artifact["probes"][2]["body"], separators=(",", ":")
+        ).encode("utf-8")
+        self.assertLessEqual(
+            len(rendered_body), proveout.MAX_BODY_BYTES + len(b'{"_text":""}')
+        )
+        self.assertLess(len(stdout.encode("utf-8")), 2 * proveout.MAX_BODY_BYTES)
+        self.assertLess(len(raw), 2 * proveout.MAX_BODY_BYTES)
+
+    def test_reflected_bearer_in_nested_json_keys_is_redacted(self):
+        token = HostileBodyTests.TOKEN
+        code, stdout, artifact, raw = HostileBodyTests().run_main({
+            0: (200, {}, json.dumps({token: {token: token}})),
+        })
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            artifact["probes"][0]["body"], {"***": {"***": "***"}}
+        )
+        self.assertNotIn(token, stdout)
+        self.assertNotIn(token.encode(), raw)
+
 
 if __name__ == "__main__":
     unittest.main()
