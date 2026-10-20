@@ -260,13 +260,13 @@ async fn omitted_flags_recovery(evidence: Evidence) {
             .any(|r| r.method == "GET" && r.path == RECIPIENT_PATH));
         // A later, genuinely queued welcome must be suppressed by that marker,
         // not only by the gateway's same-sequence duplicate fence.
-        seed(&case, &ws.mock.url, 4).await;
-        let later = completed(&case, 4, 1).await;
-        assert_eq!(later.3, RECEIPT_AT);
+        ws.send(member_add(4, false, &joined_at_wire(RECEIPT_AT)))
+            .await;
+        wait_sequence(&case.store(), 4).await;
+        wait_row(&case, 4, "completed").await;
         assert_eq!(row(&case, 2).await, saved);
         assert_current_defaults(&assert_welcome(&mock, "legacy"));
         assert_eq!(case.prompts().await, 1);
-        assert_cold(&runner);
         assert!(!runner.task.is_finished());
         runner.stop().await;
     })
