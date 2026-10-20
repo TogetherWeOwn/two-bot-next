@@ -7,7 +7,7 @@
 //! runtime lane. Do not move it into an unselected standalone ignored target.
 
 use super::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Notify;
 use two_bot_core::member_moderation::MemberModerationStore;
 use two_bot_testsupport::TestDatabase;
@@ -158,7 +158,11 @@ impl AuthorityRest {
                     });
                     tokio::time::sleep(response.delay).await;
                     let body = response.body.unwrap_or_default();
-                    let header = format!("HTTP/1.1 {} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", response.status, body.len());
+                    let header = format!(
+                        "HTTP/1.1 {} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        response.status,
+                        body.len()
+                    );
                     let _ = stream.write_all(header.as_bytes()).await;
                     let _ = stream.write_all(body.as_bytes()).await;
                 });
@@ -590,11 +594,12 @@ async fn valid_current_facts_and_nonmember_bans_still_work_and_completed_replay_
         ));
     }
     let mut controls = Vec::new();
-    for (index, case) in [
-        "nonmember ban",
-        "nonmember tempban",
-        "current administrator",
-        "current guild owner",
+    for (index, (case, expected)) in [
+        ("nonmember ban", 1),
+        ("nonmember tempban", 1),
+        ("current administrator", 1),
+        ("administrator below a higher target", 0),
+        ("current guild owner", 1),
     ]
     .into_iter()
     .enumerate()
@@ -607,7 +612,12 @@ async fn valid_current_facts_and_nonmember_bans_still_work_and_completed_replay_
         };
         match case {
             "nonmember ban" | "nonmember tempban" => facts.fault = Some(("/members/3333", 404)),
+            // Administrator expands permissions only: with no explicit ban bit it
+            // can act on a lower target, but keeps its real top-role position.
             "current administrator" => {
+                facts.guild["roles"][1]["permissions"] = json!("8");
+            }
+            "administrator below a higher target" => {
                 facts.guild["roles"][1]["permissions"] = json!("8");
                 facts.target["roles"] = json!([HIGH_ROLE]);
             }
@@ -623,7 +633,7 @@ async fn valid_current_facts_and_nonmember_bans_still_work_and_completed_replay_
         runtime
             .on_interaction(&stale_interaction(verb, 50_100 + index as u64))
             .await;
-        controls.push((case, mutations(&rest.requests()).len()));
+        controls.push((case, expected, mutations(&rest.requests()).len()));
     }
     db.close().await.expect("dispose fixture");
     for (verb, first, replay, done, audits, effect, after_failed_read, first_evidence) in outcomes {
@@ -647,8 +657,11 @@ async fn valid_current_facts_and_nonmember_bans_still_work_and_completed_replay_
             "{verb}: failed freshness reads never reopen a completed request"
         );
     }
-    for (case, calls) in controls {
-        assert_eq!(calls, 1, "{case}: preserve intentional policy exemptions");
+    for (case, expected, calls) in controls {
+        assert_eq!(
+            calls, expected,
+            "{case}: preserve intentional policy exemptions"
+        );
     }
 }
 
