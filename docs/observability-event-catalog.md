@@ -314,6 +314,7 @@ sink attaches to the gateway writer on the cutover path.
 | `voice_event="voice_dead_letter"` | `crates/bot/src/voice_rooms.rs` (`mark_failed_observed`: `voice action dead-lettered`) | Queue write exhausted retries with bounded `action` and attempts |
 | `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs` (`execute_create`: `voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
 | `voice_event="voice_join_received"` | `crates/bot/src/voice_rooms.rs` (`accept_join_received`: `voice creator join accepted` / `voice creator join refused before queueing`) | One creator-channel join delivered to the guild actor, accepted or refused. The refused line carries a bounded `reason` (`halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked`, `other`) plus the refusing `channel` id and creator-map state at join time (`creators_len`, `known`, `halted`, `ready`, `live_generation`, `ticket_generation`; no member/name/token content); every delivery bumps `two_bot_voice_joins_received_total`, so received-vs-handled drift is the stall signal |
+| `voice_event="voice_admin_store"` | `crates/bot/src/voice_rooms.rs` (`log_admin_store_failure`: `voice admin store failed`) | One failed admin store read/write behind `/access`, `/logging`, `/export` or `/import`; bounded `op` (`access_read`, `access_save`, `logging_read`, `logging_save`, `export_read`, `import_read`) plus bounded `reason` (`unavailable`, `credential_refused`, `conflict`: the `StoreError` variant, no driver text) and the `guild_id`; the member reply is unchanged |
 
 ### `voice_event` JSON field shapes (verified 2026-10-17, emitter code only, no live log paste)
 
@@ -337,6 +338,7 @@ always `"tracing_event"` and the text above sits under `message`. Match on
 | `voice_creator_orphan` | `outcome`: `&str` (always `manual_needed`) | `execute_create` | warn / `voice creator orphan needs manual deletion` |
 | `voice_join_received` accepted | `guild`: `String` | `accept_join_received` | info / `voice creator join accepted` |
 | `voice_join_received` refused | `guild`, `channel`: `String`; `reason`: `&str` (bounded: `halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked`, unknown folds to `other` in the counter); `creators_len`: `u64`; `known`, `halted`, `ready`: `bool`; `live_generation`, `ticket_generation`: `u64` | `accept_join_received` | warn when `reason` is `halted`, debug when `duplicate`, info otherwise (including `name_blocked`) / `voice creator join refused before queueing` |
+| `voice_admin_store` | `op`: `&'static str` (bounded: `access_read`, `access_save`, `logging_read`, `logging_save`, `export_read`, `import_read`); `reason`: `&'static str` (bounded: `unavailable`, `credential_refused`, `conflict`); `guild_id`: `String` | `log_admin_store_failure` | warn / `voice admin store failed` |
 
 Rename-decision lines without a `voice_event` field:
 `voice room rename decision` (`log_rename_decision` and
@@ -403,6 +405,14 @@ Empty-grace override warning (in `stored_empty_grace_with` in
 stored per-guild `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` row is malformed or
 outside 0 to 600 whole seconds, so the sweep keeps the boot fallback. The
 line carries the setting key and the `out_of_range` reason.
+
+Invite-code override warning (in `stored_invite_code_with` in
+`crates/bot/src/voice_rooms.rs`, guild-only fields, no IDs):
+`stored invite-code override invalid; using vanity fallback` (warn): the
+stored per-guild `TWO_GUILD_INVITE_CODE` row is not a JSON string of 2 to
+32 ASCII alphanumerics plus `-`/`_`, so the `/invite` reply keeps the
+gateway vanity fallback. The line carries the setting key and the
+`invalid_invite_code` reason, never the rejected value.
 
 Boot admission warning (in `configured_admission` in
 `crates/bot/src/voice_rooms.rs`, key-only fields, no IDs):

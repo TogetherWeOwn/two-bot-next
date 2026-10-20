@@ -14,10 +14,11 @@
 //! `member:self-serve` label — never a subject ID, count, content or secret
 //! (the scope columns already name the pair, like every other receipt).
 //!
-//! Repeat taps never retake the purge's write-blocking locks: an
-//! already-suppressed pair gets the already-opted-out reply, and a pair with
-//! a purge receipt younger than the cooldown gets the cooldown reply. Either
-//! early return writes no new receipt; only a fresh purge locks and deletes.
+//! Repeat taps never retake the purge's write-blocking table locks: under
+//! the shared pair lock, an already-suppressed pair gets the already-opted-out
+//! reply, and a pair with a purge receipt younger than the cooldown gets the
+//! cooldown reply. Either early return writes no new receipt; only a fresh
+//! purge takes the table locks and deletes.
 
 use sqlx::{Pool, Postgres};
 use twilight_model::application::interaction::{
@@ -25,7 +26,9 @@ use twilight_model::application::interaction::{
 };
 use two_bot_cutover::{
     db::CutoverDb,
-    privacy::{analytics_settings, has_recent_opt_out, is_opted_out, opt_back_in, opt_out_member},
+    privacy::{
+        analytics_settings, is_opted_out, opt_back_in, opt_out_member_with_cooldown, OptOutOutcome,
+    },
 };
 use two_bot_discord::ActionExecutor;
 
@@ -59,6 +62,19 @@ const ALREADY_OPTED_OUT_REPLY: &str = "You are already opted out of analytics fo
 
 const OPT_OUT_COOLDOWN_REPLY: &str = "You recently changed your privacy setting; \
      try `/privacy opt-out` again in a few minutes.";
+
+fn opt_out_reply(outcome: &OptOutOutcome) -> &'static str {
+    match outcome {
+        OptOutOutcome::OptedOut(_) => {
+            "You are opted out of analytics for this server. \
+             Your stored activity here was deleted and future activity will not be stored. \
+             Moderation, safety and delivery records are unchanged. \
+             Use `/privacy opt-in` to resume."
+        }
+        OptOutOutcome::AlreadyOptedOut => ALREADY_OPTED_OUT_REPLY,
+        OptOutOutcome::Cooldown => OPT_OUT_COOLDOWN_REPLY,
+    }
+}
 
 /// The `/privacy` subcommand the interaction invoked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,57 +156,21 @@ pub(crate) async fn privacy_command(
     let db = CutoverDb::from_pool(pool.clone());
     match privacy_action(interaction) {
         PrivacyAction::OptOut => {
-            // Cheap read-only guards first: either early return skips the
-            // locking purge (and its receipt) entirely, so repeat taps and
-            // rapid opt-in/opt-out loops cannot hold or queue the
-            // SHARE ROW EXCLUSIVE locks on every invocation.
-            match is_opted_out(&db, &guild_id, &member).await {
+            // The service checks suppression and cooldown under the same
+            // pair lock as opt-in, before taking any purge table locks.
+            match opt_out_member_with_cooldown(
+                &db,
+                &guild_id,
+                &member,
+                MEMBER_SELF_SERVE_ACTOR,
+                OPT_OUT_COOLDOWN_MINUTES,
+            )
+            .await
+            {
+                Ok(outcome) => finish(executor, interaction, opt_out_reply(&outcome)).await,
                 Err(err) => {
-                    tracing::warn!(reason = db_class(&err), "privacy opt-out guard failed");
+                    tracing::warn!(reason = db_class(&err), "privacy opt-out failed");
                     finish(executor, interaction, STORE_FAILURE_REPLY).await;
-                }
-                Ok(true) => {
-                    finish(executor, interaction, ALREADY_OPTED_OUT_REPLY).await;
-                }
-                Ok(false) => {
-                    match has_recent_opt_out(&db, &guild_id, &member, OPT_OUT_COOLDOWN_MINUTES)
-                        .await
-                    {
-                        Err(err) => {
-                            tracing::warn!(
-                                reason = db_class(&err),
-                                "privacy opt-out cooldown check failed"
-                            );
-                            finish(executor, interaction, STORE_FAILURE_REPLY).await;
-                        }
-                        Ok(true) => {
-                            finish(executor, interaction, OPT_OUT_COOLDOWN_REPLY).await;
-                        }
-                        Ok(false) => {
-                            match opt_out_member(&db, &guild_id, &member, MEMBER_SELF_SERVE_ACTOR)
-                                .await
-                            {
-                                Ok(_) => {
-                                    finish(
-                                        executor,
-                                        interaction,
-                                        "You are opted out of analytics for this server. \
-                     Your stored activity here was deleted and future activity will not be stored. \
-                     Moderation, safety and delivery records are unchanged. \
-                     Use `/privacy opt-in` to resume.",
-                                    )
-                                    .await;
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        reason = db_class(&err),
-                                        "privacy opt-out failed"
-                                    );
-                                    finish(executor, interaction, STORE_FAILURE_REPLY).await;
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -248,5 +228,168 @@ pub(crate) async fn privacy_command(
         PrivacyAction::Invalid => {
             finish(executor, interaction, USAGE_REPLY).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use twilight_model::id::Id;
+
+    #[tokio::test]
+    async fn concurrent_opt_out_replies_once_then_already_and_preserves_cooldown() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            eprintln!("SKIP privacy reply race: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let fixture = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("disposable privacy reply database");
+        let (base, _) = url.rsplit_once('/').expect("guarded bootstrap URL");
+        let fixture_url = format!("{base}/{}", fixture.name());
+        // Wider than the herd so pool admission cannot serialize the race.
+        let db = two_bot_cutover::connect_with_tls(
+            &fixture_url,
+            16,
+            true,
+            two_bot_core::database_tls::TlsPolicy::LocalOnly,
+        )
+        .await
+        .expect("connect to owned disposable database");
+        const GUILD: u64 = 100000000000000431;
+        const MEMBER: u64 = 100000000000000432;
+        let guild = GUILD.to_string();
+        let member = MEMBER.to_string();
+
+        let replies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&replies);
+        let app = axum::Router::new().fallback(axum::routing::patch(
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorded = Arc::clone(&recorded);
+                async move {
+                    recorded
+                        .lock()
+                        .expect("record reply")
+                        .push(body["content"].as_str().expect("reply text").to_owned());
+                    axum::Json(serde_json::json!({}))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock REST listen");
+        let origin = format!("http://{}", listener.local_addr().expect("mock address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock REST serve");
+        });
+        let executor = ActionExecutor::with_proxy("mock-only-token".into(), Some(origin))
+            .expect("mock executor");
+        let interaction = |tap: u64, action: &str| {
+            let mut invocation = crate::command_runtime_tests::slash(
+                "privacy",
+                None,
+                vec![twilight_model::application::interaction::application_command::CommandDataOption {
+                    name: action.to_owned(),
+                    value: CommandOptionValue::SubCommand(Vec::new()),
+                }],
+            );
+            invocation.guild_id = Some(Id::new(GUILD));
+            invocation.id = Id::new(tap + 1);
+            invocation.token = format!("privacy-tap-{tap}");
+            let invoker = invocation.member.as_mut().expect("member");
+            invoker.user.as_mut().expect("member user").id = Id::new(MEMBER);
+            invoker.permissions = Some(twilight_model::guild::Permissions::empty());
+            invocation
+        };
+        // Direct handler calls bypass the interaction lane so this proves the
+        // service boundary, not accidental serialization by gateway routing.
+        // The account is empty: its winning tap must still get the fresh reply.
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut taps = Vec::new();
+        for tap in 0..8 {
+            let db = db.clone();
+            let executor = executor.clone();
+            let barrier = Arc::clone(&barrier);
+            let invocation = interaction(tap, "opt-out");
+            taps.push(tokio::spawn(async move {
+                barrier.wait().await;
+                privacy_command(db.pool(), &executor, &invocation).await;
+            }));
+        }
+        for tap in taps {
+            tap.await.expect("privacy tap");
+        }
+        {
+            let replies = replies.lock().expect("read replies");
+            assert_eq!(replies.len(), 8);
+            assert_eq!(
+                replies
+                    .iter()
+                    .filter(|text| text.starts_with("You are opted out"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                replies
+                    .iter()
+                    .filter(|text| text.as_str() == ALREADY_OPTED_OUT_REPLY)
+                    .count(),
+                7
+            );
+        }
+        let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM privacy_opt_out_audit")
+            .fetch_one(db.pool())
+            .await
+            .expect("receipts");
+        assert_eq!(receipts, 1);
+        assert!(is_opted_out(&db, &guild, &member)
+            .await
+            .expect("suppressed"));
+
+        privacy_command(db.pool(), &executor, &interaction(8, "opt-in")).await;
+        privacy_command(db.pool(), &executor, &interaction(9, "opt-out")).await;
+        assert!(!is_opted_out(&db, &guild, &member)
+            .await
+            .expect("re-enabled"));
+        {
+            let replies = replies.lock().expect("read replies");
+            assert!(replies[8].starts_with("Analytics persistence is back on"));
+            assert_eq!(replies[9], OPT_OUT_COOLDOWN_REPLY);
+        }
+        // The member cooldown does not apply to assisted operator calls.
+        two_bot_cutover::privacy::opt_out_member(&db, &guild, &member, "operator:fixture")
+            .await
+            .expect("operator opt-out ignores member cooldown");
+        let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM privacy_opt_out_audit")
+            .fetch_one(db.pool())
+            .await
+            .expect("receipts");
+        assert_eq!(receipts, 2);
+        server.abort();
+        db.close().await;
+        fixture.close().await.expect("drop disposable database");
+    }
+
+    #[test]
+    fn opt_out_reply_distinguishes_empty_purge_already_and_cooldown() {
+        use two_bot_cutover::privacy::OptOutOutcome;
+
+        // A first opt-out with no stored rows is still a real transition.
+        let fresh = opt_out_reply(&OptOutOutcome::OptedOut(Vec::new()));
+        assert!(fresh.starts_with("You are opted out of analytics"));
+        assert_eq!(
+            opt_out_reply(&OptOutOutcome::AlreadyOptedOut),
+            ALREADY_OPTED_OUT_REPLY
+        );
+        assert_eq!(
+            opt_out_reply(&OptOutOutcome::Cooldown),
+            OPT_OUT_COOLDOWN_REPLY
+        );
+        assert_ne!(fresh, ALREADY_OPTED_OUT_REPLY);
+        assert_ne!(fresh, OPT_OUT_COOLDOWN_REPLY);
     }
 }

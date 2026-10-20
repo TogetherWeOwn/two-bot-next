@@ -890,13 +890,11 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     Some(Value::Object(data)) => data,
                     _ => return Err(refuse("dump row has no data object")),
                 };
-                // The manifest column list gates unknown keys here, before any
+                // The manifest column list gates row keys here, before any
                 // publish/restore or `--dry-run` success: a row key it never
-                // declared refuses. This check does not verify column
-                // completeness: a row carrying a subset stays valid at
-                // inspect, while restore refuses a row with a missing cell
-                // (`missing cell`, dump.rs). The message is fixed vocabulary:
-                // it never echoes the hostile key.
+                // declared refuses, and so does a row missing a column it
+                // did declare. Both messages are fixed vocabulary: they
+                // never echo row content.
                 // Membership is tested against the per-table set built with the
                 // manifest, so the per-row cost is O(row keys). The fallback
                 // linear scan is unreachable (the set is built from the same
@@ -909,6 +907,26 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                 if has_outside_key {
                     return Err(refuse(format!(
                         "{table} row on line {line_no} has a column outside the manifest"
+                    )));
+                }
+                // Completeness is the other half of the restore contract:
+                // restore binds one parameter per kept manifest column and
+                // refuses a row with a missing cell (`missing cell`,
+                // dump.rs), so a row carrying a subset of its table's
+                // declared columns refuses here too. The check runs for
+                // every dump version including frozen v3, whose untyped
+                // rows still declare columns; the message names neither
+                // the missing column nor any cell value.
+                // Outside keys have already refused, so equality with the
+                // deduplicated set's size proves completeness in O(1), even
+                // when the manifest repeats a column many times.
+                let is_missing_column = match column_sets.get(&table) {
+                    Some(known) => data.len() != known.len(),
+                    None => info.columns.iter().any(|col| !data.contains_key(col)),
+                };
+                if is_missing_column {
+                    return Err(refuse(format!(
+                        "{table} row on line {line_no} is missing a manifest column"
                     )));
                 }
                 // Frozen v3 has native driver-decoded cells and no type metadata.
@@ -2657,16 +2675,66 @@ mod tests {
                 row
             }]
         );
-        // A row carrying only a subset of the declared columns stays valid:
-        // only keys outside the manifest refuse, never missing ones.
+    }
+
+    #[test]
+    fn duplicate_heavy_columns_preserve_row_completeness_verdicts() {
+        // Duplicate declarations must not multiply the work for each row.
+        // Keep this shape large enough to exercise the amplification without
+        // a wall-clock assertion that would flake on a loaded CI runner.
+        let row_count = 2_000;
+        let mut over = BTreeMap::new();
+        over.insert("events", (vec!["id"; 200_000], row_count));
+        let mut objs = vec![manifest(complete_tables(&over))];
+        let row = serde_json::json!({"kind":"row","table":"events","data":{"id":"1"}});
+        objs.extend(std::iter::repeat_n(row, row_count as usize));
+        objs.push(serde_json::json!({"kind":"end","rows":row_count}));
+        let bytes = gzip_lines(&objs);
+        let contents = inspect_bytes(&bytes).unwrap();
+        assert_eq!(contents.rows, row_count);
+        assert_eq!(contents.buffers["events"].len(), row_count as usize);
+        assert_eq!(
+            contents.buffers["events"][0],
+            serde_json::json!({"id":"1"}).as_object().unwrap().clone()
+        );
+
+        // The same distinct-column contract applies to typed and legacy rows.
+        for strip_types in [false, true] {
+            if strip_types {
+                objs[0]["version"] = serde_json::json!(3);
+                for table in objs[0]["tables"].as_array_mut().unwrap() {
+                    table.as_object_mut().unwrap().shift_remove("column_types");
+                }
+            }
+            objs[1]["data"] = serde_json::json!({});
+            let err = acceptance_refusal(&objs);
+            assert!(err.contains("is missing a manifest column"), "{err}");
+            // Equal key counts alone do not prove completeness: an outside
+            // key replacing a required key must retain the earlier refusal.
+            objs[1]["data"] = serde_json::json!({ECHO_SENTINEL:ECHO_SENTINEL});
+            let err = acceptance_refusal(&objs);
+            assert!(err.contains("has a column outside the manifest"), "{err}");
+            assert!(!err.contains(ECHO_SENTINEL), "{err}");
+            objs[1]["data"] = serde_json::json!({"id":"1"});
+            assert_eq!(inspect_bytes(&gzip_lines(&objs)).unwrap().rows, row_count);
+        }
+    }
+
+    #[test]
+    fn acceptance_dump_inspect_refuses_row_missing_a_manifest_column() {
+        // Completeness is the restore contract: restore binds one parameter
+        // per kept manifest column and refuses a row with a missing cell, so
+        // a row carrying only a subset of the declared columns refuses at
+        // inspect with fixed vocabulary that never echoes row content.
         let mut subset = good_dump();
         subset[1]["data"]
             .as_object_mut()
             .unwrap()
             .shift_remove("guild_id");
-        let contents = inspect_bytes(&gzip_lines(&subset)).unwrap();
-        assert_eq!(contents.rows, 1);
-        assert_eq!(contents.buffers["events"][0].len(), 1);
+        subset[1]["data"]["id"] = serde_json::json!(ECHO_SENTINEL);
+        let err = acceptance_refusal(&subset);
+        assert!(err.contains("is missing a manifest column"), "{err}");
+        assert!(!err.contains(ECHO_SENTINEL), "{err}");
     }
 
     #[test]
