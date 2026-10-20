@@ -1,6 +1,9 @@
 //! Raid runtime acceptance against the mock Discord double. The one database
 //! test is ignored and runs only on agent-testdb / the CI service container.
 
+#[path = "raid_tuning_refusal_acceptance_tests.rs"]
+mod tuning_refusal_acceptance;
+
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +16,9 @@ use two_bot_discord::{ActionExecutor, JoinObservation, JoinObserver};
 
 use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
 use crate::gateway::ensure_crypto_provider;
-use crate::raid_runtime::{self, RaidSettings, SettingsSource, StoreSettings};
+use crate::raid_runtime::{
+    self, CheckedSettingsSource, RaidSettings, SettingsSource, StoreSettings,
+};
 
 const GUILD: u64 = 22;
 const CHANNEL: &str = "12";
@@ -379,7 +384,7 @@ async fn raid_runtime_store_tuning_and_channel_are_live() {
     let mut source =
         StoreSettings::new(db.pool.clone(), GUILD, deployment).with_max_age(Duration::ZERO);
 
-    let first = source.current().await;
+    let first = source.try_current().await.expect("valid tuning");
     assert_eq!(
         first.tuning.threshold(),
         7.0,
@@ -415,7 +420,7 @@ async fn raid_runtime_store_tuning_and_channel_are_live() {
         )
         .await
         .unwrap();
-    let live = source.current().await;
+    let live = source.try_current().await.expect("valid tuning");
     assert_eq!(live.tuning, RaidTuning::new(30.0, 3.0).unwrap());
     assert_eq!(
         live.staff_channel.as_deref(),
@@ -432,13 +437,13 @@ async fn raid_runtime_store_tuning_and_channel_are_live() {
         .set(&guild, "DISCORD_STAFF_ALERT_CHANNEL_ID", None, "raid-test")
         .await
         .unwrap();
-    let back = source.current().await;
+    let back = source.try_current().await.expect("valid tuning");
     assert_eq!(back.tuning, RaidTuning::new(30.0, 7.0).unwrap());
     assert_eq!(back.staff_channel.as_deref(), Some("123456789012345678"));
 
     // A failed refresh keeps the last good values.
     db.pool.close().await;
-    let kept = source.current().await;
+    let kept = source.try_current().await.expect("valid tuning");
     assert_eq!(kept, back);
     db.close().await;
 }

@@ -318,6 +318,19 @@ Startup `error_class` values logged before fatal exits (see
 `receiver_bind_failed`, `moderation_disable_unknown`,
 `container_service_failed`, plus the twelve classes above.
 
+## Voice responder overload
+
+| Event | Callsite (stable anchor) | Level | Fields | Meaning |
+| --- | --- | --- | --- | --- |
+| `voice responder saturated; interaction dropped without acknowledgement (sampled)` | `crates/bot/src/voice_rooms.rs` (`ResponderAdmission::record_drop`) | WARN | `interaction_id`: the refused interaction's snowflake as a string; `dropped`: cumulative refusals for this responder instance | All 16 responder permits are occupied. The refused interaction sends no callback and runs no command; no detached busy-response task is started. |
+
+The counter increments on every refusal. The warning is sampled at most once
+per 60-second wall-clock window per responder, shared across guilds and
+interaction kinds; suppressed warnings do not extend the window. `dropped`
+is a log field, not a metrics series. No interaction token, command arguments,
+member name or response body is logged. This execution bound is distinct from
+the shared router's lane, which continues to own `/kick`.
+
 ## Voice structured fields (gateway sink, adjacent)
 
 `voice_event` fields in `crates/bot/src/voice_rooms.rs`; guild and channel
