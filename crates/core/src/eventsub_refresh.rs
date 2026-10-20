@@ -19,10 +19,13 @@
 //!   callback path, timestamp, nonce, the flow's `x-request-id`, and the
 //!   SHA-256 hex of the candidate secret. It mirrors `signEventsubRefresh` in
 //!   `wrangler/src/eventsub.ts` byte for byte; a mismatch fails closed.
-//! - [`refresh_before_verify`] authenticates (constant-time HMAC), checks
-//!   freshness ([`SKEW_SECONDS`], same window as internal actions), burns the
-//!   nonce ([`NONCE_TTL_SECONDS`] memory, so a replay can never re-arm an old
-//!   secret), validates the candidate as a [`WebhookSecret`], and swaps the
+//! - [`refresh_before_verify`] authenticates (constant-time HMAC), evaluates
+//!   the freshness clock against a [`ClockGuard`] high-water mark (threat-model
+//!   F8, as internal actions do), checks freshness ([`SKEW_SECONDS`], same
+//!   window as internal actions), burns the nonce ([`NONCE_TTL_SECONDS`]
+//!   memory at the guarded time, so a replay — including after a swept nonce
+//!   plus clock rollback — can never re-arm an old secret), validates the
+//!   candidate as a [`WebhookSecret`], and swaps the
 //!   complete snapshot under one write lock. Every failure maps to a bare
 //!   [`RefreshRejection`] variant: no secret, digest, key id or header value
 //!   travels with the error, and the caller answers one generic retryable
@@ -40,6 +43,7 @@ use hmac::{Hmac, KeyInit, Mac as _};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
+    clock_guard::ClockGuard,
     internal_actions::{
         signatures_match, valid_nonce_format, within_skew, NonceCache, NONCE_TTL_SECONDS,
         SKEW_SECONDS,
@@ -129,6 +133,12 @@ pub enum RefreshRejection {
 pub struct RefreshVerifier {
     key: Secret<Vec<u8>>,
     nonces: Mutex<NonceCache>,
+    /// Fail-closed freshness clock (threat-model F8): nonce memory drops
+    /// entries past [`NONCE_TTL_SECONDS`], so expiry followed by wall-clock
+    /// rollback could otherwise reopen a signed window whose nonce is already
+    /// forgotten. Freshness and the nonce burn both decide at the guarded
+    /// time, never at a regressed reading.
+    clock: Mutex<ClockGuard>,
 }
 
 impl std::fmt::Debug for RefreshVerifier {
@@ -146,12 +156,15 @@ impl std::fmt::Debug for RefreshVerifier {
 impl RefreshVerifier {
     /// Build from the validated startup key. The nonce memory covers the
     /// whole freshness window ([`NONCE_TTL_SECONDS`] over [`SKEW_SECONDS`]),
-    /// so a nonce stays burned at every instant its timestamp is still fresh.
+    /// so a nonce stays burned at every instant its timestamp is still fresh,
+    /// and the [`ClockGuard`] high-water mark keeps it burned across clock
+    /// rollback: freshness and the burn both decide at the guarded time.
     #[must_use]
     pub fn new(key: Secret<Vec<u8>>) -> Self {
         Self {
             key,
             nonces: Mutex::new(NonceCache::new(NONCE_TTL_SECONDS)),
+            clock: Mutex::new(ClockGuard::new()),
         }
     }
 }
@@ -160,10 +173,11 @@ impl RefreshVerifier {
 /// `current` before the caller verifies the delivery.
 ///
 /// Order: presence → nonce/signature shape → HMAC (constant-time) →
-/// freshness → nonce burn → secret validation → swap. Only an authenticated,
-/// fresh, unreplayed, valid candidate swaps; anything else leaves `current`
-/// untouched for the caller to refuse generically. The swap holds one write
-/// lock, so concurrent requests each verify against one complete snapshot.
+/// clock-guard evaluation → freshness → nonce burn → secret validation →
+/// swap. Only an authenticated, fresh, unreplayed, valid candidate swaps;
+/// anything else leaves `current` untouched for the caller to refuse
+/// generically. The swap holds one write lock, so concurrent requests each
+/// verify against one complete snapshot.
 pub fn refresh_before_verify<'headers>(
     verifier: &RefreshVerifier,
     current: &RwLock<WebhookSecret>,
@@ -201,13 +215,31 @@ pub fn refresh_before_verify<'headers>(
     if !signatures_match(&expected, signature) {
         return Err(RefreshRejection::BadSignature);
     }
-    if !within_skew(timestamp, SKEW_SECONDS, now_ms / 1000) {
+    // Evaluate the freshness clock against the high-water mark before
+    // touching time or replay state, as internal actions do: a forged
+    // request must not move the mark, and a regressed reading must never
+    // decide freshness. Within-tolerance samples decide at the mark;
+    // rollback past the tolerance refuses fail-closed.
+    let guarded_ms = {
+        let mut clock = match verifier.clock.lock() {
+            Ok(clock) => clock,
+            // Poisoned clock state fails closed; the guard is unrecoverable
+            // and must not travel with the error.
+            Err(_) => return Err(RefreshRejection::Unavailable),
+        };
+        match clock.evaluate(now_ms) {
+            Ok(guarded) => guarded,
+            Err(_) => return Err(RefreshRejection::Stale),
+        }
+    };
+    if !within_skew(timestamp, SKEW_SECONDS, guarded_ms / 1000) {
         return Err(RefreshRejection::Stale);
     }
-    // Burn only authenticated, fresh nonces: a replay can never re-arm an
-    // old secret, and a forged nonce cannot deny a legitimate one.
+    // Burn only authenticated, fresh nonces at the guarded time: a replay can
+    // never re-arm an old secret, and a forged nonce cannot deny a legitimate
+    // one.
     let fresh = match verifier.nonces.lock() {
-        Ok(mut cache) => cache.offer(nonce, now_ms),
+        Ok(mut cache) => cache.offer(nonce, guarded_ms),
         // Poisoned replay state fails closed; the guard is unrecoverable and
         // must not travel with the error.
         Err(_) => return Err(RefreshRejection::Unavailable),
@@ -569,6 +601,43 @@ mod tests {
         assert_eq!(
             refresh_before_verify(&verifier, &current, lookup(&rollback), REQUEST_ID, NOW_MS),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn clock_rollback_after_nonce_sweep_cannot_rearm_an_old_secret() {
+        // Threat-model F8: nonce memory drops entries past NONCE_TTL_SECONDS,
+        // so expiry followed by wall-clock rollback could reopen a signed
+        // window whose nonce is already forgotten. The ClockGuard high-water
+        // mark closes that gap: both freshness and the burn decide at the
+        // guarded time, and rollback past the tolerance refuses fail-closed.
+        let (verifier, key) = verifier();
+        let old = fresh_material();
+        let new = fresh_material();
+        let current = lock_for(&old);
+        let first = signed_headers(&key, &new, now_secs(), &fresh_nonce());
+        assert_eq!(
+            refresh_before_verify(&verifier, &current, lookup(&first), REQUEST_ID, NOW_MS),
+            Ok(())
+        );
+        // A later refresh advances the high-water mark and sweeps the first
+        // nonce from memory (300 s gap over the 241 s TTL).
+        let later_ms = NOW_MS + 300_000;
+        let later = signed_headers(&key, &new, later_ms / 1000, &fresh_nonce());
+        assert_eq!(
+            refresh_before_verify(&verifier, &current, lookup(&later), REQUEST_ID, later_ms),
+            Ok(())
+        );
+        // Replaying the first header set at the rolled-back clock refuses:
+        // the regressed reading is 300 s below the mark (past the 5 s
+        // tolerance), so the guard fails closed instead of re-arming.
+        assert_eq!(
+            refresh_before_verify(&verifier, &current, lookup(&first), REQUEST_ID, NOW_MS),
+            Err(RefreshRejection::Stale)
+        );
+        assert_eq!(
+            *current.read().expect("snapshot lock must be readable"),
+            WebhookSecret::new(new).expect("rotated secret must parse")
         );
     }
 
