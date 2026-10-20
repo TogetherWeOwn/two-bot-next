@@ -72,27 +72,35 @@ pub async fn run_sweep(
     fn epoch_millis(dt: &sqlx::types::time::OffsetDateTime) -> i64 {
         dt.unix_timestamp() * 1000 + i64::from(dt.millisecond())
     }
-    // `seen` is the paging progress guard, and it terminates correctly only
-    // because every unwritten row leaves the select window on reselect:
-    // suppressed members are excluded from the select below (they would
-    // otherwise pin the LIMIT window forever and starve the writable tail),
-    // while stale, left, bot, concurrently-flagged, and deleted rows all stop
-    // matching the eligibility predicate once observed. A page with nothing
-    // new therefore means exhaustion, not a crowded window.
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    // Progress is structural, not observational: pages advance a composite
+    // `(guild_id, member_id)` cursor along PRIMARY KEY order, so each page is
+    // disjoint from every earlier page by construction. Rows that stay
+    // eligible after being visited — a full page whose events already exist
+    // but whose projections lag, or a page MemberJoin reopens by clearing
+    // `inactive_flagged_at` — can never pin the window or hide the writable
+    // tail behind them: the cursor has already moved past their keys. A page
+    // therefore ends the sweep only when it comes back empty or short, never
+    // because its rows were seen before.
+    let mut cursor: Option<(String, String)> = None;
     let mut written: Vec<(String, String)> = Vec::with_capacity(SWEEP_PAGE_ROWS);
     let mut outcome = InactivityOutcome { flagged: vec![] };
     let cutoff_ms = super::inactivity::inactivity_cutoff_ms(now_ms, days);
     loop {
-        // The eligible set shrinks as the sweep flags it, so paging re-runs
-        // the same bounded select until it comes back empty instead of using
-        // OFFSET (an offset would skip members the earlier pages just flagged).
-        // Suppressed members are excluded here, not only at the per-write
-        // gate: they never leave the eligible set, so a suppressed prefix of
-        // SWEEP_PAGE_ROWS or more would otherwise pin this window and the
-        // sweep would end without ever visiting the writable tail. The
-        // per-write suppression check stays as the TOCTOU gate for opt-outs
-        // that land between this select and the write.
+        // Keyset paging re-runs the bounded select with the previous page's
+        // final key instead of using OFFSET (an offset would skip members the
+        // earlier pages just flagged). `$3` is false on the first page, when
+        // `$4`/`$5` are empty and ignored; on later pages the row comparison
+        // seeks strictly past the cursor. Suppressed members are excluded
+        // here, not only at the per-write gate: they never leave the eligible
+        // set, so without the exclusion a suppressed prefix of
+        // SWEEP_PAGE_ROWS or more would fill whole pages the sweep must still
+        // walk key by key. The per-write suppression check stays as the
+        // TOCTOU gate for opt-outs that land between this select and the
+        // write.
+        let (has_cursor, cursor_guild, cursor_member) = cursor
+            .as_ref()
+            .map(|(guild_id, member_id)| (true, guild_id.as_str(), member_id.as_str()))
+            .unwrap_or((false, "", ""));
         let rows: Vec<SweepRow> = sqlx::query_as(
             "SELECT guild_id, member_id, COALESCE(last_active_at, joined_at),
                     inactive_flagged_at, is_bot
@@ -106,37 +114,37 @@ pub async fn run_sweep(
                     WHERE opt.guild_id = members.guild_id
                       AND opt.member_id = members.member_id
                 )
+                AND (NOT $3::boolean OR (guild_id, member_id) > ($4, $5))
+              ORDER BY guild_id, member_id
               LIMIT $2",
         )
         .bind(&cutoff)
         .bind(SWEEP_PAGE_ROWS as i64)
+        .bind(has_cursor)
+        .bind(cursor_guild)
+        .bind(cursor_member)
         .fetch_all(pool)
         .await?;
         if rows.is_empty() {
             break;
         }
         let page_len = rows.len();
-        let mut new_pairs = 0usize;
+        if let Some((guild_id, member_id, _, _, _)) = rows.last() {
+            cursor = Some((guild_id.clone(), member_id.clone()));
+        }
         let candidates: Vec<InactivityCandidate> = rows
             .into_iter()
-            .filter_map(|(guild_id, member_id, last_seen, flagged_at, is_bot)| {
-                if !seen.insert((guild_id.clone(), member_id.clone())) {
-                    return None;
-                }
-                new_pairs += 1;
-                Some(InactivityCandidate {
+            .map(
+                |(guild_id, member_id, last_seen, flagged_at, is_bot)| InactivityCandidate {
                     guild_id,
                     member_id,
                     last_seen_ms: last_seen.as_ref().map(epoch_millis),
                     flagged_at_ms: flagged_at.as_ref().map(epoch_millis),
                     is_bot,
                     has_left: false,
-                })
-            })
+                },
+            )
             .collect();
-        if new_pairs == 0 {
-            break;
-        }
         let page = flag_inactive(&candidates, now_ms, days);
         for flagged in &page.flagged {
             let key = super::inactivity::member_inactive_event_key(
@@ -229,7 +237,10 @@ pub async fn run_sweep(
                 > 0
             {
                 // Already flagged in an earlier sweep: the outcome still reports
-                // the member, but there is no new write to gate.
+                // the member, but there is no new write to gate. The lagging
+                // projection is deliberately left alone — repairing it here
+                // would rewrite another sweep's outcome — and the keyset
+                // cursor advances past such pages regardless of write outcome.
                 written.push((flagged.guild_id.clone(), flagged.member_id.clone()));
             }
             tx.commit().await?;
@@ -529,6 +540,60 @@ mod tests {
             .await
             .expect("event count");
         assert_eq!(count.0, 100);
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_pages_past_a_lagging_projection_prefix_without_dropping_the_tail() {
+        let Some((pool, schema)) = test_pool("inactivity_lagging_prefix")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping inactivity_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        // A full page whose events already exist but whose projections lag,
+        // ahead of a 100-member writable tail. The existing-event arm reports
+        // without touching projections, so without keyset progress the prefix
+        // would reselect on every page and the sweep would end without ever
+        // visiting the tail. `generate_series` keeps the seed to two
+        // statements; the seeded keys match this sweep's idempotency shape.
+        sqlx::query(
+            "INSERT INTO members (guild_id, member_id, joined_at)
+             SELECT 'guild-a', 'member-' || g, '2026-07-01T00:00:00.000Z'::timestamptz
+             FROM generate_series(1, 4196) g",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed members");
+        sqlx::query(
+            "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
+             SELECT 'member_inactive', 'member-' || g, 'guild-a',
+                    '2026-09-07T00:00:00.000Z'::timestamptz, 'job:inactivity',
+                    '{\"thresholdDays\":14}',
+                    'guild-a:member-' || g || ':member_inactive:2026-09-07T00:00:00.000Z'
+             FROM generate_series(1, 4096) g",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed existing events");
+        let outcome = run_sweep(&pool, "2026-09-07T00:00:00.000Z", 14)
+            .await
+            .expect("sweep past lagging prefix");
+        assert_eq!(outcome.flagged.len(), 4196);
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .expect("event count");
+        assert_eq!(count.0, 4196);
+        // Existing-event rows are reported but their projections stay
+        // untouched; only the writable tail advances.
+        let untouched: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM members WHERE inactive_flagged_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .expect("untouched projection count");
+        assert_eq!(untouched.0, 4096);
         drop_schema(&pool, &schema).await;
     }
 }
