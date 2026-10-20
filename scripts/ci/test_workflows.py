@@ -227,17 +227,25 @@ def _match_fn_name(text, pos):
 
 
 def ignored_test_names(suite):
-    """The #[ignore]d test fns of the integration test target `suite`."""
+    """Find ignored test fns, refusing any ignore mark the scanner cannot map."""
     [path] = ROOT.glob(f"crates/*/tests/{suite}.rs")
     text = path.read_text(encoding="utf-8")
+    marks = list(IGNORE_MARK.finditer(text))
     names = []
-    for mark in IGNORE_MARK.finditer(text):
+    for mark in marks:
         line_end = text.find("\n", mark.end())
         if line_end == -1:
             continue
         name = _match_fn_name(text, _skip_trivia(text, line_end + 1))
         if name is not None:
             names.append(name)
+    # This is a source-style scanner, not a Rust parser. Unsupported syntax
+    # must fail policy validation, never silently shrink the sweep's skip set.
+    if len(names) != len(marks):
+        raise ValueError(
+            f"{path.name}: discovered {len(names)} of {len(marks)} ignored test functions; "
+            "extend the scanner for the unsupported declaration",
+        )
     return names
 
 
@@ -3474,13 +3482,41 @@ class WorkflowTests(unittest.TestCase):
                             + separator + prefix + 'fn selected() {}\n'
                             '#[test]\nfn ordinary_after() {}\n'
                             '#[ignore]\nfn other_ignored() {}\n'
-                            '#[ignore]\nstruct NotAFunction;\nfn unrelated() {}\n',
+                            'struct NotAFunction;\nfn unrelated() {}\n',
                             encoding="utf-8",
                         )
                         with patch(f"{__name__}.ROOT", root):
                             self.assertEqual(
                                 ignored_test_names("discovery"), ["selected", "other_ignored"],
                             )
+
+    def test_ignored_test_names_fail_closed_on_unsupported_forms(self):
+        unsupported = (
+            ("public function", '#[ignore]\npub async fn omitted() {}\n'),
+            ("multiline attribute", '#[ignore]\n#[cfg_attr(\n'
+             '    all(feature = "first", feature = "second"),\n'
+             '    tokio::test\n)]\nasync fn omitted() {}\n'),
+            ("nested block comment", '#[ignore]\n/* outer comment\n'
+             '   /* nested comment */\n*/\nasync fn omitted() {}\n'),
+            ("non-function item", '#[ignore]\nstruct NotAFunction;\nfn unrelated() {}\n'),
+            ("no following function", '#[ignore]\n'),
+            ("no final newline", '#[ignore]'),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "crates/fixture/tests/discovery.rs"
+            source.parent.mkdir(parents=True)
+            for label, declaration in unsupported:
+                with self.subTest(form=label):
+                    source.write_text(
+                        '#[ignore]\nfn discovered() {}\n' + declaration,
+                        encoding="utf-8",
+                    )
+                    with patch(f"{__name__}.ROOT", root):
+                        with self.assertRaisesRegex(
+                            ValueError, r"discovery\.rs: discovered 1 of 2 ignored test functions",
+                        ):
+                            ignored_test_names("discovery")
 
     def test_patch_coverage_ignored_sweep_skips_tests_that_cannot_pass_there(self):
         # The ignored sweep tolerates failures, but the flake ledger reads
