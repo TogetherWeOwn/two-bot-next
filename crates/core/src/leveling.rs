@@ -340,7 +340,7 @@ pub const RANK_DISPLAY_NAME_LIMIT: usize = 512;
 /// Sanitize a display name for the `/rank` reply name slot (goodbye grade):
 /// fold newlines to spaces so the reply keeps its three template lines,
 /// neutralize mass mentions with the shared neutralizer, split mention pills
-/// (`<@`, `<#`, `<:`, `<a:`) so they render literally, backslash-escape the
+/// and timestamps (`<@`, `<#`, `<:`, `<a:`, `<t:`) so they render literally, escape the
 /// vote-reason markdown set, and cap the escaped output at
 /// [`RANK_DISPLAY_NAME_LIMIT`] characters. Plain names pass through
 /// byte-identical.
@@ -357,7 +357,8 @@ fn sanitize_rank_name(display_name: &str) -> String {
         .replace("<@", "<\u{200b}@")
         .replace("<#", "<\u{200b}#")
         .replace("<:", "<\u{200b}:")
-        .replace("<a:", "<\u{200b}a:");
+        .replace("<a:", "<\u{200b}a:")
+        .replace("<t:", "<\u{200b}t:");
     let mut escaped = String::with_capacity(pills.len());
     for ch in pills.chars() {
         if matches!(ch, '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']') {
@@ -777,6 +778,89 @@ mod tests {
         let text = rank_text("Test", 1, Some(3), 50, 114);
         assert!(text.starts_with("**Test**\nLevel **1** · Rank **#3** of **50**"));
         assert!(text.contains("XP **114** · 14/155 this level · **141** to level 2"));
+    }
+
+    fn assert_rank_name_slot(name: &str, expected_slot: &str) {
+        let profile = LevelProfile {
+            guild_id: "g".to_owned(),
+            member_id: "100000000000000001".to_owned(),
+            xp: 114,
+            level: 1,
+            message_xp: 114,
+            voice_xp: 0,
+            imported_xp: 0,
+            rank: Some(3),
+            member_count: 50,
+            next_level_xp: total_xp_for_level(2),
+        };
+        let expected = format!(
+            "**{expected_slot}**\nLevel **1** · Rank **#3** of **50**\nXP **114** · 14/155 this level · **141** to level 2"
+        );
+        assert_eq!(rank_text(name, 1, Some(3), 50, 114), expected);
+        let reply = rank_reply(&profile, name);
+        assert!(reply.ephemeral);
+        assert_eq!(reply.content, expected);
+        let rendered_slot = reply
+            .content
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("**"))
+            .and_then(|line| line.strip_suffix("**"))
+            .expect("rank name inside bold markers");
+        assert!(rendered_slot.chars().count() <= RANK_DISPLAY_NAME_LIMIT);
+        for pill in ["<@", "<#", "<:", "<a:", "<t:"] {
+            assert!(!rendered_slot.contains(pill));
+        }
+        let mut escaped = false;
+        for ch in rendered_slot.chars() {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else {
+                assert!(!matches!(ch, '`' | '*' | '_' | '~' | '|' | '[' | ']'));
+            }
+        }
+        assert!(
+            !escaped,
+            "a lone escape must not eat the closing bold marker"
+        );
+    }
+
+    #[test]
+    fn rank_name_splits_timestamp_tokens_exactly() {
+        for suffix in ["", ":t", ":T", ":d", ":D", ":f", ":F", ":R"] {
+            assert_rank_name_slot(
+                &format!("before <t:1618953630{suffix}> after"),
+                &format!("before <\u{200b}t:1618953630{suffix}> after"),
+            );
+        }
+        assert_rank_name_slot(
+            "<t:0> <t:1618953630:R>",
+            "<\u{200b}t:0> <\u{200b}t:1618953630:R>",
+        );
+    }
+
+    #[test]
+    fn rank_name_cap_trims_partial_escape_for_every_markdown_character() {
+        for prefix in ["a".repeat(511), "界".repeat(511)] {
+            for ch in ['\\', '`', '*', '_', '~', '|', '[', ']'] {
+                assert_rank_name_slot(&format!("{prefix}{ch}"), &prefix);
+            }
+        }
+    }
+
+    #[test]
+    fn rank_name_cap_preserves_complete_trailing_escape_pairs() {
+        assert_rank_name_slot(&"\\".repeat(256), &"\\\\".repeat(256));
+        assert_rank_name_slot(
+            &format!("a{}", "\\".repeat(256)),
+            &format!("a{}", "\\\\".repeat(255)),
+        );
+        assert_rank_name_slot(
+            &format!("{}*", "a".repeat(510)),
+            &format!("{}\\*", "a".repeat(510)),
+        );
     }
 
     #[test]
